@@ -142,6 +142,20 @@ impl Default for KanbanConfig {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            discord: DiscordConfig::default(),
+            agents: Vec::new(),
+            github: GitHubConfig::default(),
+            policies: PoliciesConfig::default(),
+            data: DataConfig::default(),
+            kanban: KanbanConfig::default(),
+        }
+    }
+}
+
 pub fn load() -> Result<Config> {
     let path = std::env::var("AGENTDESK_CONFIG")
         .unwrap_or_else(|_| "agentdesk.yaml".into());
@@ -156,6 +170,32 @@ pub fn load() -> Result<Config> {
     std::fs::create_dir_all(&config.data.dir)?;
 
     Ok(config)
+}
+
+/// Load config gracefully — returns Config::default() if the file doesn't exist
+/// or fails to parse, instead of panicking.
+pub fn load_graceful() -> Config {
+    let path = std::env::var("AGENTDESK_CONFIG")
+        .unwrap_or_else(|_| "agentdesk.yaml".into());
+
+    let config = match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_yaml::from_str::<Config>(&contents) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("  ⚠ Failed to parse {path}: {e} — using defaults");
+                Config::default()
+            }
+        },
+        Err(_) => {
+            eprintln!("  ⚠ {path} not found — using defaults");
+            Config::default()
+        }
+    };
+
+    // Ensure data dir exists (best effort)
+    let _ = std::fs::create_dir_all(&config.data.dir);
+
+    config
 }
 
 /// Compatibility shim: RCC's `config::Settings` is referenced by discord code

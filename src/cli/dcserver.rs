@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::services;
+use crate::config;
+use crate::db;
+use crate::engine::PolicyEngine;
+use crate::server;
 
 use super::VERSION;
 pub(crate) const REMOTECC_DCSERVER_LAUNCHD_LABEL: &str = "com.itismyfield.remotecc.dcserver";
@@ -728,6 +732,46 @@ pub fn handle_dcserver(token: Option<String>) {
 
     rt.block_on(async {
         println!();
+
+        // ── AgentDesk HTTP server ──────────────────────────────────
+        // Load agentdesk.yaml (graceful: use defaults if missing)
+        let ad_config = config::load_graceful();
+
+        // Initialize SQLite DB
+        match db::init(&ad_config) {
+            Ok(ad_db) => {
+                // Sync agents from config → DB
+                let agent_count = ad_config.agents.len();
+                if agent_count > 0 {
+                    match db::agents::sync_agents_from_config(&ad_db, &ad_config.agents) {
+                        Ok(n) => println!("  ▸ Agents : {n} synced from config"),
+                        Err(e) => eprintln!("  ⚠ Agent sync failed: {e}"),
+                    }
+                }
+
+                // Start axum HTTP server (background task)
+                let http_port = ad_config.server.port;
+                match PolicyEngine::new(&ad_config, ad_db.clone()) {
+                    Ok(engine) => {
+                        let http_config = ad_config.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = server::run(http_config, ad_db, engine).await {
+                                eprintln!("  ⚠ HTTP server error: {e}");
+                            }
+                        });
+                        println!("  ▸ HTTP    : listening on {}:{}", ad_config.server.host, http_port);
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ Policy engine init failed: {e} — HTTP server not started");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ DB init failed: {e} — HTTP server not started");
+            }
+        }
+
+        // ── Discord bot ────────────────────────────────────────────
         // Process-global counters shared across all providers for deferred restart barrier
         let global_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let global_finalizing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
