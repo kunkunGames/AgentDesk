@@ -52,9 +52,7 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
     // Load announce bot token for agent-to-agent routing.
     // This bot is separate from claude/codex bots — its messages are in
     // every agent's allowed_bot_ids, so agents process them.
-    if let Some(home) = dirs::home_dir() {
-        let root = home.join(".remotecc");
-        // TODO: Remove legacy fallback after 2026-03-26
+    if let Some(root) = super::runtime_store::remotecc_root() {
         let new_path = root.join("credential").join("announce_bot_token");
         let legacy = root.join("announce_bot_token");
         let token_path = if new_path.exists() { new_path } else if legacy.exists() { legacy } else { new_path };
@@ -113,6 +111,10 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
                     // Extract JSON body (after \r\n\r\n)
                     let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
                     handle_send(&registry, body_str).await
+                }
+                ("POST", "/api/session/start") => {
+                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    handle_session_start(&registry, body_str).await
                 }
                 _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
             };
@@ -274,6 +276,89 @@ pub fn resolve_port() -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8793)
+}
+
+/// Handle POST /api/session/start — start a session via API.
+/// Accepts JSON: {"channel_id":"<id>", "path":"/some/path", "provider":"claude"}
+/// Creates a DiscordSession in the provider's SharedData and responds.
+async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string());
+    };
+
+    let channel_id_str = json.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+    let path = json.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let provider_hint = json.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+
+    let Some(channel_id_raw) = channel_id_str.parse::<u64>().ok() else {
+        return ("400 Bad Request", r#"{"ok":false,"error":"channel_id must be a numeric string"}"#.to_string());
+    };
+
+    // Resolve path — expand ~ and . to absolute
+    let effective_path = if path == "." || path.is_empty() {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    } else if path.starts_with('~') {
+        dirs::home_dir()
+            .map(|h| path.replacen('~', &h.to_string_lossy(), 1))
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    };
+
+    let channel_id = ChannelId::new(channel_id_raw);
+
+    // Find the matching provider
+    let providers = registry.providers.lock().await;
+
+    // Try to match by provider hint, or by channel name suffix
+    let target_provider = if !provider_hint.is_empty() {
+        providers.iter().find(|p| p.name == provider_hint)
+    } else {
+        // Try to detect from channel_id via role binding
+        let binding = super::settings::resolve_role_binding(channel_id, None);
+        let bound_provider = binding.as_ref().and_then(|b| b.provider.as_ref());
+        match bound_provider {
+            Some(p) => providers.iter().find(|e| &e.name == p.as_str()),
+            None => providers.first(),
+        }
+    };
+
+    let Some(provider_entry) = target_provider else {
+        return ("404 Not Found", r#"{"ok":false,"error":"no matching provider found"}"#.to_string());
+    };
+
+    // Create session
+    {
+        let mut data = provider_entry.shared.core.lock().await;
+        let session = data
+            .sessions
+            .entry(channel_id)
+            .or_insert_with(|| super::DiscordSession {
+                session_id: None,
+                current_path: None,
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                cleared: false,
+                channel_name: None,
+                category_name: None,
+                remote_profile_name: None,
+                channel_id: Some(channel_id_raw),
+                last_active: tokio::time::Instant::now(),
+                worktree: None,
+                last_shared_memory_ts: None,
+                born_generation: super::runtime_store::load_generation(),
+            });
+        session.current_path = Some(effective_path.clone());
+        session.last_active = tokio::time::Instant::now();
+    }
+
+    let response = format!(
+        r#"{{"ok":true,"channel_id":"{}","path":"{}","provider":"{}"}}"#,
+        channel_id_raw, effective_path, provider_entry.name
+    );
+    ("200 OK", response)
 }
 
 /// Parse a /api/send JSON body and extract (target, content, source).
