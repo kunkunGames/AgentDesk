@@ -16,11 +16,10 @@ pub(crate) use cli::remotecc_runtime_root;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Check for dcserver mode
+    // CLI subcommands that create their own tokio runtime — must run BEFORE #[tokio::main]
     for arg in &args[1..] {
         match arg.as_str() {
             "--dcserver" | "dcserver" => {
@@ -179,26 +178,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Default: start full AgentDesk server
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("agentdesk=info".parse()?))
-        .init();
+    // Default: start full AgentDesk server (needs tokio runtime)
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env().add_directive("agentdesk=info".parse().unwrap()))
+            .init();
 
-    let config = config::load()?;
-    let db = db::init(&config)?;
-    let engine = engine::PolicyEngine::new(&config, db.clone())?;
+        let config = config::load().expect("Failed to load config");
+        let db = db::init(&config).expect("Failed to init DB");
+        let engine = engine::PolicyEngine::new(&config, db.clone()).expect("Failed to init policy engine");
 
-    tracing::info!(
-        "AgentDesk v{} starting on {}:{}",
-        env!("CARGO_PKG_VERSION"),
-        config.server.host,
-        config.server.port
-    );
+        tracing::info!(
+            "AgentDesk v{} starting on {}:{}",
+            env!("CARGO_PKG_VERSION"),
+            config.server.host,
+            config.server.port
+        );
 
-    // Start subsystems concurrently
-    tokio::try_join!(
-        server::run(config.clone(), db.clone(), engine.clone()),
-    )?;
+        tokio::try_join!(
+            server::run(config.clone(), db.clone(), engine.clone()),
+        ).expect("Server error");
+    });
 
     Ok(())
 }
