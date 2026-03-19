@@ -16,7 +16,7 @@ use crate::services::claude;
 use crate::services::provider::ProviderKind;
 use crate::services::tmux_diagnostics::{tmux_session_exists, tmux_session_has_live_pane};
 
-pub(super) async fn build_health_report(
+pub(in crate::services::discord) async fn build_health_report(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -164,7 +164,7 @@ pub(super) async fn build_health_report(
     )
 }
 
-pub(super) async fn build_status_report(
+pub(in crate::services::discord) async fn build_status_report(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -273,7 +273,7 @@ pub(super) async fn build_status_report(
     )
 }
 
-pub(super) async fn build_inflight_report(
+pub(in crate::services::discord) async fn build_inflight_report(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -479,7 +479,7 @@ fn build_queue_report_sync(
     lines.join("\n")
 }
 
-async fn build_queue_report(
+pub(in crate::services::discord) async fn build_queue_report(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     current_channel: ChannelId,

@@ -1273,7 +1273,7 @@ async fn handle_shell_command_raw(
     Ok(())
 }
 
-/// Handle text-based commands (!start, !meeting, !stop, !clear).
+/// Handle text-based commands (!start, !meeting, !stop, !clear, etc.).
 /// Returns true if the command was handled, false otherwise.
 async fn handle_text_command(
     ctx: &serenity::Context,
@@ -1478,6 +1478,633 @@ async fn handle_text_command(
             d.intervention_queue.remove(&channel_id);
             drop(d);
             let _ = msg.reply(&ctx.http, "Session cleared.").await;
+            return Ok(true);
+        }
+
+        // ── Simple diagnostic / info commands ──
+
+        "!pwd" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !pwd", msg.author.name);
+
+            auto_restore_session(&data.shared, channel_id, ctx).await;
+
+            let (current_path, remote_name) = {
+                let d = data.shared.core.lock().await;
+                let session = d.sessions.get(&channel_id);
+                (
+                    session.and_then(|s| s.current_path.clone()),
+                    session.and_then(|s| s.remote_profile_name.clone()),
+                )
+            };
+            let reply = match current_path {
+                Some(path) => {
+                    let remote_info = remote_name
+                        .map(|n| format!(" (remote: **{}**)", n))
+                        .unwrap_or_else(|| " (local)".to_string());
+                    format!("`{}`{}", path, remote_info)
+                }
+                None => "No active session. Use `!start <path>` first.".to_string(),
+            };
+            let _ = msg.reply(&ctx.http, &reply).await;
+            return Ok(true);
+        }
+
+        "!health" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !health", msg.author.name);
+
+            let text = commands::build_health_report(&data.shared, &data.provider, channel_id).await;
+            send_long_message_raw(&ctx.http, channel_id, &text, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!status" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !status", msg.author.name);
+
+            let text = commands::build_status_report(&data.shared, &data.provider, channel_id).await;
+            send_long_message_raw(&ctx.http, channel_id, &text, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!inflight" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !inflight", msg.author.name);
+
+            let text = commands::build_inflight_report(&data.shared, &data.provider, channel_id).await;
+            send_long_message_raw(&ctx.http, channel_id, &text, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!queue" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !queue", msg.author.name);
+
+            let show_all = *arg1 == "all";
+            let text = commands::build_queue_report(&data.shared, &data.provider, channel_id, show_all).await;
+            send_long_message_raw(&ctx.http, channel_id, &text, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!metrics" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !metrics", msg.author.name);
+
+            let metrics_data = if arg1.is_empty() {
+                metrics::load_today()
+            } else {
+                metrics::load_date(arg1)
+            };
+            let label = if arg1.is_empty() { "today" } else { arg1 };
+            let text = metrics::build_metrics_report(&metrics_data, label);
+            send_long_message_raw(&ctx.http, channel_id, &text, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!debug" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !debug", msg.author.name);
+
+            let new_state = claude::toggle_debug();
+            let status = if new_state { "ON" } else { "OFF" };
+            let _ = msg.reply(&ctx.http, format!("Debug logging: **{}**", status)).await;
+            println!("  [{ts}] ▶ Debug logging toggled to {status}");
+            return Ok(true);
+        }
+
+        "!help" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !help", msg.author.name);
+
+            let provider_name = data.provider.display_name();
+            let help = format!(
+                "\
+**RemoteCC Discord Bot**
+Manage server files & chat with {p}.
+Each channel gets its own independent {p} session.
+
+**Session**
+`!start <path>` — Start session at directory
+`!pwd` — Show current working directory
+`!health` — Show runtime health summary
+`!status` — Show this channel session status
+`!inflight` — Show saved inflight turn state
+`!clear` — Clear AI conversation history
+`!stop` — Stop current AI request
+
+**File Transfer**
+`!down <file>` — Download file from server
+Send a file/photo — Upload to session directory
+
+**Shell**
+`!shell <command>` — Run shell command directly
+
+**AI Chat**
+Any other message is sent to {p}.
+
+**Tool Management**
+`!allowedtools` — Show currently allowed tools
+`!allowed +name` — Add tool (e.g. `!allowed +Bash`)
+`!allowed -name` — Remove tool
+
+**Skills**
+`!cc <skill>` — Run a provider skill
+
+**Settings**
+`!model [get|set|clear] [name]` — Model management
+`!debug` — Toggle debug logging
+`!metrics [date]` — Show turn metrics
+`!queue [all]` — Show pending queue
+
+**User Management** (owner only)
+`!adduser <user_id>` — Allow a user to use the bot
+`!removeuser <user_id>` — Remove a user's access
+`!help` — Show this help",
+                p = provider_name
+            );
+            send_long_message_raw(&ctx.http, channel_id, &help, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!allowedtools" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !allowedtools", msg.author.name);
+
+            let tools = {
+                let settings = data.shared.settings.read().await;
+                settings.allowed_tools.clone()
+            };
+
+            let mut reply = String::from("**Allowed Tools**\n\n");
+            for tool in &tools {
+                let (desc, destructive) = super::formatting::tool_info(tool);
+                let badge = super::formatting::risk_badge(destructive);
+                if badge.is_empty() {
+                    reply.push_str(&format!("`{}` — {}\n", tool, desc));
+                } else {
+                    reply.push_str(&format!("`{}` {} — {}\n", tool, badge, desc));
+                }
+            }
+            reply.push_str(&format!(
+                "\n{} = destructive\nTotal: {}",
+                super::formatting::risk_badge(true),
+                tools.len()
+            ));
+            send_long_message_raw(&ctx.http, channel_id, &reply, &data.shared).await?;
+            return Ok(true);
+        }
+
+        // ── Commands with arguments ──
+
+        "!model" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
+
+            if !matches!(data.provider, ProviderKind::Claude) {
+                let _ = msg.reply(&ctx.http, "Model override is only supported for Claude channels.").await;
+                return Ok(true);
+            }
+
+            match *arg1 {
+                "set" => {
+                    if arg2.is_empty() {
+                        let _ = msg.reply(&ctx.http, "Usage: `!model set <model_name>`").await;
+                    } else {
+                        data.shared.model_overrides.insert(channel_id, arg2.to_string());
+                        let display = data.shared.model_overrides.get(&channel_id)
+                            .map(|v| v.clone())
+                            .unwrap_or_else(|| "(default)".to_string());
+                        let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                    }
+                }
+                "clear" | "default" | "none" => {
+                    data.shared.model_overrides.remove(&channel_id);
+                    let _ = msg.reply(&ctx.http, "Model override cleared. Using default.").await;
+                }
+                "get" | "" => {
+                    let override_model = data.shared.model_overrides.get(&channel_id)
+                        .map(|v| v.clone());
+                    let ch_name = {
+                        let d = data.shared.core.lock().await;
+                        d.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+                    };
+                    let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
+                        .and_then(|rb| rb.model);
+                    let effective = override_model.as_deref()
+                        .or(role_model.as_deref())
+                        .unwrap_or("(default)");
+                    let source = if override_model.is_some() {
+                        "runtime override"
+                    } else if role_model.is_some() {
+                        "role-map"
+                    } else {
+                        "system default"
+                    };
+                    let _ = msg.reply(&ctx.http, format!("Model: **{effective}** (source: {source})")).await;
+                }
+                _ => {
+                    // Treat bare arg as shorthand for "set"
+                    data.shared.model_overrides.insert(channel_id, arg1.to_string());
+                    let display = data.shared.model_overrides.get(&channel_id)
+                        .map(|v| v.clone())
+                        .unwrap_or_else(|| "(default)".to_string());
+                    let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                }
+            }
+            return Ok(true);
+        }
+
+        "!allowed" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !allowed {}", msg.author.name, arg1);
+
+            let arg = arg1.trim();
+            let (op, raw_name) = if let Some(name) = arg.strip_prefix('+') {
+                ('+', name.trim())
+            } else if let Some(name) = arg.strip_prefix('-') {
+                ('-', name.trim())
+            } else {
+                let _ = msg.reply(&ctx.http, "Use `+toolname` to add or `-toolname` to remove.\nExample: `!allowed +Bash`").await;
+                return Ok(true);
+            };
+
+            if raw_name.is_empty() {
+                let _ = msg.reply(&ctx.http, "Tool name cannot be empty.").await;
+                return Ok(true);
+            }
+
+            let Some(tool_name) = super::formatting::canonical_tool_name(raw_name).map(str::to_string) else {
+                let _ = msg.reply(&ctx.http, format!(
+                    "Unknown tool `{}`. Use `!allowedtools` to see valid tool names.",
+                    raw_name
+                )).await;
+                return Ok(true);
+            };
+
+            let response_msg = {
+                let mut settings = data.shared.settings.write().await;
+                match op {
+                    '+' => {
+                        if settings.allowed_tools.iter().any(|t| t == &tool_name) {
+                            format!("`{}` is already in the list.", tool_name)
+                        } else {
+                            settings.allowed_tools.push(tool_name.clone());
+                            save_bot_settings(&data.token, &settings);
+                            format!("Added `{}`", tool_name)
+                        }
+                    }
+                    '-' => {
+                        let before_len = settings.allowed_tools.len();
+                        settings.allowed_tools.retain(|t| t != &tool_name);
+                        if settings.allowed_tools.len() < before_len {
+                            save_bot_settings(&data.token, &settings);
+                            format!("Removed `{}`", tool_name)
+                        } else {
+                            format!("`{}` is not in the list.", tool_name)
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            let _ = msg.reply(&ctx.http, &response_msg).await;
+            return Ok(true);
+        }
+
+        "!adduser" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !adduser {}", msg.author.name, arg1);
+
+            if !check_owner(msg.author.id, &data.shared).await {
+                let _ = msg.reply(&ctx.http, "Only the owner can add users.").await;
+                return Ok(true);
+            }
+
+            let raw_id = arg1.trim().trim_start_matches("<@").trim_end_matches('>').trim_start_matches('!');
+            let target_id: u64 = match raw_id.parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = msg.reply(&ctx.http, "Usage: `!adduser <user_id>` or `!adduser @user`").await;
+                    return Ok(true);
+                }
+            };
+
+            {
+                let mut settings = data.shared.settings.write().await;
+                if settings.allowed_user_ids.contains(&target_id) {
+                    let _ = msg.reply(&ctx.http, format!("`{}` is already authorized.", target_id)).await;
+                    return Ok(true);
+                }
+                settings.allowed_user_ids.push(target_id);
+                save_bot_settings(&data.token, &settings);
+            }
+
+            let _ = msg.reply(&ctx.http, format!("Added `{}` as authorized user.", target_id)).await;
+            println!("  [{ts}] ▶ Added user: {target_id}");
+            return Ok(true);
+        }
+
+        "!removeuser" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !removeuser {}", msg.author.name, arg1);
+
+            if !check_owner(msg.author.id, &data.shared).await {
+                let _ = msg.reply(&ctx.http, "Only the owner can remove users.").await;
+                return Ok(true);
+            }
+
+            let raw_id = arg1.trim().trim_start_matches("<@").trim_end_matches('>').trim_start_matches('!');
+            let target_id: u64 = match raw_id.parse() {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = msg.reply(&ctx.http, "Usage: `!removeuser <user_id>` or `!removeuser @user`").await;
+                    return Ok(true);
+                }
+            };
+
+            {
+                let mut settings = data.shared.settings.write().await;
+                let before_len = settings.allowed_user_ids.len();
+                settings.allowed_user_ids.retain(|&id| id != target_id);
+                if settings.allowed_user_ids.len() == before_len {
+                    let _ = msg.reply(&ctx.http, format!("`{}` is not in the authorized list.", target_id)).await;
+                    return Ok(true);
+                }
+                save_bot_settings(&data.token, &settings);
+            }
+
+            let _ = msg.reply(&ctx.http, format!("Removed `{}` from authorized users.", target_id)).await;
+            println!("  [{ts}] ▶ Removed user: {target_id}");
+            return Ok(true);
+        }
+
+        "!down" => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let file_arg = text.strip_prefix("!down").unwrap_or("").trim();
+            println!("  [{ts}] ◀ [{}] !down {}", msg.author.name, file_arg);
+
+            if file_arg.is_empty() {
+                let _ = msg.reply(&ctx.http, "Usage: `!down <filepath>`\nExample: `!down /home/user/file.txt`").await;
+                return Ok(true);
+            }
+
+            // Resolve relative path
+            let resolved_path = if std::path::Path::new(file_arg).is_absolute() {
+                file_arg.to_string()
+            } else {
+                let current_path = {
+                    let d = data.shared.core.lock().await;
+                    d.sessions
+                        .get(&channel_id)
+                        .and_then(|s| s.current_path.clone())
+                };
+                match current_path {
+                    Some(base) => format!("{}/{}", base.trim_end_matches('/'), file_arg),
+                    None => {
+                        let _ = msg.reply(&ctx.http, "No active session. Use absolute path or `!start <path>` first.").await;
+                        return Ok(true);
+                    }
+                }
+            };
+
+            let path = std::path::Path::new(&resolved_path);
+            if !path.exists() {
+                let _ = msg.reply(&ctx.http, format!("File not found: {}", resolved_path)).await;
+                return Ok(true);
+            }
+            if !path.is_file() {
+                let _ = msg.reply(&ctx.http, format!("Not a file: {}", resolved_path)).await;
+                return Ok(true);
+            }
+
+            let attachment = CreateAttachment::path(path).await?;
+            rate_limit_wait(&data.shared, channel_id).await;
+            let _ = channel_id.send_message(
+                &ctx.http,
+                CreateMessage::new().add_file(attachment),
+            ).await;
+            return Ok(true);
+        }
+
+        "!shell" => {
+            let cmd_str = text.strip_prefix("!shell").unwrap_or("").trim();
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let preview = truncate_str(cmd_str, 60);
+            println!("  [{ts}] ◀ [{}] !shell {}", msg.author.name, preview);
+
+            if cmd_str.is_empty() {
+                let _ = msg.reply(&ctx.http, "Usage: `!shell <command>`\nExample: `!shell ls -la`").await;
+                return Ok(true);
+            }
+
+            let working_dir = {
+                let d = data.shared.core.lock().await;
+                d.sessions
+                    .get(&channel_id)
+                    .and_then(|s| s.current_path.clone())
+                    .unwrap_or_else(|| {
+                        dirs::home_dir()
+                            .map(|h| h.display().to_string())
+                            .unwrap_or_else(|| "/".to_string())
+                    })
+            };
+
+            let cmd_owned = cmd_str.to_string();
+            let working_dir_clone = working_dir.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                let child = std::process::Command::new("bash")
+                    .args(["-c", &cmd_owned])
+                    .current_dir(&working_dir_clone)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+                match child {
+                    Ok(child) => child.wait_with_output(),
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+
+            let response = match result {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let exit_code = output.status.code().unwrap_or(-1);
+                    let mut parts = Vec::new();
+                    if !stdout.is_empty() {
+                        parts.push(format!("```\n{}\n```", stdout.trim_end()));
+                    }
+                    if !stderr.is_empty() {
+                        parts.push(format!("stderr:\n```\n{}\n```", stderr.trim_end()));
+                    }
+                    if parts.is_empty() {
+                        parts.push(format!("(exit code: {})", exit_code));
+                    } else if exit_code != 0 {
+                        parts.push(format!("(exit code: {})", exit_code));
+                    }
+                    parts.join("\n")
+                }
+                Ok(Err(e)) => format!("Failed to execute: {}", e),
+                Err(e) => format!("Task error: {}", e),
+            };
+
+            send_long_message_raw(&ctx.http, channel_id, &response, &data.shared).await?;
+            return Ok(true);
+        }
+
+        "!cc" => {
+            let skill = arg1.to_string();
+            let args_str = text
+                .strip_prefix("!cc")
+                .unwrap_or("")
+                .trim()
+                .strip_prefix(&skill)
+                .unwrap_or("")
+                .trim();
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ◀ [{}] !cc {} {}", msg.author.name, skill, args_str);
+
+            if skill.is_empty() {
+                let _ = msg.reply(&ctx.http, "Usage: `!cc <skill> [args]`").await;
+                return Ok(true);
+            }
+
+            // Handle built-in shortcuts
+            match skill.as_str() {
+                "clear" => {
+                    let _ = msg.reply(&ctx.http, "Use `!clear` instead.").await;
+                    return Ok(true);
+                }
+                "stop" => {
+                    let mut d = data.shared.core.lock().await;
+                    if let Some(token) = d.cancel_tokens.remove(&channel_id) {
+                        token.cancel_with_tmux_cleanup();
+                        drop(d);
+                        let _ = msg.reply(&ctx.http, "Stopping...").await;
+                    } else {
+                        drop(d);
+                        let _ = msg.reply(&ctx.http, "No active request to stop.").await;
+                    }
+                    return Ok(true);
+                }
+                "pwd" => {
+                    // Delegate to !pwd
+                    return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!pwd")).await;
+                }
+                "health" => {
+                    return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!health")).await;
+                }
+                "status" => {
+                    return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!status")).await;
+                }
+                "inflight" => {
+                    return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!inflight")).await;
+                }
+                "help" => {
+                    return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!help")).await;
+                }
+                _ => {}
+            }
+
+            // Auto-restore session
+            auto_restore_session(&data.shared, channel_id, ctx).await;
+
+            // Verify skill exists
+            let skill_exists = {
+                let skills = data.shared.skills_cache.read().await;
+                skills.iter().any(|(name, _)| name == &skill)
+            };
+
+            if !skill_exists {
+                let _ = msg.reply(&ctx.http, format!(
+                    "Unknown skill: `{}`. Use `!cc` to see available skills.",
+                    skill
+                )).await;
+                return Ok(true);
+            }
+
+            // Check session exists
+            let has_session = {
+                let d = data.shared.core.lock().await;
+                d.sessions
+                    .get(&channel_id)
+                    .and_then(|s| s.current_path.as_ref())
+                    .is_some()
+            };
+
+            if !has_session {
+                let _ = msg.reply(&ctx.http, "No active session. Use `!start <path>` first.").await;
+                return Ok(true);
+            }
+
+            // Block if AI is in progress
+            {
+                let d = data.shared.core.lock().await;
+                if d.cancel_tokens.contains_key(&channel_id) {
+                    drop(d);
+                    let _ = msg.reply(&ctx.http, "AI request in progress. Use `!stop` to cancel.").await;
+                    return Ok(true);
+                }
+            }
+
+            // Build the prompt
+            let skill_prompt = match &data.provider {
+                ProviderKind::Claude => {
+                    if args_str.is_empty() {
+                        format!(
+                            "Execute the skill `/{skill}` now. \
+                             Use the Skill tool with skill=\"{skill}\"."
+                        )
+                    } else {
+                        format!(
+                            "Execute the skill `/{skill}` with arguments: {args_str}\n\
+                             Use the Skill tool with skill=\"{skill}\", args=\"{args_str}\"."
+                        )
+                    }
+                }
+                ProviderKind::Codex => {
+                    if args_str.is_empty() {
+                        format!(
+                            "Use the local Codex skill `/{skill}` now. \
+                             Follow its SKILL.md instructions exactly and complete the task."
+                        )
+                    } else {
+                        format!(
+                            "Use the local Codex skill `/{skill}` now with this user request: {args_str}\n\
+                             Follow its SKILL.md instructions exactly and adapt them to the request."
+                        )
+                    }
+                }
+                ProviderKind::Unsupported(name) => {
+                    let _ = msg.reply(&ctx.http, format!("Provider '{}' is not installed.", name)).await;
+                    return Ok(true);
+                }
+            };
+
+            // Send confirmation and hand off to AI
+            rate_limit_wait(&data.shared, channel_id).await;
+            let confirm = channel_id.send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!("Running skill: `/{skill}`")),
+            ).await?;
+
+            handle_text_message(
+                ctx,
+                channel_id,
+                confirm.id,
+                msg.author.id,
+                &msg.author.name,
+                &skill_prompt,
+                &data.shared,
+                &data.token,
+                false,
+                false,
+                false,
+                None,
+            )
+            .await?;
             return Ok(true);
         }
 
