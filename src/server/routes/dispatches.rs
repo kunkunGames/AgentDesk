@@ -286,8 +286,8 @@ fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Val
         "context": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
         "result": row.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
         "parent_dispatch_id": row.get::<_, Option<String>>(9)?,
-        "chain_depth": row.get::<_, i64>(10)?,
-        "created_at": row.get::<_, String>(11)?,
-        "updated_at": row.get::<_, String>(12)?,
+        "chain_depth": row.get::<_, i64>(10).unwrap_or(0),
+        "created_at": row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string())),
+        "updated_at": row.get::<_, Option<String>>(12).ok().flatten().or_else(|| row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v.to_string())),
     }))
 }

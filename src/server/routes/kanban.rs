@@ -408,9 +408,9 @@ fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         "github_issue_url": row.get::<_, Option<String>>(6)?,
         "github_issue_number": row.get::<_, Option<i64>>(7)?,
         "latest_dispatch_id": row.get::<_, Option<String>>(8)?,
-        "review_round": row.get::<_, i64>(9)?,
-        "metadata": row.get::<_, Option<String>>(10)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
-        "created_at": row.get::<_, String>(11)?,
-        "updated_at": row.get::<_, String>(12)?,
+        "review_round": row.get::<_, i64>(9).unwrap_or(0),
+        "metadata": row.get::<_, Option<String>>(10).unwrap_or(None).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+        "created_at": row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string())),
+        "updated_at": row.get::<_, Option<String>>(12).ok().flatten().or_else(|| row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v.to_string())),
     }))
 }

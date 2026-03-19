@@ -86,7 +86,7 @@ async fn list_agents(State(state): State<AppState>) -> Json<serde_json::Value> {
                         "discord_channel_id": row.get::<_, Option<String>>(6)?,
                         "discord_channel_alt": row.get::<_, Option<String>>(7)?,
                         "status": row.get::<_, Option<String>>(8)?,
-                        "xp": row.get::<_, i64>(9)?,
+                        "xp": row.get::<_, f64>(9).unwrap_or(0.0) as i64,
                     }))
                 })
                 .ok();
@@ -124,7 +124,7 @@ async fn get_agent(
                         "discord_channel_id": row.get::<_, Option<String>>(6)?,
                         "discord_channel_alt": row.get::<_, Option<String>>(7)?,
                         "status": row.get::<_, Option<String>>(8)?,
-                        "xp": row.get::<_, i64>(9)?,
+                        "xp": row.get::<_, f64>(9).unwrap_or(0.0) as i64,
                     }))
                 },
             );
