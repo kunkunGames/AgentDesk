@@ -162,12 +162,376 @@ pub async fn delete_stage(
     }
 }
 
+// ── Dashboard v2 types (/pipeline/...) ────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GetStagesQuery {
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteStagesQuery {
+    pub repo: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutStagesBody {
+    pub repo: String,
+    pub stages: Vec<PutStageItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutStageItem {
+    pub stage_name: String,
+    pub stage_order: Option<i64>,
+    pub trigger_after: Option<String>,
+    pub entry_skill: Option<String>,
+    pub provider: Option<String>,
+    pub agent_override_id: Option<String>,
+    pub timeout_minutes: Option<i64>,
+    pub on_failure: Option<String>,
+    pub on_failure_target: Option<String>,
+    pub max_retries: Option<i64>,
+    pub skip_condition: Option<String>,
+    pub parallel_with: Option<String>,
+}
+
+// ── Dashboard v2 handlers ─────────────────────────────────────
+
+/// GET /api/pipeline/stages?repo=...&agent_id=...
+pub async fn get_stages(
+    State(state): State<AppState>,
+    Query(params): Query<GetStagesQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+        }
+    };
+
+    let mut sql = String::from(
+        "SELECT id, repo_id, stage_name, stage_order, trigger_after, entry_skill,
+                timeout_minutes, on_failure, skip_condition, provider,
+                agent_override_id, on_failure_target, max_retries, parallel_with
+         FROM pipeline_stages WHERE 1=1",
+    );
+    let mut bind_values: Vec<String> = Vec::new();
+
+    if let Some(ref repo) = params.repo {
+        bind_values.push(repo.clone());
+        sql.push_str(&format!(" AND repo_id = ?{}", bind_values.len()));
+    }
+
+    if let Some(ref agent_id) = params.agent_id {
+        bind_values.push(agent_id.clone());
+        sql.push_str(&format!(" AND agent_override_id = ?{}", bind_values.len()));
+    }
+
+    sql.push_str(" ORDER BY stage_order ASC");
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("prepare: {e}")})),
+            )
+        }
+    };
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| extended_stage_row_to_json(row))
+        .ok();
+
+    let stages: Vec<serde_json::Value> = match rows {
+        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+        None => Vec::new(),
+    };
+
+    (StatusCode::OK, Json(json!({"stages": stages})))
+}
+
+/// PUT /api/pipeline/stages — bulk replace stages for a repo
+pub async fn put_stages(
+    State(state): State<AppState>,
+    Json(body): Json<PutStagesBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+        }
+    };
+
+    // Transaction: delete all existing stages for the repo, then insert new ones
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("begin tx: {e}")})),
+        );
+    }
+
+    if let Err(e) = conn.execute(
+        "DELETE FROM pipeline_stages WHERE repo_id = ?1",
+        [&body.repo],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("delete: {e}")})),
+        );
+    }
+
+    for (idx, stage) in body.stages.iter().enumerate() {
+        let order = stage.stage_order.unwrap_or(idx as i64 + 1);
+        let timeout = stage.timeout_minutes.unwrap_or(60);
+        let on_failure = stage.on_failure.as_deref().unwrap_or("fail");
+        let max_retries = stage.max_retries.unwrap_or(0);
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after, entry_skill,
+                timeout_minutes, on_failure, skip_condition, provider, agent_override_id,
+                on_failure_target, max_retries, parallel_with)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                body.repo,
+                stage.stage_name,
+                order,
+                stage.trigger_after,
+                stage.entry_skill,
+                timeout,
+                on_failure,
+                stage.skip_condition,
+                stage.provider,
+                stage.agent_override_id,
+                stage.on_failure_target,
+                max_retries,
+                stage.parallel_with,
+            ],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("insert stage '{}': {e}", stage.stage_name)})),
+            );
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("commit: {e}")})),
+        );
+    }
+
+    // Read back inserted stages
+    let mut stmt = match conn.prepare(
+        "SELECT id, repo_id, stage_name, stage_order, trigger_after, entry_skill,
+                timeout_minutes, on_failure, skip_condition, provider,
+                agent_override_id, on_failure_target, max_retries, parallel_with
+         FROM pipeline_stages WHERE repo_id = ?1 ORDER BY stage_order ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("readback: {e}")})),
+            )
+        }
+    };
+
+    let rows = stmt
+        .query_map([&body.repo], |row| extended_stage_row_to_json(row))
+        .ok();
+
+    let stages: Vec<serde_json::Value> = match rows {
+        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+        None => Vec::new(),
+    };
+
+    (StatusCode::OK, Json(json!({"stages": stages})))
+}
+
+/// DELETE /api/pipeline/stages?repo=...
+pub async fn delete_stages(
+    State(state): State<AppState>,
+    Query(params): Query<DeleteStagesQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+        }
+    };
+
+    match conn.execute("DELETE FROM pipeline_stages WHERE repo_id = ?1", [&params.repo]) {
+        Ok(n) => (StatusCode::OK, Json(json!({"deleted": true, "count": n}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/pipeline/cards/{cardId} — card pipeline state with history
+pub async fn get_card_pipeline(
+    State(state): State<AppState>,
+    Path(card_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+        }
+    };
+
+    // 1. Find the card and its repo_id
+    let repo_id: Option<String> = match conn.query_row(
+        "SELECT repo_id FROM kanban_cards WHERE id = ?1",
+        [&card_id],
+        |row| row.get(0),
+    ) {
+        Ok(r) => r,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    // 2. Get pipeline stages for the repo
+    let stages: Vec<serde_json::Value> = if let Some(ref rid) = repo_id {
+        let mut stmt = match conn.prepare(
+            "SELECT id, repo_id, stage_name, stage_order, trigger_after, entry_skill,
+                    timeout_minutes, on_failure, skip_condition, provider,
+                    agent_override_id, on_failure_target, max_retries, parallel_with
+             FROM pipeline_stages WHERE repo_id = ?1 ORDER BY stage_order ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "failed to query stages"})),
+                );
+            }
+        };
+
+        stmt.query_map([rid], |row| extended_stage_row_to_json(row))
+            .ok()
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // 3. Get dispatch history for the card
+    let mut hist_stmt = match conn.prepare(
+        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type,
+                status, title, context, result, created_at, updated_at
+         FROM task_dispatches WHERE kanban_card_id = ?1 ORDER BY created_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("history query: {e}")})),
+            );
+        }
+    };
+
+    let history: Vec<serde_json::Value> = hist_stmt
+        .query_map([&card_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "kanban_card_id": row.get::<_, Option<String>>(1)?,
+                "from_agent_id": row.get::<_, Option<String>>(2)?,
+                "to_agent_id": row.get::<_, Option<String>>(3)?,
+                "dispatch_type": row.get::<_, Option<String>>(4)?,
+                "status": row.get::<_, Option<String>>(5)?,
+                "title": row.get::<_, Option<String>>(6)?,
+                "context": row.get::<_, Option<String>>(7)?,
+                "result": row.get::<_, Option<String>>(8)?,
+                "created_at": row.get::<_, Option<String>>(9)?,
+                "updated_at": row.get::<_, Option<String>>(10)?,
+            }))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    // 4. Determine current_stage by matching the most recent non-completed dispatch's
+    //    dispatch_type or title against stage entry_skill names
+    let current_stage: serde_json::Value = if !history.is_empty() && !stages.is_empty() {
+        // Find the most recent active dispatch (pending/running)
+        let active_dispatch = history
+            .iter()
+            .rev()
+            .find(|d| {
+                let s = d["status"].as_str().unwrap_or("");
+                s == "pending" || s == "running" || s == "in_progress"
+            });
+
+        if let Some(dispatch) = active_dispatch {
+            let dtype = dispatch["dispatch_type"].as_str().unwrap_or("");
+            let title = dispatch["title"].as_str().unwrap_or("");
+
+            // Match against stage entry_skill or stage_name
+            stages
+                .iter()
+                .find(|st| {
+                    let skill = st["entry_skill"].as_str().unwrap_or("");
+                    let name = st["stage_name"].as_str().unwrap_or("");
+                    (!skill.is_empty() && (skill == dtype || skill == title))
+                        || (!name.is_empty() && (name == dtype || name == title))
+                })
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::Value::Null
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "stages": stages,
+            "history": history,
+            "current_stage": current_stage,
+        })),
+    )
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 fn stage_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    let repo_id = row.get::<_, Option<String>>(1)?;
     Ok(json!({
         "id": row.get::<_, i64>(0)?,
-        "repo_id": row.get::<_, Option<String>>(1)?,
+        "repo_id": repo_id,
+        "repo": repo_id,  // alias for frontend
         "stage_name": row.get::<_, Option<String>>(2)?,
         "stage_order": row.get::<_, i64>(3)?,
         "trigger_after": row.get::<_, Option<String>>(4)?,
@@ -175,5 +539,27 @@ fn stage_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value>
         "timeout_minutes": row.get::<_, i64>(6)?,
         "on_failure": row.get::<_, Option<String>>(7)?,
         "skip_condition": row.get::<_, Option<String>>(8)?,
+    }))
+}
+
+/// Extended version that includes dashboard v2 columns
+fn extended_stage_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    let repo_id = row.get::<_, Option<String>>(1)?;
+    Ok(json!({
+        "id": row.get::<_, i64>(0)?,
+        "repo_id": repo_id,
+        "repo": repo_id,  // alias for frontend
+        "stage_name": row.get::<_, Option<String>>(2)?,
+        "stage_order": row.get::<_, i64>(3)?,
+        "trigger_after": row.get::<_, Option<String>>(4)?,
+        "entry_skill": row.get::<_, Option<String>>(5)?,
+        "timeout_minutes": row.get::<_, i64>(6)?,
+        "on_failure": row.get::<_, Option<String>>(7)?,
+        "skip_condition": row.get::<_, Option<String>>(8)?,
+        "provider": row.get::<_, Option<String>>(9)?,
+        "agent_override_id": row.get::<_, Option<String>>(10)?,
+        "on_failure_target": row.get::<_, Option<String>>(11)?,
+        "max_retries": row.get::<_, Option<i64>>(12)?,
+        "parallel_with": row.get::<_, Option<String>>(13)?,
     }))
 }

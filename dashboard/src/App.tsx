@@ -68,7 +68,9 @@ function hasUnresolvedMeetingIssues(meeting: RoundTableMeeting): boolean {
 interface BootstrapData {
   offices: Office[];
   agents: Agent[];
+  allAgents: Agent[];
   departments: Department[];
+  allDepartments: Department[];
   sessions: DispatchedSession[];
   stats: DashboardStats | null;
   settings: CompanySettings;
@@ -89,12 +91,15 @@ export default function App() {
     (async () => {
       try {
         await api.getSession();
-        const [off, ag, dep, ses, st, set, rtm, logs, cards, dispatches] = await Promise.all([
-          api.getOffices(),
+        const off = await api.getOffices();
+        const defaultOfficeId = off.length > 0 ? off[0].id : undefined;
+        const [allAg, ag, allDep, dep, ses, st, set, rtm, logs, cards, dispatches] = await Promise.all([
           api.getAgents(),
+          api.getAgents(defaultOfficeId),
           api.getDepartments(),
+          api.getDepartments(defaultOfficeId),
           api.getDispatchedSessions(true),
-          api.getStats(),
+          api.getStats(defaultOfficeId),
           api.getSettings(),
           api.getRoundTableMeetings().catch(() => [] as RoundTableMeeting[]),
           api.getAuditLogs(12).catch(() => [] as AuditLogEntry[]),
@@ -107,7 +112,9 @@ export default function App() {
         setData({
           offices: off,
           agents: ag,
+          allAgents: allAg,
           departments: dep,
+          allDepartments: allDep,
           sessions: ses,
           stats: st,
           settings: resolvedSettings,
@@ -123,7 +130,9 @@ export default function App() {
         setData({
           offices: [],
           agents: [],
+          allAgents: [],
           departments: [],
+          allDepartments: [],
           sessions: [],
           stats: null,
           settings: DEFAULT_SETTINGS,
@@ -170,7 +179,7 @@ export default function App() {
       <div className="flex items-center justify-center h-screen bg-gray-900 text-gray-400">
         <div className="text-center">
           <div className="text-4xl mb-4">🐾</div>
-          <div>Loading PixelClawDashboard...</div>
+          <div>Loading AgentDesk Dashboard...</div>
         </div>
       </div>
     );
@@ -180,7 +189,9 @@ export default function App() {
     <OfficeProvider
       initialOffices={data.offices}
       initialAgents={data.agents}
+      initialAllAgents={data.allAgents}
       initialDepartments={data.departments}
+      initialAllDepartments={data.allDepartments}
       initialSessions={data.sessions}
       initialRoundTableMeetings={data.roundTableMeetings}
       initialAuditLogs={data.auditLogs}

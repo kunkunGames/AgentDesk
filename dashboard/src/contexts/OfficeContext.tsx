@@ -95,7 +95,9 @@ const OfficeContext = createContext<OfficeContextValue | null>(null);
 interface OfficeProviderProps {
   initialOffices: Office[];
   initialAgents: Agent[];
+  initialAllAgents?: Agent[];
   initialDepartments: Department[];
+  initialAllDepartments?: Department[];
   initialSessions: DispatchedSession[];
   initialRoundTableMeetings: RoundTableMeeting[];
   initialAuditLogs: AuditLogEntry[];
@@ -107,7 +109,9 @@ interface OfficeProviderProps {
 export function OfficeProvider({
   initialOffices,
   initialAgents,
+  initialAllAgents,
   initialDepartments,
+  initialAllDepartments,
   initialSessions,
   initialRoundTableMeetings,
   initialAuditLogs,
@@ -118,9 +122,9 @@ export function OfficeProvider({
   const [offices, setOffices] = useState<Office[]>(initialOffices);
   const [selectedOfficeId, setSelectedOfficeId] = useState<string | null>(initialSelectedOfficeId);
   const [agents, setAgents] = useState<Agent[]>(initialAgents);
-  const [allAgents, setAllAgents] = useState<Agent[]>(initialAgents);
+  const [allAgents, setAllAgents] = useState<Agent[]>(initialAllAgents ?? initialAgents);
   const [departments, setDepartments] = useState<Department[]>(initialDepartments);
-  const [allDepartments, setAllDepartments] = useState<Department[]>(initialDepartments);
+  const [allDepartments, setAllDepartments] = useState<Department[]>(initialAllDepartments ?? initialDepartments);
   const [sessions, setSessions] = useState<DispatchedSession[]>(initialSessions);
   const [roundTableMeetings, setRoundTableMeetings] = useState<RoundTableMeeting[]>(initialRoundTableMeetings);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(initialAuditLogs);

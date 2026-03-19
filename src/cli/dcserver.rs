@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
 use crate::services;
 use crate::config;
 use crate::db;
@@ -701,14 +704,42 @@ pub fn handle_restart_dcserver(
 }
 
 pub fn handle_dcserver(token: Option<String>) {
-    // Single-instance guard: kill any existing dcserver before starting
-    kill_existing_dcserver_processes();
-
-    // Ensure directory structure exists and write PID/version files
+    // Ensure directory structure exists first (needed for lock file)
     if let Some(root) = remotecc_runtime_root() {
         for subdir in ["config", "credential", "runtime", "logs", "scripts"] {
             let _ = std::fs::create_dir_all(root.join(subdir));
         }
+    }
+
+    // Single-instance guard via flock — prevents race conditions
+    #[cfg(unix)]
+    let _lock_file = {
+        let lock_path = remotecc_runtime_root()
+            .map(|r| r.join("runtime/dcserver.lock"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/agentdesk-dcserver.lock"));
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("Failed to open lock file");
+        let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            eprintln!("  ✗ Another dcserver is already running (lock held on {:?}). Exiting.", lock_path);
+            std::process::exit(1);
+        }
+        // Write our PID into the lock file
+        use std::io::Write;
+        let mut ff = &f;
+        let _ = ff.write_all(std::process::id().to_string().as_bytes());
+        f // keep File open — dropping it releases the lock
+    };
+
+    // Also kill any stale processes (e.g. orphaned without lock)
+    kill_existing_dcserver_processes();
+
+    // Write PID/version files
+    if let Some(root) = remotecc_runtime_root() {
         let runtime_dir = root.join("runtime");
         let _ = std::fs::write(runtime_dir.join("dcserver.pid"), std::process::id().to_string());
         let _ = std::fs::write(runtime_dir.join("dcserver.version"), VERSION);

@@ -262,10 +262,11 @@ export async function updateKanbanCard(
   id: string,
   patch: Partial<KanbanCard> & { before_card_id?: string | null },
 ): Promise<KanbanCard> {
-  return request(`/api/kanban-cards/${id}`, {
+  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
+  return res.card;
 }
 
 export async function deleteKanbanCard(id: string): Promise<void> {
@@ -276,30 +277,33 @@ export async function retryKanbanCard(
   id: string,
   payload?: { assignee_agent_id?: string | null; request_now?: boolean },
 ): Promise<KanbanCard> {
-  return request(`/api/kanban-cards/${id}/retry`, {
+  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/retry`, {
     method: "POST",
     body: JSON.stringify(payload ?? {}),
   });
+  return res.card;
 }
 
 export async function redispatchKanbanCard(
   id: string,
   payload?: { reason?: string | null },
 ): Promise<KanbanCard> {
-  return request(`/api/kanban-cards/${id}/redispatch`, {
+  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/redispatch`, {
     method: "POST",
     body: JSON.stringify(payload ?? {}),
   });
+  return res.card;
 }
 
 export async function patchKanbanDeferDod(
   id: string,
   payload: { items?: Array<{ label: string }>; verify?: string; unverify?: string; remove?: string },
 ): Promise<KanbanCard> {
-  return request(`/api/kanban-cards/${id}/defer-dod`, {
+  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/defer-dod`, {
     method: "PATCH",
     body: JSON.stringify(payload),
   });
+  return res.card;
 }
 
 export async function assignKanbanIssue(payload: {
@@ -310,10 +314,11 @@ export async function assignKanbanIssue(payload: {
   description?: string | null;
   assignee_agent_id: string;
 }): Promise<KanbanCard> {
-  return request("/api/kanban-cards/assign-issue", {
+  const res = await request<{ card: KanbanCard }>("/api/kanban-cards/assign-issue", {
     method: "POST",
     body: JSON.stringify(payload),
   });
+  return res.card;
 }
 
 export async function getStalledCards(): Promise<KanbanCard[]> {

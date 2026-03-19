@@ -18,9 +18,15 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
         });
     }
 
+    // Resolve dashboard dist path relative to runtime root or binary location
+    let dashboard_dir = crate::cli::remotecc_runtime_root()
+        .map(|r| r.join("dashboard/dist"))
+        .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
+    tracing::info!("Serving dashboard from {:?}", dashboard_dir);
+
     let app = Router::new()
         .nest("/api", routes::api_router(db.clone(), engine.clone()))
-        .fallback_service(ServeDir::new("dashboard/dist"));
+        .fallback_service(ServeDir::new(&dashboard_dir));
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -311,6 +311,10 @@ pub(super) struct SharedData {
     pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
     /// Per-channel turn start time — used for metrics duration calculation.
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
+    /// Cached serenity context for deferred queue drain (set once during ready event).
+    pub(super) cached_serenity_ctx: tokio::sync::OnceCell<serenity::Context>,
+    /// Cached bot token for deferred queue drain.
+    pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
 }
 
 /// Poise user data type
@@ -1131,6 +1135,8 @@ pub async fn run_bot(
         model_overrides: dashmap::DashMap::new(),
         last_message_ids: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
+        cached_serenity_ctx: tokio::sync::OnceCell::new(),
+        cached_bot_token: tokio::sync::OnceCell::new(),
     });
 
     {
@@ -1179,6 +1185,7 @@ pub async fn run_bot(
             let shared_for_migrate = shared_clone.clone();
             let health_registry_for_setup = health_registry.clone();
             let provider_for_setup = provider.clone();
+            let token_for_ready = token_owned.clone();
             Box::pin(async move {
                 // Register in each guild for instant slash command propagation
                 // (register_globally can take up to 1 hour)
@@ -1198,6 +1205,8 @@ pub async fn run_bot(
                     _ready.guilds.len()
                 );
                 shared_for_migrate.bot_connected.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = shared_for_migrate.cached_serenity_ctx.set(ctx.clone());
+                let _ = shared_for_migrate.cached_bot_token.set(token_for_ready.clone());
                 health_registry_for_setup.register_http(provider_for_setup.as_str().to_string(), ctx.http.clone()).await;
 
                 // Background: resolve category names for all known channels

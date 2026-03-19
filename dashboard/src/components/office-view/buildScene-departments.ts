@@ -96,6 +96,7 @@ export function buildDepartmentRooms({
     const { rx, ry, rw: roomW, rh: roomH, deptAgentRows } = deptLayouts[deptIdx];
     const theme = customThemes?.[dept.id] || DEPT_THEME[dept.id] || DEPT_THEME.dev;
     const deptAgents = agents.filter((agent) => agent.department_id === dept.id);
+    if (deptAgents.length === 0) return;
     roomRectsRef.current.push({ dept, x: rx, y: ry, w: roomW, h: roomH });
 
     const room = new Container();

@@ -17,7 +17,7 @@ pub fn gh_available() -> bool {
 
 /// Run a `gh` CLI command and return its stdout as a String.
 /// Returns an error if the command fails or is not available.
-fn run_gh(args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_gh(args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("gh")
         .args(args)
         .output()

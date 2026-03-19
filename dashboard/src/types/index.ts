@@ -631,7 +631,7 @@ export interface CompanySettings {
 }
 
 export const DEFAULT_SETTINGS: CompanySettings = {
-  companyName: "PixelClawDashboard",
+  companyName: "AgentDesk Dashboard",
   ceoName: "CEO",
   theme: "dark",
   language: "ko",

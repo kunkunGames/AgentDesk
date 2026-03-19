@@ -810,6 +810,8 @@ pub(super) fn spawn_turn_bridge(
                 if let Some(intervention) = next_intervention {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] 📋 Processing next queued command");
+                    // Remove 📬 (queued) reaction before processing
+                    remove_reaction_raw(&http, channel_id, intervention.message_id, '📬').await;
                     if let Err(e) = handle_text_message(
                         ctx,
                         channel_id,
@@ -835,7 +837,7 @@ pub(super) fn spawn_turn_bridge(
                 }
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 📦 preserving queued command(s): missing live Discord context");
+                println!("  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain");
                 if let Some(offset) = tmux_last_offset {
                     if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
                         if let Ok(mut guard) = watcher.resume_offset.lock() {
@@ -844,6 +846,22 @@ pub(super) fn spawn_turn_bridge(
                         watcher.paused.store(false, Ordering::Relaxed);
                     }
                 }
+                // Deferred drain: wait briefly then kickoff idle queues using cached context
+                let shared_for_drain = shared_owned.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if let (Some(ctx), Some(tok)) = (
+                        shared_for_drain.cached_serenity_ctx.get(),
+                        shared_for_drain.cached_bot_token.get(),
+                    ) {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] 🚀 Deferred drain: kicking off idle queues");
+                        super::kickoff_idle_queues(ctx, &shared_for_drain, tok).await;
+                    } else {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] ⚠ Deferred drain: still no cached context, queued messages remain pending");
+                    }
+                });
             }
         }
 

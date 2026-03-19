@@ -139,7 +139,17 @@ pub async fn create_dispatch(
         &body.title,
         &context,
     ) {
-        Ok(d) => (StatusCode::CREATED, Json(json!({"dispatch": d}))),
+        Ok(d) => {
+            // Send dispatch message to the target agent's Discord channel
+            let to_agent_id = body.to_agent_id.clone();
+            let title = body.title.clone();
+            let card_id = body.kanban_card_id.clone();
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                send_dispatch_to_discord(&db, &to_agent_id, &title, &card_id).await;
+            });
+            (StatusCode::CREATED, Json(json!({"dispatch": d})))
+        }
         Err(e) => {
             let msg = format!("{e}");
             if msg.contains("not found") {
@@ -275,19 +285,150 @@ pub async fn update_dispatch(
 // ── Helpers ────────────────────────────────────────────────────
 
 fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    let status = row.get::<_, String>(5)?;
+    let created_at = row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string()));
+    let updated_at = row.get::<_, Option<String>>(12).ok().flatten().or_else(|| row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v.to_string()));
+    let completed_at = if status == "completed" { updated_at.clone() } else { None };
     Ok(json!({
         "id": row.get::<_, String>(0)?,
         "kanban_card_id": row.get::<_, Option<String>>(1)?,
         "from_agent_id": row.get::<_, Option<String>>(2)?,
         "to_agent_id": row.get::<_, Option<String>>(3)?,
         "dispatch_type": row.get::<_, Option<String>>(4)?,
-        "status": row.get::<_, String>(5)?,
+        "status": status,
         "title": row.get::<_, Option<String>>(6)?,
         "context": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
         "result": row.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+        "context_file": serde_json::Value::Null,
+        "result_file": serde_json::Value::Null,
+        "result_summary": serde_json::Value::Null,
         "parent_dispatch_id": row.get::<_, Option<String>>(9)?,
         "chain_depth": row.get::<_, i64>(10).unwrap_or(0),
-        "created_at": row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string())),
-        "updated_at": row.get::<_, Option<String>>(12).ok().flatten().or_else(|| row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v.to_string())),
+        "created_at": created_at,
+        "dispatched_at": row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string())),
+        "updated_at": updated_at,
+        "completed_at": completed_at,
     }))
+}
+
+/// Send a dispatch notification to the target agent's Discord channel.
+async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str, title: &str, card_id: &str) {
+    // Look up agent's discord channel
+    let channel_id: Option<String> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        conn.query_row(
+            "SELECT discord_channel_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+
+    let channel_id = match channel_id {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            tracing::warn!("[dispatch] No discord_channel_id for agent {agent_id}, skipping message");
+            return;
+        }
+    };
+
+    // Parse channel ID as u64, or resolve alias via role_map.json
+    let channel_id_num: u64 = match channel_id.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            // Try resolving channel name alias from role_map.json
+            match resolve_channel_alias(&channel_id) {
+                Some(n) => n,
+                None => {
+                    tracing::warn!("[dispatch] Cannot resolve channel '{channel_id}' for agent {agent_id}");
+                    return;
+                }
+            }
+        }
+    };
+
+    // Look up the issue URL for context
+    let issue_url: Option<String> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        conn.query_row(
+            "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    let message = if let Some(url) = issue_url {
+        format!("[Dispatch] {title}\n{url}")
+    } else {
+        format!("[Dispatch] {title}")
+    };
+
+    // Send via Discord HTTP API using the "command" (announce) bot
+    let config = crate::config::load_graceful();
+    let token = match config.discord.bots.get("command") {
+        Some(bot) => bot.token.clone(),
+        None => {
+            tracing::warn!("[dispatch] No 'command' (announce) bot configured");
+            return;
+        }
+    };
+
+    // Use reqwest to send directly via Discord REST API
+    let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id_num);
+    let client = reqwest::Client::new();
+    match client
+        .post(&url)
+        .header("Authorization", format!("Bot {}", token))
+        .json(&serde_json::json!({"content": message}))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!("[dispatch] Sent message to {agent_id} (channel {channel_id})");
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("[dispatch] Discord API error {status}: {body}");
+        }
+        Err(e) => {
+            tracing::warn!("[dispatch] Request failed: {e}");
+        }
+    }
+}
+
+/// Resolve a channel name alias (e.g. "adk-cc") to a numeric channel ID
+/// by reading role_map.json's byChannelName section.
+fn resolve_channel_alias(alias: &str) -> Option<u64> {
+    let root = crate::cli::remotecc_runtime_root()?;
+    let path = root.join("config/role_map.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // role_map.json has byChannelId: { "123456": { roleId, ... } }
+    // and byChannelName: { "adk-cc": { roleId, ... } }
+    // We need to find the numeric ID that maps to the same role as the alias
+    let by_name = json.get("byChannelName")?.as_object()?;
+    let entry = by_name.get(alias)?;
+    let role_id = entry.get("roleId")?.as_str()?;
+
+    // Now find the numeric channel ID with the same roleId and matching provider
+    let provider = entry.get("provider").and_then(|v| v.as_str()).unwrap_or("claude");
+    let by_id = json.get("byChannelId")?.as_object()?;
+    for (ch_id, ch_entry) in by_id {
+        if ch_entry.get("roleId").and_then(|v| v.as_str()) == Some(role_id)
+            && ch_entry.get("provider").and_then(|v| v.as_str()) == Some(provider)
+        {
+            return ch_id.parse().ok();
+        }
+    }
+    None
 }

@@ -129,11 +129,17 @@ export function buildOfficeScene(context: BuildOfficeSceneContext): void {
   const availableW = OFFICE_W - layoutMargin * 2;
   const minRoomW = 1 * SLOT_W + ROOM_PAD * 2;
 
-  const agentsPerDept = departments.map((dept) => agents.filter((agent) => agent.department_id === dept.id));
+  // Filter out departments with no agents assigned
+  const agentsPerDeptRaw = departments.map((dept) => agents.filter((agent) => agent.department_id === dept.id));
+  const nonEmptyIndices = agentsPerDeptRaw.map((da, i) => (da.length > 0 ? i : -1)).filter((i) => i >= 0);
+  const filteredDepartments = nonEmptyIndices.map((i) => departments[i]);
+  const agentsPerDept = nonEmptyIndices.map((i) => agentsPerDeptRaw[i]);
+  // Override deptCount and departments reference for layout
+  const deptCountFiltered = filteredDepartments.length;
 
   const meetingTheme = DEFAULT_MEETING_THEME;
 
-  if (deptCount === 0) {
+  if (deptCountFiltered === 0) {
     const meetingRoomY = CEO_ZONE_H + HALLWAY_H;
     const breakRoomY = meetingRoomY + MEETING_ROOM_H + BREAK_ROOM_GAP;
     const totalH = breakRoomY + BREAK_ROOM_H + 30;
@@ -208,7 +214,7 @@ export function buildOfficeScene(context: BuildOfficeSceneContext): void {
   // Flow layout: greedily pack departments into rows
   const flowRows: number[][] = [[]];
   let curRowW = 0;
-  for (let i = 0; i < deptCount; i++) {
+  for (let i = 0; i < deptCountFiltered; i++) {
     const w = deptWidths[i];
     const gap = flowRows[flowRows.length - 1].length > 0 ? roomGap : 0;
     if (curRowW + gap + w > availableW && flowRows[flowRows.length - 1].length > 0) {
@@ -271,7 +277,7 @@ export function buildOfficeScene(context: BuildOfficeSceneContext): void {
   buildDepartmentRooms({
     app,
     textures,
-    departments,
+    departments: filteredDepartments,
     agents,
     tasks,
     subAgents,

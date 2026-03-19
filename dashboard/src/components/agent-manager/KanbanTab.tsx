@@ -710,7 +710,7 @@ export default function KanbanTab({
           </div>
           {/* Desktop-only inline repo tabs + agent selector */}
           <div className="hidden sm:flex items-center gap-1.5 overflow-x-auto min-w-0">
-            {repoSources.length > 1 && repoSources.map((source) => (
+            {repoSources.length >= 1 && repoSources.map((source) => (
               <button
                 key={source.id}
                 onClick={() => setSelectedRepo(source.repo)}
@@ -791,7 +791,7 @@ export default function KanbanTab({
 
         {/* Row 2 (mobile only): Repo tabs + Agent selector — on desktop these are in Row 1 */}
         <div className="flex gap-1.5 overflow-x-auto min-w-0 -mt-1 sm:hidden">
-          {repoSources.length > 1 && repoSources.map((source) => (
+          {repoSources.length >= 1 && repoSources.map((source) => (
             <button
               key={source.id}
               onClick={() => setSelectedRepo(source.repo)}

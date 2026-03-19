@@ -216,6 +216,9 @@ pub(super) async fn handle_event(
                         return Ok(());
                     }
 
+                    // React with 📬 to indicate message is queued
+                    add_reaction(ctx, channel_id, new_message.id, '📬').await;
+
                     // Checkpoint: message successfully queued
                     data.shared.last_message_ids.insert(channel_id, new_message.id.get());
                     if is_shutting_down {
@@ -268,6 +271,9 @@ pub(super) async fn handle_event(
                     "  [{ts}] ⏸ DRAIN: queued message from [{user_name}] in channel {} (restart pending)",
                     channel_id
                 );
+
+                // React with 📬 to indicate message is queued
+                add_reaction(ctx, channel_id, new_message.id, '📬').await;
 
                 // Checkpoint: message successfully queued in drain mode
                 data.shared.last_message_ids.insert(channel_id, new_message.id.get());
