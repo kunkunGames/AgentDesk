@@ -466,7 +466,15 @@ pub(super) async fn send_dispatch_to_discord(
         .flatten()
     };
 
-    let message = if let Some(url) = issue_url {
+    let message = if use_alt {
+        // Review dispatch — clearly indicate this is a code review request
+        let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
+        format!(
+            "DISPATCH:{dispatch_id} - {title}\n\
+             ⚠️ 검토 전용 — 작업 착수 금지\n\
+             코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요.{url_line}"
+        )
+    } else if let Some(url) = issue_url {
         format!("DISPATCH:{dispatch_id} - {title}\n{url}")
     } else {
         format!("DISPATCH:{dispatch_id} - {title}")

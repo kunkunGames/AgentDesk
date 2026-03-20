@@ -243,6 +243,33 @@ pub async fn hook_session(
                                         "dispatch_id": did,
                                     }),
                                 );
+
+                                // Send Discord notification for any new dispatch created by OnReviewEnter
+                                let db_clone = state.db.clone();
+                                let did_owned = did.clone();
+                                tokio::spawn(async move {
+                                    let info: Option<(String, String, String, String)> = {
+                                        let conn = match db_clone.lock() {
+                                            Ok(c) => c,
+                                            Err(_) => return,
+                                        };
+                                        conn.query_row(
+                                            "SELECT kc.id, kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
+                                             FROM kanban_cards kc \
+                                             JOIN task_dispatches td ON td.kanban_card_id = kc.id \
+                                             WHERE td.id = ?1",
+                                            [&did_owned],
+                                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                                        ).ok()
+                                    };
+                                    if let Some((card_id, agent_id, title, new_did)) = info {
+                                        if new_did != did_owned {
+                                            super::dispatches::send_dispatch_to_discord(
+                                                &db_clone, &agent_id, &title, &card_id, &new_did,
+                                            ).await;
+                                        }
+                                    }
+                                });
                             }
                         }
                     }
