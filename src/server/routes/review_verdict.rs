@@ -64,7 +64,7 @@ pub async fn submit_verdict(
 
     // Update dispatch with verdict result
     let updated = match conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result_summary = ?2, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE task_dispatches SET status = 'completed', result = ?2, updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![body.dispatch_id, result_str],
     ) {
         Ok(n) => n,

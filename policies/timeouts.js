@@ -28,7 +28,7 @@ var timeouts = {
       // Dispatch를 failed로
       if (staleRequested[i].latest_dispatch_id) {
         agentdesk.db.execute(
-          "UPDATE task_dispatches SET status = 'failed', result_summary = 'Timed out waiting for agent', updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
+          "UPDATE task_dispatches SET status = 'failed', result ='Timed out waiting for agent', updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
           [staleRequested[i].latest_dispatch_id]
         );
       }
@@ -109,7 +109,7 @@ var timeouts = {
     );
     for (var sd = 0; sd < staleDispatches.length; sd++) {
       agentdesk.db.execute(
-        "UPDATE task_dispatches SET status = 'failed', result_summary = 'Stale dispatch auto-failed after 24h', updated_at = datetime('now') WHERE id = ?",
+        "UPDATE task_dispatches SET status = 'failed', result ='Stale dispatch auto-failed after 24h', updated_at = datetime('now') WHERE id = ?",
         [staleDispatches[sd].id]
       );
       if (staleDispatches[sd].kanban_card_id) {

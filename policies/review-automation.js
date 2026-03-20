@@ -110,7 +110,7 @@ var reviewAutomation = {
   // ── Dispatch Completed — review/decision verdict ──────────
   onDispatchCompleted: function(payload) {
     var dispatches = agentdesk.db.query(
-      "SELECT id, kanban_card_id, dispatch_type, result_summary FROM task_dispatches WHERE id = ?",
+      "SELECT id, kanban_card_id, dispatch_type, result FROM task_dispatches WHERE id = ?",
       [payload.dispatch_id]
     );
     if (dispatches.length === 0) return;
@@ -121,7 +121,7 @@ var reviewAutomation = {
     if (!dispatch.kanban_card_id) return;
 
     var result = null;
-    try { result = JSON.parse(dispatch.result_summary || "{}"); } catch(e) { result = {}; }
+    try { result = JSON.parse(dispatch.result || "{}"); } catch(e) { result = {}; }
     var verdict = result.verdict || result.decision;
 
     if (!verdict) {
