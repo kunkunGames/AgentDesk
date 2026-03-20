@@ -170,7 +170,7 @@ pub async fn achievements(
 
     // Build agent filter
     let mut sql = String::from(
-        "SELECT id, COALESCE(name, id), COALESCE(name_ko, name, id), xp, sprite_number FROM agents WHERE xp > 0",
+        "SELECT id, COALESCE(name, id), COALESCE(name_ko, name, id), xp, avatar_emoji FROM agents WHERE xp > 0",
     );
     let mut bind_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(ref agent_id) = params.agent_id {
@@ -190,27 +190,25 @@ pub async fn achievements(
         }
     };
 
-    let agents: Vec<(String, String, String, i64, i64)> = stmt
+    let agents: Vec<(String, String, String, i64, String)> = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "🤖".to_string()),
             ))
         })
         .ok()
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    let sprite_emojis = ["🤖", "🦾", "🧠", "⚡", "🎯", "🔥", "💎", "🌟", "🏆", "👾"];
-
     let mut achievements = Vec::new();
-    for (agent_id, name, name_ko, xp, sprite) in &agents {
+    for (agent_id, name, name_ko, xp, avatar_emoji) in &agents {
         for (threshold, achievement_type, description) in milestones {
             if xp >= threshold {
-                let emoji = sprite_emojis.get(*sprite as usize % sprite_emojis.len()).unwrap_or(&"🤖");
+                let emoji = avatar_emoji.as_str();
                 achievements.push(json!({
                     "id": format!("{agent_id}:{achievement_type}"),
                     "agent_id": agent_id,
@@ -463,7 +461,17 @@ pub async fn rate_limits(
                 .filter_map(|(provider, data, fetched_at)| {
                     let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
                     let buckets = parsed.get("buckets")?.as_array()?.clone();
-                    let stale = (now - fetched_at) > 600; // >10min = stale
+                    // Read stale threshold from bot_settings (default 600s)
+                    let stale_sec: i64 = conn
+                        .query_row(
+                            "SELECT value FROM kv_meta WHERE key = 'rateLimitStaleSec'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(600);
+                    let stale = (now - fetched_at) > stale_sec;
                     Some(json!({
                         "provider": provider,
                         "buckets": buckets,
