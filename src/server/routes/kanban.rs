@@ -385,8 +385,33 @@ pub async fn update_card(
                 );
             }
 
-            // Dispatch creation for "requested" is handled by kanban-rules.js policy
-            // via onCardTransition hook — not hardcoded here.
+            // After hook fires, send Discord notification asynchronously for new dispatches.
+            // Policy creates the dispatch record synchronously; we handle async Discord send here
+            // to avoid ureq deadlock (synchronous HTTP from QuickJS blocks the tokio runtime).
+            if new_s == "requested" {
+                let db_clone = state.db.clone();
+                let card_id = id.clone();
+                tokio::spawn(async move {
+                    // Check if the hook created a new dispatch
+                    let dispatch_info: Option<(String, String, String)> = {
+                        let conn = match db_clone.lock() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        conn.query_row(
+                            "SELECT kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
+                             FROM kanban_cards kc WHERE kc.id = ?1",
+                            [&card_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        ).ok()
+                    };
+                    if let Some((agent_id, title, dispatch_id)) = dispatch_info {
+                        super::dispatches::send_dispatch_to_discord(
+                            &db_clone, &agent_id, &title, &card_id, &dispatch_id,
+                        ).await;
+                    }
+                });
+            }
         }
     }
 

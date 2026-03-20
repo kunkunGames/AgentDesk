@@ -148,9 +148,10 @@ pub async fn create_dispatch(
             let to_agent_id = body.to_agent_id.clone();
             let title = body.title.clone();
             let card_id = body.kanban_card_id.clone();
+            let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
             let db = state.db.clone();
             tokio::spawn(async move {
-                send_dispatch_to_discord(&db, &to_agent_id, &title, &card_id).await;
+                send_dispatch_to_discord(&db, &to_agent_id, &title, &card_id, &dispatch_id).await;
             });
             (StatusCode::CREATED, Json(json!({"dispatch": d})))
         }
@@ -343,11 +344,15 @@ fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Val
 }
 
 /// Send a dispatch notification to the target agent's Discord channel.
+/// Message format: `DISPATCH:<dispatch_id> - <title>\n<issue_url>`
+/// The `DISPATCH:<uuid>` prefix is required for the dcserver to link the
+/// resulting Claude session back to the kanban card (via `parse_dispatch_id`).
 pub(super) async fn send_dispatch_to_discord(
     db: &crate::db::Db,
     agent_id: &str,
     title: &str,
     card_id: &str,
+    dispatch_id: &str,
 ) {
     // Look up agent's discord channel
     let channel_id: Option<String> = {
@@ -406,9 +411,9 @@ pub(super) async fn send_dispatch_to_discord(
     };
 
     let message = if let Some(url) = issue_url {
-        format!("[Dispatch] {title}\n{url}")
+        format!("DISPATCH:{dispatch_id} - {title}\n{url}")
     } else {
-        format!("[Dispatch] {title}")
+        format!("DISPATCH:{dispatch_id} - {title}")
     };
 
     // Send via Discord HTTP API using the announce bot
@@ -455,6 +460,10 @@ pub(super) async fn send_dispatch_to_discord(
 
 /// Resolve a channel name alias (e.g. "adk-cc") to a numeric channel ID
 /// by reading role_map.json's byChannelName section.
+pub fn resolve_channel_alias_pub(alias: &str) -> Option<u64> {
+    resolve_channel_alias(alias)
+}
+
 fn resolve_channel_alias(alias: &str) -> Option<u64> {
     let root = crate::cli::agentdesk_runtime_root()?;
     let path = root.join("config/role_map.json");
