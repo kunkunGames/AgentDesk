@@ -16,7 +16,7 @@ pub(super) struct TurnMetric {
 }
 
 fn metrics_dir() -> Option<PathBuf> {
-    runtime_store::remotecc_root().map(|root| root.join("metrics"))
+    runtime_store::agentdesk_root().map(|root| root.join("metrics"))
 }
 
 fn today_file() -> Option<PathBuf> {

@@ -649,7 +649,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         _ => return, // No tmux or no sessions
     };
 
-    let remotecc_sessions: Vec<&str> = output
+    let agent_sessions: Vec<&str> = output
         .lines()
         .map(|l| l.trim())
         .filter(|l| {
@@ -659,7 +659,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         })
         .collect();
 
-    if remotecc_sessions.is_empty() {
+    if agent_sessions.is_empty() {
         return;
     }
 
@@ -679,7 +679,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     }
 
     // If in-memory sessions don't cover all tmux sessions, fetch from Discord API
-    let unresolved: Vec<&&str> = remotecc_sessions
+    let unresolved: Vec<&&str> = agent_sessions
         .iter()
         .filter(|s| !name_to_channel.contains_key(**s))
         .collect();
@@ -721,7 +721,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     let mut owned_sessions: std::collections::HashMap<ChannelId, String> =
         std::collections::HashMap::new();
 
-    for session_name in &remotecc_sessions {
+    for session_name in &agent_sessions {
         let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
             continue;
         };

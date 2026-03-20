@@ -143,11 +143,11 @@ pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
 }
 
 /// Build a catalog of long-term memory files for a given role.
-/// Scans ~/.remotecc/role-context/{role_id}.memory/ for .md files and extracts
+/// Scans $AGENTDESK_ROOT_DIR/role-context/{role_id}.memory/ for .md files and extracts
 /// name + description from YAML frontmatter (or first heading as fallback).
 /// Returns None if directory doesn't exist or has no .md files.
 pub(super) fn load_longterm_memory_catalog(role_id: &str) -> Option<String> {
-    let root = super::runtime_store::remotecc_root()?;
+    let root = super::runtime_store::agentdesk_root()?;
     let memory_dir = root.join("role-context").join(format!("{}.memory", role_id));
     if !memory_dir.is_dir() {
         return None;

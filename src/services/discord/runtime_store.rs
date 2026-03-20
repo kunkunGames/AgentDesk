@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
 const LEGACY_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
 
-pub(super) fn remotecc_root() -> Option<PathBuf> {
+pub(super) fn agentdesk_root() -> Option<PathBuf> {
     // Primary: AGENTDESK_ROOT_DIR, fallback: legacy REMOTECC_ROOT_DIR
     for key in [AGENTDESK_ROOT_DIR_ENV, LEGACY_ROOT_DIR_ENV] {
         if let Ok(override_root) = std::env::var(key) {
@@ -20,31 +20,31 @@ pub(super) fn remotecc_root() -> Option<PathBuf> {
 }
 
 pub(super) fn runtime_root() -> Option<PathBuf> {
-    remotecc_root().map(|root| root.join("runtime"))
+    agentdesk_root().map(|root| root.join("runtime"))
 }
 
 pub(super) fn workspace_root() -> Option<PathBuf> {
-    remotecc_root().map(|root| root.join("workspace"))
+    agentdesk_root().map(|root| root.join("workspace"))
 }
 
 pub(super) fn worktrees_root() -> Option<PathBuf> {
-    remotecc_root().map(|root| root.join("worktrees"))
+    agentdesk_root().map(|root| root.join("worktrees"))
 }
 
 pub(super) fn bot_settings_path() -> Option<PathBuf> {
-    remotecc_root().map(|root| {
+    agentdesk_root().map(|root| {
         legacy_fallback(root.join("config").join("bot_settings.json"), root.join("bot_settings.json"))
     })
 }
 
 pub(super) fn role_map_path() -> Option<PathBuf> {
-    remotecc_root().map(|root| {
+    agentdesk_root().map(|root| {
         legacy_fallback(root.join("config").join("role_map.json"), root.join("role_map.json"))
     })
 }
 
 pub(super) fn org_schema_path() -> Option<PathBuf> {
-    remotecc_root().map(|root| {
+    agentdesk_root().map(|root| {
         legacy_fallback(root.join("config").join("org.yaml"), root.join("org.yaml"))
     })
 }
@@ -70,12 +70,12 @@ pub(super) fn discord_handoff_root() -> Option<PathBuf> {
 }
 
 pub(super) fn shared_agent_memory_root() -> Option<PathBuf> {
-    remotecc_root().map(|root| root.join("shared_agent_memory"))
+    agentdesk_root().map(|root| root.join("shared_agent_memory"))
 }
 
 /// Path to the generation counter file.
 pub fn generation_path() -> Option<PathBuf> {
-    remotecc_root().map(|root| {
+    agentdesk_root().map(|root| {
         legacy_fallback(root.join("runtime").join("generation"), root.join("generation"))
     })
 }
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remotecc_root_env_override() {
+    fn test_agentdesk_root_env_override() {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let override_path = tmp.path().join("custom_root");
@@ -168,7 +168,7 @@ mod tests {
         let prev_legacy = std::env::var_os(LEGACY_ROOT_DIR_ENV);
         unsafe { std::env::remove_var(LEGACY_ROOT_DIR_ENV) };
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, override_path.to_str().unwrap()) };
-        let root = remotecc_root().expect("should return Some");
+        let root = agentdesk_root().expect("should return Some");
         assert_eq!(root, override_path);
 
         unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
@@ -176,13 +176,13 @@ mod tests {
     }
 
     #[test]
-    fn test_remotecc_root_env_empty_falls_back() {
+    fn test_agentdesk_root_env_empty_falls_back() {
         let _lock = env_lock();
         let prev_legacy = std::env::var_os(LEGACY_ROOT_DIR_ENV);
         unsafe { std::env::remove_var(LEGACY_ROOT_DIR_ENV) };
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, "   ") };
         // Empty/whitespace-only override should fall back to home-based default
-        let root = remotecc_root().expect("should return Some");
+        let root = agentdesk_root().expect("should return Some");
         let expected = dirs::home_dir().unwrap().join(".agentdesk");
         assert_eq!(root, expected);
 

@@ -12,7 +12,7 @@ mod ui;
 mod utils;
 
 // Re-export for crate-level access (used by services::discord::mod.rs)
-pub(crate) use cli::remotecc_runtime_root;
+pub(crate) use cli::agentdesk_runtime_root;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -30,6 +30,7 @@ fn main() -> Result<()> {
                     .nth(1)
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
+                    .or_else(|| std::env::var("AGENTDESK_TOKEN").ok())
                     .or_else(|| std::env::var("REMOTECC_TOKEN").ok());
                 cli::handle_dcserver(token);
                 return Ok(());

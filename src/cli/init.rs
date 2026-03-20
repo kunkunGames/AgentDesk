@@ -196,12 +196,12 @@ fn default_agent_prompt(role_id: &str) -> String {
 
 // ── Launchd plist ──────────────────────────────────────────────────
 
-fn generate_launchd_plist(home: &Path, remotecc_bin: &Path) -> String {
+fn generate_launchd_plist(home: &Path, agentdesk_bin: &Path) -> String {
     let home_str = home.display();
-    let bin_str = remotecc_bin.display();
+    let bin_str = agentdesk_bin.display();
     let label = dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL;
     // Use AGENTDESK_ROOT_DIR if set, otherwise default to ~/.agentdesk
-    let root_dir = dcserver::remotecc_runtime_root()
+    let root_dir = dcserver::agentdesk_runtime_root()
         .unwrap_or_else(|| home.join(".agentdesk"));
     let root_str = root_dir.display();
     let logs_dir = root_dir.join("logs");
@@ -283,8 +283,8 @@ fn generate_bot_settings(
 // ── Main init flow ─────────────────────────────────────────────────
 
 pub fn handle_init(reconfigure: bool) {
-    let root = dcserver::remotecc_runtime_root().unwrap_or_else(|| {
-        eprintln!("Error: cannot determine ~/.remotecc directory");
+    let root = dcserver::agentdesk_runtime_root().unwrap_or_else(|| {
+        eprintln!("Error: cannot determine ~/.agentdesk directory");
         std::process::exit(1);
     });
 
@@ -295,7 +295,7 @@ pub fn handle_init(reconfigure: bool) {
     }
 
     println!("═══════════════════════════════════════");
-    println!("  RemoteCC 초기 설정 (v{})", super::VERSION);
+    println!("  AgentDesk 초기 설정 (v{})", super::VERSION);
     println!("═══════════════════════════════════════\n");
 
     if reconfigure {
@@ -506,24 +506,24 @@ pub fn handle_init(reconfigure: bool) {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().unwrap();
-        let remotecc_bin = root.join("bin").join("remotecc");
+        let agentdesk_bin = root.join("bin").join("agentdesk");
 
         // Create wrapper bin dir
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
         // If no binary installed yet, link current executable
-        if !remotecc_bin.exists() {
+        if !agentdesk_bin.exists() {
             if let Ok(current_exe) = std::env::current_exe() {
-                if let Err(e) = fs::copy(&current_exe, &remotecc_bin) {
+                if let Err(e) = fs::copy(&current_exe, &agentdesk_bin) {
                     eprintln!("  [WARN] 바이너리 복사 실패: {} — 수동으로 복사하세요", e);
                 } else {
-                    println!("  [OK] {}", remotecc_bin.display());
+                    println!("  [OK] {}", agentdesk_bin.display());
                 }
             }
         }
 
-        let plist_content = generate_launchd_plist(&home, &remotecc_bin);
+        let plist_content = generate_launchd_plist(&home, &agentdesk_bin);
         let launch_agents = home.join("Library").join("LaunchAgents");
         fs::create_dir_all(&launch_agents).unwrap();
         let plist_filename = format!("{}.plist", dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL);

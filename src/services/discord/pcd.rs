@@ -6,7 +6,7 @@ use poise::serenity_prelude as serenity;
 use super::SharedData;
 use crate::services::provider::ProviderKind;
 
-const PCD_SESSION_INFO_MAX_CHARS: usize = 60;
+const SESSION_INFO_MAX_CHARS: usize = 60;
 
 /// Parse `DISPATCH:<uuid> - <title>` format and return the dispatch_id (uuid part).
 pub(super) fn parse_dispatch_id(text: &str) -> Option<String> {
@@ -71,7 +71,7 @@ pub(super) fn derive_pcd_session_info(
     }
 
     if let Some(action) = action {
-        return format!("RemoteCC {} 작업 진행 중", action);
+        return format!("AgentDesk {} 작업 진행 중", action);
     }
 
     if let Some(channel) = channel_name.and_then(clean_nonempty) {
@@ -82,7 +82,7 @@ pub(super) fn derive_pcd_session_info(
         return format!("{} 작업 진행 중", label);
     }
 
-    "RemoteCC 작업 진행 중".to_string()
+    "AgentDesk 작업 진행 중".to_string()
 }
 
 pub(super) async fn post_pcd_session_status(
@@ -132,11 +132,11 @@ pub(super) async fn post_pcd_session_status(
     {
         Ok(resp) if !resp.status().is_success() => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!("  [{ts}] ⚠ PCD session POST failed: HTTP {}", resp.status());
+            eprintln!("  [{ts}] ⚠ ADK session POST failed: HTTP {}", resp.status());
         }
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!("  [{ts}] ⚠ PCD session POST error: {e}");
+            eprintln!("  [{ts}] ⚠ ADK session POST error: {e}");
         }
         _ => {}
     }
@@ -159,7 +159,7 @@ fn normalize_user_task_summary(input: &str) -> Option<String> {
         return None;
     }
 
-    Some(truncate_chars(&collapsed, PCD_SESSION_INFO_MAX_CHARS))
+    Some(truncate_chars(&collapsed, SESSION_INFO_MAX_CHARS))
 }
 
 fn trim_leading_marker(input: &str) -> &str {
@@ -211,6 +211,7 @@ fn looks_like_raw_command_or_path(text: &str) -> bool {
         "sh ",
         "launchctl ",
         "tmux ",
+        "agentdesk ",
         "remotecc ",
     ];
 
@@ -437,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_derive_session_info_max_chars() {
-        // PCD_SESSION_INFO_MAX_CHARS = 60
+        // SESSION_INFO_MAX_CHARS = 60
         // A long user text should be truncated to 60 chars (with ellipsis)
         let long_text = "가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하";
         let summary = derive_pcd_session_info(Some(long_text), None, None);

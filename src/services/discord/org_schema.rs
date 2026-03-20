@@ -18,11 +18,11 @@ pub(super) struct OrgSchema {
     #[allow(dead_code)]
     pub name: Option<String>,
     pub shared_prompt: Option<String>,
-    /// Root directory for prompt files (e.g. "~/.remotecc/prompts").
+    /// Root directory for prompt files (e.g. "$AGENTDESK_ROOT_DIR/prompts").
     /// When set, agent prompt_file is auto-derived as
     /// `{prompts_root}/agents/{role_id}/IDENTITY.md` if not explicitly specified.
     pub prompts_root: Option<String>,
-    /// Root directory for skill files (e.g. "~/.remotecc/skills").
+    /// Root directory for skill files (e.g. "$AGENTDESK_ROOT_DIR/skills").
     pub skills_root: Option<String>,
     pub agents: HashMap<String, AgentDef>,
     pub channels: Option<ChannelsConfig>,

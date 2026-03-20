@@ -56,7 +56,7 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
     // Load announce + notify bot tokens for message routing.
     // Announce bot: agent-to-agent (agents process these messages)
     // Notify bot: info-only alerts (agents do NOT respond)
-    if let Some(root) = super::runtime_store::remotecc_root() {
+    if let Some(root) = super::runtime_store::agentdesk_root() {
         for (bot_name, field) in [("announce", &registry.announce_http), ("notify", &registry.notify_http)] {
             let new_path = root.join("credential").join(format!("{bot_name}_bot_token"));
             let legacy = root.join(format!("{bot_name}_bot_token"));

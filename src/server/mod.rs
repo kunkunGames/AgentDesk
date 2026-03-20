@@ -21,7 +21,7 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
     }
 
     // Resolve dashboard dist path relative to runtime root or binary location
-    let dashboard_dir = crate::cli::remotecc_runtime_root()
+    let dashboard_dir = crate::cli::agentdesk_runtime_root()
         .map(|r| r.join("dashboard/dist"))
         .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);

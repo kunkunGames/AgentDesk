@@ -944,7 +944,7 @@ pub(super) async fn handle_text_message(
     {
         let script = dirs::home_dir()
             .unwrap_or_default()
-            .join(".remotecc/scripts/worktree-autosync.sh");
+            .join(".agentdesk/scripts/worktree-autosync.sh");
         if script.exists() {
             let ws = current_path.clone();
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1587,7 +1587,7 @@ async fn handle_text_command(
             let provider_name = data.provider.display_name();
             let help = format!(
                 "\
-**RemoteCC Discord Bot**
+**AgentDesk Discord Bot**
 Manage server files & chat with {p}.
 Each channel gets its own independent {p} session.
 

@@ -6,7 +6,7 @@ pub(in crate::services::discord) async fn cmd_help(ctx: Context<'_>) -> Result<(
     let provider_name = ctx.data().provider.display_name();
     let help = format!(
         "\
-**RemoteCC Discord Bot**
+**AgentDesk Discord Bot**
 Manage server files & chat with {}.
 Each channel gets its own independent {} session.
 

@@ -681,7 +681,7 @@ fn execute_streaming_local_process_codex(
     let config = SessionConfig {
         session_name: session_name.to_string(),
         working_dir: working_dir.to_string(),
-        remotecc_exe: exe.display().to_string(),
+        agentdesk_exe: exe.display().to_string(),
         output_path: output_path.clone(),
         prompt_path: prompt_path.clone(),
         wrapper_args: vec!["--codex-bin".to_string(), codex_bin.to_string()],

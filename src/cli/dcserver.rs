@@ -55,7 +55,7 @@ pub fn kickstart_launchd_job(label: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn remotecc_runtime_root() -> Option<PathBuf> {
+pub fn agentdesk_runtime_root() -> Option<PathBuf> {
     // Primary: AGENTDESK_ROOT_DIR, fallback: legacy REMOTECC_ROOT_DIR
     for key in [AGENTDESK_ROOT_DIR_ENV, LEGACY_ROOT_DIR_ENV] {
         if let Ok(override_root) = env::var(key) {
@@ -144,7 +144,7 @@ pub fn dcserver_instance_pids() -> Vec<u32> {
 }
 
 pub fn instance_bot_settings_path() -> Option<PathBuf> {
-    remotecc_runtime_root().map(|root| {
+    agentdesk_runtime_root().map(|root| {
         // TODO: Remove legacy fallback after 2026-03-26
         let new_path = root.join("config").join("bot_settings.json");
         if new_path.exists() { return new_path; }
@@ -155,7 +155,7 @@ pub fn instance_bot_settings_path() -> Option<PathBuf> {
 }
 
 pub fn dcserver_stdout_log_path() -> Option<PathBuf> {
-    remotecc_runtime_root().map(|root| {
+    agentdesk_runtime_root().map(|root| {
         // TODO: Remove legacy fallback after 2026-03-26
         let new_path = root.join("logs").join("dcserver.stdout.log");
         if new_path.exists() { return new_path; }
@@ -166,11 +166,11 @@ pub fn dcserver_stdout_log_path() -> Option<PathBuf> {
 }
 
 pub fn current_release_link_path() -> Option<PathBuf> {
-    remotecc_runtime_root().map(|root| root.join("releases").join("current"))
+    agentdesk_runtime_root().map(|root| root.join("releases").join("current"))
 }
 
 pub fn previous_release_link_path() -> Option<PathBuf> {
-    remotecc_runtime_root().map(|root| root.join("releases").join("previous"))
+    agentdesk_runtime_root().map(|root| root.join("releases").join("previous"))
 }
 
 pub fn read_release_link_target(path: &Path) -> Option<PathBuf> {
@@ -251,10 +251,10 @@ pub fn rollback_to_previous_release(label: &str, timeout: Duration) -> Result<Pa
     let previous_target = read_release_link_target(&previous_link)
         .ok_or_else(|| format!("no rollback target found at {}", previous_link.display()))?;
 
-    if !previous_target.join("remotecc").exists() {
+    if !previous_target.join("agentdesk").exists() {
         return Err(format!(
             "rollback target missing binary: {}",
-            previous_target.join("remotecc").display()
+            previous_target.join("agentdesk").display()
         ));
     }
 
@@ -368,7 +368,7 @@ pub fn handle_restart_dcserver(
     let report_context = report_context_override.or_else(restart_report_context_from_env);
     if report_context.is_none() {
         eprintln!(
-            "ℹ no restart follow-up target configured; pass --report-channel-id/--report-provider or set REMOTECC_REPORT_* to send a Discord completion message"
+            "ℹ no restart follow-up target configured; pass --report-channel-id/--report-provider or set AGENTDESK_REPORT_* / REMOTECC_REPORT_* to send a Discord completion message"
         );
     }
     let write_restart_report = |status: &str, summary: String| {
@@ -395,7 +395,7 @@ pub fn handle_restart_dcserver(
         Ok(_) => {}
         Err(_) => {
             eprintln!("Error: {} not found.", settings_path.display());
-            eprintln!("Run 'remotecc --dcserver' after configuring bot_settings.json.");
+            eprintln!("Run 'agentdesk --dcserver' after configuring bot_settings.json.");
             write_restart_report(
                 "failed",
                 "bot_settings.json이 없어서 dcserver restart를 시작하지 못했습니다.".to_string(),
@@ -421,7 +421,7 @@ pub fn handle_restart_dcserver(
         services::discord::runtime_store::increment_generation();
 
     // Show version transition if available
-    if let Some(root) = remotecc_runtime_root() {
+    if let Some(root) = agentdesk_runtime_root() {
         // TODO: Remove legacy fallback after 2026-03-26
         let new_vf = root.join("runtime").join("dcserver.version");
         let legacy_vf = root.join("dcserver.version");
@@ -463,7 +463,7 @@ pub fn handle_restart_dcserver(
     // Deferred restart: write marker file and wait for dcserver to self-exit
     // after all active turns complete. Falls back to force-kill on timeout.
     const DEFERRED_TIMEOUT: Duration = Duration::from_secs(120);
-    if let Some(root) = remotecc_runtime_root() {
+    if let Some(root) = agentdesk_runtime_root() {
         let marker = root.join("restart_pending");
         let _ = fs::write(&marker, VERSION);
         println!("   ⏳ Deferred restart requested — waiting for active turns to complete (max {}s)", DEFERRED_TIMEOUT.as_secs());
@@ -575,13 +575,13 @@ pub fn handle_restart_dcserver(
         }
     }
 
-    // NOTE: We intentionally do NOT kill AgentDesk-* Claude work sessions here.
+    // NOTE: We intentionally do NOT kill AgentDesk-* work sessions here.
     // They will be reconnected by restore_tmux_watchers() after the new dcserver starts.
     // Orphan sessions (channels renamed/deleted) are cleaned up inside the bot event loop.
 
-    // Launch new dcserver inside tmux session "remoteCC"
+    // Launch new dcserver inside tmux session "AgentDesk-dcserver"
     // Write a launcher script to avoid token exposure in ps aux
-    let launcher_path = remotecc_runtime_root()
+    let launcher_path = agentdesk_runtime_root()
         .map(|root| {
             let scripts_dir = root.join("scripts");
             let _ = std::fs::create_dir_all(&scripts_dir);
@@ -589,9 +589,9 @@ pub fn handle_restart_dcserver(
         })
         .expect("Cannot determine runtime root");
 
-    // Use production binary at ~/.remotecc/bin/remotecc (trunk-based: separate from build output)
-    let prod_bin = remotecc_runtime_root()
-        .map(|root| root.join("bin").join("remotecc"))
+    // Use production binary at ~/.agentdesk/bin/agentdesk (trunk-based: separate from build output)
+    let prod_bin = agentdesk_runtime_root()
+        .map(|root| root.join("bin").join("agentdesk"))
         .expect("Cannot determine runtime root");
     let exe = if prod_bin.exists() {
         prod_bin.display().to_string()
@@ -600,7 +600,7 @@ pub fn handle_restart_dcserver(
         let project_exe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("release")
-            .join("remotecc");
+            .join("agentdesk");
         if project_exe.exists() {
             project_exe.display().to_string()
         } else {
@@ -723,7 +723,7 @@ pub fn handle_restart_dcserver(
 
 pub fn handle_dcserver(token: Option<String>) {
     // Ensure directory structure exists first (needed for lock file)
-    if let Some(root) = remotecc_runtime_root() {
+    if let Some(root) = agentdesk_runtime_root() {
         for subdir in ["config", "credential", "runtime", "logs", "scripts"] {
             let _ = std::fs::create_dir_all(root.join(subdir));
         }
@@ -732,7 +732,7 @@ pub fn handle_dcserver(token: Option<String>) {
     // Single-instance guard via flock — prevents race conditions
     #[cfg(unix)]
     let _lock_file = {
-        let lock_path = remotecc_runtime_root()
+        let lock_path = agentdesk_runtime_root()
             .map(|r| r.join("runtime/dcserver.lock"))
             .unwrap_or_else(|| PathBuf::from("/tmp/agentdesk-dcserver.lock"));
         let f = fs::OpenOptions::new()
@@ -757,7 +757,7 @@ pub fn handle_dcserver(token: Option<String>) {
     kill_existing_dcserver_processes();
 
     // Write PID/version files
-    if let Some(root) = remotecc_runtime_root() {
+    if let Some(root) = agentdesk_runtime_root() {
         let runtime_dir = root.join("runtime");
         let _ = std::fs::write(runtime_dir.join("dcserver.pid"), std::process::id().to_string());
         let _ = std::fs::write(runtime_dir.join("dcserver.version"), VERSION);
@@ -770,7 +770,7 @@ pub fn handle_dcserver(token: Option<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     let settings_path = instance_bot_settings_path();
 
-    let title = format!("  RemoteCC v{}  |  Discord Bot Server  ", VERSION);
+    let title = format!("  AgentDesk v{}  |  Discord Bot Server  ", VERSION);
     let width = title.chars().count();
     println!();
     println!("  ┌{}┐", "─".repeat(width));
@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn parses_explicit_restart_report_context() {
         let args = vec![
-            "remotecc".to_string(),
+            "agentdesk".to_string(),
             "--restart-dcserver".to_string(),
             "--report-channel-id".to_string(),
             "1479671301387059200".to_string(),
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn parses_restart_report_message_id() {
         let args = vec![
-            "remotecc".to_string(),
+            "agentdesk".to_string(),
             "--restart-dcserver".to_string(),
             "--report-channel-id".to_string(),
             "1479671301387059200".to_string(),
@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn rejects_partial_restart_report_context() {
         let args = vec![
-            "remotecc".to_string(),
+            "agentdesk".to_string(),
             "--restart-dcserver".to_string(),
             "--report-channel-id".to_string(),
             "1479671301387059200".to_string(),
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn rejects_restart_report_message_id_without_context() {
         let args = vec![
-            "remotecc".to_string(),
+            "agentdesk".to_string(),
             "--restart-dcserver".to_string(),
             "--report-message-id".to_string(),
             "1480460000000000000".to_string(),
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn rejects_unknown_restart_report_provider() {
         let args = vec![
-            "remotecc".to_string(),
+            "agentdesk".to_string(),
             "--restart-dcserver".to_string(),
             "--report-channel-id".to_string(),
             "1479671301387059200".to_string(),

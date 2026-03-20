@@ -13,8 +13,8 @@ pub struct SessionConfig {
     pub session_name: String,
     /// Working directory for the AI provider
     pub working_dir: String,
-    /// Path to the remotecc binary (for spawning wrapper)
-    pub remotecc_exe: String,
+    /// Path to the agentdesk binary (for spawning wrapper)
+    pub agentdesk_exe: String,
     /// Output JSONL file path
     pub output_path: String,
     /// Prompt file path
@@ -95,7 +95,7 @@ impl SessionBackend for ProcessBackend {
         // 3. Spawn wrapper directly as child process.
         // Create a new process group so kill_pid_tree(-pid) can clean up
         // the entire subtree (wrapper + Claude/Codex child) on cancel.
-        let mut cmd = Command::new(&config.remotecc_exe);
+        let mut cmd = Command::new(&config.agentdesk_exe);
         cmd.args(&args)
             .envs(config.env_vars.iter().cloned())
             .stdin(Stdio::piped())

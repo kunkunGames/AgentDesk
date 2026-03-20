@@ -410,7 +410,7 @@ async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str, title: &st
 /// Resolve a channel name alias (e.g. "adk-cc") to a numeric channel ID
 /// by reading role_map.json's byChannelName section.
 fn resolve_channel_alias(alias: &str) -> Option<u64> {
-    let root = crate::cli::remotecc_runtime_root()?;
+    let root = crate::cli::agentdesk_runtime_root()?;
     let path = root.join("config/role_map.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;

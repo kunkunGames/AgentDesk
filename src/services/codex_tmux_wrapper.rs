@@ -20,7 +20,7 @@ pub fn run(
         InputMode::Pipe => "pipe-mode",
     };
     eprintln!("\x1b[90m═══════════════════════════════════════════════════════\x1b[0m");
-    eprintln!("\x1b[90m  RemoteCC Codex Session ({})\x1b[0m", mode_label);
+    eprintln!("\x1b[90m  AgentDesk Codex Session ({})\x1b[0m", mode_label);
     if input_mode == InputMode::Fifo {
         eprintln!("\x1b[90m  Type messages below when Codex is ready.\x1b[0m");
         eprintln!("\x1b[90m  Ctrl-B, D to detach\x1b[0m");

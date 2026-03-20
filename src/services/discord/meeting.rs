@@ -376,7 +376,7 @@ pub(super) async fn start_meeting(
         )
         .await;
 
-    // Update meeting state and notify PCD
+    // Update meeting state and notify ADK
     let pcd_payload = {
         let mut core = shared.core.lock().await;
         match core.active_meetings.get_mut(&channel_id) {
@@ -1193,7 +1193,7 @@ async fn conclude_meeting(
     Ok(true)
 }
 
-/// Save meeting record as Markdown to ~/.remotecc/meetings/
+/// Save meeting record as Markdown to $AGENTDESK_ROOT_DIR/meetings/
 async fn save_meeting_record(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -1213,7 +1213,7 @@ async fn save_meeting_record(
         (build_meeting_markdown(m), m.id.clone(), payload)
     };
 
-    let meetings_dir = super::runtime_store::remotecc_root()
+    let meetings_dir = super::runtime_store::agentdesk_root()
         .ok_or("Home dir not found")?
         .join("meetings");
     fs::create_dir_all(&meetings_dir)?;
@@ -1233,7 +1233,7 @@ async fn save_meeting_record(
     Ok(true)
 }
 
-/// Build PCD API payload from meeting
+/// Build ADK API payload from meeting
 fn build_pcd_payload(m: &Meeting) -> Option<serde_json::Value> {
     let status_str = match &m.status {
         MeetingStatus::Completed => "completed",

@@ -135,7 +135,7 @@ pub(super) fn check_deferred_restart(shared: &SharedData) {
     }
     // Only the last provider to finish calls exit(0)
     if shared.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-        let Some(root) = crate::remotecc_runtime_root() else { return; };
+        let Some(root) = crate::agentdesk_runtime_root() else { return; };
         let marker = root.join("restart_pending");
         let version = fs::read_to_string(&marker).unwrap_or_default();
         let version = version.trim();
@@ -1228,7 +1228,7 @@ pub async fn run_bot(
                         // Detect restart_pending marker and set the in-memory flag
                         // so the router queues new messages instead of starting turns.
                         if !shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
-                            if let Some(root) = crate::remotecc_runtime_root() {
+                            if let Some(root) = crate::agentdesk_runtime_root() {
                                 if root.join("restart_pending").exists() {
                                     shared_for_deferred.restart_pending.store(true, Ordering::SeqCst);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1641,10 +1641,10 @@ pub(super) async fn check_owner(user_id: UserId, shared: &Arc<SharedData>) -> bo
 }
 
 fn family_profile_probe_script_path() -> Option<std::path::PathBuf> {
-    // Try org.yaml skills_root first, fallback to ~/.remotecc/skills/
+    // Try org.yaml skills_root first, fallback to $AGENTDESK_ROOT_DIR/skills/
     let skills_root = org_schema::load_skills_root()
         .map(std::path::PathBuf::from)
-        .or_else(|| runtime_store::remotecc_root().map(|r| r.join("skills")));
+        .or_else(|| runtime_store::agentdesk_root().map(|r| r.join("skills")));
     skills_root.map(|root| {
         root.join("family-profile-probe")
             .join("scripts")

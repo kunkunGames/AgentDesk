@@ -2086,7 +2086,7 @@ pub(crate) fn execute_streaming_local_process(
     let config = SessionConfig {
         session_name: session_name.to_string(),
         working_dir: working_dir.to_string(),
-        remotecc_exe: exe.display().to_string(),
+        agentdesk_exe: exe.display().to_string(),
         output_path: output_path.clone(),
         prompt_path: prompt_path.clone(),
         wrapper_args,

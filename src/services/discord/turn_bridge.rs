@@ -50,7 +50,7 @@ pub(super) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
 pub(super) fn stale_inflight_message(saved_response: &str) -> String {
     let trimmed = saved_response.trim();
     if trimmed.is_empty() {
-        "⚠️ RemoteCC가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
+        "⚠️ AgentDesk가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
     } else {
         let formatted = format_for_discord(trimmed);
         format!("{}\n\n[Interrupted by restart]", formatted)
@@ -60,16 +60,22 @@ pub(super) fn stale_inflight_message(saved_response: &str) -> String {
 fn is_dcserver_restart_command(input: &str) -> bool {
     let lower = input.to_lowercase();
 
-    if lower.contains("--restart-dcserver") || lower.contains("restart_remotecc.sh") {
+    if lower.contains("--restart-dcserver")
+        || lower.contains("restart_remotecc.sh")   // legacy
+        || lower.contains("restart_agentdesk.sh")
+    {
         return true;
     }
 
-    if lower.contains("remotecc-discord-smoke.sh") && lower.contains("--deploy-live") {
+    if (lower.contains("remotecc-discord-smoke.sh") || lower.contains("agentdesk-discord-smoke.sh"))
+        && lower.contains("--deploy-live")
+    {
         return true;
     }
 
     lower.contains("launchctl")
-        && lower.contains("com.itismyfield.remotecc.dcserver")
+        && (lower.contains("com.agentdesk.dcserver")
+            || lower.contains("com.itismyfield.remotecc.dcserver"))  // legacy
         && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
 }
 

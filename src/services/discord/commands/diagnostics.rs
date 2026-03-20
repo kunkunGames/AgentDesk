@@ -60,7 +60,7 @@ pub(in crate::services::discord) async fn build_health_report(
         )
     };
 
-    let runtime_root = crate::cli::dcserver::remotecc_runtime_root();
+    let runtime_root = crate::cli::dcserver::agentdesk_runtime_root();
     let current_release = runtime_root.as_ref()
         .map(|r| r.join("releases").join("current"))
         .and_then(|p| fs::read_link(p).ok())
@@ -127,7 +127,7 @@ pub(in crate::services::discord) async fn build_health_report(
 
     format!(
         "\
-**RemoteCC Health**
+**AgentDesk Health**
 - provider: `{}`
 - dcserver pid: `{}`
 - release: current `{}`, previous `{}`

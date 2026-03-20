@@ -528,7 +528,7 @@ pub(super) async fn restore_inflight_turns(
                 }
                 Ok(ReadOutputResult::SessionDied { .. }) => {
                     let _ = tx.send(StreamMessage::Done {
-                        result: "⚠️ RemoteCC 재시작 중 진행되던 세션을 복구하지 못했습니다."
+                        result: "⚠️ AgentDesk 재시작 중 진행되던 세션을 복구하지 못했습니다."
                             .to_string(),
                         session_id: recovery_session_id,
                     });

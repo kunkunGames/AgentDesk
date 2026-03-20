@@ -1,6 +1,6 @@
 //! Wrapper subprocess module (bidirectional).
 //!
-//! When invoked via `remotecc --tmux-wrapper`, this module manages a Claude session.
+//! When invoked via `agentdesk --tmux-wrapper`, this module manages a Claude session.
 //! It spawns Claude with `--input-format stream-json` and keeps stdin open for multi-turn.
 //!
 //! Supports two input modes:
@@ -49,7 +49,7 @@ pub fn run(
         InputMode::Pipe => "pipe-mode",
     };
     eprintln!("\x1b[90m═══════════════════════════════════════════════════════\x1b[0m");
-    eprintln!("\x1b[90m  RemoteCC Claude Session ({})\x1b[0m", mode_label);
+    eprintln!("\x1b[90m  AgentDesk Claude Session ({})\x1b[0m", mode_label);
     if input_mode == InputMode::Fifo {
         eprintln!("\x1b[90m  Type messages below when Claude is ready.\x1b[0m");
         eprintln!("\x1b[90m  Ctrl-B, D to detach\x1b[0m");
