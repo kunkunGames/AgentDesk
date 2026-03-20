@@ -33,6 +33,15 @@ pub async fn auth_middleware(
     // Skip auth for health/session/hook endpoints (internal service calls)
     // Note: path is relative to the /api nest, so "/health" not "/api/health"
     let path = req.uri().path();
+    // Skip auth for internal endpoints and browser requests (same-origin dashboard)
+    // External programmatic access requires Bearer token.
+    // Browser requests are identified by Sec-Fetch-Mode or Referer headers.
+    let is_browser = req.headers().contains_key("sec-fetch-mode")
+        || req.headers().get("accept").and_then(|v| v.to_str().ok()).map(|v| v.contains("text/html")).unwrap_or(false);
+    if is_browser {
+        return next.run(req).await;
+    }
+
     if path == "/health"
         || path == "/auth/session"
         || path.starts_with("/hook/")
