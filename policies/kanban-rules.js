@@ -96,12 +96,35 @@ var rules = {
   onCardTransition: function(payload) {
     agentdesk.log.info("[kanban] card " + payload.card_id + ": " + payload.from + " → " + payload.to);
 
-    // Auto-set requested_at timestamp
-    if (payload.to === "requested") {
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET updated_at = datetime('now') WHERE id = ?",
+    // Auto-create dispatch when transitioning to "requested"
+    if (payload.to === "requested" && payload.from !== "requested") {
+      var cards = agentdesk.db.query(
+        "SELECT assigned_agent_id, title, latest_dispatch_id FROM kanban_cards WHERE id = ?",
         [payload.card_id]
       );
+      if (cards.length > 0 && cards[0].assigned_agent_id) {
+        // Only create dispatch if one wasn't already created (e.g. by retry/redispatch handlers)
+        var existingDispatch = cards[0].latest_dispatch_id
+          ? agentdesk.db.query("SELECT status FROM task_dispatches WHERE id = ?", [cards[0].latest_dispatch_id])
+          : [];
+        var alreadyPending = existingDispatch.length > 0 && existingDispatch[0].status === "pending";
+
+        if (!alreadyPending) {
+          try {
+            var dispatchId = agentdesk.dispatch.create(
+              payload.card_id,
+              cards[0].assigned_agent_id,
+              "implementation",
+              cards[0].title
+            );
+            agentdesk.log.info("[kanban] dispatch created: " + dispatchId + " for card " + payload.card_id);
+          } catch (e) {
+            agentdesk.log.warn("[kanban] dispatch creation failed: " + e.message);
+          }
+        }
+      } else {
+        agentdesk.log.warn("[kanban] card " + payload.card_id + " has no assignee — dispatch skipped");
+      }
     }
   },
 

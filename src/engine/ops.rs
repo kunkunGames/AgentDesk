@@ -27,7 +27,13 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
     register_log_ops(ctx)?;
 
     // ── agentdesk.config ─────────────────────────────────────────
-    register_config_ops(ctx, db)?;
+    register_config_ops(ctx, db.clone())?;
+
+    // ── agentdesk.http ────────────────────────────────────────────
+    register_http_ops(ctx)?;
+
+    // ── agentdesk.dispatch ────────────────────────────────────────
+    register_dispatch_ops(ctx, db)?;
 
     Ok(())
 }
@@ -251,6 +257,144 @@ fn register_config_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     "#)?;
 
     Ok(())
+}
+
+// ── HTTP ops ────────────────────────────────────────────────────
+//
+// agentdesk.http.post(url, body) → response_string
+// Synchronous HTTP POST for localhost API calls from policy JS.
+// Only allows 127.0.0.1 targets for security.
+
+fn register_http_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
+    let ad: Object<'js> = ctx.globals().get("agentdesk")?;
+    let http_obj = Object::new(ctx.clone())?;
+
+    http_obj.set(
+        "__post_raw",
+        Function::new(
+            ctx.clone(),
+            |url: String, body_json: String| -> String {
+                if !url.starts_with("http://127.0.0.1") {
+                    return r#"{"error":"only localhost allowed"}"#.to_string();
+                }
+                match ureq::post(&url)
+                    .set("Content-Type", "application/json")
+                    .send_string(&body_json)
+                {
+                    Ok(resp) => resp.into_string().unwrap_or_else(|_| "{}".to_string()),
+                    Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+                }
+            },
+        )?,
+    )?;
+
+    ad.set("http", http_obj)?;
+
+    let _: rquickjs::Value = ctx.eval(r#"
+        (function() {
+            var raw = agentdesk.http.__post_raw;
+            agentdesk.http.post = function(url, body) {
+                return JSON.parse(raw(url, JSON.stringify(body)));
+            };
+        })();
+    "#)?;
+
+    Ok(())
+}
+
+// ── Dispatch ops ────────────────────────────────────────────────
+//
+// agentdesk.dispatch.create(cardId, agentId, dispatchType, title) → dispatchId
+// Creates a task_dispatch row + updates kanban card to "requested".
+// Discord notification is handled by posting to the local /api/send endpoint.
+
+fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
+    let ad: Object<'js> = ctx.globals().get("agentdesk")?;
+    let dispatch_obj = Object::new(ctx.clone())?;
+
+    // __dispatch_create_raw(card_id, agent_id, dispatch_type, title) → json_string
+    let db_d = db;
+    dispatch_obj.set(
+        "__create_raw",
+        Function::new(
+            ctx.clone(),
+            rquickjs::function::MutFn::from(
+                move |card_id: String, agent_id: String, dispatch_type: String, title: String| -> String {
+                    dispatch_create_raw(&db_d, &card_id, &agent_id, &dispatch_type, &title)
+                },
+            ),
+        )?,
+    )?;
+
+    ad.set("dispatch", dispatch_obj)?;
+
+    // JS wrapper
+    let _: rquickjs::Value = ctx.eval(r#"
+        (function() {
+            var raw = agentdesk.dispatch.__create_raw;
+            agentdesk.dispatch.create = function(cardId, agentId, dispatchType, title) {
+                var result = JSON.parse(raw(cardId, agentId, dispatchType || "implementation", title || "Dispatch"));
+                if (result.error) throw new Error(result.error);
+                // Fire Discord notification via local API (best-effort, non-blocking from JS perspective)
+                try {
+                    var port = agentdesk.config.get("health_port") || 8793;
+                    var channel = agentdesk.db.query(
+                        "SELECT discord_channel_id FROM agents WHERE id = ?", [agentId]
+                    );
+                    if (channel.length > 0 && channel[0].discord_channel_id) {
+                        agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
+                            target: "channel:" + channel[0].discord_channel_id,
+                            content: "[Dispatch] " + (title || "Dispatch") + (result.issue_url ? "\n" + result.issue_url : ""),
+                            source: "kanban-rules"
+                        });
+                    }
+                } catch(e) {
+                    agentdesk.log.warn("[dispatch] Discord send failed: " + e.message);
+                }
+                return result.dispatch_id;
+            };
+        })();
+    "#)?;
+
+    Ok(())
+}
+
+fn dispatch_create_raw(db: &Db, card_id: &str, agent_id: &str, dispatch_type: &str, title: &str) -> String {
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(e) => return format!(r#"{{"error":"DB lock: {}"}}"#, e),
+    };
+
+    // Insert dispatch
+    if let Err(e) = conn.execute(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, '{}', datetime('now'), datetime('now'))",
+        rusqlite::params![dispatch_id, card_id, agent_id, dispatch_type, title],
+    ) {
+        return format!(r#"{{"error":"INSERT dispatch: {}"}}"#, e);
+    }
+
+    // Update kanban card
+    if let Err(e) = conn.execute(
+        "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = 'requested', requested_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
+        rusqlite::params![dispatch_id, card_id],
+    ) {
+        return format!(r#"{{"error":"UPDATE card: {}"}}"#, e);
+    }
+
+    // Get issue URL for Discord message
+    let issue_url: Option<String> = conn
+        .query_row("SELECT github_issue_url FROM kanban_cards WHERE id = ?1", [card_id], |row| row.get(0))
+        .ok().flatten();
+
+    format!(
+        r#"{{"dispatch_id":"{}","card_id":"{}","agent_id":"{}","issue_url":{}}}"#,
+        dispatch_id,
+        card_id,
+        agent_id,
+        issue_url.map(|u| format!("\"{}\"", u)).unwrap_or_else(|| "null".to_string()),
+    )
 }
 
 #[cfg(test)]

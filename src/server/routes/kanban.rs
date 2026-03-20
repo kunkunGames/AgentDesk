@@ -359,35 +359,8 @@ pub async fn update_card(
                 );
             }
 
-            // Auto-create dispatch when transitioning to "requested"
-            if new_s == "requested" {
-                let (to_agent_id, title) = {
-                    let conn = state.db.lock().unwrap();
-                    let agent_id: Option<String> = conn
-                        .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-                        .ok().flatten();
-                    let title: String = conn
-                        .query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-                        .unwrap_or_else(|_| "Dispatch".to_string());
-                    (agent_id, title)
-                };
-                if let Some(ref agent_id) = to_agent_id {
-                    match crate::dispatch::create_dispatch(
-                        &state.db, &state.engine, &id, agent_id, "implementation", &title, &json!({}),
-                    ) {
-                        Ok(_) => {
-                            let db = state.db.clone();
-                            let agent_id = agent_id.clone();
-                            let title = title.clone();
-                            let card_id = id.clone();
-                            tokio::spawn(async move {
-                                super::dispatches::send_dispatch_to_discord(&db, &agent_id, &title, &card_id).await;
-                            });
-                        }
-                        Err(e) => tracing::warn!("[update_card] auto-dispatch creation failed: {e}"),
-                    }
-                }
-            }
+            // Dispatch creation for "requested" is handled by kanban-rules.js policy
+            // via onCardTransition hook — not hardcoded here.
         }
     }
 
@@ -529,50 +502,32 @@ pub async fn retry_card(
         }
 
         // Reset to 'ready' + optionally update assignee
+        // Update assignee if provided, then set status to "requested"
+        // The OnCardTransition hook (kanban-rules.js) will create the dispatch + Discord message
+        let old_status: String = conn
+            .query_row("SELECT status FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+
         if let Some(ref agent_id) = body.assignee_agent_id {
             conn.execute(
-                "UPDATE kanban_cards SET status = 'ready', assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                "UPDATE kanban_cards SET status = 'requested', assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
                 rusqlite::params![agent_id, id],
             ).ok();
         } else {
             conn.execute(
-                "UPDATE kanban_cards SET status = 'ready', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE kanban_cards SET status = 'requested', updated_at = datetime('now') WHERE id = ?1",
                 [&id],
             ).ok();
         }
+
+        // Fire OnCardTransition hook → policy creates dispatch
+        let _ = state.engine.fire_hook(
+            crate::engine::hooks::Hook::OnCardTransition,
+            json!({ "card_id": id, "from": old_status, "to": "requested" }),
+        );
     } // drop conn lock
 
-    // 2. Resolve assignee for dispatch
-    let (to_agent_id, title) = {
-        let conn = state.db.lock().unwrap();
-        let agent_id: Option<String> = conn
-            .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-            .ok().flatten();
-        let title: String = conn
-            .query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-            .unwrap_or_else(|_| "Retry".to_string());
-        (agent_id, title)
-    };
-
-    // 3. Create dispatch and send Discord message (if assignee exists)
-    if let Some(ref agent_id) = to_agent_id {
-        match crate::dispatch::create_dispatch(
-            &state.db, &state.engine, &id, agent_id, "retry", &title, &json!({}),
-        ) {
-            Ok(_) => {
-                let db = state.db.clone();
-                let agent_id = agent_id.clone();
-                let title = title.clone();
-                let card_id = id.clone();
-                tokio::spawn(async move {
-                    super::dispatches::send_dispatch_to_discord(&db, &agent_id, &title, &card_id).await;
-                });
-            }
-            Err(e) => tracing::warn!("[retry] dispatch creation failed: {e}"),
-        }
-    }
-
-    // 4. Return updated card
+    // Return updated card
     let conn = state.db.lock().unwrap();
     match conn.query_row(
         "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
@@ -590,12 +545,17 @@ pub async fn redispatch_card(
     Path(id): Path<String>,
     Json(_body): Json<RedispatchCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 1. Cancel current dispatch if any, reset card to ready
-    let (to_agent_id, title) = {
+    // 1. Cancel current dispatch, then transition to "requested"
+    // The OnCardTransition hook (kanban-rules.js) creates the new dispatch + Discord message
+    {
         let conn = match state.db.lock() {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
         };
+
+        let old_status: String = conn
+            .query_row("SELECT status FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .unwrap_or_else(|_| "unknown".to_string());
 
         // Cancel existing dispatch
         let dispatch_id: Option<String> = conn
@@ -608,9 +568,9 @@ pub async fn redispatch_card(
             ).ok();
         }
 
-        // Reset to ready (keep assignee)
+        // Set to requested (keep assignee), clear review_status
         match conn.execute(
-            "UPDATE kanban_cards SET status = 'ready', review_status = NULL, updated_at = datetime('now') WHERE id = ?1",
+            "UPDATE kanban_cards SET status = 'requested', review_status = NULL, latest_dispatch_id = NULL, updated_at = datetime('now') WHERE id = ?1",
             [&id],
         ) {
             Ok(0) => return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"}))),
@@ -618,34 +578,16 @@ pub async fn redispatch_card(
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
         }
 
-        let agent_id: Option<String> = conn
-            .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-            .ok().flatten();
-        let title: String = conn
-            .query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-            .unwrap_or_else(|_| "Redispatch".to_string());
-        (agent_id, title)
-    };
+        drop(conn);
 
-    // 2. Create new dispatch and send Discord message
-    if let Some(ref agent_id) = to_agent_id {
-        match crate::dispatch::create_dispatch(
-            &state.db, &state.engine, &id, agent_id, "redispatch", &title, &json!({}),
-        ) {
-            Ok(_) => {
-                let db = state.db.clone();
-                let agent_id = agent_id.clone();
-                let title = title.clone();
-                let card_id = id.clone();
-                tokio::spawn(async move {
-                    super::dispatches::send_dispatch_to_discord(&db, &agent_id, &title, &card_id).await;
-                });
-            }
-            Err(e) => tracing::warn!("[redispatch] dispatch creation failed: {e}"),
-        }
+        // Fire hook → policy creates dispatch
+        let _ = state.engine.fire_hook(
+            crate::engine::hooks::Hook::OnCardTransition,
+            json!({ "card_id": id, "from": old_status, "to": "requested" }),
+        );
     }
 
-    // 3. Return updated card
+    // 2. Return updated card
     let conn = state.db.lock().unwrap();
     match conn.query_row(
         "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
