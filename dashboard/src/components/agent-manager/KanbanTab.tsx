@@ -126,6 +126,7 @@ export default function KanbanTab({
   const [stalledSelected, setStalledSelected] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [deferredDodPopup, setDeferredDodPopup] = useState(false);
+  const [assignBeforeReady, setAssignBeforeReady] = useState<{ cardId: string; agentId: string } | null>(null);
 
   const agentMap = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const cardsById = useMemo(() => new Map(cards.map((card) => [card.id, card])), [cards]);
@@ -542,6 +543,14 @@ export default function KanbanTab({
 
   const handleUpdateCardStatus = async (cardId: string, targetStatus: KanbanCardStatus) => {
     setActionError(null);
+    // When moving to "ready" without an assignee, show assignee selection modal
+    if (targetStatus === "ready") {
+      const card = cardsById.get(cardId);
+      if (card && !card.assignee_agent_id) {
+        setAssignBeforeReady({ cardId, agentId: "" });
+        return;
+      }
+    }
     try {
       await onUpdateCard(cardId, { status: targetStatus });
     } catch (error) {
@@ -1013,6 +1022,44 @@ export default function KanbanTab({
         {actionError && (
           <div className="rounded-xl px-3 py-2 text-sm border" style={{ borderColor: "rgba(248,113,113,0.45)", color: "#fecaca", backgroundColor: "rgba(127,29,29,0.22)" }}>
             {actionError}
+          </div>
+        )}
+
+        {/* Assignee selection modal: shown when moving to "ready" without an assignee */}
+        {assignBeforeReady && (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setAssignBeforeReady(null)}>
+            <div onClick={(e) => e.stopPropagation()} className="w-full max-w-sm rounded-2xl border p-5 space-y-4" style={{ backgroundColor: "rgba(2,6,23,0.96)", borderColor: "rgba(148,163,184,0.24)" }}>
+              <h3 className="text-lg font-semibold" style={{ color: "var(--th-text-heading)" }}>{tr("담당자 할당", "Assign Agent")}</h3>
+              <p className="text-sm" style={{ color: "var(--th-text-secondary)" }}>{tr("준비됨 상태로 이동하려면 담당자를 지정해야 합니다.", "Assign an agent before moving to ready.")}</p>
+              <select
+                value={assignBeforeReady.agentId}
+                onChange={(e) => setAssignBeforeReady((prev) => prev ? { ...prev, agentId: e.target.value } : null)}
+                className="w-full rounded-xl px-3 py-2 text-sm bg-white/6 border"
+                style={{ borderColor: "rgba(148,163,184,0.24)", color: "var(--th-text-primary)" }}
+              >
+                <option value="">{tr("선택...", "Select...")}</option>
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name_ko || a.name} ({a.id})</option>
+                ))}
+              </select>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setAssignBeforeReady(null)} className="rounded-xl px-4 py-2 text-sm bg-white/8" style={{ color: "var(--th-text-secondary)" }}>{tr("취소", "Cancel")}</button>
+                <button
+                  disabled={!assignBeforeReady.agentId}
+                  onClick={async () => {
+                    const { cardId, agentId } = assignBeforeReady;
+                    setAssignBeforeReady(null);
+                    try {
+                      await onUpdateCard(cardId, { status: "ready", assignee_agent_id: agentId });
+                    } catch (error) {
+                      setActionError(error instanceof Error ? error.message : tr("상태 전환에 실패했습니다.", "Failed to change status."));
+                    }
+                  }}
+                  className="rounded-xl px-4 py-2 text-sm font-medium"
+                  style={{ backgroundColor: !assignBeforeReady.agentId ? "rgba(34,197,94,0.2)" : "rgba(34,197,94,0.8)", color: "#fff" }}
+                >{tr("할당 후 준비됨", "Assign & Ready")}</button>
+              </div>
+            </div>
           </div>
         )}
 

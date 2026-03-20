@@ -312,7 +312,7 @@ fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Val
 }
 
 /// Send a dispatch notification to the target agent's Discord channel.
-async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str, title: &str, card_id: &str) {
+pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str, title: &str, card_id: &str) {
     // Look up agent's discord channel
     let channel_id: Option<String> = {
         let conn = match db.lock() {

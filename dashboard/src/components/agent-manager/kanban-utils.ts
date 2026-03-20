@@ -41,7 +41,7 @@ export const REVIEW_DISPATCH_TYPES = new Set(["review", "review-decision"]);
 export const STATUS_TRANSITIONS: Record<KanbanCardStatus, KanbanCardStatus[]> = {
   backlog: ["ready", "cancelled"],
   ready: ["requested", "backlog", "cancelled"],
-  requested: ["in_progress", "cancelled"],
+  requested: ["ready", "in_progress", "cancelled"],
   in_progress: ["review", "blocked"],
   review: ["done", "in_progress"],
   blocked: ["in_progress", "cancelled"],

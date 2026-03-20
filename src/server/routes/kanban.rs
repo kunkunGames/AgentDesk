@@ -484,47 +484,73 @@ pub async fn retry_card(
     Path(id): Path<String>,
     Json(body): Json<RetryCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            )
+    // 1. Update assignee if provided
+    {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        };
+
+        let exists: bool = conn
+            .query_row("SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .unwrap_or(false);
+        if !exists {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
         }
+
+        // Reset to 'ready' + optionally update assignee
+        if let Some(ref agent_id) = body.assignee_agent_id {
+            conn.execute(
+                "UPDATE kanban_cards SET status = 'ready', assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+                rusqlite::params![agent_id, id],
+            ).ok();
+        } else {
+            conn.execute(
+                "UPDATE kanban_cards SET status = 'ready', updated_at = datetime('now') WHERE id = ?1",
+                [&id],
+            ).ok();
+        }
+    } // drop conn lock
+
+    // 2. Resolve assignee for dispatch
+    let (to_agent_id, title) = {
+        let conn = state.db.lock().unwrap();
+        let agent_id: Option<String> = conn
+            .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .ok().flatten();
+        let title: String = conn
+            .query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .unwrap_or_else(|_| "Retry".to_string());
+        (agent_id, title)
     };
 
-    // Check card exists
-    let exists: bool = conn
-        .query_row("SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-        .unwrap_or(false);
-    if !exists {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+    // 3. Create dispatch and send Discord message (if assignee exists)
+    if let Some(ref agent_id) = to_agent_id {
+        match crate::dispatch::create_dispatch(
+            &state.db, &state.engine, &id, agent_id, "retry", &title, &json!({}),
+        ) {
+            Ok(_) => {
+                let db = state.db.clone();
+                let agent_id = agent_id.clone();
+                let title = title.clone();
+                let card_id = id.clone();
+                tokio::spawn(async move {
+                    super::dispatches::send_dispatch_to_discord(&db, &agent_id, &title, &card_id).await;
+                });
+            }
+            Err(e) => tracing::warn!("[retry] dispatch creation failed: {e}"),
+        }
     }
 
-    // Reset status to 'ready', optionally update assignee
-    if let Some(ref agent_id) = body.assignee_agent_id {
-        conn.execute(
-            "UPDATE kanban_cards SET status = 'ready', assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![agent_id, id],
-        ).ok();
-    } else {
-        conn.execute(
-            "UPDATE kanban_cards SET status = 'ready', updated_at = datetime('now') WHERE id = ?1",
-            [&id],
-        ).ok();
-    }
-
+    // 4. Return updated card
+    let conn = state.db.lock().unwrap();
     match conn.query_row(
         "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
         [&id],
         |row| card_row_to_json(row),
     ) {
         Ok(card) => (StatusCode::OK, Json(json!({"card": card}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
     }
 }
 
@@ -534,40 +560,70 @@ pub async fn redispatch_card(
     Path(id): Path<String>,
     Json(_body): Json<RedispatchCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            )
+    // 1. Cancel current dispatch if any, reset card to ready
+    let (to_agent_id, title) = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        };
+
+        // Cancel existing dispatch
+        let dispatch_id: Option<String> = conn
+            .query_row("SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .ok().flatten();
+        if let Some(ref did) = dispatch_id {
+            conn.execute(
+                "UPDATE task_dispatches SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?1",
+                [did],
+            ).ok();
         }
+
+        // Reset to ready (keep assignee)
+        match conn.execute(
+            "UPDATE kanban_cards SET status = 'ready', review_status = NULL, updated_at = datetime('now') WHERE id = ?1",
+            [&id],
+        ) {
+            Ok(0) => return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"}))),
+            Ok(_) => {}
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        }
+
+        let agent_id: Option<String> = conn
+            .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .ok().flatten();
+        let title: String = conn
+            .query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .unwrap_or_else(|_| "Redispatch".to_string());
+        (agent_id, title)
     };
 
-    match conn.execute(
-        "UPDATE kanban_cards SET status = 'backlog', assigned_agent_id = NULL, updated_at = datetime('now') WHERE id = ?1",
-        [&id],
-    ) {
-        Ok(0) => return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"}))),
-        Ok(_) => {}
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
+    // 2. Create new dispatch and send Discord message
+    if let Some(ref agent_id) = to_agent_id {
+        match crate::dispatch::create_dispatch(
+            &state.db, &state.engine, &id, agent_id, "redispatch", &title, &json!({}),
+        ) {
+            Ok(_) => {
+                let db = state.db.clone();
+                let agent_id = agent_id.clone();
+                let title = title.clone();
+                let card_id = id.clone();
+                tokio::spawn(async move {
+                    super::dispatches::send_dispatch_to_discord(&db, &agent_id, &title, &card_id).await;
+                });
+            }
+            Err(e) => tracing::warn!("[redispatch] dispatch creation failed: {e}"),
         }
     }
 
+    // 3. Return updated card
+    let conn = state.db.lock().unwrap();
     match conn.query_row(
         "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
         [&id],
         |row| card_row_to_json(row),
     ) {
         Ok(card) => (StatusCode::OK, Json(json!({"card": card}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
     }
 }
 
