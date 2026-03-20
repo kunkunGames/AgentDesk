@@ -882,7 +882,9 @@ pub fn handle_dcserver(token: Option<String>) {
                 }
 
                 for task in tasks {
-                    let _ = task.await;
+                    if let Err(e) = task.await {
+                        eprintln!("  ⚠ bot task terminated unexpectedly: {e}");
+                    }
                 }
             }
         }

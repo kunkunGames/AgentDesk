@@ -150,6 +150,18 @@ pub(super) fn spawn_turn_bridge(
         let mut new_session_id = bridge.new_session_id.clone();
         let defer_watcher_resume = bridge.defer_watcher_resume;
         let completion_tx = bridge.completion_tx;
+        // Guard: ensure completion_tx fires even if the task panics or
+        // exits early, preventing the parent from hanging on completion_rx.
+        struct CompletionGuard(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for CompletionGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let _completion_guard = CompletionGuard(completion_tx);
+
         let mut inflight_state = bridge.inflight_state.clone();
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
@@ -894,9 +906,7 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if let Some(tx) = completion_tx {
-            let _ = tx.send(());
-        }
+        // completion_tx is sent automatically by CompletionGuard on drop
     });
 }
 
