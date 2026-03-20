@@ -104,11 +104,17 @@ impl ProviderKind {
     }
 }
 
+/// Legacy tmux session prefix for backward compatibility during rolling upgrades.
+const LEGACY_TMUX_SESSION_PREFIX: &str = "remoteCC";
+
 pub fn parse_provider_and_channel_from_tmux_name(
     session_name: &str,
 ) -> Option<(ProviderKind, String)> {
     let prefix = format!("{}-", TMUX_SESSION_PREFIX);
-    let stripped = session_name.strip_prefix(&prefix)?;
+    let legacy_prefix = format!("{}-", LEGACY_TMUX_SESSION_PREFIX);
+    let stripped = session_name
+        .strip_prefix(&prefix)
+        .or_else(|| session_name.strip_prefix(&legacy_prefix))?;
     // Strip env suffix (e.g. "-dev") from the end before parsing
     let suffix = tmux_env_suffix();
     let without_suffix = if !suffix.is_empty() {

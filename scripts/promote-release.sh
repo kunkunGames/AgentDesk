@@ -34,9 +34,13 @@ mkdir -p "$ADK_REL/dashboard"
 rm -rf "$ADK_REL/dashboard/dist"
 cp -r "$ADK_DEV/dashboard/dist" "$ADK_REL/dashboard/dist"
 
-# Copy database from dev
-echo "▸ Copying database from dev..."
-cp "$ADK_DEV/data/agentdesk.sqlite" "$ADK_REL/data/agentdesk.sqlite"
+# Initialize release database if it doesn't exist (never overwrite release data)
+if [ ! -f "$ADK_REL/data/agentdesk.sqlite" ]; then
+    echo "▸ Initializing release database from dev..."
+    cp "$ADK_DEV/data/agentdesk.sqlite" "$ADK_REL/data/agentdesk.sqlite"
+else
+    echo "▸ Release database exists — preserving release data (skip copy)"
+fi
 
 # Start release
 echo "▸ Starting release..."

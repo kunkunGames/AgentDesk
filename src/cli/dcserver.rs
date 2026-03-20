@@ -102,19 +102,29 @@ pub fn dcserver_process_command(pid: u32) -> Option<String> {
 }
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
-    if !command.contains("remotecc --dcserver") {
+    // Match both new "agentdesk dcserver" and legacy "remotecc --dcserver"
+    let is_dcserver = command.contains("agentdesk dcserver")
+        || command.contains("remotecc --dcserver");
+    if !is_dcserver {
         return false;
     }
 
     match current_dcserver_root_marker() {
-        Some(root) => command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}={root}")),
-        None => !command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}=")),
+        Some(root) => {
+            command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}={root}"))
+                || command.contains(&format!("REMOTECC_ROOT_DIR={root}"))
+        }
+        None => {
+            !command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}="))
+                && !command.contains("REMOTECC_ROOT_DIR=")
+        }
     }
 }
 
 pub fn dcserver_instance_pids() -> Vec<u32> {
+    // Search for both new and legacy process names
     let output = match std::process::Command::new("pgrep")
-        .args(["-f", "remotecc --dcserver"])
+        .args(["-f", "agentdesk dcserver|remotecc --dcserver"])
         .output()
     {
         Ok(output) if output.status.success() => output,
