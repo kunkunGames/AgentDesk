@@ -1,5 +1,5 @@
-pub(crate) mod schema;
 pub mod agents;
+pub(crate) mod schema;
 
 use anyhow::Result;
 use rusqlite::Connection;

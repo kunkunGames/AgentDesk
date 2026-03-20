@@ -96,38 +96,70 @@ pub struct KanbanConfig {
     pub max_chain_depth: u32,
 }
 
-fn default_port() -> u16 { 8791 }
-fn default_host() -> String { "0.0.0.0".into() }
-fn default_provider() -> String { "claude".into() }
-fn default_sync_interval() -> u64 { 10 }
-fn default_policies_dir() -> PathBuf { PathBuf::from("./policies") }
-fn default_true() -> bool { true }
+fn default_port() -> u16 {
+    8791
+}
+fn default_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_provider() -> String {
+    "claude".into()
+}
+fn default_sync_interval() -> u64 {
+    10
+}
+fn default_policies_dir() -> PathBuf {
+    PathBuf::from("./policies")
+}
+fn default_true() -> bool {
+    true
+}
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("agentdesk")
 }
-fn default_db_name() -> String { "agentdesk.sqlite".into() }
-fn default_45() -> u64 { 45 }
-fn default_100() -> u64 { 100 }
-fn default_3() -> u32 { 3 }
-fn default_5() -> u32 { 5 }
+fn default_db_name() -> String {
+    "agentdesk.sqlite".into()
+}
+fn default_45() -> u64 {
+    45
+}
+fn default_100() -> u64 {
+    100
+}
+fn default_3() -> u32 {
+    3
+}
+fn default_5() -> u32 {
+    5
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { port: default_port(), host: default_host(), auth_token: None }
+        Self {
+            port: default_port(),
+            host: default_host(),
+            auth_token: None,
+        }
     }
 }
 
 impl Default for PoliciesConfig {
     fn default() -> Self {
-        Self { dir: default_policies_dir(), hot_reload: true }
+        Self {
+            dir: default_policies_dir(),
+            hot_reload: true,
+        }
     }
 }
 
 impl Default for DataConfig {
     fn default() -> Self {
-        Self { dir: default_data_dir(), db_name: default_db_name() }
+        Self {
+            dir: default_data_dir(),
+            db_name: default_db_name(),
+        }
     }
 }
 
@@ -157,11 +189,10 @@ impl Default for Config {
 }
 
 pub fn load() -> Result<Config> {
-    let path = std::env::var("AGENTDESK_CONFIG")
-        .unwrap_or_else(|_| "agentdesk.yaml".into());
+    let path = std::env::var("AGENTDESK_CONFIG").unwrap_or_else(|_| "agentdesk.yaml".into());
 
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config: {path}"))?;
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("Failed to read config: {path}"))?;
 
     let config: Config = serde_yaml::from_str(&contents)
         .with_context(|| format!("Failed to parse config: {path}"))?;
@@ -175,8 +206,7 @@ pub fn load() -> Result<Config> {
 /// Load config gracefully — returns Config::default() if the file doesn't exist
 /// or fails to parse, instead of panicking.
 pub fn load_graceful() -> Config {
-    let path = std::env::var("AGENTDESK_CONFIG")
-        .unwrap_or_else(|_| "agentdesk.yaml".into());
+    let path = std::env::var("AGENTDESK_CONFIG").unwrap_or_else(|_| "agentdesk.yaml".into());
 
     let config = match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_yaml::from_str::<Config>(&contents) {
@@ -213,12 +243,10 @@ impl Settings {
     }
 
     pub fn config_dir() -> Option<std::path::PathBuf> {
-        for key in ["AGENTDESK_ROOT_DIR", "REMOTECC_ROOT_DIR"] {
-            if let Ok(root) = std::env::var(key) {
-                let trimmed = root.trim();
-                if !trimmed.is_empty() {
-                    return Some(std::path::PathBuf::from(trimmed));
-                }
+        if let Ok(root) = std::env::var("AGENTDESK_ROOT_DIR") {
+            let trimmed = root.trim();
+            if !trimmed.is_empty() {
+                return Some(std::path::PathBuf::from(trimmed));
             }
         }
         dirs::home_dir().map(|h| h.join(".agentdesk"))

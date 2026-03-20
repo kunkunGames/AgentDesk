@@ -3,12 +3,10 @@ use std::sync::atomic::Ordering;
 use poise::serenity_prelude as serenity;
 use serenity::CreateMessage;
 
-use super::super::{
-    auto_restore_session, check_auth, Context, Error,
-};
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::router::handle_text_message;
 use super::super::turn_bridge::cancel_active_token;
+use super::super::{Context, Error, auto_restore_session, check_auth};
 use crate::services::provider::ProviderKind;
 
 // Re-use the report builders from diagnostics (they are private to diagnostics,
@@ -232,7 +230,11 @@ pub(in crate::services::discord) async fn cmd_cc(
             }
         }
         ProviderKind::Unsupported(name) => {
-            ctx.say(format!("Provider '{}' is not installed. This skill cannot run.", name)).await?;
+            ctx.say(format!(
+                "Provider '{}' is not installed. This skill cannot run.",
+                name
+            ))
+            .await?;
             return Ok(());
         }
     };

@@ -18,10 +18,7 @@ pub fn new_broadcast() -> BroadcastTx {
     Arc::new(tx)
 }
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(tx): State<BroadcastTx>,
-) -> impl IntoResponse {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(tx): State<BroadcastTx>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, tx))
 }
 

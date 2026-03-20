@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -104,7 +104,7 @@ pub async fn list_cards(
     };
 
     let mut sql = String::from(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE 1=1"
+        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE 1=1",
     );
     let mut bind_values: Vec<String> = Vec::new();
 
@@ -139,12 +139,14 @@ pub async fn list_cards(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| card_row_to_json(row))
@@ -169,7 +171,7 @@ pub async fn get_card(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -203,7 +205,7 @@ pub async fn create_card(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -247,7 +249,7 @@ pub async fn update_card(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("{e}")})),
-                )
+                );
             }
         };
 
@@ -260,7 +262,10 @@ pub async fn update_card(
     };
 
     if old_status.is_none() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        );
     }
     let old_status = old_status.unwrap();
 
@@ -294,12 +299,19 @@ pub async fn update_card(
     }
 
     if sets.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no fields to update"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no fields to update"})),
+        );
     }
 
     sets.push(format!("updated_at = datetime('now')"));
 
-    let sql = format!("UPDATE kanban_cards SET {} WHERE id = ?{}", sets.join(", "), idx);
+    let sql = format!(
+        "UPDATE kanban_cards SET {} WHERE id = ?{}",
+        sets.join(", "),
+        idx
+    );
     values.push(Box::new(id.clone()));
 
     let conn = match state.db.lock() {
@@ -308,14 +320,17 @@ pub async fn update_card(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "card not found"})),
+            );
         }
         Ok(_) => {}
         Err(e) => {
@@ -359,6 +374,17 @@ pub async fn update_card(
                 );
             }
 
+            // Fire OnReviewEnter when transitioning to review
+            if new_s == "review" {
+                let _ = state.engine.fire_hook(
+                    Hook::OnReviewEnter,
+                    json!({
+                        "card_id": id,
+                        "from": old_status,
+                    }),
+                );
+            }
+
             // Dispatch creation for "requested" is handled by kanban-rules.js policy
             // via onCardTransition hook — not hardcoded here.
         }
@@ -386,7 +412,7 @@ pub async fn assign_card(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("{e}")})),
-                )
+                );
             }
         };
         conn.query_row(
@@ -398,7 +424,10 @@ pub async fn assign_card(
     };
 
     if old_status.is_none() {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        );
     }
     let old_status = old_status.unwrap();
 
@@ -408,7 +437,7 @@ pub async fn assign_card(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -467,12 +496,15 @@ pub async fn delete_card(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     match conn.execute("DELETE FROM kanban_cards WHERE id = ?1", [&id]) {
-        Ok(0) => (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"}))),
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        ),
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -491,21 +523,37 @@ pub async fn retry_card(
     {
         let conn = match state.db.lock() {
             Ok(c) => c,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
         };
 
         let exists: bool = conn
-            .query_row("SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
             .unwrap_or(false);
         if !exists {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "card not found"})),
+            );
         }
 
         // Reset to 'ready' + optionally update assignee
         // Update assignee if provided, then set status to "requested"
         // The OnCardTransition hook (kanban-rules.js) will create the dispatch + Discord message
         let old_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
             .unwrap_or_else(|_| "unknown".to_string());
 
         if let Some(ref agent_id) = body.assignee_agent_id {
@@ -550,17 +598,31 @@ pub async fn redispatch_card(
     {
         let conn = match state.db.lock() {
             Ok(c) => c,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
         };
 
         let old_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
             .unwrap_or_else(|_| "unknown".to_string());
 
         // Cancel existing dispatch
         let dispatch_id: Option<String> = conn
-            .query_row("SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
-            .ok().flatten();
+            .query_row(
+                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
         if let Some(ref did) = dispatch_id {
             conn.execute(
                 "UPDATE task_dispatches SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?1",
@@ -611,26 +673,35 @@ pub async fn defer_dod(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Ensure deferred_dod_json column exists
-    let _ = conn.execute_batch(
-        "ALTER TABLE kanban_cards ADD COLUMN deferred_dod_json TEXT;"
-    );
+    let _ = conn.execute_batch("ALTER TABLE kanban_cards ADD COLUMN deferred_dod_json TEXT;");
 
     // Check card exists
     let exists: bool = conn
-        .query_row("SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
         .unwrap_or(false);
     if !exists {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        );
     }
 
     // Read current deferred_dod_json
     let current: Option<String> = conn
-        .query_row("SELECT deferred_dod_json FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+        .query_row(
+            "SELECT deferred_dod_json FROM kanban_cards WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
         .unwrap_or(None);
 
     let mut dod: serde_json::Value = current
@@ -739,7 +810,7 @@ pub async fn list_card_reviews(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -754,7 +825,7 @@ pub async fn list_card_reviews(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -780,16 +851,14 @@ pub async fn list_card_reviews(
 }
 
 /// GET /api/kanban-cards/stalled
-pub async fn stalled_cards(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -807,7 +876,10 @@ pub async fn stalled_cards(
     let repo_filter = if registered_repos.is_empty() {
         String::new()
     } else {
-        let quoted: Vec<String> = registered_repos.iter().map(|r| format!("'{}'", r.replace('\'', "''"))).collect();
+        let quoted: Vec<String> = registered_repos
+            .iter()
+            .map(|r| format!("'{}'", r.replace('\'', "''")))
+            .collect();
         format!(" AND repo_id IN ({})", quoted.join(","))
     };
 
@@ -826,9 +898,7 @@ pub async fn stalled_cards(
         }
     };
 
-    let rows = stmt
-        .query_map([], |row| card_row_to_json(row))
-        .ok();
+    let rows = stmt.query_map([], |row| card_row_to_json(row)).ok();
 
     let cards: Vec<serde_json::Value> = match rows {
         Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -861,7 +931,7 @@ pub async fn bulk_action(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -877,7 +947,10 @@ pub async fn bulk_action(
         }
     }
 
-    (StatusCode::OK, Json(json!({"action": body.action, "results": results})))
+    (
+        StatusCode::OK,
+        Json(json!({"action": body.action, "results": results})),
+    )
 }
 
 /// POST /api/kanban-cards/assign-issue
@@ -893,7 +966,7 @@ pub async fn assign_issue(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -937,7 +1010,9 @@ fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
     let repo_id = row.get::<_, Option<String>>(1)?;
     let assigned_agent_id = row.get::<_, Option<String>>(5)?;
     let metadata_raw = row.get::<_, Option<String>>(10).unwrap_or(None);
-    let metadata_parsed = metadata_raw.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let metadata_parsed = metadata_raw
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
 
     Ok(json!({
         "id": row.get::<_, String>(0)?,

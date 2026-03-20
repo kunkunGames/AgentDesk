@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -28,17 +28,15 @@ pub async fn agent_offices(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Check agent exists
     let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM agents WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -61,7 +59,7 @@ pub async fn agent_offices(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -97,17 +95,15 @@ pub async fn agent_cron(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Check agent exists
     let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM agents WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -133,17 +129,15 @@ pub async fn agent_skills(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Check agent exists
     let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM agents WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -212,17 +206,15 @@ pub async fn agent_dispatched_sessions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Check agent exists
     let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM agents WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -245,7 +237,7 @@ pub async fn agent_dispatched_sessions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -286,17 +278,15 @@ pub async fn agent_timeline(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Check agent exists
     let exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM agents WHERE id = ?1",
-            [&id],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
+            row.get::<_, i64>(0)
+        })
         .map(|c| c > 0)
         .unwrap_or(false);
 
@@ -370,7 +360,7 @@ pub async fn agent_timeline(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 

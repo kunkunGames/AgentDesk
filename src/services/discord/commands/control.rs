@@ -4,12 +4,10 @@ use std::sync::atomic::Ordering;
 use poise::serenity_prelude as serenity;
 use serenity::CreateAttachment;
 
-use super::super::{
-    check_auth, cleanup_session_files, Context, Error,
-};
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::settings::cleanup_channel_uploads;
 use super::super::turn_bridge::cancel_active_token;
+use super::super::{Context, Error, check_auth, cleanup_session_files};
 
 /// /stop — Cancel in-progress AI request
 #[poise::command(slash_command, rename = "stop")]
@@ -85,7 +83,10 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
             session.cleared = true;
         }
         if data.cancel_tokens.remove(&channel_id).is_some() {
-            ctx.data().shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            ctx.data()
+                .shared
+                .global_active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         data.active_request_owner.remove(&channel_id);
         data.intervention_queue.remove(&channel_id);

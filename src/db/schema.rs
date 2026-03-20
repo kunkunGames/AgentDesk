@@ -6,7 +6,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS kv_meta (
             key   TEXT PRIMARY KEY,
             value TEXT
-        );"
+        );",
     )?;
 
     let version: i64 = conn
@@ -34,7 +34,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             department_id TEXT,
             joined_at   TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (office_id, agent_id)
-        );"
+        );",
     )?;
 
     // Additive columns — ALTER TABLE errors are ignored if column already exists
@@ -60,7 +60,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN provider TEXT;");
     let _ = conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN agent_override_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN on_failure_target TEXT;");
-    let _ = conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN max_retries INTEGER DEFAULT 0;");
+    let _ =
+        conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN max_retries INTEGER DEFAULT 0;");
     let _ = conn.execute_batch("ALTER TABLE pipeline_stages ADD COLUMN parallel_with TEXT;");
 
     // Kanban card extended columns for policies
@@ -86,7 +87,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             action      TEXT,
             timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
             actor       TEXT
-        );"
+        );",
     )?;
 
     Ok(())

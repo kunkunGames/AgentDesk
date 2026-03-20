@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -40,7 +40,7 @@ pub async fn list_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -62,12 +62,14 @@ pub async fn list_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| stage_row_to_json(row))
@@ -95,7 +97,7 @@ pub async fn create_stage(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -148,12 +150,15 @@ pub async fn delete_stage(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     match conn.execute("DELETE FROM pipeline_stages WHERE id = ?1", [id]) {
-        Ok(0) => (StatusCode::NOT_FOUND, Json(json!({"error": "stage not found"}))),
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "stage not found"})),
+        ),
         Ok(_) => (StatusCode::OK, Json(json!({"deleted": true, "id": id}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -210,7 +215,7 @@ pub async fn get_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -240,12 +245,14 @@ pub async fn get_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| extended_stage_row_to_json(row))
@@ -270,7 +277,7 @@ pub async fn put_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -347,7 +354,7 @@ pub async fn put_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("readback: {e}")})),
-            )
+            );
         }
     };
 
@@ -374,11 +381,14 @@ pub async fn delete_stages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
-    match conn.execute("DELETE FROM pipeline_stages WHERE repo_id = ?1", [&params.repo]) {
+    match conn.execute(
+        "DELETE FROM pipeline_stages WHERE repo_id = ?1",
+        [&params.repo],
+    ) {
         Ok(n) => (StatusCode::OK, Json(json!({"deleted": true, "count": n}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -398,7 +408,7 @@ pub async fn get_card_pipeline(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -410,7 +420,10 @@ pub async fn get_card_pipeline(
     ) {
         Ok(r) => r,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "card not found"})),
+            );
         }
         Err(e) => {
             return (
@@ -484,13 +497,10 @@ pub async fn get_card_pipeline(
     //    dispatch_type or title against stage entry_skill names
     let current_stage: serde_json::Value = if !history.is_empty() && !stages.is_empty() {
         // Find the most recent active dispatch (pending/running)
-        let active_dispatch = history
-            .iter()
-            .rev()
-            .find(|d| {
-                let s = d["status"].as_str().unwrap_or("");
-                s == "pending" || s == "running" || s == "in_progress"
-            });
+        let active_dispatch = history.iter().rev().find(|d| {
+            let s = d["status"].as_str().unwrap_or("");
+            s == "pending" || s == "running" || s == "in_progress"
+        });
 
         if let Some(dispatch) = active_dispatch {
             let dtype = dispatch["dispatch_type"].as_str().unwrap_or("");
@@ -535,7 +545,7 @@ pub async fn get_card_history(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 

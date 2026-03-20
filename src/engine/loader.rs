@@ -30,10 +30,7 @@ unsafe impl Sync for LoadedPolicy {}
 pub type PolicyStore = Arc<Mutex<Vec<LoadedPolicy>>>;
 
 /// Scan the given directory for *.js files and load each as a policy.
-pub fn load_policies_from_dir(
-    ctx: &Context,
-    dir: &Path,
-) -> Result<Vec<LoadedPolicy>> {
+pub fn load_policies_from_dir(ctx: &Context, dir: &Path) -> Result<Vec<LoadedPolicy>> {
     let mut policies = Vec::new();
 
     if !dir.exists() {
@@ -86,20 +83,22 @@ pub fn load_single_policy(ctx: &Context, path: &Path) -> Result<LoadedPolicy> {
         let globals = ctx.globals();
 
         // Set up capture holder and registerPolicy in JS
-        let _: rquickjs::Value = ctx.eval(r#"
+        let _: rquickjs::Value = ctx
+            .eval(
+                r#"
             var __policyCapture = { captured: null };
             agentdesk.registerPolicy = function(obj) {
                 __policyCapture.captured = obj;
             };
-        "#).map_err(|e| anyhow::anyhow!("failed to set up registerPolicy: {e}"))?;
+        "#,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to set up registerPolicy: {e}"))?;
 
         // Evaluate the policy file (non-strict so policies can use sloppy mode)
         let mut eval_opts = rquickjs::context::EvalOptions::default();
         eval_opts.strict = false;
-        let eval_result: rquickjs::Result<rquickjs::Value> = ctx.eval_with_options(
-            source.as_bytes().to_vec(),
-            eval_opts,
-        );
+        let eval_result: rquickjs::Result<rquickjs::Value> =
+            ctx.eval_with_options(source.as_bytes().to_vec(), eval_opts);
 
         if let Err(e) = eval_result {
             return Err(anyhow::anyhow!("JS eval error in {}: {e}", path.display()));

@@ -76,7 +76,7 @@ export function getAgentTitle(xp: number, isKo: boolean) {
 }
 
 const ACTIVITY_SOURCE_COLORS: Record<string, string> = {
-  remotecc: "#a78bfa",
+  agentdesk: "#a78bfa",
   idle: "#64748b",
 };
 
@@ -309,8 +309,8 @@ export default function AgentInfoCard({
     offline: { ko: "오프라인", en: "Offline" },
   };
 
-  const sourceLabel = agent.activity_source === "remotecc"
-    ? tr("RemoteCC 작업", "RemoteCC")
+  const sourceLabel = agent.activity_source === "agentdesk"
+    ? tr("AgentDesk 작업", "AgentDesk")
     : null;
 
   const workingLinkedSessions = claudeSessions.filter((session) => session.status === "working");
@@ -357,7 +357,7 @@ export default function AgentInfoCard({
       tone: discordBindings.length > 0 ? "#a78bfa" : "#94a3b8",
     },
     {
-      label: tr("RemoteCC 링크", "RemoteCC Links"),
+      label: tr("AgentDesk 링크", "AgentDesk Links"),
       value: `${workingLinkedSessions.length}/${claudeSessions.length}`,
       tone: workingLinkedSessions.length > 0 ? "#38bdf8" : "#94a3b8",
     },
@@ -617,7 +617,7 @@ export default function AgentInfoCard({
                 className="text-[10px] px-2 py-1 rounded-lg"
                 style={{ background: "rgba(56,189,248,0.14)", color: "#67e8f9" }}
               >
-                RemoteCC {workingLinkedSessions.length}/{claudeSessions.length}
+                AgentDesk {workingLinkedSessions.length}/{claudeSessions.length}
               </span>
               <span
                 className="text-[10px] px-2 py-1 rounded-lg"
@@ -784,13 +784,13 @@ export default function AgentInfoCard({
           </div>
         )}
 
-        {/* Linked RemoteCC Sessions */}
+        {/* Linked AgentDesk Sessions */}
         <div className="px-5 py-3" style={{ borderBottom: "1px solid var(--th-card-border)" }}>
           <div
             className="text-[10px] font-semibold uppercase tracking-widest mb-2"
             style={{ color: "var(--th-text-muted)" }}
           >
-            {tr("연결된 RemoteCC 세션", "Linked RemoteCC Sessions")}
+            {tr("연결된 AgentDesk 세션", "Linked AgentDesk Sessions")}
             {!loadingClaudeSessions && ` (${claudeSessions.length})`}
           </div>
           {loadingClaudeSessions ? (
@@ -799,7 +799,7 @@ export default function AgentInfoCard({
             </div>
           ) : claudeSessions.length === 0 ? (
             <div className="text-xs py-1" style={{ color: "var(--th-text-muted)" }}>
-              {tr("연결된 RemoteCC 세션 없음", "No linked RemoteCC sessions")}
+              {tr("연결된 AgentDesk 세션 없음", "No linked AgentDesk sessions")}
             </div>
           ) : (
             <div className="space-y-1.5">
@@ -814,7 +814,7 @@ export default function AgentInfoCard({
                       {s.name || s.session_key}
                     </div>
                     <div className="text-[10px] truncate mt-0.5" style={{ color: "var(--th-text-muted)" }}>
-                      {s.session_info || s.model || "RemoteCC session"}
+                      {s.session_info || s.model || "AgentDesk session"}
                     </div>
                   </div>
                   <div className="flex items-center gap-1 shrink-0">

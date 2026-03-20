@@ -10,6 +10,7 @@ use poise::serenity_prelude as serenity;
 use crate::services::claude::DEFAULT_ALLOWED_TOOLS;
 use crate::services::provider::ProviderKind;
 
+use super::DiscordBotSettings;
 use super::formatting::normalize_allowed_tools;
 use super::org_schema;
 use super::role_map::{
@@ -20,7 +21,6 @@ use super::role_map::{
     resolve_workspace as resolve_workspace_from_role_map,
 };
 use super::runtime_store::{bot_settings_path, discord_uploads_root};
-use super::DiscordBotSettings;
 
 fn json_u64(value: &serde_json::Value) -> Option<u64> {
     value
@@ -148,7 +148,9 @@ pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
 /// Returns None if directory doesn't exist or has no .md files.
 pub(super) fn load_longterm_memory_catalog(role_id: &str) -> Option<String> {
     let root = super::runtime_store::agentdesk_root()?;
-    let memory_dir = root.join("role-context").join(format!("{}.memory", role_id));
+    let memory_dir = root
+        .join("role-context")
+        .join(format!("{}.memory", role_id));
     if !memory_dir.is_dir() {
         return None;
     }
@@ -557,7 +559,7 @@ mod tests {
     #[test]
     fn test_load_bot_settings_keeps_explicit_empty_allowed_tools() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -588,7 +590,7 @@ mod tests {
     #[test]
     fn test_load_bot_settings_normalizes_and_dedupes_tool_names() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -615,7 +617,7 @@ mod tests {
     #[test]
     fn test_load_bot_launch_configs_reads_provider() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             fs::write(
                 settings_dir.join("bot_settings.json"),
@@ -637,7 +639,7 @@ mod tests {
     #[test]
     fn test_load_bot_settings_accepts_string_encoded_ids() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -665,7 +667,7 @@ mod tests {
     #[test]
     fn test_resolve_role_binding_reads_optional_provider() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             fs::write(
                 settings_dir.join("role_map.json"),
@@ -704,7 +706,7 @@ mod tests {
     #[test]
     fn test_load_peer_agents_reads_meeting_config() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             let json = serde_json::json!({
                 "meeting": {
@@ -738,7 +740,7 @@ mod tests {
     #[test]
     fn test_render_peer_agent_guidance_excludes_current_role() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".agentdesk");
+            let settings_dir = temp_home.path().join(".agentdesk").join("config");
             fs::create_dir_all(&settings_dir).unwrap();
             let json = serde_json::json!({
                 "meeting": {

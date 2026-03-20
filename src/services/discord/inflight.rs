@@ -126,7 +126,10 @@ pub(super) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) {
 }
 
 /// Load a single inflight state by provider + channel_id (returns None if missing).
-pub(super) fn load_inflight_state(provider: &ProviderKind, channel_id: u64) -> Option<InflightTurnState> {
+pub(super) fn load_inflight_state(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<InflightTurnState> {
     let root = inflight_runtime_root()?;
     let path = inflight_state_path(&root, provider, channel_id);
     let data = fs::read_to_string(path).ok()?;
@@ -205,7 +208,7 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
 
 #[cfg(test)]
 mod tests {
-    use super::{load_inflight_states_from_root, save_inflight_state_in_root, InflightTurnState};
+    use super::{InflightTurnState, load_inflight_states_from_root, save_inflight_state_in_root};
     use crate::services::provider::ProviderKind;
     use tempfile::TempDir;
 
@@ -216,13 +219,13 @@ mod tests {
         let state = InflightTurnState::new(
             ProviderKind::Codex,
             123,
-            Some("remotecc-cdx".to_string()),
+            Some("adk-cdx".to_string()),
             456,
             789,
             999,
             "hello".to_string(),
             Some("session-1".to_string()),
-            Some("AgentDesk-codex-remotecc-cdx".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
             Some("/tmp/out.jsonl".to_string()),
             Some("/tmp/in.fifo".to_string()),
             42,

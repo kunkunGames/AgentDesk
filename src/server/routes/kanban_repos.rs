@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -23,23 +23,19 @@ pub struct UpdateRepoBody {
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/kanban-repos
-pub async fn list_repos(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_repos(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Ensure default_agent_id column exists
-    let _ = conn.execute_batch(
-        "ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;"
-    );
+    let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
 
     let mut stmt = match conn.prepare(
         "SELECT id, display_name, sync_enabled, last_synced_at, default_agent_id
@@ -51,7 +47,7 @@ pub async fn list_repos(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -96,16 +92,19 @@ pub async fn create_repo(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Ensure default_agent_id column exists
-    let _ = conn.execute_batch(
-        "ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;"
-    );
+    let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
 
-    let display_name = body.repo.split('/').last().unwrap_or(&body.repo).to_string();
+    let display_name = body
+        .repo
+        .split('/')
+        .last()
+        .unwrap_or(&body.repo)
+        .to_string();
 
     match conn.execute(
         "INSERT OR IGNORE INTO github_repos (id, display_name, sync_enabled) VALUES (?1, ?2, TRUE)",
@@ -155,21 +154,24 @@ pub async fn update_repo(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Ensure default_agent_id column exists
-    let _ = conn.execute_batch(
-        "ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;"
-    );
+    let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
 
     if let Some(ref agent_id) = body.default_agent_id {
         match conn.execute(
             "UPDATE github_repos SET default_agent_id = ?1 WHERE id = ?2",
             rusqlite::params![agent_id, id],
         ) {
-            Ok(0) => return (StatusCode::NOT_FOUND, Json(json!({"error": "repo not found"}))),
+            Ok(0) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "repo not found"})),
+                );
+            }
             Ok(_) => {}
             Err(e) => {
                 return (
@@ -181,10 +183,17 @@ pub async fn update_repo(
     } else {
         // Check exists
         let exists: bool = conn
-            .query_row("SELECT COUNT(*) > 0 FROM github_repos WHERE id = ?1", [&id], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM github_repos WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
             .unwrap_or(false);
         if !exists {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "repo not found"})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "repo not found"})),
+            );
         }
     }
 
@@ -222,12 +231,15 @@ pub async fn delete_repo(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     match conn.execute("DELETE FROM github_repos WHERE id = ?1", [&id]) {
-        Ok(0) => (StatusCode::NOT_FOUND, Json(json!({"error": "repo not found"}))),
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "repo not found"})),
+        ),
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

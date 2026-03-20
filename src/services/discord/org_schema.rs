@@ -109,9 +109,7 @@ fn load_org_schema() -> Option<OrgSchema> {
 }
 
 pub(super) fn org_schema_exists() -> bool {
-    org_schema_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    org_schema_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Check if a role_id exists in the org schema's agents map.
@@ -172,10 +170,7 @@ pub(super) fn resolve_role_binding(
         .or(agent_def.provider.as_deref())
         .and_then(ProviderKind::from_str);
 
-    let model = ch_binding
-        .model
-        .clone()
-        .or_else(|| agent_def.model.clone());
+    let model = ch_binding.model.clone().or_else(|| agent_def.model.clone());
 
     // Explicit prompt_file > auto-derived from prompts_root > empty
     let prompt_file = agent_def
@@ -363,7 +358,7 @@ mod tests {
     }
 
     fn write_org_yaml(dir: &std::path::Path, content: &str) {
-        let settings_dir = dir.join(".agentdesk");
+        let settings_dir = dir.join(".agentdesk").join("config");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("org.yaml"), content).unwrap();
     }
@@ -562,7 +557,7 @@ channels:
                 temp_home.path(),
                 r#"
 version: 1
-prompts_root: "~/.remotecc/prompts"
+prompts_root: "~/.agentdesk/prompts"
 agents:
   my-agent:
     display_name: "Agent"
@@ -576,7 +571,9 @@ channels:
             // prompt_file should be auto-derived from prompts_root
             let binding = resolve_role_binding(ChannelId::new(200), None).unwrap();
             assert!(
-                binding.prompt_file.contains("/prompts/agents/my-agent/IDENTITY.md"),
+                binding
+                    .prompt_file
+                    .contains("/prompts/agents/my-agent/IDENTITY.md"),
                 "Expected auto-derived prompt path, got: {}",
                 binding.prompt_file
             );
@@ -599,10 +596,7 @@ suffix_map:
 "#,
             );
 
-            assert_eq!(
-                lookup_suffix_provider("dev-cc"),
-                Some(ProviderKind::Claude)
-            );
+            assert_eq!(lookup_suffix_provider("dev-cc"), Some(ProviderKind::Claude));
         });
     }
 
@@ -620,10 +614,7 @@ suffix_map:
 "#,
             );
 
-            assert_eq!(
-                lookup_suffix_provider("dev-cdx"),
-                Some(ProviderKind::Codex)
-            );
+            assert_eq!(lookup_suffix_provider("dev-cdx"), Some(ProviderKind::Codex));
         });
     }
 
@@ -658,10 +649,7 @@ suffix_map:
         assert!(schema.agents.contains_key("alpha"));
         assert!(schema.agents.contains_key("beta"));
         assert_eq!(schema.agents["alpha"].display_name, "Alpha Agent");
-        assert_eq!(
-            schema.agents["beta"].provider.as_deref(),
-            Some("codex")
-        );
+        assert_eq!(schema.agents["beta"].provider.as_deref(), Some("codex"));
         let suffix_map = schema.suffix_map.as_ref().unwrap();
         assert_eq!(suffix_map.get("-cc").map(String::as_str), Some("claude"));
         assert_eq!(suffix_map.get("-cdx").map(String::as_str), Some("codex"));

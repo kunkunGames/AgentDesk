@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -35,7 +35,7 @@ pub async fn update_decisions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -46,7 +46,9 @@ pub async fn update_decisions(
         if !valid {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("invalid decision '{}', must be 'accept' or 'reject'", item.decision)})),
+                Json(
+                    json!({"error": format!("invalid decision '{}', must be 'accept' or 'reject'", item.decision)}),
+                ),
             );
         }
 
@@ -76,7 +78,7 @@ pub async fn update_decisions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -98,7 +100,10 @@ pub async fn update_decisions(
         None => Vec::new(),
     };
 
-    (StatusCode::OK, Json(json!({"review": {"dispatch_id": id, "decisions": decisions}})))
+    (
+        StatusCode::OK,
+        Json(json!({"review": {"dispatch_id": id, "decisions": decisions}})),
+    )
 }
 
 /// POST /api/kanban-reviews/:id/trigger-rework
@@ -112,7 +117,7 @@ pub async fn trigger_rework(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 

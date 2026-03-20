@@ -242,7 +242,9 @@ pub fn run(
                 || lower.contains("token expired")
                 || lower.contains("invalid api key")
                 || lower.contains("api key")
-                    && (lower.contains("missing") || lower.contains("invalid") || lower.contains("expired"))
+                    && (lower.contains("missing")
+                        || lower.contains("invalid")
+                        || lower.contains("expired"))
             {
                 // Write a synthetic error result to the output file so the watcher
                 // can detect it and stop the spinner.

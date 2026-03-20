@@ -1,8 +1,29 @@
+/**
+ * review-automation.js — ADK Policy: Review Lifecycle
+ * priority: 50
+ *
+ * Hooks:
+ *   onReviewEnter       — 카운터모델 리뷰 디스패치 생성
+ *   onDispatchCompleted — review/decision dispatch 완료 → verdict 처리
+ *   onReviewVerdict     — 외부 API verdict 수신 처리
+ */
+
+function sendDiscordReview(target, content, bot) {
+  try {
+    var port = agentdesk.config.get("health_port") || 8798;
+    agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
+      target: target, content: content, bot: bot || "announce"
+    });
+  } catch (e) {
+    agentdesk.log.warn("[review] Discord send failed: " + e);
+  }
+}
+
 var reviewAutomation = {
   name: "review-automation",
   priority: 50,
 
-  // When a card enters review state, check review configuration
+  // ── Review Enter — counter-model review trigger ───────────
   onReviewEnter: function(payload) {
     var cards = agentdesk.db.query(
       "SELECT id, repo_id, assigned_agent_id, review_round, deferred_dod_json FROM kanban_cards WHERE id = ?",
@@ -11,10 +32,9 @@ var reviewAutomation = {
     if (cards.length === 0) return;
     var card = cards[0];
 
-    // Check if review is enabled for this repo
+    // Check if review is enabled
     var reviewEnabled = agentdesk.config.get("review_enabled");
     if (reviewEnabled === "false" || reviewEnabled === false) {
-      // Review disabled — skip directly to done
       agentdesk.db.execute(
         "UPDATE kanban_cards SET status = 'done', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
         [card.id]
@@ -26,16 +46,82 @@ var reviewAutomation = {
     // Increment review round
     var newRound = (card.review_round || 0) + 1;
     agentdesk.db.execute(
-      "UPDATE kanban_cards SET review_round = ?, updated_at = datetime('now') WHERE id = ?",
+      "UPDATE kanban_cards SET review_round = ?, review_status = 'reviewing', updated_at = datetime('now') WHERE id = ?",
       [newRound, card.id]
     );
-    agentdesk.log.info("[review] Card " + card.id + " entering review round " + newRound);
+
+    // Check review round limit
+    var maxRounds = agentdesk.config.get("max_review_rounds") || 3;
+    if (newRound > maxRounds) {
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET review_status = 'dilemma_pending', updated_at = datetime('now') WHERE id = ?",
+        [card.id]
+      );
+      agentdesk.log.warn("[review] Max review rounds (" + maxRounds + ") reached for " + card.id);
+      // Notify PMD about dilemma
+      var pmdChannel = agentdesk.config.get("pmd_channel_id");
+      if (pmdChannel) {
+        sendDiscordReview(
+          "channel:" + pmdChannel,
+          "[Review Dilemma] " + card.id + " — 리뷰 라운드 " + maxRounds + "회 초과. 수동 결정 필요.",
+          "notify"
+        );
+      }
+      return;
+    }
+
+    // Counter-model review: send to alternate channel (Claude↔Codex pair)
+    var counterModelEnabled = agentdesk.config.get("counter_model_review_enabled");
+    if (counterModelEnabled === false || counterModelEnabled === "false") {
+      agentdesk.log.info("[review] Counter-model disabled, manual review for " + card.id);
+      return;
+    }
+
+    if (!card.assigned_agent_id) return;
+
+    // Get agent's alternate channel (CDX for Claude agents, CC for Codex)
+    var agentRow = agentdesk.db.query(
+      "SELECT discord_channel_id, discord_channel_alt FROM agents WHERE id = ?",
+      [card.assigned_agent_id]
+    );
+    if (agentRow.length === 0 || !agentRow[0].discord_channel_alt) {
+      agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + ", manual review");
+      return;
+    }
+
+    var counterChannelId = agentRow[0].discord_channel_alt;
+
+    // Create review dispatch (targets same agent — counter channel picks it up)
+    try {
+      var reviewDispatchId = agentdesk.dispatch.create(
+        card.id,
+        card.assigned_agent_id,
+        "review",
+        "[Review R" + newRound + "] " + card.id
+      );
+      agentdesk.log.info("[review] Counter-model review dispatched: " + reviewDispatchId);
+
+      // Send review message to counter channel via announce bot
+      var port = agentdesk.config.get("health_port") || 8798;
+      var issueUrl = agentdesk.db.query(
+        "SELECT github_issue_url, title FROM kanban_cards WHERE id = ?", [card.id]
+      );
+      var title = (issueUrl.length > 0) ? issueUrl[0].title : card.id;
+      var url = (issueUrl.length > 0 && issueUrl[0].github_issue_url) ? "\n" + issueUrl[0].github_issue_url : "";
+      sendDiscordReview(
+        "channel:" + counterChannelId,
+        "⚠️ 검토 전용 — 작업 착수 금지\n\n[Counter Review R" + newRound + "] " + title + url,
+        "announce"
+      );
+    } catch (e) {
+      agentdesk.log.warn("[review] Review dispatch failed: " + e);
+    }
   },
 
-  // When a review/decision dispatch completes
+  // ── Dispatch Completed — review/decision verdict ──────────
   onDispatchCompleted: function(payload) {
     var dispatches = agentdesk.db.query(
-      "SELECT id, kanban_card_id, dispatch_type, result FROM task_dispatches WHERE id = ?",
+      "SELECT id, kanban_card_id, dispatch_type, result_summary FROM task_dispatches WHERE id = ?",
       [payload.dispatch_id]
     );
     if (dispatches.length === 0) return;
@@ -46,47 +132,87 @@ var reviewAutomation = {
     if (!dispatch.kanban_card_id) return;
 
     var result = null;
-    try { result = JSON.parse(dispatch.result || "{}"); } catch(e) { result = {}; }
+    try { result = JSON.parse(dispatch.result_summary || "{}"); } catch(e) { result = {}; }
     var verdict = result.verdict || result.decision;
 
-    if (!verdict) return;
-
-    var cardId = dispatch.kanban_card_id;
-
-    if (verdict === "pass" || verdict === "accept" || verdict === "approved") {
-      // Review passed — check pipeline, otherwise done
-      var stages = agentdesk.db.query(
-        "SELECT id FROM pipeline_stages WHERE repo_id = (SELECT repo_id FROM kanban_cards WHERE id = ?) AND trigger_after = 'review_pass' LIMIT 1",
-        [cardId]
-      );
-      if (stages.length > 0) {
-        agentdesk.log.info("[review] Card " + cardId + " passed review, entering pipeline");
-        // Pipeline policy will handle the next stage
-      } else {
-        agentdesk.db.execute(
-          "UPDATE kanban_cards SET status = 'done', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
-          [cardId]
-        );
-        agentdesk.log.info("[review] Card " + cardId + " passed review → done");
-      }
-    } else if (verdict === "improve" || verdict === "reject" || verdict === "rework") {
-      // Needs rework — back to ready for re-dispatch
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET status = 'ready', updated_at = datetime('now') WHERE id = ?",
-        [cardId]
-      );
-      // Store review notes
-      if (result.notes || result.feedback) {
-        agentdesk.db.execute(
-          "UPDATE kanban_cards SET review_notes = ? WHERE id = ?",
-          [result.notes || result.feedback, cardId]
-        );
-      }
-      agentdesk.log.info("[review] Card " + cardId + " needs rework → ready");
-    } else {
-      agentdesk.log.warn("[review] Unknown verdict '" + verdict + "' for card " + cardId);
+    if (!verdict) {
+      agentdesk.log.info("[review] No verdict in dispatch " + dispatch.id + " result, waiting for API verdict");
+      return;
     }
+
+    processVerdict(dispatch.kanban_card_id, verdict, result);
+  },
+
+  // ── Review Verdict — from /api/review-verdict ─────────────
+  onReviewVerdict: function(payload) {
+    if (!payload.card_id || !payload.verdict) return;
+    processVerdict(payload.card_id, payload.verdict, payload);
   }
 };
+
+function processVerdict(cardId, verdict, result) {
+  if (verdict === "pass" || verdict === "accept" || verdict === "approved") {
+    // Review passed — check pipeline, otherwise done
+    var stages = agentdesk.db.query(
+      "SELECT id FROM pipeline_stages WHERE repo_id = (SELECT repo_id FROM kanban_cards WHERE id = ?) AND trigger_after = 'review_pass' LIMIT 1",
+      [cardId]
+    );
+    if (stages.length > 0) {
+      agentdesk.log.info("[review] Card " + cardId + " passed review, entering pipeline");
+    } else {
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET status = 'done', review_status = NULL, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
+        [cardId]
+      );
+      agentdesk.log.info("[review] Card " + cardId + " passed review → done");
+    }
+
+  } else if (verdict === "improve" || verdict === "reject" || verdict === "rework") {
+    // Store review notes
+    if (result.notes || result.feedback) {
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET review_notes = ? WHERE id = ?",
+        [result.notes || result.feedback, cardId]
+      );
+    }
+
+    // Set review_status to suggestion_pending (agent decision phase)
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET review_status = 'suggestion_pending', updated_at = datetime('now') WHERE id = ?",
+      [cardId]
+    );
+    agentdesk.log.info("[review] Card " + cardId + " needs rework → suggestion_pending");
+
+    // Auto-create rework dispatch to original agent
+    var cards = agentdesk.db.query(
+      "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?", [cardId]
+    );
+    if (cards.length > 0 && cards[0].assigned_agent_id) {
+      try {
+        var reworkId = agentdesk.dispatch.create(
+          cardId,
+          cards[0].assigned_agent_id,
+          "rework",
+          "[Rework] " + (cards[0].title || cardId)
+        );
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET status = 'in_progress', review_status = 'rework_pending', updated_at = datetime('now') WHERE id = ?",
+          [cardId]
+        );
+        agentdesk.log.info("[review] Rework dispatch " + reworkId + " created for " + cardId);
+      } catch (e) {
+        agentdesk.log.warn("[review] Rework dispatch failed: " + e);
+        // Fallback: back to ready
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET status = 'ready', review_status = NULL, updated_at = datetime('now') WHERE id = ?",
+          [cardId]
+        );
+      }
+    }
+
+  } else {
+    agentdesk.log.warn("[review] Unknown verdict '" + verdict + "' for card " + cardId);
+  }
+}
 
 agentdesk.registerPolicy(reviewAutomation);

@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -9,16 +9,14 @@ use serde_json::json;
 use super::AppState;
 
 /// GET /api/skills/catalog
-pub async fn catalog(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn catalog(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -31,7 +29,7 @@ pub async fn catalog(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("query prepare failed: {e}")})),
-            )
+            );
         }
     };
 
@@ -73,7 +71,7 @@ pub async fn ranking(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -104,7 +102,7 @@ pub async fn ranking(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("query prepare failed: {e}")})),
-                )
+                );
             }
         };
 
@@ -142,7 +140,7 @@ pub async fn ranking(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("query prepare failed: {e}")})),
-                )
+                );
             }
         };
 

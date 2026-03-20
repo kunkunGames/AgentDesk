@@ -6,14 +6,14 @@ use std::time::Duration;
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 
+use super::SharedData;
 use super::formatting::send_long_message_raw;
 use super::runtime_store::{atomic_write, discord_restart_reports_root};
-use super::SharedData;
 use crate::services::provider::ProviderKind;
 
 const RESTART_REPORT_VERSION: u32 = 1;
-pub(crate) const RESTART_REPORT_CHANNEL_ENV: &str = "REMOTECC_REPORT_CHANNEL_ID";
-pub(crate) const RESTART_REPORT_PROVIDER_ENV: &str = "REMOTECC_REPORT_PROVIDER";
+pub(crate) const RESTART_REPORT_CHANNEL_ENV: &str = "AGENTDESK_REPORT_CHANNEL_ID";
+pub(crate) const RESTART_REPORT_PROVIDER_ENV: &str = "AGENTDESK_REPORT_PROVIDER";
 
 #[derive(Debug, Clone)]
 pub(crate) struct RestartReportContext {
@@ -250,7 +250,10 @@ pub(super) async fn flush_restart_reports(
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
                     "  [{ts}] ⏳ pending restart report for channel {} deferred (age={:.0}s, active={}, finalizing={})",
-                    report.channel_id, age.as_secs_f64(), has_active_turn, has_finalizing
+                    report.channel_id,
+                    age.as_secs_f64(),
+                    has_active_turn,
+                    has_finalizing
                 );
                 continue;
             }
@@ -264,12 +267,23 @@ pub(super) async fn flush_restart_reports(
                 let queue_preview = {
                     let data = shared.core.lock().await;
                     if let Some(queue) = data.intervention_queue.get(&channel_id) {
-                        let items: Vec<String> = queue.iter().take(5).map(|item| {
-                            let raw: String = item.text.lines().next().unwrap_or("").chars().take(50).collect();
-                            // Escape mentions to prevent re-triggering @everyone/@here/role/user mentions
-                            let preview = raw.replace('@', "@\u{200B}");
-                            format!("• <@{}>: {}", item.author_id, preview)
-                        }).collect();
+                        let items: Vec<String> = queue
+                            .iter()
+                            .take(5)
+                            .map(|item| {
+                                let raw: String = item
+                                    .text
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(50)
+                                    .collect();
+                                // Escape mentions to prevent re-triggering @everyone/@here/role/user mentions
+                                let preview = raw.replace('@', "@\u{200B}");
+                                format!("• <@{}>: {}", item.author_id, preview)
+                            })
+                            .collect();
                         if items.is_empty() {
                             None
                         } else {
@@ -278,7 +292,12 @@ pub(super) async fn flush_restart_reports(
                             } else {
                                 String::new()
                             };
-                            Some(format!("대기 메시지 {}건:\n{}{}", queue.len(), items.join("\n"), overflow))
+                            Some(format!(
+                                "대기 메시지 {}건:\n{}{}",
+                                queue.len(),
+                                items.join("\n"),
+                                overflow
+                            ))
                         }
                     } else {
                         None
@@ -312,8 +331,10 @@ pub(super) async fn flush_restart_reports(
                     // Mark user message as completed: ⏳ → ✅
                     if let Some(umid) = report.user_msg_id {
                         let user_msg_id = serenity::model::id::MessageId::new(umid);
-                        super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
-                        super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
+                        super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
+                            .await;
+                        super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅')
+                            .await;
                     }
                     clear_restart_report(provider, report.channel_id);
                     break;
@@ -341,8 +362,8 @@ pub(super) async fn flush_restart_reports(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_restart_reports_in_root, save_restart_report_in_root, RestartCompletionReport,
-        RESTART_REPORT_VERSION,
+        RESTART_REPORT_VERSION, RestartCompletionReport, load_restart_reports_in_root,
+        save_restart_report_in_root,
     };
     use crate::services::provider::ProviderKind;
     use tempfile::TempDir;

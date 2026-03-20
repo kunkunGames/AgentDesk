@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -25,7 +25,7 @@ pub async fn get_stats(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -48,7 +48,10 @@ pub async fn get_stats(
     let agent_where = |col: &str| -> String {
         match &agent_ids {
             Some(ids) if !ids.is_empty() => {
-                let placeholders: Vec<String> = ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+                let placeholders: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!("'{}'", id.replace('\'', "''")))
+                    .collect();
                 format!("{} IN ({})", col, placeholders.join(","))
             }
             Some(_) => format!("{} = '__none__'", col), // empty office
@@ -109,7 +112,11 @@ pub async fn get_stats(
         let dept_filter = if params.office_id.is_some() {
             format!(
                 "WHERE d.id IN (SELECT DISTINCT oa.department_id FROM office_agents oa WHERE oa.office_id = '{}' AND oa.department_id IS NOT NULL)",
-                params.office_id.as_deref().unwrap_or("").replace('\'', "''")
+                params
+                    .office_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .replace('\'', "''")
             )
         } else {
             String::new()
@@ -190,8 +197,15 @@ pub async fn get_stats(
         // by_status
         let mut by_status = serde_json::Map::new();
         let statuses = [
-            "backlog", "ready", "requested", "in_progress", "review",
-            "blocked", "failed", "done", "cancelled",
+            "backlog",
+            "ready",
+            "requested",
+            "in_progress",
+            "review",
+            "blocked",
+            "failed",
+            "done",
+            "cancelled",
         ];
         for status in &statuses {
             let count: i64 = conn

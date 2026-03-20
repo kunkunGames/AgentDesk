@@ -35,9 +35,7 @@ fn default_port() -> u16 {
 }
 
 /// Stub — always returns Err. Real implementation requires russh.
-pub async fn ssh_connect_and_auth(
-    _profile: &RemoteProfile,
-) -> Result<SshConnectionStub, String> {
+pub async fn ssh_connect_and_auth(_profile: &RemoteProfile) -> Result<SshConnectionStub, String> {
     Err("SSH not available in AgentDesk build".to_string())
 }
 

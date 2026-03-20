@@ -4,8 +4,8 @@
 //! then create JS wrappers that do the marshaling. This avoids rquickjs
 //! lifetime issues with Value<'js> in MutFn closures.
 
-use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use crate::db::Db;
+use rquickjs::{Ctx, Function, Object, Result as JsResult};
 
 /// Register all `agentdesk.*` globals in the given JS context.
 pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
@@ -70,7 +70,8 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     ad.set("db", db_obj)?;
 
     // JS wrappers that do JSON marshaling
-    let _: rquickjs::Value = ctx.eval(r#"
+    let _: rquickjs::Value = ctx.eval(
+        r#"
         (function() {
             var rawQuery = agentdesk.db.__query_raw;
             var rawExec = agentdesk.db.__execute_raw;
@@ -85,7 +86,8 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             };
         })();
         undefined;
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -109,8 +111,10 @@ fn db_query_raw(db: &Db, sql: &str, params_json: &str) -> String {
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
         .collect();
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = match stmt.query_map(params_ref.as_slice(), |row| {
         let mut map = serde_json::Map::new();
@@ -138,8 +142,10 @@ fn db_execute_raw(db: &Db, sql: &str, params_json: &str) -> String {
         Err(e) => return format!(r#"{{"__error":"db lock: {e}"}}"#),
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let changes = match conn.execute(sql, params_ref.as_slice()) {
         Ok(n) => n,
@@ -174,10 +180,7 @@ fn sqlite_to_json(val: &rusqlite::types::Value) -> serde_json::Value {
         rusqlite::types::Value::Real(f) => serde_json::json!(*f),
         rusqlite::types::Value::Text(s) => serde_json::Value::String(s.clone()),
         rusqlite::types::Value::Blob(b) => {
-            let encoded = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                b,
-            );
+            let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b);
             serde_json::Value::String(encoded)
         }
     }
@@ -231,11 +234,9 @@ fn register_config_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     Ok(c) => c,
                     Err(_) => return "null".to_string(),
                 };
-                match conn.query_row(
-                    "SELECT value FROM kv_meta WHERE key = ?1",
-                    [&key],
-                    |row| row.get::<_, String>(0),
-                ) {
+                match conn.query_row("SELECT value FROM kv_meta WHERE key = ?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                }) {
                     Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "null".to_string()),
                     Err(_) => "null".to_string(),
                 }
@@ -246,7 +247,8 @@ fn register_config_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     ad.set("config", config_obj)?;
 
     // JS wrapper
-    let _: rquickjs::Value = ctx.eval(r#"
+    let _: rquickjs::Value = ctx.eval(
+        r#"
         (function() {
             var rawGet = agentdesk.config.__get_raw;
             agentdesk.config.get = function(key) {
@@ -254,7 +256,8 @@ fn register_config_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             };
         })();
         undefined;
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -271,33 +274,32 @@ fn register_http_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
 
     http_obj.set(
         "__post_raw",
-        Function::new(
-            ctx.clone(),
-            |url: String, body_json: String| -> String {
-                if !url.starts_with("http://127.0.0.1") {
-                    return r#"{"error":"only localhost allowed"}"#.to_string();
-                }
-                match ureq::post(&url)
-                    .set("Content-Type", "application/json")
-                    .send_string(&body_json)
-                {
-                    Ok(resp) => resp.into_string().unwrap_or_else(|_| "{}".to_string()),
-                    Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-                }
-            },
-        )?,
+        Function::new(ctx.clone(), |url: String, body_json: String| -> String {
+            if !url.starts_with("http://127.0.0.1") {
+                return r#"{"error":"only localhost allowed"}"#.to_string();
+            }
+            match ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .send_string(&body_json)
+            {
+                Ok(resp) => resp.into_string().unwrap_or_else(|_| "{}".to_string()),
+                Err(e) => format!(r#"{{"error":"{}"}}"#, e),
+            }
+        })?,
     )?;
 
     ad.set("http", http_obj)?;
 
-    let _: rquickjs::Value = ctx.eval(r#"
+    let _: rquickjs::Value = ctx.eval(
+        r#"
         (function() {
             var raw = agentdesk.http.__post_raw;
             agentdesk.http.post = function(url, body) {
                 return JSON.parse(raw(url, JSON.stringify(body)));
             };
         })();
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -319,7 +321,11 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
         Function::new(
             ctx.clone(),
             rquickjs::function::MutFn::from(
-                move |card_id: String, agent_id: String, dispatch_type: String, title: String| -> String {
+                move |card_id: String,
+                      agent_id: String,
+                      dispatch_type: String,
+                      title: String|
+                      -> String {
                     dispatch_create_raw(&db_d, &card_id, &agent_id, &dispatch_type, &title)
                 },
             ),
@@ -345,7 +351,7 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
                             target: "channel:" + channel[0].discord_channel_id,
                             content: "[Dispatch] " + (title || "Dispatch") + (result.issue_url ? "\n" + result.issue_url : ""),
-                            source: "kanban-rules"
+                            source: agentId
                         });
                     }
                 } catch(e) {
@@ -359,7 +365,13 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     Ok(())
 }
 
-fn dispatch_create_raw(db: &Db, card_id: &str, agent_id: &str, dispatch_type: &str, title: &str) -> String {
+fn dispatch_create_raw(
+    db: &Db,
+    card_id: &str,
+    agent_id: &str,
+    dispatch_type: &str,
+    title: &str,
+) -> String {
     let dispatch_id = uuid::Uuid::new_v4().to_string();
     let conn = match db.lock() {
         Ok(c) => c,
@@ -385,15 +397,22 @@ fn dispatch_create_raw(db: &Db, card_id: &str, agent_id: &str, dispatch_type: &s
 
     // Get issue URL for Discord message
     let issue_url: Option<String> = conn
-        .query_row("SELECT github_issue_url FROM kanban_cards WHERE id = ?1", [card_id], |row| row.get(0))
-        .ok().flatten();
+        .query_row(
+            "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
 
     format!(
         r#"{{"dispatch_id":"{}","card_id":"{}","agent_id":"{}","issue_url":{}}}"#,
         dispatch_id,
         card_id,
         agent_id,
-        issue_url.map(|u| format!("\"{}\"", u)).unwrap_or_else(|| "null".to_string()),
+        issue_url
+            .map(|u| format!("\"{}\"", u))
+            .unwrap_or_else(|| "null".to_string()),
     )
 }
 
@@ -468,12 +487,14 @@ mod tests {
         ctx.with(|ctx| {
             register_globals(&ctx, db.clone()).unwrap();
             let _: rquickjs::Value = ctx
-                .eval(r#"
+                .eval(
+                    r#"
                     agentdesk.log.info("test info message");
                     agentdesk.log.warn("test warn message");
                     agentdesk.log.error("test error message");
                     null;
-                "#)
+                "#,
+                )
                 .unwrap();
         });
     }
@@ -486,16 +507,15 @@ mod tests {
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('test_key', 'test_value')",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
             register_globals(&ctx, db.clone()).unwrap();
-            let val: String = ctx
-                .eval(r#"agentdesk.config.get("test_key")"#)
-                .unwrap();
+            let val: String = ctx.eval(r#"agentdesk.config.get("test_key")"#).unwrap();
             assert_eq!(val, "test_value");
 
             let is_null: bool = ctx

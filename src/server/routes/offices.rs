@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -41,16 +41,14 @@ pub struct BatchAddAgentsBody {
 // ── Handlers ──────────────────────────────────────────────────
 
 /// GET /api/offices
-pub async fn list_offices(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_offices(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -107,7 +105,7 @@ pub async fn create_office(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -145,7 +143,7 @@ pub async fn update_office(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -174,21 +172,20 @@ pub async fn update_office(
     let sql = format!("UPDATE offices SET {} WHERE id = ?{}", sets.join(", "), idx);
     values.push(Box::new(id.clone()));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        values.iter().map(|v| v.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "office not found"})),
-            )
+            );
         }
         Ok(_) => {}
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     }
 
@@ -223,7 +220,7 @@ pub async fn delete_office(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -256,7 +253,7 @@ pub async fn add_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -301,7 +298,7 @@ pub async fn remove_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -333,7 +330,7 @@ pub async fn update_office_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -365,7 +362,7 @@ pub async fn batch_add_agents(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 

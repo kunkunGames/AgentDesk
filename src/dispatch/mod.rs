@@ -241,13 +241,8 @@ mod tests {
         .unwrap();
         let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
 
-        let completed = complete_dispatch(
-            &db,
-            &engine,
-            &dispatch_id,
-            &json!({"output": "done"}),
-        )
-        .unwrap();
+        let completed =
+            complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
 
         assert_eq!(completed["status"], "completed");
     }
@@ -257,12 +252,7 @@ mod tests {
         let db = test_db();
         let engine = test_engine(&db);
 
-        let result = complete_dispatch(
-            &db,
-            &engine,
-            "nonexistent",
-            &json!({}),
-        );
+        let result = complete_dispatch(&db, &engine, "nonexistent", &json!({}));
         assert!(result.is_err());
     }
 }

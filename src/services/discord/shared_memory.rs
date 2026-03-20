@@ -191,7 +191,13 @@ fn build_shared_memory_context_at_root(
 ) -> Option<String> {
     let path = shared_agent_memory_path(&root, role_id);
     let store = load_store_from_path(&path, role_id);
-    build_context_from_store(&store, provider, channel_id, has_provider_session, last_injected_ts)
+    build_context_from_store(
+        &store,
+        provider,
+        channel_id,
+        has_provider_session,
+        last_injected_ts,
+    )
 }
 
 /// Returns the timestamp of the newest turn in context, for dedup tracking.
@@ -276,9 +282,8 @@ fn append_shared_memory_turn_at_root(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_shared_memory_turn_at_root, build_context_from_store,
+        SharedAgentMemoryStore, append_shared_memory_turn_at_root, build_context_from_store,
         build_shared_memory_context_at_root, load_store_from_path, shared_agent_memory_path,
-        SharedAgentMemoryStore,
     };
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::ChannelId;
@@ -322,9 +327,14 @@ mod tests {
         super::save_store_to_path(&path, &store).expect("save");
 
         let loaded = load_store_from_path(&path, "ch-pmd");
-        let rendered =
-            build_context_from_store(&loaded, &ProviderKind::Claude, ChannelId::new(1), true, None)
-                .expect("context");
+        let rendered = build_context_from_store(
+            &loaded,
+            &ProviderKind::Claude,
+            ChannelId::new(1),
+            true,
+            None,
+        )
+        .expect("context");
 
         assert!(rendered.contains("codex remembered"));
         assert!(!rendered.contains("same-channel"));

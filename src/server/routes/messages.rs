@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -46,7 +46,7 @@ pub async fn list_messages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -91,12 +91,14 @@ pub async fn list_messages(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| message_row_to_json(row))
@@ -124,7 +126,7 @@ pub async fn create_message(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 

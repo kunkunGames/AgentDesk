@@ -116,17 +116,15 @@ pub fn sync_all_repos(db: &Db) -> Result<SyncResult, String> {
         }
 
         match fetch_issues(&repo.id) {
-            Ok(issues) => {
-                match sync_github_issues_for_repo(db, &repo.id, &issues) {
-                    Ok(r) => {
-                        total.closed_count += r.closed_count;
-                        total.inconsistency_count += r.inconsistency_count;
-                    }
-                    Err(e) => {
-                        tracing::error!("[github-sync] sync failed for {}: {e}", repo.id);
-                    }
+            Ok(issues) => match sync_github_issues_for_repo(db, &repo.id, &issues) {
+                Ok(r) => {
+                    total.closed_count += r.closed_count;
+                    total.inconsistency_count += r.inconsistency_count;
                 }
-            }
+                Err(e) => {
+                    tracing::error!("[github-sync] sync failed for {}: {e}", repo.id);
+                }
+            },
             Err(e) => {
                 tracing::warn!("[github-sync] fetch failed for {}: {e}", repo.id);
             }
@@ -176,10 +174,8 @@ mod tests {
         // Register repo and create a card linked to issue #5
         {
             let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO github_repos (id) VALUES ('owner/repo')",
-                [],
-            ).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO kanban_cards (id, repo_id, title, status, priority, github_issue_number, created_at, updated_at)
                  VALUES ('c1', 'owner/repo', 'Fix bug', 'in_progress', 'medium', 5, datetime('now'), datetime('now'))",
@@ -202,7 +198,9 @@ mod tests {
         // Verify card is now done
         let conn = db.lock().unwrap();
         let status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| r.get(0))
+            .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "done");
     }
@@ -213,10 +211,8 @@ mod tests {
 
         {
             let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO github_repos (id) VALUES ('owner/repo')",
-                [],
-            ).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO kanban_cards (id, repo_id, title, status, priority, github_issue_number, created_at, updated_at)
                  VALUES ('c1', 'owner/repo', 'Feature', 'done', 'medium', 10, datetime('now'), datetime('now'))",
@@ -243,10 +239,8 @@ mod tests {
 
         {
             let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO github_repos (id) VALUES ('owner/repo')",
-                [],
-            ).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO kanban_cards (id, repo_id, title, status, priority, github_issue_number, created_at, updated_at)
                  VALUES ('c1', 'owner/repo', 'Done thing', 'done', 'medium', 7, datetime('now'), datetime('now'))",

@@ -1,23 +1,17 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use serde_json::json;
 
 use super::AppState;
 
 /// GET /api/settings
-pub async fn get_settings(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_settings(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -29,8 +23,7 @@ pub async fn get_settings(
         )
         .unwrap_or_else(|_| "{}".to_string());
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&value).unwrap_or(json!({}));
+    let parsed: serde_json::Value = serde_json::from_str(&value).unwrap_or(json!({}));
 
     (StatusCode::OK, Json(parsed))
 }
@@ -46,7 +39,7 @@ pub async fn put_settings(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -75,7 +68,7 @@ pub async fn get_runtime_config(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -87,8 +80,7 @@ pub async fn get_runtime_config(
         )
         .unwrap_or_else(|_| "{}".to_string());
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&value).unwrap_or(json!({}));
+    let parsed: serde_json::Value = serde_json::from_str(&value).unwrap_or(json!({}));
 
     (StatusCode::OK, Json(parsed))
 }
@@ -104,7 +96,7 @@ pub async fn put_runtime_config(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 

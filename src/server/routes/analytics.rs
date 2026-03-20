@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -10,16 +10,14 @@ use std::process::Command;
 use super::AppState;
 
 /// GET /api/streaks
-pub async fn streaks(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn streaks(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -40,7 +38,7 @@ pub async fn streaks(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("query prepare failed: {e}")})),
-            )
+            );
         }
     };
 
@@ -170,7 +168,7 @@ pub async fn activity_heatmap(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -257,7 +255,7 @@ pub async fn audit_logs(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -300,7 +298,7 @@ pub async fn audit_logs(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("query prepare failed: {e}")})),
-            )
+            );
         }
     };
 
@@ -378,7 +376,7 @@ pub async fn skills_trend(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -394,7 +392,7 @@ pub async fn skills_trend(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("query prepare failed: {e}")})),
-            )
+            );
         }
     };
 

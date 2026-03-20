@@ -1,14 +1,14 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
+use std::sync::mpsc::Sender;
 
 use crate::services::claude::{
-    self, process_stream_line, read_output_file_until_result, shell_escape, CancelToken,
-    ReadOutputResult, SessionProbe, StreamLineState, StreamMessage,
+    self, CancelToken, ReadOutputResult, SessionProbe, StreamLineState, StreamMessage,
+    process_stream_line, read_output_file_until_result, shell_escape,
 };
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
@@ -16,12 +16,11 @@ use crate::services::discord::restart_report::{
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, tmux_session_exists,
-    tmux_session_has_live_pane,
+    record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
 };
 
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
-const TMUX_PROMPT_B64_PREFIX: &str = "__REMOTECC_B64__:";
+const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
 fn resolve_codex_path() -> Option<String> {
     if let Ok(output) = Command::new("which").arg("codex").output() {
@@ -130,7 +129,7 @@ pub fn execute_command_streaming(
 
     if let Some(profile) = remote_profile {
         let use_remote_tmux = tmux_session_name.is_some()
-            && std::env::var("REMOTECC_CODEX_REMOTE_TMUX")
+            && std::env::var("AGENTDESK_CODEX_REMOTE_TMUX")
                 .map(|value| {
                     let normalized = value.trim().to_ascii_lowercase();
                     normalized == "1" || normalized == "true" || normalized == "yes"
@@ -365,7 +364,8 @@ fn execute_streaming_local_tmux(
     report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     let output_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
-    let input_fifo_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "input");
+    let input_fifo_path =
+        crate::services::tmux_common::session_temp_path(tmux_session_name, "input");
     let prompt_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "prompt");
     let owner_path = tmux_owner_path(tmux_session_name);
 
@@ -399,7 +399,10 @@ fn execute_streaming_local_tmux(
     let _ = std::fs::remove_file(&input_fifo_path);
     let _ = std::fs::remove_file(&prompt_path);
     let _ = std::fs::remove_file(&owner_path);
-    let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(tmux_session_name, "sh"));
+    let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(
+        tmux_session_name,
+        "sh",
+    ));
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
 
@@ -427,9 +430,7 @@ fn execute_streaming_local_tmux(
     let script_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "sh");
 
     let mut env_lines = String::from("unset CLAUDECODE\n");
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR")
-        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
-    {
+    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
         let trimmed = root_dir.trim();
         if !trimmed.is_empty() {
             env_lines.push_str(&format!(
@@ -509,7 +510,8 @@ fn execute_streaming_local_tmux(
         .output();
 
     // Stamp generation marker so post-restart watcher restore can detect old sessions
-    let gen_marker_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
+    let gen_marker_path =
+        crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
     let current_gen = crate::services::discord::runtime_store::load_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
 
@@ -611,10 +613,20 @@ fn execute_streaming_local_process_codex(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
 ) -> Result<(), String> {
-    use crate::services::session_backend::{ProcessBackend, SessionBackend, SessionConfig, SessionHandle};
+    use crate::services::session_backend::{
+        ProcessBackend, SessionBackend, SessionConfig, SessionHandle,
+    };
 
-    let output_path = format!("{}/remotecc-{}.jsonl", std::env::temp_dir().display(), session_name);
-    let prompt_path = format!("{}/remotecc-{}.prompt", std::env::temp_dir().display(), session_name);
+    let output_path = format!(
+        "{}/agentdesk-{}.jsonl",
+        std::env::temp_dir().display(),
+        session_name
+    );
+    let prompt_path = format!(
+        "{}/agentdesk-{}.prompt",
+        std::env::temp_dir().display(),
+        session_name
+    );
 
     // Check for existing process session
     {
@@ -626,7 +638,9 @@ fn execute_streaming_local_process_codex(
                 // Snapshot file length BEFORE sending input to avoid race:
                 // Codex wrapper appends JSONL immediately on stdin, so a fast
                 // response could be written before we read the offset.
-                let start_offset = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                let start_offset = std::fs::metadata(&output_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
 
                 // For codex follow-up, encode prompt in the expected format
                 let encoded = format!(
@@ -648,7 +662,8 @@ fn execute_streaming_local_process_codex(
                 )?;
 
                 match read_result {
-                    ReadOutputResult::Completed { offset } | ReadOutputResult::Cancelled { offset } => {
+                    ReadOutputResult::Completed { offset }
+                    | ReadOutputResult::Cancelled { offset } => {
                         let _ = sender.send(StreamMessage::ProcessReady {
                             output_path: output_path.to_string(),
                             session_name: session_name.to_string(),
@@ -675,8 +690,8 @@ fn execute_streaming_local_process_codex(
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
 
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let config = SessionConfig {
         session_name: session_name.to_string(),
@@ -697,7 +712,10 @@ fn execute_streaming_local_process_codex(
         *token.child_pid.lock().unwrap() = Some(*pid);
     }
 
-    claude::PROCESS_HANDLES.lock().unwrap().insert(session_name.to_string(), handle);
+    claude::PROCESS_HANDLES
+        .lock()
+        .unwrap()
+        .insert(session_name.to_string(), handle);
 
     let read_result = claude::read_output_file_until_result(
         &output_path,
@@ -877,9 +895,9 @@ fn handle_codex_json_line(
 mod tests {
     use std::sync::mpsc;
 
-    use super::{compose_codex_prompt, handle_codex_json_line, TMUX_PROMPT_B64_PREFIX};
+    use super::{TMUX_PROMPT_B64_PREFIX, compose_codex_prompt, handle_codex_json_line};
     use crate::services::claude::StreamMessage;
-    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     #[test]
     fn test_handle_codex_json_line_maps_thread_and_turn_completion() {
@@ -962,7 +980,10 @@ mod tests {
 
         let items: Vec<StreamMessage> = rx.try_iter().collect();
         assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], StreamMessage::Thinking { summary: None }));
+        assert!(matches!(
+            items[0],
+            StreamMessage::Thinking { summary: None }
+        ));
     }
 
     #[test]

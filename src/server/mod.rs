@@ -20,6 +20,14 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
         });
     }
 
+    // Spawn periodic policy tick (fires OnTick every 60s)
+    {
+        let tick_engine = engine.clone();
+        tokio::spawn(async move {
+            policy_tick_loop(tick_engine).await;
+        });
+    }
+
     // Resolve dashboard dist path relative to runtime root or binary location
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
         .map(|r| r.join("dashboard/dist"))
@@ -38,6 +46,22 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
     tracing::info!("HTTP server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Background task that fires the OnTick policy hook at regular intervals.
+async fn policy_tick_loop(engine: PolicyEngine) {
+    use std::time::Duration;
+
+    let interval = Duration::from_secs(60);
+    tracing::info!("[policy-tick] OnTick timer started (every 60s)");
+
+    loop {
+        tokio::time::sleep(interval).await;
+        if let Err(e) = engine.fire_hook(crate::engine::hooks::Hook::OnTick, serde_json::json!({}))
+        {
+            tracing::warn!("[policy-tick] OnTick hook error: {e}");
+        }
+    }
 }
 
 /// Background task that periodically syncs GitHub issues for all registered repos.

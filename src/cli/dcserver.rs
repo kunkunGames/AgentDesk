@@ -6,19 +6,16 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use crate::services;
 use crate::config;
 use crate::db;
 use crate::engine::PolicyEngine;
 use crate::server;
+use crate::services;
 
 use super::VERSION;
 pub(crate) const AGENTDESK_DCSERVER_LAUNCHD_LABEL: &str = "com.agentdesk.dcserver";
 const AGENTDESK_DCSERVER_LABEL_ENV: &str = "AGENTDESK_DCSERVER_LABEL";
 const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
-// Legacy fallback env var names for backward compatibility
-const LEGACY_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
-const LEGACY_DCSERVER_LABEL_ENV: &str = "REMOTECC_DCSERVER_LABEL";
 
 pub fn current_launchd_domain() -> Option<String> {
     let output = std::process::Command::new("id").arg("-u").output().ok()?;
@@ -56,13 +53,10 @@ pub fn kickstart_launchd_job(label: &str) -> bool {
 }
 
 pub fn agentdesk_runtime_root() -> Option<PathBuf> {
-    // Primary: AGENTDESK_ROOT_DIR, fallback: legacy REMOTECC_ROOT_DIR
-    for key in [AGENTDESK_ROOT_DIR_ENV, LEGACY_ROOT_DIR_ENV] {
-        if let Ok(override_root) = env::var(key) {
-            let trimmed = override_root.trim();
-            if !trimmed.is_empty() {
-                return Some(PathBuf::from(trimmed));
-            }
+    if let Ok(override_root) = env::var(AGENTDESK_ROOT_DIR_ENV) {
+        let trimmed = override_root.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
         }
     }
 
@@ -71,7 +65,6 @@ pub fn agentdesk_runtime_root() -> Option<PathBuf> {
 
 pub fn current_dcserver_launchd_label() -> String {
     env::var(AGENTDESK_DCSERVER_LABEL_ENV)
-        .or_else(|_| env::var(LEGACY_DCSERVER_LABEL_ENV))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -80,7 +73,6 @@ pub fn current_dcserver_launchd_label() -> String {
 
 pub fn current_dcserver_root_marker() -> Option<String> {
     env::var(AGENTDESK_ROOT_DIR_ENV)
-        .or_else(|_| env::var(LEGACY_ROOT_DIR_ENV))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -102,29 +94,20 @@ pub fn dcserver_process_command(pid: u32) -> Option<String> {
 }
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
-    // Match both new "agentdesk dcserver" and legacy "remotecc --dcserver"
-    let is_dcserver = command.contains("agentdesk dcserver")
-        || command.contains("remotecc --dcserver");
+    let is_dcserver = command.contains("agentdesk dcserver");
     if !is_dcserver {
         return false;
     }
 
     match current_dcserver_root_marker() {
-        Some(root) => {
-            command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}={root}"))
-                || command.contains(&format!("REMOTECC_ROOT_DIR={root}"))
-        }
-        None => {
-            !command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}="))
-                && !command.contains("REMOTECC_ROOT_DIR=")
-        }
+        Some(root) => command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}={root}")),
+        None => !command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}=")),
     }
 }
 
 pub fn dcserver_instance_pids() -> Vec<u32> {
-    // Search for both new and legacy process names
     let output = match std::process::Command::new("pgrep")
-        .args(["-f", "agentdesk dcserver|remotecc --dcserver"])
+        .args(["-f", "agentdesk dcserver"])
         .output()
     {
         Ok(output) if output.status.success() => output,
@@ -144,25 +127,11 @@ pub fn dcserver_instance_pids() -> Vec<u32> {
 }
 
 pub fn instance_bot_settings_path() -> Option<PathBuf> {
-    agentdesk_runtime_root().map(|root| {
-        // TODO: Remove legacy fallback after 2026-03-26
-        let new_path = root.join("config").join("bot_settings.json");
-        if new_path.exists() { return new_path; }
-        let legacy = root.join("bot_settings.json");
-        if legacy.exists() { return legacy; }
-        new_path
-    })
+    agentdesk_runtime_root().map(|root| root.join("config").join("bot_settings.json"))
 }
 
 pub fn dcserver_stdout_log_path() -> Option<PathBuf> {
-    agentdesk_runtime_root().map(|root| {
-        // TODO: Remove legacy fallback after 2026-03-26
-        let new_path = root.join("logs").join("dcserver.stdout.log");
-        if new_path.exists() { return new_path; }
-        let legacy = root.join("dcserver.stdout.log");
-        if legacy.exists() { return legacy; }
-        new_path
-    })
+    agentdesk_runtime_root().map(|root| root.join("logs").join("dcserver.stdout.log"))
 }
 
 pub fn current_release_link_path() -> Option<PathBuf> {
@@ -287,7 +256,7 @@ pub fn parse_restart_dcserver_report_context(
     start_index: usize,
 ) -> Result<Option<services::discord::restart_report::RestartReportContext>, String> {
     use services::discord::restart_report::{
-        restart_report_context_from_env, RestartReportContext,
+        RestartReportContext, restart_report_context_from_env,
     };
     use services::provider::ProviderKind;
 
@@ -360,23 +329,27 @@ pub fn handle_restart_dcserver(
 ) {
     use services::discord::load_discord_bot_launch_configs;
     use services::discord::restart_report::{
-        load_restart_report, restart_report_context_from_env, save_restart_report,
-        RestartCompletionReport,
+        RestartCompletionReport, load_restart_report, restart_report_context_from_env,
+        save_restart_report,
     };
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
     let report_context = report_context_override.or_else(restart_report_context_from_env);
     if report_context.is_none() {
         eprintln!(
-            "ℹ no restart follow-up target configured; pass --report-channel-id/--report-provider or set AGENTDESK_REPORT_* / REMOTECC_REPORT_* to send a Discord completion message"
+            "ℹ no restart follow-up target configured; pass --report-channel-id/--report-provider or set AGENTDESK_REPORT_* to send a Discord completion message"
         );
     }
     let write_restart_report = |status: &str, summary: String| {
         let Some(context) = report_context.as_ref() else {
             return;
         };
-        let mut report =
-            RestartCompletionReport::new(context.provider.clone(), context.channel_id, status, summary);
+        let mut report = RestartCompletionReport::new(
+            context.provider.clone(),
+            context.channel_id,
+            status,
+            summary,
+        );
         if let Some(existing) = load_restart_report(&context.provider, context.channel_id) {
             report.current_msg_id = existing.current_msg_id;
         }
@@ -417,15 +390,11 @@ pub fn handle_restart_dcserver(
 
     // Increment generation counter — every restart request gets a unique generation,
     // even for same-version deployments (e.g. code-only changes without version bump).
-    let new_generation =
-        services::discord::runtime_store::increment_generation();
+    let new_generation = services::discord::runtime_store::increment_generation();
 
     // Show version transition if available
     if let Some(root) = agentdesk_runtime_root() {
-        // TODO: Remove legacy fallback after 2026-03-26
-        let new_vf = root.join("runtime").join("dcserver.version");
-        let legacy_vf = root.join("dcserver.version");
-        let version_file = if new_vf.exists() { new_vf } else if legacy_vf.exists() { legacy_vf } else { new_vf };
+        let version_file = root.join("runtime").join("dcserver.version");
         if let Ok(running_version) = std::fs::read_to_string(&version_file) {
             let running = running_version.trim();
             println!(
@@ -466,7 +435,10 @@ pub fn handle_restart_dcserver(
     if let Some(root) = agentdesk_runtime_root() {
         let marker = root.join("restart_pending");
         let _ = fs::write(&marker, VERSION);
-        println!("   ⏳ Deferred restart requested — waiting for active turns to complete (max {}s)", DEFERRED_TIMEOUT.as_secs());
+        println!(
+            "   ⏳ Deferred restart requested — waiting for active turns to complete (max {}s)",
+            DEFERRED_TIMEOUT.as_secs()
+        );
 
         let start = Instant::now();
         loop {
@@ -476,10 +448,7 @@ pub fn handle_restart_dcserver(
                 break;
             }
             // Check if dcserver process is still running
-            // TODO: Remove legacy fallback after 2026-03-26
-            let new_pid = root.join("runtime").join("dcserver.pid");
-            let legacy_pid = root.join("dcserver.pid");
-            let pid_file = if new_pid.exists() { new_pid } else if legacy_pid.exists() { legacy_pid } else { new_pid };
+            let pid_file = root.join("runtime").join("dcserver.pid");
             if let Ok(pid_str) = fs::read_to_string(&pid_file) {
                 if let Ok(pid) = pid_str.trim().parse::<u32>() {
                     // Check if process still exists via /bin/kill -0
@@ -743,7 +712,10 @@ pub fn handle_dcserver(token: Option<String>) {
             .expect("Failed to open lock file");
         let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if ret != 0 {
-            eprintln!("  ✗ Another dcserver is already running (lock held on {:?}). Exiting.", lock_path);
+            eprintln!(
+                "  ✗ Another dcserver is already running (lock held on {:?}). Exiting.",
+                lock_path
+            );
             std::process::exit(1);
         }
         // Write our PID into the lock file
@@ -759,13 +731,18 @@ pub fn handle_dcserver(token: Option<String>) {
     // Write PID/version files
     if let Some(root) = agentdesk_runtime_root() {
         let runtime_dir = root.join("runtime");
-        let _ = std::fs::write(runtime_dir.join("dcserver.pid"), std::process::id().to_string());
+        let _ = std::fs::write(
+            runtime_dir.join("dcserver.pid"),
+            std::process::id().to_string(),
+        );
         let _ = std::fs::write(runtime_dir.join("dcserver.version"), VERSION);
     }
 
     // Prevent CLAUDECODE from leaking into child tmux sessions
     // SAFETY: We're single-threaded at this point (before tokio runtime starts).
-    unsafe { std::env::remove_var("CLAUDECODE"); }
+    unsafe {
+        std::env::remove_var("CLAUDECODE");
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     let settings_path = instance_bot_settings_path();
@@ -808,7 +785,10 @@ pub fn handle_dcserver(token: Option<String>) {
                                 eprintln!("  ⚠ HTTP server error: {e}");
                             }
                         });
-                        println!("  ▸ HTTP    : listening on {}:{}", ad_config.server.host, http_port);
+                        println!(
+                            "  ▸ HTTP    : listening on {}:{}",
+                            ad_config.server.host, http_port
+                        );
                     }
                     Err(e) => {
                         eprintln!("  ⚠ Policy engine init failed: {e} — HTTP server not started");
@@ -839,7 +819,8 @@ pub fn handle_dcserver(token: Option<String>) {
         match token {
             Some(token) => {
                 let provider = services::discord::resolve_discord_bot_provider(&token);
-                let shutdown_remaining = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+                let shutdown_remaining =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
                 services::discord::run_bot(
                     &token,
                     provider,
@@ -873,9 +854,8 @@ pub fn handle_dcserver(token: Option<String>) {
                         .join(", ")
                 );
 
-                let shutdown_remaining = std::sync::Arc::new(
-                    std::sync::atomic::AtomicUsize::new(configs.len()),
-                );
+                let shutdown_remaining =
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(configs.len()));
                 let mut tasks = Vec::new();
                 for config in configs {
                     let ga = global_active.clone();
@@ -884,7 +864,16 @@ pub fn handle_dcserver(token: Option<String>) {
                     let hr = health_registry.clone();
                     let port = api_port;
                     tasks.push(tokio::spawn(async move {
-                        services::discord::run_bot(&config.token, config.provider, ga, gf, sr, hr, port).await;
+                        services::discord::run_bot(
+                            &config.token,
+                            config.provider,
+                            ga,
+                            gf,
+                            sr,
+                            hr,
+                            port,
+                        )
+                        .await;
                     }));
                 }
 

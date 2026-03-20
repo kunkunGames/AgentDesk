@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
@@ -14,7 +14,7 @@ use super::formatting::{
     format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw,
 };
 use super::settings::{channel_supports_provider, resolve_role_binding};
-use super::{rate_limit_wait, SharedData, TmuxWatcherHandle, DISCORD_MSG_LIMIT};
+use super::{DISCORD_MSG_LIMIT, SharedData, TmuxWatcherHandle, rate_limit_wait};
 
 use crate::utils::format::tail_with_ellipsis;
 
@@ -97,14 +97,18 @@ pub(super) async fn tmux_output_watcher(
             // between the top-of-loop check and here
             if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly");
+                println!(
+                    "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
+                );
                 break;
             }
             // Extra grace: wait briefly and re-check, since SIGTERM handler is async
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly");
+                println!(
+                    "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
+                );
                 break;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -245,7 +249,9 @@ pub(super) async fn tmux_output_watcher(
                     spin_idx += 1;
 
                     let raw_tool_status = super::formatting::resolve_raw_tool_status(
-                        tool_state.current_tool_line.as_deref(), &full_response);
+                        tool_state.current_tool_line.as_deref(),
+                        &full_response,
+                    );
                     let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
                     let footer = format!("\n\n{} {}", indicator, tool_status);
                     let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
@@ -285,7 +291,8 @@ pub(super) async fn tmux_output_watcher(
 
         // If paused was set while we were reading (even if already unpaused), discard partial data.
         // Also check epoch: if it changed, a Discord turn claimed this data even if paused is now false.
-        if was_paused || paused.load(Ordering::Relaxed)
+        if was_paused
+            || paused.load(Ordering::Relaxed)
             || pause_epoch.load(Ordering::Relaxed) != epoch_snapshot
         {
             // Clean up placeholder if we created one
@@ -298,7 +305,9 @@ pub(super) async fn tmux_output_watcher(
         // Handle prompt-too-long: kill session so next message creates a fresh one
         if is_prompt_too_long {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] 👁 Prompt too long detected in watcher for {tmux_session_name}, killing session");
+            println!(
+                "  [{ts}] 👁 Prompt too long detected in watcher for {tmux_session_name}, killing session"
+            );
             prompt_too_long_killed = true;
 
             let sess = tmux_session_name.clone();
@@ -329,7 +338,9 @@ pub(super) async fn tmux_output_watcher(
         // Handle auth error: kill session and notify user to re-authenticate
         if is_auth_error {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] 👁 Auth error detected in watcher for {tmux_session_name}, killing session");
+            println!(
+                "  [{ts}] 👁 Auth error detected in watcher for {tmux_session_name}, killing session"
+            );
             prompt_too_long_killed = true; // reuse flag to suppress duplicate "session ended" message
 
             let sess = tmux_session_name.clone();
@@ -397,7 +408,8 @@ pub(super) async fn tmux_output_watcher(
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] 👁 Relaying terminal response to Discord ({} chars, offset {})",
-                prefixed.len(), data_start_offset
+                prefixed.len(),
+                data_start_offset
             );
             match placeholder_msg_id {
                 Some(msg_id) => {
@@ -762,7 +774,8 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         // Generation gate: quarantine tmux sessions from a previous generation.
         // Keep the session alive for post-mortem but don't attach a watcher.
-        let gen_marker_path = crate::services::tmux_common::session_temp_path(session_name, "generation");
+        let gen_marker_path =
+            crate::services::tmux_common::session_temp_path(session_name, "generation");
         let session_gen = std::fs::read_to_string(&gen_marker_path)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
@@ -972,9 +985,15 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
         if killed {
             println!("  [{ts}]   killed orphan: {}", name);
             // Also clean associated temp files
-            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(name, "jsonl"));
-            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(name, "input"));
-            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(name, "prompt"));
+            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(
+                name, "jsonl",
+            ));
+            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(
+                name, "input",
+            ));
+            let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(
+                name, "prompt",
+            ));
             let _ = std::fs::remove_file(tmux_owner_path(name));
         }
     }

@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -25,16 +25,14 @@ pub struct StartMeetingBody {
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/round-table-meetings
-pub async fn list_meetings(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_meetings(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -48,13 +46,11 @@ pub async fn list_meetings(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let rows = stmt
-        .query_map([], |row| meeting_row_to_json(row))
-        .ok();
+    let rows = stmt.query_map([], |row| meeting_row_to_json(row)).ok();
 
     let mut meetings: Vec<serde_json::Value> = match rows {
         Some(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -85,7 +81,7 @@ pub async fn get_meeting(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -102,9 +98,10 @@ pub async fn get_meeting(
             obj.insert("entries".to_string(), json!(transcripts));
             (StatusCode::OK, Json(json!({"meeting": meeting})))
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            (StatusCode::NOT_FOUND, Json(json!({"error": "meeting not found"})))
-        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "meeting not found"})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("{e}")})),
@@ -123,12 +120,15 @@ pub async fn delete_meeting(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Delete transcripts first
-    let _ = conn.execute("DELETE FROM meeting_transcripts WHERE meeting_id = ?1", [&id]);
+    let _ = conn.execute(
+        "DELETE FROM meeting_transcripts WHERE meeting_id = ?1",
+        [&id],
+    );
 
     match conn.execute("DELETE FROM meetings WHERE id = ?1", [&id]) {
         Ok(0) => (
@@ -155,7 +155,7 @@ pub async fn update_issue_repo(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -198,8 +198,14 @@ pub async fn update_issue_repo(
         |row| meeting_row_to_json(row),
     ) {
         Ok(mut meeting) => {
-            meeting.as_object_mut().unwrap().insert("issue_repo".to_string(), json!(body.repo));
-            (StatusCode::OK, Json(json!({"ok": true, "meeting": meeting})))
+            meeting
+                .as_object_mut()
+                .unwrap()
+                .insert("issue_repo".to_string(), json!(body.repo));
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "meeting": meeting})),
+            )
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -209,9 +215,7 @@ pub async fn update_issue_repo(
 }
 
 /// POST /api/round-table-meetings/:id/issues — stub
-pub async fn create_issues(
-    Path(_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn create_issues(Path(_id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::OK,
         Json(json!({
@@ -228,16 +232,12 @@ pub async fn create_issues(
 }
 
 /// POST /api/round-table-meetings/:id/issues/discard — stub
-pub async fn discard_issue(
-    Path(_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn discard_issue(Path(_id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// POST /api/round-table-meetings/:id/issues/discard-all — stub
-pub async fn discard_all_issues(
-    Path(_id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn discard_all_issues(Path(_id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({"ok": true})))
 }
 

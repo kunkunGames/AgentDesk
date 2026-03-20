@@ -8,7 +8,6 @@ use tokio::net::TcpListener;
 
 use super::SharedData;
 
-
 /// Per-provider snapshot for the health response.
 struct ProviderEntry {
     name: String,
@@ -42,7 +41,10 @@ impl HealthRegistry {
     }
 
     pub(super) async fn register(&self, name: String, shared: Arc<SharedData>) {
-        self.providers.lock().await.push(ProviderEntry { name, shared });
+        self.providers
+            .lock()
+            .await
+            .push(ProviderEntry { name, shared });
     }
 
     pub(super) async fn register_http(&self, provider: String, http: Arc<serenity::Http>) {
@@ -57,17 +59,24 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
     // Announce bot: agent-to-agent (agents process these messages)
     // Notify bot: info-only alerts (agents do NOT respond)
     if let Some(root) = super::runtime_store::agentdesk_root() {
-        for (bot_name, field) in [("announce", &registry.announce_http), ("notify", &registry.notify_http)] {
-            let new_path = root.join("credential").join(format!("{bot_name}_bot_token"));
-            let legacy = root.join(format!("{bot_name}_bot_token"));
-            let token_path = if new_path.exists() { new_path } else if legacy.exists() { legacy } else { new_path };
-            if let Ok(token) = std::fs::read_to_string(&token_path) {
+        for (bot_name, field) in [
+            ("announce", &registry.announce_http),
+            ("notify", &registry.notify_http),
+        ] {
+            let new_path = root
+                .join("credential")
+                .join(format!("{bot_name}_bot_token"));
+            if let Ok(token) = std::fs::read_to_string(&new_path) {
                 let token = token.trim().to_string();
                 if !token.is_empty() {
                     let http = Arc::new(serenity::Http::new(&format!("Bot {token}")));
                     *field.lock().await = Some(http);
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    let emoji = if bot_name == "announce" { "📢" } else { "🔔" };
+                    let emoji = if bot_name == "announce" {
+                        "📢"
+                    } else {
+                        "🔔"
+                    };
                     println!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
                 }
             }
@@ -111,7 +120,11 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
                 ("GET", "/api/health") => {
                     let json = build_health_json(&registry).await;
                     let healthy = is_healthy(&registry).await;
-                    let code = if healthy { "200 OK" } else { "503 Service Unavailable" };
+                    let code = if healthy {
+                        "200 OK"
+                    } else {
+                        "503 Service Unavailable"
+                    };
                     (code, json)
                 }
                 ("POST", "/api/send") => {
@@ -153,9 +166,18 @@ async fn build_health_json(registry: &HealthRegistry) -> String {
         let session_count = data.sessions.len();
         drop(data);
 
-        let restart_pending = entry.shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed);
-        let connected = entry.shared.bot_connected.load(std::sync::atomic::Ordering::Relaxed);
-        let last_turn_at = entry.shared.last_turn_at.lock()
+        let restart_pending = entry
+            .shared
+            .restart_pending
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let connected = entry
+            .shared
+            .bot_connected
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_turn_at = entry
+            .shared
+            .last_turn_at
+            .lock()
             .ok()
             .and_then(|g| g.clone())
             .map(|t| format!(r#""{}""#, t))
@@ -168,19 +190,27 @@ async fn build_health_json(registry: &HealthRegistry) -> String {
     }
 
     let global_active = if let Some(p) = providers.first() {
-        p.shared.global_active.load(std::sync::atomic::Ordering::Relaxed)
+        p.shared
+            .global_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     } else {
         0
     };
     let global_finalizing = if let Some(p) = providers.first() {
-        p.shared.global_finalizing.load(std::sync::atomic::Ordering::Relaxed)
+        p.shared
+            .global_finalizing
+            .load(std::sync::atomic::Ordering::Relaxed)
     } else {
         0
     };
 
     format!(
         r#"{{"status":"{}","version":"{}","uptime_secs":{},"global_active":{},"global_finalizing":{},"providers":[{}]}}"#,
-        if is_healthy_inner(&providers) { "healthy" } else { "unhealthy" },
+        if is_healthy_inner(&providers) {
+            "healthy"
+        } else {
+            "unhealthy"
+        },
         version,
         uptime_secs,
         global_active,
@@ -201,11 +231,18 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
     }
     for p in providers {
         // Unhealthy if any provider hasn't connected to Discord gateway yet
-        if !p.shared.bot_connected.load(std::sync::atomic::Ordering::Relaxed) {
+        if !p
+            .shared
+            .bot_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         // Unhealthy if restart is pending (draining)
-        if p.shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed) {
+        if p.shared
+            .restart_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
     }
@@ -213,7 +250,10 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
 }
 
 /// Resolve the bot HTTP client by name (announce or notify).
-async fn resolve_bot_http(registry: &HealthRegistry, bot: &str) -> Result<Arc<serenity::Http>, (&'static str, String)> {
+async fn resolve_bot_http(
+    registry: &HealthRegistry,
+    bot: &str,
+) -> Result<Arc<serenity::Http>, (&'static str, String)> {
     let (lock, bot_label) = match bot {
         "notify" => (&registry.notify_http, "notify"),
         _ => (&registry.announce_http, "announce"),
@@ -227,8 +267,12 @@ async fn resolve_bot_http(registry: &HealthRegistry, bot: &str) -> Result<Arc<se
         }
         None => {
             drop(guard);
-            Err(("503 Service Unavailable",
-                format!(r#"{{"ok":false,"error":"{bot_label} bot not configured (missing credential/{bot_label}_bot_token)"}}"#)))
+            Err((
+                "503 Service Unavailable",
+                format!(
+                    r#"{{"ok":false,"error":"{bot_label} bot not configured (missing credential/{bot_label}_bot_token)"}}"#
+                ),
+            ))
         }
     }
 }
@@ -237,16 +281,28 @@ async fn resolve_bot_http(registry: &HealthRegistry, bot: &str) -> Result<Arc<se
 /// Accepts JSON: {"target":"channel:<id>", "content":"...", "source":"role-id", "bot":"announce|notify"}
 async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"invalid JSON"}"#.to_string(),
+        );
     };
 
     let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("");
     let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let source = json.get("source").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let bot = json.get("bot").and_then(|v| v.as_str()).unwrap_or("announce");
+    let source = json
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let bot = json
+        .get("bot")
+        .and_then(|v| v.as_str())
+        .unwrap_or("announce");
 
     if content.is_empty() {
-        return ("400 Bad Request", r#"{"ok":false,"error":"content is required"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"content is required"}"#.to_string(),
+        );
     }
 
     // Parse "channel:<id>" format
@@ -257,22 +313,39 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
     };
 
     let Some(channel_id_raw) = channel_id_raw else {
-        return ("400 Bad Request", r#"{"ok":false,"error":"invalid target format (use channel:<id>)"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"invalid target format (use channel:<id>)"}"#.to_string(),
+        );
     };
 
     let channel_id = ChannelId::new(channel_id_raw);
 
-    // Validate source is a known agent role_id (checks org schema agents + role_map bindings)
-    if !super::settings::is_known_agent(source) {
+    // Validate source is a known agent role_id or internal system source
+    const INTERNAL_SOURCES: &[&str] = &[
+        "kanban-rules",
+        "triage-rules",
+        "review-automation",
+        "auto-queue",
+        "pipeline",
+        "system",
+    ];
+    if !INTERNAL_SOURCES.contains(&source) && !super::settings::is_known_agent(source) {
         return (
             "403 Forbidden",
-            format!(r#"{{"ok":false,"error":"unknown source role: {}"}}"#, source),
+            format!(
+                r#"{{"ok":false,"error":"unknown source role: {}"}}"#,
+                source
+            ),
         );
     }
 
     // Verify target channel exists in role-map (authorization check)
     if super::settings::resolve_role_binding(channel_id, None).is_none() {
-        return ("403 Forbidden", r#"{"ok":false,"error":"channel not in role-map"}"#.to_string());
+        return (
+            "403 Forbidden",
+            r#"{"ok":false,"error":"channel not in role-map"}"#.to_string(),
+        );
     }
 
     // Select bot: "announce" (default, agents respond) or "notify" (info-only, agents ignore)
@@ -281,20 +354,26 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
         Err(resp) => return resp,
     };
 
-    match channel_id
-        .say(&*http, content)
-        .await
-    {
+    match channel_id.say(&*http, content).await {
         Ok(_) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             let emoji = if bot == "notify" { "🔔" } else { "📨" };
             println!("  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot})");
-            ("200 OK", format!(r#"{{"ok":true,"target":"channel:{}","source":"{}","bot":"{}"}}"#, channel_id, source, bot))
+            (
+                "200 OK",
+                format!(
+                    r#"{{"ok":true,"target":"channel:{}","source":"{}","bot":"{}"}}"#,
+                    channel_id, source, bot
+                ),
+            )
         }
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             eprintln!("  [{ts}] ⚠ ROUTE: failed to send to channel {channel_id}: {e}");
-            ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"Discord send failed: {}"}}"#, e))
+            (
+                "500 Internal Server Error",
+                format!(r#"{{"ok":false,"error":"Discord send failed: {}"}}"#, e),
+            )
         }
     }
 }
@@ -305,7 +384,12 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
 async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(_) => return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string()),
+        Err(_) => {
+            return (
+                "400 Bad Request",
+                r#"{"ok":false,"error":"invalid JSON"}"#.to_string(),
+            );
+        }
     };
 
     let user_id_raw: u64 = parsed["user_id"]
@@ -314,12 +398,20 @@ async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, 
         .or_else(|| parsed["user_id"].as_u64())
         .unwrap_or(0);
     if user_id_raw == 0 {
-        return ("400 Bad Request", r#"{"ok":false,"error":"user_id required (string or number)"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"user_id required (string or number)"}"#.to_string(),
+        );
     }
 
     let content = match parsed["content"].as_str() {
         Some(c) if !c.is_empty() => c,
-        _ => return ("400 Bad Request", r#"{"ok":false,"error":"content required"}"#.to_string()),
+        _ => {
+            return (
+                "400 Bad Request",
+                r#"{"ok":false,"error":"content required"}"#.to_string(),
+            );
+        }
     };
 
     let bot = parsed["bot"].as_str().unwrap_or("announce");
@@ -328,31 +420,42 @@ async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, 
         Err(resp) => return resp,
     };
 
-    use poise::serenity_prelude::{UserId, CreateMessage};
+    use poise::serenity_prelude::{CreateMessage, UserId};
     let user_id = UserId::new(user_id_raw);
     match user_id.create_dm_channel(&*http).await {
         Ok(dm_channel) => {
-            match dm_channel.id.send_message(&*http, CreateMessage::new().content(content)).await {
+            match dm_channel
+                .id
+                .send_message(&*http, CreateMessage::new().content(content))
+                .await
+            {
                 Ok(_) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] 📨 DM: → user {user_id_raw}");
-                    ("200 OK", format!(r#"{{"ok":true,"user_id":"{}"}}"#, user_id_raw))
+                    (
+                        "200 OK",
+                        format!(r#"{{"ok":true,"user_id":"{}"}}"#, user_id_raw),
+                    )
                 }
-                Err(e) => {
-                    ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, e))
-                }
+                Err(e) => (
+                    "500 Internal Server Error",
+                    format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, e),
+                ),
             }
         }
-        Err(e) => {
-            ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"DM channel creation failed: {}"}}"#, e))
-        }
+        Err(e) => (
+            "500 Internal Server Error",
+            format!(
+                r#"{{"ok":false,"error":"DM channel creation failed: {}"}}"#,
+                e
+            ),
+        ),
     }
 }
 
 /// Resolve the health check port from env or default.
 pub fn resolve_port() -> u16 {
     std::env::var("AGENTDESK_HEALTH_PORT")
-        .or_else(|_| std::env::var("REMOTECC_HEALTH_PORT"))
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8793)
@@ -363,15 +466,24 @@ pub fn resolve_port() -> u16 {
 /// Creates a DiscordSession in the provider's SharedData and responds.
 async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"invalid JSON"}"#.to_string(),
+        );
     };
 
-    let channel_id_str = json.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+    let channel_id_str = json
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let path = json.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let provider_hint = json.get("provider").and_then(|v| v.as_str()).unwrap_or("");
 
     let Some(channel_id_raw) = channel_id_str.parse::<u64>().ok() else {
-        return ("400 Bad Request", r#"{"ok":false,"error":"channel_id must be a numeric string"}"#.to_string());
+        return (
+            "400 Bad Request",
+            r#"{"ok":false,"error":"channel_id must be a numeric string"}"#.to_string(),
+        );
     };
 
     // Resolve path — expand ~ and . to absolute
@@ -406,7 +518,10 @@ async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a
     };
 
     let Some(provider_entry) = target_provider else {
-        return ("404 Not Found", r#"{"ok":false,"error":"no matching provider found"}"#.to_string());
+        return (
+            "404 Not Found",
+            r#"{"ok":false,"error":"no matching provider found"}"#.to_string(),
+        );
     };
 
     // Create session
@@ -445,8 +560,7 @@ async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a
 /// Returns Err with an error message on invalid input.
 /// Factored out of handle_send for testability.
 fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str> {
-    let json: serde_json::Value =
-        serde_json::from_str(body).map_err(|_| "invalid JSON")?;
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid JSON")?;
     let content = json
         .get("content")
         .and_then(|v| v.as_str())
@@ -529,34 +643,24 @@ mod tests {
 
     #[test]
     fn test_resolve_port_default() {
-        // When neither env var is set, default to 8793
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        let prev = std::env::var_os("REMOTECC_HEALTH_PORT");
         unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
         assert_eq!(resolve_port(), 8793);
-        if let Some(v) = prev { unsafe { std::env::set_var("REMOTECC_HEALTH_PORT", v) }; }
     }
 
     #[test]
     fn test_resolve_port_env_override() {
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        let prev = std::env::var_os("REMOTECC_HEALTH_PORT");
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
         unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "9999") };
         assert_eq!(resolve_port(), 9999);
         unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
-        if let Some(v) = prev { unsafe { std::env::set_var("REMOTECC_HEALTH_PORT", v) }; }
     }
 
     #[test]
     fn test_resolve_port_invalid_env() {
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        let prev = std::env::var_os("REMOTECC_HEALTH_PORT");
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
         unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "not-a-number") };
         assert_eq!(resolve_port(), 8793);
         unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
-        if let Some(v) = prev { unsafe { std::env::set_var("REMOTECC_HEALTH_PORT", v) }; }
     }
 }

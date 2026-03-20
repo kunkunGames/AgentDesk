@@ -3,13 +3,13 @@ use std::path::Path;
 
 use poise::serenity_prelude as serenity;
 
-use super::super::{
-    auto_restore_session, check_auth, detect_worktree_conflict,
-    create_git_worktree, load_existing_session, resolve_channel_category, scan_skills,
-    save_bot_settings, Context, DiscordSession, Error, WorktreeInfo,
-};
 use super::super::formatting::send_long_message_ctx;
 use super::super::runtime_store::{self, workspace_root};
+use super::super::{
+    Context, DiscordSession, Error, WorktreeInfo, auto_restore_session, check_auth,
+    create_git_worktree, detect_worktree_conflict, load_existing_session, resolve_channel_category,
+    save_bot_settings, scan_skills,
+};
 
 /// Autocomplete handler for remote profile names in /start
 pub(in crate::services::discord) async fn autocomplete_remote_profile<'a>(

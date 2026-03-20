@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use rusqlite::params;
 use serde::Deserialize;
@@ -53,7 +53,7 @@ pub async fn list_departments(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -77,12 +77,14 @@ pub async fn list_departments(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| {
@@ -125,7 +127,7 @@ pub async fn create_department(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -163,7 +165,7 @@ pub async fn update_department(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -196,21 +198,20 @@ pub async fn update_department(
     );
     values.push(Box::new(id.clone()));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        values.iter().map(|v| v.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "department not found"})),
-            )
+            );
         }
         Ok(_) => {}
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     }
 
@@ -245,7 +246,7 @@ pub async fn delete_department(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -273,7 +274,7 @@ pub async fn reorder_departments(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -308,5 +309,8 @@ pub async fn reorder_departments(
         );
     }
 
-    (StatusCode::OK, Json(json!({"ok": true, "updated": updated})))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "updated": updated})),
+    )
 }

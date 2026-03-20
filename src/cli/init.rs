@@ -120,10 +120,7 @@ channels:
 "#,
     );
     for (ch_id, _ch_name, _role) in channels {
-        yaml.push_str(&format!(
-            "    \"{}\":\n      agent: assistant\n",
-            ch_id
-        ));
+        yaml.push_str(&format!("    \"{}\":\n      agent: assistant\n", ch_id));
     }
     yaml
 }
@@ -153,10 +150,7 @@ agents:
     }
     yaml.push_str("\nchannels:\n  by_id:\n");
     for (ch_id, _ch_name, role) in channels {
-        yaml.push_str(&format!(
-            "    \"{}\":\n      agent: {}\n",
-            ch_id, role
-        ));
+        yaml.push_str(&format!("    \"{}\":\n      agent: {}\n", ch_id, role));
     }
     yaml
 }
@@ -201,8 +195,7 @@ fn generate_launchd_plist(home: &Path, agentdesk_bin: &Path) -> String {
     let bin_str = agentdesk_bin.display();
     let label = dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL;
     // Use AGENTDESK_ROOT_DIR if set, otherwise default to ~/.agentdesk
-    let root_dir = dcserver::agentdesk_runtime_root()
-        .unwrap_or_else(|| home.join(".agentdesk"));
+    let root_dir = dcserver::agentdesk_runtime_root().unwrap_or_else(|| home.join(".agentdesk"));
     let root_str = root_dir.display();
     let logs_dir = root_dir.join("logs");
     let logs_str = logs_dir.display();
@@ -387,7 +380,10 @@ pub fn handle_init(reconfigure: bool) {
     println!("\nStep 3/5: 템플릿 선택");
     let template_idx = prompt_select(
         "조직 템플릿을 선택하세요:",
-        &["solo — 단일 에이전트 (모든 채널 동일)", "small-team — 채널별 역할 분리"],
+        &[
+            "solo — 단일 에이전트 (모든 채널 동일)",
+            "small-team — 채널별 역할 분리",
+        ],
     );
 
     let mut channel_mappings: Vec<(String, String, String)> = Vec::new(); // (id, name, role)
@@ -406,11 +402,7 @@ pub fn handle_init(reconfigure: bool) {
             for &idx in &selected {
                 let (name, id) = &text_channels[idx];
                 let role = prompt_line(&format!("  #{} → 역할: ", name));
-                let role = if role.is_empty() {
-                    name.clone()
-                } else {
-                    role
-                };
+                let role = if role.is_empty() { name.clone() } else { role };
                 channel_mappings.push((id.clone(), name.clone(), role));
             }
         }
@@ -430,7 +422,8 @@ pub fn handle_init(reconfigure: bool) {
 
     // Owner user ID (optional)
     println!("\nStep 4/5: 소유자 설정");
-    let owner_input = prompt_line("Discord 사용자 ID (Enter로 건너뛰기 — 첫 메시지 발신자가 자동 등록): ");
+    let owner_input =
+        prompt_line("Discord 사용자 ID (Enter로 건너뛰기 — 첫 메시지 발신자가 자동 등록): ");
     let owner_id = if owner_input.is_empty() {
         None
     } else {
@@ -452,7 +445,10 @@ pub fn handle_init(reconfigure: bool) {
             if !existing.contains(&marker) {
                 let entry = format!("    \"{}\":\n      agent: {}\n", ch_id, role);
                 if let Some(pos) = existing.find("  by_id:") {
-                    let insert_at = existing[pos..].find('\n').map(|n| pos + n + 1).unwrap_or(existing.len());
+                    let insert_at = existing[pos..]
+                        .find('\n')
+                        .map(|n| pos + n + 1)
+                        .unwrap_or(existing.len());
                     existing.insert_str(insert_at, &entry);
                 }
             }
@@ -538,15 +534,26 @@ pub fn handle_init(reconfigure: bool) {
             // Unload first if already loaded
             if dcserver::is_launchd_job_loaded(label) {
                 let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", &format!("gui/{}", get_uid()), &plist_path.to_string_lossy().to_string()])
+                    .args([
+                        "bootout",
+                        &format!("gui/{}", get_uid()),
+                        &plist_path.to_string_lossy().to_string(),
+                    ])
                     .status();
             }
             let status = std::process::Command::new("launchctl")
-                .args(["bootstrap", &format!("gui/{}", get_uid()), &plist_path.to_string_lossy().to_string()])
+                .args([
+                    "bootstrap",
+                    &format!("gui/{}", get_uid()),
+                    &plist_path.to_string_lossy().to_string(),
+                ])
                 .status();
             match status {
                 Ok(s) if s.success() => println!("  [OK] dcserver 시작됨"),
-                _ => println!("  [WARN] launchd 등록 실패 — 수동으로 실행: launchctl bootstrap gui/$(id -u) {}", plist_path.display()),
+                _ => println!(
+                    "  [WARN] launchd 등록 실패 — 수동으로 실행: launchctl bootstrap gui/$(id -u) {}",
+                    plist_path.display()
+                ),
             }
         }
     }
@@ -556,7 +563,10 @@ pub fn handle_init(reconfigure: bool) {
     println!("═══════════════════════════════════════");
     println!("\n생성된 파일:");
     println!("  {} (org.yaml)", root.join("org.yaml").display());
-    println!("  {} (bot_settings.json)", root.join("bot_settings.json").display());
+    println!(
+        "  {} (bot_settings.json)",
+        root.join("bot_settings.json").display()
+    );
     println!("  {} (prompts)", root.join("prompts").display());
     println!("\n다음 단계:");
     println!("  1. 프롬프트 파일을 편집하여 에이전트 성격을 정의하세요");
@@ -572,9 +582,7 @@ fn write_with_backup(path: &Path, content: &str, reconfigure: bool) {
         }
         let backup = path.with_extension(format!(
             "{}.bak",
-            path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("bak")
+            path.extension().and_then(|e| e.to_str()).unwrap_or("bak")
         ));
         if !backup.exists() {
             let _ = fs::copy(path, &backup);

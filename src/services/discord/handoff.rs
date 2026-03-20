@@ -96,9 +96,7 @@ pub(super) fn save_handoff(record: &HandoffRecord) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let mut updated = record.clone();
-    updated.updated_at = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    updated.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
     atomic_write(&path, &json)?;
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -180,12 +178,9 @@ pub(super) fn update_handoff_state(
     };
     let path = handoff_path(&root, provider, channel_id);
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut record: HandoffRecord =
-        serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let mut record: HandoffRecord = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     record.state = new_state.to_string();
-    record.updated_at = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    record.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let json = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     atomic_write(&path, &json)
 }
@@ -215,7 +210,7 @@ mod tests {
             version: 1,
             provider: "claude".to_string(),
             channel_id: 123,
-            channel_name: Some("remotecc-cc".to_string()),
+            channel_name: Some("adk-cc".to_string()),
             intent: "verify code changes".to_string(),
             context: "modified src/main.rs".to_string(),
             dedupe_key: "claude-123-5".to_string(),

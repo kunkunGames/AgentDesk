@@ -38,7 +38,7 @@ export function SessionPanel({ sessions, departments, agents, onAssign }: Props)
       </div>
 
       <p className="text-gray-400 text-sm mb-6">
-        RemoteCC 세션이 감지되면 파견 인력으로 등록됩니다.
+        AgentDesk 세션이 감지되면 파견 인력으로 등록됩니다.
         각 세션을 부서에 배치하여 오피스에서 시각화할 수 있습니다.
       </p>
 
@@ -46,7 +46,7 @@ export function SessionPanel({ sessions, departments, agents, onAssign }: Props)
         <div className="text-center py-16 text-gray-500">
           <Monitor size={48} className="mx-auto mb-4 opacity-30" />
           <p>현재 활성 세션이 없습니다</p>
-          <p className="text-sm mt-1">RemoteCC 세션이 실행되면 자동으로 표시됩니다</p>
+          <p className="text-sm mt-1">AgentDesk 세션이 실행되면 자동으로 표시됩니다</p>
         </div>
       )}
 

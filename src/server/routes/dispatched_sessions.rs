@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -52,7 +52,7 @@ pub async fn list_dispatched_sessions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -85,7 +85,7 @@ pub async fn list_dispatched_sessions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
@@ -143,7 +143,7 @@ pub async fn hook_session(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -203,7 +203,23 @@ pub async fn hook_session(
     );
 
     match result {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
+        Ok(_) => {
+            // Fire OnSessionStatusChange hook for policy engines
+            // Read old status to detect change (best-effort — the upsert may have changed it)
+            let dispatch_id = body.dispatch_id.clone();
+            drop(conn);
+            let _ = state.engine.fire_hook(
+                crate::engine::hooks::Hook::OnSessionStatusChange,
+                json!({
+                    "session_key": body.session_key,
+                    "status": status,
+                    "agent_id": agent_id,
+                    "dispatch_id": dispatch_id,
+                    "provider": provider,
+                }),
+            );
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("{e}")})),
@@ -221,11 +237,14 @@ pub async fn cleanup_sessions(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
-    match conn.execute("DELETE FROM dispatched_sessions WHERE status = 'disconnected'", []) {
+    match conn.execute(
+        "DELETE FROM dispatched_sessions WHERE status = 'disconnected'",
+        [],
+    ) {
         Ok(n) => (StatusCode::OK, Json(json!({"ok": true, "deleted": n}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -246,7 +265,7 @@ pub async fn update_dispatched_session(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -299,8 +318,7 @@ pub async fn update_dispatched_session(
     );
     values.push(Box::new(id));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        values.iter().map(|v| v.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => (
             StatusCode::NOT_FOUND,

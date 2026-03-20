@@ -1,7 +1,4 @@
-use axum::{
-    http::StatusCode,
-    Json,
-};
+use axum::{Json, http::StatusCode};
 use serde_json::json;
 
 /// GET /api/cron-jobs

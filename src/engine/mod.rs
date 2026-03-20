@@ -51,8 +51,8 @@ pub struct PolicyInfo {
 impl PolicyEngine {
     /// Create a new policy engine, initializing QuickJS and loading policies.
     pub fn new(config: &Config, db: Db) -> Result<Self> {
-        let runtime = Runtime::new()
-            .map_err(|e| anyhow::anyhow!("QuickJS runtime creation failed: {e}"))?;
+        let runtime =
+            Runtime::new().map_err(|e| anyhow::anyhow!("QuickJS runtime creation failed: {e}"))?;
         let context = Context::full(&runtime)
             .map_err(|e| anyhow::anyhow!("QuickJS context creation failed: {e}"))?;
 
@@ -77,8 +77,9 @@ impl PolicyEngine {
 
             // Register bridge ops in the reload context too
             reload_ctx.with(|ctx| {
-                ops::register_globals(&ctx, db.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to register bridge ops in reload ctx: {e}"))
+                ops::register_globals(&ctx, db.clone()).map_err(|e| {
+                    anyhow::anyhow!("Failed to register bridge ops in reload ctx: {e}")
+                })
             })?;
 
             match loader::start_hot_reload(policies_dir.clone(), reload_ctx, store.clone()) {
@@ -113,17 +114,23 @@ impl PolicyEngine {
     /// Fire a hook with the given JSON payload. All policies that registered
     /// for this hook are called in priority order.
     pub fn fire_hook(&self, hook: Hook, payload: serde_json::Value) -> Result<()> {
-        let inner = self.inner.lock()
+        let inner = self
+            .inner
+            .lock()
             .map_err(|e| anyhow::anyhow!("engine lock poisoned: {e}"))?;
 
         // Collect the persistent functions for this hook
-        let policies = inner.policies.lock()
+        let policies = inner
+            .policies
+            .lock()
             .map_err(|e| anyhow::anyhow!("policy store lock poisoned: {e}"))?;
 
         let hook_fns: Vec<(String, Persistent<Function<'static>>)> = policies
             .iter()
             .filter_map(|p| {
-                p.hooks.get(&hook).map(|f: &Persistent<Function<'static>>| (p.name.clone(), f.clone()))
+                p.hooks
+                    .get(&hook)
+                    .map(|f: &Persistent<Function<'static>>| (p.name.clone(), f.clone()))
             })
             .collect();
         drop(policies);
@@ -143,7 +150,8 @@ impl PolicyEngine {
                     Err(e) => {
                         tracing::error!(
                             "Failed to restore hook {} for policy '{}': {e}",
-                            hook, policy_name
+                            hook,
+                            policy_name
                         );
                         continue;
                     }
@@ -151,10 +159,7 @@ impl PolicyEngine {
 
                 let result: rquickjs::Result<rquickjs::Value> = func.call((js_payload.clone(),));
                 if let Err(e) = result {
-                    tracing::error!(
-                        "Hook {} in policy '{}' failed: {e}",
-                        hook, policy_name
-                    );
+                    tracing::error!("Hook {} in policy '{}' failed: {e}", hook, policy_name);
                 }
             }
 
@@ -179,7 +184,11 @@ impl PolicyEngine {
                 name: p.name.clone(),
                 file: p.file.display().to_string(),
                 priority: p.priority,
-                hooks: p.hooks.keys().map(|h: &Hook| h.js_name().to_string()).collect(),
+                hooks: p
+                    .hooks
+                    .keys()
+                    .map(|h: &Hook| h.js_name().to_string())
+                    .collect(),
             })
             .collect()
     }
@@ -187,11 +196,14 @@ impl PolicyEngine {
     /// Evaluate arbitrary JS in the engine context (useful for testing).
     #[cfg(test)]
     pub fn eval_js<T: for<'js> rquickjs::FromJs<'js> + Send>(&self, code: &str) -> Result<T> {
-        let inner = self.inner.lock()
+        let inner = self
+            .inner
+            .lock()
             .map_err(|e| anyhow::anyhow!("engine lock poisoned: {e}"))?;
         let code_owned = code.to_string();
         inner.context.with(|ctx| {
-            let result: T = ctx.eval(code_owned.as_bytes().to_vec())
+            let result: T = ctx
+                .eval(code_owned.as_bytes().to_vec())
                 .map_err(|e| anyhow::anyhow!("JS eval error: {e}"))?;
             Ok(result)
         })
@@ -199,7 +211,10 @@ impl PolicyEngine {
 }
 
 /// Convert a serde_json::Value to a rquickjs::Value.
-fn json_to_js<'js>(ctx: &rquickjs::Ctx<'js>, val: &serde_json::Value) -> Result<rquickjs::Value<'js>> {
+fn json_to_js<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    val: &serde_json::Value,
+) -> Result<rquickjs::Value<'js>> {
     match val {
         serde_json::Value::Null => Ok(rquickjs::Value::new_null(ctx.clone())),
         serde_json::Value::Bool(b) => Ok(rquickjs::Value::new_bool(ctx.clone(), *b)),
@@ -222,7 +237,8 @@ fn json_to_js<'js>(ctx: &rquickjs::Ctx<'js>, val: &serde_json::Value) -> Result<
                 .map_err(|e| anyhow::anyhow!("array creation: {e}"))?;
             for (i, item) in arr.iter().enumerate() {
                 let js_item = json_to_js(ctx, item)?;
-                js_arr.set(i, js_item)
+                js_arr
+                    .set(i, js_item)
                     .map_err(|e| anyhow::anyhow!("array set: {e}"))?;
             }
             Ok(js_arr.into_value())
@@ -372,7 +388,9 @@ mod tests {
         let engine = PolicyEngine::new(&config, db.clone()).unwrap();
 
         // Fire onTick
-        engine.fire_hook(Hook::OnTick, serde_json::json!({})).unwrap();
+        engine
+            .fire_hook(Hook::OnTick, serde_json::json!({}))
+            .unwrap();
 
         // Check the marker was written
         let conn = db.lock().unwrap();

@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -22,9 +22,7 @@ pub struct IssuesQuery {
 
 /// Dashboard-oriented repo list via `gh` CLI.
 /// Returns `{ viewer_login, repos }`.
-pub async fn list_repos(
-    State(_state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn list_repos(State(_state): State<AppState>) -> Json<serde_json::Value> {
     if !github::gh_available() {
         return Json(json!({
             "viewer_login": "unknown",
@@ -113,10 +111,8 @@ pub async fn list_issues(
         "--json",
         "number,title,body,state,url,labels,assignees,createdAt,updatedAt",
     ]) {
-        Ok(raw) => {
-            serde_json::from_str::<serde_json::Value>(&raw)
-                .unwrap_or(serde_json::Value::Array(vec![]))
-        }
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or(serde_json::Value::Array(vec![])),
         Err(_) => serde_json::Value::Array(vec![]),
     };
 
@@ -142,13 +138,7 @@ pub async fn close_issue(
         );
     }
 
-    match github::run_gh(&[
-        "issue",
-        "close",
-        &number.to_string(),
-        "--repo",
-        &full_repo,
-    ]) {
+    match github::run_gh(&["issue", "close", &number.to_string(), "--repo", &full_repo]) {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({
@@ -172,9 +162,7 @@ pub async fn close_issue(
 // ── GET /api/github-closed-today ────────────────────────────────
 
 /// Returns kanban cards marked "done" today that have a github_issue_url.
-pub async fn closed_today(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn closed_today(State(state): State<AppState>) -> Json<serde_json::Value> {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {

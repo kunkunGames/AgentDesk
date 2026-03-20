@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -15,7 +15,10 @@ pub async fn generate() -> (StatusCode, Json<serde_json::Value>) {
 
 /// POST /api/auto-queue/activate
 pub async fn activate() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(json!({ "dispatched": [], "count": 0 })))
+    (
+        StatusCode::OK,
+        Json(json!({ "dispatched": [], "count": 0 })),
+    )
 }
 
 /// GET /api/auto-queue/status
@@ -61,7 +64,7 @@ pub async fn enqueue(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -78,7 +81,9 @@ pub async fn enqueue(
                 _ => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(json!({"error": "no agent_id provided and repo has no default_agent_id"})),
+                        Json(
+                            json!({"error": "no agent_id provided and repo has no default_agent_id"}),
+                        ),
                     );
                 }
             }

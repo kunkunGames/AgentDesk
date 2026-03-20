@@ -1,20 +1,24 @@
 use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
 
 /// Get the platform-appropriate temp directory for AgentDesk runtime files.
-pub fn remotecc_temp_dir() -> String {
+pub fn agentdesk_temp_dir() -> String {
     std::env::temp_dir().display().to_string()
 }
 
 /// Build a path for an AgentDesk runtime temp file.
-/// Example: session_temp_path("mySession", "jsonl") -> "/tmp/remotecc-mySession.jsonl"
+/// Example: session_temp_path("mySession", "jsonl") -> "/tmp/agentdesk-mySession.jsonl"
 pub fn session_temp_path(session_name: &str, extension: &str) -> String {
-    format!("{}/remotecc-{}.{}", remotecc_temp_dir(), session_name, extension)
+    format!(
+        "{}/agentdesk-{}.{}",
+        agentdesk_temp_dir(),
+        session_name,
+        extension
+    )
 }
 
 /// Get the current AgentDesk runtime root marker for tmux session ownership.
 pub fn current_tmux_owner_marker() -> String {
     std::env::var("AGENTDESK_ROOT_DIR")
-        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

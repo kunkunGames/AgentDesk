@@ -9,17 +9,19 @@ pub fn print_help() {
     println!("OPTIONS:");
     println!("    -h, --help              Print help information");
     println!("    -v, --version           Print version information");
-    println!("    --dcserver [TOKEN]      Start Discord bot server(s); without TOKEN uses bot_settings.json");
+    println!(
+        "    --dcserver [TOKEN]      Start Discord bot server(s); without TOKEN uses bot_settings.json"
+    );
     println!(
         "    --restart-dcserver [--report-channel-id <ID> --report-provider <claude|codex> [--report-message-id <ID>]]"
     );
     println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
     println!("    --discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]");
     println!("    --discord-senddm --user <ID> --message <TEXT> [--key <HASH>]");
+    println!("    --reset-tmux             Kill all AgentDesk-* tmux sessions");
     println!(
-        "    --reset-tmux             Kill all AgentDesk-* tmux sessions"
+        "    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)"
     );
-    println!("    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)");
     println!(
         "    --addmcptool <TOOL>...   Add MCP tool permission(s) to .claude/settings.json (CWD)"
     );
@@ -31,7 +33,7 @@ pub fn print_version() {
 }
 
 pub fn handle_base64(encoded: &str) {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     match BASE64.decode(encoded) {
         Ok(decoded) => {
             if let Ok(text) = String::from_utf8(decoded) {
@@ -142,7 +144,7 @@ pub fn handle_reset_tmux() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "local".to_string());
 
-    // Kill local AgentDesk-* sessions (also cleans legacy remoteCC-* sessions)
+    // Kill local AgentDesk-* sessions.
     println!("[{}] Cleaning AgentDesk-* tmux sessions...", hostname);
     let killed = kill_agentdesk_tmux_sessions_local();
     if killed == 0 {
@@ -151,8 +153,8 @@ pub fn handle_reset_tmux() {
         println!("   Killed {} session(s).", killed);
     }
 
-    // Also clean /tmp/remotecc-* temp files
-    let cleaned = clean_remotecc_tmp_files();
+    // Also clean /tmp/agentdesk-* temp files
+    let cleaned = clean_agentdesk_tmp_files();
     if cleaned > 0 {
         println!("   Cleaned {} temp file(s).", cleaned);
     }
@@ -172,7 +174,7 @@ fn kill_agentdesk_tmux_sessions_local() -> usize {
     let mut count = 0;
     for line in output.lines() {
         let name = line.trim();
-        if name.starts_with("AgentDesk-") || name.starts_with("remoteCC-") {
+        if name.starts_with("AgentDesk-") {
             if std::process::Command::new("tmux")
                 .args(["kill-session", "-t", name])
                 .status()
@@ -187,13 +189,13 @@ fn kill_agentdesk_tmux_sessions_local() -> usize {
     count
 }
 
-fn clean_remotecc_tmp_files() -> usize {
+fn clean_agentdesk_tmp_files() -> usize {
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("remotecc-")
+            if name_str.starts_with("agentdesk-")
                 && (name_str.ends_with(".jsonl")
                     || name_str.ends_with(".input")
                     || name_str.ends_with(".prompt"))

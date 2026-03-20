@@ -128,8 +128,8 @@ mod tests {
             token,
             disabled_notice,
             skills_notice,
-            None,   // role_binding
-            false,  // queued_turn
+            None,  // role_binding
+            false, // queued_turn
         )
     }
 
@@ -151,14 +151,7 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt_includes_cwd() {
-        let output = call_build(
-            "ctx",
-            "/home/user/projects",
-            1,
-            "tok",
-            "",
-            "",
-        );
+        let output = call_build("ctx", "/home/user/projects", 1, "tok", "", "");
         assert!(
             output.contains("Current working directory: /home/user/projects"),
             "System prompt should contain the current working directory"

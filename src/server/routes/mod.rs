@@ -1,33 +1,32 @@
 pub mod agents;
+pub mod analytics;
+pub mod auth;
+pub mod auto_queue;
+pub mod cron_api;
+pub mod departments;
+pub mod discord;
+pub mod dispatched_sessions;
+pub mod dispatches;
+pub mod docs;
+pub mod github;
+pub mod github_dashboard;
 pub mod kanban;
 pub mod kanban_repos;
-pub mod reviews;
-pub mod dispatches;
-pub mod pipeline;
-pub mod github;
-pub mod auth;
-pub mod offices;
-pub mod departments;
-pub mod stats;
-pub mod settings;
-pub mod dispatched_sessions;
-pub mod messages;
-pub mod discord;
-pub mod github_dashboard;
 pub mod meetings;
-pub mod skills_api;
-pub mod cron_api;
-pub mod auto_queue;
-pub mod analytics;
-pub mod docs;
+pub mod messages;
+pub mod offices;
+pub mod pipeline;
 pub mod review_verdict;
+pub mod reviews;
+pub mod settings;
+pub mod skills_api;
+pub mod stats;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post, delete, patch},
-    Json,
+    routing::{delete, get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -48,83 +47,189 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/agents", get(list_agents).post(create_agent))
-        .route("/agents/{id}", get(get_agent).patch(update_agent).delete(delete_agent))
+        .route(
+            "/agents/{id}",
+            get(get_agent).patch(update_agent).delete(delete_agent),
+        )
         .route("/agents/{id}/offices", get(agents::agent_offices))
         .route("/agents/{id}/cron", get(agents::agent_cron))
         .route("/agents/{id}/skills", get(agents::agent_skills))
-        .route("/agents/{id}/dispatched-sessions", get(agents::agent_dispatched_sessions))
+        .route(
+            "/agents/{id}/dispatched-sessions",
+            get(agents::agent_dispatched_sessions),
+        )
         .route("/agents/{id}/timeline", get(agents::agent_timeline))
         .route("/sessions", get(list_sessions))
         .route("/policies", get(list_policies))
         // Auth
         .route("/auth/session", get(auth::get_session))
         // Kanban
-        .route("/kanban-cards", get(kanban::list_cards).post(kanban::create_card))
+        .route(
+            "/kanban-cards",
+            get(kanban::list_cards).post(kanban::create_card),
+        )
         .route("/kanban-cards/stalled", get(kanban::stalled_cards))
         .route("/kanban-cards/bulk-action", post(kanban::bulk_action))
         .route("/kanban-cards/assign-issue", post(kanban::assign_issue))
-        .route("/kanban-cards/{id}", get(kanban::get_card).patch(kanban::update_card).delete(kanban::delete_card))
+        .route(
+            "/kanban-cards/{id}",
+            get(kanban::get_card)
+                .patch(kanban::update_card)
+                .delete(kanban::delete_card),
+        )
         .route("/kanban-cards/{id}/assign", post(kanban::assign_card))
         .route("/kanban-cards/{id}/retry", post(kanban::retry_card))
-        .route("/kanban-cards/{id}/redispatch", post(kanban::redispatch_card))
+        .route(
+            "/kanban-cards/{id}/redispatch",
+            post(kanban::redispatch_card),
+        )
         .route("/kanban-cards/{id}/defer-dod", patch(kanban::defer_dod))
         .route("/kanban-cards/{id}/reviews", get(kanban::list_card_reviews))
         // Kanban repos
-        .route("/kanban-repos", get(kanban_repos::list_repos).post(kanban_repos::create_repo))
-        .route("/kanban-repos/{owner}/{repo}", patch(kanban_repos::update_repo).delete(kanban_repos::delete_repo))
+        .route(
+            "/kanban-repos",
+            get(kanban_repos::list_repos).post(kanban_repos::create_repo),
+        )
+        .route(
+            "/kanban-repos/{owner}/{repo}",
+            patch(kanban_repos::update_repo).delete(kanban_repos::delete_repo),
+        )
         // Reviews
-        .route("/kanban-reviews/{id}/decisions", patch(reviews::update_decisions))
-        .route("/kanban-reviews/{id}/trigger-rework", post(reviews::trigger_rework))
+        .route(
+            "/kanban-reviews/{id}/decisions",
+            patch(reviews::update_decisions),
+        )
+        .route(
+            "/kanban-reviews/{id}/trigger-rework",
+            post(reviews::trigger_rework),
+        )
         // Dispatches
-        .route("/dispatches", get(dispatches::list_dispatches).post(dispatches::create_dispatch))
-        .route("/dispatches/{id}", get(dispatches::get_dispatch).patch(dispatches::update_dispatch))
+        .route(
+            "/dispatches",
+            get(dispatches::list_dispatches).post(dispatches::create_dispatch),
+        )
+        .route(
+            "/dispatches/{id}",
+            get(dispatches::get_dispatch).patch(dispatches::update_dispatch),
+        )
         // Pipeline stages (legacy path)
-        .route("/pipeline-stages", get(pipeline::list_stages).post(pipeline::create_stage))
+        .route(
+            "/pipeline-stages",
+            get(pipeline::list_stages).post(pipeline::create_stage),
+        )
         .route("/pipeline-stages/{id}", delete(pipeline::delete_stage))
         // Pipeline stages (dashboard v2 path)
-        .route("/pipeline/stages", get(pipeline::get_stages).put(pipeline::put_stages).delete(pipeline::delete_stages))
+        .route(
+            "/pipeline/stages",
+            get(pipeline::get_stages)
+                .put(pipeline::put_stages)
+                .delete(pipeline::delete_stages),
+        )
         .route("/pipeline/cards/{cardId}", get(pipeline::get_card_pipeline))
-        .route("/pipeline/cards/{cardId}/history", get(pipeline::get_card_history))
+        .route(
+            "/pipeline/cards/{cardId}/history",
+            get(pipeline::get_card_history),
+        )
         // GitHub repos
-        .route("/github/repos", get(github::list_repos).post(github::register_repo))
+        .route(
+            "/github/repos",
+            get(github::list_repos).post(github::register_repo),
+        )
         .route("/github/repos/{owner}/{repo}/sync", post(github::sync_repo))
         // GitHub dashboard
         .route("/github-repos", get(github_dashboard::list_repos))
         .route("/github-issues", get(github_dashboard::list_issues))
-        .route("/github-issues/{owner}/{repo}/{number}/close", patch(github_dashboard::close_issue))
+        .route(
+            "/github-issues/{owner}/{repo}/{number}/close",
+            patch(github_dashboard::close_issue),
+        )
         .route("/github-closed-today", get(github_dashboard::closed_today))
         // Offices
-        .route("/offices", get(offices::list_offices).post(offices::create_office))
-        .route("/offices/{id}", patch(offices::update_office).delete(offices::delete_office))
+        .route(
+            "/offices",
+            get(offices::list_offices).post(offices::create_office),
+        )
+        .route(
+            "/offices/{id}",
+            patch(offices::update_office).delete(offices::delete_office),
+        )
         .route("/offices/{id}/agents", post(offices::add_agent))
-        .route("/offices/{id}/agents/batch", post(offices::batch_add_agents))
-        .route("/offices/{id}/agents/{agentId}", delete(offices::remove_agent).patch(offices::update_office_agent))
+        .route(
+            "/offices/{id}/agents/batch",
+            post(offices::batch_add_agents),
+        )
+        .route(
+            "/offices/{id}/agents/{agentId}",
+            delete(offices::remove_agent).patch(offices::update_office_agent),
+        )
         // Departments
-        .route("/departments", get(departments::list_departments).post(departments::create_department))
-        .route("/departments/reorder", patch(departments::reorder_departments))
-        .route("/departments/{id}", patch(departments::update_department).delete(departments::delete_department))
+        .route(
+            "/departments",
+            get(departments::list_departments).post(departments::create_department),
+        )
+        .route(
+            "/departments/reorder",
+            patch(departments::reorder_departments),
+        )
+        .route(
+            "/departments/{id}",
+            patch(departments::update_department).delete(departments::delete_department),
+        )
         // Stats
         .route("/stats", get(stats::get_stats))
         // Settings
-        .route("/settings", get(settings::get_settings).put(settings::put_settings))
-        .route("/settings/runtime-config", get(settings::get_runtime_config).put(settings::put_runtime_config))
+        .route(
+            "/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
+        .route(
+            "/settings/runtime-config",
+            get(settings::get_runtime_config).put(settings::put_runtime_config),
+        )
         // Dispatched sessions
-        .route("/dispatched-sessions", get(dispatched_sessions::list_dispatched_sessions))
-        .route("/dispatched-sessions/cleanup", delete(dispatched_sessions::cleanup_sessions))
-        .route("/dispatched-sessions/{id}", patch(dispatched_sessions::update_dispatched_session))
+        .route(
+            "/dispatched-sessions",
+            get(dispatched_sessions::list_dispatched_sessions),
+        )
+        .route(
+            "/dispatched-sessions/cleanup",
+            delete(dispatched_sessions::cleanup_sessions),
+        )
+        .route(
+            "/dispatched-sessions/{id}",
+            patch(dispatched_sessions::update_dispatched_session),
+        )
         .route("/hook/session", post(dispatched_sessions::hook_session))
         // Messages
-        .route("/messages", get(messages::list_messages).post(messages::create_message))
+        .route(
+            "/messages",
+            get(messages::list_messages).post(messages::create_message),
+        )
         // Discord bindings
         .route("/discord-bindings", get(discord::list_bindings))
         // Round-table meetings
         .route("/round-table-meetings", get(meetings::list_meetings))
         .route("/round-table-meetings/start", post(meetings::start_meeting))
-        .route("/round-table-meetings/{id}", get(meetings::get_meeting).delete(meetings::delete_meeting))
-        .route("/round-table-meetings/{id}/issue-repo", patch(meetings::update_issue_repo))
-        .route("/round-table-meetings/{id}/issues", post(meetings::create_issues))
-        .route("/round-table-meetings/{id}/issues/discard", post(meetings::discard_issue))
-        .route("/round-table-meetings/{id}/issues/discard-all", post(meetings::discard_all_issues))
+        .route(
+            "/round-table-meetings/{id}",
+            get(meetings::get_meeting).delete(meetings::delete_meeting),
+        )
+        .route(
+            "/round-table-meetings/{id}/issue-repo",
+            patch(meetings::update_issue_repo),
+        )
+        .route(
+            "/round-table-meetings/{id}/issues",
+            post(meetings::create_issues),
+        )
+        .route(
+            "/round-table-meetings/{id}/issues/discard",
+            post(meetings::discard_issue),
+        )
+        .route(
+            "/round-table-meetings/{id}/issues/discard-all",
+            post(meetings::discard_all_issues),
+        )
         // Skills API
         .route("/skills/catalog", get(skills_api::catalog))
         .route("/skills/ranking", get(skills_api::ranking))
@@ -134,7 +239,10 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
         .route("/auto-queue/generate", post(auto_queue::generate))
         .route("/auto-queue/activate", post(auto_queue::activate))
         .route("/auto-queue/status", get(auto_queue::status))
-        .route("/auto-queue/entries/{id}/skip", patch(auto_queue::skip_entry))
+        .route(
+            "/auto-queue/entries/{id}/skip",
+            patch(auto_queue::skip_entry),
+        )
         .route("/auto-queue/runs/{id}", patch(auto_queue::update_run))
         .route("/auto-queue/reorder", patch(auto_queue::reorder))
         .route("/auto-queue/enqueue", post(auto_queue::enqueue))
@@ -177,10 +285,12 @@ async fn list_agents(
     State(state): State<AppState>,
     Query(params): Query<ListAgentsQuery>,
 ) -> Json<serde_json::Value> {
-    let agents = match state.db.lock() {
-        Ok(conn) => {
-            let (sql, bind_values): (String, Vec<String>) = if let Some(ref oid) = params.office_id {
-                (
+    let agents =
+        match state.db.lock() {
+            Ok(conn) => {
+                let (sql, bind_values): (String, Vec<String>) =
+                    if let Some(ref oid) = params.office_id {
+                        (
                     "SELECT a.id, a.name, a.name_ko, a.provider, a.department, a.avatar_emoji,
                             a.discord_channel_id, a.discord_channel_alt, a.status, a.xp,
                             a.sprite_number, d.name, d.name, NULL, a.created_at
@@ -191,8 +301,8 @@ async fn list_agents(
                      ORDER BY a.id".to_string(),
                     vec![oid.clone()],
                 )
-            } else {
-                (
+                    } else {
+                        (
                     "SELECT a.id, a.name, a.name_ko, a.provider, a.department, a.avatar_emoji,
                             a.discord_channel_id, a.discord_channel_alt, a.status, a.xp,
                             a.sprite_number, d.name, d.name, NULL, a.created_at
@@ -201,60 +311,62 @@ async fn list_agents(
                      ORDER BY a.id".to_string(),
                     vec![],
                 )
-            };
+                    };
 
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Json(json!({ "error": format!("query prepare failed: {e}") }));
+                let mut stmt = match conn.prepare(&sql) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Json(json!({ "error": format!("query prepare failed: {e}") }));
+                    }
+                };
+
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::types::ToSql)
+                    .collect();
+
+                let rows = stmt
+                    .query_map(params_ref.as_slice(), |row| {
+                        let provider = row.get::<_, Option<String>>(3)?;
+                        let discord_channel_alt = row.get::<_, Option<String>>(7)?;
+                        let xp_val = row.get::<_, f64>(9).unwrap_or(0.0) as i64;
+                        Ok(json!({
+                            "id": row.get::<_, String>(0)?,
+                            "name": row.get::<_, String>(1)?,
+                            "name_ko": row.get::<_, Option<String>>(2)?,
+                            "provider": provider,
+                            "cli_provider": provider,
+                            "department": row.get::<_, Option<String>>(4)?,
+                            "department_id": row.get::<_, Option<String>>(4)?,
+                            "avatar_emoji": row.get::<_, Option<String>>(5)?,
+                            "discord_channel_id": row.get::<_, Option<String>>(6)?,
+                            "discord_channel_alt": discord_channel_alt,
+                            "discord_channel_id_codex": discord_channel_alt,
+                            "status": row.get::<_, Option<String>>(8)?,
+                            "xp": xp_val,
+                            "stats_xp": xp_val,
+                            "stats_tasks_done": 0,
+                            "stats_tokens": 0,
+                            "sprite_number": row.get::<_, Option<i64>>(10)?,
+                            "department_name": row.get::<_, Option<String>>(11)?,
+                            "department_name_ko": row.get::<_, Option<String>>(12)?,
+                            "department_color": row.get::<_, Option<String>>(13)?,
+                            "created_at": row.get::<_, Option<String>>(14)?,
+                            "alias": serde_json::Value::Null,
+                            "role_id": serde_json::Value::Null,
+                            "personality": serde_json::Value::Null,
+                            "current_task_id": serde_json::Value::Null,
+                        }))
+                    })
+                    .ok();
+
+                match rows {
+                    Some(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
+                    None => Vec::new(),
                 }
-            };
-
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
-
-            let rows = stmt
-                .query_map(params_ref.as_slice(), |row| {
-                    let provider = row.get::<_, Option<String>>(3)?;
-                    let discord_channel_alt = row.get::<_, Option<String>>(7)?;
-                    let xp_val = row.get::<_, f64>(9).unwrap_or(0.0) as i64;
-                    Ok(json!({
-                        "id": row.get::<_, String>(0)?,
-                        "name": row.get::<_, String>(1)?,
-                        "name_ko": row.get::<_, Option<String>>(2)?,
-                        "provider": provider,
-                        "cli_provider": provider,
-                        "department": row.get::<_, Option<String>>(4)?,
-                        "department_id": row.get::<_, Option<String>>(4)?,
-                        "avatar_emoji": row.get::<_, Option<String>>(5)?,
-                        "discord_channel_id": row.get::<_, Option<String>>(6)?,
-                        "discord_channel_alt": discord_channel_alt,
-                        "discord_channel_id_codex": discord_channel_alt,
-                        "status": row.get::<_, Option<String>>(8)?,
-                        "xp": xp_val,
-                        "stats_xp": xp_val,
-                        "stats_tasks_done": 0,
-                        "stats_tokens": 0,
-                        "sprite_number": row.get::<_, Option<i64>>(10)?,
-                        "department_name": row.get::<_, Option<String>>(11)?,
-                        "department_name_ko": row.get::<_, Option<String>>(12)?,
-                        "department_color": row.get::<_, Option<String>>(13)?,
-                        "created_at": row.get::<_, Option<String>>(14)?,
-                        "alias": serde_json::Value::Null,
-                        "role_id": serde_json::Value::Null,
-                        "personality": serde_json::Value::Null,
-                        "current_task_id": serde_json::Value::Null,
-                    }))
-                })
-                .ok();
-
-            match rows {
-                Some(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-                None => Vec::new(),
             }
-        }
-        Err(_) => Vec::new(),
-    };
+            Err(_) => Vec::new(),
+        };
 
     Json(json!({ "agents": agents }))
 }
@@ -359,7 +471,7 @@ async fn create_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -436,7 +548,7 @@ async fn update_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -494,21 +606,20 @@ async fn update_agent(
     let sql = format!("UPDATE agents SET {} WHERE id = ?{}", sets.join(", "), idx);
     values.push(Box::new(id.clone()));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        values.iter().map(|v| v.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "agent not found"})),
-            )
+            );
         }
         Ok(_) => {}
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     }
 
@@ -551,7 +662,7 @@ async fn delete_agent(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -659,7 +770,12 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -680,7 +796,12 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/agents").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -709,7 +830,12 @@ mod tests {
 
         let app = api_router(db, engine);
         let response = app
-            .oneshot(Request::builder().uri("/agents").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -823,7 +949,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["card"]["title"], "Test Card");
         assert_eq!(json["card"]["priority"], "high");
@@ -838,12 +966,19 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/kanban-cards").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/kanban-cards")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["cards"].as_array().unwrap().is_empty());
     }
@@ -876,7 +1011,9 @@ mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let cards = json["cards"].as_array().unwrap();
         assert_eq!(cards.len(), 1);
@@ -908,7 +1045,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["card"]["id"], "c1");
         assert_eq!(json["card"]["title"], "Card1");
@@ -960,7 +1099,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["card"]["status"], "ready");
     }
@@ -1017,7 +1158,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["card"]["status"], "ready");
         assert_eq!(json["card"]["assigned_agent_id"], "ch-td");
@@ -1053,12 +1196,19 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/dispatches").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/dispatches")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["dispatches"].as_array().unwrap().is_empty());
     }
@@ -1092,7 +1242,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
         assert_eq!(json["dispatch"]["status"], "pending");
@@ -1101,7 +1253,9 @@ mod tests {
         // Card should be "requested"
         let conn = db.lock().unwrap();
         let card_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| r.get(0))
+            .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(card_status, "requested");
         drop(conn);
@@ -1119,7 +1273,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2["dispatch"]["id"], dispatch_id);
     }
@@ -1176,7 +1332,9 @@ mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
 
@@ -1195,7 +1353,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2["dispatch"]["status"], "completed");
     }
@@ -1282,12 +1442,20 @@ mod tests {
 
         let conn = db.lock().unwrap();
         let transition: String = conn
-            .query_row("SELECT value FROM kv_meta WHERE key = 'transition'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'transition'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(transition, "review->done");
 
         let terminal: String = conn
-            .query_row("SELECT value FROM kv_meta WHERE key = 'terminal'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'terminal'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(terminal, "c1:done");
     }
@@ -1324,7 +1492,9 @@ mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let dispatches = json["dispatches"].as_array().unwrap();
         assert_eq!(dispatches.len(), 1);
@@ -1340,12 +1510,19 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/github/repos").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/github/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["repos"].as_array().unwrap().is_empty());
     }
@@ -1370,18 +1547,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["repo"]["id"], "owner/repo1");
 
         // List
         let app2 = api_router(db, engine);
         let response2 = app2
-            .oneshot(Request::builder().uri("/github/repos").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/github/repos")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2["repos"].as_array().unwrap().len(), 1);
     }
@@ -1436,12 +1622,19 @@ mod tests {
         let app = api_router(db, engine);
 
         let response = app
-            .oneshot(Request::builder().uri("/pipeline-stages").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/pipeline-stages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["stages"].as_array().unwrap().is_empty());
     }
@@ -1468,7 +1661,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["stage"]["stage_name"], "qa-test");
         assert_eq!(json["stage"]["trigger_after"], "review_pass");
@@ -1487,7 +1682,9 @@ mod tests {
             .await
             .unwrap();
 
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX).await.unwrap();
+        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2["stages"].as_array().unwrap().len(), 1);
 
@@ -1505,7 +1702,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response3.status(), StatusCode::OK);
-        let body3 = axum::body::to_bytes(response3.into_body(), usize::MAX).await.unwrap();
+        let body3 = axum::body::to_bytes(response3.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
         assert_eq!(json3["deleted"], true);
     }
@@ -1558,7 +1757,9 @@ mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let stages = json["stages"].as_array().unwrap();
         assert_eq!(stages.len(), 1);

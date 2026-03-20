@@ -64,7 +64,7 @@ function getMessageTypeLabel(type: string, isKo: boolean): string {
 }
 
 function getActivitySourceLabel(agent: Agent, isKo: boolean): string {
-  if (agent.activity_source === "remotecc") return "RemoteCC";
+  if (agent.activity_source === "agentdesk") return "AgentDesk";
   return isKo ? "기본" : "Default";
 }
 

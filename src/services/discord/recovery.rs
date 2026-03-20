@@ -108,8 +108,7 @@ pub(super) async fn restore_inflight_turns(
             if state.current_msg_id != 0 {
                 let channel_id = ChannelId::new(state.channel_id);
                 let current_msg_id = MessageId::new(state.current_msg_id);
-                let stale_text =
-                    super::turn_bridge::stale_inflight_message(&state.full_response);
+                let stale_text = super::turn_bridge::stale_inflight_message(&state.full_response);
                 let _ = super::formatting::replace_long_message_raw(
                     http,
                     channel_id,
@@ -191,7 +190,10 @@ pub(super) async fn restore_inflight_turns(
                 .as_deref()
                 .or_else(|| state.channel_name.as_deref())
                 .map(|name| {
-                    if name.starts_with(&format!("{}-", crate::services::provider::TMUX_SESSION_PREFIX)) {
+                    if name.starts_with(&format!(
+                        "{}-",
+                        crate::services::provider::TMUX_SESSION_PREFIX
+                    )) {
                         name.to_string()
                     } else {
                         provider.build_tmux_session_name(name)
@@ -372,12 +374,14 @@ pub(super) async fn restore_inflight_turns(
             {
                 println!(
                     "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {}, {diag})",
-                    state.channel_id, best_response.len()
+                    state.channel_id,
+                    best_response.len()
                 );
             } else {
                 println!(
                     "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {})",
-                    state.channel_id, best_response.len()
+                    state.channel_id,
+                    best_response.len()
                 );
             }
             let _ = super::formatting::replace_long_message_raw(
@@ -473,7 +477,9 @@ pub(super) async fn restore_inflight_turns(
                 }
             }
             if !data.cancel_tokens.contains_key(&channel_id) {
-                shared.global_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                shared
+                    .global_active
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             data.cancel_tokens.insert(channel_id, cancel_token.clone());
             data.active_request_owner

@@ -108,7 +108,8 @@ mod tests {
         let db = test_db();
         {
             let conn = db.lock().unwrap();
-            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", []).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
         }
 
         let issues = vec![
@@ -116,7 +117,9 @@ mod tests {
                 number: 1,
                 state: "OPEN".to_string(),
                 title: "Bug fix needed".to_string(),
-                labels: vec![GhLabel { name: "bug".to_string() }],
+                labels: vec![GhLabel {
+                    name: "bug".to_string(),
+                }],
                 body: Some("Description".to_string()),
             },
             GhIssue {
@@ -134,7 +137,11 @@ mod tests {
         // Verify cards exist
         let conn = db.lock().unwrap();
         let card_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM kanban_cards WHERE repo_id = 'owner/repo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_cards WHERE repo_id = 'owner/repo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(card_count, 2);
 
@@ -156,7 +163,8 @@ mod tests {
         let db = test_db();
         {
             let conn = db.lock().unwrap();
-            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", []).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
             conn.execute(
                 "INSERT INTO kanban_cards (id, repo_id, title, status, priority, github_issue_number, created_at, updated_at)
                  VALUES ('existing', 'owner/repo', 'Existing', 'backlog', 'medium', 1, datetime('now'), datetime('now'))",
@@ -181,7 +189,8 @@ mod tests {
         let db = test_db();
         {
             let conn = db.lock().unwrap();
-            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", []).unwrap();
+            conn.execute("INSERT INTO github_repos (id) VALUES ('owner/repo')", [])
+                .unwrap();
         }
 
         let issues = vec![GhIssue {
@@ -199,19 +208,27 @@ mod tests {
     #[test]
     fn priority_inference_from_labels() {
         assert_eq!(
-            infer_priority(&[GhLabel { name: "P0-critical".to_string() }]),
+            infer_priority(&[GhLabel {
+                name: "P0-critical".to_string()
+            }]),
             "critical"
         );
         assert_eq!(
-            infer_priority(&[GhLabel { name: "priority:high".to_string() }]),
+            infer_priority(&[GhLabel {
+                name: "priority:high".to_string()
+            }]),
             "high"
         );
         assert_eq!(
-            infer_priority(&[GhLabel { name: "p3-low".to_string() }]),
+            infer_priority(&[GhLabel {
+                name: "p3-low".to_string()
+            }]),
             "low"
         );
         assert_eq!(
-            infer_priority(&[GhLabel { name: "enhancement".to_string() }]),
+            infer_priority(&[GhLabel {
+                name: "enhancement".to_string()
+            }]),
             "medium"
         );
         assert_eq!(infer_priority(&[]), "medium");

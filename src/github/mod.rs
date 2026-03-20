@@ -1,6 +1,6 @@
+pub mod dod;
 pub mod sync;
 pub mod triage;
-pub mod dod;
 
 use crate::db::Db;
 
@@ -25,7 +25,11 @@ pub(crate) fn run_gh(args: &[&str]) -> Result<String, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh exited with {}: {}", output.status, stderr.trim()));
+        return Err(format!(
+            "gh exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
     }
 
     String::from_utf8(output.stdout).map_err(|e| format!("invalid utf8 from gh: {e}"))
@@ -35,7 +39,9 @@ pub(crate) fn run_gh(args: &[&str]) -> Result<String, String> {
 pub fn list_repos(db: &Db) -> Result<Vec<RepoRow>, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
     let mut stmt = conn
-        .prepare("SELECT id, display_name, sync_enabled, last_synced_at FROM github_repos ORDER BY id")
+        .prepare(
+            "SELECT id, display_name, sync_enabled, last_synced_at FROM github_repos ORDER BY id",
+        )
         .map_err(|e| format!("prepare: {e}"))?;
 
     let rows = stmt

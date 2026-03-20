@@ -82,7 +82,8 @@ impl SessionBackend for ProcessBackend {
             // Pipe mode doesn't use a FIFO, but the wrapper CLI still requires
             // this arg.  Use a path under the runtime temp dir so cleanup's
             // remove_file() can never hit a real user file.
-            crate::services::tmux_common::session_temp_path(&config.session_name, "unused-fifo").to_string(),
+            crate::services::tmux_common::session_temp_path(&config.session_name, "unused-fifo")
+                .to_string(),
             "--prompt-file".to_string(),
             config.prompt_path.clone(),
             "--cwd".to_string(),

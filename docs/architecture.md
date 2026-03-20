@@ -73,7 +73,7 @@ RCC의 serenity 기반 Discord 봇을 그대로 이관.
 |------|------|------|
 | `tmux.rs` | tmux 세션 생성/파괴/모니터링 | RCC tmux 관리 |
 | `tracker.rs` | 세션 상태 DB 기록, 하트비트 | PCD `dispatched-sync.ts` |
-| `agent_link.rs` | 세션 ↔ 에이전트 매핑 | PCD `remotecc-session.ts` + `role-map.ts` |
+| `agent_link.rs` | 세션 ↔ 에이전트 매핑 | PCD `agentdesk-session.ts` + `role-map.ts` |
 
 **변경점:**
 - `role_map.json` 파일 의존 제거 → DB `agents` 테이블에서 직접 조회

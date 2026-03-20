@@ -8,12 +8,9 @@ pub const TMUX_SESSION_PREFIX: &str = "AgentDesk";
 pub fn tmux_env_suffix() -> &'static str {
     use std::sync::OnceLock;
     static SUFFIX: OnceLock<String> = OnceLock::new();
-    SUFFIX.get_or_init(|| {
-        match std::env::var("AGENTDESK_ROOT_DIR")
-            .or_else(|_| std::env::var("REMOTECC_ROOT_DIR")).ok() {
-            Some(root) if root.contains(".adk/dev") => "-dev".to_string(),
-            _ => String::new(),
-        }
+    SUFFIX.get_or_init(|| match std::env::var("AGENTDESK_ROOT_DIR").ok() {
+        Some(root) if root.contains(".adk/dev") => "-dev".to_string(),
+        _ => String::new(),
     })
 }
 
@@ -100,21 +97,21 @@ impl ProviderKind {
             })
             .collect();
         let trimmed = safe_prefix(&sanitized, 44);
-        format!("{}-{}-{}{}", TMUX_SESSION_PREFIX, self.as_str(), trimmed, tmux_env_suffix())
+        format!(
+            "{}-{}-{}{}",
+            TMUX_SESSION_PREFIX,
+            self.as_str(),
+            trimmed,
+            tmux_env_suffix()
+        )
     }
 }
-
-/// Legacy tmux session prefix for backward compatibility during rolling upgrades.
-const LEGACY_TMUX_SESSION_PREFIX: &str = "remoteCC";
 
 pub fn parse_provider_and_channel_from_tmux_name(
     session_name: &str,
 ) -> Option<(ProviderKind, String)> {
     let prefix = format!("{}-", TMUX_SESSION_PREFIX);
-    let legacy_prefix = format!("{}-", LEGACY_TMUX_SESSION_PREFIX);
-    let stripped = session_name
-        .strip_prefix(&prefix)
-        .or_else(|| session_name.strip_prefix(&legacy_prefix))?;
+    let stripped = session_name.strip_prefix(&prefix)?;
     // Strip env suffix (e.g. "-dev") from the end before parsing
     let suffix = tmux_env_suffix();
     let without_suffix = if !suffix.is_empty() {
@@ -133,7 +130,7 @@ pub fn parse_provider_and_channel_from_tmux_name(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_provider_and_channel_from_tmux_name, ProviderKind};
+    use super::{ProviderKind, parse_provider_and_channel_from_tmux_name};
 
     #[test]
     fn test_provider_channel_support() {
@@ -158,12 +155,18 @@ mod tests {
 
     #[test]
     fn test_from_str_or_unsupported_known() {
-        assert_eq!(ProviderKind::from_str_or_unsupported("claude"), ProviderKind::Claude);
-        assert_eq!(ProviderKind::from_str_or_unsupported("Codex"), ProviderKind::Codex);
+        assert_eq!(
+            ProviderKind::from_str_or_unsupported("claude"),
+            ProviderKind::Claude
+        );
+        assert_eq!(
+            ProviderKind::from_str_or_unsupported("Codex"),
+            ProviderKind::Codex
+        );
     }
 
     #[test]
-    fn test_tmux_name_parse_supports_legacy_and_provider_aware_names() {
+    fn test_tmux_name_parse_supports_provider_aware_names() {
         assert_eq!(
             parse_provider_and_channel_from_tmux_name("AgentDesk-claude-cookingheart-dev-cc"),
             Some((ProviderKind::Claude, "cookingheart-dev-cc".to_string()))

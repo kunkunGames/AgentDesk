@@ -129,7 +129,7 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
     return () => { mounted = false; clearInterval(timer); };
   }, []);
 
-  if (!data || data.providers.length === 0) return null;
+  if (!data || !data.providers || data.providers.length === 0) return null;
 
   return (
     <div className="game-panel relative overflow-hidden px-3 py-2 sm:px-4 sm:py-2.5">

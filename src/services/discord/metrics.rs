@@ -29,8 +29,12 @@ fn today_file() -> Option<PathBuf> {
 /// Append a turn metric entry to today's JSONL file.
 pub(super) fn record_turn(metric: &TurnMetric) {
     let Some(path) = today_file() else { return };
-    let Ok(json) = serde_json::to_string(metric) else { return };
-    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+    let Ok(json) = serde_json::to_string(metric) else {
+        return;
+    };
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
     let _ = writeln!(file, "{json}");
 }
 
@@ -46,12 +50,16 @@ pub(super) fn load_date(date: &str) -> Vec<TurnMetric> {
     if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
         return vec![];
     }
-    let Some(dir) = metrics_dir() else { return vec![] };
+    let Some(dir) = metrics_dir() else {
+        return vec![];
+    };
     load_file(&dir.join(format!("{date}.jsonl")))
 }
 
 fn load_file(path: &std::path::Path) -> Vec<TurnMetric> {
-    let Ok(content) = fs::read_to_string(path) else { return vec![] };
+    let Ok(content) = fs::read_to_string(path) else {
+        return vec![];
+    };
     content
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
@@ -71,14 +79,18 @@ pub(super) fn build_metrics_report(metrics: &[TurnMetric], label: &str) -> Strin
     let total_output: u64 = metrics.iter().filter_map(|m| m.output_tokens).sum();
 
     // Per-channel breakdown
-    let mut by_channel: std::collections::HashMap<u64, Vec<&TurnMetric>> = std::collections::HashMap::new();
+    let mut by_channel: std::collections::HashMap<u64, Vec<&TurnMetric>> =
+        std::collections::HashMap::new();
     for m in metrics {
         by_channel.entry(m.channel_id).or_default().push(m);
     }
 
     let mut lines = vec![
         format!("**📊 Metrics ({label})**"),
-        format!("  Turns: {} | Avg: {:.0}s | Total: {:.0}s", total_turns, avg_duration, total_duration),
+        format!(
+            "  Turns: {} | Avg: {:.0}s | Total: {:.0}s",
+            total_turns, avg_duration, total_duration
+        ),
         format!("  Tokens: {}↓ {}↑", total_input, total_output),
     ];
 

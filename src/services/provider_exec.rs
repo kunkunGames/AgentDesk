@@ -13,8 +13,6 @@ pub async fn execute_simple(provider: ProviderKind, prompt: String) -> Result<St
                 .await
                 .map_err(|e| format!("Task join error: {}", e))?
         }
-        ProviderKind::Unsupported(name) => {
-            Err(format!("Provider '{}' is not installed", name))
-        }
+        ProviderKind::Unsupported(name) => Err(format!("Provider '{}' is not installed", name)),
     }
 }

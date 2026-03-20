@@ -1,11 +1,11 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-use crate::services::tmux_wrapper::{render_for_terminal, InputMode};
+use crate::services::tmux_wrapper::{InputMode, render_for_terminal};
 
-const TMUX_PROMPT_B64_PREFIX: &str = "__REMOTECC_B64__:";
+const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
 pub fn run(
     output_file: &str,
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_decode_external_prompt_decodes_base64_payload() {
-        let line = "__REMOTECC_B64__:bGluZTEKbGluZTI=";
+        let line = "__AGENTDESK_B64__:bGluZTEKbGluZTI=";
         assert_eq!(decode_external_prompt(line).unwrap(), "line1\nline2");
     }
 }

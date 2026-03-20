@@ -264,8 +264,14 @@ Other notes
     #[test]
     fn render_dod_markdown_output() {
         let items = vec![
-            DodItem { text: "Tests pass".to_string(), checked: false },
-            DodItem { text: "Reviewed".to_string(), checked: true },
+            DodItem {
+                text: "Tests pass".to_string(),
+                checked: false,
+            },
+            DodItem {
+                text: "Reviewed".to_string(),
+                checked: true,
+            },
         ];
 
         let md = render_dod_markdown(&items);

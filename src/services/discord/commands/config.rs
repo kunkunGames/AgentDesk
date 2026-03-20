@@ -1,12 +1,8 @@
 use poise::serenity_prelude as serenity;
 
-use super::super::{
-    check_auth, check_owner, Context, Error,
-};
-use super::super::formatting::{
-    canonical_tool_name, risk_badge, send_long_message_ctx, tool_info,
-};
+use super::super::formatting::{canonical_tool_name, risk_badge, send_long_message_ctx, tool_info};
 use super::super::settings::{resolve_role_binding, save_bot_settings};
+use super::super::{Context, Error, check_auth, check_owner};
 use crate::services::provider::ProviderKind;
 
 /// /model — Set or view the model override for this channel
@@ -27,7 +23,8 @@ pub(in crate::services::discord) async fn cmd_model(
     // Model override only applies to Claude provider
     if !matches!(ctx.data().provider, ProviderKind::Claude) {
         println!("  [{ts}] ◀ [{user_name}] /model (unsupported provider)");
-        ctx.say("Model override is only supported for Claude channels.").await?;
+        ctx.say("Model override is only supported for Claude channels.")
+            .await?;
         return Ok(());
     }
 
@@ -36,24 +33,41 @@ pub(in crate::services::discord) async fn cmd_model(
             if m == "default" || m == "none" || m == "clear" {
                 ctx.data().shared.model_overrides.remove(&channel_id);
             } else {
-                ctx.data().shared.model_overrides.insert(channel_id, m.clone());
+                ctx.data()
+                    .shared
+                    .model_overrides
+                    .insert(channel_id, m.clone());
             }
-            let display = ctx.data().shared.model_overrides.get(&channel_id)
+            let display = ctx
+                .data()
+                .shared
+                .model_overrides
+                .get(&channel_id)
                 .map(|v| v.clone())
                 .unwrap_or_else(|| "(default)".to_string());
             println!("  [{ts}] ◀ [{user_name}] /model {m}");
-            ctx.say(format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await?;
+            ctx.say(format!(
+                "Model set to **{display}** for this channel. Takes effect on next turn."
+            ))
+            .await?;
         }
         None => {
-            let override_model = ctx.data().shared.model_overrides.get(&channel_id)
+            let override_model = ctx
+                .data()
+                .shared
+                .model_overrides
+                .get(&channel_id)
                 .map(|v| v.clone());
             let ch_name = {
                 let d = ctx.data().shared.core.lock().await;
-                d.sessions.get(&channel_id).and_then(|s| s.channel_name.clone())
+                d.sessions
+                    .get(&channel_id)
+                    .and_then(|s| s.channel_name.clone())
             };
-            let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
-                .and_then(|rb| rb.model);
-            let effective = override_model.as_deref()
+            let role_model =
+                resolve_role_binding(channel_id, ch_name.as_deref()).and_then(|rb| rb.model);
+            let effective = override_model
+                .as_deref()
                 .or(role_model.as_deref())
                 .unwrap_or("(default)");
             let source = if override_model.is_some() {
@@ -64,7 +78,8 @@ pub(in crate::services::discord) async fn cmd_model(
                 "system default"
             };
             println!("  [{ts}] ◀ [{user_name}] /model");
-            ctx.say(format!("Model: **{effective}** (source: {source})")).await?;
+            ctx.say(format!("Model: **{effective}** (source: {source})"))
+                .await?;
         }
     }
     Ok(())

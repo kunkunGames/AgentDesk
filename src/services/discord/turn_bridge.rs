@@ -1,5 +1,5 @@
-use super::handoff::{save_handoff, HandoffRecord};
-use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
+use super::handoff::{HandoffRecord, save_handoff};
+use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 use crate::utils::format::tail_with_ellipsis;
@@ -60,22 +60,16 @@ pub(super) fn stale_inflight_message(saved_response: &str) -> String {
 fn is_dcserver_restart_command(input: &str) -> bool {
     let lower = input.to_lowercase();
 
-    if lower.contains("--restart-dcserver")
-        || lower.contains("restart_remotecc.sh")   // legacy
-        || lower.contains("restart_agentdesk.sh")
-    {
+    if lower.contains("--restart-dcserver") || lower.contains("restart_agentdesk.sh") {
         return true;
     }
 
-    if (lower.contains("remotecc-discord-smoke.sh") || lower.contains("agentdesk-discord-smoke.sh"))
-        && lower.contains("--deploy-live")
-    {
+    if lower.contains("agentdesk-discord-smoke.sh") && lower.contains("--deploy-live") {
         return true;
     }
 
     lower.contains("launchctl")
-        && (lower.contains("com.agentdesk.dcserver")
-            || lower.contains("com.itismyfield.remotecc.dcserver"))  // legacy
+        && lower.contains("com.agentdesk.dcserver")
         && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
 }
 
@@ -210,8 +204,7 @@ pub(super) fn spawn_turn_bridge(
                             } else {
                                 truncate_str(&summary, 120).to_string()
                             };
-                            current_tool_line =
-                                Some(format!("⚙ {}: {}", name, display_summary));
+                            current_tool_line = Some(format!("⚙ {}: {}", name, display_summary));
                             last_tool_name = Some(name.clone());
                             last_tool_summary = Some(display_summary);
                             if !restart_followup_pending && is_dcserver_restart_command(&input) {
@@ -248,8 +241,7 @@ pub(super) fn spawn_turn_bridge(
                                         println!("  [{ts}] ⚠ failed to save handoff: {e}");
                                     }
 
-                                    let handoff_text =
-                                        "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
+                                    let handoff_text = "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
                                     rate_limit_wait(&shared_owned, channel_id).await;
                                     let _ = channel_id
                                         .edit_message(
@@ -367,7 +359,8 @@ pub(super) fn spawn_turn_bridge(
                                 let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
                                 let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
                                 let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
-                                let turn_delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let turn_delivered =
+                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let handle = TmuxWatcherHandle {
                                     paused: paused.clone(),
                                     resume_offset: resume_offset.clone(),
@@ -430,7 +423,9 @@ pub(super) fn spawn_turn_bridge(
             spin_idx += 1;
 
             let raw_tool_status = super::formatting::resolve_raw_tool_status(
-                current_tool_line.as_deref(), &full_response);
+                current_tool_line.as_deref(),
+                &full_response,
+            );
             let tool_status = super::formatting::humanize_tool_status(raw_tool_status);
             let current_portion = if response_sent_offset < full_response.len() {
                 &full_response[response_sent_offset..]
@@ -447,7 +442,8 @@ pub(super) fn spawn_turn_bridge(
                 format!("{}{}", body, footer)
             };
 
-            if stable_display_text != last_edit_text && !done
+            if stable_display_text != last_edit_text
+                && !done
                 && last_status_edit.elapsed() >= status_interval
             {
                 rate_limit_wait(&shared_owned, channel_id).await;
@@ -522,8 +518,12 @@ pub(super) fn spawn_turn_bridge(
             if let Some(removed_token) = data.cancel_tokens.remove(&channel_id) {
                 // Mark the token as cancelled so any lingering watchdog timer exits cleanly
                 // instead of mistakenly firing on a newer turn's token.
-                removed_token.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                shared_owned.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                removed_token
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                shared_owned
+                    .global_active
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             data.active_request_owner.remove(&channel_id);
             let mut remove_queue = false;
@@ -633,15 +633,12 @@ pub(super) fn spawn_turn_bridge(
 
                 if full_response.is_empty() {
                     if rx_disconnected {
-                        full_response =
-                            "(No response — 프로세스가 응답 없이 종료됨)".to_string();
+                        full_response = "(No response — 프로세스가 응답 없이 종료됨)".to_string();
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         eprintln!(
                             "  [{ts}] ⚠ Empty response: rx disconnected before any text \
                              (channel {}, output_path={:?}, last_offset={})",
-                            channel_id,
-                            inflight_state.output_path,
-                            inflight_state.last_offset
+                            channel_id, inflight_state.output_path, inflight_state.last_offset
                         );
                     } else {
                         full_response = "(No response)".to_string();
@@ -680,7 +677,8 @@ pub(super) fn spawn_turn_bridge(
 
             // Record turn metrics
             {
-                let duration = shared_owned.turn_start_times
+                let duration = shared_owned
+                    .turn_start_times
                     .remove(&channel_id)
                     .map(|(_, start)| start.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
@@ -694,8 +692,16 @@ pub(super) fn spawn_turn_bridge(
                     timestamp: chrono::Local::now().to_rfc3339(),
                     duration_secs: duration,
                     model: None, // model info from StatusUpdate not yet accumulated in turn_bridge
-                    input_tokens: if accumulated_input_tokens > 0 { Some(accumulated_input_tokens) } else { None },
-                    output_tokens: if accumulated_output_tokens > 0 { Some(accumulated_output_tokens) } else { None },
+                    input_tokens: if accumulated_input_tokens > 0 {
+                        Some(accumulated_input_tokens)
+                    } else {
+                        None
+                    },
+                    output_tokens: if accumulated_output_tokens > 0 {
+                        Some(accumulated_output_tokens)
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -845,7 +851,9 @@ pub(super) fn spawn_turn_bridge(
                 }
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain");
+                println!(
+                    "  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain"
+                );
                 if let Some(offset) = tmux_last_offset {
                     if let Some(watcher) = shared_owned.tmux_watchers.get(&channel_id) {
                         if let Ok(mut guard) = watcher.resume_offset.lock() {
@@ -867,7 +875,9 @@ pub(super) fn spawn_turn_bridge(
                         super::kickoff_idle_queues(ctx, &shared_for_drain, tok).await;
                     } else {
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] ⚠ Deferred drain: still no cached context, queued messages remain pending");
+                        println!(
+                            "  [{ts}] ⚠ Deferred drain: still no cached context, queued messages remain pending"
+                        );
                     }
                 });
             }

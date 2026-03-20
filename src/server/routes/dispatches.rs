@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -46,12 +46,12 @@ pub async fn list_dispatches(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     let mut sql = String::from(
-        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at FROM task_dispatches WHERE 1=1"
+        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at FROM task_dispatches WHERE 1=1",
     );
     let mut bind_values: Vec<String> = Vec::new();
 
@@ -72,12 +72,14 @@ pub async fn list_dispatches(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("prepare: {e}")})),
-            )
+            );
         }
     };
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let rows = stmt
         .query_map(params_ref.as_slice(), |row| dispatch_row_to_json(row))
@@ -102,7 +104,7 @@ pub async fn get_dispatch(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -127,7 +129,9 @@ pub async fn create_dispatch(
     State(state): State<AppState>,
     Json(body): Json<CreateDispatchBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let dispatch_type = body.dispatch_type.unwrap_or_else(|| "implementation".to_string());
+    let dispatch_type = body
+        .dispatch_type
+        .unwrap_or_else(|| "implementation".to_string());
     let context = body.context.unwrap_or(json!({}));
 
     match dispatch::create_dispatch(
@@ -155,7 +159,10 @@ pub async fn create_dispatch(
             if msg.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(json!({"error": msg})))
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg})))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": msg})),
+                )
             }
         }
     }
@@ -192,7 +199,7 @@ pub async fn update_dispatch(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -214,18 +221,28 @@ pub async fn update_dispatch(
     }
 
     if sets.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no fields to update"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no fields to update"})),
+        );
     }
 
     sets.push("updated_at = datetime('now')".to_string());
 
-    let sql = format!("UPDATE task_dispatches SET {} WHERE id = ?{}", sets.join(", "), idx);
+    let sql = format!(
+        "UPDATE task_dispatches SET {} WHERE id = ?{}",
+        sets.join(", "),
+        idx
+    );
     values.push(Box::new(id.clone()));
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "dispatch not found"})));
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "dispatch not found"})),
+            );
         }
         Ok(_) => {}
         Err(e) => {
@@ -265,7 +282,7 @@ pub async fn update_dispatch(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -286,9 +303,23 @@ pub async fn update_dispatch(
 
 fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
     let status = row.get::<_, String>(5)?;
-    let created_at = row.get::<_, Option<String>>(11).ok().flatten().or_else(|| row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v.to_string()));
-    let updated_at = row.get::<_, Option<String>>(12).ok().flatten().or_else(|| row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v.to_string()));
-    let completed_at = if status == "completed" { updated_at.clone() } else { None };
+    let created_at = row.get::<_, Option<String>>(11).ok().flatten().or_else(|| {
+        row.get::<_, Option<i64>>(11)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string())
+    });
+    let updated_at = row.get::<_, Option<String>>(12).ok().flatten().or_else(|| {
+        row.get::<_, Option<i64>>(12)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string())
+    });
+    let completed_at = if status == "completed" {
+        updated_at.clone()
+    } else {
+        None
+    };
     Ok(json!({
         "id": row.get::<_, String>(0)?,
         "kanban_card_id": row.get::<_, Option<String>>(1)?,
@@ -312,7 +343,12 @@ fn dispatch_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Val
 }
 
 /// Send a dispatch notification to the target agent's Discord channel.
-pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str, title: &str, card_id: &str) {
+pub(super) async fn send_dispatch_to_discord(
+    db: &crate::db::Db,
+    agent_id: &str,
+    title: &str,
+    card_id: &str,
+) {
     // Look up agent's discord channel
     let channel_id: Option<String> = {
         let conn = match db.lock() {
@@ -330,7 +366,9 @@ pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str,
     let channel_id = match channel_id {
         Some(id) if !id.is_empty() => id,
         _ => {
-            tracing::warn!("[dispatch] No discord_channel_id for agent {agent_id}, skipping message");
+            tracing::warn!(
+                "[dispatch] No discord_channel_id for agent {agent_id}, skipping message"
+            );
             return;
         }
     };
@@ -343,7 +381,9 @@ pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str,
             match resolve_channel_alias(&channel_id) {
                 Some(n) => n,
                 None => {
-                    tracing::warn!("[dispatch] Cannot resolve channel '{channel_id}' for agent {agent_id}");
+                    tracing::warn!(
+                        "[dispatch] Cannot resolve channel '{channel_id}' for agent {agent_id}"
+                    );
                     return;
                 }
             }
@@ -373,7 +413,10 @@ pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str,
 
     // Send via Discord HTTP API using the announce bot
     let config = crate::config::load_graceful();
-    let token = match config.discord.bots.get("announce")
+    let token = match config
+        .discord
+        .bots
+        .get("announce")
         .or_else(|| config.discord.bots.get("command"))
     {
         Some(bot) => bot.token.clone(),
@@ -384,7 +427,10 @@ pub(super) async fn send_dispatch_to_discord(db: &crate::db::Db, agent_id: &str,
     };
 
     // Use reqwest to send directly via Discord REST API
-    let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id_num);
+    let url = format!(
+        "https://discord.com/api/v10/channels/{}/messages",
+        channel_id_num
+    );
     let client = reqwest::Client::new();
     match client
         .post(&url)
@@ -423,7 +469,10 @@ fn resolve_channel_alias(alias: &str) -> Option<u64> {
     let role_id = entry.get("roleId")?.as_str()?;
 
     // Now find the numeric channel ID with the same roleId and matching provider
-    let provider = entry.get("provider").and_then(|v| v.as_str()).unwrap_or("claude");
+    let provider = entry
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("claude");
     let by_id = json.get("byChannelId")?.as_object()?;
     for (ch_id, ch_entry) in by_id {
         if ch_entry.get("roleId").and_then(|v| v.as_str()) == Some(role_id)

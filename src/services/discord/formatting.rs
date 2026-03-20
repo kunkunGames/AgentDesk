@@ -3,7 +3,7 @@ use serenity::{ChannelId, CreateMessage, EditMessage, MessageId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::{rate_limit_wait, SharedData, DISCORD_MSG_LIMIT};
+use super::{DISCORD_MSG_LIMIT, SharedData, rate_limit_wait};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, super::Data, Error>;
@@ -93,11 +93,7 @@ where
 
 /// Format a risk badge for display
 pub(super) fn risk_badge(destructive: bool) -> &'static str {
-    if destructive {
-        "⚠️"
-    } else {
-        ""
-    }
+    if destructive { "⚠️" } else { "" }
 }
 
 /// Claude Code built-in slash commands
@@ -288,7 +284,8 @@ mod tests {
     fn test_extract_skill_description_from_frontmatter() {
         use super::extract_skill_description;
 
-        let content = "---\ndescription: Build and deploy the project\n---\n# Deploy\nSome body text";
+        let content =
+            "---\ndescription: Build and deploy the project\n---\n# Deploy\nSome body text";
         assert_eq!(
             extract_skill_description(content),
             "Build and deploy the project"
@@ -319,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_split_message_long_produces_multiple_chunks() {
-        use super::{split_message, DISCORD_MSG_LIMIT};
+        use super::{DISCORD_MSG_LIMIT, split_message};
 
         // Create a message longer than the Discord limit
         let long_msg: String = "A".repeat(DISCORD_MSG_LIMIT + 500);
@@ -606,10 +603,7 @@ fn convert_markdown_tables(input: &str) -> String {
         }
 
         // Detect table: header row + separator row
-        if line.contains('|')
-            && i + 1 < raw_lines.len()
-            && is_table_separator(raw_lines[i + 1])
-        {
+        if line.contains('|') && i + 1 < raw_lines.len() && is_table_separator(raw_lines[i + 1]) {
             let headers = parse_table_cells(line);
             if headers.len() >= 2 {
                 i += 2; // skip header + separator
@@ -917,7 +911,9 @@ pub(super) async fn add_reaction_raw(
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
     if let Err(e) = channel_id.create_reaction(http, message_id, reaction).await {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        eprintln!("  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}");
+        eprintln!(
+            "  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}"
+        );
     }
 }
 
@@ -929,9 +925,14 @@ pub(super) async fn remove_reaction_raw(
     emoji: char,
 ) {
     let reaction = serenity::ReactionType::Unicode(emoji.to_string());
-    if let Err(e) = channel_id.delete_reaction(http, message_id, None, reaction).await {
+    if let Err(e) = channel_id
+        .delete_reaction(http, message_id, None, reaction)
+        .await
+    {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        eprintln!("  [{ts}] ⚠ Failed to remove reaction '{emoji}' from msg {message_id} in channel {channel_id}: {e}");
+        eprintln!(
+            "  [{ts}] ⚠ Failed to remove reaction '{emoji}' from msg {message_id} in channel {channel_id}: {e}"
+        );
     }
 }
 
@@ -943,7 +944,9 @@ pub(super) fn resolve_raw_tool_status<'a>(
 ) -> &'a str {
     current_tool_line
         .or_else(|| {
-            full_response.lines().rev()
+            full_response
+                .lines()
+                .rev()
                 .find(|l| !l.trim().is_empty() && l.trim().len() > 3)
                 .map(|l| l.trim())
         })

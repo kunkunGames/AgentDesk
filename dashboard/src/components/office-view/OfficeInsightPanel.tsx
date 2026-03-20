@@ -567,7 +567,7 @@ function MiniRateLimitBar({ isKo }: { isKo: boolean }) {
         const res = await fetch("/api/rate-limits", { credentials: "include" });
         if (!res.ok) return;
         const json = await res.json() as { providers: RLProvider[] };
-        if (mounted) setProviders(json.providers);
+        if (mounted) setProviders(json.providers ?? []);
       } catch { /* ignore */ }
     };
     load();

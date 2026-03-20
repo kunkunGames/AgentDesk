@@ -3,8 +3,8 @@ use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
+use std::sync::mpsc::Sender;
 
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
@@ -12,8 +12,7 @@ use crate::services::discord::restart_report::{
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, tmux_session_exists,
-    tmux_session_has_live_pane,
+    record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
 };
 use crate::utils::format::safe_prefix;
 
@@ -102,7 +101,6 @@ fn debug_log(msg: &str) {
 /// Write a debug message to a specific log file under $AGENTDESK_ROOT_DIR/debug/.
 pub fn debug_log_to(filename: &str, msg: &str) {
     let debug_dir = std::env::var("AGENTDESK_ROOT_DIR")
-        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
         .ok()
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty())
@@ -1451,7 +1449,8 @@ fn execute_streaming_local_tmux(
     ));
 
     let output_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
-    let input_fifo_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "input");
+    let input_fifo_path =
+        crate::services::tmux_common::session_temp_path(tmux_session_name, "input");
     let prompt_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "prompt");
     let owner_path = tmux_owner_path(tmux_session_name);
 
@@ -1492,7 +1491,10 @@ fn execute_streaming_local_tmux(
     let _ = std::fs::remove_file(&input_fifo_path);
     let _ = std::fs::remove_file(&prompt_path);
     let _ = std::fs::remove_file(&owner_path);
-    let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(tmux_session_name, "sh"));
+    let _ = std::fs::remove_file(crate::services::tmux_common::session_temp_path(
+        tmux_session_name,
+        "sh",
+    ));
 
     // Create output file (empty)
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
@@ -1527,9 +1529,7 @@ fn execute_streaming_local_tmux(
     let script_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "sh");
 
     let mut env_lines = String::from("unset CLAUDECODE\n");
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR")
-        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
-    {
+    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
         let trimmed = root_dir.trim();
         if !trimmed.is_empty() {
             env_lines.push_str(&format!(
@@ -1617,7 +1617,8 @@ fn execute_streaming_local_tmux(
         .output();
 
     // Stamp generation marker so post-restart watcher restore can detect old sessions
-    let gen_marker_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
+    let gen_marker_path =
+        crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
     let current_gen = crate::services::discord::runtime_store::load_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
 
@@ -1724,8 +1725,14 @@ fn execute_streaming_local_tmux(
                 }
 
                 // Re-stamp generation marker after tmux re-create
-                let gen_marker_retry = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
-                let _ = std::fs::write(&gen_marker_retry, crate::services::discord::runtime_store::load_generation().to_string());
+                let gen_marker_retry = crate::services::tmux_common::session_temp_path(
+                    tmux_session_name,
+                    "generation",
+                );
+                let _ = std::fs::write(
+                    &gen_marker_retry,
+                    crate::services::discord::runtime_store::load_generation().to_string(),
+                );
 
                 debug_log("tmux session re-created, retrying read...");
             }
@@ -1943,10 +1950,7 @@ pub(crate) fn read_output_file_until_result(
                     // the previous turn's "Ready for input" prompt still lingers
                     // in the tmux pane — causing a false-positive completion.
                     let output_ever_grew = current_offset > start_offset;
-                    if !has_new_bytes
-                        && output_ever_grew
-                        && (probe.is_ready_for_input)()
-                    {
+                    if !has_new_bytes && output_ever_grew && (probe.is_ready_for_input)() {
                         consecutive_ready_count += 1;
                         // Require 3 consecutive ready checks (~15s) to avoid false
                         // positives during Claude Code auto-continue transitions.
@@ -2042,15 +2046,25 @@ pub(crate) fn execute_streaming_local_process(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
 ) -> Result<(), String> {
-    use crate::services::session_backend::{ProcessBackend, SessionBackend, SessionConfig, SessionHandle};
+    use crate::services::session_backend::{
+        ProcessBackend, SessionBackend, SessionConfig, SessionHandle,
+    };
 
     debug_log(&format!(
         "=== execute_streaming_local_process START: {} ===",
         session_name
     ));
 
-    let output_path = format!("{}/remotecc-{}.jsonl", std::env::temp_dir().display(), session_name);
-    let prompt_path = format!("{}/remotecc-{}.prompt", std::env::temp_dir().display(), session_name);
+    let output_path = format!(
+        "{}/agentdesk-{}.jsonl",
+        std::env::temp_dir().display(),
+        session_name
+    );
+    let prompt_path = format!(
+        "{}/agentdesk-{}.prompt",
+        std::env::temp_dir().display(),
+        session_name
+    );
 
     // Check for existing process session (follow-up)
     // ProcessBackend sessions don't persist across restarts, so we track via static map
@@ -2061,7 +2075,13 @@ pub(crate) fn execute_streaming_local_process(
             if backend.is_alive(handle) {
                 debug_log("Existing process session found — sending follow-up");
                 drop(handles);
-                return send_followup_to_process(prompt, &output_path, session_name, sender, cancel_token);
+                return send_followup_to_process(
+                    prompt,
+                    &output_path,
+                    session_name,
+                    sender,
+                    cancel_token,
+                );
             }
         }
     }
@@ -2080,8 +2100,8 @@ pub(crate) fn execute_streaming_local_process(
     let mut wrapper_args: Vec<String> = vec!["--".to_string(), claude_bin.to_string()];
     wrapper_args.extend(args.iter().map(|a| a.to_string()));
 
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let config = SessionConfig {
         session_name: session_name.to_string(),
@@ -2104,7 +2124,10 @@ pub(crate) fn execute_streaming_local_process(
     }
 
     // Store handle for follow-up messages
-    PROCESS_HANDLES.lock().unwrap().insert(session_name.to_string(), handle);
+    PROCESS_HANDLES
+        .lock()
+        .unwrap()
+        .insert(session_name.to_string(), handle);
 
     // Poll output file until result
     let read_result = read_output_file_until_result(
@@ -2148,7 +2171,10 @@ fn send_followup_to_process(
 ) -> Result<(), String> {
     use crate::services::session_backend::{ProcessBackend, SessionBackend};
 
-    debug_log(&format!("=== send_followup_to_process: {} ===", session_name));
+    debug_log(&format!(
+        "=== send_followup_to_process: {} ===",
+        session_name
+    ));
 
     let start_offset = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
@@ -2212,7 +2238,9 @@ fn send_followup_to_process(
 /// Global storage for ProcessBackend session handles.
 /// Keyed by session name, stores the SessionHandle for follow-up messages.
 pub(crate) static PROCESS_HANDLES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, crate::services::session_backend::SessionHandle>>,
+    std::sync::Mutex<
+        std::collections::HashMap<String, crate::services::session_backend::SessionHandle>,
+    >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Execute Claude inside a tmux session on a remote host via SSH.

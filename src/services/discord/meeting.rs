@@ -11,8 +11,8 @@ use crate::services::provider_exec;
 use super::formatting::send_long_message_raw;
 use super::org_schema;
 use super::role_map::load_meeting_config as load_meeting_config_from_role_map;
-use super::settings::{load_role_prompt, RoleBinding};
-use super::{rate_limit_wait, SharedData};
+use super::settings::{RoleBinding, load_role_prompt};
+use super::{SharedData, rate_limit_wait};
 
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
@@ -194,7 +194,8 @@ pub(super) fn parse_meeting_start_text(
             .unwrap_or(after_flag.len());
         let provider_raw = after_flag[..split_at].trim();
         let remainder = after_flag[split_at..].trim();
-        primary_provider = parse_primary_provider_arg(Some(provider_raw), default_provider.clone())?;
+        primary_provider =
+            parse_primary_provider_arg(Some(provider_raw), default_provider.clone())?;
         agenda = remainder;
     } else if let Some(after_flag) = rest.strip_prefix("--primary ") {
         let after_flag = after_flag.trim_start();
@@ -625,7 +626,8 @@ async fn select_participants(
         current = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
     );
 
-    let review_notes = provider_exec::execute_simple(reviewer_provider.clone(), review_prompt).await?;
+    let review_notes =
+        provider_exec::execute_simple(reviewer_provider.clone(), review_prompt).await?;
 
     let finalize_prompt = format!(
         r#"다음 안건에 대한 회의 참가자 선정을 최종 확정해줘.
@@ -652,7 +654,8 @@ async fn select_participants(
         review = review_notes.trim(),
     );
 
-    let final_response = provider_exec::execute_simple(primary_provider.clone(), finalize_prompt).await?;
+    let final_response =
+        provider_exec::execute_simple(primary_provider.clone(), finalize_prompt).await?;
     let selected = parse_json_array_fragment(&final_response)?;
 
     let participants: Vec<MeetingParticipant> = selected
@@ -1292,7 +1295,9 @@ async fn post_meeting_to_pcd(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     let _ = client
-        .post(format!("http://localhost:{api_port}/api/round-table-meetings"))
+        .post(format!(
+            "http://localhost:{api_port}/api/round-table-meetings"
+        ))
         .json(&payload)
         .send()
         .await?;
@@ -1466,8 +1471,8 @@ pub(super) async fn handle_meeting_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pcd_payload, effective_round_count, meeting_slot_state, parse_meeting_start_text,
         ActiveMeetingSlot, Meeting, MeetingStatus, MeetingUtterance, ProviderKind,
+        build_pcd_payload, effective_round_count, meeting_slot_state, parse_meeting_start_text,
     };
     use serde_json::json;
 

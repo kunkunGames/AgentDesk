@@ -169,7 +169,7 @@
 ## P1: Tmux Management
 
 ### Session Lifecycle
-- `tmux_create_with_provider_prefix` — `remoteCC-claude-channelname` 형식
+- `tmux_create_with_provider_prefix` — `AgentDesk-claude-channelname` 형식
 - `tmux_name_sanitization` — 특수문자 제거
 - `tmux_owner_marker_write` — owner marker 파일 생성
 - `tmux_ownership_check` — 현재 runtime 소유권 확인

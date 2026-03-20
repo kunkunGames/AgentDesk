@@ -2,16 +2,14 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serenity::ChannelId;
 use poise::serenity_prelude as serenity;
+use serenity::ChannelId;
 
-use super::super::{
-    check_auth, Context, CoreState, Error, PendingQueueItem, SharedData,
-};
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::inflight::load_inflight_states;
 use super::super::metrics;
 use super::super::runtime_store;
+use super::super::{Context, CoreState, Error, PendingQueueItem, SharedData, check_auth};
 use crate::services::claude;
 use crate::services::provider::ProviderKind;
 use crate::services::tmux_diagnostics::{tmux_session_exists, tmux_session_has_live_pane};
@@ -61,12 +59,14 @@ pub(in crate::services::discord) async fn build_health_report(
     };
 
     let runtime_root = crate::cli::dcserver::agentdesk_runtime_root();
-    let current_release = runtime_root.as_ref()
+    let current_release = runtime_root
+        .as_ref()
         .map(|r| r.join("releases").join("current"))
         .and_then(|p| fs::read_link(p).ok())
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(unknown)".to_string());
-    let previous_release = runtime_root.as_ref()
+    let previous_release = runtime_root
+        .as_ref()
         .map(|r| r.join("releases").join("previous"))
         .and_then(|p| fs::read_link(p).ok())
         .map(|p| p.display().to_string())
@@ -395,7 +395,10 @@ fn build_queue_report_sync(
         channels.iter().map(|(_, q)| q.len()).sum()
     };
 
-    lines.push(format!("**📋 Pending Queue{}**", if show_all { " (all channels)" } else { "" }));
+    lines.push(format!(
+        "**📋 Pending Queue{}**",
+        if show_all { " (all channels)" } else { "" }
+    ));
 
     if channels.is_empty() || total_in_memory == 0 {
         lines.push("  In-memory: (empty)".to_string());
@@ -434,9 +437,14 @@ fn build_queue_report_sync(
                 Some(dir.join(format!("{}.json", current_channel)))
             };
             let paths: Vec<std::path::PathBuf> = if let Some(ref tf) = target_file {
-                if tf.is_file() { vec![tf.clone()] } else { vec![] }
+                if tf.is_file() {
+                    vec![tf.clone()]
+                } else {
+                    vec![]
+                }
             } else if let Ok(entries) = std::fs::read_dir(&dir) {
-                entries.flatten()
+                entries
+                    .flatten()
                     .map(|e| e.path())
                     .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
                     .collect()
@@ -447,7 +455,8 @@ fn build_queue_report_sync(
                 if let Ok(contents) = std::fs::read_to_string(path) {
                     if let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&contents) {
                         if !items.is_empty() {
-                            let ch_name = path.file_stem()
+                            let ch_name = path
+                                .file_stem()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_default();
                             // Use file mtime as approximate queue age
@@ -457,10 +466,20 @@ fn build_queue_report_sync(
                                 .and_then(|mt| std::time::SystemTime::now().duration_since(mt).ok())
                                 .map(|d| format!(" (saved ~{}s ago)", d.as_secs()))
                                 .unwrap_or_default();
-                            lines.push(format!("  **Disk** #{} — {} item(s){}", ch_name, items.len(), age_str));
+                            lines.push(format!(
+                                "  **Disk** #{} — {} item(s){}",
+                                ch_name,
+                                items.len(),
+                                age_str
+                            ));
                             for (i, item) in items.iter().enumerate().take(3) {
                                 let preview = truncate_str(&item.text, 60);
-                                lines.push(format!("    {}. `<@{}>`: {}", i + 1, item.author_id, preview));
+                                lines.push(format!(
+                                    "    {}. `<@{}>`: {}",
+                                    i + 1,
+                                    item.author_id,
+                                    preview
+                                ));
                             }
                             disk_count += items.len();
                         }
@@ -527,7 +546,8 @@ pub(in crate::services::discord) async fn cmd_health(ctx: Context<'_>) -> Result
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ◀ [{user_name}] /health");
 
-    let text = build_health_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
+    let text =
+        build_health_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
@@ -544,7 +564,8 @@ pub(in crate::services::discord) async fn cmd_status(ctx: Context<'_>) -> Result
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ◀ [{user_name}] /status");
 
-    let text = build_status_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
+    let text =
+        build_status_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }
@@ -583,7 +604,13 @@ pub(in crate::services::discord) async fn cmd_queue(
     println!("  [{ts}] ◀ [{user_name}] /queue");
 
     let show_all = all.unwrap_or(false);
-    let text = build_queue_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id(), show_all).await;
+    let text = build_queue_report(
+        &ctx.data().shared,
+        &ctx.data().provider,
+        ctx.channel_id(),
+        show_all,
+    )
+    .await;
     send_long_message_ctx(ctx, &text).await?;
     Ok(())
 }

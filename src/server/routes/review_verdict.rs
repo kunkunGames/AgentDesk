@@ -1,8 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
+use crate::engine::hooks::Hook;
 
 #[derive(Debug, Deserialize)]
 pub struct VerdictItem {
@@ -15,18 +16,25 @@ pub struct SubmitVerdictBody {
     pub dispatch_id: String,
     pub overall: String,
     pub items: Option<Vec<VerdictItem>>,
+    pub notes: Option<String>,
+    pub feedback: Option<String>,
 }
 
 /// POST /api/review-verdict
+///
+/// Accepts a review verdict and delegates processing to the policy engine
+/// via OnReviewVerdict hook. No hardcoded card state changes.
 pub async fn submit_verdict(
     State(state): State<AppState>,
     Json(body): Json<SubmitVerdictBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Validate overall value
-    if body.overall != "pass" && body.overall != "improve" {
+    let valid_verdicts = ["pass", "improve", "reject", "rework", "accept", "approved"];
+    if !valid_verdicts.contains(&body.overall.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "overall must be 'pass' or 'improve'"})),
+            Json(
+                json!({"error": format!("overall must be one of: {}", valid_verdicts.join(", "))}),
+            ),
         );
     }
 
@@ -36,25 +44,27 @@ pub async fn submit_verdict(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
     // Build result JSON
     let result_json = json!({
-        "overall": body.overall,
+        "verdict": body.overall,
         "items": body.items.as_ref().map(|items| {
             items.iter().map(|it| json!({
                 "category": it.category,
                 "summary": it.summary,
             })).collect::<Vec<_>>()
         }).unwrap_or_default(),
+        "notes": body.notes,
+        "feedback": body.feedback,
     });
     let result_str = result_json.to_string();
 
-    // Update task_dispatches
+    // Update dispatch with verdict result
     let updated = match conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?2 WHERE id = ?1",
+        "UPDATE task_dispatches SET status = 'completed', result_summary = ?2, updated_at = datetime('now') WHERE id = ?1",
         rusqlite::params![body.dispatch_id, result_str],
     ) {
         Ok(n) => n,
@@ -73,23 +83,30 @@ pub async fn submit_verdict(
         );
     }
 
-    // If overall is "pass", update the related kanban card to 'done'
-    if body.overall == "pass" {
-        let card_id: Option<String> = conn
-            .query_row(
-                "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
-                [&body.dispatch_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
+    // Find associated card
+    let card_id: Option<String> = conn
+        .query_row(
+            "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
+            [&body.dispatch_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
 
-        if let Some(cid) = card_id {
-            let _ = conn.execute(
-                "UPDATE kanban_cards SET status = 'done' WHERE id = ?1 AND status = 'review'",
-                [&cid],
-            );
-        }
+    drop(conn);
+
+    // Fire OnReviewVerdict hook — policy engine handles all state transitions
+    if let Some(ref cid) = card_id {
+        let _ = state.engine.fire_hook(
+            Hook::OnReviewVerdict,
+            json!({
+                "card_id": cid,
+                "dispatch_id": body.dispatch_id,
+                "verdict": body.overall,
+                "notes": body.notes,
+                "feedback": body.feedback,
+            }),
+        );
     }
 
     (
@@ -98,6 +115,7 @@ pub async fn submit_verdict(
             "ok": true,
             "dispatch_id": body.dispatch_id,
             "overall": body.overall,
+            "card_id": card_id,
         })),
     )
 }

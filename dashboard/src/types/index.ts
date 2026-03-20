@@ -37,7 +37,7 @@ export type AgentStatus = "idle" | "working" | "break" | "offline";
 export type CliProvider = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity" | "api";
 export type MeetingReviewDecision = "reviewing" | "approved" | "hold";
 
-export type ActivitySource = "idle" | "remotecc";
+export type ActivitySource = "idle" | "agentdesk";
 
 export interface Agent {
   id: string;
@@ -53,7 +53,7 @@ export interface Agent {
   role_id?: string | null;
   session_info?: string | null;
   activity_source?: ActivitySource;
-  remotecc_working_count?: number;
+  agentdesk_working_count?: number;
   workflow_pack_key?: string | null;
   department_name?: string | null;
   department_name_ko?: string | null;

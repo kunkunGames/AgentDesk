@@ -116,11 +116,4 @@ echo "Then run setup:"
 echo "  agentdesk --init"
 echo ""
 
-# ── Migrate hint ──────────────────────────────────────────────────────────────
-if [ -d "$HOME/.remotecc" ] || [ -d "$HOME/.local/state/pixel-claw-dashboard" ]; then
-  echo "Legacy RCC/PCD data detected. To migrate:"
-  echo "  agentdesk migrate  (or ./scripts/migrate-from-legacy.sh)"
-  echo ""
-fi
-
 echo "Done."

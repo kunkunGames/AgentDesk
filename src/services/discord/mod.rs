@@ -3,13 +3,13 @@ mod formatting;
 mod handoff;
 pub(crate) mod health;
 mod inflight;
-mod metrics;
 mod meeting;
+mod metrics;
+mod org_schema;
 mod pcd;
 mod prompt_builder;
 mod recovery;
 pub(crate) mod restart_report;
-mod org_schema;
 mod role_map;
 mod router;
 pub mod runtime_store;
@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -33,21 +33,21 @@ use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
 use crate::services::claude::{
-    self, CancelToken, ReadOutputResult, StreamMessage, DEFAULT_ALLOWED_TOOLS,
+    self, CancelToken, DEFAULT_ALLOWED_TOOLS, ReadOutputResult, StreamMessage,
 };
 use crate::services::codex;
 use crate::services::provider::ProviderKind;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
 use formatting::{
-    add_reaction_raw, extract_skill_description, format_for_discord,
-    format_tool_input, normalize_empty_lines, remove_reaction_raw,
-    send_long_message_raw, truncate_str, BUILTIN_SKILLS,
-};
-use inflight::{
-    clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
+    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
+    format_tool_input, normalize_empty_lines, remove_reaction_raw, send_long_message_raw,
+    truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
+use inflight::{
+    InflightTurnState, clear_inflight_state, load_inflight_states, save_inflight_state,
+};
 use pcd::{
     build_pcd_session_key, derive_pcd_session_info, parse_dispatch_id, post_pcd_session_status,
 };
@@ -57,14 +57,14 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    channel_supports_provider, channel_upload_dir, cleanup_old_uploads,
-    load_bot_settings, resolve_role_binding, save_bot_settings, RoleBinding,
+    RoleBinding, channel_supports_provider, channel_upload_dir, cleanup_old_uploads,
+    load_bot_settings, resolve_role_binding, save_bot_settings,
 };
 use shared_memory::{
     append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts,
 };
 use tmux::{cleanup_orphan_tmux_sessions, restore_tmux_watchers, tmux_output_watcher};
-use turn_bridge::{spawn_turn_bridge, tmux_runtime_paths, TurnBridgeContext};
+use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
 
 pub use settings::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
@@ -83,11 +83,11 @@ const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Minimum interval between Discord placeholder edits for progress status.
-/// Configurable via REMOTECC_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
+/// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
 pub(super) fn status_update_interval() -> Duration {
     static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        let secs = std::env::var("REMOTECC_STATUS_INTERVAL_SECS")
+        let secs = std::env::var("AGENTDESK_STATUS_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5);
@@ -95,12 +95,12 @@ pub(super) fn status_update_interval() -> Duration {
     })
 }
 
-/// Turn watchdog timeout. Configurable via REMOTECC_TURN_TIMEOUT_SECS env var.
+/// Turn watchdog timeout. Configurable via AGENTDESK_TURN_TIMEOUT_SECS env var.
 /// Default: 3600 seconds (60 minutes).
 pub(super) fn turn_watchdog_timeout() -> Duration {
     static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        let secs = std::env::var("REMOTECC_TURN_TIMEOUT_SECS")
+        let secs = std::env::var("AGENTDESK_TURN_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(3600);
@@ -117,25 +117,43 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
 /// `shutdown_counted` (per-provider) prevents double-decrement when both deferred restart
 /// and SIGTERM paths run for the same provider.
 pub(super) fn check_deferred_restart(shared: &SharedData) {
-    let g_active = shared.global_active.load(std::sync::atomic::Ordering::Relaxed);
-    let g_finalizing = shared.global_finalizing.load(std::sync::atomic::Ordering::Relaxed);
+    let g_active = shared
+        .global_active
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let g_finalizing = shared
+        .global_finalizing
+        .load(std::sync::atomic::Ordering::Relaxed);
     if g_active > 0 || g_finalizing > 0 {
         return;
     }
-    if !shared.restart_pending.load(std::sync::atomic::Ordering::Relaxed) {
+    if !shared
+        .restart_pending
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     // CAS: ensure this provider only decrements once
-    if shared.shutdown_counted.compare_exchange(
-        false, true,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Relaxed,
-    ).is_err() {
+    if shared
+        .shutdown_counted
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
         return;
     }
     // Only the last provider to finish calls exit(0)
-    if shared.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-        let Some(root) = crate::agentdesk_runtime_root() else { return; };
+    if shared
+        .shutdown_remaining
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1
+    {
+        let Some(root) = crate::agentdesk_runtime_root() else {
+            return;
+        };
         let marker = root.join("restart_pending");
         let version = fs::read_to_string(&marker).unwrap_or_default();
         let version = version.trim();
@@ -483,23 +501,35 @@ async fn catch_up_missed_messages(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) {
-    let Some(root) = runtime_store::last_message_root() else { return };
+    let Some(root) = runtime_store::last_message_root() else {
+        return;
+    };
     let dir = root.join(provider.as_str());
     if !dir.is_dir() {
         return;
     }
 
-    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
     let mut total_recovered = 0usize;
     let now = Instant::now();
     let max_age = std::time::Duration::from_secs(300); // Only catch up messages within 5 minutes
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let Ok(channel_id_raw) = stem.parse::<u64>() else { continue };
-        let Ok(last_id_str) = fs::read_to_string(&path) else { continue };
-        let Ok(last_id) = last_id_str.trim().parse::<u64>() else { continue };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(channel_id_raw) = stem.parse::<u64>() else {
+            continue;
+        };
+        let Ok(last_id_str) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(last_id) = last_id_str.trim().parse::<u64>() else {
+            continue;
+        };
 
         let channel_id = ChannelId::new(channel_id_raw);
         let after_msg = MessageId::new(last_id);
@@ -517,7 +547,9 @@ async fn catch_up_missed_messages(
             Ok(msgs) => msgs,
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!("  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}");
+                eprintln!(
+                    "  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}"
+                );
                 continue;
             }
         };
@@ -609,7 +641,9 @@ async fn catch_up_missed_messages(
 
     if total_recovered > 0 {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] 🔍 CATCH-UP: total {total_recovered} message(s) recovered across channels");
+        println!(
+            "  [{ts}] 🔍 CATCH-UP: total {total_recovered} message(s) recovered across channels"
+        );
     }
 }
 
@@ -727,8 +761,9 @@ async fn execute_handoff_turns(
         let placeholder = match channel_id
             .send_message(
                 http,
-                serenity::CreateMessage::new()
-                    .content("📎 **Post-restart handoff** — 재시작 후속 작업을 자동으로 이어받습니다."),
+                serenity::CreateMessage::new().content(
+                    "📎 **Post-restart handoff** — 재시작 후속 작업을 자동으로 이어받습니다.",
+                ),
             )
             .await
         {
@@ -770,11 +805,7 @@ async fn execute_handoff_turns(
 /// turn running. This bridges the gap where restored pending queues or
 /// handoff injections sit idle because no turn-completion event triggers
 /// the dequeue chain.
-async fn kickoff_idle_queues(
-    ctx: &serenity::Context,
-    shared: &Arc<SharedData>,
-    token: &str,
-) {
+async fn kickoff_idle_queues(ctx: &serenity::Context, shared: &Arc<SharedData>, token: &str) {
     // Collect channels with queued items that are idle (no active turn)
     let channels_to_kick: Vec<(ChannelId, Intervention, bool)> = {
         let mut data = shared.core.lock().await;
@@ -835,10 +866,10 @@ async fn kickoff_idle_queues(
             &intervention.text,
             shared,
             token,
-            true,      // reply_to_user_message
-            has_more,  // defer_watcher_resume
-            false,     // wait_for_completion — don't block, let channels run concurrently
-            None,      // reply_context
+            true,     // reply_to_user_message
+            has_more, // defer_watcher_resume
+            false,    // wait_for_completion — don't block, let channels run concurrently
+            None,     // reply_context
         )
         .await
         {
@@ -856,7 +887,10 @@ async fn kickoff_idle_queues(
 }
 
 /// Scan for provider-specific skills available to this bot.
-pub(super) fn scan_skills(provider: &ProviderKind, project_path: Option<&str>) -> Vec<(String, String)> {
+pub(super) fn scan_skills(
+    provider: &ProviderKind,
+    project_path: Option<&str>,
+) -> Vec<(String, String)> {
     let mut skills: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -996,7 +1030,9 @@ fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
     };
 
     fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -1026,11 +1062,16 @@ fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
 }
 
 /// Like `skill_dir_fingerprint` but also includes project-level skill directories.
-fn skill_dir_fingerprint_with_projects(provider: &ProviderKind, project_paths: &[String]) -> (usize, u64) {
+fn skill_dir_fingerprint_with_projects(
+    provider: &ProviderKind,
+    project_paths: &[String],
+) -> (usize, u64) {
     let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
 
     fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -1152,7 +1193,9 @@ pub async fn run_bot(
     }
 
     // Register this provider with the health check registry
-    health_registry.register(provider.as_str().to_string(), shared.clone()).await;
+    health_registry
+        .register(provider.as_str().to_string(), shared.clone())
+        .await;
 
     let token_owned = token.to_string();
     let shared_clone = shared.clone();
@@ -1417,7 +1460,7 @@ pub async fn run_bot(
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1465,11 +1508,15 @@ pub async fn run_bot(
                 // Persist last_message_ids for catch-up polling after restart
                 {
                     let ids: std::collections::HashMap<u64, u64> = shared_for_signal
-                        .last_message_ids.iter()
+                        .last_message_ids
+                        .iter()
                         .map(|entry| (entry.key().get(), *entry.value()))
                         .collect();
                     if !ids.is_empty() {
-                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
+                        runtime_store::save_all_last_message_ids(
+                            provider_for_shutdown.as_str(),
+                            &ids,
+                        );
                     }
                 }
 
@@ -1479,7 +1526,10 @@ pub async fn run_bot(
                 // Save restart reports FIRST (disk-only, guaranteed to complete)
                 // before any HTTP calls that might hang/timeout.
                 for state in &inflight_states {
-                    let existing = restart_report::load_restart_report(&provider_for_shutdown, state.channel_id);
+                    let existing = restart_report::load_restart_report(
+                        &provider_for_shutdown,
+                        state.channel_id,
+                    );
                     if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
                         continue;
                     }
@@ -1526,11 +1576,8 @@ pub async fn run_bot(
                             msg_id,
                             EditMessage::new().content(&restart_notice),
                         );
-                        match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(3),
-                            edit_fut,
-                        )
-                        .await
+                        match tokio::time::timeout(tokio::time::Duration::from_secs(3), edit_fut)
+                            .await
                         {
                             Ok(Ok(_)) => {
                                 let ts_ok = chrono::Local::now().format("%H:%M:%S");
@@ -1571,22 +1618,35 @@ pub async fn run_bot(
                 }
                 {
                     let ids: std::collections::HashMap<u64, u64> = shared_for_signal
-                        .last_message_ids.iter()
+                        .last_message_ids
+                        .iter()
                         .map(|entry| (entry.key().get(), *entry.value()))
                         .collect();
                     if !ids.is_empty() {
-                        runtime_store::save_all_last_message_ids(provider_for_shutdown.as_str(), &ids);
+                        runtime_store::save_all_last_message_ids(
+                            provider_for_shutdown.as_str(),
+                            &ids,
+                        );
                     }
                 }
 
                 // Wait for all providers to finish saving before exiting.
                 // CAS guard: skip if this provider already decremented via deferred restart path.
-                if shared_for_signal.shutdown_counted.compare_exchange(
-                    false, true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                ).is_ok() {
-                    if shared_for_signal.shutdown_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                if shared_for_signal
+                    .shutdown_counted
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    if shared_for_signal
+                        .shutdown_remaining
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                        == 1
+                    {
                         std::process::exit(0);
                     }
                 }
@@ -1846,7 +1906,9 @@ async fn add_reaction(
         .await
     {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        eprintln!("  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}");
+        eprintln!(
+            "  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}"
+        );
     }
 }
 
@@ -1888,7 +1950,9 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             }
             data.sessions.remove(ch);
             if data.cancel_tokens.remove(ch).is_some() {
-                shared.global_active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                shared
+                    .global_active
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             data.active_request_owner.remove(ch);
             data.intervention_queue.remove(ch);
@@ -2149,7 +2213,12 @@ pub(super) async fn auto_restore_session(
         let last_path = settings.last_sessions.get(&channel_key).cloned();
         let is_remote = settings.last_remotes.contains_key(&channel_key);
         let saved_remote = settings.last_remotes.get(&channel_key).cloned();
-        (last_path, is_remote, saved_remote, settings.provider.clone())
+        (
+            last_path,
+            is_remote,
+            saved_remote,
+            settings.provider.clone(),
+        )
     };
 
     let mut data = shared.core.lock().await;

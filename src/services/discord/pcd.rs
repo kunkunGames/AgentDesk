@@ -212,7 +212,7 @@ fn looks_like_raw_command_or_path(text: &str) -> bool {
         "launchctl ",
         "tmux ",
         "agentdesk ",
-        "remotecc ",
+        "agentdesk ",
     ];
 
     command_prefixes
@@ -362,7 +362,7 @@ mod tests {
     fn derive_uses_user_text_when_human_readable() {
         let summary = derive_pcd_session_info(
             Some("회의록 일감 전체 폐기 기능 구현해줘"),
-            Some("remotecc-cdx"),
+            Some("adk-cdx"),
             Some("/repo"),
         );
         assert_eq!(summary, "회의록 일감 전체 폐기 기능 구현해줘");
@@ -372,30 +372,24 @@ mod tests {
     fn derive_skips_raw_commands_and_falls_back() {
         let summary = derive_pcd_session_info(
             Some("cargo test --no-run"),
-            Some("remotecc-cdx"),
-            Some("/Users/me/remotecc"),
+            Some("adk-cdx"),
+            Some("/Users/me/AgentDesk"),
         );
-        assert_eq!(summary, "remotecc 작업 진행 중");
+        assert_eq!(summary, "AgentDesk 작업 진행 중");
     }
 
     #[test]
     fn derive_maps_short_generic_request_to_actionable_fallback() {
-        let summary = derive_pcd_session_info(
-            Some("맞춰줘"),
-            Some("remotecc-cdx"),
-            Some("/Users/me/remotecc"),
-        );
-        assert_eq!(summary, "remotecc 개선 작업 진행 중");
+        let summary =
+            derive_pcd_session_info(Some("맞춰줘"), Some("adk-cdx"), Some("/Users/me/AgentDesk"));
+        assert_eq!(summary, "AgentDesk 개선 작업 진행 중");
     }
 
     #[test]
     fn derive_maps_short_deploy_request_to_deploy_fallback() {
-        let summary = derive_pcd_session_info(
-            Some("배포해"),
-            Some("remotecc-cdx"),
-            Some("/Users/me/remotecc"),
-        );
-        assert_eq!(summary, "remotecc 배포 작업 진행 중");
+        let summary =
+            derive_pcd_session_info(Some("배포해"), Some("adk-cdx"), Some("/Users/me/AgentDesk"));
+        assert_eq!(summary, "AgentDesk 배포 작업 진행 중");
     }
 
     // ── P0 tests ─────────────────────────────────────────────────────────

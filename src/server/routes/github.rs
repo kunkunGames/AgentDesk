@@ -1,7 +1,7 @@
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -19,9 +19,7 @@ pub struct RegisterRepoBody {
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/github/repos
-pub async fn list_repos(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn list_repos(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     match github::list_repos(&state.db) {
         Ok(repos) => {
             let items: Vec<serde_json::Value> = repos
@@ -37,10 +35,7 @@ pub async fn list_repos(
                 .collect();
             (StatusCode::OK, Json(json!({"repos": items})))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }
 
@@ -68,10 +63,7 @@ pub async fn register_repo(
                 }
             })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
     }
 }
 
@@ -90,7 +82,7 @@ pub async fn sync_repo(
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("{e}")})),
-                )
+                );
             }
         };
 
@@ -130,11 +122,11 @@ pub async fn sync_repo(
     };
 
     // Triage new issues
-    let triaged = github::triage::triage_new_issues(&state.db, &repo_id, &issues)
-        .unwrap_or(0);
+    let triaged = github::triage::triage_new_issues(&state.db, &repo_id, &issues).unwrap_or(0);
 
     // Sync state
-    let sync_result = match github::sync::sync_github_issues_for_repo(&state.db, &repo_id, &issues) {
+    let sync_result = match github::sync::sync_github_issues_for_repo(&state.db, &repo_id, &issues)
+    {
         Ok(r) => r,
         Err(e) => {
             return (
