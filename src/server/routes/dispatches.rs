@@ -179,7 +179,40 @@ pub async fn update_dispatch(
     if body.status.as_deref() == Some("completed") {
         let result = body.result.unwrap_or(json!({}));
         match dispatch::complete_dispatch(&state.db, &state.engine, &id, &result) {
-            Ok(d) => return (StatusCode::OK, Json(json!({"dispatch": d}))),
+            Ok(d) => {
+                // Check if OnDispatchCompleted → OnReviewEnter created a new dispatch
+                // (e.g., counter-model review). If so, send async Discord notification.
+                let db_clone = state.db.clone();
+                let dispatch_id = id.clone();
+                tokio::spawn(async move {
+                    // Get the card associated with this dispatch
+                    let info: Option<(String, String, String, String)> = {
+                        let conn = match db_clone.lock() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        conn.query_row(
+                            "SELECT kc.id, kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
+                             FROM kanban_cards kc \
+                             JOIN task_dispatches td ON td.kanban_card_id = kc.id \
+                             WHERE td.id = ?1",
+                            [&dispatch_id],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        )
+                        .ok()
+                    };
+                    if let Some((card_id, agent_id, title, new_dispatch_id)) = info {
+                        // Only send if a NEW dispatch was created (different from completed one)
+                        if new_dispatch_id != dispatch_id {
+                            send_dispatch_to_discord(
+                                &db_clone, &agent_id, &title, &card_id, &new_dispatch_id,
+                            )
+                            .await;
+                        }
+                    }
+                });
+                return (StatusCode::OK, Json(json!({"dispatch": d})));
+            }
             Err(e) => {
                 let msg = format!("{e}");
                 if msg.contains("not found") {
@@ -354,14 +387,37 @@ pub(super) async fn send_dispatch_to_discord(
     card_id: &str,
     dispatch_id: &str,
 ) {
+    // Determine dispatch type to choose the right channel
+    let dispatch_type: Option<String> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        conn.query_row(
+            "SELECT dispatch_type FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    };
+
+    // For review dispatches, use the alternate channel (counter-model)
+    let use_alt = matches!(dispatch_type.as_deref(), Some("review") | Some("review-decision"));
+
     // Look up agent's discord channel
     let channel_id: Option<String> = {
         let conn = match db.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
+        let col = if use_alt {
+            "discord_channel_alt"
+        } else {
+            "discord_channel_id"
+        };
         conn.query_row(
-            "SELECT discord_channel_id FROM agents WHERE id = ?1",
+            &format!("SELECT {col} FROM agents WHERE id = ?1"),
             [agent_id],
             |row| row.get(0),
         )

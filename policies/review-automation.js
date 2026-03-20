@@ -100,19 +100,8 @@ var reviewAutomation = {
         "[Review R" + newRound + "] " + card.id
       );
       agentdesk.log.info("[review] Counter-model review dispatched: " + reviewDispatchId);
-
-      // Send review message to counter channel via announce bot
-      var port = agentdesk.config.get("health_port") || 8798;
-      var issueUrl = agentdesk.db.query(
-        "SELECT github_issue_url, title FROM kanban_cards WHERE id = ?", [card.id]
-      );
-      var title = (issueUrl.length > 0) ? issueUrl[0].title : card.id;
-      var url = (issueUrl.length > 0 && issueUrl[0].github_issue_url) ? "\n" + issueUrl[0].github_issue_url : "";
-      sendDiscordReview(
-        "channel:" + counterChannelId,
-        "⚠️ 검토 전용 — 작업 착수 금지\n\n[Counter Review R" + newRound + "] " + title + url,
-        "announce"
-      );
+      // Discord notification is handled by the Rust handler (async send_dispatch_to_discord)
+      // to avoid ureq deadlock on tokio runtime.
     } catch (e) {
       agentdesk.log.warn("[review] Review dispatch failed: " + e);
     }

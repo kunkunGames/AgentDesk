@@ -111,6 +111,30 @@ pub fn complete_dispatch(
         }),
     );
 
+    // If the policy transitioned the card to "review" (via direct SQL UPDATE),
+    // fire OnReviewEnter so review-automation.js can create a counter-model review.
+    // This is needed because direct DB updates from policies don't trigger Rust hooks.
+    if let Some(ref card_id) = kanban_card_id {
+        let conn = db.lock().map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
+        let card_status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |row| row.get(0),
+            )
+            .ok();
+        drop(conn);
+        if card_status.as_deref() == Some("review") {
+            let _ = engine.fire_hook(
+                Hook::OnReviewEnter,
+                json!({
+                    "card_id": card_id,
+                    "from": "in_progress",
+                }),
+            );
+        }
+    }
+
     Ok(dispatch)
 }
 
