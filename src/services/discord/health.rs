@@ -112,6 +112,10 @@ pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
                     let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
                     handle_send(&registry, body_str).await
                 }
+                ("POST", "/api/senddm") => {
+                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    handle_senddm(&registry, body_str).await
+                }
                 ("POST", "/api/session/start") => {
                     let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
                     handle_session_start(&registry, body_str).await
@@ -266,6 +270,58 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
             let ts = chrono::Local::now().format("%H:%M:%S");
             eprintln!("  [{ts}] ⚠ ROUTE: failed to send to channel {channel_id}: {e}");
             ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"Discord send failed: {}"}}"#, e))
+        }
+    }
+}
+
+/// Handle POST /api/senddm — send a DM to a Discord user via the announce bot.
+/// When the user replies, the bot's event handler creates a Claude session.
+async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return ("400 Bad Request", r#"{"ok":false,"error":"invalid JSON"}"#.to_string()),
+    };
+
+    let user_id_str = parsed["user_id"].as_str().or_else(|| parsed["user_id"].as_u64().map(|_| "")).unwrap_or("");
+    let user_id_raw: u64 = parsed["user_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| parsed["user_id"].as_u64())
+        .unwrap_or(0);
+    if user_id_raw == 0 {
+        return ("400 Bad Request", r#"{"ok":false,"error":"user_id required (string or number)"}"#.to_string());
+    }
+
+    let content = match parsed["content"].as_str() {
+        Some(c) if !c.is_empty() => c,
+        _ => return ("400 Bad Request", r#"{"ok":false,"error":"content required"}"#.to_string()),
+    };
+
+    let announce = registry.announce_http.lock().await;
+    let Some(http) = announce.as_ref() else {
+        return ("503 Service Unavailable",
+            r#"{"ok":false,"error":"announce bot not configured"}"#.to_string());
+    };
+    let http = http.clone();
+    drop(announce);
+
+    use poise::serenity_prelude::{UserId, CreateMessage};
+    let user_id = UserId::new(user_id_raw);
+    match user_id.create_dm_channel(&*http).await {
+        Ok(dm_channel) => {
+            match dm_channel.id.send_message(&*http, CreateMessage::new().content(content)).await {
+                Ok(_) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] 📨 DM: → user {user_id_raw}");
+                    ("200 OK", format!(r#"{{"ok":true,"user_id":"{}"}}"#, user_id_raw))
+                }
+                Err(e) => {
+                    ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, e))
+                }
+            }
+        }
+        Err(e) => {
+            ("500 Internal Server Error", format!(r#"{{"ok":false,"error":"DM channel creation failed: {}"}}"#, e))
         }
     }
 }
