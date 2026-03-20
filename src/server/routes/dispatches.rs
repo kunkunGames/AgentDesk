@@ -403,7 +403,7 @@ pub(super) async fn send_dispatch_to_discord(
     };
 
     // For review dispatches, use the alternate channel (counter-model)
-    let use_alt = matches!(dispatch_type.as_deref(), Some("review") | Some("review-decision"));
+    let use_alt = use_counter_model_channel(dispatch_type.as_deref());
 
     // Look up agent's discord channel
     let channel_id: Option<String> = {
@@ -466,19 +466,7 @@ pub(super) async fn send_dispatch_to_discord(
         .flatten()
     };
 
-    let message = if use_alt {
-        // Review dispatch — clearly indicate this is a code review request
-        let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
-        format!(
-            "DISPATCH:{dispatch_id} - {title}\n\
-             ⚠️ 검토 전용 — 작업 착수 금지\n\
-             코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요.{url_line}"
-        )
-    } else if let Some(url) = issue_url {
-        format!("DISPATCH:{dispatch_id} - {title}\n{url}")
-    } else {
-        format!("DISPATCH:{dispatch_id} - {title}")
-    };
+    let message = format_dispatch_message(dispatch_id, title, issue_url.as_deref(), use_alt);
 
     // Send via Discord HTTP API using the announce bot
     let config = crate::config::load_graceful();
@@ -528,6 +516,34 @@ pub fn resolve_channel_alias_pub(alias: &str) -> Option<u64> {
     resolve_channel_alias(alias)
 }
 
+fn use_counter_model_channel(dispatch_type: Option<&str>) -> bool {
+    matches!(dispatch_type, Some("review") | Some("review-decision"))
+}
+
+fn format_dispatch_message(
+    dispatch_id: &str,
+    title: &str,
+    issue_url: Option<&str>,
+    use_alt: bool,
+) -> String {
+    if use_alt {
+        let mut message = format!(
+            "DISPATCH:{dispatch_id} - {title}\n\
+             ⚠️ 검토 전용 — 작업 착수 금지\n\
+             코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요."
+        );
+        if let Some(url) = issue_url {
+            message.push('\n');
+            message.push_str(url);
+        }
+        message
+    } else if let Some(url) = issue_url {
+        format!("DISPATCH:{dispatch_id} - {title}\n{url}")
+    } else {
+        format!("DISPATCH:{dispatch_id} - {title}")
+    }
+}
+
 fn resolve_channel_alias(alias: &str) -> Option<u64> {
     let root = crate::cli::agentdesk_runtime_root()?;
     let path = root.join("config/role_map.json");
@@ -555,4 +571,49 @@ fn resolve_channel_alias(alias: &str) -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_dispatch_message, use_counter_model_channel};
+
+    #[test]
+    fn review_dispatch_uses_counter_model_channel() {
+        assert!(use_counter_model_channel(Some("review")));
+        assert!(use_counter_model_channel(Some("review-decision")));
+        assert!(!use_counter_model_channel(Some("implementation")));
+        assert!(!use_counter_model_channel(Some("rework")));
+        assert!(!use_counter_model_channel(None));
+    }
+
+    #[test]
+    fn review_dispatch_message_includes_review_only_banner() {
+        let message = format_dispatch_message(
+            "dispatch-1",
+            "[Review R1] card-1",
+            Some("https://github.com/itismyfield/AgentDesk/issues/19"),
+            true,
+        );
+
+        assert!(message.starts_with("DISPATCH:dispatch-1 - [Review R1] card-1"));
+        assert!(message.contains("⚠️ 검토 전용"));
+        assert!(message.contains("코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요."));
+        assert!(message.ends_with("https://github.com/itismyfield/AgentDesk/issues/19"));
+    }
+
+    #[test]
+    fn implementation_dispatch_message_stays_compact() {
+        let message = format_dispatch_message(
+            "dispatch-2",
+            "Implement feature",
+            Some("https://github.com/itismyfield/AgentDesk/issues/24"),
+            false,
+        );
+
+        assert_eq!(
+            message,
+            "DISPATCH:dispatch-2 - Implement feature\nhttps://github.com/itismyfield/AgentDesk/issues/24"
+        );
+        assert!(!message.contains("검토 전용"));
+    }
 }
