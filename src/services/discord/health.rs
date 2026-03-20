@@ -264,29 +264,44 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
     true
 }
 
-/// Resolve the bot HTTP client by name (announce or notify).
+/// Resolve the bot HTTP client by name.
+/// Supported: "announce", "notify", or a provider name like "claude"/"codex".
 async fn resolve_bot_http(
     registry: &HealthRegistry,
     bot: &str,
 ) -> Result<Arc<serenity::Http>, (&'static str, String)> {
-    let (lock, bot_label) = match bot {
-        "notify" => (&registry.notify_http, "notify"),
-        _ => (&registry.announce_http, "announce"),
-    };
-    let guard = lock.lock().await;
-    match guard.as_ref() {
-        Some(http) => {
-            let http = http.clone();
-            drop(guard);
-            Ok(http)
+    match bot {
+        "notify" => {
+            let guard = registry.notify_http.lock().await;
+            match guard.as_ref() {
+                Some(http) => Ok(http.clone()),
+                None => Err((
+                    "503 Service Unavailable",
+                    r#"{"ok":false,"error":"notify bot not configured (missing credential/notify_bot_token)"}"#.to_string(),
+                )),
+            }
         }
-        None => {
-            drop(guard);
+        "announce" => {
+            let guard = registry.announce_http.lock().await;
+            match guard.as_ref() {
+                Some(http) => Ok(http.clone()),
+                None => Err((
+                    "503 Service Unavailable",
+                    r#"{"ok":false,"error":"announce bot not configured (missing credential/announce_bot_token)"}"#.to_string(),
+                )),
+            }
+        }
+        provider => {
+            // Look up provider bot (e.g. "claude", "codex")
+            let clients = registry.discord_http.lock().await;
+            for (name, http) in clients.iter() {
+                if name == provider {
+                    return Ok(http.clone());
+                }
+            }
             Err((
-                "503 Service Unavailable",
-                format!(
-                    r#"{{"ok":false,"error":"{bot_label} bot not configured (missing credential/{bot_label}_bot_token)"}}"#
-                ),
+                "400 Bad Request",
+                format!(r#"{{"ok":false,"error":"unknown bot: {provider}"}}"#),
             ))
         }
     }
