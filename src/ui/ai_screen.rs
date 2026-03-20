@@ -42,9 +42,9 @@ pub struct SessionData {
     pub born_generation: u64,
 }
 
-/// Get the AI sessions directory path (~/.remotecc/ai_sessions)
+/// Get the AI sessions directory path (~/.agentdesk/ai_sessions)
 pub fn ai_sessions_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".remotecc").join("ai_sessions"))
+    dirs::home_dir().map(|h| h.join(".agentdesk").join("ai_sessions"))
 }
 
 /// Sanitize user input — remove common prompt injection patterns and truncate.

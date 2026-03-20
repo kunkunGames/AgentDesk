@@ -9,7 +9,8 @@ pub fn tmux_env_suffix() -> &'static str {
     use std::sync::OnceLock;
     static SUFFIX: OnceLock<String> = OnceLock::new();
     SUFFIX.get_or_init(|| {
-        match std::env::var("REMOTECC_ROOT_DIR").ok() {
+        match std::env::var("AGENTDESK_ROOT_DIR")
+            .or_else(|_| std::env::var("REMOTECC_ROOT_DIR")).ok() {
             Some(root) if root.contains(".adk/dev") => "-dev".to_string(),
             _ => String::new(),
         }

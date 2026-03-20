@@ -543,21 +543,21 @@ mod tests {
     {
         let _guard = super::super::runtime_store::test_env_lock().lock().unwrap();
         let temp_home = TempDir::new().unwrap();
-        let root = temp_home.path().join(".remotecc");
+        let root = temp_home.path().join(".agentdesk");
         fs::create_dir_all(&root).unwrap();
-        let prev = std::env::var_os("REMOTECC_ROOT_DIR");
-        unsafe { std::env::set_var("REMOTECC_ROOT_DIR", &root) };
+        let prev = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
         f(&temp_home);
         match prev {
-            Some(v) => unsafe { std::env::set_var("REMOTECC_ROOT_DIR", v) },
-            None => unsafe { std::env::remove_var("REMOTECC_ROOT_DIR") },
+            Some(v) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", v) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
         }
     }
 
     #[test]
     fn test_load_bot_settings_keeps_explicit_empty_allowed_tools() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn test_load_bot_settings_normalizes_and_dedupes_tool_names() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn test_load_bot_launch_configs_reads_provider() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             fs::write(
                 settings_dir.join("bot_settings.json"),
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn test_load_bot_settings_accepts_string_encoded_ids() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             let token = "test-token";
             let key = discord_token_hash(token);
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn test_resolve_role_binding_reads_optional_provider() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             fs::write(
                 settings_dir.join("role_map.json"),
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn test_load_peer_agents_reads_meeting_config() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             let json = serde_json::json!({
                 "meeting": {
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn test_render_peer_agent_guidance_excludes_current_role() {
         with_temp_home(|temp_home: &TempDir| {
-            let settings_dir = temp_home.path().join(".remotecc");
+            let settings_dir = temp_home.path().join(".agentdesk");
             fs::create_dir_all(&settings_dir).unwrap();
             let json = serde_json::json!({
                 "meeting": {

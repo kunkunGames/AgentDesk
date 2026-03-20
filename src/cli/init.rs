@@ -199,10 +199,10 @@ fn default_agent_prompt(role_id: &str) -> String {
 fn generate_launchd_plist(home: &Path, remotecc_bin: &Path) -> String {
     let home_str = home.display();
     let bin_str = remotecc_bin.display();
-    let label = dcserver::REMOTECC_DCSERVER_LAUNCHD_LABEL;
-    // Use REMOTECC_ROOT_DIR if set, otherwise default to ~/.remotecc
+    let label = dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL;
+    // Use AGENTDESK_ROOT_DIR if set, otherwise default to ~/.agentdesk
     let root_dir = dcserver::remotecc_runtime_root()
-        .unwrap_or_else(|| home.join(".remotecc"));
+        .unwrap_or_else(|| home.join(".agentdesk"));
     let root_str = root_dir.display();
     let logs_dir = root_dir.join("logs");
     let logs_str = logs_dir.display();
@@ -232,7 +232,7 @@ fn generate_launchd_plist(home: &Path, remotecc_bin: &Path) -> String {
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{home_str}/.cargo/bin</string>
     <key>HOME</key>
     <string>{home_str}</string>
-    <key>REMOTECC_ROOT_DIR</key>
+    <key>AGENTDESK_ROOT_DIR</key>
     <string>{root_str}</string>
   </dict>
   <key>StandardOutPath</key>
@@ -526,7 +526,7 @@ pub fn handle_init(reconfigure: bool) {
         let plist_content = generate_launchd_plist(&home, &remotecc_bin);
         let launch_agents = home.join("Library").join("LaunchAgents");
         fs::create_dir_all(&launch_agents).unwrap();
-        let plist_filename = format!("{}.plist", dcserver::REMOTECC_DCSERVER_LAUNCHD_LABEL);
+        let plist_filename = format!("{}.plist", dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL);
         let plist_path = launch_agents.join(&plist_filename);
         write_with_backup(&plist_path, &plist_content, reconfigure);
         println!("  [OK] {}", plist_path.display());
@@ -534,7 +534,7 @@ pub fn handle_init(reconfigure: bool) {
         // Load and start
         let load_answer = prompt_line("\ndcserver를 지금 시작할까요? (Y/n): ");
         if load_answer.is_empty() || load_answer.to_lowercase().starts_with('y') {
-            let label = dcserver::REMOTECC_DCSERVER_LAUNCHD_LABEL;
+            let label = dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL;
             // Unload first if already loaded
             if dcserver::is_launchd_job_loaded(label) {
                 let _ = std::process::Command::new("launchctl")

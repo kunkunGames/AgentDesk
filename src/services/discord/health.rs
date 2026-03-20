@@ -272,7 +272,8 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
 
 /// Resolve the health check port from env or default.
 pub fn resolve_port() -> u16 {
-    std::env::var("REMOTECC_HEALTH_PORT")
+    std::env::var("AGENTDESK_HEALTH_PORT")
+        .or_else(|_| std::env::var("AGENTDESK_HEALTH_PORT"))
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8793)
@@ -449,26 +450,26 @@ mod tests {
 
     #[test]
     fn test_resolve_port_default() {
-        // When REMOTECC_HEALTH_PORT is not set, default to 8793
+        // When AGENTDESK_HEALTH_PORT is not set, default to 8793
         // Use env lock to avoid races with other tests
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
+        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
         assert_eq!(resolve_port(), 8793);
     }
 
     #[test]
     fn test_resolve_port_env_override() {
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::set_var("REMOTECC_HEALTH_PORT", "9999") };
+        unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "9999") };
         assert_eq!(resolve_port(), 9999);
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
+        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
     }
 
     #[test]
     fn test_resolve_port_invalid_env() {
         let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::set_var("REMOTECC_HEALTH_PORT", "not-a-number") };
+        unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "not-a-number") };
         assert_eq!(resolve_port(), 8793);
-        unsafe { std::env::remove_var("REMOTECC_HEALTH_PORT") };
+        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
     }
 }

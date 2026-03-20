@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn append_shared_memory_turn_persists_entries() {
         let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join(".remotecc").join("shared_agent_memory");
+        let root = dir.path().join(".agentdesk").join("shared_agent_memory");
         let result = append_shared_memory_turn_at_root(
             &root,
             "ch-td",
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn build_shared_memory_context_includes_same_channel_when_no_provider_session() {
         let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join(".remotecc").join("shared_agent_memory");
+        let root = dir.path().join(".agentdesk").join("shared_agent_memory");
         append_shared_memory_turn_at_root(
             &root,
             "ch-qad",

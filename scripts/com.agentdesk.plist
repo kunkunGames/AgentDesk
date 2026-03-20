@@ -13,9 +13,9 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>REMOTECC_ROOT_DIR</key>
+        <key>AGENTDESK_ROOT_DIR</key>
         <string>AGENTDESK_HOME</string>
-        <key>REMOTECC_HEALTH_PORT</key>
+        <key>AGENTDESK_HEALTH_PORT</key>
         <string>8796</string>
     </dict>
 

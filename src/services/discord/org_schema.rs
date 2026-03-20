@@ -351,19 +351,19 @@ mod tests {
     {
         let _guard = super::super::runtime_store::test_env_lock().lock().unwrap();
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join(".remotecc");
+        let root = temp.path().join(".agentdesk");
         fs::create_dir_all(&root).unwrap();
-        let prev = std::env::var_os("REMOTECC_ROOT_DIR");
-        unsafe { std::env::set_var("REMOTECC_ROOT_DIR", &root) };
+        let prev = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
         f(&temp);
         match prev {
-            Some(v) => unsafe { std::env::set_var("REMOTECC_ROOT_DIR", v) },
-            None => unsafe { std::env::remove_var("REMOTECC_ROOT_DIR") },
+            Some(v) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", v) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
         }
     }
 
     fn write_org_yaml(dir: &std::path::Path, content: &str) {
-        let settings_dir = dir.join(".remotecc");
+        let settings_dir = dir.join(".agentdesk");
         fs::create_dir_all(&settings_dir).unwrap();
         fs::write(settings_dir.join("org.yaml"), content).unwrap();
     }

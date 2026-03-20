@@ -2,17 +2,21 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const REMOTECC_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
+const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+const LEGACY_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
 
 pub(super) fn remotecc_root() -> Option<PathBuf> {
-    if let Ok(override_root) = std::env::var(REMOTECC_ROOT_DIR_ENV) {
-        let trimmed = override_root.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
+    // Primary: AGENTDESK_ROOT_DIR, fallback: legacy REMOTECC_ROOT_DIR
+    for key in [AGENTDESK_ROOT_DIR_ENV, LEGACY_ROOT_DIR_ENV] {
+        if let Ok(override_root) = std::env::var(key) {
+            let trimmed = override_root.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
         }
     }
 
-    dirs::home_dir().map(|h| h.join(".remotecc"))
+    dirs::home_dir().map(|h| h.join(".agentdesk"))
 }
 
 pub(super) fn runtime_root() -> Option<PathBuf> {
@@ -114,7 +118,7 @@ pub(super) fn save_all_last_message_ids(provider: &str, ids: &std::collections::
     }
 }
 
-/// Shared mutex for tests that manipulate REMOTECC_ROOT_DIR env var.
+/// Shared mutex for tests that manipulate AGENTDESK_ROOT_DIR env var.
 /// All test modules must use this to avoid env var races.
 #[cfg(test)]
 pub(super) fn test_env_lock() -> &'static std::sync::Mutex<()> {
@@ -130,7 +134,7 @@ pub(super) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-/// Temporary helper for ~/.remotecc/ folder restructuring migration.
+/// Temporary helper for folder restructuring migration.
 /// Returns new_path if it exists, otherwise legacy_path if it exists, otherwise new_path.
 /// TODO: Remove after 2026-03-26 (legacy fallback cleanup)
 fn legacy_fallback(new_path: PathBuf, legacy_path: PathBuf) -> PathBuf {
@@ -149,7 +153,7 @@ mod tests {
     use std::fs;
 
     /// Acquire the shared env lock to avoid races between tests that mutate
-    /// REMOTECC_ROOT_DIR.
+    /// AGENTDESK_ROOT_DIR.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         test_env_lock().lock().unwrap()
     }
@@ -161,23 +165,29 @@ mod tests {
         let override_path = tmp.path().join("custom_root");
         fs::create_dir_all(&override_path).unwrap();
 
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, override_path.to_str().unwrap()) };
+        let prev_legacy = std::env::var_os(LEGACY_ROOT_DIR_ENV);
+        unsafe { std::env::remove_var(LEGACY_ROOT_DIR_ENV) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, override_path.to_str().unwrap()) };
         let root = remotecc_root().expect("should return Some");
         assert_eq!(root, override_path);
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+        if let Some(v) = prev_legacy { unsafe { std::env::set_var(LEGACY_ROOT_DIR_ENV, v) }; }
     }
 
     #[test]
     fn test_remotecc_root_env_empty_falls_back() {
         let _lock = env_lock();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, "   ") };
+        let prev_legacy = std::env::var_os(LEGACY_ROOT_DIR_ENV);
+        unsafe { std::env::remove_var(LEGACY_ROOT_DIR_ENV) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, "   ") };
         // Empty/whitespace-only override should fall back to home-based default
         let root = remotecc_root().expect("should return Some");
-        let expected = dirs::home_dir().unwrap().join(".remotecc");
+        let expected = dirs::home_dir().unwrap().join(".agentdesk");
         assert_eq!(root, expected);
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+        if let Some(v) = prev_legacy { unsafe { std::env::set_var(LEGACY_ROOT_DIR_ENV, v) }; }
     }
 
     #[test]
@@ -185,7 +195,7 @@ mod tests {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, root.to_str().unwrap()) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, root.to_str().unwrap()) };
 
         // Create both new and legacy paths
         let new_path = root.join("config").join("bot_settings.json");
@@ -197,7 +207,7 @@ mod tests {
         let result = bot_settings_path().expect("should return Some");
         assert_eq!(result, new_path, "Should prefer config/ path when both exist");
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 
     #[test]
@@ -205,7 +215,7 @@ mod tests {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, root.to_str().unwrap()) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, root.to_str().unwrap()) };
 
         // Create only legacy path (no config/ directory)
         let legacy_path = root.join("bot_settings.json");
@@ -214,7 +224,7 @@ mod tests {
         let result = bot_settings_path().expect("should return Some");
         assert_eq!(result, legacy_path, "Should fall back to legacy path when new path doesn't exist");
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 
     #[test]
@@ -222,7 +232,7 @@ mod tests {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, root.to_str().unwrap()) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, root.to_str().unwrap()) };
 
         // All path functions should return paths under the root
         let paths: Vec<(&str, Option<PathBuf>)> = vec![
@@ -247,7 +257,7 @@ mod tests {
             );
         }
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 
     #[test]
@@ -255,7 +265,7 @@ mod tests {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, root.to_str().unwrap()) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, root.to_str().unwrap()) };
 
         // generation_path uses legacy_fallback — create the runtime dir
         let runtime_dir = root.join("runtime");
@@ -272,7 +282,7 @@ mod tests {
         assert_eq!(increment_generation(), 2);
         assert_eq!(load_generation(), 2);
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 
     #[test]
@@ -280,13 +290,13 @@ mod tests {
         let _lock = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        unsafe { std::env::set_var(REMOTECC_ROOT_DIR_ENV, root.to_str().unwrap()) };
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, root.to_str().unwrap()) };
 
         // Neither config/bot_settings.json nor bot_settings.json exists
         let result = bot_settings_path().expect("should return Some");
         let expected_new = root.join("config").join("bot_settings.json");
         assert_eq!(result, expected_new, "Should return new path when neither exists");
 
-        unsafe { std::env::remove_var(REMOTECC_ROOT_DIR_ENV) };
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 }

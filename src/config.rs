@@ -213,12 +213,14 @@ impl Settings {
     }
 
     pub fn config_dir() -> Option<std::path::PathBuf> {
-        if let Ok(root) = std::env::var("REMOTECC_ROOT_DIR") {
-            let trimmed = root.trim();
-            if !trimmed.is_empty() {
-                return Some(std::path::PathBuf::from(trimmed));
+        for key in ["AGENTDESK_ROOT_DIR", "REMOTECC_ROOT_DIR"] {
+            if let Ok(root) = std::env::var(key) {
+                let trimmed = root.trim();
+                if !trimmed.is_empty() {
+                    return Some(std::path::PathBuf::from(trimmed));
+                }
             }
         }
-        dirs::home_dir().map(|h| h.join(".remotecc"))
+        dirs::home_dir().map(|h| h.join(".agentdesk"))
     }
 }

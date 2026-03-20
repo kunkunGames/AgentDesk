@@ -210,7 +210,7 @@ fn clean_remotecc_tmp_files() -> usize {
 pub fn migrate_config_dir() {
     if let Some(home) = dirs::home_dir() {
         let old_dir = home.join(".cokacdir");
-        let new_dir = home.join(".remotecc");
+        let new_dir = home.join(".agentdesk");
         if old_dir.exists() && !new_dir.exists() {
             if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
                 eprintln!(

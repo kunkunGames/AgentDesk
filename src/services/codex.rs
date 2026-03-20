@@ -427,11 +427,13 @@ fn execute_streaming_local_tmux(
     let script_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "sh");
 
     let mut env_lines = String::from("unset CLAUDECODE\n");
-    if let Ok(root_dir) = std::env::var("REMOTECC_ROOT_DIR") {
+    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR")
+        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
+    {
         let trimmed = root_dir.trim();
         if !trimmed.is_empty() {
             env_lines.push_str(&format!(
-                "export REMOTECC_ROOT_DIR='{}'\n",
+                "export AGENTDESK_ROOT_DIR='{}'\n",
                 trimmed.replace('\'', "'\\''")
             ));
         }

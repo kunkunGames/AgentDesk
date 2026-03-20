@@ -13,9 +13,12 @@ use crate::engine::PolicyEngine;
 use crate::server;
 
 use super::VERSION;
-pub(crate) const REMOTECC_DCSERVER_LAUNCHD_LABEL: &str = "com.itismyfield.remotecc.dcserver";
-const REMOTECC_DCSERVER_LABEL_ENV: &str = "REMOTECC_DCSERVER_LABEL";
-const REMOTECC_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
+pub(crate) const AGENTDESK_DCSERVER_LAUNCHD_LABEL: &str = "com.agentdesk.dcserver";
+const AGENTDESK_DCSERVER_LABEL_ENV: &str = "AGENTDESK_DCSERVER_LABEL";
+const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+// Legacy fallback env var names for backward compatibility
+const LEGACY_ROOT_DIR_ENV: &str = "REMOTECC_ROOT_DIR";
+const LEGACY_DCSERVER_LABEL_ENV: &str = "REMOTECC_DCSERVER_LABEL";
 
 pub fn current_launchd_domain() -> Option<String> {
     let output = std::process::Command::new("id").arg("-u").output().ok()?;
@@ -53,26 +56,31 @@ pub fn kickstart_launchd_job(label: &str) -> bool {
 }
 
 pub fn remotecc_runtime_root() -> Option<PathBuf> {
-    if let Ok(override_root) = env::var(REMOTECC_ROOT_DIR_ENV) {
-        let trimmed = override_root.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
+    // Primary: AGENTDESK_ROOT_DIR, fallback: legacy REMOTECC_ROOT_DIR
+    for key in [AGENTDESK_ROOT_DIR_ENV, LEGACY_ROOT_DIR_ENV] {
+        if let Ok(override_root) = env::var(key) {
+            let trimmed = override_root.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
         }
     }
 
-    dirs::home_dir().map(|h| h.join(".remotecc"))
+    dirs::home_dir().map(|h| h.join(".agentdesk"))
 }
 
 pub fn current_dcserver_launchd_label() -> String {
-    env::var(REMOTECC_DCSERVER_LABEL_ENV)
+    env::var(AGENTDESK_DCSERVER_LABEL_ENV)
+        .or_else(|_| env::var(LEGACY_DCSERVER_LABEL_ENV))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| REMOTECC_DCSERVER_LAUNCHD_LABEL.to_string())
+        .unwrap_or_else(|| AGENTDESK_DCSERVER_LAUNCHD_LABEL.to_string())
 }
 
 pub fn current_dcserver_root_marker() -> Option<String> {
-    env::var(REMOTECC_ROOT_DIR_ENV)
+    env::var(AGENTDESK_ROOT_DIR_ENV)
+        .or_else(|_| env::var(LEGACY_ROOT_DIR_ENV))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -99,8 +107,8 @@ pub fn dcserver_process_matches_instance(command: &str) -> bool {
     }
 
     match current_dcserver_root_marker() {
-        Some(root) => command.contains(&format!("{REMOTECC_ROOT_DIR_ENV}={root}")),
-        None => !command.contains(&format!("{REMOTECC_ROOT_DIR_ENV}=")),
+        Some(root) => command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}={root}")),
+        None => !command.contains(&format!("{AGENTDESK_ROOT_DIR_ENV}=")),
     }
 }
 
@@ -596,18 +604,18 @@ pub fn handle_restart_dcserver(
     let root_env = current_dcserver_root_marker()
         .map(|root| {
             format!(
-                "export {REMOTECC_ROOT_DIR_ENV}='{}'\n",
+                "export {AGENTDESK_ROOT_DIR_ENV}='{}'\n",
                 root.replace('\'', "'\\''")
             )
         })
         .unwrap_or_default();
-    let label_env = env::var(REMOTECC_DCSERVER_LABEL_ENV)
+    let label_env = env::var(AGENTDESK_DCSERVER_LABEL_ENV)
         .ok()
         .map(|label| label.trim().to_string())
         .filter(|label| !label.is_empty())
         .map(|label| {
             format!(
-                "export {REMOTECC_DCSERVER_LABEL_ENV}='{}'\n",
+                "export {AGENTDESK_DCSERVER_LABEL_ENV}='{}'\n",
                 label.replace('\'', "'\\''")
             )
         })

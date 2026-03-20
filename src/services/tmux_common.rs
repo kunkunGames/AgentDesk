@@ -11,14 +11,15 @@ pub fn session_temp_path(session_name: &str, extension: &str) -> String {
     format!("{}/remotecc-{}.{}", remotecc_temp_dir(), session_name, extension)
 }
 
-/// Get the current RemoteCC runtime root marker for tmux session ownership.
+/// Get the current AgentDesk runtime root marker for tmux session ownership.
 pub fn current_tmux_owner_marker() -> String {
-    std::env::var("REMOTECC_ROOT_DIR")
+    std::env::var("AGENTDESK_ROOT_DIR")
+        .or_else(|_| std::env::var("REMOTECC_ROOT_DIR"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".remotecc").display().to_string()))
-        .unwrap_or_else(|| ".remotecc".to_string())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".agentdesk").display().to_string()))
+        .unwrap_or_else(|| ".agentdesk".to_string())
 }
 
 /// Path to the owner marker file for a tmux session.
