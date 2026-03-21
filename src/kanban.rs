@@ -45,6 +45,24 @@ pub fn transition_status(
         });
     }
 
+    // Validate transition: done requires passing through review first
+    // (unless transitioning from review itself or from blocked/pending_decision)
+    if new_status == "done"
+        && !matches!(
+            old_status.as_str(),
+            "review" | "blocked" | "pending_decision" | "done"
+        )
+    {
+        tracing::warn!(
+            "[kanban] Blocked invalid transition {} → done for card {} (must go through review)",
+            old_status, card_id
+        );
+        return Err(anyhow::anyhow!(
+            "Cannot transition from {} to done directly. Must go through review first.",
+            old_status
+        ));
+    }
+
     // Build UPDATE with appropriate extra fields
     let extra = match new_status {
         "in_progress" => ", started_at = COALESCE(started_at, datetime('now'))",
