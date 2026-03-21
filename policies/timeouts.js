@@ -157,6 +157,75 @@ var timeouts = {
         [staleQueueEntries[se].id]
       );
     }
+
+    // ─── [I] 턴 데드락 감지 (15분) ──────────────────────────
+    var DEADLOCK_MINUTES = 15;
+    var MAX_EXTENSIONS = 3;
+    var staleSessions = agentdesk.db.query(
+      "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat " +
+      "FROM sessions WHERE status = 'working' " +
+      "AND last_heartbeat < datetime('now', '-" + DEADLOCK_MINUTES + " minutes')"
+    );
+    for (var dl = 0; dl < staleSessions.length; dl++) {
+      var sess = staleSessions[dl];
+      var deadlockKey = "deadlock_check:" + sess.session_key;
+
+      // Check extension count
+      var extRecord = agentdesk.db.query(
+        "SELECT value FROM kv_meta WHERE key = ?", [deadlockKey]
+      );
+      var extensions = 0;
+      if (extRecord.length > 0) {
+        try { extensions = parseInt(extRecord[0].value) || 0; } catch(e) {}
+      }
+
+      if (extensions >= MAX_EXTENSIONS) {
+        // Max extensions reached — force alert for manual intervention
+        agentdesk.log.warn("[deadlock] Session " + sess.session_key +
+          " — max extensions (" + MAX_EXTENSIONS + ") reached. Manual intervention needed.");
+        sendNotifyAlert(getPMDChannel(),
+          "🔴 [Deadlock] " + sess.agent_id + " 세션 " + sess.session_key +
+          " — " + (DEADLOCK_MINUTES * (MAX_EXTENSIONS + 1)) + "분 이상 무응답. 수동 개입 필요.");
+        // Reset counter to avoid spam
+        agentdesk.db.execute(
+          "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, '-1')",
+          [deadlockKey]
+        );
+      } else if (extensions >= 0) {
+        // Extend timeout + alert
+        agentdesk.db.execute(
+          "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
+          [deadlockKey, String(extensions + 1)]
+        );
+        // Update last_heartbeat to extend by 15 more minutes
+        agentdesk.db.execute(
+          "UPDATE sessions SET last_heartbeat = datetime('now') WHERE session_key = ?",
+          [sess.session_key]
+        );
+        agentdesk.log.warn("[deadlock] Session " + sess.session_key +
+          " — heartbeat stale " + DEADLOCK_MINUTES + "min. Extension " +
+          (extensions + 1) + "/" + MAX_EXTENSIONS);
+        sendNotifyAlert(getPMDChannel(),
+          "⚠️ [Deadlock 의심] " + sess.agent_id + " 세션 — " +
+          DEADLOCK_MINUTES + "분 무응답 (연장 " + (extensions + 1) + "/" + MAX_EXTENSIONS + ")");
+      }
+      // extensions == -1 means already force-alerted, skip
+    }
+
+    // Clean up deadlock counters for sessions that are no longer working
+    var activeKeys = agentdesk.db.query(
+      "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'"
+    );
+    for (var ak = 0; ak < activeKeys.length; ak++) {
+      var sessKey = activeKeys[ak].key.replace("deadlock_check:", "");
+      var stillWorking = agentdesk.db.query(
+        "SELECT COUNT(*) as cnt FROM sessions WHERE session_key = ? AND status = 'working'",
+        [sessKey]
+      );
+      if (stillWorking.length > 0 && stillWorking[0].cnt === 0) {
+        agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [activeKeys[ak].key]);
+      }
+    }
   }
 };
 
