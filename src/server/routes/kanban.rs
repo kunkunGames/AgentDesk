@@ -285,7 +285,8 @@ pub async fn update_card(
     }
 
     push_field!("title", body.title);
-    push_field!("status", body.status);
+    // Status changes go through transition_status_with_opts (not direct SQL)
+    // push_field!("status", body.status); — handled below
     push_field!("priority", body.priority);
     push_field!("assigned_agent_id", body.assigned_agent_id);
     push_field!("repo_id", body.repo_id);
@@ -298,64 +299,83 @@ pub async fn update_card(
         idx += 1;
     }
 
-    if sets.is_empty() {
+    if sets.is_empty() && body.status.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no fields to update"})),
         );
     }
 
-    sets.push(format!("updated_at = datetime('now')"));
+    // Execute non-status field updates if any
+    if !sets.is_empty() {
+        sets.push(format!("updated_at = datetime('now')"));
+        let sql = format!(
+            "UPDATE kanban_cards SET {} WHERE id = ?{}",
+            sets.join(", "),
+            idx
+        );
+        values.push(Box::new(id.clone()));
 
-    let sql = format!(
-        "UPDATE kanban_cards SET {} WHERE id = ?{}",
-        sets.join(", "),
-        idx
-    );
-    values.push(Box::new(id.clone()));
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
 
-    let conn = match state.db.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-    match conn.execute(&sql, params_ref.as_slice()) {
-        Ok(0) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "card not found"})),
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            values.iter().map(|v| v.as_ref()).collect();
+        match conn.execute(&sql, params_ref.as_slice()) {
+            Ok(0) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "card not found"})),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
         }
     }
 
+    let new_status = body.status.clone();
+
+    // Status change via transition_status_with_opts (dispatch validation + audit)
+    // Do this BEFORE reading card back, so the response reflects the new status
+    if let Some(new_s) = &new_status {
+        if new_s.as_str() != old_status {
+            match crate::kanban::transition_status_with_opts(
+                &state.db, &state.engine, &id, new_s, "api", false,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
+            }
+        }
+    }
+
+    let conn = state.db.lock().unwrap();
     let card = conn.query_row(
         "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
         [&id],
         |row| card_row_to_json(row),
     );
-
-    let new_status = body.status.clone();
     drop(conn);
 
-    // Fire hooks if status changed — centralized via kanban::fire_transition_hooks
+    // Discord notification for new dispatches (if hooks created them)
     if let Some(ref new_s) = new_status {
-        if new_s != &old_status {
-            crate::kanban::fire_transition_hooks(
-                &state.db, &state.engine, &id, &old_status, new_s,
-            );
+        if new_s.as_str() != old_status {
 
             // Send Discord notification for new dispatches created by hooks
             if new_s == "requested" || new_s == "review" {

@@ -13,16 +13,33 @@ use serde_json::json;
 ///
 /// This is the ONLY correct way to change a card's status.
 /// It handles:
-/// 1. DB UPDATE with appropriate timestamp fields
-/// 2. OnCardTransition hook
-/// 3. OnReviewEnter hook (when → review)
-/// 4. OnCardTerminal hook (when → done)
-/// 5. auto_queue_entries sync (when → done)
+/// 1. Dispatch validation (C: dispatch required for non-free transitions)
+/// 2. DB UPDATE with appropriate timestamp fields
+/// 3. Audit logging (D: all transitions logged)
+/// 4. OnCardTransition hook
+/// 5. OnReviewEnter hook (when → review)
+/// 6. OnCardTerminal hook (when → done)
+/// 7. auto_queue_entries sync (when → done)
+///
+/// `source`: who initiated the transition (e.g., "api", "policy", "pmd")
+/// `force`: PMD-only override to bypass dispatch validation
 pub fn transition_status(
     db: &Db,
     engine: &PolicyEngine,
     card_id: &str,
     new_status: &str,
+) -> Result<TransitionResult> {
+    transition_status_with_opts(db, engine, card_id, new_status, "system", false)
+}
+
+/// Full transition with source tracking and force override.
+pub fn transition_status_with_opts(
+    db: &Db,
+    engine: &PolicyEngine,
+    card_id: &str,
+    new_status: &str,
+    source: &str,
+    force: bool,
 ) -> Result<TransitionResult> {
     let conn = db
         .lock()
@@ -45,14 +62,47 @@ pub fn transition_status(
         });
     }
 
+    // ── C: Dispatch validation ──
+    // Free transitions: backlog ↔ ready (no dispatch needed)
+    let free_transition = matches!(
+        (old_status.as_str(), new_status),
+        ("backlog", "ready") | ("ready", "backlog")
+    );
+
+    if !free_transition && !force {
+        // Check for active dispatch
+        let has_dispatch: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM task_dispatches \
+                 WHERE kanban_card_id = ?1 AND status IN ('pending', 'completed')",
+                [card_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !has_dispatch {
+            // Log violation
+            log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no dispatch");
+            tracing::warn!(
+                "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
+                old_status, new_status, card_id, source
+            );
+            return Err(anyhow::anyhow!(
+                "Status transition {} → {} requires an active dispatch. Use dispatch lifecycle or PMD force override.",
+                old_status, new_status
+            ));
+        }
+    }
+
     // Validate transition: done requires passing through review first
-    // (unless transitioning from review itself or from blocked/pending_decision)
     if new_status == "done"
+        && !force
         && !matches!(
             old_status.as_str(),
             "review" | "blocked" | "pending_decision" | "done"
         )
     {
+        log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: review required");
         tracing::warn!(
             "[kanban] Blocked invalid transition {} → done for card {} (must go through review)",
             old_status, card_id
@@ -74,6 +124,9 @@ pub fn transition_status(
         "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){extra} WHERE id = ?2"
     );
     conn.execute(&sql, rusqlite::params![new_status, card_id])?;
+
+    // ── D: Audit log ──
+    log_audit(&conn, card_id, &old_status, new_status, source, "OK");
 
     // Sync auto_queue_entries on terminal status
     if new_status == "done" {
@@ -144,6 +197,11 @@ pub fn fire_transition_hooks(
 ) {
     if from == to {
         return;
+    }
+
+    // Audit log
+    if let Ok(conn) = db.lock() {
+        log_audit(&conn, card_id, from, to, "hook", "OK");
     }
 
     // Capture pre-hook dispatch ID to detect new dispatches created by hooks
@@ -369,4 +427,32 @@ fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
         }
         _ => {}
     }
+}
+
+/// Log a kanban state transition to audit_logs table.
+fn log_audit(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    from: &str,
+    to: &str,
+    source: &str,
+    result: &str,
+) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS kanban_audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id TEXT,
+            from_status TEXT,
+            to_status TEXT,
+            source TEXT,
+            result TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .ok();
+    conn.execute(
+        "INSERT INTO kanban_audit_logs (card_id, from_status, to_status, source, result) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![card_id, from, to, source, result],
+    )
+    .ok();
 }
