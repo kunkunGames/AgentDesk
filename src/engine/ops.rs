@@ -84,6 +84,11 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return JSON.parse(json);
             };
             agentdesk.db.execute = function(sql, params) {
+                // Block direct status updates on kanban_cards — use agentdesk.kanban.setStatus() instead
+                // Only blocks "status =" but not "review_status =", "blocked_reason =" etc.
+                if (/UPDATE\s+kanban_cards\b/i.test(sql) && /(?<![_a-z])status\s*=/i.test(sql)) {
+                    throw new Error("Direct kanban_cards status UPDATE is blocked. Use agentdesk.kanban.setStatus(cardId, newStatus) instead.");
+                }
                 var json = rawExec(sql, JSON.stringify(params || []));
                 return JSON.parse(json);
             };
