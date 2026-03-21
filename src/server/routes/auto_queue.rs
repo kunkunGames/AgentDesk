@@ -80,7 +80,9 @@ fn ensure_tables(conn: &rusqlite::Connection) {
 fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Value {
     conn.query_row(
         "SELECT e.id, e.agent_id, e.kanban_card_id, e.priority_rank, e.reason, e.status,
-                e.created_at, e.dispatched_at, e.completed_at,
+                CAST(strftime('%s', e.created_at) AS INTEGER) * 1000,
+                CASE WHEN e.dispatched_at IS NOT NULL THEN CAST(strftime('%s', e.dispatched_at) AS INTEGER) * 1000 END,
+                CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
                 kc.title, kc.github_issue_number, kc.github_issue_url
          FROM auto_queue_entries e
          LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id
@@ -94,9 +96,9 @@ fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Val
                 "priority_rank": row.get::<_, i64>(3)?,
                 "reason": row.get::<_, Option<String>>(4)?,
                 "status": row.get::<_, String>(5)?,
-                "created_at": row.get::<_, String>(6)?,
-                "dispatched_at": row.get::<_, Option<String>>(7)?,
-                "completed_at": row.get::<_, Option<String>>(8)?,
+                "created_at": row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                "dispatched_at": row.get::<_, Option<i64>>(7)?,
+                "completed_at": row.get::<_, Option<i64>>(8)?,
                 "card_title": row.get::<_, Option<String>>(9)?,
                 "github_issue_number": row.get::<_, Option<i64>>(10)?,
                 "github_repo": row.get::<_, Option<String>>(11)?,
@@ -108,7 +110,9 @@ fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Val
 
 fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
     conn.query_row(
-        "SELECT id, repo, agent_id, status, timeout_minutes, created_at, completed_at
+        "SELECT id, repo, agent_id, status, timeout_minutes,
+                CAST(strftime('%s', created_at) AS INTEGER) * 1000,
+                CASE WHEN completed_at IS NOT NULL THEN CAST(strftime('%s', completed_at) AS INTEGER) * 1000 END
          FROM auto_queue_runs WHERE id = ?1",
         [run_id],
         |row| {
@@ -118,8 +122,10 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
                 "agent_id": row.get::<_, Option<String>>(2)?,
                 "status": row.get::<_, String>(3)?,
                 "timeout_minutes": row.get::<_, i64>(4)?,
-                "created_at": row.get::<_, String>(5)?,
-                "completed_at": row.get::<_, Option<String>>(6)?,
+                "ai_model": null,
+                "ai_rationale": null,
+                "created_at": row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                "completed_at": row.get::<_, Option<i64>>(6)?,
             }))
         },
     )
