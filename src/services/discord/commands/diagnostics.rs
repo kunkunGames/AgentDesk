@@ -12,6 +12,7 @@ use super::super::runtime_store;
 use super::super::{Context, CoreState, Error, PendingQueueItem, SharedData, check_auth};
 use crate::services::claude;
 use crate::services::provider::ProviderKind;
+#[cfg(unix)]
 use crate::services::tmux_diagnostics::{tmux_session_exists, tmux_session_has_live_pane};
 
 pub(in crate::services::discord) async fn build_health_report(

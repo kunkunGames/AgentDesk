@@ -15,6 +15,7 @@ use crate::services::discord::restart_report::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
+#[cfg(unix)]
 use crate::services::tmux_diagnostics::{
     record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
 };

@@ -1,6 +1,7 @@
 use super::handoff::{HandoffRecord, save_handoff};
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
+#[cfg(unix)]
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 use crate::utils::format::tail_with_ellipsis;
 
@@ -39,6 +40,7 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
     }
 }
 
+#[cfg(unix)]
 pub(super) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
     use crate::services::tmux_common::session_temp_path;
     (

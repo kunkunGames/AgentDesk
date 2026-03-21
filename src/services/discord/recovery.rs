@@ -1,6 +1,7 @@
 use super::shared_memory::latest_shared_memory_ts;
 use super::turn_bridge::stale_inflight_message;
 use super::*;
+#[cfg(unix)]
 use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
 
 fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {

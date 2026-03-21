@@ -15,6 +15,7 @@ mod router;
 pub mod runtime_store;
 pub(crate) mod settings;
 mod shared_memory;
+#[cfg(unix)]
 mod tmux;
 mod turn_bridge;
 
@@ -63,8 +64,11 @@ use settings::{
 use shared_memory::{
     append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts,
 };
+#[cfg(unix)]
 use tmux::{cleanup_orphan_tmux_sessions, restore_tmux_watchers, tmux_output_watcher};
-use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
+use turn_bridge::{TurnBridgeContext, spawn_turn_bridge};
+#[cfg(unix)]
+use turn_bridge::tmux_runtime_paths;
 
 pub use settings::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
