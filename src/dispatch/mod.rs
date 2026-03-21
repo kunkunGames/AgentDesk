@@ -43,11 +43,21 @@ pub fn create_dispatch(
         rusqlite::params![dispatch_id, kanban_card_id, to_agent_id, dispatch_type, title, context_str],
     )?;
 
-    // Update kanban card
-    conn.execute(
-        "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = 'requested', requested_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![dispatch_id, kanban_card_id],
-    )?;
+    // Update kanban card — rework/review dispatches keep current status
+    let is_review_type = dispatch_type == "review"
+        || dispatch_type == "review-decision"
+        || dispatch_type == "rework";
+    if is_review_type {
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![dispatch_id, kanban_card_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = 'requested', requested_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![dispatch_id, kanban_card_id],
+        )?;
+    }
 
     // Read back the dispatch
     let dispatch = query_dispatch_row(&conn, &dispatch_id)?;

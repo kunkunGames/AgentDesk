@@ -175,11 +175,68 @@ pub async fn submit_review_decision(
 
     match body.decision.as_str() {
         "accept" => {
-            // Agent accepts review feedback → go to in_progress for rework
+            // Agent accepts review feedback → create rework dispatch
+            let (agent_id, title): (String, String) = conn
+                .query_row(
+                    "SELECT COALESCE(assigned_agent_id, ''), title FROM kanban_cards WHERE id = ?1",
+                    [&body.card_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_default();
+
             conn.execute(
                 "UPDATE kanban_cards SET status = 'in_progress', review_status = 'rework_pending', updated_at = datetime('now') WHERE id = ?1",
                 [&body.card_id],
             ).ok();
+            drop(conn);
+
+            // Create rework dispatch so agent gets a session to do the fix
+            if !agent_id.is_empty() {
+                let _ = crate::dispatch::create_dispatch(
+                    &state.db,
+                    &state.engine,
+                    &body.card_id,
+                    &agent_id,
+                    "rework",
+                    &format!("[Rework] {title}"),
+                    &json!({"review_decision": "accept", "comment": body.comment}),
+                );
+
+                // Async Discord notification
+                let db_clone = state.db.clone();
+                let card_id = body.card_id.clone();
+                let agent_id_c = agent_id.clone();
+                tokio::spawn(async move {
+                    let info: Option<(String, String)> = {
+                        let conn = match db_clone.lock() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        conn.query_row(
+                            "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
+                            [&card_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .ok()
+                    };
+                    if let Some((dispatch_id, title)) = info {
+                        super::dispatches::send_dispatch_to_discord(
+                            &db_clone, &agent_id_c, &title, &card_id, &dispatch_id,
+                        )
+                        .await;
+                    }
+                });
+            }
+
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "card_id": body.card_id,
+                    "decision": "accept",
+                    "message": "Rework dispatch created",
+                })),
+            );
         }
         "dispute" => {
             // Agent disputes → increment review_round, create new review dispatch to counter-model
