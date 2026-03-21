@@ -121,7 +121,6 @@ var rules = {
 
     // Rework dispatches — skip gate, go directly to review
     if (dispatch.dispatch_type === "rework") {
-      agentdesk.db.execute(
       agentdesk.kanban.setStatus(card.id, "review");
       agentdesk.log.info("[kanban] " + card.id + " rework done → review");
       return;
