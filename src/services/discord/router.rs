@@ -143,14 +143,13 @@ pub(super) async fn handle_event(
             if new_message.author.bot {
                 let dedup_key =
                     if let Some(dispatch_id) = super::adk_session::parse_dispatch_id(text) {
+                        // Same dispatch_id = genuine duplicate (Discord retry)
                         format!("dispatch:{}", dispatch_id)
                     } else {
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                        channel_id.get().hash(&mut hasher);
-                        user_id.get().hash(&mut hasher);
-                        text.hash(&mut hasher);
-                        format!("bot:{}:{:x}", channel_id, hasher.finish())
+                        // Use Discord message_id as dedup key — each message is unique
+                        // This prevents false-positive dedup of different bot messages
+                        // with similar text content
+                        format!("msg:{}", new_message.id)
                     };
 
                 const INTAKE_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
