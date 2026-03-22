@@ -381,18 +381,20 @@ export default function SettingsView({
                   </h4>
                   <div className="space-y-2">
                     {items.map((entry) => (
-                      <div key={entry.key} className="flex items-center gap-3 rounded-xl border px-4 py-2" style={{ borderColor: "rgba(148,163,184,0.2)" }}>
-                        <span className="text-sm min-w-[200px]" style={{ color: "var(--th-text-primary)" }}>
-                          {isKo ? entry.label_ko : entry.label_en}
-                        </span>
+                      <div key={entry.key} className="rounded-xl border px-4 py-3 space-y-1.5" style={{ borderColor: "rgba(148,163,184,0.2)" }}>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium" style={{ color: "var(--th-text-primary)" }}>
+                            {isKo ? entry.label_ko : entry.label_en}
+                          </span>
+                          <span className="text-[10px] shrink-0" style={{ color: "var(--th-text-muted)" }}>{entry.key}</span>
+                        </div>
                         <input
                           type="text"
-                          className="flex-1 rounded-lg px-3 py-1.5 text-sm bg-white/5 border"
+                          className="w-full rounded-lg px-3 py-2 text-sm bg-white/5 border"
                           style={{ borderColor: "rgba(148,163,184,0.24)", color: "var(--th-text-primary)" }}
                           defaultValue={entry.value ?? ""}
                           onChange={(e) => setConfigEdits((prev) => ({ ...prev, [entry.key]: e.target.value }))}
                         />
-                        <span className="text-[10px]" style={{ color: "var(--th-text-muted)" }}>{entry.key}</span>
                       </div>
                     ))}
                   </div>
