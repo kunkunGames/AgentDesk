@@ -9,6 +9,13 @@ use serde_json::json;
 use super::AppState;
 use crate::engine::hooks::Hook;
 
+/// Common kanban card SELECT columns with dispatch metadata via LEFT JOIN.
+const CARD_SELECT: &str = "SELECT kc.id, kc.repo_id, kc.title, kc.status, kc.priority, kc.assigned_agent_id, \
+    kc.github_issue_url, kc.github_issue_number, kc.latest_dispatch_id, kc.review_round, kc.metadata, \
+    kc.created_at, kc.updated_at, \
+    td.status AS d_status, td.dispatch_type AS d_type, td.title AS d_title, td.chain_depth AS d_depth \
+    FROM kanban_cards kc LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id";
+
 // ── Query / Body types ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -104,34 +111,34 @@ pub async fn list_cards(
     };
 
     let mut sql = String::from(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE 1=1",
+        &format!("{CARD_SELECT} WHERE 1=1"),
     );
     let mut bind_values: Vec<String> = Vec::new();
 
     if let Some(ref status) = params.status {
         bind_values.push(status.clone());
-        sql.push_str(&format!(" AND status = ?{}", bind_values.len()));
+        sql.push_str(&format!(" AND kc.status = ?{}", bind_values.len()));
     }
     if let Some(ref repo_id) = params.repo_id {
         bind_values.push(repo_id.clone());
-        sql.push_str(&format!(" AND repo_id = ?{}", bind_values.len()));
+        sql.push_str(&format!(" AND kc.repo_id = ?{}", bind_values.len()));
     } else if !registered_repos.is_empty() {
         let placeholders: Vec<String> = registered_repos
             .iter()
             .enumerate()
-            .map(|(i, r)| {
+            .map(|(_i, r)| {
                 bind_values.push(r.clone());
                 format!("?{}", bind_values.len())
             })
             .collect();
-        sql.push_str(&format!(" AND repo_id IN ({})", placeholders.join(",")));
+        sql.push_str(&format!(" AND kc.repo_id IN ({})", placeholders.join(",")));
     }
     if let Some(ref agent_id) = params.assigned_agent_id {
         bind_values.push(agent_id.clone());
-        sql.push_str(&format!(" AND assigned_agent_id = ?{}", bind_values.len()));
+        sql.push_str(&format!(" AND kc.assigned_agent_id = ?{}", bind_values.len()));
     }
 
-    sql.push_str(" ORDER BY created_at DESC");
+    sql.push_str(" ORDER BY kc.created_at DESC");
 
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -176,7 +183,7 @@ pub async fn get_card(
     };
 
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -223,7 +230,7 @@ pub async fn create_card(
     }
 
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -380,7 +387,7 @@ pub async fn update_card(
 
     let conn = state.db.lock().unwrap();
     let card = conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     );
@@ -490,7 +497,7 @@ pub async fn assign_card(
     }
 
     let card = conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     );
@@ -671,7 +678,7 @@ pub async fn retry_card(
     // Return updated card
     let conn = state.db.lock().unwrap();
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -788,7 +795,7 @@ pub async fn redispatch_card(
     // 2. Return updated card
     let conn = state.db.lock().unwrap();
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -920,7 +927,7 @@ pub async fn defer_dod(
     ).ok();
 
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -1016,14 +1023,13 @@ pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<s
             .iter()
             .map(|r| format!("'{}'", r.replace('\'', "''")))
             .collect();
-        format!(" AND repo_id IN ({})", quoted.join(","))
+        format!(" AND kc.repo_id IN ({})", quoted.join(","))
     };
 
     let mut stmt = match conn.prepare(&format!(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at
-         FROM kanban_cards
-         WHERE status = 'in_progress' AND updated_at < datetime('now', '-2 hours'){}
-         ORDER BY updated_at ASC", repo_filter),
+        "{CARD_SELECT}
+         WHERE kc.status = 'in_progress' AND kc.updated_at < datetime('now', '-2 hours'){}
+         ORDER BY kc.updated_at ASC", repo_filter),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -1116,7 +1122,7 @@ pub async fn assign_issue(
     }
 
     match conn.query_row(
-        "SELECT id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, latest_dispatch_id, review_round, metadata, created_at, updated_at FROM kanban_cards WHERE id = ?1",
+        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
         [&id],
         |row| card_row_to_json(row),
     ) {
@@ -1171,12 +1177,11 @@ fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> 
         "started_at": null,
         "requested_at": null,
         "completed_at": null,
-        // TODO: JOIN task_dispatches to populate these when latest_dispatch_id is set
-        "latest_dispatch_status": null,
-        "latest_dispatch_title": null,
-        "latest_dispatch_type": null,
+        "latest_dispatch_status": row.get::<_, Option<String>>(13).unwrap_or(None),
+        "latest_dispatch_title": row.get::<_, Option<String>>(15).unwrap_or(None),
+        "latest_dispatch_type": row.get::<_, Option<String>>(14).unwrap_or(None),
         "latest_dispatch_result_summary": null,
-        "latest_dispatch_chain_depth": null,
+        "latest_dispatch_chain_depth": row.get::<_, Option<i64>>(16).unwrap_or(None),
         "child_count": 0,
     }))
 }
