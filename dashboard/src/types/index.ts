@@ -364,6 +364,7 @@ export type TaskDispatchStatus =
 
 export interface TaskDispatch {
   id: string;
+  kanban_card_id: string | null;
   from_agent_id: string;
   to_agent_id: string | null;
   dispatch_type: string;

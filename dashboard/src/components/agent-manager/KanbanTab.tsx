@@ -127,6 +127,8 @@ export default function KanbanTab({
   const [bulkBusy, setBulkBusy] = useState(false);
   const [deferredDodPopup, setDeferredDodPopup] = useState(false);
   const [assignBeforeReady, setAssignBeforeReady] = useState<{ cardId: string; agentId: string } | null>(null);
+  const [cancelConfirm, setCancelConfirm] = useState<{ cardIds: string[]; closeGithub: boolean; source: "bulk" | "single" } | null>(null);
+  const [cancelBusy, setCancelBusy] = useState(false);
 
   const agentMap = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const cardsById = useMemo(() => new Map(cards.map((card) => [card.id, card])), [cards]);
@@ -173,6 +175,11 @@ export default function KanbanTab({
 
   const handleBulkAction = async (action: "pass" | "reset" | "cancel") => {
     if (stalledSelected.size === 0) return;
+    if (action === "cancel") {
+      // Show confirmation modal for cancel — check if any selected cards have GitHub issues
+      setCancelConfirm({ cardIds: Array.from(stalledSelected), closeGithub: false, source: "bulk" });
+      return;
+    }
     setBulkBusy(true);
     try {
       await api.bulkKanbanAction(action, Array.from(stalledSelected));
@@ -182,6 +189,45 @@ export default function KanbanTab({
       setActionError((e as Error).message);
     } finally {
       setBulkBusy(false);
+    }
+  };
+
+  const executeBulkCancel = async (closeGithub: boolean) => {
+    if (!cancelConfirm) return;
+    setCancelBusy(true);
+    try {
+      if (cancelConfirm.source === "bulk") {
+        await api.bulkKanbanAction("cancel", cancelConfirm.cardIds);
+      } else {
+        // Single card cancel — transition to done
+        for (const cardId of cancelConfirm.cardIds) {
+          await onUpdateCard(cardId, { status: "done" });
+        }
+      }
+      if (closeGithub) {
+        // Close GitHub issues for cards that have them
+        for (const cardId of cancelConfirm.cardIds) {
+          const card = cardsById.get(cardId);
+          if (card?.github_repo && card.github_issue_number) {
+            try {
+              await api.closeGitHubIssue(card.github_repo, card.github_issue_number);
+            } catch {
+              // Best-effort — card is already cancelled
+            }
+          }
+        }
+      }
+      if (cancelConfirm.source === "bulk") {
+        setStalledSelected(new Set());
+        setStalledPopup(false);
+      } else {
+        setSelectedCardId(null);
+      }
+      setCancelConfirm(null);
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setCancelBusy(false);
     }
   };
 
@@ -1209,6 +1255,76 @@ export default function KanbanTab({
         )}
       </section>
 
+      {/* Cancel confirmation modal — ask whether to also close GitHub issues */}
+      {cancelConfirm && (() => {
+        const ghCards = cancelConfirm.cardIds
+          .map((id) => cardsById.get(id))
+          .filter((c): c is KanbanCard => !!(c?.github_repo && c.github_issue_number));
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-md rounded-2xl border p-5 space-y-4"
+              style={{ backgroundColor: "rgba(2,6,23,0.96)", borderColor: "rgba(148,163,184,0.24)" }}
+            >
+              <h3 className="text-base font-semibold" style={{ color: "var(--th-text-heading)" }}>
+                {tr("카드 취소 확인", "Cancel cards")}
+              </h3>
+              <p className="text-sm" style={{ color: "var(--th-text-secondary)" }}>
+                {tr(
+                  `${cancelConfirm.cardIds.length}건의 카드를 취소합니다.`,
+                  `Cancel ${cancelConfirm.cardIds.length} card(s).`,
+                )}
+              </p>
+              {ghCards.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm" style={{ color: "var(--th-text-secondary)" }}>
+                    {tr(
+                      `GitHub 이슈가 연결된 카드 ${ghCards.length}건:`,
+                      `${ghCards.length} card(s) linked to GitHub issues:`,
+                    )}
+                  </p>
+                  <ul className="text-xs space-y-1 pl-2" style={{ color: "var(--th-text-muted)" }}>
+                    {ghCards.map((c) => (
+                      <li key={c.id}>
+                        #{c.github_issue_number} — {c.title}
+                      </li>
+                    ))}
+                  </ul>
+                  <label className="flex items-center gap-2 text-sm cursor-pointer" style={{ color: "var(--th-text-primary)" }}>
+                    <input
+                      type="checkbox"
+                      checked={cancelConfirm.closeGithub}
+                      onChange={(e) => setCancelConfirm((prev) => prev ? { ...prev, closeGithub: e.target.checked } : prev)}
+                      className="rounded"
+                    />
+                    {tr("GitHub 이슈도 함께 닫기", "Also close GitHub issues")}
+                  </label>
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={() => setCancelConfirm(null)}
+                  disabled={cancelBusy}
+                  className="rounded-xl px-4 py-2 text-sm bg-white/8"
+                  style={{ color: "var(--th-text-secondary)" }}
+                >
+                  {tr("돌아가기", "Go back")}
+                </button>
+                <button
+                  onClick={() => void executeBulkCancel(cancelConfirm.closeGithub)}
+                  disabled={cancelBusy}
+                  className="rounded-xl px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                  style={{ backgroundColor: "#dc2626" }}
+                >
+                  {cancelBusy ? tr("처리 중…", "Processing…") : tr("취소 확정", "Confirm cancel")}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {selectedRepo && (
         <>
           <AutoQueuePanel
@@ -1978,44 +2094,125 @@ export default function KanbanTab({
               </div>
             </div>
 
-            {(selectedCard.latest_dispatch_status || dispatchMap.get(selectedCard.latest_dispatch_id ?? "")?.status) && (
-              <div className="rounded-2xl border p-4 bg-white/5 space-y-2" style={{ borderColor: "rgba(148,163,184,0.18)" }}>
-                <h4 className="font-medium" style={{ color: "var(--th-text-heading)" }}>
-                  {tr("실행 상태", "Execution state")}
-                </h4>
-                <div className="grid gap-2 md:grid-cols-2 text-sm">
-                  <div>{tr("dispatch 상태", "Dispatch status")}: {selectedCard.latest_dispatch_status ?? dispatchMap.get(selectedCard.latest_dispatch_id ?? "")?.status ?? "-"}</div>
-                  <div>{tr("최신 dispatch", "Latest dispatch")}: {selectedCard.latest_dispatch_id ? `#${selectedCard.latest_dispatch_id.slice(0, 8)}` : "-"}</div>
+            {/* Dispatch history — all dispatches for this card */}
+            {(() => {
+              const cardDispatches = dispatches
+                .filter((d) => d.kanban_card_id === selectedCard.id)
+                .sort((a, b) => {
+                  const ta = typeof a.created_at === "number" ? a.created_at : new Date(a.created_at).getTime();
+                  const tb = typeof b.created_at === "number" ? b.created_at : new Date(b.created_at).getTime();
+                  return tb - ta;
+                });
+              const hasAny = cardDispatches.length > 0 || selectedCard.latest_dispatch_status;
+              if (!hasAny) return null;
+
+              const dispatchStatusColor: Record<string, string> = {
+                pending: "#fbbf24",
+                dispatched: "#38bdf8",
+                in_progress: "#f59e0b",
+                completed: "#4ade80",
+                failed: "#f87171",
+                cancelled: "#9ca3af",
+              };
+
+              return (
+                <div className="rounded-2xl border p-4 bg-white/5 space-y-3" style={{ borderColor: "rgba(148,163,184,0.18)" }}>
+                  <h4 className="font-medium" style={{ color: "var(--th-text-heading)" }}>
+                    {tr("Dispatch 이력", "Dispatch history")}
+                    {cardDispatches.length > 0 && (
+                      <span className="ml-2 text-xs font-normal" style={{ color: "var(--th-text-muted)" }}>
+                        ({cardDispatches.length})
+                      </span>
+                    )}
+                  </h4>
+                  {parseCardMetadata(selectedCard.metadata_json).timed_out_reason && (
+                    <div className="rounded-xl px-3 py-2 text-sm" style={{ color: "#fdba74", backgroundColor: "rgba(154,52,18,0.18)" }}>
+                      {parseCardMetadata(selectedCard.metadata_json).timed_out_reason}
+                    </div>
+                  )}
+                  {cardDispatches.length > 0 ? (
+                    <div className="space-y-2 max-h-64 overflow-y-auto">
+                      {cardDispatches.map((d) => (
+                        <div
+                          key={d.id}
+                          className="rounded-xl border px-3 py-2 text-sm"
+                          style={{ borderColor: "rgba(148,163,184,0.12)", backgroundColor: d.id === selectedCard.latest_dispatch_id ? "rgba(37,99,235,0.08)" : "transparent" }}
+                        >
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span
+                              className="inline-block w-2 h-2 rounded-full shrink-0"
+                              style={{ backgroundColor: dispatchStatusColor[d.status] ?? "#94a3b8" }}
+                            />
+                            <span className="font-mono text-xs" style={{ color: "var(--th-text-muted)" }}>
+                              #{d.id.slice(0, 8)}
+                            </span>
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                              style={{ backgroundColor: "rgba(148,163,184,0.12)", color: dispatchStatusColor[d.status] ?? "#94a3b8" }}
+                            >
+                              {d.status}
+                            </span>
+                            {d.dispatch_type && (
+                              <span className="px-1.5 py-0.5 rounded text-[10px]" style={{ backgroundColor: "rgba(148,163,184,0.08)", color: "var(--th-text-secondary)" }}>
+                                {d.dispatch_type}
+                              </span>
+                            )}
+                            {d.to_agent_id && (
+                              <span className="text-xs" style={{ color: "var(--th-text-secondary)" }}>
+                                → {getAgentLabel(d.to_agent_id)}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-3 mt-1 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                            <span>{formatIso(d.created_at, locale)}</span>
+                            {d.chain_depth > 0 && <span>depth {d.chain_depth}</span>}
+                          </div>
+                          {d.result_summary && (
+                            <div className="mt-1 text-xs truncate" style={{ color: "var(--th-text-secondary)" }}>
+                              {d.result_summary}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="grid gap-2 md:grid-cols-2 text-sm">
+                      <div>{tr("dispatch 상태", "Dispatch status")}: {selectedCard.latest_dispatch_status ?? "-"}</div>
+                      <div>{tr("최신 dispatch", "Latest dispatch")}: {selectedCard.latest_dispatch_id ? `#${selectedCard.latest_dispatch_id.slice(0, 8)}` : "-"}</div>
+                    </div>
+                  )}
                 </div>
-                {(selectedCard.latest_dispatch_result_summary || dispatchMap.get(selectedCard.latest_dispatch_id ?? "")?.result_summary) && (
-                  <div className="rounded-xl px-3 py-2 text-sm bg-black/20" style={{ color: "var(--th-text-secondary)" }}>
-                    {selectedCard.latest_dispatch_result_summary || dispatchMap.get(selectedCard.latest_dispatch_id ?? "")?.result_summary}
-                  </div>
-                )}
-                {parseCardMetadata(selectedCard.metadata_json).timed_out_reason && (
-                  <div className="rounded-xl px-3 py-2 text-sm" style={{ color: "#fdba74", backgroundColor: "rgba(154,52,18,0.18)" }}>
-                    {parseCardMetadata(selectedCard.metadata_json).timed_out_reason}
-                  </div>
-                )}
-              </div>
-            )}
+              );
+            })()}
 
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <button
-                onClick={handleDeleteCard}
-                disabled={savingCard}
-                className="rounded-xl px-4 py-2 text-sm font-medium"
-                style={{ color: "#fecaca", backgroundColor: "rgba(127,29,29,0.32)" }}
-              >
-                {tr("카드 삭제", "Delete card")}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleDeleteCard}
+                  disabled={savingCard}
+                  className="rounded-xl px-4 py-2 text-sm font-medium"
+                  style={{ color: "#fecaca", backgroundColor: "rgba(127,29,29,0.32)" }}
+                >
+                  {tr("카드 삭제", "Delete card")}
+                </button>
+                {selectedCard.status !== "done" && (
+                  <button
+                    onClick={() => setCancelConfirm({ cardIds: [selectedCard.id], closeGithub: false, source: "single" })}
+                    disabled={savingCard}
+                    className="rounded-xl px-4 py-2 text-sm font-medium"
+                    style={{ color: "#9ca3af", backgroundColor: "rgba(107,114,128,0.18)" }}
+                  >
+                    {tr("카드 취소", "Cancel card")}
+                  </button>
+                )}
+              </div>
               <div className="flex flex-col-reverse gap-2 sm:flex-row">
                 <button
                   onClick={() => setSelectedCardId(null)}
                   className="rounded-xl px-4 py-2 text-sm bg-white/8"
                   style={{ color: "var(--th-text-secondary)" }}
                 >
-                  {tr("취소", "Cancel")}
+                  {tr("닫기", "Close")}
                 </button>
                 <button
                   onClick={() => void handleSaveCard()}
