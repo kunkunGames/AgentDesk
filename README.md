@@ -371,7 +371,7 @@ AgentDesk/
 AgentDesk incorporates and builds upon code from the following projects:
 
 - **[cokacdir](https://github.com/itismyfield/cokacdir)** (MIT License) — Discord gateway integration, session management, tmux lifecycle, and turn bridge functionality were originally developed in cokacdir.
-- **[claw-empire](https://github.com/itismyfield/claw-empire)** (MIT License) — Kanban pipeline, dispatch system, GitHub synchronization, and dashboard UI components were originally developed in claw-empire.
+- **[claw-empire](https://github.com/GreenSheep01201/claw-empire)** (Apache 2.0 License) — Kanban pipeline, dispatch system, GitHub synchronization, and dashboard UI components were originally developed in claw-empire.
 
 ## License
 

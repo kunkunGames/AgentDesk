@@ -9,8 +9,8 @@ This product includes software derived from the following projects:
   Portions of the Discord gateway, session management, and tmux integration
   were originally developed in cokacdir and adapted for AgentDesk.
 
-- claw-empire (https://github.com/itismyfield/claw-empire)
-  Copyright (c) itismyfield
-  Licensed under the MIT License
+- claw-empire (https://github.com/GreenSheep01201/claw-empire)
+  Copyright (c) GreenSheep01201
+  Licensed under the Apache License 2.0
   Portions of the kanban pipeline, dispatch system, and dashboard UI
   were originally developed in claw-empire and adapted for AgentDesk.
