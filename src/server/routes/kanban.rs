@@ -1112,6 +1112,26 @@ pub async fn assign_issue(
             "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, updated_at = datetime('now') WHERE id = ?4",
             rusqlite::params![body.title, body.assignee_agent_id, body.github_issue_url, existing_id],
         );
+        drop(conn);
+
+        // Transition to 'ready' if not already — fires OnCardTransition hook
+        // (backlog → ready is a free transition, no dispatch needed)
+        let _ = crate::kanban::transition_status(
+            &state.db,
+            &state.engine,
+            &existing_id,
+            "ready",
+        );
+
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
         return match conn.query_row(
             &format!("{CARD_SELECT} WHERE kc.id = ?1"),
             [&existing_id],

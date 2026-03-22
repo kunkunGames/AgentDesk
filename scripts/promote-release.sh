@@ -9,10 +9,11 @@ echo "═══ ADK Promote Dev → Release ═══"
 
 # Safety check: review must be passed (unless --skip-review is passed)
 if [[ "${1:-}" != "--skip-review" ]]; then
-    # Check if the latest commit has a review-passed marker
+    # Check if the latest commit has a review-passed marker (may be in dev or release runtime)
     LAST_COMMIT=$(cd "$HOME/AgentDesk" && git rev-parse HEAD 2>/dev/null)
-    REVIEW_MARKER="$ADK_DEV/runtime/review_passed/$LAST_COMMIT"
-    if [ ! -f "$REVIEW_MARKER" ]; then
+    REVIEW_MARKER_DEV="$ADK_DEV/runtime/review_passed/$LAST_COMMIT"
+    REVIEW_MARKER_REL="$ADK_REL/runtime/review_passed/$LAST_COMMIT"
+    if [ ! -f "$REVIEW_MARKER_DEV" ] && [ ! -f "$REVIEW_MARKER_REL" ]; then
         echo "✗ Review not passed for commit $LAST_COMMIT — aborting promotion"
         echo "  Run counter-review first, or use --skip-review to override"
         exit 1

@@ -8,8 +8,11 @@ use crate::engine::hooks::Hook;
 /// Write a review-passed marker file for the current HEAD commit.
 /// `promote-release.sh` checks this before allowing release promotion.
 fn stamp_review_passed_marker() {
+    let repo_dir = std::env::var("AGENTDESK_REPO_DIR")
+        .unwrap_or_else(|_| format!("{}/AgentDesk", env!("HOME")));
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_dir)
         .output()
         .ok()
         .filter(|o| o.status.success())
