@@ -1457,6 +1457,11 @@ mod tests {
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'review', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
+            // Need an active dispatch for the transition guard (#48)
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, dispatch_type, status, title, created_at, updated_at) VALUES ('d1', 'c1', 'review', 'pending', 'Review', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
         }
 
         let app = api_router(db.clone(), engine);

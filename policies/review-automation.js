@@ -40,6 +40,10 @@ var reviewAutomation = {
         "UPDATE kanban_cards SET blocked_reason = 'Review disabled — PM decision needed to proceed' WHERE id = ?",
         [card.id]
       );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET review_status = NULL WHERE id = ?",
+        [card.id]
+      );
       agentdesk.log.info("[review] Review disabled, card " + card.id + " → pending_decision");
       return;
     }
@@ -71,6 +75,10 @@ var reviewAutomation = {
         "UPDATE kanban_cards SET blocked_reason = 'Counter-model review disabled — PM decision needed' WHERE id = ?",
         [card.id]
       );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET review_status = NULL WHERE id = ?",
+        [card.id]
+      );
       agentdesk.log.info("[review] Counter-model disabled, card " + card.id + " → pending_decision");
       return;
     }
@@ -87,6 +95,10 @@ var reviewAutomation = {
       agentdesk.kanban.setStatus(card.id, "pending_decision");
       agentdesk.db.execute(
         "UPDATE kanban_cards SET blocked_reason = 'No alt channel for counter-model review — PM decision needed' WHERE id = ?",
+        [card.id]
+      );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET review_status = NULL WHERE id = ?",
         [card.id]
       );
       agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + " → pending_decision");
@@ -152,7 +164,7 @@ function processVerdict(cardId, verdict, result) {
 
     // Review passed — check pipeline stages, otherwise done
     var stages = agentdesk.db.query(
-      "SELECT id, stage_name, assigned_agent_id FROM pipeline_stages WHERE repo_id = (SELECT repo_id FROM kanban_cards WHERE id = ?) AND trigger_after = 'review_pass' ORDER BY stage_order ASC LIMIT 1",
+      "SELECT id, stage_name, agent_override_id FROM pipeline_stages WHERE repo_id = (SELECT repo_id FROM kanban_cards WHERE id = ?) AND trigger_after = 'review_pass' ORDER BY stage_order ASC LIMIT 1",
       [cardId]
     );
     if (stages.length > 0) {
@@ -165,7 +177,7 @@ function processVerdict(cardId, verdict, result) {
       agentdesk.log.info("[review] Card " + cardId + " passed review, entering pipeline stage: " + stage.stage_name);
 
       // Create dispatch for the pipeline stage if agent is assigned
-      var stageAgent = stage.assigned_agent_id;
+      var stageAgent = stage.agent_override_id;
       if (!stageAgent) {
         // Fall back to card's assigned agent
         var cardAgent = agentdesk.db.query("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?", [cardId]);

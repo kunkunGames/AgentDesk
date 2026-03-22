@@ -171,15 +171,8 @@ var timeouts = {
     );
     for (var s = 0; s < staleSuggestions.length; s++) {
       var sc = staleSuggestions[s];
-      // 1. Transition to in_progress
-      agentdesk.kanban.setStatus(sc.id, "in_progress");
-      // 2. Set review_status to rework_pending
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET review_status = 'rework_pending', updated_at = datetime('now') WHERE id = ?",
-        [sc.id]
-      );
-      // 3. Create rework dispatch so agent gets a session
       if (sc.assigned_agent_id) {
+        // Try dispatch creation FIRST — only transition on success
         try {
           agentdesk.dispatch.create(
             sc.id,
@@ -187,9 +180,21 @@ var timeouts = {
             "rework",
             "[Rework] " + (sc.title || sc.id)
           );
+          // Dispatch succeeded — now transition to in_progress + rework_pending
+          agentdesk.kanban.setStatus(sc.id, "in_progress");
+          agentdesk.db.execute(
+            "UPDATE kanban_cards SET review_status = 'rework_pending', updated_at = datetime('now') WHERE id = ?",
+            [sc.id]
+          );
           agentdesk.log.warn("[timeout] Auto-accepted suggestions for card " + sc.id + " — rework dispatch created");
         } catch (e) {
-          agentdesk.log.error("[timeout] Failed to create rework dispatch for " + sc.id + ": " + e);
+          // Dispatch failed — route to pending_decision instead
+          agentdesk.kanban.setStatus(sc.id, "pending_decision");
+          agentdesk.db.execute(
+            "UPDATE kanban_cards SET blocked_reason = 'Auto-accept rework dispatch failed: " + e + "' WHERE id = ?",
+            [sc.id]
+          );
+          agentdesk.log.error("[timeout] Failed to create rework dispatch for " + sc.id + ": " + e + " → pending_decision");
         }
       } else {
         agentdesk.log.warn("[timeout] Auto-accepted card " + sc.id + " but no agent assigned — no rework dispatch");

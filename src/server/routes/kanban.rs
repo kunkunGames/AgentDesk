@@ -1233,17 +1233,21 @@ pub async fn pm_decision(
         );
     }
 
-    // Complete any pending pm-decision dispatches
+    // Complete any pending pm-decision dispatches (rework handles its own completion after dispatch success)
+    if body.decision != "rework" {
+        if let Ok(conn) = state.db.lock() {
+            conn.execute(
+                "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+                 WHERE kanban_card_id = ?2 AND dispatch_type = 'pm-decision' AND status = 'pending'",
+                rusqlite::params![
+                    serde_json::to_string(&json!({"decision": body.decision, "comment": body.comment})).unwrap_or_default(),
+                    body.card_id
+                ],
+            ).ok();
+        }
+    }
+    // Clear blocked_reason
     if let Ok(conn) = state.db.lock() {
-        conn.execute(
-            "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
-             WHERE kanban_card_id = ?2 AND dispatch_type = 'pm-decision' AND status = 'pending'",
-            rusqlite::params![
-                serde_json::to_string(&json!({"decision": body.decision, "comment": body.comment})).unwrap_or_default(),
-                body.card_id
-            ],
-        ).ok();
-        // Clear blocked_reason
         conn.execute(
             "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = ?1",
             [&body.card_id],
@@ -1258,23 +1262,48 @@ pub async fn pm_decision(
             "Card resumed to in_progress"
         }
         "rework" => {
-            let _ = crate::kanban::transition_status_with_opts(
-                &state.db, &state.engine, &body.card_id, "in_progress", "pm-decision", true,
-            );
-            if let Ok(conn) = state.db.lock() {
-                conn.execute(
-                    "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
-                    [&body.card_id],
-                ).ok();
-            }
-            if !agent_id.is_empty() {
-                let _ = crate::dispatch::create_dispatch(
-                    &state.db, &state.engine, &body.card_id, &agent_id,
-                    "rework", &format!("[Rework] {}", title),
-                    &json!({"pm_decision": "rework", "comment": body.comment}),
+            if agent_id.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "card has no assigned agent for rework"})),
                 );
             }
-            "Rework dispatch created"
+            // Try dispatch creation FIRST — only transition on success
+            match crate::dispatch::create_dispatch(
+                &state.db, &state.engine, &body.card_id, &agent_id,
+                "rework", &format!("[Rework] {}", title),
+                &json!({"pm_decision": "rework", "comment": body.comment}),
+            ) {
+                Ok(_) => {
+                    // Dispatch succeeded — now complete pm-decision dispatch + transition
+                    if let Ok(conn) = state.db.lock() {
+                        conn.execute(
+                            "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+                             WHERE kanban_card_id = ?2 AND dispatch_type = 'pm-decision' AND status = 'pending'",
+                            rusqlite::params![
+                                serde_json::to_string(&json!({"decision": "rework", "comment": body.comment})).unwrap_or_default(),
+                                body.card_id
+                            ],
+                        ).ok();
+                    }
+                    let _ = crate::kanban::transition_status_with_opts(
+                        &state.db, &state.engine, &body.card_id, "in_progress", "pm-decision", true,
+                    );
+                    if let Ok(conn) = state.db.lock() {
+                        conn.execute(
+                            "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
+                            [&body.card_id],
+                        ).ok();
+                    }
+                    "Rework dispatch created"
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("rework dispatch failed: {}", e)})),
+                    );
+                }
+            }
         }
         "dismiss" => {
             let _ = crate::kanban::transition_status_with_opts(

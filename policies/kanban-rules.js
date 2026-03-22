@@ -230,8 +230,10 @@ var rules = {
       // Check 2: Minimum work duration (2 min)
       var MIN_WORK_SEC = 120;
       var sessions = agentdesk.db.query(
-        "SELECT MIN(created_at) as first_work, MAX(last_heartbeat) as last_seen " +
-        "FROM sessions WHERE active_dispatch_id = ? AND status = 'working'",
+        "SELECT td.created_at as first_work, MAX(s.last_heartbeat) as last_seen " +
+        "FROM task_dispatches td " +
+        "JOIN sessions s ON s.active_dispatch_id = td.id AND s.status = 'working' " +
+        "WHERE td.id = ?",
         [dispatch.id]
       );
       if (sessions.length > 0 && sessions[0].first_work && sessions[0].last_seen) {
@@ -334,16 +336,19 @@ var rules = {
           "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? LIMIT 1",
           [pmdChannel, pmdChannel]
         );
-        var pmdAgentId = pmdAgent.length > 0 ? pmdAgent[0].id : agentId;
-        try {
-          agentdesk.dispatch.create(
-            payload.card_id,
-            pmdAgentId,
-            "pm-decision",
-            "[PM Decision] " + title
-          );
-        } catch (e) {
-          agentdesk.log.warn("[kanban] pm-decision dispatch failed: " + e);
+        if (pmdAgent.length > 0) {
+          try {
+            agentdesk.dispatch.create(
+              payload.card_id,
+              pmdAgent[0].id,
+              "pm-decision",
+              "[PM Decision] " + title
+            );
+          } catch (e) {
+            agentdesk.log.warn("[kanban] pm-decision dispatch failed: " + e);
+          }
+        } else {
+          agentdesk.log.warn("[kanban] PMD agent not found for channel " + pmdChannel + " — skipping pm-decision dispatch");
         }
       }
 

@@ -14,7 +14,7 @@ var pipeline = {
     if (cards.length === 0) return;
 
     var stages = agentdesk.db.query(
-      "SELECT id, stage_name, assigned_agent_id FROM pipeline_stages WHERE repo_id = ? AND trigger_after = 'ready' ORDER BY stage_order ASC LIMIT 1",
+      "SELECT id, stage_name, agent_override_id FROM pipeline_stages WHERE repo_id = ? AND trigger_after = 'ready' ORDER BY stage_order ASC LIMIT 1",
       [cards[0].repo_id]
     );
     if (stages.length > 0) {
@@ -55,7 +55,7 @@ var pipeline = {
 
     // Find next stage
     var nextStage = agentdesk.db.query(
-      "SELECT id, stage_name FROM pipeline_stages WHERE repo_id = ? AND stage_order > ? ORDER BY stage_order ASC LIMIT 1",
+      "SELECT id, stage_name, agent_override_id FROM pipeline_stages WHERE repo_id = ? AND stage_order > ? ORDER BY stage_order ASC LIMIT 1",
       [repoId, currentStage[0].stage_order]
     );
 
@@ -65,6 +65,34 @@ var pipeline = {
         [nextStage[0].id, cardId]
       );
       agentdesk.log.info("[pipeline] Card " + cardId + " advanced to stage: " + nextStage[0].stage_name);
+
+      // Create dispatch for the next pipeline stage
+      var stageAgent = nextStage[0].agent_override_id;
+      if (!stageAgent) {
+        // Fall back to card's assigned agent
+        var cardAgent = agentdesk.db.query("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?", [cardId]);
+        stageAgent = (cardAgent.length > 0 && cardAgent[0].assigned_agent_id) ? cardAgent[0].assigned_agent_id : null;
+      }
+      if (stageAgent) {
+        try {
+          agentdesk.dispatch.create(
+            cardId,
+            stageAgent,
+            "implementation",
+            "[Pipeline: " + nextStage[0].stage_name + "] " + cardId
+          );
+          agentdesk.log.info("[pipeline] Dispatch created for stage " + nextStage[0].stage_name);
+        } catch (e) {
+          agentdesk.log.warn("[pipeline] Dispatch failed for stage " + nextStage[0].stage_name + ": " + e);
+        }
+      } else {
+        // No agent — route to PM decision
+        agentdesk.kanban.setStatus(cardId, "pending_decision");
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET blocked_reason = ? WHERE id = ?",
+          ["Pipeline stage '" + nextStage[0].stage_name + "' has no assigned agent", cardId]
+        );
+      }
     } else {
       // No more stages — clear pipeline stage
       agentdesk.db.execute(
