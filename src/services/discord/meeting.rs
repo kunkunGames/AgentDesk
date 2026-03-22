@@ -510,11 +510,8 @@ pub(super) async fn start_meeting(
             )
             .await;
 
-        // NOTE: run_meeting_round uses channel_id for state lookups (active_meetings key),
-        // so we pass the parent channel_id here. The round messages will go to parent channel
-        // until run_meeting_round is refactored to accept a separate msg target.
         let consensus =
-            match run_meeting_round(http, channel_id, &meeting_id, round, shared).await? {
+            match run_meeting_round(http, channel_id, msg_channel, &meeting_id, round, shared).await? {
                 Some(consensus) => consensus,
                 None => {
                     cleanup_meeting_if_current(shared, channel_id, &meeting_id).await;
@@ -546,7 +543,7 @@ pub(super) async fn start_meeting(
     }
 
     // Conclude meeting
-    if !conclude_meeting(http, channel_id, &meeting_id, &config, shared).await? {
+    if !conclude_meeting(http, channel_id, msg_channel, &meeting_id, &config, shared).await? {
         cleanup_meeting_if_current(shared, channel_id, &meeting_id).await;
         return Ok(None);
     }
@@ -789,6 +786,7 @@ async fn select_participants(
 async fn run_meeting_round(
     http: &serenity::Http,
     channel_id: ChannelId,
+    msg_channel: ChannelId,
     meeting_id: &str,
     round: u32,
     shared: &Arc<SharedData>,
@@ -852,7 +850,7 @@ async fn run_meeting_round(
                     "**[{}]** (R{})\n{}",
                     participant.display_name, round, response
                 );
-                send_long_message_raw(http, channel_id, &discord_msg, shared).await?;
+                send_long_message_raw(http, msg_channel, &discord_msg, shared).await?;
 
                 // Append to transcript
                 {
@@ -871,9 +869,9 @@ async fn run_meeting_round(
                 }
             }
             Err(e) => {
-                // Skip this agent, post error
-                rate_limit_wait(shared, channel_id).await;
-                let _ = channel_id
+                // Skip this agent, post error to thread
+                rate_limit_wait(shared, msg_channel).await;
+                let _ = msg_channel
                     .send_message(
                         http,
                         CreateMessage::new()
@@ -1064,6 +1062,7 @@ fn check_consensus(transcript: &[MeetingUtterance], round: u32, participant_coun
 async fn conclude_meeting(
     http: &serenity::Http,
     channel_id: ChannelId,
+    msg_channel: ChannelId,
     meeting_id: &str,
     config: &MeetingConfig,
     shared: &Arc<SharedData>,
@@ -1171,11 +1170,11 @@ async fn conclude_meeting(
         transcript = transcript_text,
     );
 
-    rate_limit_wait(shared, channel_id).await;
+    rate_limit_wait(shared, msg_channel).await;
     if active_meeting_state(shared, channel_id, meeting_id).await != ActiveMeetingSlot::Active {
         return Ok(false);
     }
-    let _ = channel_id
+    let _ = msg_channel
         .send_message(
             http,
             CreateMessage::new().content("📝 **회의록 작성 중...**"),
@@ -1256,12 +1255,12 @@ async fn conclude_meeting(
                     {
                         return Ok(false);
                     }
-                    send_long_message_raw(http, channel_id, &trimmed, shared).await?;
+                    send_long_message_raw(http, msg_channel, &trimmed, shared).await?;
                     Some(trimmed)
                 }
                 Err(e) => {
-                    rate_limit_wait(shared, channel_id).await;
-                    let _ = channel_id
+                    rate_limit_wait(shared, msg_channel).await;
+                    let _ = msg_channel
                         .send_message(
                             http,
                             CreateMessage::new().content(format!("⚠️ 회의록 작성 실패: {}", e)),
@@ -1384,6 +1383,7 @@ fn build_meeting_status_payload(m: &Meeting) -> Option<serde_json::Value> {
         "total_rounds": total_rounds,
         "started_at": started_at,
         "completed_at": if m.status == MeetingStatus::Completed { serde_json::Value::from(chrono::Local::now().timestamp_millis()) } else { serde_json::Value::Null },
+        "thread_id": m.thread_id.map(|t| t.to_string()),
         "entries": entries,
     }))
 }
