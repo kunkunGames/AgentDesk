@@ -275,9 +275,21 @@ export default function OnboardingWizard({ isKo, onComplete }: Props) {
             )}
           </div>
 
-          <button onClick={() => void validateAllTokens()} disabled={!commandToken || !announceToken || validating} className={btnPrimary}>
-            {validating ? tr("검증 중...", "Validating...") : tr("토큰 검증", "Validate Tokens")}
-          </button>
+          <div className="flex gap-3">
+            <button onClick={() => void validateAllTokens()} disabled={!commandToken || !announceToken || validating} className={btnPrimary}>
+              {validating ? tr("검증 중...", "Validating...") : tr("토큰 검증", "Validate Tokens")}
+            </button>
+            <button onClick={() => setStep(2)} className={btnSecondary} style={{ borderColor: "rgba(148,163,184,0.3)" }}>
+              {tr("나중에 입력", "Skip for now")}
+            </button>
+          </div>
+          <p className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+            {tr(
+              "토큰은 나중에 설정 파일에서 직접 입력할 수 있습니다: ",
+              "You can enter tokens later in the config file: ",
+            )}
+            <code className="text-[11px] px-1 py-0.5 rounded bg-white/10">~/.adk/release/agentdesk.yaml</code>
+          </p>
         </div>
       )}
 
