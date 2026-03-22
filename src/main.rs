@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 mod cli;
 mod config;
+pub(crate) mod credential;
 mod db;
 mod dispatch;
 mod engine;
@@ -301,7 +302,7 @@ fn main() -> Result<()> {
             config.server.port
         );
 
-        tokio::try_join!(server::run(config.clone(), db.clone(), engine.clone()),)
+        tokio::try_join!(server::run(config.clone(), db.clone(), engine.clone(), None),)
             .expect("Server error");
     });
 

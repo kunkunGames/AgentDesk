@@ -86,10 +86,10 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
         "PM Decision Gate",
     ),
     (
-        "health_port",
+        "server_port",
         "system",
-        "헬스체크 포트",
-        "Health Check Port",
+        "서버 포트",
+        "Server Port",
     ),
 ];
 

@@ -283,14 +283,8 @@ pub async fn generate(
 
         // Async: send PMD request via announce bot
         tokio::spawn(async move {
-            let config = crate::config::load_graceful();
-            let token = match config
-                .discord
-                .bots
-                .get("announce")
-                .or_else(|| config.discord.bots.get("command"))
-            {
-                Some(bot) => bot.token.clone(),
+            let token = match crate::credential::read_bot_token("announce") {
+                Some(t) => t,
                 None => return,
             };
 

@@ -22,7 +22,7 @@ if [[ "${1:-}" != "--skip-review" ]]; then
 fi
 
 # Safety check: dev must be healthy
-DEV_PORT="${AGENTDESK_DEV_PORT:-8797}"
+DEV_PORT="${AGENTDESK_DEV_PORT:-8791}"
 if ! curl -s --max-time 5 "http://127.0.0.1:${DEV_PORT}/api/health" | grep -q '"status":"healthy"'; then
     echo "✗ Dev is not healthy — aborting promotion"
     exit 1
@@ -64,7 +64,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
 sleep 3
 
 # Health check
-REL_PORT="${AGENTDESK_REL_PORT:-8798}"
+REL_PORT="${AGENTDESK_REL_PORT:-8791}"
 if curl -s --max-time 5 "http://127.0.0.1:${REL_PORT}/api/health" | grep -q '"status":"healthy"'; then
     echo "✓ Release is healthy on :${REL_PORT}"
 else

@@ -490,6 +490,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine,
+            health_registry: None,
         };
 
         let card_id = "card-1";

@@ -816,6 +816,15 @@ pub fn handle_dcserver(token: Option<String>) {
         // Load agentdesk.yaml (graceful: use defaults if missing)
         let ad_config = config::load_graceful();
 
+        // ── Discord bot setup (before HTTP server so registry is available) ──
+        // Process-global counters shared across all providers for deferred restart barrier
+        let global_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let global_finalizing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Health registry (shared across all providers, passed to axum server)
+        let health_registry = std::sync::Arc::new(services::discord::health::HealthRegistry::new());
+        health_registry.init_bot_tokens().await;
+
         // Initialize SQLite DB
         match db::init(&ad_config) {
             Ok(ad_db) => {
@@ -828,18 +837,20 @@ pub fn handle_dcserver(token: Option<String>) {
                     }
                 }
 
-                // Start axum HTTP server (background task)
+                // Start axum HTTP server (background task) — now serves all API
+                // endpoints including /api/send, /api/senddm, /api/health
                 let http_port = ad_config.server.port;
                 match PolicyEngine::new(&ad_config, ad_db.clone()) {
                     Ok(engine) => {
                         let http_config = ad_config.clone();
+                        let registry_for_http = health_registry.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = server::run(http_config, ad_db, engine).await {
+                            if let Err(e) = server::run(http_config, ad_db, engine, Some(registry_for_http)).await {
                                 eprintln!("  ⚠ HTTP server error: {e}");
                             }
                         });
                         println!(
-                            "  ▸ HTTP    : listening on {}:{}",
+                            "  ▸ HTTP    : listening on {}:{} (unified API + health)",
                             ad_config.server.host, http_port
                         );
                     }
@@ -856,22 +867,8 @@ pub fn handle_dcserver(token: Option<String>) {
         // HTTP API port for self-referencing requests (dcserver → own HTTP server)
         let api_port = ad_config.server.port;
 
-        // ── Discord bot ────────────────────────────────────────────
-        // Process-global counters shared across all providers for deferred restart barrier
-        let global_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let global_finalizing = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        // Health check HTTP server (shared across all providers)
-        let health_registry = std::sync::Arc::new(services::discord::health::HealthRegistry::new());
-        let health_port = services::discord::health::resolve_port();
-        let health_reg_clone = health_registry.clone();
-        tokio::spawn(async move {
-            services::discord::health::serve(health_reg_clone, health_port).await;
-        });
-
-        // Self-watchdog: dedicated OS thread that probes the health endpoint
-        // and force-exits if the tokio runtime becomes unresponsive.
-        services::discord::health::spawn_watchdog(health_port);
+        // Self-watchdog: probes the axum server's /api/health endpoint
+        services::discord::health::spawn_watchdog(api_port);
 
         // Async heartbeat: proves the tokio runtime is scheduling tasks.
         // If this stops printing, the runtime is hung (watchdog will catch it).

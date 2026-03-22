@@ -18,7 +18,7 @@
 function sendNotifyAlert(channelTarget, message) {
   if (!channelTarget) return;
   try {
-    var port = agentdesk.config.get("health_port") || 8798;
+    var port = agentdesk.config.get("server_port") || 8791;
     agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
       target: channelTarget,
       content: message,
@@ -75,7 +75,7 @@ var timeouts = {
       var assignee = (cardInfo.length > 0 && cardInfo[0].assigned_agent_id) ? cardInfo[0].assigned_agent_id : "미배정";
       var kmChannel = getPMDChannel();
       if (kmChannel) try {
-        var port = agentdesk.config.get("health_port") || 8798;
+        var port = agentdesk.config.get("server_port") || 8791;
         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
           target: kmChannel,
           content: "[칸반매니저] ⏰ 타임아웃 결정 요청\n\n" +
@@ -115,7 +115,7 @@ var timeouts = {
       var stalledAssignee = (stalledInfo.length > 0 && stalledInfo[0].assigned_agent_id) ? stalledInfo[0].assigned_agent_id : "미배정";
       var kmChannel2 = getPMDChannel();
       if (kmChannel2) try {
-        var port = agentdesk.config.get("health_port") || 8798;
+        var port = agentdesk.config.get("server_port") || 8791;
         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
           target: kmChannel2,
           content: "[칸반매니저] ⚠️ 정체 카드 결정 요청\n\n" +
@@ -278,7 +278,7 @@ var timeouts = {
         : "DISPATCH:" + ud.id + " - " + ud.title;
 
       try {
-        var port = agentdesk.config.get("health_port") || 8798;
+        var port = agentdesk.config.get("server_port") || 8791;
         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
           target: "channel:" + channelId,
           content: prefix + issueLink,

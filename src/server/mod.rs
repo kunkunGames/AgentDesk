@@ -1,6 +1,8 @@
 pub mod routes;
 pub mod ws;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
@@ -9,8 +11,9 @@ use tower_http::services::ServeDir;
 use crate::config::Config;
 use crate::db::Db;
 use crate::engine::PolicyEngine;
+use crate::services::discord::health::HealthRegistry;
 
-pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
+pub async fn run(config: Config, db: Db, engine: PolicyEngine, health_registry: Option<Arc<HealthRegistry>>) -> Result<()> {
     // Spawn periodic GitHub sync task
     let sync_interval = config.github.sync_interval_minutes;
     if sync_interval > 0 {
@@ -38,9 +41,18 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine) -> Result<()> {
 
     let broadcast_tx = ws::new_broadcast();
 
+    // Store server port in kv_meta so policy JS can read it
+    if let Ok(conn) = db.lock() {
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
+            [config.server.port.to_string()],
+        )
+        .ok();
+    }
+
     let app = Router::new()
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
-        .nest("/api", routes::api_router(db.clone(), engine.clone()))
+        .nest("/api", routes::api_router(db.clone(), engine.clone(), health_registry))
         .fallback_service(ServeDir::new(&dashboard_dir));
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

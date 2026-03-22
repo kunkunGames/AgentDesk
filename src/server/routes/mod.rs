@@ -10,6 +10,7 @@ pub mod dispatches;
 pub mod docs;
 pub mod github;
 pub mod github_dashboard;
+pub mod health_api;
 pub mod kanban;
 pub mod kanban_repos;
 pub mod meetings;
@@ -32,21 +33,28 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+use std::sync::Arc;
+
 use crate::db::Db;
 use crate::engine::PolicyEngine;
+use crate::services::discord::health::HealthRegistry;
 
 /// Shared application state passed to all route handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub engine: PolicyEngine,
+    pub health_registry: Option<Arc<HealthRegistry>>,
 }
 
-pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
-    let state = AppState { db, engine };
+pub fn api_router(db: Db, engine: PolicyEngine, health_registry: Option<Arc<HealthRegistry>>) -> Router {
+    let state = AppState { db, engine, health_registry };
 
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health_api::health_handler))
+        .route("/send", post(health_api::send_handler))
+        .route("/senddm", post(health_api::senddm_handler))
+        .route("/session/start", post(health_api::session_start_handler))
         .route("/agents", get(list_agents).post(create_agent))
         .route(
             "/agents/{id}",
@@ -293,20 +301,6 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
         .route("/pm-decision", post(kanban::pm_decision))
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .with_state(state)
-}
-
-async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db_ok = state
-        .db
-        .lock()
-        .map(|conn| conn.execute_batch("SELECT 1").is_ok())
-        .unwrap_or(false);
-
-    Json(json!({
-        "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
-        "db": db_ok
-    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,7 +804,7 @@ mod tests {
     async fn health_returns_ok_with_db_status() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -836,7 +830,7 @@ mod tests {
     async fn agents_empty_list() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -871,7 +865,7 @@ mod tests {
             .unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -906,7 +900,7 @@ mod tests {
             .unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -928,7 +922,7 @@ mod tests {
     async fn get_agent_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -951,7 +945,7 @@ mod tests {
     async fn sessions_empty_list() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -977,7 +971,7 @@ mod tests {
     async fn kanban_create_card() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1006,7 +1000,7 @@ mod tests {
     async fn kanban_list_cards_empty() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1043,7 +1037,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1076,7 +1070,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1100,7 +1094,7 @@ mod tests {
     async fn kanban_get_card_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1128,7 +1122,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1153,7 +1147,7 @@ mod tests {
     async fn kanban_update_card_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1187,7 +1181,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1213,7 +1207,7 @@ mod tests {
     async fn kanban_assign_card_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1236,7 +1230,7 @@ mod tests {
     async fn dispatch_list_empty() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1269,7 +1263,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db.clone(), engine.clone());
+        let app = api_router(db.clone(), engine.clone(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1304,7 +1298,7 @@ mod tests {
         drop(conn);
 
         // GET single dispatch
-        let app2 = api_router(db, engine);
+        let app2 = api_router(db, engine, None);
         let response2 = app2
             .oneshot(
                 Request::builder()
@@ -1327,7 +1321,7 @@ mod tests {
     async fn dispatch_create_card_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1360,7 +1354,7 @@ mod tests {
         }
 
         // Create dispatch
-        let app = api_router(db.clone(), engine.clone());
+        let app = api_router(db.clone(), engine.clone(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1382,7 +1376,7 @@ mod tests {
         let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
 
         // Complete dispatch
-        let app2 = api_router(db, engine);
+        let app2 = api_router(db, engine, None);
         let response2 = app2
             .oneshot(
                 Request::builder()
@@ -1407,7 +1401,7 @@ mod tests {
     async fn dispatch_get_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1473,7 +1467,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db.clone(), engine);
+        let app = api_router(db.clone(), engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1529,7 +1523,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1555,7 +1549,7 @@ mod tests {
     async fn github_repos_empty_list() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1581,7 +1575,7 @@ mod tests {
         let engine = test_engine(&db);
 
         // Register
-        let app = api_router(db.clone(), engine.clone());
+        let app = api_router(db.clone(), engine.clone(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1602,7 +1596,7 @@ mod tests {
         assert_eq!(json["repo"]["id"], "owner/repo1");
 
         // List
-        let app2 = api_router(db, engine);
+        let app2 = api_router(db, engine, None);
         let response2 = app2
             .oneshot(
                 Request::builder()
@@ -1624,7 +1618,7 @@ mod tests {
     async fn github_repos_register_bad_format() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1645,7 +1639,7 @@ mod tests {
     async fn github_repos_sync_not_registered() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1667,7 +1661,7 @@ mod tests {
     async fn pipeline_stages_empty_list() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1693,7 +1687,7 @@ mod tests {
         let engine = test_engine(&db);
 
         // Create
-        let app = api_router(db.clone(), engine.clone());
+        let app = api_router(db.clone(), engine.clone(), None);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1719,7 +1713,7 @@ mod tests {
         let stage_id = json["stage"]["id"].as_i64().unwrap();
 
         // List with filter
-        let app2 = api_router(db.clone(), engine.clone());
+        let app2 = api_router(db.clone(), engine.clone(), None);
         let response2 = app2
             .oneshot(
                 Request::builder()
@@ -1737,7 +1731,7 @@ mod tests {
         assert_eq!(json2["stages"].as_array().unwrap().len(), 1);
 
         // Delete
-        let app3 = api_router(db, engine);
+        let app3 = api_router(db, engine, None);
         let response3 = app3
             .oneshot(
                 Request::builder()
@@ -1761,7 +1755,7 @@ mod tests {
     async fn pipeline_stages_delete_not_found() {
         let db = test_db();
         let engine = test_engine(&db);
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
 
         let response = app
             .oneshot(
@@ -1794,7 +1788,7 @@ mod tests {
             ).unwrap();
         }
 
-        let app = api_router(db, engine);
+        let app = api_router(db, engine, None);
         let response = app
             .oneshot(
                 Request::builder()

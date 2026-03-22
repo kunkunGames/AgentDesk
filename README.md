@@ -174,7 +174,7 @@ Additional settings are stored in the database (`kv_meta` table) and configurabl
 |----------|---------|
 | `AGENTDESK_ROOT_DIR` | Override runtime directory (default: `~/.adk/release`) |
 | `AGENTDESK_CONFIG` | Override config file path |
-| `AGENTDESK_HEALTH_PORT` | Override health check port |
+| `AGENTDESK_SERVER_PORT` | Override HTTP server port (default: 8791) |
 | `AGENTDESK_DCSERVER_LABEL` | Override launchd service label |
 
 ## Customization

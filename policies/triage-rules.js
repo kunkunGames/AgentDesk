@@ -53,7 +53,7 @@ var triage = {
             [card.id]
           );
           if (issueNum.length > 0 && issueNum[0].github_issue_url) {
-            var port = agentdesk.config.get("health_port") || 8798;
+            var port = agentdesk.config.get("server_port") || 8791;
             try {
               agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
                 target: "channel:1478652416533463101",

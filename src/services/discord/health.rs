@@ -3,8 +3,6 @@ use std::time::Instant;
 
 use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 use super::SharedData;
 
@@ -50,109 +48,39 @@ impl HealthRegistry {
     pub(super) async fn register_http(&self, provider: String, http: Arc<serenity::Http>) {
         self.discord_http.lock().await.push((provider, http));
     }
-}
 
-/// Start the health check HTTP server on the given port.
-/// Runs forever — intended to be spawned as a background tokio task.
-pub async fn serve(registry: Arc<HealthRegistry>, port: u16) {
-    // Load announce + notify bot tokens for message routing.
-    // Announce bot: agent-to-agent (agents process these messages)
-    // Notify bot: info-only alerts (agents do NOT respond)
-    if let Some(root) = super::runtime_store::agentdesk_root() {
-        for (bot_name, field) in [
-            ("announce", &registry.announce_http),
-            ("notify", &registry.notify_http),
-        ] {
-            let new_path = root
-                .join("credential")
-                .join(format!("{bot_name}_bot_token"));
-            if let Ok(token) = std::fs::read_to_string(&new_path) {
-                let token = token.trim().to_string();
-                if !token.is_empty() {
-                    let http = Arc::new(serenity::Http::new(&format!("Bot {token}")));
-                    *field.lock().await = Some(http);
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    let emoji = if bot_name == "announce" {
-                        "📢"
-                    } else {
-                        "🔔"
-                    };
-                    println!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
+    /// Load announce + notify bot tokens from credential/ files.
+    /// Call once at startup before the axum server begins accepting requests.
+    pub async fn init_bot_tokens(&self) {
+        if let Some(root) = super::runtime_store::agentdesk_root() {
+            for (bot_name, field) in [
+                ("announce", &self.announce_http),
+                ("notify", &self.notify_http),
+            ] {
+                let path = root
+                    .join("credential")
+                    .join(format!("{bot_name}_bot_token"));
+                if let Ok(token) = std::fs::read_to_string(&path) {
+                    let token = token.trim().to_string();
+                    if !token.is_empty() {
+                        let http = Arc::new(serenity::Http::new(&format!("Bot {token}")));
+                        *field.lock().await = Some(http);
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        let emoji = if bot_name == "announce" {
+                            "📢"
+                        } else {
+                            "🔔"
+                        };
+                        println!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
+                    }
                 }
             }
         }
     }
-
-    let addr = format!("127.0.0.1:{port}");
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] 🩺 Health check server listening on {addr}");
-            l
-        }
-        Err(e) => {
-            eprintln!("  ⚠ Health check server failed to bind {addr}: {e}");
-            return;
-        }
-    };
-
-    loop {
-        let (mut stream, _) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(_) => continue,
-        };
-
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 8192]; // Larger buffer for POST bodies
-            let n = match stream.read(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            let request = String::from_utf8_lossy(&buf[..n]);
-
-            // Parse first line: "GET /api/health HTTP/1.1"
-            let first_line = request.lines().next().unwrap_or("");
-            let method = first_line.split_whitespace().next().unwrap_or("");
-            let path = first_line.split_whitespace().nth(1).unwrap_or("");
-
-            let (status, body) = match (method, path) {
-                ("GET", "/api/health") => {
-                    let json = build_health_json(&registry).await;
-                    let healthy = is_healthy(&registry).await;
-                    let code = if healthy {
-                        "200 OK"
-                    } else {
-                        "503 Service Unavailable"
-                    };
-                    (code, json)
-                }
-                ("POST", "/api/send") => {
-                    // Extract JSON body (after \r\n\r\n)
-                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                    handle_send(&registry, body_str).await
-                }
-                ("POST", "/api/senddm") => {
-                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                    handle_senddm(&registry, body_str).await
-                }
-                ("POST", "/api/session/start") => {
-                    let body_str = request.split("\r\n\r\n").nth(1).unwrap_or("");
-                    handle_session_start(&registry, body_str).await
-                }
-                _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
-            };
-
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
-    }
 }
 
-async fn build_health_json(registry: &HealthRegistry) -> String {
+/// Build the health check JSON response.
+pub async fn build_health_json(registry: &HealthRegistry) -> String {
     let uptime_secs = registry.started_at.elapsed().as_secs();
     let version = env!("CARGO_PKG_VERSION");
 
@@ -233,7 +161,7 @@ async fn build_health_json(registry: &HealthRegistry) -> String {
     )
 }
 
-async fn is_healthy(registry: &HealthRegistry) -> bool {
+pub async fn is_healthy(registry: &HealthRegistry) -> bool {
     let providers = registry.providers.lock().await;
     is_healthy_inner(&providers)
 }
@@ -265,7 +193,7 @@ fn is_healthy_inner(providers: &[ProviderEntry]) -> bool {
 
 /// Resolve the bot HTTP client by name.
 /// Supported: "announce", "notify", or a provider name like "claude"/"codex".
-async fn resolve_bot_http(
+pub async fn resolve_bot_http(
     registry: &HealthRegistry,
     bot: &str,
 ) -> Result<Arc<serenity::Http>, (&'static str, String)> {
@@ -308,7 +236,7 @@ async fn resolve_bot_http(
 
 /// Handle POST /api/send — agent-to-agent native routing.
 /// Accepts JSON: {"target":"channel:<id>", "content":"...", "source":"role-id", "bot":"announce|notify"}
-async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
+pub async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
         return (
             "400 Bad Request",
@@ -416,7 +344,7 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
 /// Handle POST /api/senddm — send a DM to a Discord user.
 /// Accepts JSON: {"user_id":"...", "content":"...", "bot":"announce|notify"}
 /// When using announce bot, user replies trigger a Claude session.
-async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
+pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => {
@@ -488,18 +416,10 @@ async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, 
     }
 }
 
-/// Resolve the health check port from env or default.
-pub fn resolve_port() -> u16 {
-    std::env::var("AGENTDESK_HEALTH_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8793)
-}
-
 /// Handle POST /api/session/start — start a session via API.
 /// Accepts JSON: {"channel_id":"<id>", "path":"/some/path", "provider":"claude"}
 /// Creates a DiscordSession in the provider's SharedData and responds.
-async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
+pub async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, String) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
         return (
             "400 Bad Request",
@@ -592,7 +512,7 @@ async fn handle_session_start<'a>(registry: &HealthRegistry, body: &str) -> (&'a
 }
 
 /// Self-watchdog: runs on a dedicated OS thread (not tokio) to detect
-/// runtime hangs.  Periodically opens a raw TCP connection to the health
+/// runtime hangs.  Periodically opens a raw TCP connection to the server
 /// port and expects a response within a few seconds.  If the check fails
 /// `max_failures` times in a row the process is force-killed so launchd
 /// (or systemd) can restart it.
@@ -763,28 +683,5 @@ mod tests {
         assert!(result.is_ok());
         let (_, _, source) = result.unwrap();
         assert_eq!(source, "unknown");
-    }
-
-    #[test]
-    fn test_resolve_port_default() {
-        let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
-        assert_eq!(resolve_port(), 8793);
-    }
-
-    #[test]
-    fn test_resolve_port_env_override() {
-        let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "9999") };
-        assert_eq!(resolve_port(), 9999);
-        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
-    }
-
-    #[test]
-    fn test_resolve_port_invalid_env() {
-        let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_HEALTH_PORT", "not-a-number") };
-        assert_eq!(resolve_port(), 8793);
-        unsafe { std::env::remove_var("AGENTDESK_HEALTH_PORT") };
     }
 }

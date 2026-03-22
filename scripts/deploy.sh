@@ -19,7 +19,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 AD_HOME="${AGENTDESK_HOME:-$HOME/.agentdesk}"
 BIN_DIR="$AD_HOME/bin"
-HEALTH_PORT="${AGENTDESK_HEALTH_PORT:-8796}"
+HEALTH_PORT="${AGENTDESK_SERVER_PORT:-8791}"
 LABEL="com.agentdesk"
 
 SKIP_BUILD=false
@@ -153,7 +153,7 @@ HEALTHY=false
 
 for i in $(seq 1 $RETRIES); do
   sleep "$DELAY"
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HEALTH_PORT/health" 2>/dev/null || echo "000")
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HEALTH_PORT/api/health" 2>/dev/null || echo "000")
   if [ "$HTTP_CODE" = "200" ]; then
     HEALTHY=true
     break
@@ -162,7 +162,7 @@ for i in $(seq 1 $RETRIES); do
 done
 
 if [ "$HEALTHY" = true ]; then
-  ok "Health check passed (HTTP 200 on :$HEALTH_PORT/health)"
+  ok "Health check passed (HTTP 200 on :$HEALTH_PORT/api/health)"
 else
   fail "Health check failed after $RETRIES attempts. Check logs:"
   echo "  $AD_HOME/logs/agentdesk.stdout.log"

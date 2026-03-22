@@ -10,7 +10,7 @@
 
 function sendDiscordReview(target, content, bot) {
   try {
-    var port = agentdesk.config.get("health_port") || 8798;
+    var port = agentdesk.config.get("server_port") || 8791;
     agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
       target: target, content: content, bot: bot || "announce"
     });

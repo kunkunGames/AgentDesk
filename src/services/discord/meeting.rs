@@ -145,14 +145,7 @@ async fn create_meeting_thread(
     parent_channel_id: ChannelId,
     thread_name: &str,
 ) -> Option<ChannelId> {
-    let config = crate::config::load_graceful();
-    let token = config
-        .discord
-        .bots
-        .get("announce")
-        .or_else(|| config.discord.bots.get("command"))?
-        .token
-        .clone();
+    let token = crate::credential::read_bot_token("announce")?;
 
     let url = format!(
         "https://discord.com/api/v10/channels/{}/threads",
@@ -182,14 +175,8 @@ async fn create_meeting_thread(
 
 /// Archive a meeting thread (set archived=true via Discord REST API).
 async fn archive_meeting_thread(thread_channel_id: ChannelId) {
-    let config = crate::config::load_graceful();
-    let token = match config
-        .discord
-        .bots
-        .get("announce")
-        .or_else(|| config.discord.bots.get("command"))
-    {
-        Some(bot) => bot.token.clone(),
+    let token = match crate::credential::read_bot_token("announce") {
+        Some(t) => t,
         None => return,
     };
 

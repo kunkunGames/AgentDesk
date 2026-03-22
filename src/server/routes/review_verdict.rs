@@ -451,6 +451,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            health_registry: None,
         };
 
         let (status, _) = submit_verdict(
@@ -497,6 +498,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            health_registry: None,
         };
 
         let (status, _) = submit_verdict(
@@ -548,6 +550,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            health_registry: None,
         };
 
         let (status, body) = submit_verdict(
@@ -593,6 +596,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            health_registry: None,
         };
 
         let (status, _) = submit_verdict(
@@ -636,6 +640,7 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            health_registry: None,
         };
 
         let (status, _) = submit_verdict(

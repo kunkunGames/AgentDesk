@@ -448,16 +448,10 @@ pub(super) async fn send_dispatch_to_discord(
     );
 
     // Send via Discord HTTP API using the announce bot
-    let config = crate::config::load_graceful();
-    let token = match config
-        .discord
-        .bots
-        .get("announce")
-        .or_else(|| config.discord.bots.get("command"))
-    {
-        Some(bot) => bot.token.clone(),
+    let token = match crate::credential::read_bot_token("announce") {
+        Some(t) => t,
         None => {
-            tracing::warn!("[dispatch] No 'announce' bot configured");
+            tracing::warn!("[dispatch] No announce bot token (missing credential/announce_bot_token)");
             return;
         }
     };
@@ -591,14 +585,8 @@ pub(super) async fn send_review_result_to_primary(
         let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
         let message = format!("✅ [리뷰 통과] {title} — done으로 이동{url_line}");
 
-        let config = crate::config::load_graceful();
-        let token = match config
-            .discord
-            .bots
-            .get("announce")
-            .or_else(|| config.discord.bots.get("command"))
-        {
-            Some(bot) => bot.token.clone(),
+        let token = match crate::credential::read_bot_token("announce") {
+            Some(t) => t,
             None => return,
         };
         let url = format!(
@@ -652,14 +640,8 @@ pub(super) async fn send_review_result_to_primary(
     );
 
     // Send to primary channel
-    let config = crate::config::load_graceful();
-    let token = match config
-        .discord
-        .bots
-        .get("announce")
-        .or_else(|| config.discord.bots.get("command"))
-    {
-        Some(bot) => bot.token.clone(),
+    let token = match crate::credential::read_bot_token("announce") {
+        Some(t) => t,
         None => return,
     };
 
@@ -758,18 +740,12 @@ pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, disp
         .flatten()
     };
     if let Some(ref tid) = thread_id {
-        let config = crate::config::load_graceful();
-        if let Some(bot) = config
-            .discord
-            .bots
-            .get("announce")
-            .or_else(|| config.discord.bots.get("command"))
-        {
+        if let Some(token) = crate::credential::read_bot_token("announce") {
             let archive_url = format!("https://discord.com/api/v10/channels/{}", tid);
             let client = reqwest::Client::new();
             let _ = client
                 .patch(&archive_url)
-                .header("Authorization", format!("Bot {}", bot.token))
+                .header("Authorization", format!("Bot {}", token))
                 .json(&serde_json::json!({"archived": true}))
                 .send()
                 .await;

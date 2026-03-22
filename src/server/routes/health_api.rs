@@ -1,0 +1,112 @@
+use axum::{
+    Json,
+    body::Bytes,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+
+use crate::services::discord::health;
+
+use super::AppState;
+
+/// GET /api/health — combined DB + Discord provider health.
+/// When HealthRegistry is present, returns Discord provider status.
+/// Always includes DB status.
+pub async fn health_handler(State(state): State<AppState>) -> Response {
+    let db_ok = state
+        .db
+        .lock()
+        .map(|conn| conn.execute_batch("SELECT 1").is_ok())
+        .unwrap_or(false);
+
+    if let Some(ref registry) = state.health_registry {
+        let healthy = health::is_healthy(registry).await;
+        let discord_json = health::build_health_json(registry).await;
+        // Parse the discord JSON and merge with DB status
+        let mut json: serde_json::Value =
+            serde_json::from_str(&discord_json).unwrap_or(serde_json::json!({}));
+        json["db"] = serde_json::json!(db_ok);
+
+        let status = if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        (status, Json(json)).into_response()
+    } else {
+        // Standalone mode — no Discord providers
+        let json = serde_json::json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "db": db_ok
+        });
+        (StatusCode::OK, Json(json)).into_response()
+    }
+}
+
+/// POST /api/send — agent-to-agent native routing.
+pub async fn send_handler(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(ref registry) = state.health_registry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
+        )
+            .into_response();
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+    let (status_str, response_body) = health::handle_send(registry, &body_str).await;
+    let status = parse_status_code(status_str);
+    let json: serde_json::Value =
+        serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
+    (status, Json(json)).into_response()
+}
+
+/// POST /api/senddm — send a DM to a Discord user.
+pub async fn senddm_handler(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(ref registry) = state.health_registry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
+        )
+            .into_response();
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+    let (status_str, response_body) = health::handle_senddm(registry, &body_str).await;
+    let status = parse_status_code(status_str);
+    let json: serde_json::Value =
+        serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
+    (status, Json(json)).into_response()
+}
+
+/// POST /api/session/start — start a session via API.
+pub async fn session_start_handler(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(ref registry) = state.health_registry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
+        )
+            .into_response();
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+    let (status_str, response_body) = health::handle_session_start(registry, &body_str).await;
+    let status = parse_status_code(status_str);
+    let json: serde_json::Value =
+        serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
+    (status, Json(json)).into_response()
+}
+
+fn parse_status_code(s: &str) -> StatusCode {
+    match s {
+        "200 OK" => StatusCode::OK,
+        "400 Bad Request" => StatusCode::BAD_REQUEST,
+        "403 Forbidden" => StatusCode::FORBIDDEN,
+        "404 Not Found" => StatusCode::NOT_FOUND,
+        "500 Internal Server Error" => StatusCode::INTERNAL_SERVER_ERROR,
+        "503 Service Unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}

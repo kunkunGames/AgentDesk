@@ -535,13 +535,13 @@ pub async fn start_meeting(
 
     let agenda = body.agenda.as_deref().unwrap_or("General discussion");
 
-    // Send meeting start command to the channel via /api/send (health server)
-    let health_port = crate::services::discord::health::resolve_port();
+    // Send meeting start command to the channel via /api/send (same axum server)
+    let server_port = crate::config::load_graceful().server.port;
 
     let message = format!("/meeting start {agenda}");
     let client = reqwest::Client::new();
     match client
-        .post(format!("http://127.0.0.1:{health_port}/api/send"))
+        .post(format!("http://127.0.0.1:{server_port}/api/send"))
         .json(&json!({
             "target": format!("channel:{channel_id}"),
             "content": message,
