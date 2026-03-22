@@ -2331,13 +2331,25 @@ pub(super) async fn auto_restore_session(
 }
 
 /// Create a lightweight session for a thread, bootstrapped from the parent channel's path.
+/// The session's `channel_name` uses `{parent_channel}-t{thread_id}` so the derived
+/// tmux session name stays short and unique instead of using the full thread title.
 async fn bootstrap_thread_session(
     shared: &Arc<SharedData>,
     thread_channel_id: ChannelId,
     parent_path: &str,
     serenity_ctx: &serenity::prelude::Context,
 ) {
-    let (ch_name, cat_name) = resolve_channel_category(serenity_ctx, thread_channel_id).await;
+    let (_thread_title, cat_name) =
+        resolve_channel_category(serenity_ctx, thread_channel_id).await;
+    // Build a short, stable channel_name: "{parent_channel}-t{thread_id}"
+    let parent_info = resolve_thread_parent(serenity_ctx, thread_channel_id).await;
+    let ch_name = if let Some((_parent_id, parent_name)) = parent_info {
+        let parent = parent_name.unwrap_or_else(|| format!("{}", _parent_id));
+        Some(format!("{}-t{}", parent, thread_channel_id.get()))
+    } else {
+        // Not a thread (shouldn't happen here) — fall back to resolved name
+        _thread_title
+    };
     let existing = load_existing_session(parent_path, Some(thread_channel_id.get()));
 
     let mut data = shared.core.lock().await;

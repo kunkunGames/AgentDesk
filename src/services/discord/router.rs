@@ -596,40 +596,52 @@ pub(super) async fn handle_text_message(
     // ── Dispatch thread auto-creation ──────────────────────────────
     // When a dispatch message arrives, create a Discord thread for
     // isolated context.  All subsequent agent output goes to the thread.
+    // Skip if already inside a thread (threads cannot nest).
+    let is_already_thread = super::resolve_thread_parent(ctx, channel_id).await.is_some();
     let dispatch_id_for_thread = super::adk_session::parse_dispatch_id(user_text);
     let channel_id = if let Some(ref did) = dispatch_id_for_thread {
-        // Extract short title from "DISPATCH:uuid - title" format
-        let thread_title = user_text
-            .find(" - ")
-            .map(|idx| &user_text[idx + 3..])
-            .unwrap_or("dispatch")
-            .chars()
-            .take(90)
-            .collect::<String>();
+        if is_already_thread {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🧵 Dispatch {did} arrived in existing thread, skipping thread creation"
+            );
+            channel_id
+        } else {
+            // Extract short title from "DISPATCH:uuid - title" format
+            let thread_title = user_text
+                .find(" - ")
+                .map(|idx| &user_text[idx + 3..])
+                .unwrap_or("dispatch")
+                .chars()
+                .take(90)
+                .collect::<String>();
 
-        match channel_id
-            .create_thread(
-                &ctx.http,
-                poise::serenity_prelude::builder::CreateThread::new(thread_title)
-                    .kind(poise::serenity_prelude::ChannelType::PublicThread)
-                    .auto_archive_duration(poise::serenity_prelude::AutoArchiveDuration::OneDay),
-            )
-            .await
-        {
-            Ok(thread) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] 🧵 Created dispatch thread {} for dispatch {}",
-                    thread.id, did
-                );
-                // Bootstrap session for the thread from parent channel
-                super::bootstrap_thread_session(shared, thread.id, &current_path, ctx).await;
-                thread.id
-            }
-            Err(e) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!("  [{ts}] ⚠ Failed to create dispatch thread: {e}");
-                channel_id // fallback to main channel
+            match channel_id
+                .create_thread(
+                    &ctx.http,
+                    poise::serenity_prelude::builder::CreateThread::new(thread_title)
+                        .kind(poise::serenity_prelude::ChannelType::PublicThread)
+                        .auto_archive_duration(
+                            poise::serenity_prelude::AutoArchiveDuration::OneDay,
+                        ),
+                )
+                .await
+            {
+                Ok(thread) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] 🧵 Created dispatch thread {} for dispatch {}",
+                        thread.id, did
+                    );
+                    // Bootstrap session for the thread from parent channel
+                    super::bootstrap_thread_session(shared, thread.id, &current_path, ctx).await;
+                    thread.id
+                }
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!("  [{ts}] ⚠ Failed to create dispatch thread: {e}");
+                    channel_id // fallback to main channel
+                }
             }
         }
     } else {
