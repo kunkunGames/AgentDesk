@@ -23,9 +23,9 @@ function sendDiscordNotification(target, content, bot) {
 }
 
 function notifyPMD(cardId, reason) {
-  var pmdChannel = agentdesk.config.get("pmd_channel_id");
+  var pmdChannel = agentdesk.config.get("kanban_manager_channel_id");
   if (!pmdChannel) {
-    agentdesk.log.warn("[pm-gate] No pmd_channel_id configured, skipping PMD notification");
+    agentdesk.log.warn("[pm-gate] No kanban_manager_channel_id configured, skipping PMD notification");
     return;
   }
   var cards = agentdesk.db.query(

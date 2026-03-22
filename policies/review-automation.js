@@ -56,7 +56,7 @@ var reviewAutomation = {
       );
       agentdesk.log.warn("[review] Max review rounds (" + maxRounds + ") reached for " + card.id);
       // Notify PMD about dilemma
-      var pmdChannel = agentdesk.config.get("pmd_channel_id");
+      var pmdChannel = agentdesk.config.get("kanban_manager_channel_id");
       if (pmdChannel) {
         sendDiscordReview(
           "channel:" + pmdChannel,
@@ -82,7 +82,9 @@ var reviewAutomation = {
       [card.assigned_agent_id]
     );
     if (agentRow.length === 0 || !agentRow[0].discord_channel_alt) {
-      agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + ", manual review");
+      // No alt channel → skip counter-model review, go directly to done
+      agentdesk.kanban.setStatus(card.id, "done");
+      agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + ", review skipped → done");
       return;
     }
 

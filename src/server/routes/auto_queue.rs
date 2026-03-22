@@ -255,24 +255,46 @@ pub async fn generate(
                 None => return,
             };
 
-            // PMD channel ID (cookingheart-pm-cc)
-            let pmd_channel = "1478652416533463101";
+            // Kanban manager channel from config (kv_meta)
+            let km_channel: Option<String> = {
+                let conn = state.db.lock().ok();
+                conn.and_then(|c| {
+                    c.query_row(
+                        "SELECT value FROM kv_meta WHERE key = 'kanban_manager_channel_id'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                })
+            };
+            let Some(km_channel) = km_channel else {
+                tracing::warn!("[auto-queue] No kanban_manager_channel_id configured, skipping PM request");
+                return;
+            };
+
+            // Resolve channel name to ID if needed
+            let km_channel_num: u64 = match km_channel.parse() {
+                Ok(n) => n,
+                Err(_) => match crate::server::routes::dispatches::resolve_channel_alias_pub(&km_channel) {
+                    Some(n) => n,
+                    None => return,
+                },
+            };
+
             let message = format!(
-                "[ADK → PMD] 자동큐 순서 분석 요청\n\n\
+                "[칸반매니저] 자동큐 순서 분석 요청\n\n\
                  repo: {}\n\
                  run_id: {}\n\n\
                  아래 일감들의 실행 순서를 분석해주세요.\n\
                  의존관계, 긴급도, 작업 내용을 고려하여 순서를 결정하고,\n\
                  `POST /api/auto-queue/runs/{}/order`에 결과를 전달해주세요.\n\n\
-                 {}\n\n\
-                 ---\n\
-                 회신: channel:1479671298497183835 | 접두어: [PMD → ADK]",
+                 {}",
                 repo_name, run_id_for_spawn, run_id_for_spawn, card_list_text
             );
 
             let client = reqwest::Client::new();
             let _ = client
-                .post(format!("https://discord.com/api/v10/channels/{pmd_channel}/messages"))
+                .post(format!("https://discord.com/api/v10/channels/{km_channel_num}/messages"))
                 .header("Authorization", format!("Bot {}", token))
                 .json(&serde_json::json!({"content": message}))
                 .send()

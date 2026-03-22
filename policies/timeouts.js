@@ -16,6 +16,7 @@
 
 // Send notification via notify bot (system alerts, not agent communication)
 function sendNotifyAlert(channelTarget, message) {
+  if (!channelTarget) return;
   try {
     var port = agentdesk.config.get("health_port") || 8798;
     agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
@@ -31,7 +32,12 @@ function sendNotifyAlert(channelTarget, message) {
 
 // Get PMD channel for alerts
 function getPMDChannel() {
-  return "channel:" + (agentdesk.config.get("pmd_channel_id") || "1478652416533463101");
+  var ch = agentdesk.config.get("kanban_manager_channel_id");
+  if (!ch) {
+    agentdesk.log.warn("[notify] No kanban_manager_channel_id configured, skipping");
+    return null;
+  }
+  return "channel:" + ch;
 }
 
 var timeouts = {
@@ -67,11 +73,12 @@ var timeouts = {
       var cardTitle = (cardInfo.length > 0) ? cardInfo[0].title : staleRequested[i].id;
       var cardUrl = (cardInfo.length > 0 && cardInfo[0].github_issue_url) ? "\n" + cardInfo[0].github_issue_url : "";
       var assignee = (cardInfo.length > 0 && cardInfo[0].assigned_agent_id) ? cardInfo[0].assigned_agent_id : "미배정";
-      try {
+      var kmChannel = getPMDChannel();
+      if (kmChannel) try {
         var port = agentdesk.config.get("health_port") || 8798;
         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
-          target: getPMDChannel(),
-          content: "[ADK → PMD] ⏰ 타임아웃 결정 요청\n\n" +
+          target: kmChannel,
+          content: "[칸반매니저] ⏰ 타임아웃 결정 요청\n\n" +
             "카드: " + cardTitle + "\n" +
             "담당: " + assignee + "\n" +
             "사유: 45분간 에이전트 무응답\n\n" +
@@ -106,11 +113,12 @@ var timeouts = {
       var stalledTitle = (stalledInfo.length > 0) ? stalledInfo[0].title : staleInProgress[j].id;
       var stalledUrl = (stalledInfo.length > 0 && stalledInfo[0].github_issue_url) ? "\n" + stalledInfo[0].github_issue_url : "";
       var stalledAssignee = (stalledInfo.length > 0 && stalledInfo[0].assigned_agent_id) ? stalledInfo[0].assigned_agent_id : "미배정";
-      try {
+      var kmChannel2 = getPMDChannel();
+      if (kmChannel2) try {
         var port = agentdesk.config.get("health_port") || 8798;
         agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
-          target: getPMDChannel(),
-          content: "[ADK → PMD] ⚠️ 정체 카드 결정 요청\n\n" +
+          target: kmChannel2,
+          content: "[칸반매니저] ⚠️ 정체 카드 결정 요청\n\n" +
             "카드: " + stalledTitle + "\n" +
             "담당: " + stalledAssignee + "\n" +
             "사유: 2시간 이상 진행 없음 → blocked\n\n" +
