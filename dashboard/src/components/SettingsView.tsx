@@ -429,6 +429,20 @@ export default function SettingsView({
           </>
         )}
       </div>
+
+      {/* Onboarding re-run */}
+      <div className="mt-8 pt-6 border-t" style={{ borderColor: "rgba(148,163,184,0.15)" }}>
+        <button
+          onClick={() => window.location.hash = "#onboarding"}
+          className="px-6 py-2.5 rounded-xl text-sm font-medium border hover:bg-white/5 transition-colors"
+          style={{ borderColor: "rgba(148,163,184,0.3)", color: "var(--th-text-secondary)" }}
+        >
+          {tr("온보딩 재수행", "Re-run Onboarding")}
+        </button>
+        <p className="mt-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+          {tr("봇 토큰, 채널, 에이전트 구성을 다시 설정합니다.", "Reconfigure bot token, channels, and agents.")}
+        </p>
+      </div>
     </div>
   );
 }

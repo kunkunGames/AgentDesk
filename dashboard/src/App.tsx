@@ -25,6 +25,7 @@ const MeetingMinutesView = lazy(() => import("./components/MeetingMinutesView"))
 const SkillCatalogView = lazy(() => import("./components/SkillCatalogView"));
 const KanbanTab = lazy(() => import("./components/agent-manager/KanbanTab"));
 const SettingsView = lazy(() => import("./components/SettingsView"));
+const OnboardingWizard = lazy(() => import("./components/OnboardingWizard"));
 import OfficeSelectorBar from "./components/OfficeSelectorBar";
 const OfficeManagerModal = lazy(() => import("./components/OfficeManagerModal"));
 const AgentInfoCard = lazy(() => import("./components/agent-manager/AgentInfoCard"));

@@ -8,6 +8,7 @@ pub mod discord;
 pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod docs;
+pub mod onboarding;
 pub mod github;
 pub mod github_dashboard;
 pub mod kanban;
@@ -51,6 +52,11 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
             "/agents/{id}",
             get(get_agent).patch(update_agent).delete(delete_agent),
         )
+        // Onboarding
+        .route("/onboarding/status", get(onboarding::status))
+        .route("/onboarding/validate-token", post(onboarding::validate_token))
+        .route("/onboarding/channels", get(onboarding::channels))
+        .route("/onboarding/complete", post(onboarding::complete))
         .route("/agent-channels", get(agents::agent_channels))
         .route("/agents/{id}/offices", get(agents::agent_offices))
         .route("/agents/{id}/signal", post(agents::agent_signal))
