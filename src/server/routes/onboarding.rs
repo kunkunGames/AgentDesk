@@ -71,7 +71,7 @@ pub async fn status(
     (StatusCode::OK, Json(json!({
         "completed": has_bots && agent_count > 0,
         "agent_count": agent_count,
-        "bot_token_set": bot_token.is_some(),
+        "bot_token": bot_token,
         "guild_id": guild_id,
         "owner_id": owner_id,
         "agents": agents,

@@ -39,13 +39,23 @@ export default function OnboardingWizard({ isKo, onComplete }: Props) {
   const [completing, setCompleting] = useState(false);
   const [error, setError] = useState("");
 
-  // Load existing config
+  // Load existing config for pre-fill
   useEffect(() => {
     void fetch("/api/onboarding/status", { credentials: "include" })
       .then((r) => r.json())
       .then((d) => {
         if (d.owner_id) setOwnerId(d.owner_id);
         if (d.guild_id) setSelectedGuild(d.guild_id);
+        if (d.bot_token) setToken(d.bot_token);
+        // Pre-fill agent mappings from existing agents
+        if (d.agents?.length > 0) {
+          setMappings(d.agents.map((a: { agent_id: string; channel_id: string; name: string }) => ({
+            channel_id: a.channel_id || "",
+            channel_name: a.channel_id || "",
+            role_id: a.agent_id,
+            selected: true,
+          })));
+        }
       })
       .catch(() => {});
   }, []);
