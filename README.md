@@ -370,7 +370,7 @@ AgentDesk/
 
 AgentDesk incorporates and builds upon code from the following projects:
 
-- **[cokacdir](https://github.com/itismyfield/cokacdir)** (MIT License) — Discord gateway integration, session management, tmux lifecycle, and turn bridge functionality were originally developed in cokacdir.
+- **[cokacdir](https://github.com/itismyfield/cokacdir)** (MIT License) — A Rust-based Telegram relay for Claude Code sessions. AgentDesk was originally forked from cokacdir's Telegram relay foundation, then extended with Discord support, session management, tmux lifecycle, and turn bridge functionality.
 - **[claw-empire](https://github.com/GreenSheep01201/claw-empire)** (Apache 2.0 License) — Sprite images used in the office view dashboard were sourced from claw-empire.
 
 ## License
