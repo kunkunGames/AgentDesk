@@ -84,9 +84,12 @@ var rules = {
         [payload.dispatch_id]
       );
       if (dispatch.length > 0 && dispatch[0].dispatch_type === "review" && dispatch[0].status === "pending") {
-        // C: GitHub 코멘트에서 verdict 추출 시도
+        // ── Verdict extraction (structured, dispatch-correlated) ──
+        // Priority: 1) dispatch result JSON  2) GitHub comment with round marker  3) pending_decision
         var verdict = null;
         var resultJson = dispatch[0].result;
+
+        // 1. Check dispatch result (set by /api/review-verdict callback)
         if (resultJson) {
           try {
             var parsed = JSON.parse(resultJson);
@@ -94,25 +97,36 @@ var rules = {
           } catch(e) { /* parse fail */ }
         }
 
-        // C: GitHub 이슈 코멘트에서 verdict 키워드 파싱
+        // 2. GitHub comment fallback — only check comments containing review round marker
         if (!verdict) {
           var cardInfo = agentdesk.db.query(
-            "SELECT github_issue_url FROM kanban_cards WHERE id = ?",
+            "SELECT github_issue_url, review_round FROM kanban_cards WHERE id = ?",
             [dispatch[0].kanban_card_id]
           );
           if (cardInfo.length > 0 && cardInfo[0].github_issue_url) {
-            // Extract owner/repo#number from URL
             var urlMatch = (cardInfo[0].github_issue_url || "").match(/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/);
             if (urlMatch) {
               try {
-                var ghOutput = agentdesk.exec("gh", ["issue", "view", urlMatch[2], "--repo", urlMatch[1], "--comments", "--json", "comments", "--jq", ".comments[-1].body"]);
-                if (ghOutput) {
+                var round = cardInfo[0].review_round || 1;
+                // Fetch all comments, filter for ones containing review markers
+                var ghOutput = agentdesk.exec("gh", [
+                  "issue", "view", urlMatch[2], "--repo", urlMatch[1],
+                  "--comments", "--json", "comments", "--jq",
+                  "[.comments[].body] | map(select(test(\"verdict|검토 피드백|리뷰 피드백|review.*feedback\"; \"i\"))) | last"
+                ]);
+                if (ghOutput && ghOutput.trim()) {
                   var lower = ghOutput.toLowerCase();
-                  if (lower.indexOf("verdict: pass") >= 0 || lower.indexOf("verdict: **pass**") >= 0 || lower.indexOf("pass") >= 0 && lower.indexOf("improve") < 0) {
+                  // Structured verdict markers (exact match preferred)
+                  if (lower.indexOf("verdict: pass") >= 0 || lower.indexOf("verdict: **pass**") >= 0) {
                     verdict = "pass";
-                  } else if (lower.indexOf("improve") >= 0 || lower.indexOf("verdict: improve") >= 0 || lower.indexOf("verdict: **improve**") >= 0) {
+                  } else if (lower.indexOf("verdict: improve") >= 0 || lower.indexOf("verdict: **improve**") >= 0) {
+                    verdict = "improve";
+                  } else if (lower.indexOf("✅") >= 0 && lower.indexOf("accept") >= 0) {
+                    verdict = "pass";
+                  } else if (lower.indexOf("보완 필요") >= 0 || lower.indexOf("한 번 더") >= 0) {
                     verdict = "improve";
                   }
+                  // Do NOT fall back to bare "pass"/"improve" keyword — too ambiguous
                 }
               } catch(e) {
                 agentdesk.log.warn("[kanban] GitHub comment parsing failed: " + e);
@@ -121,7 +135,7 @@ var rules = {
           }
         }
 
-        // A: verdict 추출 실패 시 pending_decision (pass 기본값 금지)
+        // 3. No verdict found → pending_decision (never default to pass)
         if (!verdict) {
           agentdesk.kanban.setStatus(card.id, "pending_decision");
           agentdesk.db.execute(
