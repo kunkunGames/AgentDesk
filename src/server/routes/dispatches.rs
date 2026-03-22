@@ -439,7 +439,13 @@ pub(super) async fn send_dispatch_to_discord(
         .unwrap_or_default()
     };
 
-    let message = format_dispatch_message(dispatch_id, title, issue_url.as_deref(), issue_number, use_alt);
+    let message = format_dispatch_message(
+        dispatch_id,
+        title,
+        issue_url.as_deref(),
+        issue_number,
+        use_alt,
+    );
 
     // Send via Discord HTTP API using the announce bot
     let config = crate::config::load_graceful();
@@ -771,9 +777,7 @@ fn resolve_channel_alias(alias: &str) -> Option<u64> {
     // Strategy 3: Fallback — roleId matching (original approach)
     if let Some(entry) = by_name.get(alias) {
         let role_id = entry.get("roleId").and_then(|v| v.as_str())?;
-        let provider = entry
-            .get("provider")
-            .and_then(|v| v.as_str());
+        let provider = entry.get("provider").and_then(|v| v.as_str());
         for (ch_id, ch_entry) in by_id {
             let entry_role = ch_entry.get("roleId").and_then(|v| v.as_str());
             let entry_provider = ch_entry.get("provider").and_then(|v| v.as_str());
@@ -831,7 +835,9 @@ mod tests {
         assert!(message.starts_with("DISPATCH:dispatch-1 - [Review R1] card-1"));
         assert!(message.contains("⚠️ 검토 전용"));
         assert!(message.contains("코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요."));
-        assert!(message.contains("[Review R1] card-1 #19](<https://github.com/itismyfield/AgentDesk/issues/19>)"));
+        assert!(message.contains(
+            "[Review R1] card-1 #19](<https://github.com/itismyfield/AgentDesk/issues/19>)"
+        ));
     }
 
     #[test]
@@ -844,15 +850,23 @@ mod tests {
             false,
         );
 
-        assert!(message.contains("[Implement feature #24](<https://github.com/itismyfield/AgentDesk/issues/24>)"));
+        assert!(message.contains(
+            "[Implement feature #24](<https://github.com/itismyfield/AgentDesk/issues/24>)"
+        ));
         assert!(!message.contains("검토 전용"));
     }
 
     #[test]
     fn review_verdict_extraction_defaults_to_pass() {
         assert_eq!(extract_review_verdict(None), "pass");
-        assert_eq!(extract_review_verdict(Some(r#"{"decision":"dismiss"}"#)), "dismiss");
-        assert_eq!(extract_review_verdict(Some(r#"{"verdict":"improve"}"#)), "improve");
+        assert_eq!(
+            extract_review_verdict(Some(r#"{"decision":"dismiss"}"#)),
+            "dismiss"
+        );
+        assert_eq!(
+            extract_review_verdict(Some(r#"{"verdict":"improve"}"#)),
+            "improve"
+        );
     }
 
     #[tokio::test]

@@ -353,12 +353,19 @@ pub async fn update_card(
         if new_s == "requested" {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Use POST /api/dispatches to start work. PATCH status=requested is not allowed."})),
+                Json(
+                    json!({"error": "Use POST /api/dispatches to start work. PATCH status=requested is not allowed."}),
+                ),
             );
         }
         if new_s.as_str() != old_status {
             match crate::kanban::transition_status_with_opts(
-                &state.db, &state.engine, &id, new_s, "api", false,
+                &state.db,
+                &state.engine,
+                &id,
+                new_s,
+                "api",
+                false,
             ) {
                 Ok(_) => {}
                 Err(e) => {
@@ -382,7 +389,6 @@ pub async fn update_card(
     // Discord notification for new dispatches (if hooks created them)
     if let Some(ref new_s) = new_status {
         if new_s.as_str() != old_status {
-
             // Send Discord notification for new dispatches created by hooks
             if new_s == "requested" || new_s == "review" {
                 let db_clone = state.db.clone();
@@ -398,12 +404,18 @@ pub async fn update_card(
                              FROM kanban_cards kc WHERE kc.id = ?1",
                             [&card_id],
                             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        ).ok()
+                        )
+                        .ok()
                     };
                     if let Some((agent_id, title, dispatch_id)) = dispatch_info {
                         super::dispatches::send_dispatch_to_discord(
-                            &db_clone, &agent_id, &title, &card_id, &dispatch_id,
-                        ).await;
+                            &db_clone,
+                            &agent_id,
+                            &title,
+                            &card_id,
+                            &dispatch_id,
+                        )
+                        .await;
                     }
                 });
             }
@@ -590,7 +602,11 @@ pub async fn retry_card(
             agent_id.clone()
         } else {
             let current: String = conn
-                .query_row("SELECT COALESCE(assigned_agent_id, '') FROM kanban_cards WHERE id = ?1", [&id], |row| row.get(0))
+                .query_row(
+                    "SELECT COALESCE(assigned_agent_id, '') FROM kanban_cards WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
                 .unwrap_or_default();
             conn.execute(
                 "UPDATE kanban_cards SET status = 'requested', latest_dispatch_id = NULL, updated_at = datetime('now') WHERE id = ?1",
@@ -601,7 +617,12 @@ pub async fn retry_card(
 
         // Get card info for dispatch creation
         let (card_title, card_id_owned) = (
-            conn.query_row("SELECT title FROM kanban_cards WHERE id = ?1", [&id], |row| row.get::<_, String>(0)).unwrap_or_default(),
+            conn.query_row(
+                "SELECT title FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_default(),
             id.clone(),
         );
         drop(conn);
@@ -609,8 +630,12 @@ pub async fn retry_card(
         // Create dispatch directly (bypass policy to avoid from===requested skip)
         if !agent_id_for_dispatch.is_empty() {
             let _ = crate::dispatch::create_dispatch(
-                &state.db, &state.engine,
-                &card_id_owned, &agent_id_for_dispatch, "implementation", &card_title,
+                &state.db,
+                &state.engine,
+                &card_id_owned,
+                &agent_id_for_dispatch,
+                "implementation",
+                &card_title,
                 &json!({"retry": true}),
             );
             // Async Discord notification
@@ -623,13 +648,20 @@ pub async fn retry_card(
                     };
                     conn.query_row(
                         "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                        [&card_id_owned], |row| Ok((row.get(0)?, row.get(1)?)),
-                    ).ok()
+                        [&card_id_owned],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .ok()
                 };
                 if let Some((dispatch_id, title)) = dispatch_info {
                     super::dispatches::send_dispatch_to_discord(
-                        &db_clone, &agent_id_for_dispatch, &title, &card_id_owned, &dispatch_id,
-                    ).await;
+                        &db_clone,
+                        &agent_id_for_dispatch,
+                        &title,
+                        &card_id_owned,
+                        &dispatch_id,
+                    )
+                    .await;
                 }
             });
         }
@@ -714,8 +746,12 @@ pub async fn redispatch_card(
         // Create dispatch directly (bypass policy to avoid from===requested skip)
         if !agent_id.is_empty() {
             let _ = crate::dispatch::create_dispatch(
-                &state.db, &state.engine,
-                &card_id_owned, &agent_id, "implementation", &card_title,
+                &state.db,
+                &state.engine,
+                &card_id_owned,
+                &agent_id,
+                "implementation",
+                &card_title,
                 &json!({"redispatch": true}),
             );
             // Async Discord notification
@@ -729,13 +765,20 @@ pub async fn redispatch_card(
                     };
                     conn.query_row(
                         "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                        [&card_id_owned], |row| Ok((row.get(0)?, row.get(1)?)),
-                    ).ok()
+                        [&card_id_owned],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .ok()
                 };
                 if let Some((dispatch_id, title)) = dispatch_info {
                     super::dispatches::send_dispatch_to_discord(
-                        &db_clone, &agent_id_clone, &title, &card_id_owned, &dispatch_id,
-                    ).await;
+                        &db_clone,
+                        &agent_id_clone,
+                        &title,
+                        &card_id_owned,
+                        &dispatch_id,
+                    )
+                    .await;
                 }
             });
         }

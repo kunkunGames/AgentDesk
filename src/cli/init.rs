@@ -613,7 +613,9 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
             .status();
         match status {
             Ok(s) if s.success() => println!("  [OK] dcserver 시작됨 (systemd)"),
-            _ => println!("  [WARN] systemd 등록 실패 — 수동: systemctl --user enable --now {service_name}"),
+            _ => println!(
+                "  [WARN] systemd 등록 실패 — 수동: systemctl --user enable --now {service_name}"
+            ),
         }
     }
 }
@@ -623,10 +625,16 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     let service_name = "AgentDeskDcserver";
     println!("  Windows 서비스 등록:");
     println!("  NSSM 사용 시:");
-    println!("    nssm install {service_name} \"{}\" --dcserver", agentdesk_bin.display());
+    println!(
+        "    nssm install {service_name} \"{}\" --dcserver",
+        agentdesk_bin.display()
+    );
     println!("    nssm start {service_name}");
     println!("  sc.exe 사용 시:");
-    println!("    sc create {service_name} binPath=\"{} --dcserver\" start=auto", agentdesk_bin.display());
+    println!(
+        "    sc create {service_name} binPath=\"{} --dcserver\" start=auto",
+        agentdesk_bin.display()
+    );
     println!("    sc start {service_name}");
 
     let load_answer = prompt_line("\nNSSM으로 지금 등록할까요? (y/N): ");

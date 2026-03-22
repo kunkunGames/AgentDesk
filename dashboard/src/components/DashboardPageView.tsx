@@ -346,7 +346,7 @@ export default function DashboardPageView({
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <CookingHeartRoleBoardWidget agents={agents} t={t} isKo={language === "ko"} />
-            <GitHubIssuesWidget t={t} />
+            <GitHubIssuesWidget t={t} repo={stats.kanban.top_repos[0]?.github_repo} />
           </div>
         </>
       )}

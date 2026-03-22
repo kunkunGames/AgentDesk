@@ -29,7 +29,9 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
                         .output();
                 }
                 #[cfg(not(unix))]
-                { let _ = &name; }
+                {
+                    let _ = &name;
+                }
             }
         } else {
             #[cfg(unix)]
@@ -59,8 +61,12 @@ pub(super) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
 pub(super) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
     let tmp = std::env::temp_dir();
     (
-        tmp.join(format!("agentdesk-{}.jsonl", tmux_session_name)).display().to_string(),
-        tmp.join(format!("agentdesk-{}.input", tmux_session_name)).display().to_string(),
+        tmp.join(format!("agentdesk-{}.jsonl", tmux_session_name))
+            .display()
+            .to_string(),
+        tmp.join(format!("agentdesk-{}.input", tmux_session_name))
+            .display()
+            .to_string(),
     )
 }
 
@@ -924,7 +930,13 @@ pub(super) fn spawn_turn_bridge(
                     ) {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] 🚀 Deferred drain: kicking off idle queues");
-                        super::kickoff_idle_queues(ctx, &shared_for_drain, tok, &provider_for_drain).await;
+                        super::kickoff_idle_queues(
+                            ctx,
+                            &shared_for_drain,
+                            tok,
+                            &provider_for_drain,
+                        )
+                        .await;
                     } else {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!(

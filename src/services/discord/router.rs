@@ -141,16 +141,17 @@ pub(super) async fn handle_event(
             // Prevents the same bot dispatch from starting two parallel turns
             // when Discord delivers the message twice in rapid succession.
             if new_message.author.bot {
-                let dedup_key = if let Some(dispatch_id) = super::adk_session::parse_dispatch_id(text) {
-                    format!("dispatch:{}", dispatch_id)
-                } else {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    channel_id.get().hash(&mut hasher);
-                    user_id.get().hash(&mut hasher);
-                    text.hash(&mut hasher);
-                    format!("bot:{}:{:x}", channel_id, hasher.finish())
-                };
+                let dedup_key =
+                    if let Some(dispatch_id) = super::adk_session::parse_dispatch_id(text) {
+                        format!("dispatch:{}", dispatch_id)
+                    } else {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        channel_id.get().hash(&mut hasher);
+                        user_id.get().hash(&mut hasher);
+                        text.hash(&mut hasher);
+                        format!("bot:{}:{:x}", channel_id, hasher.finish())
+                    };
 
                 const INTAKE_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
                 let now = std::time::Instant::now();
@@ -936,7 +937,9 @@ pub(super) async fn handle_text_message(
             }
         }
         #[cfg(not(unix))]
-        { (None, None, None, 0u64) }
+        {
+            (None, None, None, 0u64)
+        }
     };
 
     let inflight_state = InflightTurnState::new(

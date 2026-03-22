@@ -175,8 +175,7 @@ async fn build_health_json(registry: &HealthRegistry) -> String {
                 let at = entry
                     .shared
                     .global_active
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    as usize;
+                    .load(std::sync::atomic::Ordering::Relaxed) as usize;
                 (at, 0, 0)
             }
         };
@@ -350,7 +349,8 @@ async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str, Str
     let Some(channel_id_raw) = channel_id_raw else {
         return (
             "400 Bad Request",
-            r#"{"ok":false,"error":"invalid target format (use channel:<id> or channel:<name>)"}"#.to_string(),
+            r#"{"ok":false,"error":"invalid target format (use channel:<id> or channel:<name>)"}"#
+                .to_string(),
         );
     };
 

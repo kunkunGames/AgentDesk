@@ -387,7 +387,9 @@ fn dispatch_create_raw(
 
     // Update kanban card — only set status to 'requested' for non-review dispatches.
     // Review/rework dispatches should not change the card status (it stays in 'review').
-    let is_review = dispatch_type == "review" || dispatch_type == "review-decision" || dispatch_type == "rework";
+    let is_review = dispatch_type == "review"
+        || dispatch_type == "review-decision"
+        || dispatch_type == "rework";
     let sql = if is_review {
         "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2"
     } else {
@@ -686,10 +688,7 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
             }
 
             let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
-            match std::process::Command::new(&cmd)
-                .args(&args)
-                .output()
-            {
+            match std::process::Command::new(&cmd).args(&args).output() {
                 Ok(output) if output.status.success() => {
                     String::from_utf8_lossy(&output.stdout).trim().to_string()
                 }

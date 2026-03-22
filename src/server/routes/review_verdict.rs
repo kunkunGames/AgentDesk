@@ -63,7 +63,9 @@ pub async fn submit_verdict(
         if reviewer == reviewee {
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": "Self-review is not allowed. The reviewed agent cannot submit its own verdict."})),
+                Json(
+                    json!({"error": "Self-review is not allowed. The reviewed agent cannot submit its own verdict."}),
+                ),
             );
         }
     }
@@ -178,7 +180,7 @@ pub async fn submit_review_decision(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -211,14 +213,18 @@ pub async fn submit_review_decision(
 
             drop(conn);
             let _ = crate::kanban::transition_status(
-                &state.db, &state.engine, &body.card_id, "in_progress",
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                "in_progress",
             );
             // Set review_status separately (transition_status handles core status only)
             if let Ok(conn) = state.db.lock() {
                 conn.execute(
                     "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
                     [&body.card_id],
-                ).ok();
+                )
+                .ok();
             }
 
             // Create rework dispatch so agent gets a session to do the fix
@@ -252,7 +258,11 @@ pub async fn submit_review_decision(
                     };
                     if let Some((dispatch_id, title)) = info {
                         super::dispatches::send_dispatch_to_discord(
-                            &db_clone, &agent_id_c, &title, &card_id, &dispatch_id,
+                            &db_clone,
+                            &agent_id_c,
+                            &title,
+                            &card_id,
+                            &dispatch_id,
                         )
                         .await;
                     }
@@ -299,9 +309,8 @@ pub async fn submit_review_decision(
         "dismiss" => {
             // Agent dismisses review → go to done
             drop(conn);
-            let _ = crate::kanban::transition_status(
-                &state.db, &state.engine, &body.card_id, "done",
-            );
+            let _ =
+                crate::kanban::transition_status(&state.db, &state.engine, &body.card_id, "done");
         }
         _ => {}
     }

@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -56,6 +57,43 @@ function deriveDispatchedAsAgents(sessions: DispatchedSession[]): Agent[] {
       department_name_ko: s.department_name_ko,
       department_color: s.department_color,
     }));
+}
+
+function applySessionOverlay(baseAgents: Agent[], sessions: DispatchedSession[]): Agent[] {
+  const overlay = new Map<string, { workingCount: number; sessionInfo: string | null }>();
+
+  for (const session of sessions) {
+    if (session.status === "disconnected") continue;
+    const agentId =
+      session.linked_agent_id ??
+      (session as DispatchedSession & { agent_id?: string | null }).agent_id ??
+      null;
+    const activeDispatchId =
+      (session as DispatchedSession & { active_dispatch_id?: string | null }).active_dispatch_id ??
+      null;
+    const isWorking = session.status === "working" || !!activeDispatchId;
+    if (!agentId || !isWorking) continue;
+
+    const prev = overlay.get(agentId);
+    overlay.set(agentId, {
+      workingCount: (prev?.workingCount ?? 0) + 1,
+      sessionInfo: session.session_info ?? prev?.sessionInfo ?? session.name ?? "작업 중",
+    });
+  }
+
+  if (overlay.size === 0) return baseAgents;
+
+  return baseAgents.map((agent) => {
+    const sessionState = overlay.get(agent.id);
+    if (!sessionState) return agent;
+    return {
+      ...agent,
+      status: "working",
+      session_info: sessionState.sessionInfo ?? agent.session_info ?? "작업 중",
+      activity_source: "agentdesk",
+      agentdesk_working_count: sessionState.workingCount,
+    };
+  });
 }
 
 // ── Context value ──
@@ -130,7 +168,9 @@ export function OfficeProvider({
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(initialAuditLogs);
 
   const allAgentsRef = useRef<Agent[]>(initialAgents);
-  useEffect(() => { allAgentsRef.current = allAgents; }, [allAgents]);
+  const sessionAwareAgents = useMemo(() => applySessionOverlay(agents, sessions), [agents, sessions]);
+  const sessionAwareAllAgents = useMemo(() => applySessionOverlay(allAgents, sessions), [allAgents, sessions]);
+  useEffect(() => { allAgentsRef.current = sessionAwareAllAgents; }, [sessionAwareAllAgents]);
 
   // ── Reload scoped data when office selection changes ──
   // Skip the first execution — bootstrap already provides correct data.
@@ -277,7 +317,7 @@ export function OfficeProvider({
   );
   const subAgents = deriveSubAgents(sessions);
   const dispatchedAsAgents = deriveDispatchedAsAgents(sessions);
-  const agentsWithDispatched = [...agents, ...dispatchedAsAgents];
+  const agentsWithDispatched = [...sessionAwareAgents, ...dispatchedAsAgents];
 
   return (
     <OfficeContext.Provider
@@ -285,8 +325,8 @@ export function OfficeProvider({
         offices,
         selectedOfficeId,
         setSelectedOfficeId,
-        agents,
-        allAgents,
+        agents: sessionAwareAgents,
+        allAgents: sessionAwareAllAgents,
         departments,
         allDepartments,
         sessions,

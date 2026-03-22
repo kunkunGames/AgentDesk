@@ -1472,7 +1472,8 @@ pub(super) async fn handle_meeting_command(
 mod tests {
     use super::{
         ActiveMeetingSlot, Meeting, MeetingStatus, MeetingUtterance, ProviderKind,
-        build_meeting_status_payload, effective_round_count, meeting_slot_state, parse_meeting_start_text,
+        build_meeting_status_payload, effective_round_count, meeting_slot_state,
+        parse_meeting_start_text,
     };
     use serde_json::json;
 

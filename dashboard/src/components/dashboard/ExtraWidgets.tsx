@@ -824,22 +824,19 @@ interface SkillTrendWidgetProps {
 }
 
 export function SkillTrendWidget({ t }: SkillTrendWidgetProps) {
-  const [trend, setTrend] = useState<Record<string, Record<string, number>> | null>(null);
+  const [trend, setTrend] = useState<Array<{ day: string; count: number }> | null>(null);
 
   useEffect(() => {
-    fetch("/api/skills/trend?days=14")
+    fetch("/api/skills-trend?days=14")
       .then((r) => r.json())
       .then((d) => setTrend(d.trend))
       .catch(() => {});
   }, []);
 
-  if (!trend) return null;
+  if (!trend || trend.length === 0) return null;
 
-  const days = Object.keys(trend).sort();
-  if (days.length === 0) return null;
-
-  // Aggregate total per day
-  const dailyTotals = days.map((d) => Object.values(trend[d]).reduce((s, v) => s + v, 0));
+  const days = trend.map((entry) => entry.day);
+  const dailyTotals = trend.map((entry) => entry.count);
   const max = Math.max(1, ...dailyTotals);
 
   return (

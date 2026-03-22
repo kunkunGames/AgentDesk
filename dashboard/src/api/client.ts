@@ -623,7 +623,8 @@ export interface MachineStatus {
 }
 
 export async function getMachineStatus(): Promise<MachineStatus[]> {
-  return request("/api/machine-status");
+  const data = await request<{ machines: MachineStatus[] }>("/api/machine-status");
+  return data.machines;
 }
 
 // ── Activity Heatmap ──

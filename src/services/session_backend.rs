@@ -85,11 +85,15 @@ impl SessionBackend for ProcessBackend {
             {
                 #[cfg(unix)]
                 {
-                    crate::services::tmux_common::session_temp_path(&config.session_name, "unused-fifo")
+                    crate::services::tmux_common::session_temp_path(
+                        &config.session_name,
+                        "unused-fifo",
+                    )
                 }
                 #[cfg(not(unix))]
                 {
-                    let tmp = std::env::temp_dir().join(format!("agentdesk-{}-unused-fifo", config.session_name));
+                    let tmp = std::env::temp_dir()
+                        .join(format!("agentdesk-{}-unused-fifo", config.session_name));
                     tmp.display().to_string()
                 }
             },

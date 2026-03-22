@@ -6,21 +6,20 @@ use super::AppState;
 
 /// GET /api/onboarding/status
 /// Returns whether onboarding is complete + existing config values.
-pub async fn status(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
     };
 
     // Check if bot_settings exists (indicates onboarding was done)
     let has_bots: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM agents",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) > 0 FROM agents", [], |row| row.get(0))
         .unwrap_or(false);
 
     // Get existing config
@@ -70,28 +69,43 @@ pub async fn status(
 
     // Load all bot tokens for pre-fill
     let announce_token: Option<String> = conn
-        .query_row("SELECT value FROM kv_meta WHERE key = 'onboarding_announce_token'", [], |row| row.get(0))
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'onboarding_announce_token'",
+            [],
+            |row| row.get(0),
+        )
         .ok();
     let notify_token: Option<String> = conn
-        .query_row("SELECT value FROM kv_meta WHERE key = 'onboarding_notify_token'", [], |row| row.get(0))
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'onboarding_notify_token'",
+            [],
+            |row| row.get(0),
+        )
         .ok();
     let command_token_2: Option<String> = conn
-        .query_row("SELECT value FROM kv_meta WHERE key = 'onboarding_command_token_2'", [], |row| row.get(0))
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'onboarding_command_token_2'",
+            [],
+            |row| row.get(0),
+        )
         .ok();
 
-    (StatusCode::OK, Json(json!({
-        "completed": has_bots && agent_count > 0,
-        "agent_count": agent_count,
-        "bot_tokens": {
-            "command": bot_token,
-            "announce": announce_token,
-            "notify": notify_token,
-            "command2": command_token_2,
-        },
-        "guild_id": guild_id,
-        "owner_id": owner_id,
-        "agents": agents,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "completed": has_bots && agent_count > 0,
+            "agent_count": agent_count,
+            "bot_tokens": {
+                "command": bot_token,
+                "announce": announce_token,
+                "notify": notify_token,
+                "command2": command_token_2,
+            },
+            "guild_id": guild_id,
+            "owner_id": owner_id,
+            "agents": agents,
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,26 +128,33 @@ pub async fn validate_token(
     match resp {
         Ok(r) if r.status().is_success() => {
             let user: serde_json::Value = r.json().await.unwrap_or(json!({}));
-            (StatusCode::OK, Json(json!({
-                "valid": true,
-                "bot_id": user.get("id").and_then(|v| v.as_str()),
-                "bot_name": user.get("username").and_then(|v| v.as_str()),
-                "avatar": user.get("avatar").and_then(|v| v.as_str()),
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "valid": true,
+                    "bot_id": user.get("id").and_then(|v| v.as_str()),
+                    "bot_name": user.get("username").and_then(|v| v.as_str()),
+                    "avatar": user.get("avatar").and_then(|v| v.as_str()),
+                })),
+            )
         }
         Ok(r) => {
             let status = r.status();
-            (StatusCode::OK, Json(json!({
-                "valid": false,
-                "error": format!("Discord API error: {status}"),
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "valid": false,
+                    "error": format!("Discord API error: {status}"),
+                })),
+            )
         }
-        Err(e) => {
-            (StatusCode::OK, Json(json!({
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({
                 "valid": false,
                 "error": format!("Request failed: {e}"),
-            })))
-        }
+            })),
+        ),
     }
 }
 
@@ -161,7 +182,10 @@ pub async fn channels(
     });
 
     let Some(token) = token else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "No token provided"})));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "No token provided"})),
+        );
     };
 
     let client = reqwest::Client::new();
@@ -174,7 +198,12 @@ pub async fn channels(
         .await
     {
         Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
-        _ => return (StatusCode::OK, Json(json!({"guilds": [], "error": "Failed to fetch guilds"}))),
+        _ => {
+            return (
+                StatusCode::OK,
+                Json(json!({"guilds": [], "error": "Failed to fetch guilds"})),
+            );
+        }
     };
 
     let mut result_guilds = Vec::new();
@@ -184,7 +213,9 @@ pub async fn channels(
 
         // Fetch channels for this guild
         let channels: Vec<serde_json::Value> = match client
-            .get(format!("https://discord.com/api/v10/guilds/{guild_id}/channels"))
+            .get(format!(
+                "https://discord.com/api/v10/guilds/{guild_id}/channels"
+            ))
             .header("Authorization", format!("Bot {}", token))
             .send()
             .await
@@ -198,7 +229,10 @@ pub async fn channels(
             .into_iter()
             .filter(|c| c.get("type").and_then(|v| v.as_i64()) == Some(0))
             .map(|c| {
-                let parent = c.get("parent_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let parent = c
+                    .get("parent_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 json!({
                     "id": c.get("id").and_then(|v| v.as_str()),
                     "name": c.get("name").and_then(|v| v.as_str()),
@@ -234,6 +268,8 @@ pub struct ChannelMapping {
     pub channel_id: String,
     pub channel_name: String,
     pub role_id: String,
+    pub description: Option<String>,
+    pub system_prompt: Option<String>,
 }
 
 /// POST /api/onboarding/complete
@@ -244,7 +280,12 @@ pub async fn complete(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
     };
 
     let provider = body.provider.as_deref().unwrap_or("claude");
@@ -253,47 +294,56 @@ pub async fn complete(
     conn.execute(
         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_bot_token', ?1)",
         [&body.token],
-    ).ok();
+    )
+    .ok();
     conn.execute(
         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_guild_id', ?1)",
         [&body.guild_id],
-    ).ok();
+    )
+    .ok();
     if let Some(ref owner) = body.owner_id {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_owner_id', ?1)",
             [owner],
-        ).ok();
+        )
+        .ok();
     }
     if let Some(ref ann) = body.announce_token {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_announce_token', ?1)",
             [ann],
-        ).ok();
+        )
+        .ok();
     }
     if let Some(ref ntf) = body.notify_token {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_notify_token', ?1)",
             [ntf],
-        ).ok();
+        )
+        .ok();
     }
     if let Some(ref cmd2) = body.command_token_2 {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_command_token_2', ?1)",
             [cmd2],
-        ).ok();
+        )
+        .ok();
     }
 
     // Create/update agents for each channel mapping
     let mut created = 0;
     for mapping in &body.channels {
         conn.execute(
-            "INSERT INTO agents (id, name, discord_channel_id, status, xp) \
-             VALUES (?1, ?2, ?3, 'active', 0) \
+            "INSERT INTO agents (id, name, discord_channel_id, description, system_prompt, status, xp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0) \
              ON CONFLICT(id) DO UPDATE SET \
                name = COALESCE(excluded.name, agents.name), \
-               discord_channel_id = excluded.discord_channel_id",
-            rusqlite::params![mapping.role_id, mapping.role_id, mapping.channel_id],
-        ).ok();
+               discord_channel_id = excluded.discord_channel_id, \
+               description = COALESCE(excluded.description, agents.description), \
+               system_prompt = COALESCE(excluded.system_prompt, agents.system_prompt)",
+            rusqlite::params![mapping.role_id, mapping.role_id, mapping.channel_id, mapping.description, mapping.system_prompt],
+        )
+        .ok();
         created += 1;
     }
 
@@ -339,7 +389,8 @@ pub async fn complete(
     conn.execute(
         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('onboarding_complete', 'true')",
         [],
-    ).ok();
+    )
+    .ok();
     drop(conn);
 
     // Write bot tokens to agentdesk.yaml
@@ -367,7 +418,11 @@ pub async fn complete(
         lines.push("  bots:".to_string());
 
         // Command bot (claude or codex based on provider)
-        let cmd_label = if provider == "codex" { "codex" } else { "claude" };
+        let cmd_label = if provider == "codex" {
+            "codex"
+        } else {
+            "claude"
+        };
         lines.push(format!("    {}:", cmd_label));
         lines.push(format!("      token: \"{}\"", body.token));
 
@@ -388,7 +443,11 @@ pub async fn complete(
         // Second command bot (dual provider)
         if let Some(ref cmd2) = body.command_token_2 {
             if !cmd2.is_empty() {
-                let cmd2_label = if provider == "codex" { "claude" } else { "codex" };
+                let cmd2_label = if provider == "codex" {
+                    "claude"
+                } else {
+                    "codex"
+                };
                 lines.push(format!("    {}:", cmd2_label));
                 lines.push(format!("      token: \"{}\"", cmd2));
             }
@@ -397,9 +456,153 @@ pub async fn complete(
         std::fs::write(&yaml_path, lines.join("\n") + "\n").ok();
     }
 
-    (StatusCode::OK, Json(json!({
-        "ok": true,
-        "agents_created": created,
-        "provider": provider,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "agents_created": created,
+            "provider": provider,
+        })),
+    )
+}
+
+// ── Provider Check ──────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CheckProviderBody {
+    pub provider: String,
+}
+
+/// POST /api/onboarding/check-provider
+/// Checks if a CLI provider (claude/codex) is installed and authenticated.
+pub async fn check_provider(
+    Json(body): Json<CheckProviderBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let cmd = match body.provider.as_str() {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "provider must be 'claude' or 'codex'"})),
+            )
+        }
+    };
+
+    // Check if installed
+    let which = tokio::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .await;
+    let installed = which.map(|o| o.status.success()).unwrap_or(false);
+
+    if !installed {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "installed": false,
+                "logged_in": false,
+                "version": null,
+            })),
+        );
+    }
+
+    // Get version
+    let version_out = tokio::process::Command::new(cmd)
+        .arg("--version")
+        .output()
+        .await;
+    let version = version_out.ok().and_then(|o| {
+        if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else {
+            None
+        }
+    });
+
+    // Check login (heuristic: config directory exists with content)
+    let home = std::env::var("HOME").unwrap_or_default();
+    let config_dir = if cmd == "claude" {
+        format!("{home}/.claude")
+    } else {
+        format!("{home}/.codex")
+    };
+    let logged_in = std::path::Path::new(&config_dir).is_dir();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "installed": installed,
+            "logged_in": logged_in,
+            "version": version,
+        })),
+    )
+}
+
+// ── AI Prompt Generation ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GeneratePromptBody {
+    pub name: String,
+    pub description: String,
+    pub provider: Option<String>,
+}
+
+/// POST /api/onboarding/generate-prompt
+/// Generates a system prompt for a custom agent using the local CLI.
+pub async fn generate_prompt(
+    Json(body): Json<GeneratePromptBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let provider = body.provider.as_deref().unwrap_or("claude");
+    let cmd = if provider == "codex" { "codex" } else { "claude" };
+
+    let instruction = format!(
+        "다음 AI 에이전트의 시스템 프롬프트를 한국어로 작성해줘.\n\
+         이름: {}\n설명: {}\n\n\
+         에이전트의 역할, 핵심 능력, 소통 스타일을 포함해서 5-10줄로 작성해.\n\
+         시스템 프롬프트 텍스트만 출력하고 다른 설명은 붙이지 마.",
+        body.name, body.description
+    );
+
+    // Try local CLI (claude -p or codex -q)
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(cmd)
+            .args(["-p", &instruction])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await;
+
+    if let Ok(Ok(out)) = result {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !text.is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "prompt": text, "source": "ai" })),
+                );
+            }
+        }
+    }
+
+    // Fallback to template
+    let fallback = format!(
+        "당신은 '{name}'입니다. {desc}\n\n\
+         ## 역할\n\
+         - 위 설명에 맞는 업무를 수행합니다\n\
+         - 사용자의 요청에 정확하고 친절하게 응답합니다\n\n\
+         ## 소통 원칙\n\
+         - 한국어로 소통합니다\n\
+         - 간결하고 명확하게 답변합니다\n\
+         - 필요시 확인 질문을 합니다",
+        name = body.name,
+        desc = body.description,
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({ "prompt": fallback, "source": "template" })),
+    )
 }

@@ -49,10 +49,7 @@ fn resolve_claude_path() -> Option<String> {
 
     // Fallback: check known installation paths
     let home = dirs::home_dir().unwrap_or_default();
-    let mut known_paths = vec![
-        home.join(".local/bin/claude"),
-        home.join("bin/claude"),
-    ];
+    let mut known_paths = vec![home.join(".local/bin/claude"), home.join("bin/claude")];
     #[cfg(unix)]
     {
         known_paths.push(std::path::PathBuf::from("/usr/local/bin/claude"));
@@ -61,7 +58,9 @@ fn resolve_claude_path() -> Option<String> {
     #[cfg(windows)]
     {
         known_paths.push(home.join("AppData/Local/Programs/claude/claude.exe"));
-        known_paths.push(std::path::PathBuf::from("C:/Program Files/claude/claude.exe"));
+        known_paths.push(std::path::PathBuf::from(
+            "C:/Program Files/claude/claude.exe",
+        ));
     }
     for path in &known_paths {
         if path.is_file() {

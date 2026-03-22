@@ -59,7 +59,10 @@ pub async fn list_meetings(State(state): State<AppState>) -> (StatusCode, Json<s
 
     // Attach transcripts + issue data to each meeting
     for meeting in meetings.iter_mut() {
-        let meeting_id = meeting.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let meeting_id = meeting
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let Some(mid) = meeting_id {
             let transcripts = load_transcripts(&conn, &mid);
             let obj = meeting.as_object_mut().unwrap();
@@ -236,7 +239,7 @@ pub async fn create_issues(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -257,13 +260,13 @@ pub async fn create_issues(
 
     // Get issue repo from kv_meta or request body
     let repo: Option<String> = body.repo.clone().or_else(|| {
-            conn.query_row(
-                "SELECT value FROM kv_meta WHERE key = ?1",
-                [&format!("meeting_issue_repo:{id}")],
-                |row| row.get(0),
-            )
-            .ok()
-        });
+        conn.query_row(
+            "SELECT value FROM kv_meta WHERE key = ?1",
+            [&format!("meeting_issue_repo:{id}")],
+            |row| row.get(0),
+        )
+        .ok()
+    });
 
     let Some(repo) = repo else {
         return (
@@ -342,7 +345,11 @@ pub async fn create_issues(
         }
 
         // Extract first line as title
-        let title = summary.lines().next().unwrap_or("Meeting action item").trim();
+        let title = summary
+            .lines()
+            .next()
+            .unwrap_or("Meeting action item")
+            .trim();
         let body_text = if summary.lines().count() > 1 {
             summary.lines().skip(1).collect::<Vec<_>>().join("\n")
         } else {
@@ -352,14 +359,7 @@ pub async fn create_issues(
         // Create GitHub issue
         let output = std::process::Command::new("gh")
             .args([
-                "issue",
-                "create",
-                "--repo",
-                &repo,
-                "--title",
-                title,
-                "--body",
-                &body_text,
+                "issue", "create", "--repo", &repo, "--title", title, "--body", &body_text,
             ])
             .output();
 
@@ -390,7 +390,10 @@ pub async fn create_issues(
     }
 
     let total = results.len() as i64;
-    let discarded = results.iter().filter(|r| r["discarded"].as_bool().unwrap_or(false)).count() as i64;
+    let discarded = results
+        .iter()
+        .filter(|r| r["discarded"].as_bool().unwrap_or(false))
+        .count() as i64;
     let pending = total - created - failed - discarded;
 
     (
@@ -436,7 +439,7 @@ pub async fn discard_issue(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -457,7 +460,9 @@ pub async fn discard_issue(
 
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "meeting": meeting, "summary": {"total": 0, "created": 0, "failed": 0, "discarded": 1, "pending": 0, "all_created": false, "all_resolved": false}})),
+        Json(
+            json!({"ok": true, "meeting": meeting, "summary": {"total": 0, "created": 0, "failed": 0, "discarded": 1, "pending": 0, "all_created": false, "all_resolved": false}}),
+        ),
     )
 }
 
@@ -472,7 +477,7 @@ pub async fn discard_all_issues(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -554,7 +559,9 @@ pub async fn start_meeting(
             let body = resp.text().await.unwrap_or_default();
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": format!("Discord send failed: {status} {body}")})),
+                Json(
+                    json!({"ok": false, "error": format!("Discord send failed: {status} {body}")}),
+                ),
             )
         }
         Err(e) => (

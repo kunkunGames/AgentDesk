@@ -3,11 +3,21 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Command;
 
 use super::AppState;
+
+fn sqlite_datetime_to_millis(value: &str) -> Option<i64> {
+    if let Ok(ts) = DateTime::parse_from_rfc3339(value) {
+        return Some(ts.timestamp_millis());
+    }
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|ts| DateTime::<Utc>::from_naive_utc_and_offset(ts, Utc).timestamp_millis())
+}
 
 /// GET /api/streaks
 pub async fn streaks(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
@@ -154,7 +164,7 @@ pub async fn achievements(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -186,7 +196,7 @@ pub async fn achievements(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -197,7 +207,8 @@ pub async fn achievements(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "🤖".to_string()),
+                row.get::<_, Option<String>>(4)?
+                    .unwrap_or_else(|| "🤖".to_string()),
             ))
         })
         .ok()
@@ -224,7 +235,10 @@ pub async fn achievements(
         }
     }
 
-    (StatusCode::OK, Json(json!({ "achievements": achievements })))
+    (
+        StatusCode::OK,
+        Json(json!({ "achievements": achievements })),
+    )
 }
 
 /// GET /api/activity-heatmap?date=2026-03-19
@@ -247,19 +261,9 @@ pub async fn activity_heatmap(
         }
     };
 
-    let date = params.date.unwrap_or_else(|| {
-        // 오늘 날짜 (UTC)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let days = now / 86400;
-        let y = 1970 + days / 365;
-        let rem = days % 365;
-        let m = 1 + rem / 30;
-        let d = 1 + rem % 30;
-        format!("{y:04}-{m:02}-{d:02}")
-    });
+    let date = params
+        .date
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
 
     // 시간대별 에이전트 활동 집계 (task_dispatches 기반)
     let mut hours: Vec<serde_json::Value> = Vec::with_capacity(24);
@@ -335,67 +339,154 @@ pub async fn audit_logs(
     };
 
     let limit = params.limit.unwrap_or(20);
+    let audit_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM audit_logs", [], |row| row.get(0))
+        .unwrap_or(0);
 
-    // audit_logs 테이블에서 읽기 (schema.rs에서 CREATE TABLE IF NOT EXISTS로 생성)
-    let mut conditions = Vec::new();
-    let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    let mut idx = 1;
+    let logs = if audit_count > 0 {
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
 
-    if let Some(ref et) = params.entity_type {
-        conditions.push(format!("entity_type = ?{idx}"));
-        bind_values.push(Box::new(et.clone()));
-        idx += 1;
-    }
-    if let Some(ref eid) = params.entity_id {
-        conditions.push(format!("entity_id = ?{idx}"));
-        bind_values.push(Box::new(eid.clone()));
-        idx += 1;
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    let sql = format!(
-        "SELECT id, entity_type, entity_id, action, timestamp, actor
-         FROM audit_logs
-         {where_clause}
-         ORDER BY timestamp DESC
-         LIMIT ?{idx}"
-    );
-    bind_values.push(Box::new(limit));
-
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("query prepare failed: {e}")})),
-            );
+        if let Some(ref et) = params.entity_type {
+            conditions.push(format!("entity_type = ?{idx}"));
+            bind_values.push(Box::new(et.clone()));
+            idx += 1;
         }
-    };
+        if let Some(ref eid) = params.entity_id {
+            conditions.push(format!("entity_id = ?{idx}"));
+            bind_values.push(Box::new(eid.clone()));
+            idx += 1;
+        }
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-        bind_values.iter().map(|v| v.as_ref()).collect();
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
 
-    let rows = stmt
-        .query_map(params_ref.as_slice(), |row| {
+        let sql = format!(
+            "SELECT id, entity_type, entity_id, action, timestamp, actor
+             FROM audit_logs
+             {where_clause}
+             ORDER BY timestamp DESC
+             LIMIT ?{idx}"
+        );
+        bind_values.push(Box::new(limit));
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("query prepare failed: {e}")})),
+                );
+            }
+        };
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|v| v.as_ref()).collect();
+
+        stmt.query_map(params_ref.as_slice(), |row| {
+            let entity_type = row
+                .get::<_, Option<String>>(1)?
+                .unwrap_or_else(|| "system".to_string());
+            let entity_id = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let action = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "updated".to_string());
+            let created_raw = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let actor = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            let created_at = sqlite_datetime_to_millis(&created_raw).unwrap_or(0);
+            let summary = if entity_id.is_empty() {
+                format!("{entity_type} {action}")
+            } else {
+                format!("{entity_type}:{entity_id} {action}")
+            };
             Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "entityType": row.get::<_, Option<String>>(1)?,
-                "entityId": row.get::<_, Option<String>>(2)?,
-                "action": row.get::<_, Option<String>>(3)?,
-                "timestamp": row.get::<_, Option<String>>(4)?,
-                "actor": row.get::<_, Option<String>>(5)?,
+                "id": row.get::<_, i64>(0)?.to_string(),
+                "actor": actor,
+                "action": action,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "summary": summary,
+                "created_at": created_at,
             }))
         })
-        .ok();
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default()
+    } else {
+        if let Some(ref entity_type) = params.entity_type {
+            if entity_type != "kanban_card" {
+                return (StatusCode::OK, Json(json!({ "logs": [] })));
+            }
+        }
 
-    let logs = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-        None => Vec::new(),
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(ref card_id) = params.entity_id {
+            conditions.push(format!("card_id = ?{idx}"));
+            bind_values.push(Box::new(card_id.clone()));
+            idx += 1;
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT id, card_id, from_status, to_status, source, created_at
+             FROM kanban_audit_logs
+             {where_clause}
+             ORDER BY created_at DESC
+             LIMIT ?{idx}"
+        );
+        bind_values.push(Box::new(limit));
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::OK, Json(json!({ "logs": [] }))),
+        };
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|v| v.as_ref()).collect();
+
+        stmt.query_map(params_ref.as_slice(), |row| {
+            let card_id = row.get::<_, String>(1)?;
+            let from_status = row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "unknown".to_string());
+            let to_status = row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "unknown".to_string());
+            let actor = row
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| "hook".to_string());
+            let created_raw = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            let created_at = sqlite_datetime_to_millis(&created_raw).unwrap_or(0);
+            Ok(json!({
+                "id": format!("kanban-{}", row.get::<_, i64>(0)?),
+                "actor": actor.clone(),
+                "action": format!("{from_status}->{to_status}"),
+                "entity_type": "kanban_card",
+                "entity_id": card_id,
+                "summary": format!("{from_status} -> {to_status}"),
+                "metadata": {
+                    "from_status": from_status,
+                    "to_status": to_status,
+                    "source": actor,
+                },
+                "created_at": created_at,
+            }))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default()
     };
 
     (StatusCode::OK, Json(json!({ "logs": logs })))
@@ -427,22 +518,20 @@ pub async fn machine_status() -> (StatusCode, Json<serde_json::Value>) {
 
 /// GET /api/rate-limits
 /// Returns cached rate limit data from rate_limit_cache table.
-pub async fn rate_limits(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn rate_limits(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
-    let mut stmt = match conn.prepare(
-        "SELECT provider, data, fetched_at FROM rate_limit_cache ORDER BY provider",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT provider, data, fetched_at FROM rate_limit_cache ORDER BY provider")
+    {
         Ok(s) => s,
         Err(_) => return (StatusCode::OK, Json(json!({"providers": []}))),
     };

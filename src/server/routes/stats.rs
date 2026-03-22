@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 
 use super::AppState;
 
@@ -59,102 +60,172 @@ pub async fn get_stats(
         }
     };
 
-    // ── agents stats ──
-    let total: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM agents WHERE {}", agent_where("id")),
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let agents_sql = format!(
+        "SELECT id, name, name_ko, avatar_emoji, xp, department, status
+         FROM agents WHERE {} ORDER BY id",
+        agent_where("id")
+    );
+    let mut agents_stmt = match conn.prepare(&agents_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("query prepare failed: {e}")})),
+            );
+        }
+    };
 
-    let working: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM agents WHERE status = 'working' AND {}",
-                agent_where("id")
-            ),
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let agent_rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+    )> = agents_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, f64>(4).unwrap_or(0.0) as i64,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
 
-    let idle = total - working;
+    let mut working_session_stmt = match conn.prepare(
+        "SELECT DISTINCT agent_id
+         FROM sessions
+         WHERE agent_id IS NOT NULL
+           AND status != 'disconnected'
+           AND (status = 'working' OR active_dispatch_id IS NOT NULL)",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("query prepare failed: {e}")})),
+            );
+        }
+    };
+    let working_session_agents: HashSet<String> = working_session_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    let total = agent_rows.len() as i64;
+    let mut working = 0i64;
+    let mut on_break = 0i64;
+    let mut offline = 0i64;
+    let mut idle = 0i64;
+
+    for (agent_id, _, _, _, _, _, base_status) in &agent_rows {
+        let effective_working =
+            working_session_agents.contains(agent_id) || base_status.as_deref() == Some("working");
+        if effective_working {
+            working += 1;
+            continue;
+        }
+        match base_status.as_deref() {
+            Some("break") => on_break += 1,
+            Some("offline") => offline += 1,
+            _ => idle += 1,
+        }
+    }
 
     // ── top_agents (by XP, top 10) ──
-    let top_agents = {
-        let sql = format!(
-            "SELECT id, name, name_ko, avatar_emoji, xp
-             FROM agents WHERE {} ORDER BY xp DESC LIMIT 10",
-            agent_where("id")
-        );
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "name": row.get::<_, String>(1)?,
-                    "name_ko": row.get::<_, Option<String>>(2)?,
-                    "avatar_emoji": row.get::<_, Option<String>>(3)?,
-                    "stats_xp": row.get::<_, f64>(4).unwrap_or(0.0) as i64,
-                    "stats_tasks_done": 0,
-                    "stats_tokens": 0,
-                }))
+    let mut top_agents_src = agent_rows.clone();
+    top_agents_src.sort_by(|a, b| b.4.cmp(&a.4).then_with(|| a.0.cmp(&b.0)));
+    let top_agents: Vec<serde_json::Value> = top_agents_src
+        .into_iter()
+        .take(10)
+        .map(|(id, name, name_ko, avatar_emoji, xp, _, _)| {
+            json!({
+                "id": id,
+                "name": name,
+                "name_ko": name_ko,
+                "avatar_emoji": avatar_emoji,
+                "stats_xp": xp,
+                "stats_tasks_done": 0,
+                "stats_tokens": 0,
             })
-            .ok()
-            .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-        rows
-    };
+        })
+        .collect();
 
     // ── departments stats ──
     let departments = {
-        let dept_filter = if params.office_id.is_some() {
-            format!(
-                "WHERE d.id IN (SELECT DISTINCT oa.department_id FROM office_agents oa WHERE oa.office_id = '{}' AND oa.department_id IS NOT NULL)",
-                params
-                    .office_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .replace('\'', "''")
-            )
-        } else {
-            String::new()
+        let mut stats_by_dept: HashMap<String, (i64, i64, i64)> = HashMap::new();
+        for (agent_id, _, _, _, xp, department_id, base_status) in &agent_rows {
+            let Some(dept_id) = department_id else {
+                continue;
+            };
+            let entry = stats_by_dept.entry(dept_id.clone()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.2 += *xp;
+            let effective_working = working_session_agents.contains(agent_id)
+                || base_status.as_deref() == Some("working");
+            if effective_working {
+                entry.1 += 1;
+            }
+        }
+
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut dept_sql = String::from("SELECT id, name, name_ko, icon, color FROM departments");
+        if let Some(ref oid) = params.office_id {
+            dept_sql.push_str(
+                " WHERE id IN (
+                    SELECT DISTINCT department_id
+                    FROM office_agents
+                    WHERE office_id = ?1 AND department_id IS NOT NULL
+                )",
+            );
+            bind_values.push(Box::new(oid.clone()));
+        }
+        dept_sql.push_str(" ORDER BY sort_order, id");
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|v| v.as_ref()).collect();
+        let mut stmt = match conn.prepare(&dept_sql) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("query prepare failed: {e}")})),
+                );
+            }
         };
-        let sql = format!(
-            "SELECT d.id, d.name, d.name_ko, d.icon, d.color,
-                    (SELECT COUNT(*) FROM agents a WHERE a.department = d.id AND {agent_filter}) as total_agents,
-                    (SELECT COUNT(*) FROM agents a WHERE a.department = d.id AND a.status = 'working' AND {agent_filter}) as working_agents,
-                    (SELECT COALESCE(SUM(a.xp), 0) FROM agents a WHERE a.department = d.id AND {agent_filter}) as sum_xp
-             FROM departments d {dept_filter}
-             ORDER BY d.sort_order, d.id",
-            agent_filter = agent_where("a.id"),
-            dept_filter = dept_filter,
-        );
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let rows: Vec<serde_json::Value> = stmt
-            .query_map([], |row| {
-                Ok(json!({
-                    "id": row.get::<_, String>(0)?,
-                    "name": row.get::<_, Option<String>>(1)?,
-                    "name_ko": row.get::<_, Option<String>>(2)?,
-                    "icon": row.get::<_, Option<String>>(3)?,
-                    "color": row.get::<_, Option<String>>(4)?,
-                    "total_agents": row.get::<_, i64>(5).unwrap_or(0),
-                    "working_agents": row.get::<_, i64>(6).unwrap_or(0),
-                    "sum_xp": row.get::<_, i64>(7).unwrap_or(0),
-                }))
-            })
-            .ok()
-            .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-        rows
+        stmt.query_map(params_ref.as_slice(), |row| {
+            let dept_id: String = row.get(0)?;
+            let stats = stats_by_dept.get(&dept_id).copied().unwrap_or((0, 0, 0));
+            Ok(json!({
+                "id": dept_id,
+                "name": row.get::<_, Option<String>>(1)?,
+                "name_ko": row.get::<_, Option<String>>(2)?,
+                "icon": row.get::<_, Option<String>>(3)?,
+                "color": row.get::<_, Option<String>>(4)?,
+                "total_agents": stats.0,
+                "working_agents": stats.1,
+                "sum_xp": stats.2,
+            }))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default()
     };
 
     // ── dispatched_count ──
     let dispatched_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE active_dispatch_id IS NOT NULL",
+            "SELECT COUNT(*) FROM sessions
+             WHERE status != 'disconnected'
+               AND (status = 'working' OR active_dispatch_id IS NOT NULL)",
             [],
             |row| row.get(0),
         )
@@ -235,6 +306,7 @@ pub async fn get_stats(
                     Ok(json!({
                         "github_repo": row.get::<_, String>(0)?,
                         "open_count": row.get::<_, i64>(1)?,
+                        "pressure_count": row.get::<_, i64>(1)?,
                     }))
                 })
                 .ok()
@@ -271,8 +343,8 @@ pub async fn get_stats(
                 "total": total,
                 "working": working,
                 "idle": idle,
-                "break": 0,
-                "offline": 0,
+                "break": on_break,
+                "offline": offline,
             },
             "top_agents": top_agents,
             "departments": departments,

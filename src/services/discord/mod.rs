@@ -1,3 +1,4 @@
+mod adk_session;
 mod commands;
 mod formatting;
 mod handoff;
@@ -6,7 +7,6 @@ mod inflight;
 mod meeting;
 mod metrics;
 mod org_schema;
-mod adk_session;
 mod prompt_builder;
 mod recovery;
 pub(crate) mod restart_report;
@@ -40,6 +40,9 @@ use crate::services::codex;
 use crate::services::provider::ProviderKind;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
+use adk_session::{
+    build_adk_session_key, derive_adk_session_info, parse_dispatch_id, post_adk_session_status,
+};
 use formatting::{
     BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
     format_tool_input, normalize_empty_lines, remove_reaction_raw, send_long_message_raw,
@@ -48,9 +51,6 @@ use formatting::{
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
     InflightTurnState, clear_inflight_state, load_inflight_states, save_inflight_state,
-};
-use adk_session::{
-    build_adk_session_key, derive_adk_session_info, parse_dispatch_id, post_adk_session_status,
 };
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
@@ -2583,10 +2583,7 @@ fn enrich_role_map_with_channel_ids() {
             if entry.get("channelId").is_some() {
                 continue;
             }
-            let role_id = entry
-                .get("roleId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let role_id = entry.get("roleId").and_then(|v| v.as_str()).unwrap_or("");
             let entry_provider = entry.get("provider").and_then(|v| v.as_str());
 
             let candidates: Vec<(&String, &serde_json::Value)> = by_id
@@ -2638,7 +2635,10 @@ fn enrich_role_map_with_channel_ids() {
     }
 
     // Pass 2: apply mappings
-    if let Some(by_name) = json.get_mut("byChannelName").and_then(|v| v.as_object_mut()) {
+    if let Some(by_name) = json
+        .get_mut("byChannelName")
+        .and_then(|v| v.as_object_mut())
+    {
         for (name, ch_id) in &mappings {
             if let Some(entry) = by_name.get_mut(name) {
                 if let Some(obj) = entry.as_object_mut() {

@@ -406,7 +406,12 @@ pub async fn agent_signal(
     // Find active card for this agent
     let conn = match state.db.lock() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
     };
 
     let card_id: Option<String> = conn
@@ -418,18 +423,25 @@ pub async fn agent_signal(
         .ok();
 
     let Some(card_id) = card_id else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no active card for agent"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no active card for agent"})),
+        );
     };
 
     conn.execute(
         "UPDATE kanban_cards SET blocked_reason = ?1 WHERE id = ?2",
         rusqlite::params![reason, card_id],
-    ).ok();
+    )
+    .ok();
     drop(conn);
 
     let _ = crate::kanban::transition_status(&state.db, &state.engine, &card_id, "blocked");
 
-    (StatusCode::OK, Json(json!({"ok": true, "card_id": card_id, "signal": signal})))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "card_id": card_id, "signal": signal})),
+    )
 }
 
 /// GET /api/agent-channels
@@ -439,7 +451,12 @@ pub async fn agent_channels(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
     };
 
     let mut stmt = conn

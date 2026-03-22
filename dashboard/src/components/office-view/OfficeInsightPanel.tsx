@@ -78,6 +78,29 @@ export default function OfficeInsightPanel({
     .filter((entry) => entry.warnings.length > 0);
   const recentNotifications = notifications.slice(0, 4);
   const recentChanges = auditLogs.slice(0, 4);
+  const fallbackNotifications: Notification[] =
+    agents
+      .filter((agent) => agent.status === "working")
+      .slice(0, 4)
+      .map((agent, idx) => ({
+        id: `working-${agent.id}-${idx}`,
+        message: `${agent.alias || agent.name_ko || agent.name}: ${agent.session_info || (isKo ? "작업 중" : "Working")}`,
+        type: "info",
+        ts: Date.now(),
+      }));
+  const changeFallbackNotifications: Notification[] =
+    recentChanges.map((item, idx) => ({
+      id: `change-${item.id}-${idx}`,
+      message: item.summary,
+      type: "info",
+      ts: item.created_at,
+    }));
+  const visibleNotifications =
+    recentNotifications.length > 0
+      ? recentNotifications
+      : fallbackNotifications.length > 0
+        ? fallbackNotifications
+        : changeFallbackNotifications;
   const rootClassName = docked
     ? "relative z-20 w-full pointer-events-auto"
     : "relative z-20 mb-3 px-3 pt-3 pointer-events-auto sm:absolute sm:left-auto sm:right-3 sm:top-3 sm:mb-0 sm:w-[min(22rem,calc(100vw-1.5rem))] sm:px-0 sm:pt-0";
@@ -147,14 +170,14 @@ export default function OfficeInsightPanel({
 
           {mobileExpanded ? (
             <div className="mt-3 max-h-[38vh] space-y-3 overflow-y-auto pr-1">
-              <InsightCard title={isKo ? "최근 이벤트" : "Recent Activity"} count={recentNotifications.length}>
-                {recentNotifications.length === 0 ? (
+              <InsightCard title={isKo ? "최근 이벤트" : "Recent Activity"} count={visibleNotifications.length}>
+                {visibleNotifications.length === 0 ? (
                   <div className="mt-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                     {isKo ? "표시할 런타임 이벤트가 없습니다" : "No runtime events"}
                   </div>
                 ) : (
                   <div className="mt-2 space-y-2">
-                    {recentNotifications.map((item) => (
+                    {visibleNotifications.map((item) => (
                       <EventRow
                         key={item.id}
                         title={item.message}
@@ -245,14 +268,14 @@ export default function OfficeInsightPanel({
           <MiniRateLimitBar isKo={isKo} />
         </section>
 
-        <InsightCard title={isKo ? "최근 이벤트" : "Recent Activity"} count={recentNotifications.length}>
-          {recentNotifications.length === 0 ? (
+        <InsightCard title={isKo ? "최근 이벤트" : "Recent Activity"} count={visibleNotifications.length}>
+          {visibleNotifications.length === 0 ? (
             <div className="mt-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
               {isKo ? "표시할 런타임 이벤트가 없습니다" : "No runtime events"}
             </div>
           ) : (
             <div className="mt-2 space-y-2">
-              {recentNotifications.map((item) => (
+              {visibleNotifications.map((item) => (
                 <EventRow
                   key={item.id}
                   title={item.message}

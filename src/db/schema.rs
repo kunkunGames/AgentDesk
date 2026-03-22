@@ -41,6 +41,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE kanban_cards ADD COLUMN deferred_dod_json TEXT;");
     let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN sprite_number INTEGER DEFAULT NULL;");
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN description TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN system_prompt TEXT;");
 
     // Office/department extended columns
     let _ = conn.execute_batch("ALTER TABLE offices ADD COLUMN name_ko TEXT;");

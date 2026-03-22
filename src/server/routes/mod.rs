@@ -8,7 +8,6 @@ pub mod discord;
 pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod docs;
-pub mod onboarding;
 pub mod github;
 pub mod github_dashboard;
 pub mod kanban;
@@ -16,6 +15,7 @@ pub mod kanban_repos;
 pub mod meetings;
 pub mod messages;
 pub mod offices;
+pub mod onboarding;
 pub mod pipeline;
 pub mod review_verdict;
 pub mod reviews;
@@ -54,9 +54,20 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
         )
         // Onboarding
         .route("/onboarding/status", get(onboarding::status))
-        .route("/onboarding/validate-token", post(onboarding::validate_token))
+        .route(
+            "/onboarding/validate-token",
+            post(onboarding::validate_token),
+        )
         .route("/onboarding/channels", get(onboarding::channels))
         .route("/onboarding/complete", post(onboarding::complete))
+        .route(
+            "/onboarding/check-provider",
+            post(onboarding::check_provider),
+        )
+        .route(
+            "/onboarding/generate-prompt",
+            post(onboarding::generate_prompt),
+        )
         .route("/agent-channels", get(agents::agent_channels))
         .route("/agents/{id}/offices", get(agents::agent_offices))
         .route("/agents/{id}/signal", post(agents::agent_signal))
@@ -275,7 +286,10 @@ pub fn api_router(db: Db, engine: PolicyEngine) -> Router {
         .route("/docs", get(docs::api_docs))
         // Review verdict
         .route("/review-verdict", post(review_verdict::submit_verdict))
-        .route("/review-decision", post(review_verdict::submit_review_decision))
+        .route(
+            "/review-decision",
+            post(review_verdict::submit_review_decision),
+        )
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .with_state(state)
 }

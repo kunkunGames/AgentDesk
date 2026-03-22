@@ -267,12 +267,24 @@ pub(super) async fn restore_inflight_turns(
             .output_path
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| if !fallback_output.is_empty() { Some(fallback_output.clone()) } else { None });
+            .or_else(|| {
+                if !fallback_output.is_empty() {
+                    Some(fallback_output.clone())
+                } else {
+                    None
+                }
+            });
         let input_fifo_path = state
             .input_fifo_path
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| if !fallback_input.is_empty() { Some(fallback_input.clone()) } else { None });
+            .or_else(|| {
+                if !fallback_input.is_empty() {
+                    Some(fallback_input.clone())
+                } else {
+                    None
+                }
+            });
         // Check exit reason file for post-mortem diagnostics
         if let Some(ref op) = output_path {
             let exit_reason_path = format!("{}.exit_reason", op);

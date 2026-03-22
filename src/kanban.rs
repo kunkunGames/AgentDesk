@@ -4,8 +4,8 @@
 //! This ensures hooks fire, auto-queue syncs, and notifications are sent.
 
 use crate::db::Db;
-use crate::engine::hooks::Hook;
 use crate::engine::PolicyEngine;
+use crate::engine::hooks::Hook;
 use anyhow::Result;
 use serde_json::json;
 
@@ -41,9 +41,7 @@ pub fn transition_status_with_opts(
     source: &str,
     force: bool,
 ) -> Result<TransitionResult> {
-    let conn = db
-        .lock()
-        .map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
+    let conn = db.lock().map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
 
     // Get current status
     let old_status: String = conn
@@ -82,14 +80,25 @@ pub fn transition_status_with_opts(
 
         if !has_dispatch {
             // Log violation
-            log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no dispatch");
+            log_audit(
+                &conn,
+                card_id,
+                &old_status,
+                new_status,
+                source,
+                "BLOCKED: no dispatch",
+            );
             tracing::warn!(
                 "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
-                old_status, new_status, card_id, source
+                old_status,
+                new_status,
+                card_id,
+                source
             );
             return Err(anyhow::anyhow!(
                 "Status transition {} → {} requires an active dispatch. Use dispatch lifecycle or PMD force override.",
-                old_status, new_status
+                old_status,
+                new_status
             ));
         }
     }
@@ -102,10 +111,18 @@ pub fn transition_status_with_opts(
             "review" | "blocked" | "pending_decision" | "done"
         )
     {
-        log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: review required");
+        log_audit(
+            &conn,
+            card_id,
+            &old_status,
+            new_status,
+            source,
+            "BLOCKED: review required",
+        );
         tracing::warn!(
             "[kanban] Blocked invalid transition {} → done for card {} (must go through review)",
-            old_status, card_id
+            old_status,
+            card_id
         );
         return Err(anyhow::anyhow!(
             "Cannot transition from {} to done directly. Must go through review first.",
@@ -188,13 +205,7 @@ pub struct TransitionResult {
 
 /// Fire hooks for a status transition that already happened in the DB.
 /// Use this when the DB UPDATE was done elsewhere (e.g., update_card with mixed fields).
-pub fn fire_transition_hooks(
-    db: &Db,
-    engine: &PolicyEngine,
-    card_id: &str,
-    from: &str,
-    to: &str,
-) {
+pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &str, to: &str) {
     if from == to {
         return;
     }
@@ -205,18 +216,15 @@ pub fn fire_transition_hooks(
     }
 
     // Capture pre-hook dispatch ID to detect new dispatches created by hooks
-    let pre_dispatch_id: Option<String> = db
-        .lock()
+    let pre_dispatch_id: Option<String> = db.lock().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
         .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
-                [card_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten()
-        });
+        .flatten()
+    });
 
     // Sync auto_queue_entries + GitHub on terminal status
     if to == "done" {
@@ -302,7 +310,7 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
                      COALESCE(kc.github_issue_url, ''), kc.github_issue_number \
                      FROM task_dispatches td \
                      JOIN kanban_cards kc ON td.kanban_card_id = kc.id \
-                     WHERE td.status = 'pending' AND td.created_at > datetime('now', '-5 seconds')"
+                     WHERE td.status = 'pending' AND td.created_at > datetime('now', '-5 seconds')",
                 )
                 .ok();
             stmt.as_mut()
@@ -350,19 +358,18 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
             "discord_channel_id"
         };
 
-        let channel_id: Option<String> = db
-            .lock()
+        let channel_id: Option<String> = db.lock().ok().and_then(|conn| {
+            conn.query_row(
+                &format!("SELECT {col} FROM agents WHERE id = ?1"),
+                [agent_id],
+                |row| row.get(0),
+            )
             .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    &format!("SELECT {col} FROM agents WHERE id = ?1"),
-                    [agent_id],
-                    |row| row.get(0),
-                )
-                .ok()
-            });
+        });
 
-        let Some(channel_id) = channel_id else { continue };
+        let Some(channel_id) = channel_id else {
+            continue;
+        };
         let channel_num: Option<u64> = channel_id
             .parse()
             .ok()
@@ -395,7 +402,9 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
             let client = reqwest::Client::new();
             for (ch, message) in notifications {
                 let _ = client
-                    .post(format!("https://discord.com/api/v10/channels/{ch}/messages"))
+                    .post(format!(
+                        "https://discord.com/api/v10/channels/{ch}/messages"
+                    ))
                     .header("Authorization", format!("Bot {}", token))
                     .json(&serde_json::json!({"content": message}))
                     .send()
@@ -445,9 +454,13 @@ fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
             let comment = "🔍 칸반 상태: **review** (카운터모델 리뷰 진행 중)";
             let _ = std::process::Command::new("gh")
                 .args([
-                    "issue", "comment", &num.to_string(),
-                    "--repo", &repo,
-                    "--body", comment,
+                    "issue",
+                    "comment",
+                    &num.to_string(),
+                    "--repo",
+                    &repo,
+                    "--body",
+                    comment,
                 ])
                 .output();
         }
@@ -479,6 +492,23 @@ fn log_audit(
     conn.execute(
         "INSERT INTO kanban_audit_logs (card_id, from_status, to_status, source, result) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![card_id, from, to, source, result],
+    )
+    .ok();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT,
+            entity_id   TEXT,
+            action      TEXT,
+            timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+            actor       TEXT
+        )",
+    )
+    .ok();
+    conn.execute(
+        "INSERT INTO audit_logs (entity_type, entity_id, action, actor)
+         VALUES ('kanban_card', ?1, ?2, ?3)",
+        rusqlite::params![card_id, format!("{from}->{to} ({result})"), source],
     )
     .ok();
 }

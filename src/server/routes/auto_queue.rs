@@ -150,7 +150,7 @@ pub async fn generate(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -190,7 +190,7 @@ pub async fn generate(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
 
@@ -199,7 +199,8 @@ pub async fn generate(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "medium".to_string()),
+                row.get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "medium".to_string()),
             ))
         })
         .ok()
@@ -236,7 +237,10 @@ pub async fn generate(
                 .unwrap_or_default();
             card_summaries.push(format!(
                 "- #{} {} (priority: {}, agent: {})",
-                issue_num.unwrap_or(0), title, priority, agent_id
+                issue_num.unwrap_or(0),
+                title,
+                priority,
+                agent_id
             ));
         }
 
@@ -250,7 +254,12 @@ pub async fn generate(
         // Async: send PMD request via announce bot
         tokio::spawn(async move {
             let config = crate::config::load_graceful();
-            let token = match config.discord.bots.get("announce").or_else(|| config.discord.bots.get("command")) {
+            let token = match config
+                .discord
+                .bots
+                .get("announce")
+                .or_else(|| config.discord.bots.get("command"))
+            {
                 Some(bot) => bot.token.clone(),
                 None => return,
             };
@@ -268,17 +277,22 @@ pub async fn generate(
                 })
             };
             let Some(km_channel) = km_channel else {
-                tracing::warn!("[auto-queue] No kanban_manager_channel_id configured, skipping PM request");
+                tracing::warn!(
+                    "[auto-queue] No kanban_manager_channel_id configured, skipping PM request"
+                );
                 return;
             };
 
             // Resolve channel name to ID if needed
             let km_channel_num: u64 = match km_channel.parse() {
                 Ok(n) => n,
-                Err(_) => match crate::server::routes::dispatches::resolve_channel_alias_pub(&km_channel) {
-                    Some(n) => n,
-                    None => return,
-                },
+                Err(_) => {
+                    match crate::server::routes::dispatches::resolve_channel_alias_pub(&km_channel)
+                    {
+                        Some(n) => n,
+                        None => return,
+                    }
+                }
             };
 
             let message = format!(
@@ -294,7 +308,9 @@ pub async fn generate(
 
             let client = reqwest::Client::new();
             let _ = client
-                .post(format!("https://discord.com/api/v10/channels/{km_channel_num}/messages"))
+                .post(format!(
+                    "https://discord.com/api/v10/channels/{km_channel_num}/messages"
+                ))
                 .header("Authorization", format!("Bot {}", token))
                 .json(&serde_json::json!({"content": message}))
                 .send()
@@ -353,10 +369,7 @@ pub async fn generate(
                         .flatten();
                     if let Some(meta) = metadata {
                         // Parse #N references from metadata
-                        for cap in regex::Regex::new(r"#(\d+)")
-                            .unwrap()
-                            .captures_iter(&meta)
-                        {
+                        for cap in regex::Regex::new(r"#(\d+)").unwrap().captures_iter(&meta) {
                             if let Ok(n) = cap[1].parse::<i64>() {
                                 deps.push(n);
                             }
@@ -453,7 +466,10 @@ pub async fn generate(
 
     let run = run_to_json(&conn, &run_id);
 
-    (StatusCode::OK, Json(json!({ "run": run, "entries": entries })))
+    (
+        StatusCode::OK,
+        Json(json!({ "run": run, "entries": entries })),
+    )
 }
 
 /// POST /api/auto-queue/activate
@@ -468,7 +484,7 @@ pub async fn activate(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -590,7 +606,11 @@ pub async fn activate(
             };
             if let Some((dispatch_id, title)) = info {
                 super::dispatches::send_dispatch_to_discord(
-                    &db_clone, &agent_id_c, &title, &card_id_c, &dispatch_id,
+                    &db_clone,
+                    &agent_id_c,
+                    &title,
+                    &card_id_c,
+                    &dispatch_id,
                 )
                 .await;
             }
@@ -641,7 +661,7 @@ pub async fn status(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -691,8 +711,7 @@ pub async fn status(
              LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id \
              WHERE e.run_id = ?1",
         );
-        let mut entry_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(run_id.clone())];
+        let mut entry_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(run_id.clone())];
         if let Some(ref agent_id) = query.agent_id {
             entry_sql.push_str(&format!(" AND e.agent_id = ?{}", entry_params.len() + 1));
             entry_params.push(Box::new(agent_id.clone()));
@@ -723,9 +742,9 @@ pub async fn status(
     for entry in &entries {
         let agent = entry["agent_id"].as_str().unwrap_or("unknown").to_string();
         let status = entry["status"].as_str().unwrap_or("pending");
-        let counter = agents.entry(agent).or_insert_with(|| {
-            json!({"pending": 0, "dispatched": 0, "done": 0, "skipped": 0})
-        });
+        let counter = agents
+            .entry(agent)
+            .or_insert_with(|| json!({"pending": 0, "dispatched": 0, "done": 0, "skipped": 0}));
         if let Some(obj) = counter.as_object_mut() {
             if let Some(val) = obj.get_mut(status) {
                 *val = json!(val.as_i64().unwrap_or(0) + 1);
@@ -750,7 +769,7 @@ pub async fn skip_entry(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -784,7 +803,7 @@ pub async fn update_run(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -816,16 +835,14 @@ pub async fn update_run(
 
 /// POST /api/auto-queue/reset
 /// Clear all entries and complete all active runs.
-pub async fn reset(
-    State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn reset(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -861,7 +878,7 @@ pub async fn reorder(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -960,7 +977,9 @@ pub async fn enqueue(
     if already {
         return (
             StatusCode::OK,
-            Json(json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true})),
+            Json(
+                json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true}),
+            ),
         );
     }
 
@@ -1008,7 +1027,7 @@ pub async fn submit_order(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
-            )
+            );
         }
     };
     ensure_tables(&conn);
@@ -1067,10 +1086,7 @@ pub async fn submit_order(
     }
 
     // Update run: pending → active, set rationale
-    let rationale = body
-        .rationale
-        .as_deref()
-        .unwrap_or("PMD 분석 완료");
+    let rationale = body.rationale.as_deref().unwrap_or("PMD 분석 완료");
     conn.execute(
         "UPDATE auto_queue_runs SET status = 'active', ai_rationale = ?1 WHERE id = ?2",
         rusqlite::params![rationale, run_id],
