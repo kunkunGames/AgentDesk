@@ -291,15 +291,15 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
         return;
     }
 
-    // Also check new dispatches created for OTHER cards (e.g., auto-queue dispatching next card)
-    // We look for any pending dispatches created in the last few seconds
-    let pending_dispatches: Vec<(String, String, String, String, Option<i64>)> = db
+    // Check for any new pending dispatches created in the last few seconds
+    let pending_dispatches: Vec<(String, String, String, String, String, Option<i64>)> = db
         .lock()
         .ok()
         .map(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT td.id, td.to_agent_id, kc.title, COALESCE(kc.github_issue_url, ''), kc.github_issue_number \
+                    "SELECT td.id, td.to_agent_id, td.dispatch_type, kc.title, \
+                     COALESCE(kc.github_issue_url, ''), kc.github_issue_number \
                      FROM task_dispatches td \
                      JOIN kanban_cards kc ON td.kanban_card_id = kc.id \
                      WHERE td.status = 'pending' AND td.created_at > datetime('now', '-5 seconds')"
@@ -308,7 +308,14 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
             stmt.as_mut()
                 .and_then(|s| {
                     s.query_map([], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
                     })
                     .ok()
                 })
@@ -317,63 +324,82 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
         })
         .unwrap_or_default();
 
-    for (dispatch_id, agent_id, title, issue_url, issue_num) in pending_dispatches {
-        // Send Discord notification via announce bot
-        let config = crate::config::load_graceful();
-        let token = match config
-            .discord
-            .bots
-            .get("announce")
-            .or_else(|| config.discord.bots.get("command"))
-        {
-            Some(bot) => bot.token.clone(),
-            None => continue,
+    if pending_dispatches.is_empty() {
+        return;
+    }
+
+    // Collect notification data before spawning async task
+    let config = crate::config::load_graceful();
+    let token = match config
+        .discord
+        .bots
+        .get("announce")
+        .or_else(|| config.discord.bots.get("command"))
+    {
+        Some(bot) => bot.token.clone(),
+        None => return,
+    };
+
+    let mut notifications: Vec<(u64, String)> = Vec::new();
+    for (dispatch_id, agent_id, dispatch_type, title, issue_url, issue_num) in &pending_dispatches {
+        // Determine channel: review → alt, implementation → primary
+        let use_alt = dispatch_type == "review" || dispatch_type == "review-decision";
+        let col = if use_alt {
+            "discord_channel_alt"
+        } else {
+            "discord_channel_id"
         };
 
-        // Look up agent's channel
         let channel_id: Option<String> = db
             .lock()
             .ok()
             .and_then(|conn| {
                 conn.query_row(
-                    "SELECT discord_channel_id FROM agents WHERE id = ?1",
-                    [&agent_id],
+                    &format!("SELECT {col} FROM agents WHERE id = ?1"),
+                    [agent_id],
                     |row| row.get(0),
                 )
                 .ok()
             });
 
         let Some(channel_id) = channel_id else { continue };
-
-        // Resolve channel name to ID
         let channel_num: Option<u64> = channel_id
             .parse()
             .ok()
             .or_else(|| crate::server::routes::dispatches::resolve_channel_alias_pub(&channel_id));
-
         let Some(ch) = channel_num else { continue };
 
-        // Format message
         let issue_link = if let (Some(num), false) = (issue_num, issue_url.is_empty()) {
             format!("\n[{title} #{num}](<{issue_url}>)")
         } else {
             String::new()
         };
-        let message = format!("DISPATCH:{dispatch_id} - {title}{issue_link}");
 
-        // Synchronous HTTP send (we're not in async context)
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = rt {
-                handle.spawn(async move {
-                    let client = reqwest::Client::new();
-                    let _ = client
-                        .post(format!("https://discord.com/api/v10/channels/{ch}/messages"))
-                        .header("Authorization", format!("Bot {token}"))
-                        .json(&serde_json::json!({"content": message}))
-                        .send()
-                        .await;
-                });
+        let message = if use_alt {
+            format!(
+                "DISPATCH:{dispatch_id} - {title}\n\
+                 ⚠️ 검토 전용 — 작업 착수 금지\n\
+                 코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요.{issue_link}"
+            )
+        } else {
+            format!("DISPATCH:{dispatch_id} - {title}{issue_link}")
+        };
+
+        notifications.push((ch, message));
+    }
+
+    // Use tokio Handle::current() to spawn async notifications from sync context
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let token = token.clone();
+        handle.spawn(async move {
+            let client = reqwest::Client::new();
+            for (ch, message) in notifications {
+                let _ = client
+                    .post(format!("https://discord.com/api/v10/channels/{ch}/messages"))
+                    .header("Authorization", format!("Bot {}", token))
+                    .json(&serde_json::json!({"content": message}))
+                    .send()
+                    .await;
             }
         });
     }
