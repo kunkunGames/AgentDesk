@@ -24,7 +24,11 @@ pub fn create_dispatch(
 
     // For review dispatches, inject reviewed_commit (HEAD) as server-side source of truth
     let context_str = if dispatch_type == "review" {
-        let mut ctx_val = context.clone();
+        let mut ctx_val = if context.is_object() {
+            context.clone()
+        } else {
+            json!({})
+        };
         if let Some(obj) = ctx_val.as_object_mut() {
             if !obj.contains_key("reviewed_commit") {
                 let repo_dir = std::env::var("AGENTDESK_REPO_DIR")
