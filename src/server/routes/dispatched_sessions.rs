@@ -363,7 +363,7 @@ pub async fn cleanup_sessions(
     };
 
     match conn.execute(
-        "DELETE FROM dispatched_sessions WHERE status = 'disconnected'",
+        "DELETE FROM sessions WHERE status = 'disconnected'",
         [],
     ) {
         Ok(n) => (StatusCode::OK, Json(json!({"ok": true, "deleted": n}))),

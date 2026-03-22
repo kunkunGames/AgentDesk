@@ -230,8 +230,8 @@ var rules = {
       // Check 2: Minimum work duration (2 min)
       var MIN_WORK_SEC = 120;
       var sessions = agentdesk.db.query(
-        "SELECT MIN(started_at) as first_work, MAX(last_seen_at) as last_seen " +
-        "FROM dispatched_sessions WHERE active_dispatch_id = ? AND status = 'working'",
+        "SELECT MIN(created_at) as first_work, MAX(last_heartbeat) as last_seen " +
+        "FROM sessions WHERE active_dispatch_id = ? AND status = 'working'",
         [dispatch.id]
       );
       if (sessions.length > 0 && sessions[0].first_work && sessions[0].last_seen) {

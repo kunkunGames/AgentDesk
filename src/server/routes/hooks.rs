@@ -104,7 +104,7 @@ pub async fn disconnect_session(
     };
 
     match conn.execute(
-        "UPDATE dispatched_sessions SET status = 'disconnected' WHERE session_key = ?1",
+        "UPDATE sessions SET status = 'disconnected' WHERE session_key = ?1",
         [&session_key],
     ) {
         Ok(0) => (
