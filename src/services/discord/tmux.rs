@@ -489,13 +489,15 @@ pub(super) async fn tmux_output_watcher(
 
     // Kill dead tmux session to prevent accumulation (especially for thread sessions
     // which are created per-dispatch and would otherwise linger for 24h).
-    if tmux_session_exists(&tmux_session_name) && !tmux_session_has_live_pane(&tmux_session_name) {
-        record_tmux_exit_reason(&tmux_session_name, "watcher cleanup: dead session after turn");
+    {
         let sess = tmux_session_name.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &sess])
-                .output();
+            if tmux_session_exists(&sess) && !tmux_session_has_live_pane(&sess) {
+                record_tmux_exit_reason(&sess, "watcher cleanup: dead session after turn");
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &sess])
+                    .output();
+            }
         })
         .await;
     }

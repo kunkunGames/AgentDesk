@@ -7,8 +7,22 @@ PLIST_REL="com.agentdesk.release"
 
 echo "═══ ADK Promote Dev → Release ═══"
 
+# Safety check: review must be passed (unless --skip-review is passed)
+if [[ "${1:-}" != "--skip-review" ]]; then
+    # Check if the latest commit has a review-passed marker
+    LAST_COMMIT=$(cd "$HOME/AgentDesk" && git rev-parse HEAD 2>/dev/null)
+    REVIEW_MARKER="$ADK_DEV/runtime/review_passed/$LAST_COMMIT"
+    if [ ! -f "$REVIEW_MARKER" ]; then
+        echo "✗ Review not passed for commit $LAST_COMMIT — aborting promotion"
+        echo "  Run counter-review first, or use --skip-review to override"
+        exit 1
+    fi
+    echo "▸ Review passed for $LAST_COMMIT"
+fi
+
 # Safety check: dev must be healthy
-if ! curl -s --max-time 5 http://127.0.0.1:8799/api/health | grep -q '"ok":true'; then
+DEV_PORT="${AGENTDESK_DEV_PORT:-8797}"
+if ! curl -s --max-time 5 "http://127.0.0.1:${DEV_PORT}/api/health" | grep -q '"status":"healthy"'; then
     echo "✗ Dev is not healthy — aborting promotion"
     exit 1
 fi
@@ -49,8 +63,9 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
 sleep 3
 
 # Health check
-if curl -s --max-time 5 http://127.0.0.1:8791/api/health | grep -q '"ok":true'; then
-    echo "✓ Release is healthy on :8791"
+REL_PORT="${AGENTDESK_REL_PORT:-8798}"
+if curl -s --max-time 5 "http://127.0.0.1:${REL_PORT}/api/health" | grep -q '"status":"healthy"'; then
+    echo "✓ Release is healthy on :${REL_PORT}"
 else
     echo "✗ Release health check failed — check logs: $ADK_REL/logs/"
     exit 1

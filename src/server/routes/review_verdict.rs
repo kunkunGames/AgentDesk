@@ -5,6 +5,23 @@ use serde_json::json;
 use super::AppState;
 use crate::engine::hooks::Hook;
 
+/// Write a review-passed marker file for the current HEAD commit.
+/// `promote-release.sh` checks this before allowing release promotion.
+fn stamp_review_passed_marker() {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(commit) = commit else { return };
+    let root = std::env::var("AGENTDESK_ROOT_DIR")
+        .unwrap_or_else(|_| format!("{}/.adk/release", env!("HOME")));
+    let dir = format!("{}/runtime/review_passed", root);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(format!("{}/{}", dir, commit), "");
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VerdictItem {
     pub category: Option<String>,
@@ -141,6 +158,11 @@ pub async fn submit_verdict(
         tokio::spawn(async move {
             super::dispatches::handle_completed_dispatch_followups(&db_clone, &dispatch_id).await;
         });
+    }
+
+    // When review passes, stamp a marker so promote-release.sh can verify
+    if body.overall == "pass" || body.overall == "approved" {
+        stamp_review_passed_marker();
     }
 
     (
