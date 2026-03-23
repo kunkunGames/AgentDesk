@@ -1046,7 +1046,6 @@ pub async fn enqueue(
         }
     };
 
-    // Validate card is 'ready' BEFORE creating/finding a run to prevent empty active runs
     let card_status: String = conn
         .query_row(
             "SELECT status FROM kanban_cards WHERE id = ?1",
@@ -1054,6 +1053,39 @@ pub async fn enqueue(
             |row| row.get(0),
         )
         .unwrap_or_default();
+
+    // Find existing active run (do NOT create yet — preserves idempotent retry)
+    let existing_run_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM auto_queue_runs WHERE status = 'active' AND (repo = ?1 OR repo IS NULL) AND (agent_id = ?2 OR agent_id IS NULL) ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![body.repo, agent_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Check if already in queue (idempotent retry) — must run BEFORE status validation
+    if let Some(ref rid) = existing_run_id {
+        let already: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND kanban_card_id = ?2 AND status = 'pending'",
+                rusqlite::params![rid, card_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if already {
+            return (
+                StatusCode::OK,
+                Json(
+                    json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true}),
+                ),
+            );
+        }
+    }
+
+    // Validate card is 'ready' AFTER duplicate check to preserve idempotent retry,
+    // but BEFORE run creation to prevent empty active runs
     if card_status != "ready" {
         return (
             StatusCode::BAD_REQUEST,
@@ -1065,41 +1097,16 @@ pub async fn enqueue(
         );
     }
 
-    // Find or create active run (filtered by repo/agent)
-    let run_id: String = conn
-        .query_row(
-            "SELECT id FROM auto_queue_runs WHERE status = 'active' AND (repo = ?1 OR repo IS NULL) AND (agent_id = ?2 OR agent_id IS NULL) ORDER BY created_at DESC LIMIT 1",
-            rusqlite::params![body.repo, agent_id],
-            |row| row.get(0),
+    // Use existing run or create new one (only reached when card is ready)
+    let run_id = existing_run_id.unwrap_or_else(|| {
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, body.repo, agent_id],
         )
-        .unwrap_or_else(|_| {
-            let id = uuid::Uuid::new_v4().to_string();
-            conn.execute(
-                "INSERT INTO auto_queue_runs (id, repo, agent_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, body.repo, agent_id],
-            )
-            .ok();
-            id
-        });
-
-    // Check if already in queue (idempotent retry)
-    let already: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND kanban_card_id = ?2 AND status = 'pending'",
-            rusqlite::params![run_id, card_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-
-    if already {
-        return (
-            StatusCode::OK,
-            Json(
-                json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true}),
-            ),
-        );
-    }
+        .ok();
+        id
+    });
 
     let entry_id = uuid::Uuid::new_v4().to_string();
     let max_rank: i64 = conn
