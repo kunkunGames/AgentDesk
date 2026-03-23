@@ -560,21 +560,30 @@ pub(super) async fn send_dispatch_to_discord(
         .unwrap_or_default()
     };
 
-    // For review dispatches, look up the reviewed commit SHA from dispatch context
-    let reviewed_commit: Option<String> = if use_alt {
+    // For review dispatches, look up reviewed commit SHA and target provider from context
+    let (reviewed_commit, target_provider): (Option<String>, Option<String>) = if use_alt {
         let conn = match db.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
-        conn.query_row(
-            "SELECT json_extract(context, '$.reviewed_commit') FROM task_dispatches WHERE id = ?1",
-            [dispatch_id],
-            |row| row.get::<_, Option<String>>(0),
+        let ctx: Option<String> = conn
+            .query_row(
+                "SELECT context FROM task_dispatches WHERE id = ?1",
+                [dispatch_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        let ctx_val: serde_json::Value = ctx
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::json!({}));
+        (
+            ctx_val.get("reviewed_commit").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ctx_val.get("target_provider").and_then(|v| v.as_str()).map(|s| s.to_string()),
         )
-        .ok()
-        .flatten()
     } else {
-        None
+        (None, None)
     };
 
     let message = format_dispatch_message(
@@ -584,6 +593,7 @@ pub(super) async fn send_dispatch_to_discord(
         issue_number,
         use_alt,
         reviewed_commit.as_deref(),
+        target_provider.as_deref(),
     );
 
     // Send via Discord HTTP API using the announce bot
@@ -1329,6 +1339,7 @@ fn format_dispatch_message(
     issue_number: Option<i64>,
     use_alt: bool,
     reviewed_commit: Option<&str>,
+    target_provider: Option<&str>,
 ) -> String {
     // Format issue link as markdown hyperlink with angle brackets to suppress embed
     let issue_link = match (issue_url, issue_number) {
@@ -1351,6 +1362,9 @@ fn format_dispatch_message(
         let commit_arg = reviewed_commit
             .map(|c| format!(r#","commit":"{}""#, c))
             .unwrap_or_default();
+        let provider_arg = target_provider
+            .map(|p| format!(r#","provider":"{}""#, p))
+            .unwrap_or_default();
         message.push_str(&format!(
             "\n---\n\
              응답 첫 줄에 반드시 `VERDICT: pass|improve|reject|rework` 중 하나를 적으세요.\n\
@@ -1358,7 +1372,7 @@ fn format_dispatch_message(
              리뷰 완료 후 verdict API를 호출하세요:\n\
              `curl -sf -X POST http://127.0.0.1:8791/api/review-verdict \
              -H \"Content-Type: application/json\" \
-             -d '{{\"dispatch_id\":\"{dispatch_id}\",\"overall\":\"pass|improve|reject|rework\"{commit_arg}}}'`"
+             -d '{{\"dispatch_id\":\"{dispatch_id}\",\"overall\":\"pass|improve|reject|rework\"{commit_arg}{provider_arg}}}'`"
         ));
         message
     } else if !issue_link.is_empty() {
@@ -1588,6 +1602,7 @@ mod tests {
             Some(19),
             true,
             Some("abc123"),
+            Some("codex"),
         );
 
         assert!(message.starts_with("DISPATCH:dispatch-1 - [Review R1] card-1"));
@@ -1601,6 +1616,8 @@ mod tests {
         assert!(message.contains("VERDICT: pass|improve|reject|rework"));
         assert!(message.contains("dispatch-1"));
         assert!(message.contains("abc123"));
+        // Provider must be included in the curl example
+        assert!(message.contains(r#""provider":"codex""#));
     }
 
     #[test]
@@ -1611,6 +1628,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             None,
         );
 
@@ -1628,6 +1646,7 @@ mod tests {
             Some("https://github.com/itismyfield/AgentDesk/issues/24"),
             Some(24),
             false,
+            None,
             None,
         );
 
