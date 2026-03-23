@@ -48,8 +48,16 @@ pub struct AppState {
     pub health_registry: Option<Arc<HealthRegistry>>,
 }
 
-pub fn api_router(db: Db, engine: PolicyEngine, health_registry: Option<Arc<HealthRegistry>>) -> Router {
-    let state = AppState { db, engine, health_registry };
+pub fn api_router(
+    db: Db,
+    engine: PolicyEngine,
+    health_registry: Option<Arc<HealthRegistry>>,
+) -> Router {
+    let state = AppState {
+        db,
+        engine,
+        health_registry,
+    };
 
     Router::new()
         .route("/health", get(health_api::health_handler))
@@ -114,7 +122,10 @@ pub fn api_router(db: Db, engine: PolicyEngine, health_registry: Option<Arc<Heal
         .route("/kanban-cards/{id}/defer-dod", patch(kanban::defer_dod))
         .route("/kanban-cards/{id}/reviews", get(kanban::list_card_reviews))
         .route("/kanban-cards/{id}/audit-log", get(kanban::card_audit_log))
-        .route("/kanban-cards/{id}/comments", get(kanban::card_github_comments))
+        .route(
+            "/kanban-cards/{id}/comments",
+            get(kanban::card_github_comments),
+        )
         // Kanban repos
         .route(
             "/kanban-repos",
@@ -141,6 +152,14 @@ pub fn api_router(db: Db, engine: PolicyEngine, health_registry: Option<Arc<Heal
         .route(
             "/dispatches/{id}",
             get(dispatches::get_dispatch).patch(dispatches::update_dispatch),
+        )
+        .route(
+            "/internal/link-dispatch-thread",
+            post(dispatches::link_dispatch_thread),
+        )
+        .route(
+            "/internal/card-thread",
+            get(dispatches::get_card_thread),
         )
         // Pipeline stages (legacy path)
         .route(
@@ -316,18 +335,18 @@ async fn list_agents(
     State(state): State<AppState>,
     Query(params): Query<ListAgentsQuery>,
 ) -> Json<serde_json::Value> {
-    let agents =
-        match state.db.lock() {
-            Ok(conn) => {
-                let (sql, bind_values): (String, Vec<String>) =
-                    if let Some(ref oid) = params.office_id {
-                        (
+    let agents = match state.db.lock() {
+        Ok(conn) => {
+            let (sql, bind_values): (String, Vec<String>) = if let Some(ref oid) = params.office_id
+            {
+                (
                     "SELECT a.id, a.name, a.name_ko, a.provider, a.department, a.avatar_emoji,
                             a.discord_channel_id, a.discord_channel_alt, a.status, a.xp,
                             a.sprite_number, d.name, d.name, NULL, a.created_at,
                             (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                             (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
-                            (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task
+                            (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
+                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
                      FROM agents a
                      INNER JOIN office_agents oa ON oa.agent_id = a.id
                      LEFT JOIN departments d ON d.id = a.department
@@ -335,75 +354,77 @@ async fn list_agents(
                      ORDER BY a.id".to_string(),
                     vec![oid.clone()],
                 )
-                    } else {
-                        (
+            } else {
+                (
                     "SELECT a.id, a.name, a.name_ko, a.provider, a.department, a.avatar_emoji,
                             a.discord_channel_id, a.discord_channel_alt, a.status, a.xp,
                             a.sprite_number, d.name, d.name, NULL, a.created_at,
                             (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                             (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
-                            (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task
+                            (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
+                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
                      FROM agents a
                      LEFT JOIN departments d ON d.id = a.department
                      ORDER BY a.id".to_string(),
                     vec![],
                 )
-                    };
+            };
 
-                let mut stmt = match conn.prepare(&sql) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return Json(json!({ "error": format!("query prepare failed: {e}") }));
-                    }
-                };
-
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
-                    .iter()
-                    .map(|v| v as &dyn rusqlite::types::ToSql)
-                    .collect();
-
-                let rows = stmt
-                    .query_map(params_ref.as_slice(), |row| {
-                        let provider = row.get::<_, Option<String>>(3)?;
-                        let discord_channel_alt = row.get::<_, Option<String>>(7)?;
-                        let xp_val = row.get::<_, f64>(9).unwrap_or(0.0) as i64;
-                        Ok(json!({
-                            "id": row.get::<_, String>(0)?,
-                            "name": row.get::<_, String>(1)?,
-                            "name_ko": row.get::<_, Option<String>>(2)?,
-                            "provider": provider,
-                            "cli_provider": provider,
-                            "department": row.get::<_, Option<String>>(4)?,
-                            "department_id": row.get::<_, Option<String>>(4)?,
-                            "avatar_emoji": row.get::<_, Option<String>>(5)?,
-                            "discord_channel_id": row.get::<_, Option<String>>(6)?,
-                            "discord_channel_alt": discord_channel_alt,
-                            "discord_channel_id_codex": discord_channel_alt,
-                            "status": row.get::<_, Option<String>>(8)?,
-                            "xp": xp_val,
-                            "stats_xp": xp_val,
-                            "stats_tasks_done": row.get::<_, i64>(15).unwrap_or(0),
-                            "stats_tokens": row.get::<_, i64>(16).unwrap_or(0),
-                            "sprite_number": row.get::<_, Option<i64>>(10)?,
-                            "department_name": row.get::<_, Option<String>>(11)?,
-                            "department_name_ko": row.get::<_, Option<String>>(12)?,
-                            "department_color": row.get::<_, Option<String>>(13)?,
-                            "created_at": row.get::<_, Option<String>>(14)?,
-                            "alias": serde_json::Value::Null,
-                            "role_id": row.get::<_, Option<String>>(0)?,
-                            "personality": serde_json::Value::Null,
-                            "current_task_id": row.get::<_, Option<String>>(17)?,
-                        }))
-                    })
-                    .ok();
-
-                match rows {
-                    Some(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-                    None => Vec::new(),
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Json(json!({ "error": format!("query prepare failed: {e}") }));
                 }
+            };
+
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::types::ToSql)
+                .collect();
+
+            let rows = stmt
+                .query_map(params_ref.as_slice(), |row| {
+                    let provider = row.get::<_, Option<String>>(3)?;
+                    let discord_channel_alt = row.get::<_, Option<String>>(7)?;
+                    let xp_val = row.get::<_, f64>(9).unwrap_or(0.0) as i64;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "name_ko": row.get::<_, Option<String>>(2)?,
+                        "provider": provider,
+                        "cli_provider": provider,
+                        "department": row.get::<_, Option<String>>(4)?,
+                        "department_id": row.get::<_, Option<String>>(4)?,
+                        "avatar_emoji": row.get::<_, Option<String>>(5)?,
+                        "discord_channel_id": row.get::<_, Option<String>>(6)?,
+                        "discord_channel_alt": discord_channel_alt,
+                        "discord_channel_id_codex": discord_channel_alt,
+                        "status": row.get::<_, Option<String>>(8)?,
+                        "xp": xp_val,
+                        "stats_xp": xp_val,
+                        "stats_tasks_done": row.get::<_, i64>(15).unwrap_or(0),
+                        "stats_tokens": row.get::<_, i64>(16).unwrap_or(0),
+                        "sprite_number": row.get::<_, Option<i64>>(10)?,
+                        "department_name": row.get::<_, Option<String>>(11)?,
+                        "department_name_ko": row.get::<_, Option<String>>(12)?,
+                        "department_color": row.get::<_, Option<String>>(13)?,
+                        "created_at": row.get::<_, Option<String>>(14)?,
+                        "alias": serde_json::Value::Null,
+                        "role_id": row.get::<_, Option<String>>(0)?,
+                        "personality": serde_json::Value::Null,
+                        "current_task_id": row.get::<_, Option<String>>(17)?,
+                        "current_thread_channel_id": row.get::<_, Option<String>>(18)?,
+                    }))
+                })
+                .ok();
+
+            match rows {
+                Some(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
+                None => Vec::new(),
             }
-            Err(_) => Vec::new(),
-        };
+        }
+        Err(_) => Vec::new(),
+    };
 
     Json(json!({ "agents": agents }))
 }
@@ -420,7 +441,8 @@ async fn get_agent(
                         a.sprite_number, d.name, d.name, NULL, a.created_at,
                         (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                         (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
-                        (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task
+                        (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
+                        (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
                  FROM agents a
                  LEFT JOIN departments d ON d.id = a.department
                  WHERE a.id = ?1",
@@ -455,6 +477,7 @@ async fn get_agent(
                         "role_id": row.get::<_, Option<String>>(0)?,
                         "personality": serde_json::Value::Null,
                         "current_task_id": row.get::<_, Option<String>>(17)?,
+                        "current_thread_channel_id": row.get::<_, Option<String>>(18)?,
                     }))
                 },
             );
@@ -887,6 +910,66 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["id"], "a1");
         assert_eq!(agents[0]["name"], "Agent1");
+    }
+
+    #[tokio::test]
+    async fn agents_include_current_thread_channel_id_from_working_session() {
+        let db = test_db();
+        let engine = test_engine(&db);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('a1', 'Agent1', 'codex', 'idle', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, thread_channel_id, last_heartbeat)
+                 VALUES (?1, 'a1', 'codex', 'working', '1485506232256168011', datetime('now'))",
+                ["mac-mini:AgentDesk-codex-adk-cdx-t1485506232256168011"],
+            )
+            .unwrap();
+        }
+
+        let app = api_router(db, engine, None);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(
+            list_json["agents"][0]["current_thread_channel_id"],
+            serde_json::Value::String("1485506232256168011".to_string())
+        );
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agents/a1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(
+            get_json["agent"]["current_thread_channel_id"],
+            serde_json::Value::String("1485506232256168011".to_string())
+        );
     }
 
     #[tokio::test]

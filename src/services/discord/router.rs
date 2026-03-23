@@ -688,6 +688,8 @@ pub(super) async fn handle_text_message(
     // When a dispatch message arrives, create a Discord thread for
     // isolated context.  All subsequent agent output goes to the thread.
     // Skip if already inside a thread (threads cannot nest).
+    // Thread reuse: if the card already has an active_thread_id, redirect
+    // to the existing thread instead of creating a new one.
     let is_already_thread = super::resolve_thread_parent(ctx, channel_id)
         .await
         .is_some();
@@ -700,43 +702,65 @@ pub(super) async fn handle_text_message(
             );
             channel_id
         } else {
-            // Extract short title from "DISPATCH:uuid - title" format
-            let thread_title = user_text
-                .find(" - ")
-                .map(|idx| &user_text[idx + 3..])
-                .unwrap_or("dispatch")
-                .chars()
-                .take(90)
-                .collect::<String>();
-
-            match channel_id
-                .create_thread(
-                    &ctx.http,
-                    poise::serenity_prelude::builder::CreateThread::new(thread_title)
-                        .kind(poise::serenity_prelude::ChannelType::PublicThread)
-                        .auto_archive_duration(
-                            poise::serenity_prelude::AutoArchiveDuration::OneDay,
-                        ),
-                )
-                .await
-            {
-                Ok(thread) => {
+            // Check if card already has an active thread via internal API
+            let existing_thread = lookup_card_thread(shared.api_port, did).await;
+            if let Some(ref existing_tid) = existing_thread {
+                // Try to use the existing thread
+                let tid = ChannelId::new(existing_tid.parse::<u64>().unwrap_or(0));
+                if tid.get() != 0 {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
-                        "  [{ts}] 🧵 Created dispatch thread {} for dispatch {}",
-                        thread.id, did
+                        "  [{ts}] 🧵 Reusing existing thread {} for dispatch {}",
+                        tid, did
                     );
-                    // Bootstrap session for the thread from parent channel
-                    super::bootstrap_thread_session(shared, thread.id, &current_path, ctx).await;
-                    // Record parent→thread mapping so subsequent bot messages
-                    // to the parent are queued instead of starting parallel turns.
-                    shared.dispatch_thread_parents.insert(channel_id, thread.id);
-                    thread.id
+                    super::bootstrap_thread_session(shared, tid, &current_path, ctx).await;
+                    shared.dispatch_thread_parents.insert(channel_id, tid);
+                    tid
+                } else {
+                    channel_id
                 }
-                Err(e) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!("  [{ts}] ⚠ Failed to create dispatch thread: {e}");
-                    channel_id // fallback to main channel
+            } else {
+                // No existing thread — create new
+                let thread_title = user_text
+                    .find(" - ")
+                    .map(|idx| &user_text[idx + 3..])
+                    .unwrap_or("dispatch")
+                    .chars()
+                    .take(90)
+                    .collect::<String>();
+
+                match channel_id
+                    .create_thread(
+                        &ctx.http,
+                        poise::serenity_prelude::builder::CreateThread::new(thread_title)
+                            .kind(poise::serenity_prelude::ChannelType::PublicThread)
+                            .auto_archive_duration(
+                                poise::serenity_prelude::AutoArchiveDuration::OneDay,
+                            ),
+                    )
+                    .await
+                {
+                    Ok(thread) => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] 🧵 Created dispatch thread {} for dispatch {}",
+                            thread.id, did
+                        );
+                        // Bootstrap session for the thread from parent channel
+                        super::bootstrap_thread_session(shared, thread.id, &current_path, ctx)
+                            .await;
+                        // Record parent→thread mapping so subsequent bot messages
+                        // to the parent are queued instead of starting parallel turns.
+                        shared.dispatch_thread_parents.insert(channel_id, thread.id);
+                        // Link thread to card's active_thread_id via internal API
+                        link_dispatch_thread(shared.api_port, did, thread.id.get()).await;
+                        thread.id
+                    }
+                    Err(e) => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!("  [{ts}] ⚠ Failed to create dispatch thread: {e}");
+                        channel_id // fallback to main channel
+                    }
                 }
             }
         }
@@ -2469,6 +2493,44 @@ Any other message is sent to {p}.
     }
 
     Ok(false)
+}
+
+/// Look up the active_thread_id for a dispatch's kanban card via internal API.
+async fn lookup_card_thread(api_port: u16, dispatch_id: &str) -> Option<String> {
+    let url = format!(
+        "http://127.0.0.1:{}/api/internal/card-thread?dispatch_id={}",
+        api_port, dispatch_id
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("active_thread_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Link a newly created dispatch thread to the card's active_thread_id via internal API.
+async fn link_dispatch_thread(api_port: u16, dispatch_id: &str, thread_id: u64) {
+    let url = format!(
+        "http://127.0.0.1:{}/api/internal/link-dispatch-thread",
+        api_port
+    );
+    let _ = reqwest::Client::new()
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .json(&serde_json::json!({
+            "dispatch_id": dispatch_id,
+            "thread_id": thread_id.to_string(),
+        }))
+        .send()
+        .await;
 }
 
 #[cfg(test)]

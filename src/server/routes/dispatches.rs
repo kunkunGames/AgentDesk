@@ -33,6 +33,12 @@ pub struct UpdateDispatchBody {
     pub result: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LinkDispatchThreadBody {
+    pub dispatch_id: String,
+    pub thread_id: String,
+}
+
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/dispatches
@@ -476,10 +482,41 @@ pub(super) async fn send_dispatch_to_discord(
         }
     };
 
-    // Create a thread in the channel (no parent message needed), then send dispatch into the thread.
-    // This avoids dedup issues from sending the same content to both channel and thread.
+    // ── Thread reuse: check if card already has an active thread ──
     let client = reqwest::Client::new();
+    let dispatch_type_label = dispatch_type
+        .as_deref()
+        .unwrap_or("implementation");
 
+    // Try to reuse existing thread for this card
+    let existing_thread_id: Option<String> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        conn.query_row(
+            "SELECT active_thread_id FROM kanban_cards WHERE id = ?1 AND active_thread_id IS NOT NULL",
+            [card_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    if let Some(ref existing_tid) = existing_thread_id {
+        // Try to unarchive and reuse the existing thread
+        if let Some(reused) = try_reuse_thread(
+            &client, &token, existing_tid, channel_id_num,
+            dispatch_type_label, &message, dispatch_id, card_id, db,
+        )
+        .await
+        {
+            if reused {
+                return;
+            }
+        }
+    }
+
+    // No existing thread or reuse failed — create a new thread
     let thread_name = if let Some(num) = issue_number {
         let short: String = title.chars().take(90).collect();
         format!("#{} {}", num, short)
@@ -507,11 +544,16 @@ pub(super) async fn send_dispatch_to_discord(
             if let Ok(thread_body) = tr.json::<serde_json::Value>().await {
                 let thread_id = thread_body.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if !thread_id.is_empty() {
-                    // Save thread_id to the dedicated column
+                    // Save thread_id to the dedicated column and card's active_thread_id
                     if let Ok(conn) = db.lock() {
                         conn.execute(
                             "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
                             rusqlite::params![thread_id, dispatch_id],
+                        )
+                        .ok();
+                        conn.execute(
+                            "UPDATE kanban_cards SET active_thread_id = ?1 WHERE id = ?2",
+                            rusqlite::params![thread_id, card_id],
                         )
                         .ok();
                     }
@@ -600,6 +642,151 @@ pub(super) async fn send_dispatch_to_discord(
     }
 }
 
+/// Try to reuse an existing Discord thread for a dispatch.
+/// Returns `Some(true)` if reuse succeeded, `Some(false)` if the thread exists but is locked,
+/// or `None` if the thread couldn't be accessed (deleted, wrong parent, etc.).
+async fn try_reuse_thread(
+    client: &reqwest::Client,
+    token: &str,
+    thread_id: &str,
+    expected_parent: u64,
+    dispatch_type: &str,
+    message: &str,
+    dispatch_id: &str,
+    card_id: &str,
+    db: &crate::db::Db,
+) -> Option<bool> {
+    // 1. Fetch thread info to verify it exists and belongs to the right parent channel
+    let thread_info_url = format!("https://discord.com/api/v10/channels/{}", thread_id);
+    let resp = client
+        .get(&thread_info_url)
+        .header("Authorization", format!("Bot {}", token))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        tracing::info!("[dispatch] Thread {thread_id} no longer accessible, will create new");
+        // Clear stale active_thread_id
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE kanban_cards SET active_thread_id = NULL WHERE id = ?1",
+                [card_id],
+            )
+            .ok();
+        }
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+
+    // Verify parent channel matches
+    let parent_id = body
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if parent_id != expected_parent {
+        tracing::info!(
+            "[dispatch] Thread {thread_id} parent {parent_id} != expected {expected_parent}, skipping reuse"
+        );
+        return None;
+    }
+
+    // Check if thread is locked — locked threads cannot be reused
+    let metadata = body.get("thread_metadata");
+    let is_locked = metadata
+        .and_then(|m| m.get("locked"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_locked {
+        tracing::info!("[dispatch] Thread {thread_id} is locked, will create new");
+        // Clear stale active_thread_id so next dispatch creates fresh
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE kanban_cards SET active_thread_id = NULL WHERE id = ?1",
+                [card_id],
+            )
+            .ok();
+        }
+        return Some(false);
+    }
+
+    // Unarchive if needed
+    let is_archived = metadata
+        .and_then(|m| m.get("archived"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if is_archived {
+        let unarchive_resp = client
+            .patch(&thread_info_url)
+            .header("Authorization", format!("Bot {}", token))
+            .json(&serde_json::json!({"archived": false}))
+            .send()
+            .await;
+        match unarchive_resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!("[dispatch] Unarchived thread {thread_id} for reuse");
+            }
+            _ => {
+                tracing::warn!("[dispatch] Failed to unarchive thread {thread_id}, will create new");
+                return None;
+            }
+        }
+    }
+
+    // 2. Send separator message to visually distinguish dispatch phases
+    let separator = format!("── {} dispatch ──", dispatch_type);
+    let msg_url = format!(
+        "https://discord.com/api/v10/channels/{}/messages",
+        thread_id
+    );
+    let _ = client
+        .post(&msg_url)
+        .header("Authorization", format!("Bot {}", token))
+        .json(&serde_json::json!({"content": separator}))
+        .send()
+        .await;
+
+    // 3. Send the dispatch message
+    let msg_ok = client
+        .post(&msg_url)
+        .header("Authorization", format!("Bot {}", token))
+        .json(&serde_json::json!({"content": message}))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+
+    if msg_ok {
+        // Update dispatch thread_id and mark as notified
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
+                rusqlite::params![thread_id, dispatch_id],
+            )
+            .ok();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("dispatch_notified:{}", dispatch_id),
+                    dispatch_id
+                ],
+            )
+            .ok();
+        }
+        tracing::info!(
+            "[dispatch] Reused thread {thread_id} for dispatch {dispatch_id}"
+        );
+        Some(true)
+    } else {
+        tracing::warn!(
+            "[dispatch] Failed to send message to reused thread {thread_id}"
+        );
+        None
+    }
+}
+
 /// Send review result notification to the agent's PRIMARY channel.
 /// Called after a counter-model review dispatch completes.
 pub(super) async fn send_review_result_to_primary(
@@ -636,20 +823,83 @@ pub(super) async fn send_review_result_to_primary(
         },
     };
 
+    let token = match crate::credential::read_bot_token("announce") {
+        Some(t) => t,
+        None => return,
+    };
+    let client = reqwest::Client::new();
+
+    // Look up active_thread_id for this card to send to existing thread
+    let active_thread_id: Option<String> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        conn.query_row(
+            "SELECT active_thread_id FROM kanban_cards WHERE id = ?1 AND active_thread_id IS NOT NULL",
+            [card_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    // Determine target: existing thread (if valid) or main channel
+    let target_channel = if let Some(ref tid) = active_thread_id {
+        // Verify thread is accessible and belongs to the right parent
+        let info_url = format!("https://discord.com/api/v10/channels/{}", tid);
+        let valid = match client
+            .get(&info_url)
+            .header("Authorization", format!("Bot {}", &token))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let parent = body
+                        .get("parent_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u64>().ok());
+                    let locked = body
+                        .get("thread_metadata")
+                        .and_then(|m| m.get("locked"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    parent == Some(channel_id_num) && !locked
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if valid {
+            // Unarchive if needed
+            let _ = client
+                .patch(&info_url)
+                .header("Authorization", format!("Bot {}", &token))
+                .json(&serde_json::json!({"archived": false}))
+                .send()
+                .await;
+            tid.clone()
+        } else {
+            format!("{}", channel_id_num)
+        }
+    } else {
+        format!("{}", channel_id_num)
+    };
+    let sending_to_thread = active_thread_id
+        .as_ref()
+        .map(|t| *t == target_channel)
+        .unwrap_or(false);
+
     // For pass verdict, just send a simple notification (no action needed)
     if verdict == "pass" || verdict == "accept" || verdict == "approved" {
         let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
         let message = format!("✅ [리뷰 통과] {title} — done으로 이동{url_line}");
 
-        let token = match crate::credential::read_bot_token("announce") {
-            Some(t) => t,
-            None => return,
-        };
         let url = format!(
             "https://discord.com/api/v10/channels/{}/messages",
-            channel_id_num
+            target_channel
         );
-        let client = reqwest::Client::new();
         let _ = client
             .post(&url)
             .header("Authorization", format!("Bot {}", token))
@@ -661,7 +911,6 @@ pub(super) async fn send_review_result_to_primary(
 
     // For unknown verdict (e.g. session idle auto-completed without verdict submission),
     // notify the original agent to check GitHub comments and decide.
-    // This prevents false-positive "pass" when the review agent didn't actually submit a verdict.
     if verdict == "unknown" {
         let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
         let message = format!(
@@ -670,27 +919,20 @@ pub(super) async fn send_review_result_to_primary(
              GitHub 이슈 코멘트를 확인하고 리뷰 내용이 있으면 반영해주세요.{url_line}"
         );
 
-        let token = match crate::credential::read_bot_token("announce") {
-            Some(t) => t,
-            None => return,
-        };
         let url = format!(
             "https://discord.com/api/v10/channels/{}/messages",
-            channel_id_num
+            target_channel
         );
-        let client = reqwest::Client::new();
         let _ = client
             .post(&url)
             .header("Authorization", format!("Bot {}", token))
             .json(&serde_json::json!({"content": message}))
             .send()
             .await;
-        // Don't create a review-decision dispatch — just notify and let the agent handle it
         return;
     }
 
     // For improve/rework/reject: create a review-decision dispatch to the original agent
-    // This triggers a turn where the agent reads review comments and decides action
     let db_ref = db;
     let dispatch_id = uuid::Uuid::new_v4().to_string();
     {
@@ -725,33 +967,62 @@ pub(super) async fn send_review_result_to_primary(
          • 불수용 → review-decision API에 dismiss 호출{url_line}"
     );
 
-    // Send to primary channel
-    let token = match crate::credential::read_bot_token("announce") {
-        Some(t) => t,
-        None => return,
-    };
-
-    let url = format!(
-        "https://discord.com/api/v10/channels/{}/messages",
-        channel_id_num
-    );
-    let client = reqwest::Client::new();
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bot {}", token))
-        .json(&serde_json::json!({"content": message}))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::info!("[review] Sent review result to {agent_id} (channel {channel_id})");
+    // Send separator + dispatch to existing thread, or just to channel
+    if sending_to_thread {
+        let msg_url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            target_channel
+        );
+        // Separator
+        let _ = client
+            .post(&msg_url)
+            .header("Authorization", format!("Bot {}", token))
+            .json(&serde_json::json!({"content": "── review-decision dispatch ──"}))
+            .send()
+            .await;
+        // Dispatch message
+        let ok = client
+            .post(&msg_url)
+            .header("Authorization", format!("Bot {}", token))
+            .json(&serde_json::json!({"content": message}))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ok {
+            if let Ok(conn) = db.lock() {
+                conn.execute(
+                    "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
+                    rusqlite::params![target_channel, dispatch_id],
+                )
+                .ok();
+            }
+            tracing::info!(
+                "[review] Sent review-decision to existing thread {target_channel} for {agent_id}"
+            );
         }
-        Ok(resp) => {
-            let status = resp.status();
-            tracing::warn!("[review] Discord API error {status}");
-        }
-        Err(e) => {
-            tracing::warn!("[review] Request failed: {e}");
+    } else {
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            target_channel
+        );
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .json(&serde_json::json!({"content": message}))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("[review] Sent review result to {agent_id} (channel {channel_id})");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                tracing::warn!("[review] Discord API error {status}");
+            }
+            Err(e) => {
+                tracing::warn!("[review] Request failed: {e}");
+            }
         }
     }
 }
@@ -828,32 +1099,57 @@ pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, disp
         }
     }
 
-    // Archive thread on dispatch completion
-    let thread_id: Option<String> = {
+    // Archive thread on dispatch completion — but only if the card is done.
+    // When the card has an active lifecycle (not done), keep the thread open for reuse
+    // by subsequent dispatches (rework, review-decision, etc.).
+    let card_status: Option<String> = {
         let conn = match db.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
-        // Check dedicated thread_id column first, fall back to context JSON for legacy dispatches
         conn.query_row(
-            "SELECT COALESCE(thread_id, json_extract(context, '$.thread_id')) FROM task_dispatches WHERE id = ?1",
-            [dispatch_id],
-            |row| row.get::<_, Option<String>>(0),
+            "SELECT status FROM kanban_cards WHERE id = ?1",
+            [&card_id],
+            |row| row.get(0),
         )
         .ok()
-        .flatten()
     };
-    if let Some(ref tid) = thread_id {
-        if let Some(token) = crate::credential::read_bot_token("announce") {
-            let archive_url = format!("https://discord.com/api/v10/channels/{}", tid);
-            let client = reqwest::Client::new();
-            let _ = client
-                .patch(&archive_url)
-                .header("Authorization", format!("Bot {}", token))
-                .json(&serde_json::json!({"archived": true}))
-                .send()
-                .await;
-            tracing::info!("[dispatch] Archived thread {tid} for completed dispatch {dispatch_id}");
+    let should_archive = card_status.as_deref() == Some("done");
+
+    if should_archive {
+        let thread_id: Option<String> = {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            conn.query_row(
+                "SELECT COALESCE(thread_id, json_extract(context, '$.thread_id')) FROM task_dispatches WHERE id = ?1",
+                [dispatch_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        if let Some(ref tid) = thread_id {
+            if let Some(token) = crate::credential::read_bot_token("announce") {
+                let archive_url = format!("https://discord.com/api/v10/channels/{}", tid);
+                let client = reqwest::Client::new();
+                let _ = client
+                    .patch(&archive_url)
+                    .header("Authorization", format!("Bot {}", token))
+                    .json(&serde_json::json!({"archived": true}))
+                    .send()
+                    .await;
+                tracing::info!("[dispatch] Archived thread {tid} for completed dispatch {dispatch_id} (card done)");
+            }
+        }
+        // Clear active_thread_id when card is done
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE kanban_cards SET active_thread_id = NULL WHERE id = ?1",
+                [&card_id],
+            )
+            .ok();
         }
     }
 
@@ -985,6 +1281,102 @@ fn resolve_channel_alias(alias: &str) -> Option<u64> {
     }
 
     None
+}
+
+/// POST /api/internal/link-dispatch-thread
+/// Links a dispatch's kanban card to a Discord thread (sets active_thread_id).
+/// Called by dcserver router.rs when it creates a thread as fallback.
+pub async fn link_dispatch_thread(
+    State(state): State<AppState>,
+    Json(body): Json<LinkDispatchThreadBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    // Look up card_id from the dispatch, then set active_thread_id
+    let card_id: Option<String> = conn
+        .query_row(
+            "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
+            [&body.dispatch_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match card_id {
+        Some(cid) => {
+            conn.execute(
+                "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
+                rusqlite::params![body.thread_id, body.dispatch_id],
+            )
+            .ok();
+            conn.execute(
+                "UPDATE kanban_cards SET active_thread_id = ?1 WHERE id = ?2",
+                rusqlite::params![body.thread_id, cid],
+            )
+            .ok();
+            (StatusCode::OK, Json(json!({"ok": true, "card_id": cid})))
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "dispatch not found"})),
+        ),
+    }
+}
+
+/// GET /api/internal/card-thread?dispatch_id=xxx
+/// Returns the active_thread_id for a dispatch's card (if any).
+pub async fn get_card_thread(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let dispatch_id = match params.get("dispatch_id") {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "dispatch_id required"})),
+            );
+        }
+    };
+
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let result: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT kc.id, kc.active_thread_id \
+             FROM task_dispatches td \
+             JOIN kanban_cards kc ON kc.id = td.kanban_card_id \
+             WHERE td.id = ?1",
+            [dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    match result {
+        Some((card_id, thread_id)) => (
+            StatusCode::OK,
+            Json(json!({"card_id": card_id, "active_thread_id": thread_id})),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "dispatch not found"})),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1244,5 +1636,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(review_status, "pending");
+    }
+
+    #[tokio::test]
+    async fn thread_not_archived_when_card_not_done() {
+        // When an implementation dispatch completes but card is in "review" (not done),
+        // the thread should NOT be archived — it may be reused for rework/review-decision.
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', '123')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, active_thread_id)
+                 VALUES ('card-1', 'In Review', 'review', 'agent-1', 'dispatch-impl', '999888777')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, thread_id, created_at, updated_at)
+                 VALUES ('dispatch-impl', 'card-1', 'agent-1', 'implementation', 'completed', 'card-1', '999888777', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        handle_completed_dispatch_followups(&db, "dispatch-impl").await;
+
+        // active_thread_id should still be set (NOT cleared) because card is not done
+        let conn = db.lock().unwrap();
+        let active_thread: Option<String> = conn
+            .query_row(
+                "SELECT active_thread_id FROM kanban_cards WHERE id = 'card-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_thread, Some("999888777".to_string()));
+    }
+
+    #[tokio::test]
+    async fn thread_archived_and_cleared_when_card_done() {
+        // When a card reaches "done", active_thread_id should be cleared.
+        // (Thread archiving requires Discord API call, but we verify the DB cleanup.)
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', '123')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, active_thread_id)
+                 VALUES ('card-1', 'Done Card', 'done', 'agent-1', 'dispatch-final', '999888777')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, thread_id, created_at, updated_at)
+                 VALUES ('dispatch-final', 'card-1', 'agent-1', 'implementation', 'completed', 'card-1', '999888777', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        handle_completed_dispatch_followups(&db, "dispatch-final").await;
+
+        // active_thread_id should be cleared when card is done
+        let conn = db.lock().unwrap();
+        let active_thread: Option<String> = conn
+            .query_row(
+                "SELECT active_thread_id FROM kanban_cards WHERE id = 'card-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(active_thread.is_none());
     }
 }
