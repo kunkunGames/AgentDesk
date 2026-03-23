@@ -755,12 +755,19 @@ pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, disp
 
     if dispatch_type == "review" {
         let verdict = extract_review_verdict(result_json.as_deref());
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] 🔍 REVIEW-FOLLOWUP: dispatch={dispatch_id} verdict={verdict} result={:?}",
+            result_json.as_deref().unwrap_or("NULL")
+        );
         // Skip Discord notification for auto-completed reviews without an explicit verdict.
         // The policy engine's onDispatchCompleted hook handles those (review-automation.js).
         // Only send_review_result_to_primary for explicit verdicts (pass/improve/reject)
         // submitted via the verdict API — these have a real "verdict" field in the result.
         if verdict != "unknown" {
             send_review_result_to_primary(db, &card_id, &verdict).await;
+        } else {
+            println!("  [{ts}] ⏭ REVIEW-FOLLOWUP: skipping send_review_result_to_primary (verdict=unknown)");
         }
     }
 

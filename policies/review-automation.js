@@ -140,6 +140,16 @@ var reviewAutomation = {
     try { result = JSON.parse(dispatch.result || "{}"); } catch(e) { result = {}; }
     var verdict = result.verdict || result.decision;
 
+    agentdesk.log.info("[review-debug] onDispatchCompleted: dispatch=" + dispatch.id + " type=" + dispatch.dispatch_type + " verdict=" + verdict + " auto_completed=" + result.auto_completed + " result=" + JSON.stringify(result).substring(0, 200));
+
+    // When a review-decision dispatch is auto-completed, do NOT create another
+    // review-decision — that causes an infinite loop.  Only "review" type
+    // dispatches should spawn review-decision followups.
+    if (!verdict && result.auto_completed && dispatch.dispatch_type === "review-decision") {
+      agentdesk.log.info("[review] review-decision auto-completed without verdict — skipping (no infinite loop). dispatch=" + dispatch.id);
+      return;
+    }
+
     // When a review dispatch is auto-completed on session idle without an explicit
     // verdict, create a review-decision dispatch to the original agent so they
     // check the review comments and decide the verdict (agent-in-the-loop).
@@ -171,6 +181,7 @@ var reviewAutomation = {
       return;
     }
 
+    agentdesk.log.info("[review-debug] CALLING processVerdict: card=" + dispatch.kanban_card_id + " verdict=" + verdict);
     processVerdict(dispatch.kanban_card_id, verdict, result);
   },
 

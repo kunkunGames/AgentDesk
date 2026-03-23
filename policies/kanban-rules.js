@@ -118,18 +118,27 @@ var rules = {
                   "--comments", "--json", "comments", "--jq",
                   "[.comments[].body] | map(select(test(\"" + roundPattern + "\"; \"i\"))) | last"
                 ]);
+                agentdesk.log.info("[kanban-debug] gh comment output for dispatch " + payload.dispatch_id + ": " + (ghOutput || "(empty)").substring(0, 300));
                 if (ghOutput && ghOutput.trim()) {
                   var lower = ghOutput.toLowerCase();
                   // Structured verdict markers
                   if (lower.indexOf("verdict: pass") >= 0 || lower.indexOf("verdict: **pass**") >= 0) {
                     verdict = "pass";
+                    agentdesk.log.info("[kanban-debug] MATCHED verdict:pass from comment");
                   } else if (lower.indexOf("verdict: improve") >= 0 || lower.indexOf("verdict: **improve**") >= 0) {
                     verdict = "improve";
+                    agentdesk.log.info("[kanban-debug] MATCHED verdict:improve from comment");
                   } else if (lower.indexOf("✅") >= 0 && lower.indexOf("accept") >= 0) {
                     verdict = "pass";
+                    agentdesk.log.info("[kanban-debug] MATCHED ✅+accept from comment");
                   } else if (lower.indexOf("보완 필요") >= 0 || lower.indexOf("한 번 더") >= 0) {
                     verdict = "improve";
+                    agentdesk.log.info("[kanban-debug] MATCHED 보완필요 from comment");
+                  } else {
+                    agentdesk.log.info("[kanban-debug] NO verdict match in comment");
                   }
+                } else {
+                  agentdesk.log.info("[kanban-debug] gh comment output empty — no match");
                 }
               } catch(e) {
                 agentdesk.log.warn("[kanban] GitHub comment parsing failed: " + e);
