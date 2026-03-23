@@ -934,6 +934,9 @@ pub(super) async fn handle_text_message(
             }
         }
     }
+    if let Some(knowledge) = load_shared_knowledge() {
+        context_chunks.push(knowledge);
+    }
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }

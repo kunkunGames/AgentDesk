@@ -63,6 +63,7 @@ use settings::{
 };
 use shared_memory::{
     append_shared_memory_turn, build_shared_memory_context, latest_shared_memory_ts,
+    load_shared_knowledge,
 };
 #[cfg(unix)]
 use tmux::{
