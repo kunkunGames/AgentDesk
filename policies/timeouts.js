@@ -4,7 +4,7 @@
  *
  * Hook: onTick (1분 간격 — Rust 서버에서 주기적으로 fire)
  *
- * [A] Requested 타임아웃 (45분) → pending_decision
+ * [A] Requested 타임아웃 (45분) → retry_count < 10이면 재시도 대기, ≥ 10이면 pending_decision
  * [B] In-Progress 스테일 (2시간) → blocked
  * [C] 스테일 리뷰 (dispatch 완료인데 verdict 없음) → pending_decision
  * [D] DoD 대기 타임아웃 (15분) → pending_decision
@@ -13,6 +13,7 @@
  * [G] 스테일 디스패치 정리 (24시간) → failed
  * [H] Stale dispatched 큐 엔트리 진행
  * [I-0] 미전송 디스패치 알림 복구 (2분)
+ * [J] Failed 디스패치 자동 재시도 (30초 쿨다운, ~60초 cadence, 최대 10회 + 즉시 Discord 알림)
  * [I] 턴 데드락 감지 + 자동 복구 (15분 주기, 최대 3회 연장 후 강제 중단 + 재디스패치)
  */
 
@@ -318,17 +319,18 @@ var timeouts = {
       }
     }
 
-    // ─── [J] Failed 디스패치 자동 재시도 (30초 간격, 최대 10회) ──
-    // failed 상태의 디스패치 중 retry_count < 10이고 30초 이상 경과한 것을 재시도
+    // ─── [J] Failed 디스패치 자동 재시도 (30초 쿨다운, 최대 10회) ──
+    // failed 상태의 디스패치 중 retry_count < 10이고 30초+ 경과한 것을 재시도.
+    // 실제 cadence는 onTick 60초 간격이므로 ~60-90초.
+    // 10분 윈도우 제거 — latest_dispatch_id 체크로 stale 방지 충분.
     var failedForRetry = agentdesk.db.query(
       "SELECT td.id, td.kanban_card_id, td.to_agent_id, td.dispatch_type, td.title, " +
-      "COALESCE(td.retry_count, 0) as retry_count " +
+      "COALESCE(td.retry_count, 0) as retry_count, kc.github_issue_url, kc.github_issue_number " +
       "FROM task_dispatches td " +
       "JOIN kanban_cards kc ON kc.id = td.kanban_card_id " +
       "WHERE td.status = 'failed' " +
       "AND COALESCE(td.retry_count, 0) < " + MAX_DISPATCH_RETRIES + " " +
       "AND td.updated_at < datetime('now', '-30 seconds') " +
-      "AND td.updated_at > datetime('now', '-10 minutes') " +
       "AND kc.latest_dispatch_id = td.id " +
       "AND kc.status NOT IN ('done', 'pending_decision')"
     );
@@ -350,6 +352,41 @@ var timeouts = {
         agentdesk.log.info("[retry] Auto-retry dispatch for card " + fd.kanban_card_id +
           " — attempt " + newRetryCount + "/" + MAX_DISPATCH_RETRIES +
           " (old: " + fd.id + " → new: " + newDispatchId + ")");
+
+        // Discord 알림 직접 전송 ([I-0] 2분 대기 없이 즉시 알림)
+        var retryAgent = agentdesk.db.query(
+          "SELECT discord_channel_id, discord_channel_alt FROM agents WHERE id = ?",
+          [fd.to_agent_id]
+        );
+        if (retryAgent.length > 0) {
+          var useAlt = (fd.dispatch_type === "review");
+          var retryChannelId = useAlt ? retryAgent[0].discord_channel_alt : retryAgent[0].discord_channel_id;
+          if (retryChannelId) {
+            var issueLink = fd.github_issue_url
+              ? "\n[" + fd.title + " #" + fd.github_issue_number + "](<" + fd.github_issue_url + ">)"
+              : "";
+            var retryPrefix = useAlt
+              ? "DISPATCH:" + newDispatchId + " - " + fd.title + "\n⚠️ 검토 전용 — 작업 착수 금지\n코드 리뷰만 수행하고 GitHub 이슈에 코멘트로 피드백해주세요."
+              : "DISPATCH:" + newDispatchId + " - " + fd.title;
+            try {
+              var retryPort = agentdesk.config.get("server_port") || 8791;
+              var sendRes = agentdesk.http.post("http://127.0.0.1:" + retryPort + "/api/send", {
+                target: "channel:" + retryChannelId,
+                content: retryPrefix + issueLink,
+                source: "retry",
+                bot: "announce"
+              });
+              if (sendRes && !sendRes.error) {
+                agentdesk.db.execute(
+                  "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
+                  ["dispatch_notified:" + newDispatchId, newDispatchId]
+                );
+              }
+            } catch(ne) {
+              agentdesk.log.warn("[retry] Discord notify failed for " + newDispatchId + ": " + ne + " — [I-0] will recover");
+            }
+          }
+        }
       } catch (e) {
         agentdesk.log.error("[retry] Failed to create retry dispatch for card " +
           fd.kanban_card_id + ": " + e);
