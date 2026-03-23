@@ -591,6 +591,20 @@ pub async fn activate(
                 .ok()
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
+
+            // If no ready cards exist, complete the empty run instead of leaving it active
+            if ready_cards.is_empty() {
+                conn.execute(
+                    "UPDATE auto_queue_runs SET status = 'completed', completed_at = datetime('now') WHERE id = ?1",
+                    [&run_id],
+                ).ok();
+                tracing::info!("[auto-queue] Completed empty run {run_id} — no ready cards to populate");
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "dispatched": [], "count": 0, "message": "Empty run completed — no ready cards" })),
+                );
+            }
+
             for (rank, (card_id, agent_id)) in ready_cards.iter().enumerate() {
                 let entry_id = uuid::Uuid::new_v4().to_string();
                 let agent = if agent_id.is_empty() {
@@ -1032,6 +1046,25 @@ pub async fn enqueue(
         }
     };
 
+    // Validate card is 'ready' BEFORE creating/finding a run to prevent empty active runs
+    let card_status: String = conn
+        .query_row(
+            "SELECT status FROM kanban_cards WHERE id = ?1",
+            [&card_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if card_status != "ready" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("card status is '{}', only 'ready' cards can be enqueued", card_status),
+                "card_id": card_id,
+                "status": card_status,
+            })),
+        );
+    }
+
     // Find or create active run (filtered by repo/agent)
     let run_id: String = conn
         .query_row(
@@ -1049,7 +1082,7 @@ pub async fn enqueue(
             id
         });
 
-    // Check if already in queue BEFORE status validation (idempotent retry)
+    // Check if already in queue (idempotent retry)
     let already: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND kanban_card_id = ?2 AND status = 'pending'",
@@ -1065,25 +1098,6 @@ pub async fn enqueue(
             Json(
                 json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true}),
             ),
-        );
-    }
-
-    // Only allow 'ready' cards into the queue (new enqueue only)
-    let card_status: String = conn
-        .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
-            [&card_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-    if card_status != "ready" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("card status is '{}', only 'ready' cards can be enqueued", card_status),
-                "card_id": card_id,
-                "status": card_status,
-            })),
         );
     }
 
