@@ -604,6 +604,36 @@ pub(super) async fn send_review_result_to_primary(
         return;
     }
 
+    // For unknown verdict (e.g. session idle auto-completed without verdict submission),
+    // notify the original agent to check GitHub comments and decide.
+    // This prevents false-positive "pass" when the review agent didn't actually submit a verdict.
+    if verdict == "unknown" {
+        let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
+        let message = format!(
+            "⚠️ [리뷰 verdict 미제출] {title}\n\
+             카운터모델이 verdict를 제출하지 않고 세션이 종료됐습니다.\n\
+             GitHub 이슈 코멘트를 확인하고 리뷰 내용이 있으면 반영해주세요.{url_line}"
+        );
+
+        let token = match crate::credential::read_bot_token("announce") {
+            Some(t) => t,
+            None => return,
+        };
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            channel_id_num
+        );
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .json(&serde_json::json!({"content": message}))
+            .send()
+            .await;
+        // Don't create a review-decision dispatch — just notify and let the agent handle it
+        return;
+    }
+
     // For improve/rework/reject: create a review-decision dispatch to the original agent
     // This triggers a turn where the agent reads review comments and decides action
     let db_ref = db;
@@ -684,7 +714,10 @@ fn extract_review_verdict(result_json: Option<&str>) -> String {
                         .map(|s| s.to_string())
                 })
         })
-        .unwrap_or_else(|| "pass".to_string())
+        // NEVER default to "pass" — missing verdict means the review agent
+        // did not submit a verdict (e.g. session idle auto-complete).
+        // Returning "unknown" forces the followup path to request human/agent review.
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, dispatch_id: &str) {
@@ -930,8 +963,13 @@ mod tests {
     }
 
     #[test]
-    fn review_verdict_extraction_defaults_to_pass() {
-        assert_eq!(extract_review_verdict(None), "pass");
+    fn review_verdict_extraction_defaults_to_unknown() {
+        // Missing verdict must NOT default to "pass" — that caused false review passes
+        assert_eq!(extract_review_verdict(None), "unknown");
+        assert_eq!(
+            extract_review_verdict(Some(r#"{"auto_completed":true}"#)),
+            "unknown"
+        );
         assert_eq!(
             extract_review_verdict(Some(r#"{"decision":"dismiss"}"#)),
             "dismiss"
@@ -939,6 +977,10 @@ mod tests {
         assert_eq!(
             extract_review_verdict(Some(r#"{"verdict":"improve"}"#)),
             "improve"
+        );
+        assert_eq!(
+            extract_review_verdict(Some(r#"{"verdict":"pass"}"#)),
+            "pass"
         );
     }
 
