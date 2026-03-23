@@ -12,10 +12,38 @@ function sendDiscordReview(target, content, bot) {
   try {
     var port = agentdesk.config.get("server_port") || 8791;
     agentdesk.http.post("http://127.0.0.1:" + port + "/api/send", {
-      target: target, content: content, bot: bot || "announce"
+      target: target, content: content, source: "review-automation", bot: bot || "announce"
     });
   } catch (e) {
     agentdesk.log.warn("[review] Discord send failed: " + e);
+  }
+}
+
+function notifyPmdPendingDecision(cardId, reason) {
+  var cards = agentdesk.db.query(
+    "SELECT title, github_issue_number, github_issue_url, assigned_agent_id FROM kanban_cards WHERE id = ?",
+    [cardId]
+  );
+  if (cards.length === 0) return;
+  var card = cards[0];
+  var issueNum = card.github_issue_number || "?";
+  var issueUrl = card.github_issue_url || "";
+  var msg = "PM 판단 필요 — #" + issueNum + " " + card.title +
+    "\n\n사유: " + reason +
+    (issueUrl ? "\nGitHub: " + issueUrl : "") +
+    "\n\n/api/pm-decision API로 처리해주세요. (resume/rework/dismiss/requeue)";
+
+  // Send to PMD channel — find pmd_channel from agents or use config
+  var pmdChannel = agentdesk.config.get("pmd_channel_id");
+  if (!pmdChannel) {
+    // Fallback: find agent with 'pmd' in id
+    var pmdAgents = agentdesk.db.query(
+      "SELECT discord_channel_id FROM agents WHERE id LIKE '%pmd%' LIMIT 1"
+    );
+    if (pmdAgents.length > 0) pmdChannel = pmdAgents[0].discord_channel_id;
+  }
+  if (pmdChannel) {
+    sendDiscordReview("channel:" + pmdChannel, msg, "notify");
   }
 }
 
@@ -45,6 +73,7 @@ var reviewAutomation = {
         [card.id]
       );
       agentdesk.log.info("[review] Review disabled, card " + card.id + " → pending_decision");
+      notifyPmdPendingDecision(card.id, "리뷰 비활성화 — PM 판단 필요");
       return;
     }
 
@@ -64,6 +93,7 @@ var reviewAutomation = {
         ["Max review rounds (" + maxRounds + ") exceeded — PM decision needed", card.id]
       );
       agentdesk.log.warn("[review] Max review rounds (" + maxRounds + ") reached for " + card.id + " → pending_decision");
+      notifyPmdPendingDecision(card.id, "리뷰 라운드 상한(" + maxRounds + "회) 초과");
       return;
     }
 
@@ -80,6 +110,7 @@ var reviewAutomation = {
         [card.id]
       );
       agentdesk.log.info("[review] Counter-model disabled, card " + card.id + " → pending_decision");
+      notifyPmdPendingDecision(card.id, "카운터모델 리뷰 비활성화 — PM 판단 필요");
       return;
     }
 
@@ -102,6 +133,7 @@ var reviewAutomation = {
         [card.id]
       );
       agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + " → pending_decision");
+      notifyPmdPendingDecision(card.id, "카운터모델 alt 채널 없음 — PM 판단 필요");
       return;
     }
 
