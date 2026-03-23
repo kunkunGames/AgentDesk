@@ -77,10 +77,10 @@ var reviewAutomation = {
       return;
     }
 
-    // Increment review round
+    // Increment review round (AND status != 'done' guards against race with concurrent dismiss)
     var newRound = (card.review_round || 0) + 1;
     agentdesk.db.execute(
-      "UPDATE kanban_cards SET review_round = ?, review_status = 'reviewing', updated_at = datetime('now') WHERE id = ?",
+      "UPDATE kanban_cards SET review_round = ?, review_status = 'reviewing', updated_at = datetime('now') WHERE id = ? AND status != 'done'",
       [newRound, card.id]
     );
 
@@ -302,8 +302,9 @@ function processVerdict(cardId, verdict, result) {
     }
 
     // Set review_status to suggestion_pending — agent must decide: accept/dispute/dismiss
+    // AND status != 'done' guards against race with concurrent dismiss clearing review_status
     agentdesk.db.execute(
-      "UPDATE kanban_cards SET review_status = 'suggestion_pending', updated_at = datetime('now') WHERE id = ?",
+      "UPDATE kanban_cards SET review_status = 'suggestion_pending', updated_at = datetime('now') WHERE id = ? AND status != 'done'",
       [cardId]
     );
     agentdesk.log.info("[review] Card " + cardId + " needs review decision → suggestion_pending");

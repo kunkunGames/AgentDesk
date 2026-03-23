@@ -84,6 +84,19 @@ pub fn create_dispatch(
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
+    // Guard: prevent review-type dispatches for done cards — these would create stale
+    // dispatches that re-trigger review loops after dismiss (#80).
+    let is_review_type = dispatch_type == "review"
+        || dispatch_type == "review-decision"
+        || dispatch_type == "rework";
+    if is_review_type && old_status == "done" {
+        return Err(anyhow::anyhow!(
+            "Cannot create {} dispatch for done card {}",
+            dispatch_type,
+            kanban_card_id
+        ));
+    }
+
     // Insert dispatch
     conn.execute(
         "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
@@ -92,9 +105,6 @@ pub fn create_dispatch(
     )?;
 
     // Update kanban card — rework/review dispatches keep current status
-    let is_review_type = dispatch_type == "review"
-        || dispatch_type == "review-decision"
-        || dispatch_type == "rework";
     if is_review_type {
         conn.execute(
             "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2",
@@ -415,5 +425,41 @@ mod tests {
         assert!(result.is_ok());
         let returned = result.unwrap();
         assert_eq!(returned["status"], "cancelled", "cancelled dispatch must not be re-completed");
+    }
+
+    #[test]
+    fn create_review_dispatch_for_done_card_rejected() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-done", "done");
+
+        for dispatch_type in &["review", "review-decision", "rework"] {
+            let result = create_dispatch(
+                &db,
+                &engine,
+                "card-done",
+                "agent-1",
+                dispatch_type,
+                "Should fail",
+                &json!({}),
+            );
+            assert!(
+                result.is_err(),
+                "{} dispatch should not be created for done card",
+                dispatch_type
+            );
+        }
+
+        // Non-review dispatch for done card should still work
+        let result = create_dispatch(
+            &db,
+            &engine,
+            "card-done",
+            "agent-1",
+            "implementation",
+            "Reopen work",
+            &json!({}),
+        );
+        assert!(result.is_ok(), "implementation dispatch should be allowed for done card");
     }
 }
