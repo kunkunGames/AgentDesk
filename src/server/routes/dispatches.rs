@@ -526,6 +526,17 @@ pub(super) async fn send_dispatch_to_discord(
                         .json(&serde_json::json!({"content": message}))
                         .send()
                         .await;
+                    // Mark as notified so timeouts.js [I-0] won't resend
+                    if let Ok(conn) = db.lock() {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                            rusqlite::params![
+                                format!("dispatch_notified:{}", dispatch_id),
+                                dispatch_id
+                            ],
+                        )
+                        .ok();
+                    }
                     tracing::info!(
                         "[dispatch] Created thread {thread_id} and sent dispatch {dispatch_id} to {agent_id}"
                     );
@@ -550,6 +561,17 @@ pub(super) async fn send_dispatch_to_discord(
                 .await
             {
                 Ok(r) if r.status().is_success() => {
+                    // Mark as notified so timeouts.js [I-0] won't resend
+                    if let Ok(conn) = db.lock() {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                            rusqlite::params![
+                                format!("dispatch_notified:{}", dispatch_id),
+                                dispatch_id
+                            ],
+                        )
+                        .ok();
+                    }
                     tracing::info!(
                         "[dispatch] Sent fallback message to {agent_id} (channel {channel_id})"
                     );

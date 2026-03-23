@@ -294,11 +294,23 @@ var timeouts = {
     }
 
     // ─── [I] 턴 데드락 감지 + 자동 복구 (15분 주기) ─────────
-    // 판별: sessions.last_heartbeat 기반 — 15분 무응답 시 데드락 의심
-    // 연장: 15분 단위로 최대 MAX_EXTENSIONS회 (실제 작업 진행 시 자연 리셋)
-    // 확정: 연장 상한 초과 시 강제 중단 + 재디스패치
+    // 판별: sessions.last_heartbeat 기반 (연속 스톨만 카운트)
+    // 연장: 15분 단위로 최대 MAX_EXTENSIONS회 (연속 스톨만 카운트)
+    // 확정: 연장 상한 초과 시 agentdesk.session.kill → 강제 중단 + 재디스패치
     var DEADLOCK_MINUTES = 15;
     var MAX_EXTENSIONS = 3;
+
+    // 먼저: heartbeat가 신선한 working 세션의 카운터를 리셋 (비연속 스톨 누적 방지)
+    var freshSessions = agentdesk.db.query(
+      "SELECT session_key FROM sessions WHERE status = 'working' " +
+      "AND last_heartbeat >= datetime('now', '-" + DEADLOCK_MINUTES + " minutes')"
+    );
+    for (var fs = 0; fs < freshSessions.length; fs++) {
+      var freshKey = "deadlock_check:" + freshSessions[fs].session_key;
+      agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [freshKey]);
+    }
+
+    // 데드락 의심 세션: sessions.last_heartbeat 기반 판별
     var staleSessions = agentdesk.db.query(
       "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat " +
       "FROM sessions WHERE status = 'working' " +
@@ -308,13 +320,27 @@ var timeouts = {
       var sess = staleSessions[dl];
       var deadlockKey = "deadlock_check:" + sess.session_key;
 
-      // Check extension count
+      // Check extension count + last check timestamp
       var extRecord = agentdesk.db.query(
         "SELECT value FROM kv_meta WHERE key = ?", [deadlockKey]
       );
       var extensions = 0;
+      var lastCheckAt = 0;
       if (extRecord.length > 0) {
-        try { extensions = parseInt(extRecord[0].value) || 0; } catch(e) {}
+        try {
+          var parsed = JSON.parse(extRecord[0].value);
+          extensions = parsed.count || 0;
+          lastCheckAt = parsed.ts || 0;
+        } catch(e) {
+          // 기존 형식(숫자만) 마이그레이션
+          extensions = parseInt(extRecord[0].value) || 0;
+        }
+      }
+
+      // 마지막 체크 후 DEADLOCK_MINUTES 미경과 시 스킵 (1분마다 카운터 증가 방지)
+      var nowMs = Date.now();
+      if (lastCheckAt > 0 && (nowMs - lastCheckAt) < DEADLOCK_MINUTES * 60 * 1000) {
+        continue;
       }
 
       if (extensions >= MAX_EXTENSIONS) {
@@ -323,39 +349,39 @@ var timeouts = {
         agentdesk.log.warn("[deadlock] Session " + sess.session_key +
           " — max extensions (" + MAX_EXTENSIONS + ") reached. Force cancelling + re-dispatch.");
 
-        // 1) tmux 세션 강제 종료 (cancel_token 대체 — JS에서 직접 kill)
-        var tmuxName = (sess.session_key.indexOf(":") >= 0)
-          ? sess.session_key.split(":")[1] : sess.session_key;
-        try {
-          agentdesk.exec("tmux", ["kill-session", "-t", tmuxName]);
-          agentdesk.log.info("[deadlock] Killed tmux session: " + tmuxName);
-        } catch (e) {
-          agentdesk.log.warn("[deadlock] tmux kill failed (may already be dead): " + e);
+        // 1) agentdesk.session.kill로 tmux 세션 강제 종료
+        var killResult = JSON.parse(agentdesk.session.kill(sess.session_key));
+        if (killResult.ok) {
+          agentdesk.log.info("[deadlock] Killed tmux session: " + sess.session_key);
+        } else {
+          agentdesk.log.warn("[deadlock] tmux kill failed (may already be dead): " + killResult.error);
         }
 
-        // 2) 세션 상태 disconnected
+        // 2) 세션 상태 disconnected (last_heartbeat는 원본 유지 — 인위적 덮어쓰기 방지)
         agentdesk.db.execute(
-          "UPDATE sessions SET status = 'disconnected', last_heartbeat = datetime('now') WHERE session_key = ?",
+          "UPDATE sessions SET status = 'disconnected' WHERE session_key = ?",
           [sess.session_key]
         );
 
         // 3) 현재 디스패치 실패 + 재디스패치
         var redispatched = false;
         if (sess.active_dispatch_id) {
+          // 먼저 현재 상태 확인 — 이미 completed/failed면 재디스패치 불필요
           var dispInfo = agentdesk.db.query(
-            "SELECT kanban_card_id, to_agent_id, dispatch_type, title " +
+            "SELECT kanban_card_id, to_agent_id, dispatch_type, title, status " +
             "FROM task_dispatches WHERE id = ?",
             [sess.active_dispatch_id]
           );
-          agentdesk.db.execute(
-            "UPDATE task_dispatches SET status = 'failed', " +
-            "result = 'Deadlock auto-recovery: " + totalMin + "min timeout', " +
-            "updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
-            [sess.active_dispatch_id]
-          );
 
-          if (dispInfo.length > 0) {
+          if (dispInfo.length > 0 && (dispInfo[0].status === "pending" || dispInfo[0].status === "dispatched")) {
             var di = dispInfo[0];
+            agentdesk.db.execute(
+              "UPDATE task_dispatches SET status = 'failed', " +
+              "result = 'Deadlock auto-recovery: " + totalMin + "min timeout', " +
+              "updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
+              [sess.active_dispatch_id]
+            );
+
             try {
               agentdesk.dispatch.create(
                 di.kanban_card_id,
@@ -376,6 +402,9 @@ var timeouts = {
               agentdesk.log.error("[deadlock] Re-dispatch failed for " +
                 di.kanban_card_id + ": " + e + " → pending_decision");
             }
+          } else if (dispInfo.length > 0) {
+            agentdesk.log.info("[deadlock] Dispatch " + sess.active_dispatch_id +
+              " already " + dispInfo[0].status + " — skip re-dispatch");
           }
         }
 
@@ -383,7 +412,7 @@ var timeouts = {
         sendNotifyAlert(getPMDChannel(),
           "🔴 [Deadlock 복구] " + sess.agent_id + " 세션 " + sess.session_key +
           " — " + totalMin + "분 무응답 → 강제 중단" +
-          (redispatched ? " + 재디스패치 완료" : " (재디스패치 실패 — pending_decision)"));
+          (redispatched ? " + 재디스패치 완료" : ""));
 
         // 5) 이력 기록
         agentdesk.db.execute(
@@ -394,7 +423,7 @@ var timeouts = {
              agent_id: sess.agent_id,
              dispatch_id: sess.active_dispatch_id,
              extensions: extensions,
-             action: redispatched ? "force_cancel_and_redispatch" : "force_cancel_pending_decision",
+             action: redispatched ? "force_cancel_and_redispatch" : "force_cancel_only",
              ts: new Date().toISOString()
            })]
         );
@@ -402,16 +431,11 @@ var timeouts = {
         // 카운터 삭제 (다음 세션은 새 카운터)
         agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [deadlockKey]);
 
-      } else if (extensions >= 0) {
-        // ── 데드락 의심: 타임아웃 15분 연장 ──
+      } else {
+        // ── 데드락 의심: 카운터 증가 (타임스탬프 포함, last_heartbeat 인위적 덮어쓰기 없음) ──
         agentdesk.db.execute(
           "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
-          [deadlockKey, String(extensions + 1)]
-        );
-        // Update last_heartbeat to extend by 15 more minutes
-        agentdesk.db.execute(
-          "UPDATE sessions SET last_heartbeat = datetime('now') WHERE session_key = ?",
-          [sess.session_key]
+          [deadlockKey, JSON.stringify({ count: extensions + 1, ts: nowMs })]
         );
         agentdesk.log.warn("[deadlock] Session " + sess.session_key +
           " — heartbeat stale " + DEADLOCK_MINUTES + "min. Extension " +
@@ -420,7 +444,6 @@ var timeouts = {
           "⚠️ [Deadlock 의심] " + sess.agent_id + " 세션 — " +
           DEADLOCK_MINUTES + "분 무응답 (연장 " + (extensions + 1) + "/" + MAX_EXTENSIONS + ")");
       }
-      // extensions < 0: 이전 세션의 잔여 카운터 — 무시
     }
 
     // Clean up deadlock counters for sessions no longer working

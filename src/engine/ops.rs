@@ -769,6 +769,29 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
             }
         }),
     )?;
+
+    // agentdesk.session.kill(sessionKey) — force-kill a tmux session (for deadlock recovery)
+    session_obj.set(
+        "kill",
+        rquickjs::Function::new(ctx.clone(), |session_key: String| -> String {
+            let result = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &session_key])
+                .output();
+            match result {
+                Ok(out) if out.status.success() => {
+                    format!(r#"{{"ok":true,"session":"{}"}}"#, session_key)
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    format!(r#"{{"ok":false,"error":"tmux: {}"}}"#, stderr.trim())
+                }
+                Err(e) => {
+                    format!(r#"{{"ok":false,"error":"{}"}}"#, e)
+                }
+            }
+        }),
+    )?;
+
     ad.set("session", session_obj)?;
 
     Ok(())
