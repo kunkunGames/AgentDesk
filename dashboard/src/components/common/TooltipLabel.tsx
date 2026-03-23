@@ -26,7 +26,8 @@ export default function TooltipLabel({ text, tooltip, className }: TooltipLabelP
         onMouseLeave={() => setOpen(false)}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
-        onTouchStart={() => setOpen((v) => !v)}
+        onTouchStart={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+        onClick={(e) => e.stopPropagation()}
       >
         {text}
       </button>
