@@ -79,36 +79,7 @@ pub async fn submit_verdict(
         }
     };
 
-    // B: Block self-review — but allow counter-model (alt-provider) reviews.
-    // Counter-model reviews target the same agent_id but use a different provider
-    // channel (e.g., Claude reviews Codex's work via the alt channel).
-    // Only block when: same agent AND same dispatch_type is NOT 'review'.
-    let self_review_check: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT td.to_agent_id, kc.assigned_agent_id, COALESCE(td.dispatch_type, '') \
-             FROM task_dispatches td \
-             JOIN kanban_cards kc ON kc.id = td.kanban_card_id \
-             WHERE td.id = ?1",
-            [&body.dispatch_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .ok();
-    if let Some((reviewer, reviewee, dispatch_type)) = &self_review_check {
-        // Allow only 'review' dispatch type (counter-model review uses same agent_id but alt channel).
-        // 'review-decision' is NOT exempt — it's the original agent's own decision path,
-        // which has its own dedicated API at /api/review-decision.
-        let is_counter_model_review = dispatch_type == "review";
-        if reviewer == reviewee && !is_counter_model_review {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    json!({"error": "Self-review is not allowed. The reviewed agent cannot submit its own verdict."}),
-                ),
-            );
-        }
-    }
-
-    // C: Validate reviewed commit — the dispatch context stores the HEAD that was
+    // B: Validate reviewed commit — the dispatch context stores the HEAD that was
     //    actually sent for review. Reject mismatched commits to prevent arbitrary SHA injection.
     let stored_reviewed_commit: Option<String> = conn
         .query_row(
@@ -545,9 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn counter_model_review_verdict_not_blocked_by_self_review() {
-        // Counter-model review: to_agent_id == assigned_agent_id but dispatch_type = 'review'
-        // This should NOT be blocked (alt-provider review)
+    async fn review_verdict_allows_same_agent_submission() {
         let db = test_db();
         seed_review_card(&db, "dispatch-counter");
         let state = AppState {
@@ -569,15 +538,13 @@ mod tests {
         )
         .await;
 
-        // Should succeed (not 403)
         assert_eq!(status, StatusCode::OK);
         let ok = body.0.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-        assert!(ok, "counter-model review verdict should not be blocked");
+        assert!(ok, "same-agent review verdict should be allowed");
     }
 
     #[tokio::test]
-    async fn self_review_blocked_for_non_review_dispatch() {
-        // Same agent submitting verdict on a non-review dispatch should be blocked
+    async fn implementation_dispatch_verdict_allowed() {
         let db = test_db();
         let conn = db.lock().unwrap();
         conn.execute(
@@ -615,13 +582,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::FORBIDDEN, "self-review on non-review dispatch should be blocked");
+        assert_eq!(status, StatusCode::OK, "implementation dispatch verdict should be allowed");
     }
 
     #[tokio::test]
-    async fn review_decision_dispatch_blocked_by_self_review() {
-        // review-decision is the original agent's decision path — should be blocked
-        // by self-review check (it has its own dedicated API at /api/review-decision)
+    async fn review_decision_dispatch_verdict_allowed() {
         let db = test_db();
         let conn = db.lock().unwrap();
         conn.execute(
@@ -659,6 +624,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::FORBIDDEN, "review-decision dispatch should be blocked by self-review (use /api/review-decision instead)");
+        assert_eq!(status, StatusCode::OK, "review-decision dispatch verdict should be allowed");
     }
 }
