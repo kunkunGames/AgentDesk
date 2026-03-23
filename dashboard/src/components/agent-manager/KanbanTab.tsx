@@ -140,7 +140,9 @@ export default function KanbanTab({
   const [auditLog, setAuditLog] = useState<api.CardAuditLogEntry[]>([]);
   const [ghComments, setGhComments] = useState<api.GitHubComment[]>([]);
   const [timelineFilter, setTimelineFilter] = useState<"review" | "pm" | "work" | "general" | null>(null);
+  const [activityRefreshTick, setActivityRefreshTick] = useState(0);
   const ghCommentsCache = useRef<Map<string, { comments: api.GitHubComment[]; ts: number }>>(new Map());
+  const detailRequestSeq = useRef(0);
 
   const agentMap = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const cardsById = useMemo(() => new Map(cards.map((card) => [card.id, card])), [cards]);
@@ -179,6 +181,12 @@ export default function KanbanTab({
 
   const selectedCard = selectedCardId ? cardsById.get(selectedCardId) ?? null : null;
   const parsedGitHubTimeline = useMemo(() => parseGitHubCommentTimeline(ghComments), [ghComments]);
+  const invalidateCardActivity = (cardId: string) => {
+    ghCommentsCache.current.delete(cardId);
+    if (selectedCardId === cardId) {
+      setActivityRefreshTick((prev) => prev + 1);
+    }
+  };
 
   const STALLED_REVIEW_STATUSES = new Set(["awaiting_dod", "suggestion_pending", "dilemma_pending", "reviewing"]);
   const stalledCards = useMemo(
@@ -213,6 +221,7 @@ export default function KanbanTab({
       // transition_status with force=true, avoiding blocked transitions.
       // GitHub issues are automatically closed server-side when status → done.
       await api.bulkKanbanAction("cancel", cancelConfirm.cardIds);
+      cancelConfirm.cardIds.forEach((cardId) => invalidateCardActivity(cardId));
       if (cancelConfirm.source === "bulk") {
         setStalledSelected(new Set());
         setStalledPopup(false);
@@ -228,6 +237,10 @@ export default function KanbanTab({
   };
 
   useEffect(() => {
+    const requestSeq = detailRequestSeq.current + 1;
+    detailRequestSeq.current = requestSeq;
+    const isCurrentRequest = () => detailRequestSeq.current === requestSeq;
+
     setEditor(coerceEditor(selectedCard));
     setRetryAssigneeId(selectedCard?.assignee_agent_id ?? "");
     setNewChecklistItem("");
@@ -238,14 +251,17 @@ export default function KanbanTab({
     setTimelineFilter(null);
     // Fetch audit log and GitHub comments for selected card
     if (selectedCard) {
-      api.getCardAuditLog(selectedCard.id).then(setAuditLog).catch(() => {});
+      api.getCardAuditLog(selectedCard.id).then((logs) => {
+        if (isCurrentRequest()) setAuditLog(logs);
+      }).catch(() => {});
       if (selectedCard.github_issue_number) {
         const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
         const cached = ghCommentsCache.current.get(selectedCard.id);
         if (cached && Date.now() - cached.ts < CACHE_TTL) {
-          setGhComments(cached.comments);
+          if (isCurrentRequest()) setGhComments(cached.comments);
         } else {
           api.getCardGitHubComments(selectedCard.id).then((comments) => {
+            if (!isCurrentRequest()) return;
             ghCommentsCache.current.set(selectedCard.id, { comments, ts: Date.now() });
             setGhComments(comments);
           }).catch(() => {});
@@ -255,6 +271,7 @@ export default function KanbanTab({
     // Fetch review data for suggestion_pending/dilemma_pending cards
     if (selectedCard?.review_status === "suggestion_pending" || selectedCard?.review_status === "dilemma_pending" || selectedCard?.review_status === "decided") {
       api.getKanbanReviews(selectedCard.id).then((reviews) => {
+        if (!isCurrentRequest()) return;
         const latest = reviews.filter((r) => r.verdict === "improve" || r.verdict === "dilemma" || r.verdict === "mixed" || r.verdict === "decided")
           .sort((a, b) => b.round - a.round)[0];
         if (latest) {
@@ -273,7 +290,7 @@ export default function KanbanTab({
         }
       }).catch(() => {});
     }
-  }, [selectedCard]);
+  }, [activityRefreshTick, selectedCard]);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 767px)");
@@ -543,6 +560,7 @@ export default function KanbanTab({
       await onRedispatchCard(selectedCard.id, {
         reason: redispatchReason.trim() || null,
       });
+      invalidateCardActivity(selectedCard.id);
       setRedispatchReason("");
     } catch (error) {
       setActionError(error instanceof Error ? error.message : tr("재디스패치에 실패했습니다.", "Failed to redispatch."));
@@ -657,6 +675,7 @@ export default function KanbanTab({
           status: targetStatus,
           before_card_id: beforeCardId,
         });
+        invalidateCardActivity(draggedId);
       }
     } catch (error) {
       setActionError(error instanceof Error ? error.message : tr("카드 이동에 실패했습니다.", "Failed to move card."));
@@ -685,6 +704,7 @@ export default function KanbanTab({
         window.location.reload();
       } else {
         await onUpdateCard(cardId, { status: targetStatus });
+        invalidateCardActivity(cardId);
       }
     } catch (error) {
       setActionError(error instanceof Error ? error.message : tr("상태 전환에 실패했습니다.", "Failed to change status."));
@@ -732,6 +752,7 @@ export default function KanbanTab({
         assignee_agent_id: retryAssigneeId || selectedCard.assignee_agent_id,
         request_now: true,
       });
+      invalidateCardActivity(selectedCard.id);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : tr("재시도에 실패했습니다.", "Failed to retry card."));
     } finally {
@@ -1703,6 +1724,7 @@ export default function KanbanTab({
                           setActionError(null);
                           try {
                             await onUpdateCard(selectedCard.id, { status: target });
+                            invalidateCardActivity(selectedCard.id);
                             setEditor((prev) => ({ ...prev, status: target }));
                           } catch (error) {
                             setActionError(error instanceof Error ? error.message : tr("상태 전환에 실패했습니다.", "Failed to change status."));
@@ -2281,12 +2303,28 @@ export default function KanbanTab({
             {/* Unified GitHub comment timeline */}
             {parsedGitHubTimeline.length > 0 && (
               <div className="rounded-2xl border p-4 bg-white/5 space-y-3" style={{ borderColor: "rgba(148,163,184,0.18)" }}>
-                <h4 className="font-medium" style={{ color: "var(--th-text-heading)" }}>
-                  {tr("GitHub 코멘트 타임라인", "GitHub Comment Timeline")}
-                  <span className="ml-2 text-xs font-normal" style={{ color: "var(--th-text-muted)" }}>
-                    ({parsedGitHubTimeline.length})
-                  </span>
-                </h4>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h4 className="font-medium" style={{ color: "var(--th-text-heading)" }}>
+                    {tr("GitHub 코멘트 타임라인", "GitHub Comment Timeline")}
+                    <span className="ml-2 text-xs font-normal" style={{ color: "var(--th-text-muted)" }}>
+                      ({parsedGitHubTimeline.length})
+                    </span>
+                  </h4>
+                  {selectedCard && (
+                    <button
+                      type="button"
+                      onClick={() => invalidateCardActivity(selectedCard.id)}
+                      className="rounded-full px-2.5 py-1 text-xs font-medium border transition-opacity hover:opacity-80"
+                      style={{
+                        borderColor: "rgba(147,197,253,0.28)",
+                        backgroundColor: "rgba(96,165,250,0.12)",
+                        color: "#93c5fd",
+                      }}
+                    >
+                      {tr("새로고침", "Refresh")}
+                    </button>
+                  )}
+                </div>
                 {/* Filter tabs */}
                 {(() => {
                   const kindCounts = parsedGitHubTimeline.reduce<Record<string, number>>((acc, e) => {
@@ -2329,10 +2367,6 @@ export default function KanbanTab({
                     const statusStyle = getTimelineStatusStyle(entry.status);
                     const kindStyle = TIMELINE_KIND_STYLE[entry.kind];
                     const isGeneral = entry.kind === "general";
-                    // Find original comment for general entries to render markdown
-                    const originalComment = isGeneral ? ghComments.find(
-                      (c) => c.createdAt === entry.createdAt && (c.author?.login ?? "unknown") === entry.author
-                    ) : null;
                     return (
                       <div
                         key={`${entry.kind}-${entry.createdAt}-${idx}`}
@@ -2366,26 +2400,28 @@ export default function KanbanTab({
                               {entry.title}
                             </div>
                           )}
-                          {isGeneral && originalComment ? (
+                          {!isGeneral && entry.summary && entry.summary !== entry.title && (
                             <div className="text-sm" style={{ color: "var(--th-text-primary)" }}>
-                              <MarkdownContent content={originalComment.body} />
+                              {entry.summary}
                             </div>
-                          ) : (
-                            <>
-                              {entry.summary && (
-                                <div className="text-sm" style={{ color: "var(--th-text-primary)" }}>
-                                  {entry.summary}
-                                </div>
-                              )}
-                              {entry.details.length > 0 && (
-                                <ul className="space-y-1 pl-4 text-xs list-disc" style={{ color: "var(--th-text-secondary)" }}>
-                                  {entry.details.map((detail, detailIdx) => (
-                                    <li key={detailIdx}>{detail}</li>
-                                  ))}
-                                </ul>
-                              )}
-                            </>
                           )}
+                          {entry.details.length > 0 && (
+                            <ul className="space-y-1 pl-4 text-xs list-disc" style={{ color: "var(--th-text-secondary)" }}>
+                              {entry.details.map((detail, detailIdx) => (
+                                <li key={detailIdx}>{detail}</li>
+                              ))}
+                            </ul>
+                          )}
+                          <div
+                            className="rounded-lg border px-3 py-2 text-sm"
+                            style={{
+                              borderColor: "rgba(148,163,184,0.16)",
+                              backgroundColor: "rgba(15,23,42,0.24)",
+                              color: "var(--th-text-primary)",
+                            }}
+                          >
+                            <MarkdownContent content={entry.body} />
+                          </div>
                         </div>
                       </div>
                     );

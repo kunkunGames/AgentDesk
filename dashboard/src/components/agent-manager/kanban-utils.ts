@@ -250,11 +250,12 @@ export interface ParsedGitHubComment {
   details: string[];
   createdAt: string;
   author: string;
+  body: string;
 }
 
 function cleanMarkdownLine(line: string): string {
   return line
-    .replace(/^#+\s*/, "")
+    .replace(/^#+(?:\s+|$)/, "")
     .replace(/^\d+\.\s+/, "")
     .replace(/^[-*]\s+/, "")
     .replace(/\*\*/g, "")
@@ -297,16 +298,50 @@ function extractSectionHeadings(body: string, limit = 3): string[] {
   return results;
 }
 
+function filterCommentBody(body: string): string {
+  const lines: string[] = [];
+  let inCodeBlock = false;
+  for (const raw of body.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock || trimmed.startsWith(">")) continue;
+    lines.push(raw);
+  }
+  return lines.join("\n");
+}
+
+function getHeading(filteredBody: string): string | null {
+  for (const raw of filteredBody.split("\n")) {
+    const match = raw.match(/^##\s+(.+)$/);
+    if (match) return cleanMarkdownLine(match[1]);
+  }
+  return null;
+}
+
+function getMeaningfulLines(body: string): string[] {
+  return body
+    .split("\n")
+    .map((raw) => cleanMarkdownLine(raw))
+    .filter((line) => line && line !== "---");
+}
+
 export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGitHubComment[] {
   return comments.flatMap<ParsedGitHubComment>((comment) => {
     const body = comment.body.trim();
     if (!body) return [];
 
-    const firstLine = firstMeaningfulLine(body);
-    const heading = body.match(/^##\s+(.+)$/m)?.[1]?.trim() ?? null;
+    const filteredBody = filterCommentBody(body);
+    const classificationBody = filteredBody.trim() || body;
+    const meaningfulLines = getMeaningfulLines(classificationBody);
+    const firstLine = meaningfulLines[0] ?? firstMeaningfulLine(body);
+    const heading = getHeading(classificationBody);
+    const leadText = meaningfulLines.slice(0, 2).join(" ");
     const author = comment.author?.login ?? "unknown";
 
-    if (body.startsWith("🔍 칸반 상태:")) {
+    if (body.startsWith("🔍 칸반 상태:") || firstLine?.startsWith("🔍 칸반 상태:")) {
       return [{
         kind: "review",
         status: "reviewing",
@@ -315,19 +350,29 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
         details: [],
         createdAt: comment.createdAt,
         author,
+        body,
       }];
     }
 
-    if (
-      body.includes("코드 리뷰 결과")
-      || body.includes("재검토 결과")
-      || body.includes("blocking finding")
-      || body.includes("추가 결함은 확인하지 못했습니다")
-    ) {
-      const passed =
-        body.includes("추가 blocking finding은 없습니다")
-        || body.includes("머지를 막을 추가 결함은 확인하지 못했습니다")
-        || body.includes("추가 결함은 확인하지 못했습니다");
+    const passed = [
+      "추가 blocking finding은 없습니다",
+      "현재 diff 기준으로 머지를 막을 추가 결함은 확인하지 못했습니다",
+      "머지를 막을 추가 결함은 확인하지 못했습니다",
+      "추가 결함은 확인하지 못했습니다",
+    ].some((pattern) => leadText.startsWith(pattern));
+    const reviewFeedback =
+      leadText.startsWith("리뷰했습니다")
+      || leadText.startsWith("추가 리뷰했습니다")
+      || leadText.startsWith("재확인했습니다")
+      || leadText.startsWith("코드 리뷰 결과")
+      || leadText.startsWith("재검토 결과")
+      || /blocking finding/i.test(leadText)
+      || /blocking \d+건/i.test(leadText)
+      || /확인된 이슈 \d+건/.test(leadText)
+      || /결함 \d+건/.test(leadText)
+      || /문제 \d+건/.test(leadText);
+
+    if (passed || reviewFeedback) {
       const highlights = extractListHighlights(body, passed ? 1 : 3);
       return [{
         kind: "review",
@@ -337,14 +382,18 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
         details: passed ? [] : highlights.slice(1),
         createdAt: comment.createdAt,
         author,
+        body,
       }];
     }
 
+    const pmMarker = heading ?? firstLine ?? "";
     if (
-      body.includes("PM 결정")
-      || body.includes("PM 판단")
-      || body.includes("프로듀서 결정")
-      || body.includes("PMD 결정")
+      pmMarker.startsWith("PM 결정")
+      || pmMarker.startsWith("PM 판단")
+      || pmMarker.startsWith("PMD 결정")
+      || pmMarker.startsWith("PMD 판단")
+      || pmMarker.startsWith("프로듀서 결정")
+      || pmMarker.startsWith("프로듀서 판단")
     ) {
       return [{
         kind: "pm",
@@ -354,14 +403,16 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
         details: extractListHighlights(body, 3),
         createdAt: comment.createdAt,
         author,
+        body,
       }];
     }
 
+    const workMarker = heading ?? firstLine ?? "";
     if (
-      body.includes("완료 보고")
-      || body.startsWith("구현 완료")
-      || body.startsWith("수정 완료")
-      || body.startsWith("배포 완료")
+      workMarker.includes("완료 보고")
+      || workMarker.startsWith("구현 완료")
+      || workMarker.startsWith("수정 완료")
+      || workMarker.startsWith("배포 완료")
     ) {
       return [{
         kind: "work",
@@ -371,6 +422,7 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
         details: extractSectionHeadings(body, 3),
         createdAt: comment.createdAt,
         author,
+        body,
       }];
     }
 
@@ -384,6 +436,7 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
       details: [],
       createdAt: comment.createdAt,
       author,
+      body,
     }];
   });
 }

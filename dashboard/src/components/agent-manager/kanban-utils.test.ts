@@ -35,6 +35,10 @@ describe("parseGitHubCommentTimeline", () => {
       kind: "review",
       status: "changes_requested",
       summary: "High — 첫 번째 문제",
+      body: `코드 리뷰 결과입니다.
+
+1. **High** — 첫 번째 문제
+2. **Medium** — 두 번째 문제`,
     });
     expect(entry.details).toContain("Medium — 두 번째 문제");
   });
@@ -111,6 +115,68 @@ describe("parseGitHubCommentTimeline", () => {
       kind: "pm",
       status: "decision",
       title: "PM 결정",
+    });
+  });
+
+  it("실사용 리뷰 피드백 코멘트를 review 타입으로 분류한다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`리뷰했습니다. 확인된 이슈 3건 남깁니다.
+
+1. 첫 번째 이슈
+2. 두 번째 이슈`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "review",
+      status: "changes_requested",
+      title: "리뷰 피드백",
+    });
+  });
+
+  it("인용된 pass 문구는 리뷰 통과로 오인하지 않는다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`추가 리뷰했습니다. blocking finding 2건입니다.
+
+> 추가 결함은 확인하지 못했습니다
+
+1. 첫 번째 문제
+2. 두 번째 문제`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "review",
+      status: "changes_requested",
+      title: "리뷰 피드백",
+    });
+  });
+
+  it("재확인 blocking 코멘트도 review 타입으로 유지한다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`재확인했습니다. 현재 코드 기준으로도 blocking 2건 남아 있습니다.
+
+1. 첫 번째 문제
+2. 두 번째 문제`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "review",
+      status: "changes_requested",
+      title: "리뷰 피드백",
+    });
+  });
+
+  it("본문 중간의 PM 결정 문자열만으로 pm 타입으로 분류하지 않는다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`## #65 완료 보고
+
+- 리뷰 / PM 결정 / 작업 이력 타임라인 추가
+- 회귀 테스트 완료`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "work",
+      status: "completed",
+      title: "#65 완료 보고",
     });
   });
 });
