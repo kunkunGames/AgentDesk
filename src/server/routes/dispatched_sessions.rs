@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
+use super::session_activity::SessionActivityResolver;
 
 // ── Query / Body types ────────────────────────────────────────
 
@@ -89,43 +90,95 @@ pub async fn list_dispatched_sessions(
         }
     };
 
+    struct SessionRow {
+        id: i64,
+        session_key: Option<String>,
+        agent_id: Option<String>,
+        provider: Option<String>,
+        status: Option<String>,
+        active_dispatch_id: Option<String>,
+        model: Option<String>,
+        tokens: i64,
+        cwd: Option<String>,
+        last_heartbeat: Option<String>,
+        session_info: Option<String>,
+        department_id: Option<String>,
+        sprite_number: Option<i64>,
+        avatar_emoji: Option<String>,
+        stats_xp: i64,
+        department_name: Option<String>,
+        department_name_ko: Option<String>,
+        department_color: Option<String>,
+    }
+
     let rows = stmt
         .query_map([], |row| {
-            let agent_id = row.get::<_, Option<String>>(2)?;
-            let session_key = row.get::<_, Option<String>>(1)?;
-            let last_heartbeat = row.get::<_, Option<String>>(9)?;
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "session_key": session_key,
-                "agent_id": agent_id,
-                "provider": row.get::<_, Option<String>>(3)?,
-                "status": row.get::<_, Option<String>>(4)?,
-                "active_dispatch_id": row.get::<_, Option<String>>(5)?,
-                "model": row.get::<_, Option<String>>(6)?,
-                "tokens": row.get::<_, i64>(7)?,
-                "cwd": row.get::<_, Option<String>>(8)?,
-                "last_heartbeat": last_heartbeat,
-                "session_info": row.get::<_, Option<String>>(10)?,
-                // alias fields for frontend compatibility
-                "linked_agent_id": agent_id,
-                "last_seen_at": last_heartbeat,
-                "name": session_key,
-                // joined agent fields
-                "department_id": row.get::<_, Option<String>>(11)?,
-                "sprite_number": row.get::<_, Option<i64>>(12)?,
-                "avatar_emoji": row.get::<_, Option<String>>(13).ok().flatten().unwrap_or_else(|| "\u{1F916}".to_string()),
-                "stats_xp": row.get::<_, i64>(14).unwrap_or(0),
-                "connected_at": null,
-                // joined department fields
-                "department_name": row.get::<_, Option<String>>(15)?,
-                "department_name_ko": row.get::<_, Option<String>>(16)?,
-                "department_color": row.get::<_, Option<String>>(17)?,
-            }))
+            Ok(SessionRow {
+                id: row.get::<_, i64>(0)?,
+                session_key: row.get::<_, Option<String>>(1)?,
+                agent_id: row.get::<_, Option<String>>(2)?,
+                provider: row.get::<_, Option<String>>(3)?,
+                status: row.get::<_, Option<String>>(4)?,
+                active_dispatch_id: row.get::<_, Option<String>>(5)?,
+                model: row.get::<_, Option<String>>(6)?,
+                tokens: row.get::<_, i64>(7)?,
+                cwd: row.get::<_, Option<String>>(8)?,
+                last_heartbeat: row.get::<_, Option<String>>(9)?,
+                session_info: row.get::<_, Option<String>>(10)?,
+                department_id: row.get::<_, Option<String>>(11)?,
+                sprite_number: row.get::<_, Option<i64>>(12)?,
+                avatar_emoji: row.get::<_, Option<String>>(13).ok().flatten(),
+                stats_xp: row.get::<_, i64>(14).unwrap_or(0),
+                department_name: row.get::<_, Option<String>>(15)?,
+                department_name_ko: row.get::<_, Option<String>>(16)?,
+                department_color: row.get::<_, Option<String>>(17)?,
+            })
         })
         .ok();
 
+    let mut resolver = SessionActivityResolver::new();
     let sessions: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Some(iter) => iter
+            .filter_map(|r| r.ok())
+            .filter_map(|row| {
+                let effective = resolver.resolve(
+                    row.session_key.as_deref(),
+                    row.status.as_deref(),
+                    row.active_dispatch_id.as_deref(),
+                    row.last_heartbeat.as_deref(),
+                );
+                if !include_all && !effective.is_working && effective.active_dispatch_id.is_none() {
+                    return None;
+                }
+                Some(json!({
+                    "id": row.id,
+                    "session_key": row.session_key,
+                    "agent_id": row.agent_id,
+                    "provider": row.provider,
+                    "status": effective.status,
+                    "active_dispatch_id": effective.active_dispatch_id,
+                    "model": row.model,
+                    "tokens": row.tokens,
+                    "cwd": row.cwd,
+                    "last_heartbeat": row.last_heartbeat,
+                    "session_info": row.session_info,
+                    // alias fields for frontend compatibility
+                    "linked_agent_id": row.agent_id,
+                    "last_seen_at": row.last_heartbeat,
+                    "name": row.session_key,
+                    // joined agent fields
+                    "department_id": row.department_id,
+                    "sprite_number": row.sprite_number,
+                    "avatar_emoji": row.avatar_emoji.unwrap_or_else(|| "\u{1F916}".to_string()),
+                    "stats_xp": row.stats_xp,
+                    "connected_at": null,
+                    // joined department fields
+                    "department_name": row.department_name,
+                    "department_name_ko": row.department_name_ko,
+                    "department_color": row.department_color,
+                }))
+            })
+            .collect(),
         None => Vec::new(),
     };
 
@@ -549,5 +602,56 @@ mod tests {
                 .unwrap_or_default()
                 .contains("\"completion_source\":\"session_idle\"")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_local_tmux_session_is_filtered_from_active_dispatch_list() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            health_registry: None,
+        };
+
+        let hostname = std::process::Command::new("hostname")
+            .arg("-s")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let session_key = format!(
+            "{hostname}:AgentDesk-stale-test-{}",
+            std::process::id()
+        );
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, name_ko, provider, avatar_emoji, status, created_at)
+                 VALUES ('ch-ad', 'AD', 'AD', 'claude', '🤖', 'idle', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, session_info, active_dispatch_id, last_heartbeat)
+                 VALUES (?1, 'ch-ad', 'claude', 'working', 'stale session', 'dispatch-stale', datetime('now'))",
+                rusqlite::params![session_key],
+            )
+            .unwrap();
+        }
+
+        let (status, Json(body)) = list_dispatched_sessions(
+            State(state),
+            Query(ListDispatchedSessionsQuery {
+                include_merged: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 0);
     }
 }

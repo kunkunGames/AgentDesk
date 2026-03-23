@@ -20,6 +20,7 @@ pub mod onboarding;
 pub mod pipeline;
 pub mod review_verdict;
 pub mod reviews;
+mod session_activity;
 pub mod settings;
 pub mod skills_api;
 pub mod stats;

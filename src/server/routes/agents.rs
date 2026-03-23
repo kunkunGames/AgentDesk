@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
+use super::session_activity::SessionActivityResolver;
 
 // ── Query types ──────────────────────────────────────────────
 
@@ -243,23 +244,59 @@ pub async fn agent_dispatched_sessions(
 
     let rows = stmt
         .query_map([&id], |row| {
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "session_key": row.get::<_, Option<String>>(1)?,
-                "agent_id": row.get::<_, Option<String>>(2)?,
-                "provider": row.get::<_, Option<String>>(3)?,
-                "status": row.get::<_, Option<String>>(4)?,
-                "active_dispatch_id": row.get::<_, Option<String>>(5)?,
-                "model": row.get::<_, Option<String>>(6)?,
-                "tokens": row.get::<_, i64>(7)?,
-                "cwd": row.get::<_, Option<String>>(8)?,
-                "last_heartbeat": row.get::<_, Option<String>>(9)?,
-            }))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
         })
         .ok();
 
+    let mut resolver = SessionActivityResolver::new();
     let sessions: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Some(iter) => iter
+            .filter_map(|r| r.ok())
+            .map(
+                |(
+                    session_id,
+                    session_key,
+                    agent_id,
+                    provider,
+                    status,
+                    active_dispatch_id,
+                    model,
+                    tokens,
+                    cwd,
+                    last_heartbeat,
+                )| {
+                    let effective = resolver.resolve(
+                        session_key.as_deref(),
+                        status.as_deref(),
+                        active_dispatch_id.as_deref(),
+                        last_heartbeat.as_deref(),
+                    );
+                    json!({
+                        "id": session_id,
+                        "session_key": session_key,
+                        "agent_id": agent_id,
+                        "provider": provider,
+                        "status": effective.status,
+                        "active_dispatch_id": effective.active_dispatch_id,
+                        "model": model,
+                        "tokens": tokens,
+                        "cwd": cwd,
+                        "last_heartbeat": last_heartbeat,
+                    })
+                },
+            )
+            .collect(),
         None => Vec::new(),
     };
 

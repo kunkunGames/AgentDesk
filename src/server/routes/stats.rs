@@ -8,6 +8,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use super::AppState;
+use super::session_activity::SessionActivityResolver;
 
 #[derive(Debug, Deserialize)]
 pub struct StatsQuery {
@@ -102,11 +103,10 @@ pub async fn get_stats(
         .unwrap_or_default();
 
     let mut working_session_stmt = match conn.prepare(
-        "SELECT DISTINCT agent_id
+        "SELECT session_key, agent_id, status, active_dispatch_id, last_heartbeat
          FROM sessions
          WHERE agent_id IS NOT NULL
-           AND status != 'disconnected'
-           AND (status = 'working' OR active_dispatch_id IS NOT NULL)",
+           AND status != 'disconnected'",
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -116,11 +116,40 @@ pub async fn get_stats(
             );
         }
     };
-    let working_session_agents: HashSet<String> = working_session_stmt
-        .query_map([], |row| row.get::<_, String>(0))
+    let session_rows: Vec<(
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = working_session_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
         .ok()
         .map(|iter| iter.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
+    let mut resolver = SessionActivityResolver::new();
+    let mut working_session_agents: HashSet<String> = HashSet::new();
+    let mut dispatched_count = 0i64;
+    for (session_key, agent_id, status, active_dispatch_id, last_heartbeat) in session_rows {
+        let effective = resolver.resolve(
+            session_key.as_deref(),
+            status.as_deref(),
+            active_dispatch_id.as_deref(),
+            last_heartbeat.as_deref(),
+        );
+        if effective.is_working {
+            working_session_agents.insert(agent_id);
+            dispatched_count += 1;
+        }
+    }
 
     let total = agent_rows.len() as i64;
     let mut working = 0i64;
@@ -236,17 +265,6 @@ pub async fn get_stats(
         .map(|iter| iter.filter_map(|r| r.ok()).collect::<Vec<_>>())
         .unwrap_or_default()
     };
-
-    // ── dispatched_count ──
-    let dispatched_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions
-             WHERE status != 'disconnected'
-               AND (status = 'working' OR active_dispatch_id IS NOT NULL)",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
 
     // ── kanban stats ──
     let kanban = {

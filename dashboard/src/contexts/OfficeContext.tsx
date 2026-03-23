@@ -24,7 +24,7 @@ import * as api from "../api/client";
 
 function deriveSubAgents(sessions: DispatchedSession[]): SubAgent[] {
   return sessions
-    .filter((s) => s.status !== "disconnected" && s.linked_agent_id)
+    .filter((s) => s.status === "working" && s.linked_agent_id)
     .map((s) => ({
       id: s.id,
       parentAgentId: s.linked_agent_id!,
@@ -68,10 +68,7 @@ function applySessionOverlay(baseAgents: Agent[], sessions: DispatchedSession[])
       session.linked_agent_id ??
       (session as DispatchedSession & { agent_id?: string | null }).agent_id ??
       null;
-    const activeDispatchId =
-      (session as DispatchedSession & { active_dispatch_id?: string | null }).active_dispatch_id ??
-      null;
-    const isWorking = session.status === "working" || !!activeDispatchId;
+    const isWorking = session.status === "working";
     if (!agentId || !isWorking) continue;
 
     const prev = overlay.get(agentId);
