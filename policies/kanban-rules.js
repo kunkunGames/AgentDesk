@@ -76,9 +76,12 @@ var rules = {
     // idle on implementation/rework is handled in Rust hook_session by completing
     // the pending dispatch first, then letting onDispatchCompleted drive review entry.
 
-    // idle + review dispatch → auto-complete with verdict
-    // 카운터모델 리뷰 세션이 idle이 되면 디스패치를 자동 완료하고 verdict 전달
-    if (payload.status === "idle" && card.status === "review") {
+    // idle + review dispatch → auto-complete is handled by Rust
+    // (dispatched_sessions.rs idle auto-complete → complete_dispatch → OnDispatchCompleted).
+    // Previously this JS policy also auto-completed review dispatches via direct DB UPDATE,
+    // causing double processing (JS verdict extraction + Rust OnDispatchCompleted).
+    // Now only Rust handles auto-complete; JS policy reacts via onDispatchCompleted hook.
+    if (false && payload.status === "idle" && card.status === "review") {
       var dispatch = agentdesk.db.query(
         "SELECT id, dispatch_type, status, result, kanban_card_id FROM task_dispatches WHERE id = ?",
         [payload.dispatch_id]
