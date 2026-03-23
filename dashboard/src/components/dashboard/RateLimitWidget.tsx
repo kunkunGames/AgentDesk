@@ -5,6 +5,8 @@ interface RateLimitBucket {
   id: string;
   label: string;
   utilization: number;
+  remaining: number | null;
+  limit: number | null;
   resets_at: string | null;
   level: "normal" | "warning" | "danger";
 }
@@ -51,8 +53,8 @@ const BUCKET_LABELS: Record<string, string> = {
   scim: "SCIM",
 };
 
-/** Only show these buckets to avoid clutter */
-const VISIBLE_BUCKETS = new Set(["core", "search", "graphql", "code_search"]);
+/** Only show these buckets for GitHub to avoid clutter; other providers show all */
+const GITHUB_VISIBLE_BUCKETS = new Set(["core", "search", "graphql", "code_search"]);
 
 function transformRawData(
   raw: RawRateLimitData,
@@ -65,7 +67,11 @@ function transformRawData(
       fetched_at: rp.fetched_at,
       stale: rp.stale,
       buckets: rp.buckets
-        .filter((b) => VISIBLE_BUCKETS.has(b.name))
+        .filter((b) => {
+          // GitHub: show only key buckets; other providers: show all
+          if (rp.provider.toLowerCase() === "github") return GITHUB_VISIBLE_BUCKETS.has(b.name);
+          return true;
+        })
         .map((b) => {
           const utilization = b.limit > 0 ? Math.round((b.used / b.limit) * 100) : 0;
           const level: "normal" | "warning" | "danger" =
@@ -74,6 +80,8 @@ function transformRawData(
             id: b.name,
             label: BUCKET_LABELS[b.name] ?? b.name,
             utilization,
+            remaining: b.remaining ?? null,
+            limit: b.limit > 0 ? b.limit : null,
             resets_at: b.reset > 0 ? new Date(b.reset * 1000).toISOString() : null,
             level,
           };
@@ -217,7 +225,7 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
 
   return (
     <div className="game-panel relative overflow-hidden px-3 py-2 sm:px-4 sm:py-2.5">
-      <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-x-6">
+      <div className="flex flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6 sm:gap-y-1.5">
         {data.providers.map((provider) => {
           const accent = getAccent(provider.provider);
           const visibleBuckets = provider.buckets;
@@ -282,6 +290,14 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
                           }}
                         >
                           {bucket.utilization}%
+                          {bucket.remaining != null && bucket.limit != null && (
+                            <span
+                              className="text-[8px] sm:text-[9px] font-normal ml-0.5"
+                              style={{ color: "var(--th-text-muted)" }}
+                            >
+                              ({bucket.remaining}/{bucket.limit})
+                            </span>
+                          )}
                         </span>
                       </div>
                       {remaining && (
