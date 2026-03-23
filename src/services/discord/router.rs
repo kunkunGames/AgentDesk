@@ -21,13 +21,54 @@ pub(super) async fn handle_event(
             // which can happen when thread messages are delivered as both a
             // thread-context event AND a parent-channel event, or during
             // gateway reconnections.
+            //
+            // Thread-preference: when a duplicate arrives, prefer the thread
+            // context over the parent context.  If a parent-channel event
+            // was processed first, a subsequent thread event for the same
+            // message_id is allowed through (and the parent turn will have
+            // already been filtered by should_process_turn_message or the
+            // dispatch-thread guard).
             {
                 const MSG_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(60);
                 let now = std::time::Instant::now();
                 let key = format!("mid:{}", new_message.id);
+
+                // Lazy cleanup of expired mid:* entries to prevent unbounded growth.
+                // Only runs every ~50 messages to amortize cost.
+                {
+                    static CLEANUP_COUNTER: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count % 50 == 0 {
+                        data.shared.intake_dedup.retain(|k, v| {
+                            if k.starts_with("mid:") {
+                                now.duration_since(*v) < MSG_DEDUP_TTL
+                            } else {
+                                true // non-mid entries are cleaned by their own path
+                            }
+                        });
+                    }
+                }
+
+                // Check if this arrival is from a thread context
+                let is_thread_context = resolve_thread_parent(ctx, new_message.channel_id)
+                    .await
+                    .is_some();
+
                 let is_dup = match data.shared.intake_dedup.entry(key.clone()) {
-                    dashmap::mapref::entry::Entry::Occupied(e) => {
-                        now.duration_since(*e.get()) < MSG_DEDUP_TTL
+                    dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                        if now.duration_since(*e.get()) >= MSG_DEDUP_TTL {
+                            // Entry expired — treat as new
+                            e.insert(now);
+                            false
+                        } else if is_thread_context {
+                            // Thread event for a message already seen via parent —
+                            // allow thread through (refresh timestamp).
+                            e.insert(now);
+                            false
+                        } else {
+                            true // genuine duplicate from same or parent context
+                        }
                     }
                     dashmap::mapref::entry::Entry::Vacant(e) => {
                         e.insert(now);
@@ -200,10 +241,16 @@ pub(super) async fn handle_event(
                 const INTAKE_DEDUP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
                 let now = std::time::Instant::now();
 
-                // Lazy cleanup: remove expired entries (cheap — runs only on bot messages)
-                data.shared
-                    .intake_dedup
-                    .retain(|_, v| now.duration_since(*v) < INTAKE_DEDUP_TTL);
+                // Lazy cleanup: remove expired bot-specific entries.
+                // Skip mid:* entries — they use a longer TTL and are cleaned
+                // separately in the universal dedup section above.
+                data.shared.intake_dedup.retain(|k, v| {
+                    if k.starts_with("mid:") {
+                        true // preserved; cleaned by universal dedup cleanup
+                    } else {
+                        now.duration_since(*v) < INTAKE_DEDUP_TTL
+                    }
+                });
 
                 // Atomic check+insert via entry() — holds shard lock so two
                 // simultaneous arrivals cannot both see a miss.
@@ -2687,5 +2734,68 @@ mod tests {
             MessageType::ThreadStarterMessage
         ));
         assert!(!should_process_turn_message(MessageType::ChatInputCommand));
+    }
+
+    /// mid:* cleanup should use the longer MSG_DEDUP_TTL (60s),
+    /// while bot-specific entries (dispatch:*, msg:*) use INTAKE_DEDUP_TTL (30s).
+    /// Verifies that bot cleanup does not prematurely evict mid:* entries.
+    #[test]
+    fn mid_entries_survive_bot_cleanup() {
+        use std::time::{Duration, Instant};
+
+        let map = dashmap::DashMap::new();
+        let now = Instant::now();
+
+        // Simulate: mid:* entry inserted 40s ago (within 60s TTL, outside 30s TTL)
+        let mid_time = now - Duration::from_secs(40);
+        map.insert("mid:123".to_string(), mid_time);
+
+        // Simulate: dispatch:* entry inserted 40s ago (outside 30s TTL)
+        map.insert("dispatch:abc".to_string(), mid_time);
+
+        // Simulate: fresh bot entry inserted just now
+        map.insert("msg:456".to_string(), now);
+
+        // Bot cleanup: retain non-mid entries only if within 30s TTL
+        let intake_dedup_ttl = Duration::from_secs(30);
+        map.retain(|k, v| {
+            if k.starts_with("mid:") {
+                true // preserved; cleaned by universal dedup cleanup
+            } else {
+                now.duration_since(*v) < intake_dedup_ttl
+            }
+        });
+
+        // mid:* should survive bot cleanup
+        assert!(map.contains_key("mid:123"), "mid:* entry must survive bot cleanup");
+        // dispatch:* older than 30s should be removed
+        assert!(!map.contains_key("dispatch:abc"), "expired dispatch:* should be removed");
+        // fresh msg:* should survive
+        assert!(map.contains_key("msg:456"), "fresh msg:* should survive");
+
+        // Universal mid:* cleanup with 60s TTL
+        let msg_dedup_ttl = Duration::from_secs(60);
+        map.retain(|k, v| {
+            if k.starts_with("mid:") {
+                now.duration_since(*v) < msg_dedup_ttl
+            } else {
+                true
+            }
+        });
+
+        // mid:* at 40s should still survive (within 60s)
+        assert!(map.contains_key("mid:123"), "mid:* within TTL must survive universal cleanup");
+
+        // Now simulate mid:* at 65s ago (outside 60s TTL)
+        let old_mid_time = now - Duration::from_secs(65);
+        map.insert("mid:old".to_string(), old_mid_time);
+        map.retain(|k, v| {
+            if k.starts_with("mid:") {
+                now.duration_since(*v) < msg_dedup_ttl
+            } else {
+                true
+            }
+        });
+        assert!(!map.contains_key("mid:old"), "expired mid:* must be cleaned by universal cleanup");
     }
 }
