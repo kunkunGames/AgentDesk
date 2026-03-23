@@ -3,14 +3,22 @@ import type { Agent, Department, DispatchedSession } from "../../types";
 import { Monitor, MapPin, Clock, Wifi, WifiOff } from "lucide-react";
 import { getRankTier } from "../dashboard/model";
 import { useI18n } from "../../i18n";
+import TooltipLabel from "../common/TooltipLabel";
 
 function sessionSpriteNum(s: DispatchedSession): number {
   if (s.sprite_number != null && s.sprite_number > 0) return s.sprite_number;
+  const idStr = String(s.id);
   let hash = 0;
-  for (let i = 0; i < s.id.length; i += 1) {
-    hash = (hash * 31 + s.id.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < idStr.length; i += 1) {
+    hash = (hash * 31 + idStr.charCodeAt(i)) >>> 0;
   }
   return (hash % 12) + 1;
+}
+
+/** Display name for a session; full key used as tooltip */
+function sessionDisplayName(s: DispatchedSession): { label: string; full: string } {
+  if (s.name) return { label: s.name, full: s.name };
+  return { label: `Session ${s.session_key.slice(0, 8)}`, full: s.session_key };
 }
 
 interface Props {
@@ -90,12 +98,11 @@ export function SessionPanel({ sessions, departments, agents, onAssign }: Props)
                     style={{ imageRendering: "pixelated" }}
                   />
                 </div>
-                <span
-                  className="flex-1 text-sm text-gray-400 truncate min-w-0"
-                  title={s.name || s.session_key.slice(0, 12)}
-                >
-                  {s.name || s.session_key.slice(0, 12)}
-                </span>
+                <TooltipLabel
+                  className="flex-1 text-sm text-gray-400 min-w-0"
+                  text={sessionDisplayName(s).label}
+                  tooltip={sessionDisplayName(s).full}
+                />
                 <span className="text-xs text-gray-600 shrink-0">
                   {s.model || "unknown"}
                 </span>
@@ -168,12 +175,12 @@ function SessionCard({
         {/* Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 min-w-0">
-            <span
-              className="font-medium cursor-pointer hover:text-indigo-400 transition-colors truncate"
-              onClick={onSelect}
-              title={s.name || `Session ${s.session_key.slice(0, 8)}`}
-            >
-              {s.name || `Session ${s.session_key.slice(0, 8)}`}
+            <span className="cursor-pointer hover:text-indigo-400 transition-colors min-w-0" onClick={onSelect}>
+              <TooltipLabel
+                className="font-medium"
+                text={sessionDisplayName(s).label}
+                tooltip={sessionDisplayName(s).full}
+              />
             </span>
             <Wifi size={14} className="text-emerald-400 shrink-0" />
           </div>
@@ -326,12 +333,11 @@ function SessionInfoCard({
             />
           </div>
           <div className="flex-1 min-w-0">
-            <div
-              className="font-bold text-base text-gray-100 truncate"
-              title={s.name || `Session ${s.session_key.slice(0, 8)}`}
-            >
-              {s.name || `Session ${s.session_key.slice(0, 8)}`}
-            </div>
+            <TooltipLabel
+              className="font-bold text-base text-gray-100"
+              text={sessionDisplayName(s).label}
+              tooltip={sessionDisplayName(s).full}
+            />
             <div className="flex items-center gap-2 mt-1.5 flex-wrap">
               <span
                 className="text-[10px] px-2 py-0.5 rounded-full font-medium"
@@ -401,7 +407,7 @@ function SessionInfoCard({
             </span>
           </div>
           <span className="text-[10px] font-mono text-gray-600">
-            ID: {s.id.slice(0, 8)}
+            ID: {String(s.id).slice(0, 8)}
           </span>
         </div>
 
