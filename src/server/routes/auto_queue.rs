@@ -1032,25 +1032,6 @@ pub async fn enqueue(
         }
     };
 
-    // Only allow 'ready' cards into the queue
-    let card_status: String = conn
-        .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
-            [&card_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-    if card_status != "ready" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("card status is '{}', only 'ready' cards can be enqueued", card_status),
-                "card_id": card_id,
-                "status": card_status,
-            })),
-        );
-    }
-
     // Find or create active run (filtered by repo/agent)
     let run_id: String = conn
         .query_row(
@@ -1068,7 +1049,7 @@ pub async fn enqueue(
             id
         });
 
-    // Check if already in queue
+    // Check if already in queue BEFORE status validation (idempotent retry)
     let already: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND kanban_card_id = ?2 AND status = 'pending'",
@@ -1084,6 +1065,25 @@ pub async fn enqueue(
             Json(
                 json!({"ok": true, "card_id": card_id, "agent_id": agent_id, "already_queued": true}),
             ),
+        );
+    }
+
+    // Only allow 'ready' cards into the queue (new enqueue only)
+    let card_status: String = conn
+        .query_row(
+            "SELECT status FROM kanban_cards WHERE id = ?1",
+            [&card_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if card_status != "ready" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("card status is '{}', only 'ready' cards can be enqueued", card_status),
+                "card_id": card_id,
+                "status": card_status,
+            })),
         );
     }
 
@@ -1220,15 +1220,27 @@ pub async fn submit_order(
         created += 1;
     }
 
-    // Update run: pending → active, set rationale
+    // Only activate if at least one card was enqueued; otherwise leave as pending
+    // to prevent the activate() fallback from filling the run with unintended cards
     let rationale = body.rationale.as_deref()
         .or(body.reasoning.as_deref())
         .unwrap_or("PMD 분석 완료");
-    conn.execute(
-        "UPDATE auto_queue_runs SET status = 'active', ai_rationale = ?1 WHERE id = ?2",
-        rusqlite::params![rationale, run_id],
-    )
-    .ok();
+    if created > 0 {
+        conn.execute(
+            "UPDATE auto_queue_runs SET status = 'active', ai_rationale = ?1 WHERE id = ?2",
+            rusqlite::params![rationale, run_id],
+        )
+        .ok();
+    } else {
+        tracing::warn!(
+            "[auto-queue] submit_order: no ready cards enqueued, run {run_id} stays pending"
+        );
+        conn.execute(
+            "UPDATE auto_queue_runs SET status = 'completed', ai_rationale = ?1 WHERE id = ?2",
+            rusqlite::params![format!("{rationale} (no ready cards — auto-completed)"), run_id],
+        )
+        .ok();
+    }
 
     // Queue created and activated — dispatch is a separate step via POST /api/auto-queue/activate
     // This allows PMD to review/adjust the order before dispatching begins.
