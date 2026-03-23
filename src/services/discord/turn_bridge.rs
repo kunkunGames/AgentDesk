@@ -108,6 +108,7 @@ fn should_resume_watcher_after_turn(
 struct DispatchSnapshot {
     dispatch_type: String,
     status: String,
+    kanban_card_id: Option<String>,
 }
 
 async fn fetch_dispatch_snapshot(api_port: u16, dispatch_id: &str) -> Option<DispatchSnapshot> {
@@ -121,7 +122,79 @@ async fn fetch_dispatch_snapshot(api_port: u16, dispatch_id: &str) -> Option<Dis
     Some(DispatchSnapshot {
         dispatch_type: dispatch.get("dispatch_type")?.as_str()?.to_string(),
         status: dispatch.get("status")?.as_str()?.to_string(),
+        kanban_card_id: dispatch
+            .get("kanban_card_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
+}
+
+fn extract_review_decision(full_response: &str) -> Option<&'static str> {
+    // Match explicit patterns like "DECISION: accept" or "결정: dismiss"
+    let explicit = regex::Regex::new(
+        r"(?im)^\s*(?:decision|결정)\s*:\s*\**\s*(accept|dispute|dismiss)\b",
+    )
+    .ok()?;
+    if let Some(caps) = explicit.captures(full_response) {
+        let decision = caps.get(1)?.as_str().to_ascii_lowercase();
+        return match decision.as_str() {
+            "accept" => Some("accept"),
+            "dispute" => Some("dispute"),
+            "dismiss" => Some("dismiss"),
+            _ => None,
+        };
+    }
+    // Fallback: scan for standalone keywords in the last 500 chars (most likely the conclusion)
+    let tail = if full_response.len() > 500 {
+        &full_response[full_response.len() - 500..]
+    } else {
+        full_response
+    };
+    let keyword_re =
+        regex::Regex::new(r"(?im)\b(accept|dispute|dismiss)\b").ok()?;
+    let mut found: Option<&'static str> = None;
+    for caps in keyword_re.captures_iter(tail) {
+        let kw = caps.get(1)?.as_str().to_ascii_lowercase();
+        let candidate = match kw.as_str() {
+            "accept" => "accept",
+            "dispute" => "dispute",
+            "dismiss" => "dismiss",
+            _ => continue,
+        };
+        if found.is_some() && found != Some(candidate) {
+            // Ambiguous — multiple different keywords found
+            return None;
+        }
+        found = Some(candidate);
+    }
+    found
+}
+
+async fn submit_review_decision_fallback(
+    api_port: u16,
+    card_id: &str,
+    decision: &str,
+    full_response: &str,
+) -> Result<(), String> {
+    let comment = truncate_str(full_response.trim(), 4000).to_string();
+    let url = format!("http://127.0.0.1:{api_port}/api/review-decision");
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({
+            "card_id": card_id,
+            "decision": decision,
+            "comment": comment,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("HTTP {status}: {body}"))
+    }
 }
 
 fn extract_explicit_review_verdict(full_response: &str) -> Option<&'static str> {
@@ -201,10 +274,28 @@ async fn guard_review_dispatch_completion(
                     .to_string(),
             )
         }
-        "review-decision" => Some(
-            "⚠️ review-decision dispatch가 아직 pending입니다. `review-decision` API를 호출해야 카드가 다음 단계로 이동합니다."
-                .to_string(),
-        ),
+        "review-decision" => {
+            if let Some(decision) = extract_review_decision(full_response) {
+                if let Some(card_id) = snapshot.kanban_card_id.as_deref() {
+                    match submit_review_decision_fallback(
+                        api_port, card_id, decision, full_response,
+                    )
+                    .await
+                    {
+                        Ok(()) => return None,
+                        Err(err) => {
+                            return Some(format!(
+                                "⚠️ review-decision 자동 제출 실패: {err}\n`review-decision` API를 다시 호출해야 파이프라인이 진행됩니다."
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(
+                "⚠️ review-decision dispatch가 아직 pending입니다. `review-decision` API를 호출해야 카드가 다음 단계로 이동합니다."
+                    .to_string(),
+            )
+        }
         _ => None,
     }
 }
@@ -1108,7 +1199,7 @@ pub(super) fn spawn_turn_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_explicit_review_verdict, should_resume_watcher_after_turn};
+    use super::{extract_explicit_review_verdict, extract_review_decision, should_resume_watcher_after_turn};
 
     #[test]
     fn chained_batch_mid_turn_keeps_watcher_paused() {
@@ -1142,6 +1233,60 @@ mod tests {
         assert_eq!(
             extract_explicit_review_verdict("검토 완료. 전반적으로 좋아 보입니다."),
             None
+        );
+    }
+
+    #[test]
+    fn review_decision_parser_accepts_explicit_marker() {
+        assert_eq!(
+            extract_review_decision("DECISION: accept\n리뷰 반영하겠습니다."),
+            Some("accept")
+        );
+        assert_eq!(
+            extract_review_decision("결정: dismiss\n이 리뷰는 무시합니다."),
+            Some("dismiss")
+        );
+        assert_eq!(
+            extract_review_decision("Decision: dispute\n반론을 제기합니다."),
+            Some("dispute")
+        );
+    }
+
+    #[test]
+    fn review_decision_parser_accepts_keyword_in_tail() {
+        assert_eq!(
+            extract_review_decision("리뷰 내용을 검토한 결과 수정이 필요합니다.\n\naccept"),
+            Some("accept")
+        );
+        assert_eq!(
+            extract_review_decision("불필요한 변경이므로 dismiss 합니다."),
+            Some("dismiss")
+        );
+    }
+
+    #[test]
+    fn review_decision_parser_rejects_ambiguous_keywords() {
+        // Multiple different keywords → ambiguous, return None
+        assert_eq!(
+            extract_review_decision("accept or dismiss 중 선택해야 합니다."),
+            None
+        );
+    }
+
+    #[test]
+    fn review_decision_parser_ignores_unstructured_text() {
+        assert_eq!(
+            extract_review_decision("리뷰 피드백을 확인했습니다. 코드를 수정하겠습니다."),
+            None
+        );
+    }
+
+    #[test]
+    fn review_decision_explicit_marker_takes_priority() {
+        // Even with keywords in tail, explicit marker should be found first
+        assert_eq!(
+            extract_review_decision("DECISION: accept\n이 dismiss는 무시해도 됩니다."),
+            Some("accept")
         );
     }
 }
