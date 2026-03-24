@@ -51,9 +51,15 @@ async fn discord_get<T: serde::de::DeserializeOwned>(
 
 fn prompt_line(msg: &str) -> String {
     print!("{}", msg);
-    io::stdout().flush().unwrap();
+    if let Err(e) = io::stdout().flush() {
+        eprintln!("stdout flush failed: {e}");
+        std::process::exit(1);
+    }
     let mut buf = String::new();
-    io::stdin().lock().read_line(&mut buf).unwrap();
+    if let Err(e) = io::stdin().lock().read_line(&mut buf) {
+        eprintln!("stdin read failed: {e}");
+        std::process::exit(1);
+    }
     buf.trim().to_string()
 }
 
@@ -248,7 +254,7 @@ fn generate_bot_settings(
     token: &str,
     provider: &str,
     owner_id: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     let token_hash = crate::services::discord::settings::discord_token_hash(token);
     let mut entry = serde_json::json!({
         "token": token,
@@ -272,7 +278,7 @@ fn generate_bot_settings(
         obj.insert(token_hash, entry);
     }
 
-    serde_json::to_string_pretty(&root).unwrap()
+    serde_json::to_string_pretty(&root).map_err(|e| format!("JSON serialization failed: {e}"))
 }
 
 // ── Main init flow ─────────────────────────────────────────────────
@@ -310,7 +316,13 @@ pub fn handle_init(reconfigure: bool) {
 
     // Validate token & fetch bot info
     println!("\n봇 정보를 확인 중...");
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create async runtime: {}", e);
+            return;
+        }
+    };
     let client = reqwest::Client::new();
 
     let bot_user: DiscordUser = match rt.block_on(discord_get(&client, &token, "/users/@me")) {
@@ -434,9 +446,15 @@ pub fn handle_init(reconfigure: bool) {
 
     // Generate configs
     println!("\nStep 5/5: 설정 파일 생성\n");
-    fs::create_dir_all(&root).unwrap();
+    if let Err(e) = fs::create_dir_all(&root) {
+        eprintln!("Failed to create directory {}: {}", root.display(), e);
+        return;
+    }
     let config_dir = root.join("config");
-    fs::create_dir_all(&config_dir).unwrap();
+    if let Err(e) = fs::create_dir_all(&config_dir) {
+        eprintln!("Failed to create directory {}: {}", config_dir.display(), e);
+        return;
+    }
 
     // org.yaml — fresh install uses template, reconfigure preserves existing
     let org_path = config_dir.join("org.yaml");
@@ -464,22 +482,40 @@ pub fn handle_init(reconfigure: bool) {
             _ => small_team_org_yaml(&channel_mappings),
         }
     };
-    write_with_backup(&org_path, &org_yaml, reconfigure);
+    if let Err(e) = write_with_backup(&org_path, &org_yaml, reconfigure) {
+        eprintln!("Failed to write {}: {}", org_path.display(), e);
+        return;
+    }
     println!("  [OK] {}", org_path.display());
 
     // bot_settings.json
     let bs_path = config_dir.join("bot_settings.json");
-    let bot_settings = generate_bot_settings(&bs_path, &token, provider, owner_id);
-    write_with_backup(&bs_path, &bot_settings, reconfigure);
+    let bot_settings = match generate_bot_settings(&bs_path, &token, provider, owner_id) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bot_settings.json 생성 실패: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = write_with_backup(&bs_path, &bot_settings, reconfigure) {
+        eprintln!("Failed to write {}: {}", bs_path.display(), e);
+        return;
+    }
     println!("  [OK] {}", bs_path.display());
 
     // Create prompts
     let prompts_root = root.join("prompts");
-    fs::create_dir_all(prompts_root.join("agents")).unwrap();
+    if let Err(e) = fs::create_dir_all(prompts_root.join("agents")) {
+        eprintln!("Failed to create prompts/agents directory: {}", e);
+        return;
+    }
 
     let shared_path = prompts_root.join("_shared.md");
     if !shared_path.exists() {
-        fs::write(&shared_path, default_shared_prompt()).unwrap();
+        if let Err(e) = fs::write(&shared_path, default_shared_prompt()) {
+            eprintln!("Failed to write {}: {}", shared_path.display(), e);
+            return;
+        }
         println!("  [OK] {}", shared_path.display());
     }
 
@@ -489,27 +525,43 @@ pub fn handle_init(reconfigure: bool) {
             continue;
         }
         let role_dir = prompts_root.join("agents").join(role);
-        fs::create_dir_all(&role_dir).unwrap();
+        if let Err(e) = fs::create_dir_all(&role_dir) {
+            eprintln!("Failed to create directory {}: {}", role_dir.display(), e);
+            return;
+        }
         let identity_path = role_dir.join("IDENTITY.md");
         if !identity_path.exists() {
-            fs::write(&identity_path, default_agent_prompt(role)).unwrap();
+            if let Err(e) = fs::write(&identity_path, default_agent_prompt(role)) {
+                eprintln!("Failed to write {}: {}", identity_path.display(), e);
+                return;
+            }
             println!("  [OK] {}", identity_path.display());
         }
         created_roles.push(role.clone());
     }
 
     // Create skills/memory dirs
-    fs::create_dir_all(root.join("skills")).unwrap();
-    fs::create_dir_all(root.join("memory")).unwrap();
+    for dir_name in ["skills", "memory"] {
+        if let Err(e) = fs::create_dir_all(root.join(dir_name)) {
+            eprintln!("Failed to create {} directory: {}", dir_name, e);
+            return;
+        }
+    }
 
     // Binary setup + platform-specific service installation
     {
-        let home = dirs::home_dir().unwrap();
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("Error: cannot determine home directory");
+            return;
+        };
         let agentdesk_bin = root.join("bin").join("agentdesk");
 
         // Create wrapper bin dir
         let bin_dir = root.join("bin");
-        fs::create_dir_all(&bin_dir).unwrap();
+        if let Err(e) = fs::create_dir_all(&bin_dir) {
+            eprintln!("Failed to create directory {}: {}", bin_dir.display(), e);
+            return;
+        }
 
         // If no binary installed yet, copy current executable
         if !agentdesk_bin.exists() {
@@ -545,20 +597,33 @@ pub fn handle_init(reconfigure: bool) {
 fn install_service(home: &Path, agentdesk_bin: &Path, reconfigure: bool) {
     let plist_content = generate_launchd_plist(home, agentdesk_bin);
     let launch_agents = home.join("Library").join("LaunchAgents");
-    fs::create_dir_all(&launch_agents).unwrap();
+    if let Err(e) = fs::create_dir_all(&launch_agents) {
+        eprintln!("Failed to create LaunchAgents directory: {}", e);
+        return;
+    }
     let plist_filename = format!("{}.plist", dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL);
     let plist_path = launch_agents.join(&plist_filename);
-    write_with_backup(&plist_path, &plist_content, reconfigure);
+    if let Err(e) = write_with_backup(&plist_path, &plist_content, reconfigure) {
+        eprintln!("Failed to write plist {}: {}", plist_path.display(), e);
+        return;
+    }
     println!("  [OK] {}", plist_path.display());
 
     let load_answer = prompt_line("\ndcserver를 지금 시작할까요? (Y/n): ");
     if load_answer.is_empty() || load_answer.to_lowercase().starts_with('y') {
         let label = dcserver::AGENTDESK_DCSERVER_LAUNCHD_LABEL;
+        let uid = match get_uid() {
+            Ok(uid) => uid,
+            Err(e) => {
+                eprintln!("  [WARN] UID를 가져올 수 없습니다: {} — 수동으로 launchctl을 실행하세요", e);
+                return;
+            }
+        };
         if dcserver::is_launchd_job_loaded(label) {
             let _ = std::process::Command::new("launchctl")
                 .args([
                     "bootout",
-                    &format!("gui/{}", get_uid()),
+                    &format!("gui/{}", uid),
                     &plist_path.to_string_lossy().to_string(),
                 ])
                 .status();
@@ -566,7 +631,7 @@ fn install_service(home: &Path, agentdesk_bin: &Path, reconfigure: bool) {
         let status = std::process::Command::new("launchctl")
             .args([
                 "bootstrap",
-                &format!("gui/{}", get_uid()),
+                &format!("gui/{}", uid),
                 &plist_path.to_string_lossy().to_string(),
             ])
             .status();
@@ -586,7 +651,10 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     let root_dir =
         dcserver::agentdesk_runtime_root().unwrap_or_else(|| home.join(".adk").join("release"));
     let logs_dir = root_dir.join("logs");
-    fs::create_dir_all(&logs_dir).unwrap();
+    if let Err(e) = fs::create_dir_all(&logs_dir) {
+        eprintln!("Failed to create logs directory: {}", e);
+        return;
+    }
     let unit_content = format!(
         "[Unit]\n\
          Description=AgentDesk Discord Control Server\n\
@@ -607,9 +675,15 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     );
 
     let user_systemd = home.join(".config").join("systemd").join("user");
-    fs::create_dir_all(&user_systemd).unwrap();
+    if let Err(e) = fs::create_dir_all(&user_systemd) {
+        eprintln!("Failed to create systemd user directory: {}", e);
+        return;
+    }
     let unit_path = user_systemd.join(format!("{service_name}.service"));
-    fs::write(&unit_path, &unit_content).unwrap();
+    if let Err(e) = fs::write(&unit_path, &unit_content) {
+        eprintln!("Failed to write systemd unit {}: {}", unit_path.display(), e);
+        return;
+    }
     println!("  [OK] {}", unit_path.display());
 
     let load_answer = prompt_line("\ndcserver를 지금 시작할까요? (Y/n): ");
@@ -633,11 +707,17 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
 fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     let service_name = "AgentDeskDcserver";
     let root_dir = dcserver::agentdesk_runtime_root().unwrap_or_else(|| {
-        let home = dirs::home_dir().unwrap();
+        let home = dirs::home_dir().unwrap_or_else(|| {
+            eprintln!("Error: cannot determine home directory");
+            std::process::exit(1);
+        });
         home.join(".adk").join("release")
     });
     let logs_dir = root_dir.join("logs");
-    fs::create_dir_all(&logs_dir).unwrap();
+    if let Err(e) = fs::create_dir_all(&logs_dir) {
+        eprintln!("Failed to create logs directory: {}", e);
+        return;
+    }
 
     println!("  Windows 서비스 등록:");
     println!("  NSSM 사용 시:");
@@ -708,12 +788,11 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     println!("  수동으로 실행: {} --dcserver", agentdesk_bin.display());
 }
 
-fn write_with_backup(path: &Path, content: &str, reconfigure: bool) {
+fn write_with_backup(path: &Path, content: &str, reconfigure: bool) -> Result<(), io::Error> {
     if reconfigure && path.exists() {
-        // Show diff concept
         let existing = fs::read_to_string(path).unwrap_or_default();
         if existing == content {
-            return; // No change
+            return Ok(()); // No change
         }
         let backup = path.with_extension(format!(
             "{}.bak",
@@ -723,14 +802,14 @@ fn write_with_backup(path: &Path, content: &str, reconfigure: bool) {
             let _ = fs::copy(path, &backup);
         }
     }
-    fs::write(path, content).unwrap();
+    fs::write(path, content)
 }
 
 #[cfg(target_os = "macos")]
-fn get_uid() -> String {
+fn get_uid() -> Result<String, String> {
     let output = std::process::Command::new("id")
         .arg("-u")
         .output()
-        .expect("failed to get uid");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+        .map_err(|e| format!("failed to get uid: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

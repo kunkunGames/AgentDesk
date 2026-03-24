@@ -518,7 +518,17 @@ pub fn handle_restart_dcserver(
     };
 
     // Read bot_settings.json to find stored token(s)
-    let settings_path = instance_bot_settings_path().expect("Cannot determine runtime root");
+    let settings_path = match instance_bot_settings_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: Cannot determine runtime root for bot_settings.json");
+            write_restart_report(
+                "failed",
+                "runtime root를 결정할 수 없어서 dcserver restart를 시작하지 못했습니다.".to_string(),
+            );
+            return;
+        }
+    };
 
     match std::fs::read_to_string(&settings_path) {
         Ok(_) => {}
@@ -787,18 +797,21 @@ pub fn handle_restart_dcserver(
 
     // Launch new dcserver inside tmux session "AgentDesk-dcserver"
     // Write a launcher script to avoid token exposure in ps aux
-    let launcher_path = agentdesk_runtime_root()
-        .map(|root| {
-            let scripts_dir = root.join("scripts");
-            let _ = std::fs::create_dir_all(&scripts_dir);
-            scripts_dir.join("_launch_dcserver.sh")
-        })
-        .expect("Cannot determine runtime root");
+    let Some(runtime_root) = agentdesk_runtime_root() else {
+        eprintln!("Error: Cannot determine runtime root");
+        write_restart_report(
+            "failed",
+            "runtime root를 결정할 수 없어서 tmux fallback restart를 시작하지 못했습니다."
+                .to_string(),
+        );
+        return;
+    };
+    let scripts_dir = runtime_root.join("scripts");
+    let _ = std::fs::create_dir_all(&scripts_dir);
+    let launcher_path = scripts_dir.join("_launch_dcserver.sh");
 
     // Use production binary at ~/.adk/release/bin/agentdesk (trunk-based: separate from build output)
-    let prod_bin = agentdesk_runtime_root()
-        .map(|root| root.join("bin").join("agentdesk"))
-        .expect("Cannot determine runtime root");
+    let prod_bin = runtime_root.join("bin").join("agentdesk");
     let exe = if prod_bin.exists() {
         prod_bin.display().to_string()
     } else {
@@ -810,10 +823,17 @@ pub fn handle_restart_dcserver(
         if project_exe.exists() {
             project_exe.display().to_string()
         } else {
-            std::env::current_exe()
-                .expect("Cannot determine executable path")
-                .display()
-                .to_string()
+            match std::env::current_exe() {
+                Ok(p) => p.display().to_string(),
+                Err(e) => {
+                    eprintln!("Error: Cannot determine executable path: {e}");
+                    write_restart_report(
+                        "failed",
+                        format!("실행 바이너리 경로를 결정할 수 없습니다: {e}"),
+                    );
+                    return;
+                }
+            }
         }
     };
 
@@ -840,12 +860,21 @@ pub fn handle_restart_dcserver(
         "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} --dcserver\n",
         exe
     );
-    std::fs::write(&launcher_path, &script).expect("Failed to write launcher script");
+    if let Err(e) = std::fs::write(&launcher_path, &script) {
+        eprintln!("Error: Failed to write launcher script: {e}");
+        write_restart_report("failed", format!("launcher script 쓰기 실패: {e}"));
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o700))
-            .expect("Failed to set script permissions");
+        if let Err(e) =
+            std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o700))
+        {
+            eprintln!("Error: Failed to set script permissions: {e}");
+            write_restart_report("failed", format!("launcher script 권한 설정 실패: {e}"));
+            return;
+        }
     }
 
     let tmux_session = "AgentDesk-dcserver";
@@ -856,13 +885,14 @@ pub fn handle_restart_dcserver(
         .output();
     std::thread::sleep(std::time::Duration::from_millis(500));
 
+    let launcher_str = launcher_path.to_string_lossy();
     let child = std::process::Command::new("tmux")
         .args([
             "new-session",
             "-d",
             "-s",
             tmux_session,
-            launcher_path.to_str().unwrap(),
+            launcher_str.as_ref(),
         ])
         .spawn();
 
@@ -941,12 +971,18 @@ pub fn handle_dcserver(token: Option<String>) {
         let lock_path = agentdesk_runtime_root()
             .map(|r| r.join("runtime/dcserver.lock"))
             .unwrap_or_else(|| PathBuf::from("/tmp/agentdesk-dcserver.lock"));
-        let f = fs::OpenOptions::new()
+        let f = match fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .expect("Failed to open lock file");
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to open lock file {:?}: {}", lock_path, e);
+                std::process::exit(1);
+            }
+        };
         let ret = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if ret != 0 {
             eprintln!(
@@ -981,7 +1017,13 @@ pub fn handle_dcserver(token: Option<String>) {
         std::env::remove_var("CLAUDECODE");
     }
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create Tokio runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
     let settings_path = instance_bot_settings_path();
 
     let title = format!("  AgentDesk v{}  |  Discord Bot Server  ", VERSION);
