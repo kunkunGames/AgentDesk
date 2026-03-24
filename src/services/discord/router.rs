@@ -320,6 +320,49 @@ pub(super) async fn handle_event(
                 }
             }
 
+            // ── Dispatch collision guard ────────────────────────────────
+            // When a DISPATCH: message arrives on a channel that already has
+            // an active turn (inflight), queue it as an intervention instead
+            // of starting a parallel turn that would stomp the current
+            // placeholder.
+            if text.starts_with("DISPATCH:") {
+                let mut d = data.shared.core.lock().await;
+                if d.cancel_tokens.contains_key(&channel_id) {
+                    let inserted = {
+                        let queue = d.intervention_queue.entry(channel_id).or_default();
+                        enqueue_intervention(
+                            queue,
+                            Intervention {
+                                author_id: user_id,
+                                message_id: new_message.id,
+                                text: text.to_string(),
+                                mode: InterventionMode::Soft,
+                                created_at: Instant::now(),
+                            },
+                        )
+                    };
+                    if inserted {
+                        if let Some(q) = d.intervention_queue.get(&channel_id) {
+                            save_channel_queue(&data.provider, channel_id, q);
+                        }
+                    }
+                    drop(d);
+
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] 📬 DISPATCH-GUARD: queued dispatch message in channel {} (active turn in progress)",
+                        channel_id
+                    );
+                    add_reaction(ctx, channel_id, new_message.id, '📬').await;
+                    data.shared
+                        .last_message_ids
+                        .insert(channel_id, new_message.id.get());
+                    return Ok(());
+                }
+                drop(d);
+                // No active turn — fall through to normal processing below
+            }
+
             // Queue messages while AI is in progress (executed as next turn after current finishes)
             {
                 let mut d = data.shared.core.lock().await;
