@@ -502,8 +502,7 @@ pub fn handle_init(reconfigure: bool) {
     fs::create_dir_all(root.join("skills")).unwrap();
     fs::create_dir_all(root.join("memory")).unwrap();
 
-    // Launchd setup (macOS only)
-    #[cfg(target_os = "macos")]
+    // Binary setup + platform-specific service installation
     {
         let home = dirs::home_dir().unwrap();
         let agentdesk_bin = root.join("bin").join("agentdesk");
@@ -512,7 +511,7 @@ pub fn handle_init(reconfigure: bool) {
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
-        // If no binary installed yet, link current executable
+        // If no binary installed yet, copy current executable
         if !agentdesk_bin.exists() {
             if let Ok(current_exe) = std::env::current_exe() {
                 if let Err(e) = fs::copy(&current_exe, &agentdesk_bin) {
@@ -523,7 +522,7 @@ pub fn handle_init(reconfigure: bool) {
             }
         }
 
-        // Platform-specific service installation
+        // Platform-specific service installation (auto-detected)
         install_service(&home, &agentdesk_bin, reconfigure);
 
         println!("\n═══════════════════════════════════════");
@@ -584,6 +583,8 @@ fn install_service(home: &Path, agentdesk_bin: &Path, reconfigure: bool) {
 #[cfg(target_os = "linux")]
 fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
     let service_name = "agentdesk-dcserver";
+    let root_dir =
+        dcserver::agentdesk_runtime_root().unwrap_or_else(|| home.join(".adk").join("release"));
     let unit_content = format!(
         "[Unit]\n\
          Description=AgentDesk Discord Control Server\n\
@@ -597,7 +598,7 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) {
          [Install]\n\
          WantedBy=default.target\n",
         agentdesk_bin.display(),
-        home.join(".adk").join("release").display()
+        root_dir.display()
     );
 
     let user_systemd = home.join(".config").join("systemd").join("user");

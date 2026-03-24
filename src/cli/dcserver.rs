@@ -70,6 +70,120 @@ pub fn kickstart_launchd_job(_label: &str) -> bool {
     false
 }
 
+// ── systemd helpers (Linux) ─────────────────────────────────────
+
+const SYSTEMD_SERVICE_NAME: &str = "agentdesk-dcserver";
+
+#[cfg(target_os = "linux")]
+pub fn is_systemd_service_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", SYSTEMD_SERVICE_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_systemd_service_active() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_systemd_service_enabled() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "--quiet", SYSTEMD_SERVICE_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_systemd_service_enabled() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn restart_systemd_service() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "restart", SYSTEMD_SERVICE_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restart_systemd_service() -> bool {
+    false
+}
+
+pub fn restart_systemd_dcserver_and_verify(timeout: Duration) -> Result<(), String> {
+    let stdout_path =
+        dcserver_stdout_log_path().ok_or_else(|| "dcserver stdout log path missing".to_string())?;
+    let start_offset = fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+
+    if !restart_systemd_service() {
+        return Err("systemctl --user restart failed".to_string());
+    }
+
+    verify_dcserver_ready_since(start_offset, timeout)
+}
+
+// ── Windows service helpers ─────────────────────────────────────
+
+const WINDOWS_SERVICE_NAME: &str = "AgentDeskDcserver";
+
+#[cfg(target_os = "windows")]
+pub fn is_windows_service_installed() -> bool {
+    std::process::Command::new("sc")
+        .args(["query", WINDOWS_SERVICE_NAME])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_windows_service_installed() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub fn restart_windows_service() -> bool {
+    // Try NSSM first, fall back to sc.exe
+    let nssm = std::process::Command::new("nssm")
+        .args(["restart", WINDOWS_SERVICE_NAME])
+        .status();
+    if matches!(nssm, Ok(s) if s.success()) {
+        return true;
+    }
+    // Fallback: sc stop + sc start
+    let _ = std::process::Command::new("sc")
+        .args(["stop", WINDOWS_SERVICE_NAME])
+        .status();
+    std::thread::sleep(Duration::from_secs(2));
+    std::process::Command::new("sc")
+        .args(["start", WINDOWS_SERVICE_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn restart_windows_service() -> bool {
+    false
+}
+
+pub fn restart_windows_dcserver_and_verify(timeout: Duration) -> Result<(), String> {
+    let stdout_path =
+        dcserver_stdout_log_path().ok_or_else(|| "dcserver stdout log path missing".to_string())?;
+    let start_offset = fs::metadata(&stdout_path).map(|m| m.len()).unwrap_or(0);
+
+    if !restart_windows_service() {
+        return Err("Windows service restart failed".to_string());
+    }
+
+    verify_dcserver_ready_since(start_offset, timeout)
+}
+
 pub fn agentdesk_runtime_root() -> Option<PathBuf> {
     if let Ok(override_root) = env::var(AGENTDESK_ROOT_DIR_ENV) {
         let trimmed = override_root.trim();
@@ -593,6 +707,70 @@ pub fn handle_restart_dcserver(
                     );
                 }
                 return;
+            }
+        }
+    }
+
+    // systemd restart path (Linux)
+    if is_systemd_service_enabled() || is_systemd_service_active() {
+        println!("   systemd user service detected: {}", SYSTEMD_SERVICE_NAME);
+        match restart_systemd_dcserver_and_verify(READY_TIMEOUT) {
+            Ok(()) => {
+                println!(
+                    "✅ Discord bot restarted via systemd '{}' and passed ready check",
+                    SYSTEMD_SERVICE_NAME
+                );
+                write_restart_report(
+                    "ok",
+                    format!(
+                        "systemd restart 완료, ready check 통과\n- service: `{}`",
+                        SYSTEMD_SERVICE_NAME
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("⚠ systemd restart verification failed: {e}");
+                write_restart_report(
+                    "failed",
+                    format!(
+                        "systemd restart 실패\n- service: `{}`\n- error: `{}`",
+                        SYSTEMD_SERVICE_NAME, e
+                    ),
+                );
+                // Fall through to tmux fallback
+            }
+        }
+    }
+
+    // Windows service restart path
+    if is_windows_service_installed() {
+        println!("   Windows service detected: {}", WINDOWS_SERVICE_NAME);
+        match restart_windows_dcserver_and_verify(READY_TIMEOUT) {
+            Ok(()) => {
+                println!(
+                    "✅ Discord bot restarted via Windows service '{}' and passed ready check",
+                    WINDOWS_SERVICE_NAME
+                );
+                write_restart_report(
+                    "ok",
+                    format!(
+                        "Windows service restart 완료, ready check 통과\n- service: `{}`",
+                        WINDOWS_SERVICE_NAME
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("⚠ Windows service restart failed: {e}");
+                write_restart_report(
+                    "failed",
+                    format!(
+                        "Windows service restart 실패\n- service: `{}`\n- error: `{}`",
+                        WINDOWS_SERVICE_NAME, e
+                    ),
+                );
+                // Fall through to tmux fallback
             }
         }
     }
