@@ -186,6 +186,31 @@ pub(super) async fn restore_inflight_turns(
                 let user_msg_id = MessageId::new(state.user_msg_id);
                 super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
                 super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
+                // Complete the dispatch if this was a dispatch turn — the normal
+                // idle→auto_complete path was lost when dcserver restarted.
+                let recovered_dispatch_id = parse_dispatch_id(&state.user_text);
+                if let Some(ref did) = recovered_dispatch_id {
+                    let adk_session_key =
+                        build_adk_session_key(shared, ChannelId::new(state.channel_id), provider)
+                            .await;
+                    post_adk_session_status(
+                        adk_session_key.as_deref(),
+                        state.channel_name.as_deref(),
+                        Some(provider.as_str()),
+                        "idle",
+                        provider,
+                        None,
+                        None,
+                        None,
+                        Some(did),
+                        shared.api_port,
+                    )
+                    .await;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ✓ posted idle with dispatch_id {did} for completed-during-downtime recovery"
+                    );
+                }
                 super::restart_report::clear_restart_report(provider, state.channel_id);
                 clear_inflight_state(provider, state.channel_id);
                 continue;
@@ -517,7 +542,7 @@ pub(super) async fn restore_inflight_turns(
             Some(&adk_session_info),
             None,
             last_path.as_deref(),
-            None, // dispatch_id not available during recovery
+            parse_dispatch_id(&state.user_text).as_deref(),
             shared.api_port,
         )
         .await;
@@ -583,7 +608,7 @@ pub(super) async fn restore_inflight_turns(
                 adk_session_name,
                 adk_session_info: Some(adk_session_info),
                 adk_cwd: last_path.clone(),
-                dispatch_id: None,
+                dispatch_id: parse_dispatch_id(&state.user_text),
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),

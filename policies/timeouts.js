@@ -15,6 +15,7 @@
  * [I-0] 미전송 디스패치 알림 복구 (2분)
  * [J] Failed 디스패치 자동 재시도 (30초 쿨다운, ~60초 cadence, 최대 10회 + 즉시 Discord 알림)
  * [I] 턴 데드락 감지 + 자동 복구 (15분 주기, 최대 3회 연장 후 강제 중단 + 재디스패치)
+ * [K] 고아 디스패치 복구 (5분) — in_progress 카드 + pending 디스패치 + 활성 세션 없음 → review 전이
  */
 
 // Send notification via notify bot (system alerts, not agent communication)
@@ -581,6 +582,51 @@ var timeouts = {
       if (ts && ts < sevenDaysAgo) {
         agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [historyKeys[hk].key]);
       }
+    }
+
+    // ─── [K] 고아 디스패치 복구 (5분) ────────────────────────
+    // Card가 in_progress이고 latest dispatch가 pending인데
+    // 해당 dispatch_id를 가진 working 세션이 없는 경우 = 고아 디스패치.
+    // dcserver 재시작 등으로 세션-디스패치 연결이 끊긴 상태.
+    // dispatch를 completed로 마크하고 card를 review로 전이하여 리뷰 파이프라인을 재개한다.
+    var orphanedDispatches = agentdesk.db.query(
+      "SELECT td.id as dispatch_id, td.kanban_card_id, td.dispatch_type " +
+      "FROM task_dispatches td " +
+      "JOIN kanban_cards kc ON kc.id = td.kanban_card_id " +
+      "WHERE kc.status = 'in_progress' " +
+      "AND td.status = 'pending' " +
+      "AND kc.latest_dispatch_id = td.id " +
+      "AND td.dispatch_type IN ('implementation', 'rework') " +
+      "AND td.created_at < datetime('now', '-5 minutes') " +
+      "AND NOT EXISTS (" +
+      "  SELECT 1 FROM sessions s " +
+      "  WHERE s.active_dispatch_id = td.id AND s.status = 'working'" +
+      ")"
+    );
+    for (var op = 0; op < orphanedDispatches.length; op++) {
+      var od = orphanedDispatches[op];
+      // 1) Dispatch를 completed로 마크
+      agentdesk.db.execute(
+        "UPDATE task_dispatches SET status = 'completed', " +
+        "completed_at = datetime('now'), " +
+        "result = '{\"auto_completed\":true,\"completion_source\":\"orphan_recovery\"}', " +
+        "updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
+        [od.dispatch_id]
+      );
+      // 2) Card를 review로 전이 → OnReviewEnter 훅이 review dispatch를 생성
+      agentdesk.kanban.setStatus(od.kanban_card_id, "review");
+      agentdesk.log.warn("[orphan-recovery] Completed orphaned dispatch " + od.dispatch_id +
+        " (type=" + od.dispatch_type + ") → card " + od.kanban_card_id + " → review");
+      // 3) PMD 알림
+      var orphanInfo = agentdesk.db.query(
+        "SELECT title, assigned_agent_id FROM kanban_cards WHERE id = ?",
+        [od.kanban_card_id]
+      );
+      var orphanTitle = (orphanInfo.length > 0) ? orphanInfo[0].title : od.kanban_card_id;
+      var orphanAgent = (orphanInfo.length > 0) ? orphanInfo[0].assigned_agent_id : "?";
+      sendNotifyAlert(getPMDChannel(),
+        "🔄 [고아 디스패치 복구] " + orphanAgent + " — " + orphanTitle +
+        "\n사유: pending 디스패치 5분 경과 + 활성 세션 없음 → review 전이");
     }
   },
 
