@@ -117,6 +117,14 @@ pub fn transition_status_with_opts(
                 card_id,
                 source
             );
+            notify_pmd_violation(
+                &conn,
+                card_id,
+                &old_status,
+                new_status,
+                source,
+                "no active dispatch",
+            );
             return Err(anyhow::anyhow!(
                 "Status transition {} → {} requires an active dispatch (pending/dispatched). Completed dispatches do not qualify. Use dispatch lifecycle or PMD force override.",
                 old_status,
@@ -145,6 +153,14 @@ pub fn transition_status_with_opts(
             "[kanban] Blocked invalid transition {} → done for card {} (must go through review)",
             old_status,
             card_id
+        );
+        notify_pmd_violation(
+            &conn,
+            card_id,
+            &old_status,
+            new_status,
+            source,
+            "review required",
         );
         return Err(anyhow::anyhow!(
             "Cannot transition from {} to done directly. Must go through review first.",
@@ -493,6 +509,74 @@ fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
                 .output();
         }
         _ => {}
+    }
+}
+
+/// Send a violation alert to the PMD/kanban-manager channel via announce bot.
+fn notify_pmd_violation(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    from: &str,
+    to: &str,
+    source: &str,
+    reason: &str,
+) {
+    // Look up card title for the notification
+    let title: String = conn
+        .query_row(
+            "SELECT COALESCE(title, id) FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| card_id.to_string());
+
+    // Read kanban_manager_channel_id from kv_meta
+    let km_channel: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'kanban_manager_channel_id'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(km_channel) = km_channel else {
+        tracing::debug!("[kanban] No kanban_manager_channel_id configured, skipping violation alert");
+        return;
+    };
+    let Some(channel_num) = km_channel.parse::<u64>().ok() else {
+        tracing::warn!("[kanban] Invalid kanban_manager_channel_id: {km_channel}");
+        return;
+    };
+
+    let message = format!(
+        "⚠️ **칸반 위반 감지**\n\n\
+         카드: {title}\n\
+         시도: {from} → {to}\n\
+         차단 사유: {reason}\n\
+         호출자: {source}\n\
+         카드 ID: {card_id}"
+    );
+
+    let token = match crate::credential::read_bot_token("announce") {
+        Some(t) => t,
+        None => {
+            tracing::debug!("[kanban] No announce bot token, skipping violation alert");
+            return;
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let client = reqwest::Client::new();
+            let _ = client
+                .post(format!(
+                    "https://discord.com/api/v10/channels/{channel_num}/messages"
+                ))
+                .header("Authorization", format!("Bot {}", token))
+                .json(&serde_json::json!({"content": message}))
+                .send()
+                .await;
+        });
     }
 }
 

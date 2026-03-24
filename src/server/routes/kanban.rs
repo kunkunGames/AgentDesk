@@ -46,6 +46,10 @@ pub struct UpdateCardBody {
     pub repo_id: Option<String>,
     pub github_issue_url: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    /// PMD-only override to bypass dispatch validation.
+    pub force: Option<bool>,
+    /// Caller identity (e.g., "pmd", "api"). Required when force=true.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,7 +321,52 @@ pub async fn update_card(
         );
     }
 
-    // Execute non-status field updates if any
+    let new_status = body.status.clone();
+
+    // ── Status transition FIRST (validates before any writes) ──
+    // "requested" transition is ONLY allowed via POST /api/dispatches
+    if let Some(new_s) = &new_status {
+        if new_s == "requested" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": "Use POST /api/dispatches to start work. PATCH status=requested is not allowed."}),
+                ),
+            );
+        }
+        if new_s.as_str() != old_status {
+            // Resolve source and force parameters
+            let force = body.force.unwrap_or(false);
+            let source = body.source.as_deref().unwrap_or("api");
+
+            // force=true requires source="pmd"
+            if force && source != "pmd" {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "force override is only allowed for PMD (source must be 'pmd')"})),
+                );
+            }
+
+            match crate::kanban::transition_status_with_opts(
+                &state.db,
+                &state.engine,
+                &id,
+                new_s,
+                source,
+                force,
+            ) {
+                Ok(_) => {}
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Non-status field updates (only after status transition succeeds) ──
     if !sets.is_empty() {
         sets.push(format!("updated_at = datetime('now')"));
         let sql = format!(
@@ -352,39 +401,6 @@ pub async fn update_card(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("{e}")})),
                 );
-            }
-        }
-    }
-
-    let new_status = body.status.clone();
-
-    // Status change via transition_status_with_opts (dispatch validation + audit)
-    // "requested" transition is ONLY allowed via POST /api/dispatches (which creates dispatch + sets status)
-    if let Some(new_s) = &new_status {
-        if new_s == "requested" {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    json!({"error": "Use POST /api/dispatches to start work. PATCH status=requested is not allowed."}),
-                ),
-            );
-        }
-        if new_s.as_str() != old_status {
-            match crate::kanban::transition_status_with_opts(
-                &state.db,
-                &state.engine,
-                &id,
-                new_s,
-                "api",
-                false,
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": format!("{e}")})),
-                    );
-                }
             }
         }
     }
