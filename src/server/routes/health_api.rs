@@ -12,13 +12,21 @@ use super::AppState;
 
 /// GET /api/health — combined DB + Discord provider health.
 /// When HealthRegistry is present, returns Discord provider status.
-/// Always includes DB status.
+/// Always includes DB status and dashboard availability.
 pub async fn health_handler(State(state): State<AppState>) -> Response {
     let db_ok = state
         .db
         .lock()
         .map(|conn| conn.execute_batch("SELECT 1").is_ok())
         .unwrap_or(false);
+
+    // Check if dashboard dist is available
+    let dashboard_ok = {
+        let dashboard_dir = crate::cli::agentdesk_runtime_root()
+            .map(|r| r.join("dashboard/dist"))
+            .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
+        dashboard_dir.join("index.html").exists()
+    };
 
     if let Some(ref registry) = state.health_registry {
         let healthy = health::is_healthy(registry).await;
@@ -27,6 +35,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         let mut json: serde_json::Value =
             serde_json::from_str(&discord_json).unwrap_or(serde_json::json!({}));
         json["db"] = serde_json::json!(db_ok);
+        json["dashboard"] = serde_json::json!(dashboard_ok);
 
         let status = if healthy && db_ok {
             StatusCode::OK
@@ -44,7 +53,8 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         let json = serde_json::json!({
             "ok": db_ok,
             "version": env!("CARGO_PKG_VERSION"),
-            "db": db_ok
+            "db": db_ok,
+            "dashboard": dashboard_ok
         });
         (status, Json(json)).into_response()
     }

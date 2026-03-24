@@ -13,7 +13,12 @@ use crate::db::Db;
 use crate::engine::PolicyEngine;
 use crate::services::discord::health::HealthRegistry;
 
-pub async fn run(config: Config, db: Db, engine: PolicyEngine, health_registry: Option<Arc<HealthRegistry>>) -> Result<()> {
+pub async fn run(
+    config: Config,
+    db: Db,
+    engine: PolicyEngine,
+    health_registry: Option<Arc<HealthRegistry>>,
+) -> Result<()> {
     // Spawn periodic GitHub sync task
     let sync_interval = config.github.sync_interval_minutes;
     if sync_interval > 0 {
@@ -45,6 +50,35 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine, health_registry: 
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
         .map(|r| r.join("dashboard/dist"))
         .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
+
+    // Auto-provision: if runtime dist is missing, copy from workspace source
+    if !dashboard_dir.join("index.html").exists() {
+        let workspace_dist =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard/dist");
+        if workspace_dist.join("index.html").exists() {
+            tracing::info!(
+                "Dashboard dist missing at {:?}, copying from workspace {:?}",
+                dashboard_dir,
+                workspace_dist
+            );
+            if let Some(parent) = dashboard_dir.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Remove stale dist dir if it exists but is incomplete
+            let _ = std::fs::remove_dir_all(&dashboard_dir);
+            match copy_dir_recursive(&workspace_dist, &dashboard_dir) {
+                Ok(n) => tracing::info!("Dashboard dist copied ({n} files)"),
+                Err(e) => tracing::warn!("Failed to copy dashboard dist: {e}"),
+            }
+        } else {
+            tracing::warn!(
+                "Dashboard dist not found at {:?} or {:?} — dashboard will be unavailable",
+                dashboard_dir,
+                workspace_dist
+            );
+        }
+    }
+
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);
 
     let broadcast_tx = ws::new_broadcast();
@@ -60,7 +94,10 @@ pub async fn run(config: Config, db: Db, engine: PolicyEngine, health_registry: 
 
     let app = Router::new()
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
-        .nest("/api", routes::api_router(db.clone(), engine.clone(), health_registry))
+        .nest(
+            "/api",
+            routes::api_router(db.clone(), engine.clone(), health_registry),
+        )
         .fallback_service(ServeDir::new(&dashboard_dir));
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -233,9 +270,7 @@ async fn fetch_anthropic_rate_limits(
 
 /// Fetch rate limits from the OpenAI API via the models endpoint (free, read-only).
 /// Parses `x-ratelimit-*` response headers into bucket format.
-async fn fetch_openai_rate_limits(
-    api_key: &str,
-) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+async fn fetch_openai_rate_limits(api_key: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://api.openai.com/v1/models")
@@ -261,8 +296,7 @@ async fn fetch_openai_rate_limits(
     }
 
     if let Some(limit) = parse_header_i64(&headers, "x-ratelimit-limit-tokens") {
-        let remaining =
-            parse_header_i64(&headers, "x-ratelimit-remaining-tokens").unwrap_or(limit);
+        let remaining = parse_header_i64(&headers, "x-ratelimit-remaining-tokens").unwrap_or(limit);
         let reset = parse_header_reset(&headers, "x-ratelimit-reset-tokens");
         buckets.push(serde_json::json!({
             "name": "tokens",
@@ -297,7 +331,12 @@ fn parse_header_reset(headers: &reqwest::header::HeaderMap, name: &str) -> i64 {
 fn get_claude_oauth_token() -> Option<String> {
     // Try macOS Keychain first
     if let Ok(output) = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
     {
         if output.status.success() {
@@ -329,9 +368,7 @@ fn get_claude_oauth_token() -> Option<String> {
 
 /// Fetch Claude usage via OAuth API (subscription-based, no API key needed).
 /// Returns utilization-based buckets (5h, 7d).
-async fn fetch_claude_oauth_usage(
-    token: &str,
-) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -404,9 +441,7 @@ fn load_codex_access_token() -> Option<String> {
 }
 
 /// Fetch Codex usage via chatgpt.com backend API (subscription-based, no API key needed).
-async fn fetch_codex_oauth_usage(
-    token: &str,
-) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+async fn fetch_codex_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://chatgpt.com/backend-api/codex/usage")
@@ -437,10 +472,7 @@ async fn fetch_codex_oauth_usage(
                     .get("limit_window_seconds")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
-                let reset_at = window
-                    .get("reset_at")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let reset_at = window.get("reset_at").and_then(|v| v.as_i64()).unwrap_or(0);
 
                 let label = if window_seconds <= 18000 {
                     "5h"
@@ -522,7 +554,8 @@ async fn github_sync_loop(db: Db, engine: crate::engine::PolicyEngine, interval_
             }
 
             // Sync state
-            match crate::github::sync::sync_github_issues_for_repo(&db, &engine, &repo.id, &issues) {
+            match crate::github::sync::sync_github_issues_for_repo(&db, &engine, &repo.id, &issues)
+            {
                 Ok(r) => {
                     if r.closed_count > 0 || r.inconsistency_count > 0 {
                         tracing::info!(
@@ -539,4 +572,22 @@ async fn github_sync_loop(db: Db, engine: crate::engine::PolicyEngine, interval_
             }
         }
     }
+}
+
+/// Recursively copy a directory tree. Returns the number of files copied.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dst)?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            count += copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path)?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }

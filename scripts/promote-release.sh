@@ -45,11 +45,19 @@ chmod +x "$ADK_REL/bin/agentdesk"
 xattr -d com.apple.provenance "$ADK_REL/bin/agentdesk" 2>/dev/null || true
 codesign -f -s - "$ADK_REL/bin/agentdesk" 2>/dev/null || true
 
-# Copy dashboard from dev
+# Copy dashboard from dev (with fallback to workspace source)
 echo "▸ Copying dashboard from dev..."
 mkdir -p "$ADK_REL/dashboard"
 rm -rf "$ADK_REL/dashboard/dist"
-cp -r "$ADK_DEV/dashboard/dist" "$ADK_REL/dashboard/dist"
+if [ -d "$ADK_DEV/dashboard/dist" ] && [ -f "$ADK_DEV/dashboard/dist/index.html" ]; then
+    cp -r "$ADK_DEV/dashboard/dist" "$ADK_REL/dashboard/dist"
+elif [ -d "$HOME/AgentDesk/dashboard/dist" ] && [ -f "$HOME/AgentDesk/dashboard/dist/index.html" ]; then
+    echo "  ⚠ Dev dist missing, falling back to workspace source"
+    cp -r "$HOME/AgentDesk/dashboard/dist" "$ADK_REL/dashboard/dist"
+else
+    echo "  ⚠ Dashboard dist not found in dev or workspace — dashboard will be unavailable"
+    echo "  Run 'cd ~/AgentDesk/dashboard && npm run build' to generate it"
+fi
 
 # Initialize release database if it doesn't exist (never overwrite release data)
 if [ ! -f "$ADK_REL/data/agentdesk.sqlite" ]; then
