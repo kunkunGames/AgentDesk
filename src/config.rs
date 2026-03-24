@@ -206,8 +206,24 @@ pub fn load() -> Result<Config> {
 
 /// Load config gracefully — returns Config::default() if the file doesn't exist
 /// or fails to parse, instead of panicking.
+/// Searches: $AGENTDESK_CONFIG → $AGENTDESK_ROOT_DIR/agentdesk.yaml → ~/.adk/release/agentdesk.yaml → CWD/agentdesk.yaml
 pub fn load_graceful() -> Config {
-    let path = std::env::var("AGENTDESK_CONFIG").unwrap_or_else(|_| "agentdesk.yaml".into());
+    let path = std::env::var("AGENTDESK_CONFIG").unwrap_or_else(|_| {
+        // Try runtime root paths before falling back to CWD
+        if let Ok(root) = std::env::var("AGENTDESK_ROOT_DIR") {
+            let p = std::path::PathBuf::from(root.trim()).join("agentdesk.yaml");
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join(".adk").join("release").join("agentdesk.yaml");
+            if p.exists() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+        "agentdesk.yaml".into()
+    });
 
     let config = match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_yaml::from_str::<Config>(&contents) {

@@ -79,22 +79,19 @@ fn check_codex_cli() -> Check {
     }
 }
 
-fn check_port_conflict() -> Check {
-    let cfg = config::load_graceful();
-    let port = cfg.server.port;
-    // Try binding to the port to see if it's in use
-    match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
-        Ok(_listener) => {
-            // Port is free — means server is NOT running
-            Check::fail(
-                "Server Port",
-                format!("port {port} is free — server may not be running"),
-            )
+fn check_server_running() -> Check {
+    let base = super::client::api_base();
+    let url = format!("{base}/api/health");
+    match ureq::Agent::new().get(&url).call() {
+        Ok(resp) => {
+            if let Ok(body) = resp.into_json::<serde_json::Value>() {
+                let ver = body.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+                Check::ok("Server", format!("running v{ver} on {base}"))
+            } else {
+                Check::fail("Server", format!("responded but invalid JSON — {base}"))
+            }
         }
-        Err(_) => {
-            // Port is occupied — server is likely running
-            Check::ok("Server Port", format!("port {port} in use (server running)"))
-        }
+        Err(_) => Check::fail("Server", format!("not reachable — {base}")),
     }
 }
 
@@ -159,11 +156,11 @@ pub fn cmd_doctor() {
     println!("AgentDesk Doctor v{}\n", env!("CARGO_PKG_VERSION"));
 
     let checks = vec![
+        check_server_running(),
         check_discord_bot(),
         check_tmux(),
         check_claude_cli(),
         check_codex_cli(),
-        check_port_conflict(),
         check_launchd(),
         check_db_integrity(),
         check_disk_usage(),

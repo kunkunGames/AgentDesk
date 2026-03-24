@@ -399,8 +399,13 @@ fn main() -> Result<()> {
             }
         },
         Err(e) => {
-            // If clap fails to parse (e.g. unknown flag), show help
-            // But only if there were actual args (not just the binary name)
+            // --help and --version exit with 0; actual errors exit with 1
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                || e.kind() == clap::error::ErrorKind::DisplayVersion
+            {
+                e.print().ok();
+                std::process::exit(0);
+            }
             if args.len() > 1 {
                 e.print().ok();
                 std::process::exit(1);
