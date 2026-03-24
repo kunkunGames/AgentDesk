@@ -260,14 +260,14 @@ export default function KanbanTab({
         if (cached && Date.now() - cached.ts < CACHE_TTL) {
           if (isCurrentRequest()) {
             setGhComments(cached.comments);
-            if (cached.body) setEditor((prev) => ({ ...prev, description: cached.body }));
+            if (cached.body != null) setEditor((prev) => ({ ...prev, description: cached.body }));
           }
         } else {
           api.getCardGitHubComments(selectedCard.id).then((result) => {
             if (!isCurrentRequest()) return;
             ghCommentsCache.current.set(selectedCard.id, { comments: result.comments, body: result.body, ts: Date.now() });
             setGhComments(result.comments);
-            if (result.body) setEditor((prev) => ({ ...prev, description: result.body }));
+            if (result.body != null) setEditor((prev) => ({ ...prev, description: result.body }));
           }).catch(() => {});
         }
       }
