@@ -1242,7 +1242,7 @@ pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, disp
         .ok()
     };
 
-    let Some((dispatch_type, status, card_id, agent_id, title, result_json)) = info else {
+    let Some((dispatch_type, status, card_id, _agent_id, _title, result_json)) = info else {
         return;
     };
     if status != "completed" {
@@ -1321,33 +1321,11 @@ pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, disp
         }
     }
 
-    let latest_dispatch_id: Option<String> = {
-        let conn = match db.lock() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        conn.query_row(
-            "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
-            [&card_id],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten()
-    };
-
-    if let Some(new_dispatch_id) = latest_dispatch_id {
-        // Skip generic resend for review dispatches — send_review_result_to_primary()
-        // already handles all review completion notifications. Without this guard,
-        // JS policy state transitions (e.g. improve → rework) can change
-        // latest_dispatch_id and trigger a duplicate notification here.
-        if new_dispatch_id != dispatch_id
-            && !agent_id.is_empty()
-            && dispatch_type != "review"
-            && dispatch_type != "review-decision"
-        {
-            send_dispatch_to_discord(db, &agent_id, &title, &card_id, &new_dispatch_id).await;
-        }
-    }
+    // Generic resend removed — dispatch Discord notification is handled by:
+    // 1. kanban.rs fire_transition_hooks → onCardTransition → send_dispatch_to_discord
+    // 2. timeouts.js [I-0] recovery for unnotified dispatches
+    // 3. send_dispatch_to_discord has a dispatch_notified guard to prevent duplicates
+    // Previously this generic resend caused 2-3x duplicate messages for every dispatch.
 }
 
 /// Resolve a channel name alias (e.g. "adk-cc") to a numeric channel ID
