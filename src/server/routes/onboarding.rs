@@ -666,13 +666,22 @@ pub async fn check_provider(
         }
     };
 
-    // Check if installed — uses the same full resolution chain as runtime
-    // (which/where → login shell fallback) so health check agrees with actual launch.
-    let installed = crate::services::platform::async_resolve_binary_with_login_shell(cmd)
+    // Resolve binary using the exact same provider-specific resolver as the runtime,
+    // including known-path fallbacks (~/bin, /opt/homebrew/bin, etc.).
+    // This ensures onboarding and actual launch always agree on availability.
+    let resolved_path = {
+        let provider = cmd.to_string();
+        tokio::task::spawn_blocking(move || match provider.as_str() {
+            "claude" => crate::services::claude::resolve_claude_path(),
+            "codex" => crate::services::codex::resolve_codex_path(),
+            _ => None,
+        })
         .await
-        .is_some();
+        .ok()
+        .flatten()
+    };
 
-    if !installed {
+    let Some(bin_path) = resolved_path else {
         return (
             StatusCode::OK,
             Json(json!({
@@ -681,10 +690,11 @@ pub async fn check_provider(
                 "version": null,
             })),
         );
-    }
+    };
 
-    // Get version
-    let version_out = tokio::process::Command::new(cmd)
+    // Get version using the resolved binary path (not bare command name)
+    // so it works even when PATH doesn't contain the provider.
+    let version_out = tokio::process::Command::new(&bin_path)
         .arg("--version")
         .output()
         .await;
@@ -708,7 +718,7 @@ pub async fn check_provider(
     (
         StatusCode::OK,
         Json(json!({
-            "installed": installed,
+            "installed": true,
             "logged_in": logged_in,
             "version": version,
         })),

@@ -23,7 +23,8 @@ use crate::services::tmux_diagnostics::{
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
-fn resolve_codex_path() -> Option<String> {
+/// Public so onboarding/health-check can use the exact same resolution contract.
+pub fn resolve_codex_path() -> Option<String> {
     crate::services::platform::resolve_binary_with_login_shell("codex")
 }
 

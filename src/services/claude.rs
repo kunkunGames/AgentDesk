@@ -23,7 +23,8 @@ static CLAUDE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 /// Resolve the path to the claude binary.
 /// Uses platform::resolve_binary_with_login_shell, then falls back to known paths.
-fn resolve_claude_path() -> Option<String> {
+/// Public so onboarding/health-check can use the exact same resolution contract.
+pub fn resolve_claude_path() -> Option<String> {
     // Try platform-aware binary resolution (which/where + login shell fallback)
     if let Some(path) = crate::services::platform::resolve_binary_with_login_shell("claude") {
         return Some(path);
