@@ -106,9 +106,9 @@ const PROVIDER_PALETTES: Record<string, ProviderPalette> = {
 
 const DEFAULT_PALETTE: ProviderPalette = PROVIDER_PALETTES.Codex;
 const PROVIDER_ICONS: Record<string, string> = {
-  Claude: "\u{1F916}",
-  Codex: "\u26A1",
-  Gemini: "\u{1F52E}",
+  Claude: "🤖",
+  Codex: "⚡",
+  Gemini: "🔮",
 };
 
 function getColors(provider: string, level: string) {
@@ -188,7 +188,7 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
                   className="text-[10px] sm:text-xs font-bold uppercase tracking-wider"
                   style={{ color: accent }}
                 >
-                  {(PROVIDER_ICONS[provider.provider] ?? "\u2022")}{" "}
+                  {(PROVIDER_ICONS[provider.provider] ?? "•")}{" "}
                   {provider.provider}
                 </span>
                 {provider.stale ? (
@@ -196,7 +196,7 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
                     className="rounded px-1 py-0.5 text-[8px] font-medium shrink-0"
                     style={{ color: "#fbbf24", background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.2)" }}
                   >
-                    {t({ ko: "\uC9C0\uC5F0", en: "STALE", ja: "\u9045\u5EF6", zh: "\u5EF6\u8FDF" })}
+                    {t({ ko: "지연", en: "STALE", ja: "遅延", zh: "延迟" })}
                   </span>
                 ) : null}
               </div>
@@ -248,7 +248,7 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
                           className="text-[7px] sm:text-[8px] ml-[24px] sm:ml-[26px]"
                           style={{ color: "var(--th-text-muted)", marginTop: -1 }}
                         >
-                          \u21BB {remaining}
+                          ↻ {remaining}
                         </span>
                       )}
                     </div>

@@ -554,6 +554,43 @@ interface RLProvider {
   stale: boolean;
 }
 
+interface RawRLBucket {
+  name: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  reset: number;
+}
+
+interface RawRLProvider {
+  provider: string;
+  buckets: RawRLBucket[];
+  stale: boolean;
+}
+
+const RL_HIDDEN_PROVIDERS = new Set(["github"]);
+const RL_HIDDEN_BUCKETS = new Set(["7d Sonnet"]);
+
+function transformRLProviders(raw: RawRLProvider[]): RLProvider[] {
+  return raw
+    .filter((rp) => !RL_HIDDEN_PROVIDERS.has(rp.provider.toLowerCase()))
+    .map((rp) => ({
+      provider: rp.provider.charAt(0).toUpperCase() + rp.provider.slice(1),
+      stale: rp.stale,
+      buckets: rp.buckets
+        .filter((b) => !RL_HIDDEN_BUCKETS.has(b.name))
+        .map((b) => {
+          const utilization = b.limit > 0 ? Math.round((b.used / b.limit) * 100) : 0;
+          return {
+            id: b.name,
+            label: b.name,
+            utilization,
+            level: (utilization >= 95 ? "danger" : utilization >= 80 ? "warning" : "normal") as "normal" | "warning" | "danger",
+          };
+        }),
+    }));
+}
+
 const RL_COLORS: Record<string, { normal: string; warning: string; danger: string; accent: string }> = {
   Claude: { accent: "#f59e0b", normal: "#f59e0b", warning: "#ea580c", danger: "#ef4444" },
   Codex: { accent: "#34d399", normal: "#34d399", warning: "#fbbf24", danger: "#f87171" },
@@ -589,8 +626,8 @@ function MiniRateLimitBar({ isKo }: { isKo: boolean }) {
       try {
         const res = await fetch("/api/rate-limits", { credentials: "include" });
         if (!res.ok) return;
-        const json = await res.json() as { providers: RLProvider[] };
-        if (mounted) setProviders(json.providers ?? []);
+        const json = await res.json() as { providers: RawRLProvider[] };
+        if (mounted) setProviders(transformRLProviders(json.providers ?? []));
       } catch { /* ignore */ }
     };
     load();
@@ -604,7 +641,7 @@ function MiniRateLimitBar({ isKo }: { isKo: boolean }) {
     <div className="mt-2 space-y-1">
       {providers.map((p) => {
         const accent = (RL_COLORS[p.provider] || RL_COLORS.Codex).accent;
-        const visible = p.buckets.filter((b) => b.id !== "7d_sonnet");
+        const visible = p.buckets;
         return (
           <div key={p.provider} className="flex items-center gap-0">
             {/* Fixed-width left: provider + stale placeholder */}
