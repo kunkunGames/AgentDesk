@@ -1112,8 +1112,8 @@ pub async fn assign_issue(
     ) {
         // Update existing card instead of creating duplicate
         let _ = conn.execute(
-            "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, updated_at = datetime('now') WHERE id = ?4",
-            rusqlite::params![body.title, body.assignee_agent_id, body.github_issue_url, existing_id],
+            "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, description = ?4, updated_at = datetime('now') WHERE id = ?5",
+            rusqlite::params![body.title, body.assignee_agent_id, body.github_issue_url, body.description, existing_id],
         );
         drop(conn);
 
@@ -1146,7 +1146,7 @@ pub async fn assign_issue(
     }
 
     let result = conn.execute(
-        "INSERT INTO kanban_cards (id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, metadata, created_at, updated_at)
+        "INSERT INTO kanban_cards (id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, description, created_at, updated_at)
          VALUES (?1, ?2, ?3, 'ready', 'medium', ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))",
         rusqlite::params![
             id,
@@ -1155,7 +1155,7 @@ pub async fn assign_issue(
             body.assignee_agent_id,
             body.github_issue_url,
             body.github_issue_number,
-            body.description.as_ref().map(|d| json!({"description": d}).to_string()),
+            body.description,
         ],
     );
 

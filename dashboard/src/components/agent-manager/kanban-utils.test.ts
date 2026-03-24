@@ -206,6 +206,50 @@ describe("parseGitHubCommentTimeline", () => {
     });
   });
 
+  it("리뷰 키워드 + 번호 매긴 코드 참조가 있으면 review로 분류한다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`리뷰를 확인했습니다. 아래 항목 참고 부탁합니다.
+
+1. \`src/server/routes/kanban.rs:1114-1159\`
+assign_issue 경로가 description을 metadata에만 저장합니다.
+
+2. \`src/github/sync.rs:78-82\`
+동기화 주기가 너무 긴 것 같습니다.`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "review",
+      status: "changes_requested",
+      title: "리뷰 피드백",
+    });
+  });
+
+  it("영문 review 키워드 + 코드 참조를 review로 분류한다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment(`Reviewed the changes. Issues found:
+
+1. \`dashboard/src/api/client.ts:438\` — missing error handling
+2. \`src/db/schema.rs:44\` — migration may fail`),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "review",
+      status: "changes_requested",
+      title: "리뷰 피드백",
+    });
+  });
+
+  it("리뷰 키워드만 있고 코드 참조가 없으면 general로 유지한다", () => {
+    const [entry] = parseGitHubCommentTimeline([
+      makeComment("코드 리뷰 진행 상황 궁금합니다."),
+    ]);
+
+    expect(entry).toMatchObject({
+      kind: "general",
+      status: "comment",
+    });
+  });
+
   it("이슈 번호 작업 완료 헤더를 work 타입으로 파싱한다", () => {
     const [entry] = parseGitHubCommentTimeline([
       makeComment(`## #53 작업 완료

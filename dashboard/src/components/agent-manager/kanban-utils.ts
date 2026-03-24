@@ -347,8 +347,22 @@ const REVIEW_BLOCKING_PATTERNS = [
 const REVIEW_FEEDBACK_PREFIXES = [
   "리뷰했습니다",
   "추가 리뷰했습니다",
+  "추가 구현분 리뷰했습니다",
   "재확인했습니다",
+  "재검토했습니다",
   "코드 리뷰 결과",
+  "코드 검토 결과",
+  "리뷰 결과",
+  "검토 결과",
+];
+
+/** Broader review-signal keywords — used for secondary heuristic detection */
+const REVIEW_SIGNAL_KEYWORDS = [
+  /리뷰[를을]?\s*(완료|진행|확인)/,
+  /검토[를을]?\s*(완료|진행|확인)/,
+  /코드\s*리뷰/,
+  /code\s*review/i,
+  /reviewed?\b/i,
 ];
 
 const PM_MARKER_PATTERNS = [
@@ -400,7 +414,7 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
 
     const passed = REVIEW_PASS_PATTERNS.some((pattern) => leadText.includes(pattern))
       && !matchesAny(leadText, REVIEW_BLOCKING_PATTERNS);
-    const reviewFeedback =
+    const reviewFeedbackExplicit =
       REVIEW_FEEDBACK_PREFIXES.some((prefix) => leadText.startsWith(prefix))
       || leadText.includes("재검토 결과")
       || /blocking finding/i.test(leadText)
@@ -408,6 +422,13 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
       || /확인된 이슈 \d+건/.test(leadText)
       || /결함 \d+건/.test(leadText)
       || /문제 \d+건/.test(leadText);
+    // Secondary heuristic: review keyword + numbered code-reference list
+    const hasReviewSignal = matchesAny(leadText, REVIEW_SIGNAL_KEYWORDS);
+    const hasNumberedFindings = /^\s*\d+\.\s+/m.test(classificationBody)
+      && /`[^`]+\.\w+[:`]/.test(classificationBody); // file reference like `foo.rs:123`
+    const reviewFeedback = reviewFeedbackExplicit
+      || (hasReviewSignal && hasNumberedFindings)
+      || (hasReviewSignal && matchesAny(leadText, REVIEW_BLOCKING_PATTERNS));
 
     if (passed || reviewFeedback) {
       const highlights = extractListHighlights(body, passed ? 1 : 3);
