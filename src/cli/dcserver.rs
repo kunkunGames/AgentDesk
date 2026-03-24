@@ -232,7 +232,8 @@ pub fn dcserver_process_command(_pid: u32) -> Option<String> {
 }
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
-    let is_dcserver = command.contains("agentdesk dcserver");
+    let is_dcserver =
+        command.contains("agentdesk dcserver") || command.contains("agentdesk --dcserver");
     if !is_dcserver {
         return false;
     }
@@ -245,8 +246,9 @@ pub fn dcserver_process_matches_instance(command: &str) -> bool {
 
 #[cfg(unix)]
 pub fn dcserver_instance_pids() -> Vec<u32> {
+    // Match both "agentdesk dcserver" (legacy) and "agentdesk --dcserver" (service templates)
     let output = match std::process::Command::new("pgrep")
-        .args(["-f", "agentdesk dcserver"])
+        .args(["-f", "agentdesk.*(dcserver|--dcserver)"])
         .output()
     {
         Ok(output) if output.status.success() => output,
