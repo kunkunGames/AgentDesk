@@ -664,16 +664,10 @@ pub(super) async fn send_dispatch_to_discord(
             if let Ok(thread_body) = tr.json::<serde_json::Value>().await {
                 let thread_id = thread_body.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if !thread_id.is_empty() {
-                    // Save thread_id to dispatch and card's channel-thread map
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
-                            rusqlite::params![thread_id, dispatch_id],
-                        )
-                        .ok();
-                        set_thread_for_channel(&conn, card_id, channel_id_num, thread_id);
-                    }
-                    // Send dispatch message into the thread
+                    // Send dispatch message into the thread BEFORE persisting thread_id.
+                    // If the POST fails, we rollback (don't save thread_id) so that
+                    // [I-0] recovery sends to the channel and future dispatches won't
+                    // reuse an empty thread.
                     let thread_msg_url = format!(
                         "https://discord.com/api/v10/channels/{}/messages",
                         thread_id
@@ -686,9 +680,15 @@ pub(super) async fn send_dispatch_to_discord(
                         .await
                         .map(|r| r.status().is_success())
                         .unwrap_or(false);
-                    // Mark as notified only if the POST succeeded
                     if thread_msg_ok {
+                        // Persist thread_id and mark as notified only on success
                         if let Ok(conn) = db.lock() {
+                            conn.execute(
+                                "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
+                                rusqlite::params![thread_id, dispatch_id],
+                            )
+                            .ok();
+                            set_thread_for_channel(&conn, card_id, channel_id_num, thread_id);
                             conn.execute(
                                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
                                 rusqlite::params![
@@ -698,14 +698,14 @@ pub(super) async fn send_dispatch_to_discord(
                             )
                             .ok();
                         }
+                        tracing::info!(
+                            "[dispatch] Created thread {thread_id} and sent dispatch {dispatch_id} to {agent_id}"
+                        );
                     } else {
                         tracing::warn!(
-                            "[dispatch] Thread message POST failed for dispatch {dispatch_id}, skipping notified marker"
+                            "[dispatch] Thread message POST failed for dispatch {dispatch_id}, skipping notified marker and thread_id save"
                         );
                     }
-                    tracing::info!(
-                        "[dispatch] Created thread {thread_id} and sent dispatch {dispatch_id} to {agent_id}"
-                    );
                 }
             }
         }
@@ -1974,5 +1974,66 @@ mod tests {
             .unwrap();
         assert_eq!(dt, "review-decision");
         assert_eq!(ds, "pending");
+    }
+
+    /// When the agent's discord_channel_id points to a non-existent channel,
+    /// send_dispatch_to_discord must NOT write the notified marker.
+    /// This ensures that Discord send failures leave the dispatch recoverable
+    /// by timeouts.js [I-0].
+    #[tokio::test]
+    async fn no_notified_marker_when_discord_send_fails() {
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            // Use a bogus numeric channel ID that will fail at Discord API
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', '1')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, created_at, updated_at)
+                 VALUES ('card-1', 'Test card', 'requested', 'agent-1', 'dispatch-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
+                 VALUES ('dispatch-1', 'card-1', 'agent-1', 'implementation', 'pending', 'Test card', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Channel ID "1" is a valid u64 but not a real Discord channel.
+        // Thread creation and fallback will both fail with Discord API errors.
+        // No notified marker should be written.
+        super::send_dispatch_to_discord(&db, "agent-1", "Test card", "card-1", "dispatch-1").await;
+
+        let conn = db.lock().unwrap();
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kv_meta WHERE key = 'dispatch_notified:dispatch-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker_count, 0,
+            "notified marker must not be written when Discord send fails"
+        );
+
+        // thread_id should also NOT be saved (rollback on failure)
+        let thread_id: Option<String> = conn
+            .query_row(
+                "SELECT thread_id FROM task_dispatches WHERE id = 'dispatch-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            thread_id.is_none(),
+            "thread_id must not be saved when thread message POST fails"
+        );
     }
 }
