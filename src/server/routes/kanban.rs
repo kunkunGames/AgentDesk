@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -46,10 +46,6 @@ pub struct UpdateCardBody {
     pub repo_id: Option<String>,
     pub github_issue_url: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    /// PMD-only override to bypass dispatch validation.
-    pub force: Option<bool>,
-    /// Caller identity (e.g., "pmd", "api"). Required when force=true.
-    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,25 +331,13 @@ pub async fn update_card(
             );
         }
         if new_s.as_str() != old_status {
-            // Resolve source and force parameters
-            let force = body.force.unwrap_or(false);
-            let source = body.source.as_deref().unwrap_or("api");
-
-            // force=true requires source="pmd"
-            if force && source != "pmd" {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"error": "force override is only allowed for PMD (source must be 'pmd')"})),
-                );
-            }
-
             match crate::kanban::transition_status_with_opts(
                 &state.db,
                 &state.engine,
                 &id,
                 new_s,
-                source,
-                force,
+                "api",
+                false,
             ) {
                 Ok(_) => {}
                 Err(e) => {
@@ -1127,8 +1111,9 @@ pub async fn assign_issue(
         |row| row.get::<_, String>(0),
     ) {
         // Update existing card instead of creating duplicate
+        // COALESCE: preserve existing description when incoming value is NULL
         let _ = conn.execute(
-            "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, description = ?4, updated_at = datetime('now') WHERE id = ?5",
+            "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, description = COALESCE(?4, description), updated_at = datetime('now') WHERE id = ?5",
             rusqlite::params![body.title, body.assignee_agent_id, body.github_issue_url, body.description, existing_id],
         );
         drop(conn);
@@ -1524,4 +1509,89 @@ pub async fn pm_decision(
             "message": message,
         })),
     )
+}
+
+// ── PMD-only force transition ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ForceTransitionBody {
+    pub status: String,
+}
+
+/// POST /api/kanban-cards/:id/force-transition
+///
+/// PMD-only endpoint. Bypasses dispatch validation.
+/// Requires `X-Channel-Id` header matching the configured `kanban_manager_channel_id`.
+pub async fn force_transition(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ForceTransitionBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Verify caller is the kanban manager (PMD)
+    let caller_channel = headers
+        .get("x-channel-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let pmd_channel: String = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        conn.query_row(
+            "SELECT value FROM kv_meta WHERE key = 'kanban_manager_channel_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+    };
+
+    if pmd_channel.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "kanban_manager_channel_id not configured"})),
+        );
+    }
+
+    if caller_channel != pmd_channel {
+        tracing::warn!(
+            "[kanban] force-transition rejected: X-Channel-Id '{}' != PMD channel '{}'",
+            caller_channel,
+            pmd_channel
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "force-transition requires X-Channel-Id matching kanban_manager_channel_id"})),
+        );
+    }
+
+    match crate::kanban::transition_status_with_opts(
+        &state.db,
+        &state.engine,
+        &id,
+        &body.status,
+        "pmd",
+        true,
+    ) {
+        Ok(result) => {
+            let conn = state.db.lock().unwrap();
+            let card = conn.query_row(
+                &format!("{CARD_SELECT} WHERE kc.id = ?1"),
+                [&id],
+                |row| card_row_to_json(row),
+            );
+            drop(conn);
+            match card {
+                Ok(c) => (StatusCode::OK, Json(json!({"card": c, "forced": true, "from": result.from, "to": result.to}))),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")}))),
+            }
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e}")}))),
+    }
 }
