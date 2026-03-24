@@ -372,6 +372,8 @@ pub(super) fn spawn_turn_bridge(
         let mut accumulated_output_tokens: u64 = 0;
         let mut spin_idx: usize = 0;
         let mut restart_followup_pending = false;
+        let mut any_tool_used = false;
+        let mut has_post_tool_text = false;
         let mut tmux_handed_off = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
         let current_msg_id = bridge.current_msg_id;
@@ -442,6 +444,9 @@ pub(super) fn spawn_turn_bridge(
                         }
                         StreamMessage::Text { content } => {
                             full_response.push_str(&content);
+                            if any_tool_used {
+                                has_post_tool_text = true;
+                            }
                             current_tool_line = None;
                             last_tool_name = None;
                             last_tool_summary = None;
@@ -459,6 +464,8 @@ pub(super) fn spawn_turn_bridge(
                             last_tool_summary = None;
                         }
                         StreamMessage::ToolUse { name, input } => {
+                            any_tool_used = true;
+                            has_post_tool_text = false;
                             let summary = format_tool_input(&name, &input);
                             let display_summary = if summary.trim().is_empty() {
                                 "…".to_string()
@@ -548,13 +555,21 @@ pub(super) fn spawn_turn_bridge(
                             result,
                             session_id: sid,
                         } => {
-                            // Only use result as fallback when streaming didn't accumulate text.
-                            // The result event contains only the last assistant message's text,
-                            // so overwriting would lose earlier text from multi-tool turns
-                            // (e.g. text A → tool call → text B would lose text A).
-                            if full_response.trim().is_empty() && !result.is_empty() {
-                                full_response = result;
-                                inflight_state.full_response = full_response.clone();
+                            if !result.is_empty() {
+                                if full_response.trim().is_empty() {
+                                    // No streaming text — use result directly.
+                                    full_response = result;
+                                    inflight_state.full_response = full_response.clone();
+                                } else if any_tool_used && !has_post_tool_text {
+                                    // Tools were used but no text was streamed after
+                                    // the last tool call.  The accumulated text is
+                                    // pre-tool intermediate narration (e.g. "이슈를
+                                    // 생성합니다").  Replace with the authoritative
+                                    // result to prevent stale progress text from
+                                    // lingering as the final response.
+                                    full_response = result;
+                                    inflight_state.full_response = full_response.clone();
+                                }
                             }
                             if let Some(s) = sid {
                                 new_session_id = Some(s.clone());
