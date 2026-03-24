@@ -123,45 +123,57 @@ async fn rate_limit_sync_loop(db: Db) {
         }
         first = false;
 
-        // --- Claude (Anthropic API) rate limits ---
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            match fetch_anthropic_rate_limits(&api_key).await {
-                Ok(buckets) => {
-                    let data = serde_json::json!({ "buckets": buckets }).to_string();
-                    let now = chrono::Utc::now().timestamp();
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
-                            rusqlite::params!["claude", data, now],
-                        )
-                        .ok();
-                    }
-                    tracing::debug!("[rate-limit-sync] Claude: {} buckets cached", buckets.len());
+        // --- Claude rate limits ---
+        // Priority: 1) OAuth token (Claude Code subscription), 2) ANTHROPIC_API_KEY
+        let claude_result = if let Some(token) = get_claude_oauth_token() {
+            fetch_claude_oauth_usage(&token).await
+        } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+            fetch_anthropic_rate_limits(&api_key).await
+        } else {
+            Err(anyhow::anyhow!("no Claude credentials found"))
+        };
+        match claude_result {
+            Ok(buckets) => {
+                let data = serde_json::json!({ "buckets": buckets }).to_string();
+                let now = chrono::Utc::now().timestamp();
+                if let Ok(conn) = db.lock() {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params!["claude", data, now],
+                    )
+                    .ok();
                 }
-                Err(e) => {
-                    tracing::debug!("[rate-limit-sync] Claude rate_limit fetch failed: {e}");
-                }
+                tracing::info!("[rate-limit-sync] Claude: {} buckets cached", buckets.len());
+            }
+            Err(e) => {
+                tracing::warn!("[rate-limit-sync] Claude rate_limit fetch failed: {e}");
             }
         }
 
-        // --- Codex (OpenAI API) rate limits ---
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            match fetch_openai_rate_limits(&api_key).await {
-                Ok(buckets) => {
-                    let data = serde_json::json!({ "buckets": buckets }).to_string();
-                    let now = chrono::Utc::now().timestamp();
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
-                            rusqlite::params!["codex", data, now],
-                        )
-                        .ok();
-                    }
-                    tracing::debug!("[rate-limit-sync] Codex: {} buckets cached", buckets.len());
+        // --- Codex rate limits ---
+        // Priority: 1) ~/.codex/auth.json (Codex CLI subscription), 2) OPENAI_API_KEY
+        let codex_result = if let Some(token) = load_codex_access_token() {
+            fetch_codex_oauth_usage(&token).await
+        } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            fetch_openai_rate_limits(&api_key).await
+        } else {
+            Err(anyhow::anyhow!("no Codex credentials found"))
+        };
+        match codex_result {
+            Ok(buckets) => {
+                let data = serde_json::json!({ "buckets": buckets }).to_string();
+                let now = chrono::Utc::now().timestamp();
+                if let Ok(conn) = db.lock() {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params!["codex", data, now],
+                    )
+                    .ok();
                 }
-                Err(e) => {
-                    tracing::debug!("[rate-limit-sync] Codex rate_limit fetch failed: {e}");
-                }
+                tracing::info!("[rate-limit-sync] Codex: {} buckets cached", buckets.len());
+            }
+            Err(e) => {
+                tracing::warn!("[rate-limit-sync] Codex rate_limit fetch failed: {e}");
             }
         }
     }
@@ -279,6 +291,180 @@ fn parse_header_reset(headers: &reqwest::header::HeaderMap, name: &str) -> i64 {
                 .map(|dt| dt.timestamp())
         })
         .unwrap_or(0)
+}
+
+/// Read Claude Code OAuth token from macOS Keychain, falling back to ~/.claude/.credentials.json.
+fn get_claude_oauth_token() -> Option<String> {
+    // Try macOS Keychain first
+    if let Ok(output) = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(raw) = String::from_utf8(output.stdout) {
+                let raw = raw.trim();
+                if let Ok(creds) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(token) = creds
+                        .get("claudeAiOauth")
+                        .and_then(|o| o.get("accessToken"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: credentials file
+    let home = std::env::var("HOME").ok()?;
+    let cred_path = std::path::Path::new(&home).join(".claude/.credentials.json");
+    let raw = std::fs::read_to_string(cred_path).ok()?;
+    let creds: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    creds
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("accessToken"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch Claude usage via OAuth API (subscription-based, no API key needed).
+/// Returns utilization-based buckets (5h, 7d).
+async fn fetch_claude_oauth_usage(
+    token: &str,
+) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .header("accept", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("user-agent", "agentdesk/1.0.0")
+        .send()
+        .await?;
+
+    if resp.status() == 429 {
+        return Err(anyhow::anyhow!("Claude OAuth usage API rate limited (429)"));
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Claude OAuth usage API returned {}",
+            resp.status()
+        ));
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+    let mut buckets = Vec::new();
+
+    for key in &["five_hour", "seven_day", "seven_day_sonnet"] {
+        if let Some(bucket) = data.get(key) {
+            let utilization = bucket
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let resets_at = bucket
+                .get("resets_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let label = match *key {
+                "five_hour" => "5h",
+                "seven_day" => "7d",
+                "seven_day_sonnet" => "7d Sonnet",
+                _ => key,
+            };
+            // Convert utilization (0-100 float) to used/limit format for consistency
+            let limit = 100i64;
+            let used = utilization.round() as i64;
+            let reset_ts = chrono::DateTime::parse_from_rfc3339(resets_at)
+                .map(|dt| dt.timestamp())
+                .unwrap_or(0);
+
+            buckets.push(serde_json::json!({
+                "name": label,
+                "limit": limit,
+                "used": used,
+                "remaining": limit - used,
+                "reset": reset_ts,
+            }));
+        }
+    }
+
+    Ok(buckets)
+}
+
+/// Read Codex CLI access token from ~/.codex/auth.json.
+fn load_codex_access_token() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let auth_path = std::path::Path::new(&home).join(".codex/auth.json");
+    let raw = std::fs::read_to_string(auth_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    auth.get("tokens")
+        .and_then(|t| t.get("access_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch Codex usage via chatgpt.com backend API (subscription-based, no API key needed).
+async fn fetch_codex_oauth_usage(
+    token: &str,
+) -> Result<Vec<serde_json::Value>, anyhow::Error> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://chatgpt.com/backend-api/codex/usage")
+        .header("authorization", format!("Bearer {token}"))
+        .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .header("accept", "application/json")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Codex usage API returned {}",
+            resp.status()
+        ));
+    }
+
+    let data: serde_json::Value = resp.json().await?;
+    let mut buckets = Vec::new();
+
+    if let Some(rl) = data.get("rate_limit") {
+        for window_key in &["primary_window", "secondary_window"] {
+            if let Some(window) = rl.get(window_key) {
+                let used_percent = window
+                    .get("used_percent")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let window_seconds = window
+                    .get("limit_window_seconds")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let reset_at = window
+                    .get("reset_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+
+                let label = if window_seconds <= 18000 {
+                    "5h"
+                } else if window_seconds <= 86400 {
+                    "1d"
+                } else {
+                    "7d"
+                };
+
+                let limit = 100i64;
+                let used = used_percent.round() as i64;
+
+                buckets.push(serde_json::json!({
+                    "name": label,
+                    "limit": limit,
+                    "used": used,
+                    "remaining": limit - used,
+                    "reset": reset_at,
+                }));
+            }
+        }
+    }
+
+    Ok(buckets)
 }
 
 /// Background task that periodically syncs GitHub issues for all registered repos.

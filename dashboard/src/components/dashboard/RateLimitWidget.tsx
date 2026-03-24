@@ -186,12 +186,13 @@ export default function RateLimitWidget({ t }: RateLimitWidgetProps) {
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch("/api/settings", { credentials: "include" });
+        const res = await fetch("/api/settings/runtime-config", { credentials: "include" });
         if (!res.ok) return;
         const s = await res.json();
+        const current = s.current ?? s;
         setThresholds({
-          warning: s.rateLimitWarningPct ?? 80,
-          danger: s.rateLimitDangerPct ?? 95,
+          warning: current.rateLimitWarningPct ?? 80,
+          danger: current.rateLimitDangerPct ?? 95,
         });
       } catch { /* ignore */ }
     })();
