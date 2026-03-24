@@ -43,9 +43,13 @@ pub struct UpdateCardBody {
     pub status: Option<String>,
     pub priority: Option<String>,
     pub assigned_agent_id: Option<String>,
+    /// Alias for assigned_agent_id (frontend sends this name)
+    pub assignee_agent_id: Option<String>,
     pub repo_id: Option<String>,
     pub github_issue_url: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub description: Option<String>,
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,14 +301,22 @@ pub async fn update_card(
     // Status changes go through transition_status_with_opts (not direct SQL)
     // push_field!("status", body.status); — handled below
     push_field!("priority", body.priority);
-    push_field!("assigned_agent_id", body.assigned_agent_id);
+    // Accept both assigned_agent_id and assignee_agent_id (frontend alias)
+    let agent_id = body.assigned_agent_id.or(body.assignee_agent_id);
+    push_field!("assigned_agent_id", agent_id);
     push_field!("repo_id", body.repo_id);
     push_field!("github_issue_url", body.github_issue_url);
+    push_field!("description", body.description);
 
-    if let Some(ref meta) = body.metadata {
-        let meta_str = serde_json::to_string(meta).unwrap_or_default();
+    // Accept both metadata (JSON object) and metadata_json (string)
+    let meta_str = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default())
+        .or(body.metadata_json);
+    if let Some(ref ms) = meta_str {
         sets.push(format!("metadata = ?{}", idx));
-        values.push(Box::new(meta_str));
+        values.push(Box::new(ms.clone()));
         idx += 1;
     }
 
