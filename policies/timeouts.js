@@ -148,13 +148,20 @@ var timeouts = {
             [card.id]
           );
           agentdesk.log.warn("[reconcile] Card " + card.id + " → pending_decision: " + reasons.join("; "));
-          // PMD notification — same as kanban-rules.js:262
-          // (currently deferred via sendDiscordNotification, will work when #120 lands)
+          // PMD notification — mirrors kanban-rules.js:262 notifyPMD()
+          // Uses announce bot (not notify) matching the canonical path.
+          // TODO(#120): replace with agentdesk.message.queue() when async queue lands
           var pmdCh = agentdesk.config.get("kanban_manager_channel_id");
           if (pmdCh) {
             var cardTitle2 = agentdesk.db.query("SELECT title FROM kanban_cards WHERE id = ?", [card.id]);
             var t2 = cardTitle2.length > 0 ? cardTitle2[0].title : card.id;
-            sendNotifyAlert("channel:" + pmdCh, "[PM Decision] " + t2 + "\n사유: " + reasons.join("; "));
+            var pmdMsg = "[PM Decision] " + t2 + "\n사유: " + reasons.join("; ");
+            // Queue for async delivery via kv_meta (picked up by future #120 worker)
+            agentdesk.db.execute(
+              "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
+              ["pending_notification:" + card.id, JSON.stringify({target: "channel:" + pmdCh, content: pmdMsg, bot: "announce"})]
+            );
+            agentdesk.log.info("[reconcile] PMD notification queued (announce): " + card.id);
           }
           continue;
         }
