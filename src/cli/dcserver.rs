@@ -1073,6 +1073,16 @@ pub fn handle_dcserver(token: Option<String>) {
                     }
                 }
 
+                // Load data-driven pipeline definition (#106)
+                let pipeline_path = ad_config.policies.dir.join("default-pipeline.yaml");
+                if pipeline_path.exists() {
+                    if let Err(e) = crate::pipeline::load(&pipeline_path) {
+                        eprintln!("  ⚠ Pipeline load failed: {e}");
+                    } else {
+                        println!("  ▸ Pipeline : loaded {}", pipeline_path.display());
+                    }
+                }
+
                 // Start axum HTTP server (background task) — now serves all API
                 // endpoints including /api/send, /api/senddm, /api/health
                 let http_port = ad_config.server.port;

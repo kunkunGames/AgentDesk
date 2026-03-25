@@ -8,13 +8,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADK_DEV="$HOME/.adk/dev"
 ADK_REL="$HOME/.adk/release"
 PLIST_REL="com.agentdesk.release"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "═══ ADK Promote Dev → Release ═══"
 
 # Safety check: review must be passed (unless --skip-review is passed)
 if [[ "${1:-}" != "--skip-review" ]]; then
     # Check if the latest commit has a review-passed marker (may be in dev or release runtime)
-    LAST_COMMIT=$(cd "$HOME/AgentDesk" && git rev-parse HEAD 2>/dev/null)
+    LAST_COMMIT=$(cd "$REPO" && git rev-parse HEAD 2>/dev/null)
     REVIEW_MARKER_DEV="$ADK_DEV/runtime/review_passed/$LAST_COMMIT"
     REVIEW_MARKER_REL="$ADK_REL/runtime/review_passed/$LAST_COMMIT"
     if [ ! -f "$REVIEW_MARKER_DEV" ] && [ ! -f "$REVIEW_MARKER_REL" ]; then
@@ -57,12 +58,12 @@ DIST_STAGED="$ADK_REL/dashboard/dist.new"
 rm -rf "$DIST_STAGED"
 if [ -d "$ADK_DEV/dashboard/dist" ] && [ -f "$ADK_DEV/dashboard/dist/index.html" ]; then
     cp -r "$ADK_DEV/dashboard/dist" "$DIST_STAGED"
-elif [ -d "$HOME/AgentDesk/dashboard/dist" ] && [ -f "$HOME/AgentDesk/dashboard/dist/index.html" ]; then
+elif [ -d "$REPO/dashboard/dist" ] && [ -f "$REPO/dashboard/dist/index.html" ]; then
     echo "  ⚠ Dev dist missing, falling back to workspace source"
-    cp -r "$HOME/AgentDesk/dashboard/dist" "$DIST_STAGED"
+    cp -r "$REPO/dashboard/dist" "$DIST_STAGED"
 else
     echo "✗ Dashboard dist not found in dev or workspace — aborting promotion"
-    echo "  Run 'cd ~/AgentDesk/dashboard && npm run build' to generate it"
+    echo "  Run 'cd $REPO/dashboard && npm run build' to generate it"
     exit 1
 fi
 # Atomic swap: old → .old, staged → dist, cleanup

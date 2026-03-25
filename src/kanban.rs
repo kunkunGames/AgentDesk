@@ -82,8 +82,16 @@ pub fn transition_status_with_opts(
         });
     }
 
-    // Terminal guard: done cards cannot revert to any other status
-    if old_status == "done" && new_status != "done" {
+    // ── Pipeline-driven validation (#106) ──
+    // Use YAML pipeline config if loaded, fall back to hardcoded rules otherwise.
+    let pipeline = crate::pipeline::try_get();
+
+    // Terminal guard: terminal states cannot revert
+    let is_terminal = pipeline
+        .map(|p| p.is_terminal(&old_status))
+        .unwrap_or(old_status == "done");
+
+    if is_terminal && old_status != new_status {
         log_audit(
             &conn,
             card_id,
@@ -93,7 +101,8 @@ pub fn transition_status_with_opts(
             "BLOCKED: cannot revert terminal card",
         );
         tracing::warn!(
-            "[kanban] Blocked transition done → {} for card {} (cannot revert terminal card, source: {})",
+            "[kanban] Blocked transition {} → {} for card {} (cannot revert terminal card, source: {})",
+            old_status,
             new_status,
             card_id,
             source
@@ -107,106 +116,158 @@ pub fn transition_status_with_opts(
             "cannot revert terminal card",
         );
         return Err(anyhow::anyhow!(
-            "cannot revert terminal card: done → {} is not allowed",
+            "cannot revert terminal card: {} → {} is not allowed",
+            old_status,
             new_status
         ));
     }
 
-    // ── C: Dispatch validation ──
-    // Free transitions: backlog ↔ ready (no dispatch needed)
-    let free_transition = matches!(
-        (old_status.as_str(), new_status),
-        ("backlog", "ready") | ("ready", "backlog")
-    );
+    // ── Transition rule lookup ──
+    if let Some(p) = pipeline {
+        let rule = p.find_transition(&old_status, new_status);
 
-    if !free_transition && !force {
-        // Check for active dispatch — only pending/dispatched count as active.
-        // Completed dispatches are historical and must NOT authorize new transitions.
-        let has_active_dispatch: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_dispatches \
-                 WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
-                [card_id],
-                |row| row.get(0),
+        match rule {
+            Some(t) => {
+                use crate::pipeline::TransitionType;
+                match t.transition_type {
+                    TransitionType::Free => { /* no checks needed */ }
+                    TransitionType::Gated if force => { /* force bypasses gates */ }
+                    TransitionType::Gated => {
+                        // Evaluate builtin gates from YAML
+                        for gate_name in &t.gates {
+                            if let Some(gate) = p.gates.get(gate_name.as_str()) {
+                                if gate.gate_type == "builtin" {
+                                    match gate.check.as_deref() {
+                                        Some("has_active_dispatch") => {
+                                            let has: bool = conn
+                                                .query_row(
+                                                    "SELECT COUNT(*) > 0 FROM task_dispatches \
+                                                     WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
+                                                    [card_id],
+                                                    |row| row.get(0),
+                                                )
+                                                .unwrap_or(false);
+                                            if !has {
+                                                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no active dispatch");
+                                                tracing::warn!(
+                                                    "[kanban] Blocked transition {} → {} for card {} (gate: {}, source: {})",
+                                                    old_status, new_status, card_id, gate_name, source
+                                                );
+                                                notify_pmd_violation(&conn, card_id, &old_status, new_status, source, "no active dispatch");
+                                                return Err(anyhow::anyhow!(
+                                                    "Status transition {} → {} requires an active dispatch (gate: {})",
+                                                    old_status, new_status, gate_name
+                                                ));
+                                            }
+                                        }
+                                        // review_verdict_pass and review_verdict_rework are checked
+                                        // by the calling code (review_verdict.rs), not here.
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TransitionType::ForceOnly if force => { /* allowed */ }
+                    TransitionType::ForceOnly => {
+                        log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: force required");
+                        tracing::warn!(
+                            "[kanban] Blocked transition {} → {} for card {} (force_only, source: {})",
+                            old_status, new_status, card_id, source
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Transition {} → {} requires force=true (PMD/policy only)",
+                            old_status, new_status
+                        ));
+                    }
+                }
+            }
+            None if force => {
+                // Force allows any non-terminal transition even without explicit rule
+            }
+            None => {
+                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no transition rule");
+                tracing::warn!(
+                    "[kanban] No pipeline rule for {} → {} (card: {}, source: {})",
+                    old_status, new_status, card_id, source
+                );
+                return Err(anyhow::anyhow!(
+                    "No transition rule from {} to {} in pipeline definition",
+                    old_status, new_status
+                ));
+            }
+        }
+    } else {
+        // ── Legacy hardcoded validation (fallback when YAML not loaded) ──
+        let free_transition = matches!(
+            (old_status.as_str(), new_status),
+            ("backlog", "ready") | ("ready", "backlog")
+        );
+
+        if !free_transition && !force {
+            let has_active_dispatch: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM task_dispatches \
+                     WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if !has_active_dispatch {
+                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no active dispatch");
+                tracing::warn!(
+                    "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
+                    old_status, new_status, card_id, source
+                );
+                notify_pmd_violation(&conn, card_id, &old_status, new_status, source, "no active dispatch");
+                return Err(anyhow::anyhow!(
+                    "Status transition {} → {} requires an active dispatch (pending/dispatched).",
+                    old_status, new_status
+                ));
+            }
+        }
+
+        if new_status == "done"
+            && !force
+            && !matches!(
+                old_status.as_str(),
+                "review" | "blocked" | "pending_decision" | "done"
             )
-            .unwrap_or(false);
-
-        if !has_active_dispatch {
-            log_audit(
-                &conn,
-                card_id,
-                &old_status,
-                new_status,
-                source,
-                "BLOCKED: no active dispatch",
-            );
-            tracing::warn!(
-                "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
-                old_status,
-                new_status,
-                card_id,
-                source
-            );
-            notify_pmd_violation(
-                &conn,
-                card_id,
-                &old_status,
-                new_status,
-                source,
-                "no active dispatch",
-            );
+        {
+            log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: review required");
             return Err(anyhow::anyhow!(
-                "Status transition {} → {} requires an active dispatch (pending/dispatched). Completed dispatches do not qualify. Use dispatch lifecycle or PMD force override.",
-                old_status,
-                new_status
+                "Cannot transition from {} to done directly. Must go through review first.",
+                old_status
             ));
         }
     }
 
-    // Validate transition: done requires passing through review first
-    if new_status == "done"
-        && !force
-        && !matches!(
-            old_status.as_str(),
-            "review" | "blocked" | "pending_decision" | "done"
-        )
-    {
-        log_audit(
-            &conn,
-            card_id,
-            &old_status,
-            new_status,
-            source,
-            "BLOCKED: review required",
-        );
-        tracing::warn!(
-            "[kanban] Blocked invalid transition {} → done for card {} (must go through review)",
-            old_status,
-            card_id
-        );
-        notify_pmd_violation(
-            &conn,
-            card_id,
-            &old_status,
-            new_status,
-            source,
-            "review required",
-        );
-        return Err(anyhow::anyhow!(
-            "Cannot transition from {} to done directly. Must go through review first.",
-            old_status
-        ));
-    }
-
-    // Build UPDATE with appropriate extra fields
-    let extra = match new_status {
-        "in_progress" => ", started_at = datetime('now')",
-        "requested" => ", requested_at = datetime('now')",
-        "review" => ", review_entered_at = datetime('now')",
-        "done" => {
-            ", completed_at = datetime('now'), review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL"
+    // Build UPDATE with appropriate extra fields — driven by pipeline clocks
+    let extra = if let Some(p) = pipeline {
+        match p.clock_for_state(new_status) {
+            Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
+                // Only set if NULL (preserves original on re-entry)
+                format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
+            }
+            Some(clock) => {
+                format!(", {} = datetime('now')", clock.set)
+            }
+            None if new_status == "done" => {
+                // Terminal cleanup — always clear review fields
+                ", completed_at = datetime('now'), review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL".to_string()
+            }
+            None => String::new(),
         }
-        _ => "",
+    } else {
+        // Legacy hardcoded clocks
+        match new_status {
+            "in_progress" => ", started_at = datetime('now')".to_string(),
+            "requested" => ", requested_at = datetime('now')".to_string(),
+            "review" => ", review_entered_at = datetime('now')".to_string(),
+            "done" => ", completed_at = datetime('now'), review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL".to_string(),
+            _ => String::new(),
+        }
     };
     let sql = format!(
         "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){extra} WHERE id = ?2"

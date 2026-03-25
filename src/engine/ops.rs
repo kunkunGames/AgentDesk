@@ -718,21 +718,36 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return format!(r#"{{"ok":true,"changed":false,"status":"{}"}}"#, new_status);
             }
 
-            // Guard: prevent reverting terminal (done) cards back to active states
-            if old_status == "done" && new_status != "done" {
+            // Guard: prevent reverting terminal cards (#106 pipeline-driven)
+            let is_terminal = crate::pipeline::try_get()
+                .map(|p| p.is_terminal(&old_status))
+                .unwrap_or(old_status == "done");
+            if is_terminal && old_status != new_status {
                 return format!(
-                    r#"{{"error":"cannot revert terminal card from done to {}"}}"#,
-                    new_status
+                    r#"{{"error":"cannot revert terminal card from {} to {}"}}"#,
+                    old_status, new_status
                 );
             }
 
-            // Update status
-            let extra = match new_status.as_str() {
-                "in_progress" => ", started_at = datetime('now')",
-                "requested" => ", requested_at = datetime('now')",
-                "done" => ", completed_at = datetime('now'), review_status = NULL",
-                "review" => "",
-                _ => "",
+            // Clock fields from pipeline config (#106)
+            let extra: String = if let Some(p) = crate::pipeline::try_get() {
+                match p.clock_for_state(&new_status) {
+                    Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
+                        format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
+                    }
+                    Some(clock) => format!(", {} = datetime('now')", clock.set),
+                    None if new_status == "done" => {
+                        ", completed_at = datetime('now'), review_status = NULL".to_string()
+                    }
+                    None => String::new(),
+                }
+            } else {
+                match new_status.as_str() {
+                    "in_progress" => ", started_at = datetime('now')".to_string(),
+                    "requested" => ", requested_at = datetime('now')".to_string(),
+                    "done" => ", completed_at = datetime('now'), review_status = NULL".to_string(),
+                    _ => String::new(),
+                }
             };
             let sql = format!(
                 "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){} WHERE id = ?2",

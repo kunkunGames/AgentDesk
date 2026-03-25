@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ADK_DEV="$HOME/.adk/dev"
 PLIST="com.agentdesk.dev"
-REPO="$HOME/AgentDesk"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "═══ ADK Dev Deploy ═══"
 

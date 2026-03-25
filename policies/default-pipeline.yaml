@@ -1,0 +1,194 @@
+# default-pipeline.yaml — canonical pipeline definition
+# This file defines the state machine that kanban.rs enforces.
+# Editing this file changes pipeline behavior without rebuilding.
+
+name: default
+version: 1
+
+# ── States ────────────────────────────────────────────────────────
+
+states:
+  - id: backlog
+    label: 백로그
+  - id: ready
+    label: 준비됨
+  - id: requested
+    label: 요청됨
+  - id: in_progress
+    label: 진행 중
+  - id: review
+    label: 리뷰
+  - id: pending_decision
+    label: 판단 대기
+  - id: blocked
+    label: 막힘
+  - id: done
+    label: 완료
+    terminal: true
+
+# ── Transitions ───────────────────────────────────────────────────
+#
+# type:
+#   free          — no dispatch required, manual transition
+#   gated         — requires all listed gates to pass
+#   force_only    — only allowed with force=true (policy/timeout/PMD)
+#
+# Gates are evaluated in order; first failure stops the chain.
+
+transitions:
+  # Free transitions (backlog ↔ ready)
+  - from: backlog
+    to: ready
+    type: free
+
+  - from: ready
+    to: backlog
+    type: free
+
+  # Dispatch-gated transitions
+  - from: ready
+    to: requested
+    type: gated
+    gates: []
+
+  - from: requested
+    to: in_progress
+    type: gated
+    gates: [active_dispatch]
+
+  - from: in_progress
+    to: review
+    type: gated
+    gates: [active_dispatch]
+
+  # review → done requires review pass verdict
+  - from: review
+    to: done
+    type: gated
+    gates: [review_passed]
+
+  # review → in_progress requires rework verdict
+  - from: review
+    to: in_progress
+    type: gated
+    gates: [review_rework]
+
+  # Force-only transitions (timeouts, PMD overrides)
+  - from: requested
+    to: pending_decision
+    type: force_only
+
+  - from: in_progress
+    to: blocked
+    type: force_only
+
+  - from: review
+    to: pending_decision
+    type: force_only
+
+  - from: pending_decision
+    to: done
+    type: force_only
+
+  - from: pending_decision
+    to: requested
+    type: force_only
+
+  - from: pending_decision
+    to: in_progress
+    type: force_only
+
+  - from: blocked
+    to: requested
+    type: force_only
+
+  - from: blocked
+    to: in_progress
+    type: force_only
+
+  - from: blocked
+    to: pending_decision
+    type: force_only
+
+# ── Gates ─────────────────────────────────────────────────────────
+#
+# type:
+#   builtin   — evaluated in Rust (kanban.rs / dispatch check)
+#   policy    — evaluated by JS policy function
+
+gates:
+  active_dispatch:
+    type: builtin
+    check: has_active_dispatch
+    description: Card must have a pending or dispatched dispatch
+
+  review_passed:
+    type: builtin
+    check: review_verdict_pass
+    description: Review verdict must be pass/approved
+
+  review_rework:
+    type: builtin
+    check: review_verdict_rework
+    description: Review verdict must be rework/improve
+
+# ── Hooks ─────────────────────────────────────────────────────────
+#
+# on_enter: fired when a card enters this state
+# on_exit:  fired when a card leaves this state
+
+hooks:
+  requested:
+    on_enter: [OnCardTransition]
+  in_progress:
+    on_enter: [OnCardTransition]
+  review:
+    on_enter: [OnCardTransition, OnReviewEnter]
+  pending_decision:
+    on_enter: [OnCardTransition]
+  blocked:
+    on_enter: [OnCardTransition]
+  done:
+    on_enter: [OnCardTransition, OnCardTerminal]
+
+# ── Clocks ────────────────────────────────────────────────────────
+#
+# Fields set on state entry for timeout detection.
+
+clocks:
+  requested:
+    set: requested_at
+  in_progress:
+    set: started_at
+    mode: coalesce  # only set if NULL (preserves original start on rework re-entry)
+  review:
+    set: review_entered_at
+  done:
+    set: completed_at
+
+# ── Timeouts ──────────────────────────────────────────────────────
+#
+# Evaluated by timeouts.js on each onTick cycle.
+
+timeouts:
+  requested:
+    duration: 45m
+    clock: requested_at
+    max_retries: 10
+    on_exhaust: pending_decision
+
+  in_progress:
+    duration: 2h
+    clock: started_at
+    on_exhaust: blocked
+
+  review:
+    duration: 30m
+    clock: review_entered_at
+    on_exhaust: pending_decision
+
+  awaiting_dod:
+    duration: 15m
+    clock: awaiting_dod_at
+    condition: review_status = 'awaiting_dod'
+    on_exhaust: pending_decision

@@ -8,6 +8,7 @@ mod engine;
 mod error;
 mod github;
 pub(crate) mod kanban;
+pub(crate) mod pipeline;
 mod server;
 mod services;
 mod ui;
@@ -433,6 +434,14 @@ fn main() -> Result<()> {
 
         let config = config::load().expect("Failed to load config");
         let db = db::init(&config).expect("Failed to init DB");
+
+        // Load data-driven pipeline definition (#106)
+        let pipeline_path = config.policies.dir.join("default-pipeline.yaml");
+        if pipeline_path.exists() {
+            pipeline::load(&pipeline_path).expect("Failed to load pipeline definition");
+            tracing::info!("Pipeline loaded: {}", pipeline_path.display());
+        }
+
         let engine =
             engine::PolicyEngine::new(&config, db.clone()).expect("Failed to init policy engine");
 
