@@ -297,6 +297,22 @@ pub async fn submit_verdict(
                 "feedback": body.feedback,
             }),
         );
+
+        // Drain pending transitions: processVerdict may call setStatus("done"/"pending_decision")
+        // which queues transitions in __pendingTransitions. Without draining, OnCardTerminal
+        // (auto-queue continuation) won't fire until some unrelated event drains the queue (#110).
+        loop {
+            let transitions = state.engine.drain_pending_transitions();
+            if transitions.is_empty() {
+                break;
+            }
+            for (t_card_id, old_s, new_s) in &transitions {
+                crate::kanban::fire_transition_hooks(
+                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                );
+            }
+        }
+
         let db_clone = state.db.clone();
         let dispatch_id = body.dispatch_id.clone();
         tokio::spawn(async move {
@@ -511,10 +527,12 @@ pub async fn submit_review_decision(
                     "UPDATE task_dispatches SET status = 'completed', \
                      result = ?1, updated_at = datetime('now') WHERE id = ?2",
                     rusqlite::params![
-                        json!({"decision": "dispute", "completion_source": "review_decision_api"}).to_string(),
+                        json!({"decision": "dispute", "completion_source": "review_decision_api"})
+                            .to_string(),
                         rd_id,
                     ],
-                ).ok();
+                )
+                .ok();
             }
             conn.execute(
                 "UPDATE kanban_cards SET review_status = 'reviewing', updated_at = datetime('now') WHERE id = ?1",
@@ -530,6 +548,19 @@ pub async fn submit_review_decision(
                     "from": "review",
                 }),
             );
+
+            // Drain: onReviewEnter may call setStatus (e.g. pending_decision on max rounds)
+            loop {
+                let transitions = state.engine.drain_pending_transitions();
+                if transitions.is_empty() {
+                    break;
+                }
+                for (t_card_id, old_s, new_s) in &transitions {
+                    crate::kanban::fire_transition_hooks(
+                        &state.db, &state.engine, &t_card_id, &old_s, &new_s,
+                    );
+                }
+            }
 
             return (
                 StatusCode::OK,
@@ -566,6 +597,8 @@ pub async fn submit_review_decision(
                     [&body.card_id],
                 )
                 .ok();
+                // Clear thread mappings so dismissed review threads are not reused.
+                super::dispatches::clear_all_threads(&conn, &body.card_id);
             }
         }
         _ => {}
@@ -1329,7 +1362,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(card_status, "done", "card must stay done, not stranded in in_progress");
+        assert_eq!(
+            card_status, "done",
+            "card must stay done, not stranded in in_progress"
+        );
     }
 
     #[tokio::test]
@@ -1382,7 +1418,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(card_status, "done", "dismissed card must stay done on late accept");
+        assert_eq!(
+            card_status, "done",
+            "dismissed card must stay done on late accept"
+        );
     }
 
     #[tokio::test]
@@ -1489,5 +1528,100 @@ mod tests {
         )
         .await;
         assert_eq!(status2, StatusCode::CONFLICT);
+    }
+
+    /// #110: submit_verdict with "pass" must drain pending transitions so that
+    /// OnCardTerminal fires immediately (not deferred to next tick).
+    /// This ensures auto-queue continuation path is triggered.
+    #[tokio::test]
+    async fn submit_verdict_pass_fires_terminal_hook_via_drain() {
+        let db = test_db();
+        seed_review_card(&db, "dispatch-drain");
+
+        // Create auto-queue tables and entry to verify terminal hook fires
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS auto_queue_runs (
+                    id TEXT PRIMARY KEY, repo TEXT, agent_id TEXT,
+                    status TEXT DEFAULT 'active', ai_model TEXT, ai_rationale TEXT,
+                    timeout_minutes INTEGER DEFAULT 120,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, completed_at DATETIME
+                );
+                CREATE TABLE IF NOT EXISTS auto_queue_entries (
+                    id TEXT PRIMARY KEY, run_id TEXT REFERENCES auto_queue_runs(id),
+                    kanban_card_id TEXT, agent_id TEXT,
+                    priority_rank INTEGER DEFAULT 0, reason TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    dispatched_at DATETIME, completed_at DATETIME
+                );",
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, status, agent_id) VALUES ('run-drain', 'active', 'agent-1')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank) \
+                 VALUES ('entry-drain', 'run-drain', 'card-1', 'agent-1', 'dispatched', 1)",
+                [],
+            ).unwrap();
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            engine: test_engine(&db),
+            health_registry: None,
+        };
+
+        let (status, _) = submit_verdict(
+            State(state),
+            Json(SubmitVerdictBody {
+                dispatch_id: "dispatch-drain".to_string(),
+                overall: "pass".to_string(),
+                items: None,
+                notes: None,
+                feedback: None,
+                commit: None,
+                provider: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let conn = db.lock().unwrap();
+
+        // Card must be done
+        let card_status: String = conn
+            .query_row("SELECT status FROM kanban_cards WHERE id = 'card-1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(card_status, "done");
+
+        // completed_at must be set (proves OnCardTerminal or transition_status fired)
+        let completed_at: Option<String> = conn
+            .query_row(
+                "SELECT completed_at FROM kanban_cards WHERE id = 'card-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            completed_at.is_some(),
+            "completed_at must be set — proves terminal hook fired via drain"
+        );
+
+        // auto_queue_entry must be 'done' (proves OnCardTerminal → auto-queue.js ran)
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-drain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "done",
+            "auto_queue_entry must be marked done by terminal hook"
+        );
     }
 }

@@ -286,6 +286,19 @@ pub async fn update_dispatch(
                 "kanban_card_id": kanban_card_id,
             }),
         );
+
+        // Drain pending transitions: onDispatchCompleted may call setStatus (review, etc.)
+        loop {
+            let transitions = state.engine.drain_pending_transitions();
+            if transitions.is_empty() {
+                break;
+            }
+            for (t_card_id, old_s, new_s) in &transitions {
+                crate::kanban::fire_transition_hooks(
+                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                );
+            }
+        }
     } else {
         drop(conn);
     }
@@ -464,7 +477,7 @@ fn parse_channel_id(channel: &str) -> Option<u64> {
 }
 
 /// Clear ALL thread mappings (card done).
-fn clear_all_threads(conn: &rusqlite::Connection, card_id: &str) {
+pub(super) fn clear_all_threads(conn: &rusqlite::Connection, card_id: &str) {
     conn.execute(
         "UPDATE kanban_cards SET channel_thread_map = NULL, active_thread_id = NULL WHERE id = ?1",
         [card_id],
@@ -492,10 +505,7 @@ pub(crate) async fn send_dispatch_to_discord(
         let inserted = conn
             .execute(
                 "INSERT OR IGNORE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![
-                    format!("dispatch_notified:{dispatch_id}"),
-                    dispatch_id
-                ],
+                rusqlite::params![format!("dispatch_notified:{dispatch_id}"), dispatch_id],
             )
             .unwrap_or(0);
         if inserted == 0 {
@@ -2109,7 +2119,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(latest, "dispatch-review", "done card latest_dispatch_id must not be overwritten");
+        assert_eq!(
+            latest, "dispatch-review",
+            "done card latest_dispatch_id must not be overwritten"
+        );
 
         // Only the original dispatch should exist — no review-decision was created
         let count: i64 = conn
@@ -2119,6 +2132,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "no review-decision dispatch should be created for done card");
+        assert_eq!(
+            count, 1,
+            "no review-decision dispatch should be created for done card"
+        );
     }
 }

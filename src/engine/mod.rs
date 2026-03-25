@@ -182,7 +182,11 @@ impl PolicyEngine {
     pub fn drain_pending_transitions(&self) -> Vec<(String, String, String)> {
         let inner = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ drain_pending_transitions: engine lock poisoned: {e}");
+                return Vec::new();
+            }
         };
         inner.context.with(|ctx| {
             let code = r#"
@@ -192,18 +196,34 @@ impl PolicyEngine {
             "#;
             let result: rquickjs::Result<String> = ctx.eval(code);
             match result {
-                Ok(json) => serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|v| {
-                        Some((
-                            v.get("card_id")?.as_str()?.to_string(),
-                            v.get("from")?.as_str()?.to_string(),
-                            v.get("to")?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
+                Ok(ref json) => {
+                    let transitions: Vec<(String, String, String)> =
+                        serde_json::from_str::<Vec<serde_json::Value>>(json)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|v| {
+                                Some((
+                                    v.get("card_id")?.as_str()?.to_string(),
+                                    v.get("from")?.as_str()?.to_string(),
+                                    v.get("to")?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect();
+                    if !transitions.is_empty() {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] 🔄 drain_pending_transitions: {} transition(s): {:?}",
+                            transitions.len(),
+                            transitions
+                        );
+                    }
+                    transitions
+                }
+                Err(ref e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] ⚠ drain_pending_transitions: JS eval error: {e}");
+                    Vec::new()
+                }
             }
         })
     }

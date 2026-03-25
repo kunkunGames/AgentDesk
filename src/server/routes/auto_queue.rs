@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 
 use super::AppState;
 
@@ -134,6 +135,79 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
         },
     )
     .unwrap_or(json!(null))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueueEntryOrder {
+    id: String,
+    status: String,
+    agent_id: String,
+}
+
+fn reorder_entry_ids(
+    entries: &[QueueEntryOrder],
+    ordered_ids: &[String],
+    agent_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if ordered_ids.is_empty() {
+        return Err("orderedIds cannot be empty".to_string());
+    }
+
+    let scope_ids: Vec<String> = entries
+        .iter()
+        .filter(|entry| {
+            entry.status == "pending"
+                && agent_id
+                    .map(|target| entry.agent_id == target)
+                    .unwrap_or(true)
+        })
+        .map(|entry| entry.id.clone())
+        .collect();
+    if scope_ids.is_empty() {
+        return Err("no pending entries found for reorder scope".to_string());
+    }
+
+    let scope_set: HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    let mut replacement_ids = Vec::new();
+    for id in ordered_ids {
+        let id_str = id.as_str();
+        if scope_set.contains(id_str) && seen.insert(id_str) {
+            replacement_ids.push(id.clone());
+        }
+    }
+    if replacement_ids.is_empty() {
+        return Err("orderedIds do not match any pending entries in scope".to_string());
+    }
+
+    for id in &scope_ids {
+        if !seen.contains(id.as_str()) {
+            replacement_ids.push(id.clone());
+        }
+    }
+
+    let mut replacement_iter = replacement_ids.into_iter();
+    let mut reordered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.status == "pending"
+            && agent_id
+                .map(|target| entry.agent_id == target)
+                .unwrap_or(true)
+        {
+            let next_id = replacement_iter
+                .next()
+                .ok_or_else(|| "replacement sequence exhausted".to_string())?;
+            reordered.push(next_id);
+        } else {
+            reordered.push(entry.id.clone());
+        }
+    }
+
+    if replacement_iter.next().is_some() {
+        return Err("replacement sequence was not fully consumed".to_string());
+    }
+
+    Ok(reordered)
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
@@ -608,6 +682,25 @@ pub async fn activate(
 
     let mut dispatched = Vec::new();
     for (entry_id, card_id, agent_id) in &pending {
+        // Busy-agent guard (#110): skip dispatch if agent already has active cards.
+        // Prevents manual /api/auto-queue/activate from bypassing serialization.
+        let busy: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM kanban_cards \
+                 WHERE assigned_agent_id = ?1 AND status IN ('requested', 'in_progress', 'review')",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if busy {
+            tracing::info!(
+                "[auto-queue] Skipping activate for {agent_id}: agent has active cards"
+            );
+            drop(conn);
+            conn = state.db.lock().unwrap();
+            break;
+        }
+
         // Get card title for dispatch creation
         let title: String = conn
             .query_row(
@@ -650,9 +743,7 @@ pub async fn activate(
 
         // Async Discord notification — use exact dispatch_id from create_dispatch
         // to avoid latest_dispatch_id re-query race under concurrent dispatch creation.
-        let dispatch_id = dispatch_result
-            .as_ref()
-            .unwrap()["id"]
+        let dispatch_id = dispatch_result.as_ref().unwrap()["id"]
             .as_str()
             .unwrap_or("")
             .to_string();
@@ -924,7 +1015,7 @@ pub async fn reorder(
     State(state): State<AppState>,
     Json(body): Json<ReorderBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.lock() {
+    let mut conn = match state.db.lock() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -935,12 +1026,86 @@ pub async fn reorder(
     };
     ensure_tables(&conn);
 
-    for (rank, id) in body.ordered_ids.iter().enumerate() {
-        conn.execute(
+    let run_id = body.ordered_ids.iter().find_map(|id| {
+        conn.query_row(
+            "SELECT run_id FROM auto_queue_entries WHERE id = ?1",
+            [id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    });
+    let Some(run_id) = run_id else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no matching queue entries found"})),
+        );
+    };
+
+    let current_entries: Vec<QueueEntryOrder> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, COALESCE(status, 'pending'), COALESCE(agent_id, '')
+             FROM auto_queue_entries
+             WHERE run_id = ?1
+             ORDER BY priority_rank ASC, created_at ASC, id ASC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        stmt.query_map([&run_id], |row| {
+            Ok(QueueEntryOrder {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                agent_id: row.get(2)?,
+            })
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    let reordered_ids = match reorder_entry_ids(
+        &current_entries,
+        &body.ordered_ids,
+        body.agent_id.as_deref(),
+    ) {
+        Ok(ids) => ids,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+        }
+    };
+
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    for (rank, id) in reordered_ids.iter().enumerate() {
+        if let Err(e) = tx.execute(
             "UPDATE auto_queue_entries SET priority_rank = ?1 WHERE id = ?2",
             rusqlite::params![rank as i64, id],
-        )
-        .ok();
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    }
+
+    if let Err(e) = tx.commit() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        );
     }
 
     (StatusCode::OK, Json(json!({ "ok": true })))
@@ -1234,4 +1399,78 @@ pub async fn submit_order(
             "message": "Queue active. Call POST /api/auto-queue/activate to start dispatching.",
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueueEntryOrder, reorder_entry_ids};
+
+    fn entry(id: &str, status: &str, agent_id: &str) -> QueueEntryOrder {
+        QueueEntryOrder {
+            id: id.to_string(),
+            status: status.to_string(),
+            agent_id: agent_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn reorder_entry_ids_reorders_only_pending_entries_in_scope() {
+        let entries = vec![
+            entry("done-a", "done", "agent-a"),
+            entry("a-1", "pending", "agent-a"),
+            entry("b-1", "pending", "agent-b"),
+            entry("a-2", "pending", "agent-a"),
+            entry("done-b", "done", "agent-b"),
+        ];
+
+        let reordered = reorder_entry_ids(
+            &entries,
+            &["a-2".to_string(), "a-1".to_string()],
+            Some("agent-a"),
+        )
+        .expect("agent reorder should succeed");
+
+        assert_eq!(
+            reordered,
+            vec![
+                "done-a".to_string(),
+                "a-2".to_string(),
+                "b-1".to_string(),
+                "a-1".to_string(),
+                "done-b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reorder_entry_ids_filters_non_pending_ids_from_legacy_payloads() {
+        let entries = vec![
+            entry("done-a", "done", "agent-a"),
+            entry("p-1", "pending", "agent-a"),
+            entry("p-2", "pending", "agent-a"),
+            entry("done-b", "done", "agent-a"),
+        ];
+
+        let reordered = reorder_entry_ids(
+            &entries,
+            &[
+                "done-a".to_string(),
+                "p-2".to_string(),
+                "p-1".to_string(),
+                "done-b".to_string(),
+            ],
+            None,
+        )
+        .expect("legacy payload should still reorder pending entries");
+
+        assert_eq!(
+            reordered,
+            vec![
+                "done-a".to_string(),
+                "p-2".to_string(),
+                "p-1".to_string(),
+                "done-b".to_string(),
+            ]
+        );
+    }
 }

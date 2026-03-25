@@ -388,22 +388,25 @@ fn dispatch_create_raw(
     // Delegate to the single authoritative dispatch creation path (no hooks —
     // hooks are fired by the Rust caller after fire_hook returns).
     let context = serde_json::json!({});
-    match crate::dispatch::create_dispatch_core(db, card_id, agent_id, dispatch_type, title, &context)
-    {
+    match crate::dispatch::create_dispatch_core(
+        db,
+        card_id,
+        agent_id,
+        dispatch_type,
+        title,
+        &context,
+    ) {
         Ok((dispatch_id, _old_status)) => {
             // Get issue URL for Discord message
-            let issue_url: Option<String> = db
-                .lock()
+            let issue_url: Option<String> = db.lock().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+                    [card_id],
+                    |row| row.get(0),
+                )
                 .ok()
-                .and_then(|conn| {
-                    conn.query_row(
-                        "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
-                        [card_id],
-                        |row| row.get(0),
-                    )
-                    .ok()
-                    .flatten()
-                });
+                .flatten()
+            });
             format!(
                 r#"{{"dispatch_id":"{}","card_id":"{}","agent_id":"{}","issue_url":{}}}"#,
                 dispatch_id,
@@ -673,6 +676,9 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                         from: result.from,
                         to: result.to
                     });
+                    agentdesk.log.info("[setStatus] " + result.card_id + " " + result.from + " -> " + result.to + " (pendingLen=" + agentdesk.kanban.__pendingTransitions.length + ")");
+                } else {
+                    agentdesk.log.info("[setStatus] " + cardId + " -> " + newStatus + " (no-change)");
                 }
                 return result;
             };
