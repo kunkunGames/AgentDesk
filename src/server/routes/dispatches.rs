@@ -944,7 +944,38 @@ async fn try_reuse_thread(
         }
     }
 
-    // 2. Send separator message to visually distinguish dispatch phases
+    // 2a. Update thread name with current issue number (for unified thread mode)
+    {
+        let new_name: Option<String> = db
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT kc.github_issue_number, kc.title FROM kanban_cards kc WHERE kc.id = ?1",
+                    [card_id],
+                    |row| {
+                        let num: Option<i64> = row.get(0)?;
+                        let title: String = row.get(1)?;
+                        Ok(num.map(|n| {
+                            let short: String = title.chars().take(85).collect();
+                            format!("#{} {}", n, short)
+                        }))
+                    },
+                )
+                .ok()
+                .flatten()
+            });
+        if let Some(ref name) = new_name {
+            let _ = client
+                .patch(&thread_info_url)
+                .header("Authorization", format!("Bot {}", token))
+                .json(&serde_json::json!({"name": name}))
+                .send()
+                .await;
+        }
+    }
+
+    // 2b. Send separator message to visually distinguish dispatch phases
     let separator = format!("── {} dispatch ──", dispatch_type);
     let msg_url = format!(
         "https://discord.com/api/v10/channels/{}/messages",

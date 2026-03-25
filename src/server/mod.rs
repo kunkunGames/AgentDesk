@@ -173,10 +173,24 @@ async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
     }
 }
 
-/// Fire a single tick hook, log timing, and record per-tier telemetry.
+/// Fire a single tick hook, log timing, record telemetry, and notify any dispatches created by JS.
 fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Hook, label: &str) {
     let start = std::time::Instant::now();
     let now_ms = chrono::Utc::now().timestamp_millis().to_string();
+
+    // Capture pre-hook max dispatch rowid so we can detect dispatches created by JS policies
+    let pre_hook_max_rowid: i64 = db
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM task_dispatches",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+        })
+        .unwrap_or(0);
     let key_ms = format!("last_tick_{}_ms", label);
     let key_status = format!("last_tick_{}_status", label);
 
@@ -220,6 +234,11 @@ fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Ho
             .ok();
         }
     }
+
+    // Notify any dispatches created by JS policies during this hook.
+    // Without this, dispatches created in onTick (e.g., auto-queue.js dispatchNextEntry)
+    // would only be picked up by [I-0] recovery 30s later.
+    crate::dispatch::notify_hook_created_dispatches(db, pre_hook_max_rowid);
 }
 
 /// Drain pending transitions after each tier execution.

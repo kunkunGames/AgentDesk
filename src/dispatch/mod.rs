@@ -315,7 +315,7 @@ pub fn complete_dispatch(
 /// Send Discord notifications for any pending dispatches created after `pre_hook_max_rowid`.
 /// Uses the `dispatch_notified` dedup guard in `send_dispatch_to_discord` to avoid
 /// double-notifying dispatches already handled by `notify_new_dispatches_after_hooks`.
-fn notify_hook_created_dispatches(db: &Db, pre_hook_max_rowid: i64) {
+pub(crate) fn notify_hook_created_dispatches(db: &Db, pre_hook_max_rowid: i64) {
     let dispatches: Vec<(String, String, String, String)> = db
         .separate_conn()
         .ok()
