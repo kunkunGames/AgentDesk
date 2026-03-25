@@ -975,13 +975,14 @@ export async function generateAutoQueue(repo?: string | null, agentId?: string |
   });
 }
 
-export async function activateAutoQueue(repo?: string | null, agentId?: string | null): Promise<{
+export async function activateAutoQueue(repo?: string | null, agentId?: string | null, unifiedThread?: boolean): Promise<{
   dispatched: KanbanCard[];
   count: number;
 }> {
-  const body: Record<string, string> = {};
+  const body: Record<string, unknown> = {};
   if (repo) body.repo = repo;
   if (agentId) body.agent_id = agentId;
+  if (unifiedThread !== undefined) body.unified_thread = unifiedThread;
   return request("/api/auto-queue/activate", {
     method: "POST",
     body: JSON.stringify(body),

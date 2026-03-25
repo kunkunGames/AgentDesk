@@ -22,6 +22,7 @@ pub struct GenerateBody {
 pub struct ActivateBody {
     pub repo: Option<String>,
     pub agent_id: Option<String>,
+    pub unified_thread: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +63,9 @@ fn ensure_tables(conn: &rusqlite::Connection) {
             ai_model    TEXT,
             ai_rationale TEXT,
             timeout_minutes INTEGER DEFAULT 120,
+            unified_thread  INTEGER DEFAULT 0,
+            unified_thread_id TEXT,
+            unified_thread_channel_id TEXT,
             created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             completed_at DATETIME
         );
@@ -79,6 +83,22 @@ fn ensure_tables(conn: &rusqlite::Connection) {
         );",
     )
     .ok();
+    // #137: upgrade path for existing DBs
+    let has_unified: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'unified_thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_unified {
+        conn.execute_batch(
+            "ALTER TABLE auto_queue_runs ADD COLUMN unified_thread INTEGER DEFAULT 0;
+             ALTER TABLE auto_queue_runs ADD COLUMN unified_thread_id TEXT;
+             ALTER TABLE auto_queue_runs ADD COLUMN unified_thread_channel_id TEXT;",
+        )
+        .ok();
+    }
 }
 
 fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Value {
@@ -627,6 +647,15 @@ pub async fn activate(
             Json(json!({ "dispatched": [], "count": 0, "message": "No active run" })),
         );
     };
+
+    // #137: Apply unified_thread toggle if provided
+    if let Some(unified) = body.unified_thread {
+        conn.execute(
+            "UPDATE auto_queue_runs SET unified_thread = ?1 WHERE id = ?2",
+            rusqlite::params![unified as i32, run_id],
+        )
+        .ok();
+    }
 
     // Stale empty run cleanup: after generate()/enqueue() fixes, normal paths never
     // leave an active run with 0 entries.  Any such run is legacy corruption — complete

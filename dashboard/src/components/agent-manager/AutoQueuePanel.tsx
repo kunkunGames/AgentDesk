@@ -297,6 +297,7 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
   const [expanded, setExpanded] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [activating, setActivating] = useState(false);
+  const [unifiedThread, setUnifiedThread] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [noReadyCards, setNoReadyCards] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("agent");
@@ -357,7 +358,7 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
     setActivating(true);
     setError(null);
     try {
-      await api.activateAutoQueue(selectedRepo || null, selectedAgentId);
+      await api.activateAutoQueue(selectedRepo || null, selectedAgentId, unifiedThread);
       await fetchStatus();
     } catch (e) {
       setError(e instanceof Error ? e.message : tr("활성화 실패", "Activation failed"));
@@ -477,18 +478,32 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
 
         <div className="flex items-center gap-2">
           {run?.status === "active" && pendingCount > 0 && (
-            <button
-              onClick={() => void handleActivate()}
-              disabled={activating}
-              className="text-[11px] px-2.5 py-1 rounded-lg border font-medium"
-              style={{
-                borderColor: "rgba(245,158,11,0.4)",
-                color: "#fbbf24",
-                backgroundColor: "rgba(245,158,11,0.1)",
-              }}
-            >
-              {activating ? "…" : tr("디스패치", "Dispatch")}
-            </button>
+            <>
+              <label
+                className="flex items-center gap-1 text-[11px] cursor-pointer select-none"
+                style={{ color: unifiedThread ? "#fbbf24" : "var(--th-text-secondary)" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={unifiedThread}
+                  onChange={(e) => setUnifiedThread(e.target.checked)}
+                  style={{ cursor: "pointer", accentColor: "#f59e0b" }}
+                />
+                {tr("통합 스레드", "Unified Thread")}
+              </label>
+              <button
+                onClick={() => void handleActivate()}
+                disabled={activating}
+                className="text-[11px] px-2.5 py-1 rounded-lg border font-medium"
+                style={{
+                  borderColor: "rgba(245,158,11,0.4)",
+                  color: "#fbbf24",
+                  backgroundColor: "rgba(245,158,11,0.1)",
+                }}
+              >
+                {activating ? "…" : tr("디스패치", "Dispatch")}
+              </button>
+            </>
           )}
           {(!run || run.status === "completed") && (
             <>

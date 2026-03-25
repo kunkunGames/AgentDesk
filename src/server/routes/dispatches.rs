@@ -649,8 +649,26 @@ pub(crate) async fn send_dispatch_to_discord(
     let client = reqwest::Client::new();
     let dispatch_type_label = dispatch_type.as_deref().unwrap_or("implementation");
 
+    // #137: Check if this dispatch belongs to a unified-thread auto-queue run
+    let unified_thread_id: Option<String> = db
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT r.unified_thread_id FROM auto_queue_runs r \
+                 JOIN auto_queue_entries e ON e.run_id = r.id \
+                 WHERE e.kanban_card_id = ?1 AND r.unified_thread = 1 AND r.status = 'active' \
+                 AND r.unified_thread_id IS NOT NULL",
+                [card_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        });
+
     // Try to reuse existing thread for this card (channel-specific)
-    let existing_thread_id: Option<String> = {
+    let existing_thread_id: Option<String> = if unified_thread_id.is_some() {
+        unified_thread_id.clone()
+    } else {
         let conn = match db.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -732,6 +750,16 @@ pub(crate) async fn send_dispatch_to_discord(
                             )
                             .ok();
                             set_thread_for_channel(&conn, card_id, channel_id_num, thread_id);
+                            // #137: Store as unified thread for the run (first dispatch creates it)
+                            if unified_thread_id.is_none() {
+                                conn.execute(
+                                    "UPDATE auto_queue_runs SET unified_thread_id = ?1, unified_thread_channel_id = ?2 \
+                                     WHERE unified_thread = 1 AND unified_thread_id IS NULL \
+                                     AND id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?3)",
+                                    rusqlite::params![thread_id, channel_id_num.to_string(), card_id],
+                                )
+                                .ok();
+                            }
                         }
                         tracing::info!(
                             "[dispatch] Created thread {thread_id} and sent dispatch {dispatch_id} to {agent_id}"
