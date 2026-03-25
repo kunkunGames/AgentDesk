@@ -137,7 +137,8 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
         "SELECT id, repo, agent_id, status, timeout_minutes,
                 ai_model, ai_rationale,
                 CAST(strftime('%s', created_at) AS INTEGER) * 1000,
-                CASE WHEN completed_at IS NOT NULL THEN CAST(strftime('%s', completed_at) AS INTEGER) * 1000 END
+                CASE WHEN completed_at IS NOT NULL THEN CAST(strftime('%s', completed_at) AS INTEGER) * 1000 END,
+                unified_thread, unified_thread_id
          FROM auto_queue_runs WHERE id = ?1",
         [run_id],
         |row| {
@@ -151,6 +152,8 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
                 "ai_rationale": row.get::<_, Option<String>>(6)?,
                 "created_at": row.get::<_, Option<i64>>(7)?.unwrap_or(0),
                 "completed_at": row.get::<_, Option<i64>>(8)?,
+                "unified_thread": row.get::<_, i64>(9).unwrap_or(0) != 0,
+                "unified_thread_id": row.get::<_, Option<String>>(10)?,
             }))
         },
     )

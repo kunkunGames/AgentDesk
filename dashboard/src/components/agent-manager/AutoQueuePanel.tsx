@@ -308,6 +308,10 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
     try {
       const s = await api.getAutoQueueStatus(selectedRepo || null, selectedAgentId);
       setStatus(s);
+      // Sync unified_thread toggle from server state
+      if (s?.run?.unified_thread !== undefined) {
+        setUnifiedThread(!!s.run.unified_thread);
+      }
       // Only reset noReadyCards when a run with entries exists
       if (s?.run && s?.entries?.length > 0) setNoReadyCards(false);
     } catch {

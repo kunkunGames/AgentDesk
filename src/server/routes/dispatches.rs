@@ -697,6 +697,18 @@ pub(crate) async fn send_dispatch_to_discord(
         }
     }
 
+    // #137: If unified thread reuse failed, clear stale ID so new thread gets saved
+    if unified_thread_id.is_some() {
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE auto_queue_runs SET unified_thread_id = NULL, unified_thread_channel_id = NULL \
+                 WHERE unified_thread = 1 AND id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1)",
+                [card_id],
+            )
+            .ok();
+        }
+    }
+
     // No existing thread or reuse failed — create a new thread
     let thread_name = if let Some(num) = issue_number {
         let short: String = title.chars().take(90).collect();

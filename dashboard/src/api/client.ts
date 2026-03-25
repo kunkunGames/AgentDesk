@@ -940,6 +940,8 @@ export interface AutoQueueRun {
   ai_model: string | null;
   ai_rationale: string | null;
   timeout_minutes: number;
+  unified_thread: boolean;
+  unified_thread_id: string | null;
   created_at: number;
   completed_at: number | null;
 }
