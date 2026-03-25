@@ -650,7 +650,7 @@ pub(crate) async fn send_dispatch_to_discord(
     let dispatch_type_label = dispatch_type.as_deref().unwrap_or("implementation");
 
     // #137: Check if this dispatch belongs to a unified-thread auto-queue run
-    let unified_thread_id: Option<String> = db
+    let mut unified_thread_id: Option<String> = db
         .lock()
         .ok()
         .and_then(|conn| {
@@ -697,7 +697,7 @@ pub(crate) async fn send_dispatch_to_discord(
         }
     }
 
-    // #137: If unified thread reuse failed, clear stale ID so new thread gets saved
+    // #137: If unified thread reuse failed, clear stale ID so new thread gets saved in this call
     if unified_thread_id.is_some() {
         if let Ok(conn) = db.lock() {
             conn.execute(
@@ -707,6 +707,7 @@ pub(crate) async fn send_dispatch_to_discord(
             )
             .ok();
         }
+        unified_thread_id = None; // Reset local so new thread creation saves to run below
     }
 
     // No existing thread or reuse failed — create a new thread
