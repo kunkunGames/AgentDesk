@@ -154,55 +154,38 @@ async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
 
         // ── 30s tier: every tick ──
         fire_tick_hook(&engine, &db, Hook::OnTick30s, "30s");
+        drain_transitions(&engine, &db);
 
         // ── 1min tier: every 2nd tick (60s) ──
         if count % 2 == 0 {
             fire_tick_hook(&engine, &db, Hook::OnTick1min, "1min");
+            drain_transitions(&engine, &db);
         }
 
         // ── 5min tier: every 10th tick (300s) ──
         if count % 10 == 0 {
             fire_tick_hook(&engine, &db, Hook::OnTick5min, "5min");
+            drain_transitions(&engine, &db);
             // Also fire legacy OnTick for backward compat
             fire_tick_hook(&engine, &db, Hook::OnTick, "legacy");
-
-            // Record last tick timestamp
-            if let Ok(conn) = db.lock() {
-                conn.execute(
-                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_ms', ?1)",
-                    [chrono::Utc::now().timestamp_millis().to_string()],
-                )
-                .ok();
-                conn.execute(
-                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_status', 'ok')",
-                    [],
-                )
-                .ok();
-            }
-        }
-
-        // Drain transitions from all tiers
-        loop {
-            let transitions = engine.drain_pending_transitions();
-            if transitions.is_empty() {
-                break;
-            }
-            for (card_id, old_status, new_status) in &transitions {
-                crate::kanban::fire_transition_hooks(&db, &engine, card_id, old_status, new_status);
-            }
+            drain_transitions(&engine, &db);
         }
     }
 }
 
-/// Fire a single tick hook and log timing.
+/// Fire a single tick hook, log timing, and record per-tier telemetry.
 fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Hook, label: &str) {
     let start = std::time::Instant::now();
+    let now_ms = chrono::Utc::now().timestamp_millis().to_string();
+    let key_ms = format!("last_tick_{}_ms", label);
+    let key_status = format!("last_tick_{}_status", label);
+
     if let Err(e) = engine.try_fire_hook(hook, serde_json::json!({})) {
         tracing::warn!("[policy-tick] {} hook error: {e}", label);
         if let Ok(conn) = db.lock() {
             conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_status', 'error')",
-                [],
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'error')",
+                [&key_status],
             )
             .ok();
         }
@@ -212,6 +195,42 @@ fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Ho
             tracing::warn!("[policy-tick] {} took {}ms", label, elapsed.as_millis());
         } else {
             tracing::debug!("[policy-tick] {} took {}ms", label, elapsed.as_millis());
+        }
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key_ms, now_ms],
+            )
+            .ok();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'ok')",
+                [&key_status],
+            )
+            .ok();
+            // Also update legacy key for backward compat
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_ms', ?1)",
+                [&now_ms],
+            )
+            .ok();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_status', 'ok')",
+                [],
+            )
+            .ok();
+        }
+    }
+}
+
+/// Drain pending transitions after each tier execution.
+fn drain_transitions(engine: &PolicyEngine, db: &Db) {
+    loop {
+        let transitions = engine.drain_pending_transitions();
+        if transitions.is_empty() {
+            break;
+        }
+        for (card_id, old_status, new_status) in &transitions {
+            crate::kanban::fire_transition_hooks(db, engine, card_id, old_status, new_status);
         }
     }
 }

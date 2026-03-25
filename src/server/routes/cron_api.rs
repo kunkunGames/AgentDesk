@@ -3,91 +3,99 @@ use serde_json::json;
 
 use super::AppState;
 
-/// Build cron job list from policy engine's onTick handlers.
-fn build_cron_jobs(state: &AppState, agent_filter: Option<&str>) -> Vec<serde_json::Value> {
-    let policies = state.engine.list_policies();
-    let now_ms = chrono::Utc::now().timestamp_millis();
-
-    // Read actual last tick time from DB
-    let last_tick_ms: i64 = state
+/// Read a kv_meta value as i64.
+fn read_kv_i64(state: &AppState, key: &str) -> i64 {
+    state
         .db
         .lock()
         .ok()
         .and_then(|conn| {
             conn.query_row(
-                "SELECT value FROM kv_meta WHERE key = 'last_tick_ms'",
-                [],
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                [key],
                 |row| row.get::<_, String>(0),
             )
             .ok()
         })
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0); // 0 = never run, not approximate
+        .unwrap_or(0)
+}
 
-    let last_tick_status: String = state
+/// Read a kv_meta value as String.
+fn read_kv_str(state: &AppState, key: &str) -> String {
+    state
         .db
         .lock()
         .ok()
         .and_then(|conn| {
             conn.query_row(
-                "SELECT value FROM kv_meta WHERE key = 'last_tick_status'",
-                [],
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                [key],
                 |row| row.get::<_, String>(0),
             )
             .ok()
         })
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
-    let next_tick_ms = if last_tick_ms == 0 {
-        0
-    } else {
-        last_tick_ms + 60000
-    };
+/// Build cron job list — 3-tier tick jobs (#127) + legacy per-policy entries.
+fn build_cron_jobs(state: &AppState, _agent_filter: Option<&str>) -> Vec<serde_json::Value> {
+    let mut jobs = Vec::new();
 
-    policies
-        .iter()
-        .filter(|p| p.hooks.iter().any(|h| h == "onTick"))
-        .filter(|_p| {
-            if let Some(_agent_id) = agent_filter {
-                true // All onTick policies are global
-            } else {
-                true
-            }
-        })
-        .map(|p| {
-            let (description, description_ko) = match p.name.as_str() {
-                "timeouts" => (
-                    "Timeout detection — auto-handle stale requested/in_progress cards",
-                    "타임아웃 감지 — requested/in_progress 스테일 카드 자동 처리",
-                ),
-                "auto-queue" => (
-                    "Auto-queue progression — sequential dispatch from queue",
-                    "자동 큐 진행 — 큐 엔트리 순차 디스패치",
-                ),
-                "triage-rules" => (
-                    "Auto-triage — GitHub issue label-based agent assignment",
-                    "자동 분류 — GitHub 이슈 라벨 기반 에이전트 할당",
-                ),
-                _ => ("", ""),
-            };
-            json!({
-                "id": format!("policy:{}", p.name),
-                "name": format!("policy/{} → onTick", p.name),
-                "description_ko": description_ko,
-                "enabled": true,
-                "schedule": {
-                    "kind": "every",
-                    "everyMs": 60000,
-                },
-                "state": {
-                    "status": "active",
-                    "lastStatus": last_tick_status,
-                    "lastRunAtMs": if last_tick_ms == 0 { serde_json::Value::Null } else { json!(last_tick_ms) },
-                    "nextRunAtMs": if next_tick_ms == 0 { serde_json::Value::Null } else { json!(next_tick_ms) },
-                },
-            })
-        })
-        .collect()
+    // 3-tier tick jobs
+    let tiers: &[(&str, &str, i64, &str)] = &[
+        ("tick:30s", "onTick30s — [J] retry, [I-0] notification recovery", 30_000, "30s"),
+        ("tick:1min", "onTick1min — [A][C][D][E][K][L] timeouts, orphan recovery", 60_000, "1min"),
+        ("tick:5min", "onTick5min — [R][B][F][G][H][I][ctx] reconciliation, deadlock", 300_000, "5min"),
+    ];
+
+    for &(id, desc, every_ms, label) in tiers {
+        let last_ms = read_kv_i64(state, &format!("last_tick_{}_ms", label));
+        let status = read_kv_str(state, &format!("last_tick_{}_status", label));
+        let next_ms = if last_ms == 0 { 0 } else { last_ms + every_ms };
+
+        jobs.push(json!({
+            "id": id,
+            "name": desc,
+            "enabled": true,
+            "schedule": {
+                "kind": "every",
+                "everyMs": every_ms,
+            },
+            "state": {
+                "status": "active",
+                "lastStatus": status,
+                "lastRunAtMs": if last_ms == 0 { serde_json::Value::Null } else { json!(last_ms) },
+                "nextRunAtMs": if next_ms == 0 { serde_json::Value::Null } else { json!(next_ms) },
+            },
+        }));
+    }
+
+    // Legacy per-policy entries for non-tiered onTick handlers (auto-queue, triage-rules)
+    let policies = state.engine.list_policies();
+    let legacy_ms = read_kv_i64(state, "last_tick_legacy_ms");
+    let legacy_status = read_kv_str(state, "last_tick_legacy_status");
+
+    for p in policies.iter().filter(|p| p.hooks.iter().any(|h| h == "onTick") && p.name != "timeouts") {
+        let next = if legacy_ms == 0 { 0 } else { legacy_ms + 300_000 };
+        jobs.push(json!({
+            "id": format!("policy:{}", p.name),
+            "name": format!("policy/{} → onTick (5min legacy)", p.name),
+            "enabled": true,
+            "schedule": {
+                "kind": "every",
+                "everyMs": 300_000,
+            },
+            "state": {
+                "status": "active",
+                "lastStatus": legacy_status,
+                "lastRunAtMs": if legacy_ms == 0 { serde_json::Value::Null } else { json!(legacy_ms) },
+                "nextRunAtMs": if next == 0 { serde_json::Value::Null } else { json!(next) },
+            },
+        }));
+    }
+
+    jobs
 }
 
 /// GET /api/cron-jobs
