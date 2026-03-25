@@ -353,6 +353,15 @@ async fn complete_work_dispatch_on_turn_end(
         return;
     };
     let Some(snapshot) = fetch_dispatch_snapshot(api_port, dispatch_id).await else {
+        // Snapshot fetch failed — fail the dispatch to prevent orphan
+        let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
+        let _ = reqwest::Client::new()
+            .patch(&url)
+            .json(&serde_json::json!({"status": "failed", "result": {"error": "dispatch snapshot fetch failed"}}))
+            .send()
+            .await;
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!("  [{ts}] ⚠ Dispatch {dispatch_id} failed: snapshot fetch error");
         return;
     };
     if snapshot.status != "pending" {
@@ -863,12 +872,28 @@ pub(super) fn spawn_turn_bridge(
         // Explicitly complete implementation/rework dispatches before sending idle.
         // These types are NOT auto-completed by the session idle hook — they require
         // this explicit PATCH call so the pipeline can advance.
-        if !cancelled && !is_prompt_too_long {
+        // Skip if: cancelled, prompt too long, or error (don't promote failures to completed).
+        // tmux handoff is OK — Claude has finished work, watcher just delivers the output.
+        let has_error = full_response.contains("Error:") || full_response.contains("error:");
+        if !cancelled && !is_prompt_too_long && !has_error {
             complete_work_dispatch_on_turn_end(
                 shared_owned.api_port,
                 dispatch_id.as_deref(),
             )
             .await;
+        } else if has_error && !cancelled {
+            // Error occurred — fail the dispatch instead of completing
+            if let Some(ref did) = dispatch_id {
+                let port = shared_owned.api_port;
+                let url = format!("http://127.0.0.1:{port}/api/dispatches/{did}");
+                let _ = reqwest::Client::new()
+                    .patch(&url)
+                    .json(&serde_json::json!({"status": "failed", "result": {"error": full_response.chars().take(500).collect::<String>()}}))
+                    .send()
+                    .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ Dispatch {did} failed due to error in response");
+            }
         }
 
         post_adk_session_status(
