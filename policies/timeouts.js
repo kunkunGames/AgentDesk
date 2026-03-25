@@ -114,15 +114,18 @@ var timeouts = {
       } else if (pmGateEnabled !== false && pmGateEnabled !== "false") {
         var reasons = [];
         // Check 1: DoD completion
+        // Format: { items: ["task1", "task2"], verified: ["task1"] }
         if (card.deferred_dod_json) {
           try {
             var dod = JSON.parse(card.deferred_dod_json);
-            if (Array.isArray(dod)) {
-              var checked = 0;
-              for (var di2 = 0; di2 < dod.length; di2++) {
-                if (dod[di2].done || dod[di2].checked) checked++;
+            var items = dod.items || [];
+            var verified = dod.verified || [];
+            if (items.length > 0) {
+              var unverified = 0;
+              for (var di2 = 0; di2 < items.length; di2++) {
+                if (verified.indexOf(items[di2]) === -1) unverified++;
               }
-              if (checked < dod.length) reasons.push("DoD 미완료: " + checked + "/" + dod.length);
+              if (unverified > 0) reasons.push("DoD 미완료: " + (items.length - unverified) + "/" + items.length);
             }
           } catch (e) {}
         }
@@ -142,6 +145,16 @@ var timeouts = {
           }
         }
         if (reasons.length > 0) {
+          var dodOnly = reasons.length === 1 && reasons[0].indexOf("DoD 미완료") === 0;
+          if (dodOnly) {
+            agentdesk.kanban.setStatus(card.id, "review");
+            agentdesk.db.execute(
+              "UPDATE kanban_cards SET review_status = 'awaiting_dod', awaiting_dod_at = datetime('now') WHERE id = ?",
+              [card.id]
+            );
+            agentdesk.log.warn("[reconcile] Card " + card.id + " → review(awaiting_dod): " + reasons[0]);
+            continue;
+          }
           agentdesk.kanban.setStatus(card.id, "pending_decision");
           agentdesk.db.execute(
             "UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?",

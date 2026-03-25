@@ -200,7 +200,7 @@ pub fn transition_status_with_opts(
 
     // Build UPDATE with appropriate extra fields
     let extra = match new_status {
-        "in_progress" => ", started_at = COALESCE(started_at, datetime('now'))",
+        "in_progress" => ", started_at = datetime('now')",
         "requested" => ", requested_at = datetime('now')",
         "review" => ", review_entered_at = datetime('now')",
         "done" => {
@@ -1109,6 +1109,63 @@ mod tests {
         assert_eq!(
             entry_status, "dispatched",
             "pending_decision must NOT mark auto_queue_entry as done"
+        );
+    }
+
+    /// #128: started_at must reset on every in_progress re-entry (rework/resume).
+    /// Without this, a card that was in_progress 3 hours ago and re-enters via rework
+    /// would immediately be flagged as stale by timeouts.js [B].
+    #[test]
+    fn started_at_resets_on_in_progress_reentry() {
+        let db = test_db();
+        let engine = test_engine(&db);
+
+        // Create card already in_progress with an old started_at
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES ('agent-1', 'Agent 1', '123', '456')",
+                [],
+            ).ok();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, started_at, created_at, updated_at)
+                 VALUES ('card-rework', 'Test', 'review', 'agent-1', datetime('now', '-3 hours'), datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        // Add dispatch to authorize transition
+        seed_dispatch(&db, "card-rework", "pending");
+
+        // Transition back to in_progress (simulates rework)
+        let result = transition_status_with_opts(
+            &db, &engine, "card-rework", "in_progress", "pm-decision", true,
+        );
+        assert!(result.is_ok(), "rework transition should succeed");
+
+        // Verify started_at was reset to now (not 3 hours ago)
+        let started_at: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT started_at FROM kanban_cards WHERE id = 'card-rework'",
+                [],
+                |row| row.get(0),
+            ).unwrap()
+        };
+
+        // started_at should be within the last minute, not 3 hours ago
+        let age_seconds: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) FROM kanban_cards WHERE id = 'card-rework'",
+                [],
+                |row| row.get(0),
+            ).unwrap()
+        };
+        assert!(
+            age_seconds < 60,
+            "started_at should be reset to now on re-entry, but was {} seconds ago",
+            age_seconds
         );
     }
 }

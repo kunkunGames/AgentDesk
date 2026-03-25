@@ -220,16 +220,20 @@ var rules = {
       var reasons = [];
 
       // Check 1: DoD completion
+      // Format: { items: ["task1", "task2"], verified: ["task1"] }
+      // All items must be in verified to pass.
       if (card.deferred_dod_json) {
         try {
           var dod = JSON.parse(card.deferred_dod_json);
-          if (Array.isArray(dod)) {
-            var checked = 0;
-            for (var i = 0; i < dod.length; i++) {
-              if (dod[i].done || dod[i].checked) checked++;
+          var items = dod.items || [];
+          var verified = dod.verified || [];
+          if (items.length > 0) {
+            var unverified = 0;
+            for (var i = 0; i < items.length; i++) {
+              if (verified.indexOf(items[i]) === -1) unverified++;
             }
-            if (checked < dod.length) {
-              reasons.push("DoD 미완료: " + checked + "/" + dod.length);
+            if (unverified > 0) {
+              reasons.push("DoD 미완료: " + (items.length - unverified) + "/" + items.length);
             }
           }
         } catch (e) { /* parse fail = skip */ }
@@ -252,7 +256,19 @@ var rules = {
       }
 
       if (reasons.length > 0) {
-        // Gate failed → pending_decision
+        // Check if the only failure is DoD — give agent 15 min to complete it
+        var dodOnly = reasons.length === 1 && reasons[0].indexOf("DoD 미완료") === 0;
+        if (dodOnly) {
+          // DoD 미완료만 → awaiting_dod (15분 유예, timeouts.js [D]가 만료 시 pending_decision)
+          agentdesk.kanban.setStatus(card.id, "review");
+          agentdesk.db.execute(
+            "UPDATE kanban_cards SET review_status = 'awaiting_dod', awaiting_dod_at = datetime('now') WHERE id = ?",
+            [card.id]
+          );
+          agentdesk.log.warn("[pm-gate] Card " + card.id + " → review(awaiting_dod): " + reasons[0]);
+          return;
+        }
+        // Other gate failures → pending_decision
         agentdesk.kanban.setStatus(card.id, "pending_decision");
         agentdesk.db.execute(
           "UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?",

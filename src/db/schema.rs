@@ -92,6 +92,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE kanban_cards ADD COLUMN review_entered_at TEXT;");
     let _ = conn.execute_batch("ALTER TABLE kanban_cards ADD COLUMN awaiting_dod_at TEXT;");
 
+    // Backfill lifecycle timestamps for existing cards that predate these columns.
+    // Uses updated_at as best-available approximation; future transitions will use exact timestamps.
+    let _ = conn.execute_batch(
+        "UPDATE kanban_cards SET requested_at = updated_at WHERE status = 'requested' AND requested_at IS NULL;
+         UPDATE kanban_cards SET started_at = updated_at WHERE status = 'in_progress' AND started_at IS NULL;
+         UPDATE kanban_cards SET review_entered_at = updated_at WHERE status = 'review' AND review_entered_at IS NULL;
+         UPDATE kanban_cards SET awaiting_dod_at = updated_at WHERE status = 'review' AND review_status = 'awaiting_dod' AND awaiting_dod_at IS NULL;",
+    );
+
     // Unique constraint: one kanban card per GitHub issue per repo.
     // Deduplicate existing rows first so CREATE UNIQUE INDEX succeeds.
     // Strategy: for each duplicate (github_issue_number, repo_id) group,

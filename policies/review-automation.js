@@ -48,11 +48,18 @@ var reviewAutomation = {
   // ── Review Enter — counter-model review trigger ───────────
   onReviewEnter: function(payload) {
     var cards = agentdesk.db.query(
-      "SELECT id, repo_id, assigned_agent_id, review_round, deferred_dod_json FROM kanban_cards WHERE id = ?",
+      "SELECT id, repo_id, assigned_agent_id, review_round, review_status, deferred_dod_json FROM kanban_cards WHERE id = ?",
       [payload.card_id]
     );
     if (cards.length === 0) return;
     var card = cards[0];
+
+    // #128: If card entered review with awaiting_dod (DoD incomplete),
+    // skip review dispatch — timeouts.js [D] will escalate to pending_decision after 15 min
+    if (card.review_status === "awaiting_dod") {
+      agentdesk.log.info("[review] Card " + card.id + " is awaiting_dod — skipping review dispatch");
+      return;
+    }
 
     // Check if review is enabled — if not, route to PM decision (not silent done)
     var reviewEnabled = agentdesk.config.get("review_enabled");

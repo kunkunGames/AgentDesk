@@ -359,7 +359,7 @@ pub async fn get_stats(
             .unwrap_or(0);
         let stale_in_progress: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM kanban_cards WHERE status = 'in_progress' AND updated_at < datetime('now', '-100 minutes')",
+                "SELECT COUNT(*) FROM kanban_cards WHERE status = 'in_progress' AND started_at IS NOT NULL AND started_at < datetime('now', '-100 minutes')",
                 [],
                 |row| row.get(0),
             )

@@ -920,9 +920,58 @@ pub async fn defer_dod(
         rusqlite::params![dod_str, id],
     ).ok();
 
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+    // #128: Check if all DoD items are now complete AND card is awaiting_dod.
+    // If so, clear awaiting_dod and restart review (fire OnReviewEnter).
+    let should_restart_review = {
+        let (card_status, review_status): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, review_status FROM kanban_cards WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or(("".to_string(), None));
+
+        if card_status == "review" && review_status.as_deref() == Some("awaiting_dod") {
+            // Check if all DoD items are verified.
+            // Format: { items: ["task1", "task2"], verified: ["task1", "task2"] }
+            let all_done = if let (Some(items), Some(verified)) =
+                (dod["items"].as_array(), dod["verified"].as_array())
+            {
+                !items.is_empty()
+                    && items.iter().all(|item| verified.contains(item))
+            } else {
+                false
+            };
+            if all_done {
+                conn.execute(
+                    "UPDATE kanban_cards SET review_status = 'reviewing', review_entered_at = datetime('now'), awaiting_dod_at = NULL WHERE id = ?1",
+                    [&id],
+                ).ok();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    // Must drop conn before firing hooks (hooks may re-acquire DB lock)
+    let card_result = conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
         card_row_to_json(row)
-    }) {
+    });
+    drop(conn);
+
+    // Fire OnReviewEnter outside of DB lock to trigger review dispatch creation
+    if should_restart_review {
+        let _ = state.engine.try_fire_hook(
+            crate::engine::hooks::Hook::OnReviewEnter,
+            json!({"card_id": id}),
+        );
+        tracing::info!("[dod] Card {} DoD all-complete — restarting review from awaiting_dod", id);
+    }
+
+    match card_result {
         Ok(mut card) => {
             card["deferred_dod"] = dod;
             (StatusCode::OK, Json(json!({"card": card})))
@@ -1020,8 +1069,8 @@ pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<s
 
     let mut stmt = match conn.prepare(&format!(
         "{CARD_SELECT}
-         WHERE kc.status = 'in_progress' AND kc.updated_at < datetime('now', '-2 hours'){}
-         ORDER BY kc.updated_at ASC",
+         WHERE kc.status = 'in_progress' AND kc.started_at IS NOT NULL AND kc.started_at < datetime('now', '-2 hours'){}
+         ORDER BY kc.started_at ASC",
         repo_filter
     )) {
         Ok(s) => s,
