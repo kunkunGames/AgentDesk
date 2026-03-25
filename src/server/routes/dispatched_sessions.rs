@@ -309,7 +309,8 @@ pub async fn hook_session(
             .and_then(|(dtype, dstatus)| {
                 ((dtype == "implementation"
                     || dtype == "rework"
-                    || dtype == "review")
+                    || dtype == "review"
+                    || dtype == "review-decision")
                     && dstatus == "pending")
                     .then_some(did.clone())
             })
