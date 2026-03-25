@@ -228,6 +228,11 @@ pub fn complete_dispatch(
         })
         .unwrap_or_default();
 
+    // Capture max rowid before hooks fire — any dispatches created by hooks
+    // (JS agentdesk.dispatch.create()) will have a higher rowid.
+    let pre_hook_max_rowid: i64 = conn
+        .query_row("SELECT COALESCE(MAX(rowid), 0) FROM task_dispatches", [], |row| row.get(0))
+        .unwrap_or(0);
     drop(conn);
 
     // Fire OnDispatchCompleted hook
@@ -240,15 +245,11 @@ pub fn complete_dispatch(
         }),
     );
 
-    // After OnDispatchCompleted, policies may have changed the card status via kanban.setStatus.
-    // Since setStatus fires hooks internally (via fire_transition_hooks in the wrapper),
-    // we only need to check for status changes made by the wrapper that need post-processing.
-    // The kanban.setStatus wrapper handles OnCardTransition, OnCardTerminal, OnReviewEnter.
-    // However, if the policy used setStatus, the hooks already fired during the hook execution.
-    // We still check for review/done to handle edge cases where hooks create new dispatches.
     // After OnDispatchCompleted, policies may have changed card status via setStatus().
     // Drain pending transitions and fire follow-up hooks (OnReviewEnter, etc.).
     // Loop because transition hooks may generate further transitions.
+    // Note: fire_transition_hooks already calls notify_new_dispatches_after_hooks
+    // for dispatches created during each transition's hooks.
     loop {
         let transitions = engine.drain_pending_transitions();
         if transitions.is_empty() {
@@ -259,7 +260,60 @@ pub fn complete_dispatch(
         }
     }
 
+    // After all hooks and transitions drained, check for dispatches created by
+    // OnDispatchCompleted hooks (e.g. pipeline.js, review-automation.js, timeouts.js)
+    // that were NOT covered by fire_transition_hooks' notify_new_dispatches_after_hooks.
+    // These are dispatches created outside any card transition context.
+    notify_hook_created_dispatches(db, pre_hook_max_rowid);
+
     Ok(dispatch)
+}
+
+/// Send Discord notifications for any pending dispatches created after `pre_hook_max_rowid`.
+/// Uses the `dispatch_notified` dedup guard in `send_dispatch_to_discord` to avoid
+/// double-notifying dispatches already handled by `notify_new_dispatches_after_hooks`.
+fn notify_hook_created_dispatches(db: &Db, pre_hook_max_rowid: i64) {
+    let dispatches: Vec<(String, String, String, String)> = db
+        .lock()
+        .ok()
+        .map(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT td.id, td.to_agent_id, td.kanban_card_id, kc.title \
+                     FROM task_dispatches td \
+                     JOIN kanban_cards kc ON td.kanban_card_id = kc.id \
+                     WHERE td.status = 'pending' \
+                       AND td.rowid > ?1",
+                )
+                .ok();
+            stmt.as_mut()
+                .and_then(|s| {
+                    s.query_map(rusqlite::params![pre_hook_max_rowid], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })
+                    .ok()
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    if dispatches.is_empty() {
+        return;
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let db_clone = db.clone();
+        for (dispatch_id, agent_id, card_id, title) in dispatches {
+            let db_c = db_clone.clone();
+            handle.spawn(async move {
+                crate::server::routes::dispatches::send_dispatch_to_discord(
+                    &db_c, &agent_id, &title, &card_id, &dispatch_id,
+                )
+                .await;
+            });
+        }
+    }
 }
 
 /// Read a single dispatch row as JSON.

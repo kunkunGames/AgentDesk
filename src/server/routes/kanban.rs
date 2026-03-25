@@ -647,7 +647,7 @@ pub async fn retry_card(
 
         // Create dispatch directly (bypass policy to avoid from===requested skip)
         if !agent_id_for_dispatch.is_empty() {
-            let _ = crate::dispatch::create_dispatch(
+            let retry_result = crate::dispatch::create_dispatch(
                 &state.db,
                 &state.engine,
                 &card_id_owned,
@@ -656,32 +656,23 @@ pub async fn retry_card(
                 &card_title,
                 &json!({"retry": true}),
             );
-            // Async Discord notification
-            let db_clone = state.db.clone();
-            tokio::spawn(async move {
-                let dispatch_info: Option<(String, String)> = {
-                    let conn = match db_clone.lock() {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
-                    conn.query_row(
-                        "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                        [&card_id_owned],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok()
-                };
-                if let Some((dispatch_id, title)) = dispatch_info {
+            // Async Discord notification — use exact dispatch_id to avoid
+            // latest_dispatch_id re-query race.
+            if let Ok(ref d) = retry_result {
+                let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
+                let db_clone = state.db.clone();
+                let title_c = card_title.clone();
+                tokio::spawn(async move {
                     super::dispatches::send_dispatch_to_discord(
                         &db_clone,
                         &agent_id_for_dispatch,
-                        &title,
+                        &title_c,
                         &card_id_owned,
                         &dispatch_id,
                     )
                     .await;
-                }
-            });
+                });
+            }
         }
     } // drop conn lock
 
@@ -764,7 +755,7 @@ pub async fn redispatch_card(
 
         // Create dispatch directly (bypass policy to avoid from===requested skip)
         if !agent_id.is_empty() {
-            let _ = crate::dispatch::create_dispatch(
+            let redispatch_result = crate::dispatch::create_dispatch(
                 &state.db,
                 &state.engine,
                 &card_id_owned,
@@ -773,33 +764,24 @@ pub async fn redispatch_card(
                 &card_title,
                 &json!({"redispatch": true}),
             );
-            // Async Discord notification
-            let db_clone = state.db.clone();
-            let agent_id_clone = agent_id.clone();
-            tokio::spawn(async move {
-                let dispatch_info: Option<(String, String)> = {
-                    let conn = match db_clone.lock() {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
-                    conn.query_row(
-                        "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                        [&card_id_owned],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .ok()
-                };
-                if let Some((dispatch_id, title)) = dispatch_info {
+            // Async Discord notification — use exact dispatch_id to avoid
+            // latest_dispatch_id re-query race.
+            if let Ok(ref d) = redispatch_result {
+                let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
+                let db_clone = state.db.clone();
+                let agent_id_clone = agent_id.clone();
+                let title_c = card_title.clone();
+                tokio::spawn(async move {
                     super::dispatches::send_dispatch_to_discord(
                         &db_clone,
                         &agent_id_clone,
-                        &title,
+                        &title_c,
                         &card_id_owned,
                         &dispatch_id,
                     )
                     .await;
-                }
-            });
+                });
+            }
         }
     }
 

@@ -375,7 +375,7 @@ pub async fn submit_review_decision(
 
     match body.decision.as_str() {
         "accept" => {
-            // Agent accepts review feedback → create rework dispatch
+            // Agent accepts review feedback → dispatch-first rework creation
             let (agent_id, title): (String, String) = conn
                 .query_row(
                     "SELECT COALESCE(assigned_agent_id, ''), title FROM kanban_cards WHERE id = ?1",
@@ -385,72 +385,88 @@ pub async fn submit_review_decision(
                 .unwrap_or_default();
 
             drop(conn);
-            let _ = crate::kanban::transition_status(
+
+            if agent_id.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "no assigned agent for card", "card_id": body.card_id})),
+                );
+            }
+
+            // Dispatch-first: create rework dispatch BEFORE transitioning card status.
+            // If dispatch creation fails (e.g. done terminal guard), card stays in
+            // current status instead of being stranded in in_progress with no dispatch.
+            let rework_title = format!("[Rework] {title}");
+            let rework_result = crate::dispatch::create_dispatch(
                 &state.db,
                 &state.engine,
                 &body.card_id,
-                "in_progress",
+                &agent_id,
+                "rework",
+                &rework_title,
+                &json!({"review_decision": "accept", "comment": body.comment}),
             );
-            // Set review_status separately (transition_status handles core status only)
-            if let Ok(conn) = state.db.lock() {
-                conn.execute(
-                    "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
-                    [&body.card_id],
-                )
-                .ok();
-            }
 
-            // Create rework dispatch so agent gets a session to do the fix
-            if !agent_id.is_empty() {
-                let _ = crate::dispatch::create_dispatch(
-                    &state.db,
-                    &state.engine,
-                    &body.card_id,
-                    &agent_id,
-                    "rework",
-                    &format!("[Rework] {title}"),
-                    &json!({"review_decision": "accept", "comment": body.comment}),
-                );
-
-                // Async Discord notification
-                let db_clone = state.db.clone();
-                let card_id = body.card_id.clone();
-                let agent_id_c = agent_id.clone();
-                tokio::spawn(async move {
-                    let info: Option<(String, String)> = {
-                        let conn = match db_clone.lock() {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        conn.query_row(
-                            "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                            [&card_id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
+            match rework_result {
+                Ok(ref d) => {
+                    // Dispatch succeeded → safe to transition card
+                    let _ = crate::kanban::transition_status(
+                        &state.db,
+                        &state.engine,
+                        &body.card_id,
+                        "in_progress",
+                    );
+                    if let Ok(conn) = state.db.lock() {
+                        conn.execute(
+                            "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
+                            [&body.card_id],
                         )
-                        .ok()
-                    };
-                    if let Some((dispatch_id, title)) = info {
+                        .ok();
+                    }
+
+                    // Async Discord notification
+                    let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
+                    let db_clone = state.db.clone();
+                    let card_id = body.card_id.clone();
+                    let agent_id_c = agent_id.clone();
+                    let title_c = rework_title.clone();
+                    tokio::spawn(async move {
                         super::dispatches::send_dispatch_to_discord(
                             &db_clone,
                             &agent_id_c,
-                            &title,
+                            &title_c,
                             &card_id,
                             &dispatch_id,
                         )
                         .await;
-                    }
-                });
-            }
+                    });
 
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "card_id": body.card_id,
-                    "decision": "accept",
-                    "message": "Rework dispatch created",
-                })),
-            );
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "ok": true,
+                            "card_id": body.card_id,
+                            "decision": "accept",
+                            "message": "Rework dispatch created",
+                        })),
+                    );
+                }
+                Err(e) => {
+                    // Dispatch failed → fail closed, do NOT move card to in_progress
+                    tracing::warn!(
+                        "[review-decision] accept dispatch creation failed for card {}: {e}",
+                        body.card_id
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!("rework dispatch creation failed: {e}"),
+                            "card_id": body.card_id,
+                            "fallback": "card stays in current status",
+                        })),
+                    );
+                }
+            }
         }
         "dispute" => {
             // Agent disputes → increment review_round, create new review dispatch to counter-model

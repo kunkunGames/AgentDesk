@@ -648,33 +648,27 @@ pub async fn activate(
         .ok();
         drop(conn_reacquired);
 
-        // Async Discord notification
+        // Async Discord notification — use exact dispatch_id from create_dispatch
+        // to avoid latest_dispatch_id re-query race under concurrent dispatch creation.
+        let dispatch_id = dispatch_result
+            .as_ref()
+            .unwrap()["id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         let db_clone = state.db.clone();
         let card_id_c = card_id.clone();
         let agent_id_c = agent_id.clone();
+        let title_c = title.clone();
         tokio::spawn(async move {
-            let info: Option<(String, String)> = {
-                let conn = match db_clone.lock() {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                conn.query_row(
-                    "SELECT latest_dispatch_id, title FROM kanban_cards WHERE id = ?1",
-                    [&card_id_c],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok()
-            };
-            if let Some((dispatch_id, title)) = info {
-                super::dispatches::send_dispatch_to_discord(
-                    &db_clone,
-                    &agent_id_c,
-                    &title,
-                    &card_id_c,
-                    &dispatch_id,
-                )
-                .await;
-            }
+            super::dispatches::send_dispatch_to_discord(
+                &db_clone,
+                &agent_id_c,
+                &title_c,
+                &card_id_c,
+                &dispatch_id,
+            )
+            .await;
         });
 
         let conn_inner = state.db.lock().unwrap();
