@@ -307,8 +307,10 @@ pub async fn hook_session(
             )
             .ok()
             .and_then(|(dtype, dstatus)| {
-                ((dtype == "implementation" || dtype == "rework" || dtype == "review")
-                    && dstatus == "pending")
+                // Only review dispatches are auto-completed on idle.
+                // implementation/rework require explicit completion via
+                // PATCH /api/dispatches/:id (turn_bridge calls this at turn end).
+                (dtype == "review" && dstatus == "pending")
                     .then_some(did.clone())
             })
         })
@@ -716,8 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_hook_completes_pending_implementation_dispatch_and_clears_session_active_dispatch()
-     {
+    async fn idle_hook_does_not_auto_complete_implementation_dispatch() {
         let db = test_db();
         let engine = test_engine(&db);
         let state = AppState {
@@ -781,6 +782,8 @@ mod tests {
         assert_eq!(idle_status, StatusCode::OK);
 
         let conn = db.lock().unwrap();
+        // implementation dispatches must NOT be auto-completed on idle —
+        // they require explicit completion from turn_bridge
         let card_status: String = conn
             .query_row(
                 "SELECT status FROM kanban_cards WHERE id = ?1",
@@ -795,29 +798,102 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let dispatch_result: Option<String> = conn
+
+        // Card may move to in_progress via kanban-rules policy when session reports working,
+        // but must NOT advance to review (which would happen if idle auto-completed the dispatch).
+        assert!(
+            card_status == "requested" || card_status == "in_progress",
+            "card should not advance past in_progress, got: {card_status}"
+        );
+        assert_eq!(dispatch_status, "pending", "implementation dispatch should stay pending on idle");
+    }
+
+    #[tokio::test]
+    async fn idle_hook_does_not_auto_complete_rework_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            health_registry: None,
+        };
+
+        let card_id = "card-rework";
+        let dispatch_id = "dispatch-rework";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
+                 VALUES (?1, 'Rework Card', 'rework', ?2, datetime('now'), datetime('now'))",
+                rusqlite::params![card_id, dispatch_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
+                 VALUES (?1, ?2, 'ch-td', 'rework', 'pending', 'Rework Card', '{}', datetime('now'), datetime('now'))",
+                rusqlite::params![dispatch_id, card_id],
+            )
+            .unwrap();
+        }
+
+        let (working_status, _) = hook_session(
+            State(state.clone()),
+            Json(HookSessionBody {
+                session_key: "session-rework".to_string(),
+                status: Some("working".to_string()),
+                provider: Some("claude".to_string()),
+                session_info: Some("working".to_string()),
+                name: None,
+                model: None,
+                tokens: None,
+                cwd: None,
+                dispatch_id: Some(dispatch_id.to_string()),
+                claude_session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(working_status, StatusCode::OK);
+
+        let (idle_status, _) = hook_session(
+            State(state),
+            Json(HookSessionBody {
+                session_key: "session-rework".to_string(),
+                status: Some("idle".to_string()),
+                provider: Some("claude".to_string()),
+                session_info: Some("idle".to_string()),
+                name: None,
+                model: None,
+                tokens: Some(10),
+                cwd: None,
+                dispatch_id: Some(dispatch_id.to_string()),
+                claude_session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(idle_status, StatusCode::OK);
+
+        let conn = db.lock().unwrap();
+        // rework dispatches must NOT be auto-completed on idle —
+        // they require explicit completion from turn_bridge
+        let card_status: String = conn
             .query_row(
-                "SELECT result FROM task_dispatches WHERE id = ?1",
+                "SELECT status FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = ?1",
                 [dispatch_id],
                 |row| row.get(0),
             )
             .unwrap();
-        let active_dispatch_id: Option<String> = conn
-            .query_row(
-                "SELECT active_dispatch_id FROM sessions WHERE session_key = 'session-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
 
-        assert_eq!(card_status, "review");
-        assert_eq!(dispatch_status, "completed");
-        assert_eq!(active_dispatch_id, None);
-        assert!(
-            dispatch_result
-                .unwrap_or_default()
-                .contains("\"completion_source\":\"session_idle\"")
-        );
+        // Card stays in rework — must NOT advance to review (which would happen
+        // if idle auto-completed the rework dispatch).
+        assert_eq!(card_status, "rework", "card should not advance past rework");
+        assert_eq!(dispatch_status, "pending", "rework dispatch should stay pending on idle");
     }
 
     #[tokio::test]

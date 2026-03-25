@@ -70,10 +70,36 @@ pub fn test_db() -> Db {
 }
 
 /// Wrap a raw Connection into a Db (for tests and migration).
+/// Uses a named shared in-memory URI so that `separate_conn()` and `read_conn()`
+/// can open additional connections to the same in-memory database.
 pub fn wrap_conn(conn: Connection) -> Db {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let uri = format!("file:wrap_conn_{id}?mode=memory&cache=shared");
+
+    // Migrate the schema into the shared URI by opening a connection to it.
+    // The original `conn` (anonymous :memory:) already has data, so we need
+    // to create a new connection at the shared URI, migrate, and copy data.
+    // For simplicity: open a fresh connection at the shared URI, migrate it,
+    // and use that as the primary connection. The caller's `conn` is dropped.
+    let shared = Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("failed to open shared in-memory DB");
+    shared
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .ok();
+    schema::migrate(&shared).expect("failed to migrate shared in-memory DB");
+    drop(conn); // drop the original anonymous connection
+
     Arc::new(DbPool {
-        path: std::path::PathBuf::from(":memory:"),
-        write_conn: Mutex::new(conn),
+        path: std::path::PathBuf::from(uri),
+        write_conn: Mutex::new(shared),
     })
 }
 

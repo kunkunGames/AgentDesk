@@ -3,6 +3,7 @@ use super::restart_report::{RestartCompletionReport, clear_restart_report, save_
 use super::*;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
+use crate::config::local_api_url;
 use crate::utils::format::{safe_suffix, tail_with_ellipsis};
 
 /// Decide the final response text when a Done event arrives.
@@ -137,7 +138,7 @@ struct DispatchSnapshot {
 }
 
 async fn fetch_dispatch_snapshot(api_port: u16, dispatch_id: &str) -> Option<DispatchSnapshot> {
-    let url = format!("http://127.0.0.1:{api_port}/api/dispatches/{dispatch_id}");
+    let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
     let resp = reqwest::Client::new().get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -196,7 +197,7 @@ async fn submit_review_decision_fallback(
     full_response: &str,
 ) -> Result<(), String> {
     let comment = truncate_str(full_response.trim(), 4000).to_string();
-    let url = format!("http://127.0.0.1:{api_port}/api/review-decision");
+    let url = local_api_url(api_port, "/api/review-decision");
     let resp = reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({
@@ -259,7 +260,7 @@ async fn submit_review_verdict_fallback(
     provider: &str,
 ) -> Result<(), String> {
     let payload = build_verdict_payload(dispatch_id, verdict, full_response, provider);
-    let url = format!("http://127.0.0.1:{api_port}/api/review-verdict");
+    let url = local_api_url(api_port, "/api/review-verdict");
     let resp = reqwest::Client::new()
         .post(url)
         .json(&payload)
@@ -338,6 +339,61 @@ async fn guard_review_dispatch_completion(
             )
         }
         _ => None,
+    }
+}
+
+/// Explicitly complete implementation/rework dispatches at turn end.
+/// Unlike review dispatches (which auto-complete on session idle), these types
+/// require an explicit PATCH so the pipeline can advance deterministically.
+async fn complete_work_dispatch_on_turn_end(
+    api_port: u16,
+    dispatch_id: Option<&str>,
+) {
+    let Some(dispatch_id) = dispatch_id else {
+        return;
+    };
+    let Some(snapshot) = fetch_dispatch_snapshot(api_port, dispatch_id).await else {
+        return;
+    };
+    if snapshot.status != "pending" {
+        return;
+    }
+    match snapshot.dispatch_type.as_str() {
+        "implementation" | "rework" => {}
+        _ => return,
+    }
+
+    let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
+    let payload = serde_json::json!({
+        "status": "completed",
+        "result": {
+            "completion_source": "turn_bridge_explicit",
+        },
+    });
+    match reqwest::Client::new()
+        .patch(&url)
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
+                dtype = snapshot.dispatch_type,
+            );
+        }
+        Ok(resp) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ⚠ Explicit dispatch completion failed: HTTP {}",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ Explicit dispatch completion error: {e}");
+        }
     }
 }
 
@@ -804,6 +860,17 @@ pub(super) fn spawn_turn_bridge(
             None
         };
 
+        // Explicitly complete implementation/rework dispatches before sending idle.
+        // These types are NOT auto-completed by the session idle hook — they require
+        // this explicit PATCH call so the pipeline can advance.
+        if !cancelled && !is_prompt_too_long {
+            complete_work_dispatch_on_turn_end(
+                shared_owned.api_port,
+                dispatch_id.as_deref(),
+            )
+            .await;
+        }
+
         post_adk_session_status(
             adk_session_key.as_deref(),
             adk_session_name.as_deref(),
@@ -1017,9 +1084,7 @@ pub(super) fn spawn_turn_bridge(
                                     let port = shared_owned.api_port;
                                     let sid_clone = sid.clone();
                                     tokio::spawn(async move {
-                                        let url = format!(
-                                            "http://127.0.0.1:{port}/api/dispatched-sessions/clear-stale-session-id"
-                                        );
+                                        let url = local_api_url(port, "/api/dispatched-sessions/clear-stale-session-id");
                                         let _ = reqwest::Client::new()
                                             .post(&url)
                                             .json(&serde_json::json!({"claude_session_id": sid_clone}))
