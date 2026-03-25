@@ -451,7 +451,7 @@ var timeouts = {
       var tmuxAlive = false;
       try {
         var checkOut = agentdesk.exec("tmux", JSON.stringify(["list-panes", "-t", tmuxName, "-F", "#{pane_current_command}"]));
-        tmuxAlive = checkOut && checkOut.indexOf("claude") !== -1;
+        tmuxAlive = checkOut && checkOut.indexOf("agentdesk") !== -1;
       } catch(e) { tmuxAlive = false; }
       if (!tmuxAlive) {
         agentdesk.db.execute(

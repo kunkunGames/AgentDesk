@@ -699,8 +699,8 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     ad.set(
         "exec",
         Function::new(ctx.clone(), |cmd: String, args_json: String| -> String {
-            // Only allow safe commands
-            let allowed = ["gh", "git"];
+            // Only allow safe commands (tmux for read-only session queries)
+            let allowed = ["gh", "git", "tmux"];
             if !allowed.contains(&cmd.as_str()) {
                 return format!("ERROR: command '{}' not allowed", cmd);
             }
