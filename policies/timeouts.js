@@ -58,28 +58,75 @@ var timeouts = {
 
   onTick: function() {
     // ─── [R] Reconciliation: DB fallback dispatches that need hook chain ──
+    // These dispatches were completed/failed via direct DB UPDATE (API retry exhausted).
+    // We re-emit the OnDispatchCompleted payload so the full hook chain runs
+    // (PM gate, DoD check, XP, review entry — same as normal complete_dispatch path).
     var reconcileKeys = agentdesk.db.query(
       "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'"
     );
     for (var r = 0; r < reconcileKeys.length; r++) {
       var dispatchId = reconcileKeys[r].value;
+      agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [reconcileKeys[r].key]);
+      agentdesk.log.info("[reconcile] Processing fallback dispatch " + dispatchId);
+      // The dispatch is already completed/failed in DB.
+      // Fire the same event that kanban-rules.js and review-automation.js listen to.
+      // This is handled by the Rust engine — we can't re-emit hooks from JS.
+      // Instead, call the same logic that onDispatchCompleted would:
+      // 1. Read dispatch info
       var dispInfo = agentdesk.db.query(
-        "SELECT dispatch_type, status, kanban_card_id FROM task_dispatches WHERE id = ?",
+        "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result FROM task_dispatches WHERE id = ?",
         [dispatchId]
       );
-      if (dispInfo.length > 0) {
-        var di = dispInfo[0];
-        if (di.status === "completed" && di.kanban_card_id) {
-          // Run the transition that complete_dispatch would have done
-          var card = agentdesk.db.query("SELECT status FROM kanban_cards WHERE id = ?", [di.kanban_card_id]);
-          if (card.length > 0 && card[0].status === "in_progress") {
-            agentdesk.kanban.setStatus(di.kanban_card_id, "review");
-            agentdesk.log.info("[reconcile] DB-fallback completed dispatch " + dispatchId + " → card to review");
-          }
-        }
-        // failed dispatches: card stays as-is, just clean up marker
+      if (dispInfo.length === 0) continue;
+      var di = dispInfo[0];
+      if (!di.kanban_card_id) continue;
+      if (di.status === "failed") {
+        agentdesk.log.info("[reconcile] Dispatch " + dispatchId + " failed — no action needed");
+        continue;
       }
-      agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [reconcileKeys[r].key]);
+      // 2. For completed dispatches, replay kanban-rules onDispatchCompleted logic
+      var cards = agentdesk.db.query(
+        "SELECT id, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
+        [di.kanban_card_id]
+      );
+      if (cards.length === 0) continue;
+      var card = cards[0];
+      if (card.status === "done") continue;
+      if (di.dispatch_type === "review" || di.dispatch_type === "review-decision") continue;
+      if (di.dispatch_type === "rework") {
+        agentdesk.kanban.setStatus(card.id, "review");
+        agentdesk.log.info("[reconcile] " + card.id + " rework done → review");
+        continue;
+      }
+      // Implementation: run PM gate same as kanban-rules.js onDispatchCompleted
+      var xpMap = { "low": 5, "medium": 10, "high": 18, "urgent": 30 };
+      var xp = xpMap[card.priority] || 10;
+      if (di.to_agent_id) {
+        agentdesk.db.execute("UPDATE agents SET xp = xp + ? WHERE id = ?", [xp, di.to_agent_id]);
+      }
+      var pmGateEnabled = agentdesk.config.get("pm_decision_gate_enabled");
+      if (pmGateEnabled !== false && pmGateEnabled !== "false") {
+        var reasons = [];
+        if (card.deferred_dod_json) {
+          try {
+            var dod = JSON.parse(card.deferred_dod_json);
+            if (Array.isArray(dod)) {
+              var checked = 0;
+              for (var di2 = 0; di2 < dod.length; di2++) {
+                if (dod[di2].done || dod[di2].checked) checked++;
+              }
+              if (checked < dod.length) reasons.push("DoD 미완료: " + checked + "/" + dod.length);
+            }
+          } catch (e) {}
+        }
+        if (reasons.length > 0) {
+          agentdesk.kanban.setStatus(card.id, "pending_decision");
+          agentdesk.log.warn("[reconcile] Card " + card.id + " → pending_decision: " + reasons.join("; "));
+          continue;
+        }
+      }
+      agentdesk.kanban.setStatus(card.id, "review");
+      agentdesk.log.info("[reconcile] " + card.id + " implementation done → review (via DB fallback)");
     }
 
     // ─── [A] Requested 타임아웃 (45분) ─────────────────────
