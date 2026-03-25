@@ -90,9 +90,9 @@ install_launchd() {
 }
 
 install_systemd() {
-  local UNIT_SRC="$SCRIPT_DIR/agentdesk.service"
+  local UNIT_SRC="$SCRIPT_DIR/agentdesk-dcserver.service"
   local UNIT_DIR="$HOME/.config/systemd/user"
-  local UNIT_DST="$UNIT_DIR/agentdesk.service"
+  local UNIT_DST="$UNIT_DIR/agentdesk-dcserver.service"
 
   if [ ! -f "$UNIT_SRC" ]; then
     fail "Systemd unit template not found: $UNIT_SRC"
@@ -103,7 +103,7 @@ install_systemd() {
   cp "$UNIT_SRC" "$UNIT_DST"
 
   systemctl --user daemon-reload
-  systemctl --user enable agentdesk.service
+  systemctl --user enable agentdesk-dcserver.service
 
   ok "Systemd unit installed: $UNIT_DST"
 }
@@ -134,7 +134,7 @@ restart_launchd() {
 }
 
 restart_systemd() {
-  systemctl --user restart agentdesk.service
+  systemctl --user restart agentdesk-dcserver.service
   ok "Service restarted via systemd"
 }
 
