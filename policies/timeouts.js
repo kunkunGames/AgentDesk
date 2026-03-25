@@ -689,10 +689,12 @@ var timeouts = {
           }
         }
 
-        // 4) PMD 알림
-        sendNotifyAlert(getPMDChannel(),
-          "🔴 [Deadlock 복구] " + sess.agent_id + " 세션 " + sess.session_key +
-          " — " + totalMin + "분 무응답 → 강제 중단" +
+        // 4) Deadlock-manager 알림 (announce 봇)
+        sendDeadlockAlert(
+          "🔴 [Deadlock 복구] " + sess.agent_id + "\n" +
+          "session_key: " + sess.session_key + "\n" +
+          "tmux: " + ((sess.session_key || "").split(":").pop() || "unknown") + "\n" +
+          totalMin + "분 무응답 → 강제 중단" +
           (redispatched ? " + 재디스패치 완료" : ""));
 
         // 5) 이력 기록
@@ -724,7 +726,7 @@ var timeouts = {
         sendDeadlockAlert(
           "⚠️ [Deadlock 의심] " + sess.agent_id + "\n" +
           "session_key: " + sess.session_key + "\n" +
-          "tmux: " + (sess.session_key || "unknown") + "\n" +
+          "tmux: " + ((sess.session_key || "").split(":").pop() || "unknown") + "\n" +
           "무응답: " + DEADLOCK_MINUTES + "분 (연장 " + (extensions + 1) + "/" + MAX_EXTENSIONS + ")");
       }
     }
