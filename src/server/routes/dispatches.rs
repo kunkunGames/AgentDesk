@@ -1395,12 +1395,13 @@ fn format_dispatch_message(
         let provider_arg = target_provider
             .map(|p| format!(r#","provider":"{}""#, p))
             .unwrap_or_default();
+        let base_url = crate::config::local_api_url(crate::config::load_graceful().server.port, "");
         message.push_str(&format!(
             "\n---\n\
              응답 첫 줄에 반드시 `VERDICT: pass|improve|reject|rework` 중 하나를 적으세요.\n\
              verdict API가 200 OK로 호출되기 전까지 리뷰는 완료로 간주되지 않습니다.\n\
              리뷰 완료 후 verdict API를 호출하세요:\n\
-             `curl -sf -X POST http://127.0.0.1:8791/api/review-verdict \
+             `curl -sf -X POST {base_url}/api/review-verdict \
              -H \"Content-Type: application/json\" \
              -d '{{\"dispatch_id\":\"{dispatch_id}\",\"overall\":\"pass|improve|reject|rework\"{commit_arg}{provider_arg}}}'`"
         ));

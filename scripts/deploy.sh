@@ -17,9 +17,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=_defaults.sh
+. "$SCRIPT_DIR/_defaults.sh"
+
 AD_HOME="${AGENTDESK_HOME:-$HOME/.adk/release}"
 BIN_DIR="$AD_HOME/bin"
-HEALTH_PORT="${AGENTDESK_SERVER_PORT:-8791}"
+HEALTH_PORT="${AGENTDESK_SERVER_PORT:-$ADK_DEFAULT_PORT}"
 LABEL="com.agentdesk.release"
 
 SKIP_BUILD=false
@@ -169,7 +172,7 @@ HEALTHY=false
 
 for i in $(seq 1 $RETRIES); do
   sleep "$DELAY"
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$HEALTH_PORT/api/health" 2>/dev/null || echo "000")
+  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${ADK_DEFAULT_LOOPBACK}:$HEALTH_PORT/api/health" 2>/dev/null || echo "000")
   if [ "$HTTP_CODE" = "200" ]; then
     HEALTHY=true
     break

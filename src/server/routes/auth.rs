@@ -52,7 +52,10 @@ pub async fn auth_middleware(
         .get("origin")
         .or_else(|| req.headers().get("referer"))
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.starts_with("http://127.0.0.1") || v.starts_with("http://localhost"))
+        .map(|v| {
+            let loopback = crate::config::loopback();
+            v.starts_with(&format!("http://{loopback}")) || v.starts_with("http://localhost")
+        })
         .unwrap_or(false);
     if is_same_origin {
         return next.run(req).await;

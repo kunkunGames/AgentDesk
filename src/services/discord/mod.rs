@@ -2013,7 +2013,7 @@ async fn add_reaction(
 
 /// Periodic GC: delete stale idle/disconnected thread sessions from DB via cleanup API.
 async fn gc_stale_thread_sessions_via_api(api_port: u16) {
-    let url = format!("http://127.0.0.1:{api_port}/api/dispatched-sessions/gc-threads");
+    let url = crate::config::local_api_url(api_port, "/api/dispatched-sessions/gc-threads");
     match reqwest::Client::new().delete(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(body) = resp.json::<serde_json::Value>().await {

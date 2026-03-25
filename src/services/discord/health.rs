@@ -553,7 +553,8 @@ pub fn spawn_watchdog(port: u16) {
 
                 let ok = (|| -> bool {
                     use std::io::{Read, Write};
-                    let addr = format!("127.0.0.1:{port}");
+                    let loopback = crate::config::loopback();
+                    let addr = format!("{loopback}:{port}");
                     let mut stream =
                         match std::net::TcpStream::connect_timeout(
                             &addr.parse().unwrap(),
@@ -564,7 +565,7 @@ pub fn spawn_watchdog(port: u16) {
                         };
                     let _ = stream.set_read_timeout(Some(TCP_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(TCP_TIMEOUT));
-                    let req = "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                    let req = format!("GET /api/health HTTP/1.1\r\nHost: {loopback}\r\nConnection: close\r\n\r\n");
                     if stream.write_all(req.as_bytes()).is_err() {
                         return false;
                     }

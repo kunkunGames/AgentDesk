@@ -4,6 +4,7 @@ use std::sync::Arc;
 use poise::serenity_prelude as serenity;
 
 use super::SharedData;
+use crate::config::local_api_url;
 use crate::services::provider::ProviderKind;
 
 const SESSION_INFO_MAX_CHARS: usize = 60;
@@ -125,7 +126,7 @@ pub(super) async fn post_adk_session_status(
     }
 
     match reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{api_port}/api/hook/session"))
+        .post(local_api_url(api_port, "/api/hook/session"))
         .json(&body)
         .send()
         .await
@@ -145,7 +146,7 @@ pub(super) async fn post_adk_session_status(
 /// Delete a session row from the DB by session_key.
 /// Used to clean up thread sessions after dispatch completion.
 pub(super) async fn delete_adk_session(session_key: &str, api_port: u16) {
-    let url = format!("http://127.0.0.1:{api_port}/api/hook/session");
+    let url = local_api_url(api_port, "/api/hook/session");
     match reqwest::Client::new()
         .delete(&url)
         .query(&[("session_key", session_key)])
@@ -179,7 +180,7 @@ pub(super) async fn save_claude_session_id(
         "claude_session_id": claude_session_id,
     });
     match reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{api_port}/api/hook/session"))
+        .post(local_api_url(api_port, "/api/hook/session"))
         .json(&body)
         .send()
         .await
@@ -202,7 +203,7 @@ pub(super) async fn save_claude_session_id(
 /// Fetch the stored claude_session_id from DB for a given session_key.
 /// Returns None if no record exists or if the field is NULL.
 pub(super) async fn fetch_claude_session_id(session_key: &str, api_port: u16) -> Option<String> {
-    let url = format!("http://127.0.0.1:{api_port}/api/dispatched-sessions/claude-session-id");
+    let url = local_api_url(api_port, "/api/dispatched-sessions/claude-session-id");
     let resp = reqwest::Client::new()
         .get(&url)
         .query(&[("session_key", session_key)])

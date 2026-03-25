@@ -2721,9 +2721,9 @@ async fn lookup_card_thread(api_port: u16, dispatch_id: &str) -> Option<String> 
 }
 
 async fn lookup_dispatch_info(api_port: u16, dispatch_id: &str) -> Option<DispatchInfo> {
-    let url = format!(
-        "http://127.0.0.1:{}/api/internal/card-thread?dispatch_id={}",
-        api_port, dispatch_id
+    let url = crate::config::local_api_url(
+        api_port,
+        &format!("/api/internal/card-thread?dispatch_id={dispatch_id}"),
     );
     let resp = reqwest::Client::new()
         .get(&url)
@@ -2787,10 +2787,7 @@ async fn verify_thread_accessible(
 
 /// Link a newly created dispatch thread to the card's active_thread_id via internal API.
 async fn link_dispatch_thread(api_port: u16, dispatch_id: &str, thread_id: u64, channel_id: u64) {
-    let url = format!(
-        "http://127.0.0.1:{}/api/internal/link-dispatch-thread",
-        api_port
-    );
+    let url = crate::config::local_api_url(api_port, "/api/internal/link-dispatch-thread");
     let _ = reqwest::Client::new()
         .post(&url)
         .timeout(std::time::Duration::from_secs(2))

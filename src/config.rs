@@ -97,11 +97,31 @@ pub struct KanbanConfig {
     pub max_chain_depth: u32,
 }
 
+/// Compile-time defaults loaded from the project-root `defaults.json`.
+/// This is the single source of truth for port/host values shared across
+/// Rust, Vite, and shell scripts.
+mod compiled_defaults {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct Defaults {
+        pub port: u16,
+        pub host: String,
+        pub loopback: String,
+    }
+
+    static JSON: &str = include_str!("../defaults.json");
+
+    pub fn load() -> Defaults {
+        serde_json::from_str(JSON).expect("defaults.json must be valid")
+    }
+}
+
 fn default_port() -> u16 {
-    8791
+    compiled_defaults::load().port
 }
 fn default_host() -> String {
-    "0.0.0.0".into()
+    compiled_defaults::load().host
 }
 fn default_provider() -> String {
     "claude".into()
@@ -144,6 +164,30 @@ impl Default for ServerConfig {
             auth_token: None,
         }
     }
+}
+
+impl ServerConfig {
+    /// Loopback address from `defaults.json` (e.g. "127.0.0.1").
+    /// Used for self-referencing HTTP requests.
+    pub fn loopback() -> String {
+        compiled_defaults::load().loopback
+    }
+
+    /// Build a base URL for self-referencing API calls: `http://{loopback}:{port}`.
+    pub fn local_base_url(&self) -> String {
+        format!("http://{}:{}", Self::loopback(), self.port)
+    }
+}
+
+/// Build a localhost API URL: `http://{loopback}:{port}{path}`.
+/// Use this for all self-referencing HTTP calls instead of hardcoding 127.0.0.1.
+pub fn local_api_url(port: u16, path: &str) -> String {
+    format!("http://{}:{}{}", ServerConfig::loopback(), port, path)
+}
+
+/// Returns the loopback address from defaults (e.g. "127.0.0.1").
+pub fn loopback() -> String {
+    ServerConfig::loopback()
 }
 
 impl Default for PoliciesConfig {

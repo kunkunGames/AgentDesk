@@ -285,7 +285,7 @@ fn register_config_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
 //
 // agentdesk.http.post(url, body) → response_string
 // Synchronous HTTP POST for localhost API calls from policy JS.
-// Only allows 127.0.0.1 targets for security.
+// Only allows loopback targets for security.
 
 fn register_http_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
@@ -294,7 +294,8 @@ fn register_http_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     http_obj.set(
         "__post_raw",
         Function::new(ctx.clone(), |url: String, body_json: String| -> String {
-            if !url.starts_with("http://127.0.0.1") {
+            let loopback_prefix = format!("http://{}", crate::config::loopback());
+            if !url.starts_with(&loopback_prefix) {
                 return r#"{"error":"only localhost allowed"}"#.to_string();
             }
             // Run on a dedicated thread to avoid blocking the tokio I/O

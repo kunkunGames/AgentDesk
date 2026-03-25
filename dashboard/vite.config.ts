@@ -2,6 +2,10 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { readFileSync } from "fs";
+
+// Single source of truth for port/host defaults (shared with Rust backend & scripts)
+const defaults = JSON.parse(readFileSync(path.resolve(__dirname, "../defaults.json"), "utf-8"));
 
 function manualChunks(id: string) {
   if (!id.includes("node_modules")) return undefined;
@@ -63,8 +67,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8791",
-      "/ws": { target: "ws://127.0.0.1:8791", ws: true },
+      "/api": `http://${defaults.loopback}:${defaults.port}`,
+      "/ws": { target: `ws://${defaults.loopback}:${defaults.port}`, ws: true },
     },
   },
   build: {

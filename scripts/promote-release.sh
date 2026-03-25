@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=_defaults.sh
+. "$SCRIPT_DIR/_defaults.sh"
+
 ADK_DEV="$HOME/.adk/dev"
 ADK_REL="$HOME/.adk/release"
 PLIST_REL="com.agentdesk.release"
@@ -22,8 +26,8 @@ if [[ "${1:-}" != "--skip-review" ]]; then
 fi
 
 # Safety check: dev must be healthy
-DEV_PORT="${AGENTDESK_DEV_PORT:-8791}"
-if ! curl -s --max-time 5 "http://127.0.0.1:${DEV_PORT}/api/health" | grep -q '"status":"healthy"'; then
+DEV_PORT="${AGENTDESK_DEV_PORT:-$ADK_DEFAULT_PORT}"
+if ! curl -s --max-time 5 "http://${ADK_DEFAULT_LOOPBACK}:${DEV_PORT}/api/health" | grep -q '"status":"healthy"'; then
     echo "✗ Dev is not healthy — aborting promotion"
     exit 1
 fi
@@ -82,8 +86,8 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
 sleep 3
 
 # Health check (server health + dashboard availability)
-REL_PORT="${AGENTDESK_REL_PORT:-8791}"
-HEALTH_JSON=$(curl -s --max-time 5 "http://127.0.0.1:${REL_PORT}/api/health")
+REL_PORT="${AGENTDESK_REL_PORT:-$ADK_DEFAULT_PORT}"
+HEALTH_JSON=$(curl -s --max-time 5 "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}/api/health")
 if echo "$HEALTH_JSON" | grep -q '"status":"healthy"'; then
     echo "✓ Release is healthy on :${REL_PORT}"
 else

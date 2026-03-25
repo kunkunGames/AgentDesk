@@ -541,7 +541,7 @@ pub async fn start_meeting(
     let message = format!("/meeting start {agenda}");
     let client = reqwest::Client::new();
     match client
-        .post(format!("http://127.0.0.1:{server_port}/api/send"))
+        .post(crate::config::local_api_url(server_port, "/api/send"))
         .json(&json!({
             "target": format!("channel:{channel_id}"),
             "content": message,

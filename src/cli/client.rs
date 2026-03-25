@@ -10,7 +10,7 @@ pub fn api_base() -> String {
         return url.trim_end_matches('/').to_string();
     }
     let cfg = config::load_graceful();
-    format!("http://127.0.0.1:{}", cfg.server.port)
+    cfg.server.local_base_url()
 }
 
 /// Build a ureq agent (shared across calls).

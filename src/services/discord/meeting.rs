@@ -1384,9 +1384,7 @@ async fn post_meeting_status(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
     let _ = client
-        .post(format!(
-            "http://localhost:{api_port}/api/round-table-meetings"
-        ))
+        .post(crate::config::local_api_url(api_port, "/api/round-table-meetings"))
         .json(&payload)
         .send()
         .await?;

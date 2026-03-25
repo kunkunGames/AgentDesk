@@ -257,12 +257,21 @@ pub fn cmd_doctor() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::discord_bot_check_from_health;
+    use crate::config::ServerConfig;
     use serde_json::json;
+
+    fn test_base_url() -> String {
+        format!(
+            "http://{}:{}",
+            ServerConfig::loopback(),
+            ServerConfig::default().port,
+        )
+    }
 
     #[test]
     fn unified_health_requires_connected_providers() {
         let check = discord_bot_check_from_health(
-            "http://127.0.0.1:8791",
+            &test_base_url(),
             &json!({
                 "status": "healthy",
                 "providers": [
@@ -278,7 +287,7 @@ mod tests {
     #[test]
     fn standalone_health_does_not_count_as_discord_health() {
         let check = discord_bot_check_from_health(
-            "http://127.0.0.1:8791",
+            &test_base_url(),
             &json!({
                 "ok": true,
                 "db": true,

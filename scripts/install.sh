@@ -17,7 +17,22 @@ set -euo pipefail
 REPO="itismyfield/AgentDesk"
 INSTALL_DIR="$HOME/.adk/release"
 LAUNCHD_LABEL="com.agentdesk.release"
-DEFAULT_PORT=8791
+
+# Read defaults from defaults.json if available (single source of truth)
+_read_default() {
+  local key="$1" fallback="$2" src="$3"
+  if [ -f "$src" ]; then
+    local val
+    val=$(sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^,\"]*\)\"\{0,1\}.*/\1/p" "$src" | head -1)
+    [ -n "$val" ] && echo "$val" && return
+  fi
+  echo "$fallback"
+}
+# During install, defaults.json may exist in the extracted tarball or cloned repo
+_DEFAULTS_SRC="${TMPDIR_BUILD:-${TMPDIR_DL:-}}/defaults.json"
+DEFAULT_PORT=$(_read_default port 8791 "$_DEFAULTS_SRC")
+DEFAULT_HOST=$(_read_default host "0.0.0.0" "$_DEFAULTS_SRC")
+DEFAULT_LOOPBACK=$(_read_default loopback "127.0.0.1" "$_DEFAULTS_SRC")
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -159,14 +174,14 @@ fi
 
 # ── Create default config if not exists ───────────────────────────────────────
 if [ ! -f "$INSTALL_DIR/agentdesk.yaml" ]; then
-  cat > "$INSTALL_DIR/agentdesk.yaml" << 'YAML'
+  cat > "$INSTALL_DIR/agentdesk.yaml" << YAML
 # AgentDesk Configuration
 # Edit this file to add Discord bot tokens and customize settings.
-# Run the web onboarding wizard for guided setup: http://127.0.0.1:8791
+# Run the web onboarding wizard for guided setup: http://${DEFAULT_LOOPBACK}:${DEFAULT_PORT}
 
 server:
-  port: 8791
-  host: "0.0.0.0"
+  port: ${DEFAULT_PORT}
+  host: "${DEFAULT_HOST}"
 
 discord:
   bots: {}
@@ -242,7 +257,7 @@ if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
   sleep 3
 
   # Health check
-  if curl -sf --max-time 5 "http://127.0.0.1:$DEFAULT_PORT/api/health" | grep -q '"status":"healthy"'; then
+  if curl -sf --max-time 5 "http://${DEFAULT_LOOPBACK}:$DEFAULT_PORT/api/health" | grep -q '"status":"healthy"'; then
     ok "AgentDesk is running on port $DEFAULT_PORT"
   else
     warn "Service started but health check pending. Check logs: $INSTALL_DIR/logs/"
@@ -253,7 +268,7 @@ else
 fi
 
 # ── Open browser ──────────────────────────────────────────────────────────────
-DASHBOARD_URL="http://127.0.0.1:$DEFAULT_PORT"
+DASHBOARD_URL="http://${DEFAULT_LOOPBACK}:$DEFAULT_PORT"
 
 echo ""
 echo -e "${BOLD}═══ Installation Complete ═══${NC}"
