@@ -673,7 +673,7 @@ var timeouts = {
     var clearIdleMin = parseInt(agentdesk.config.get("context_clear_idle_minutes") || "60", 10);
 
     var sessions = agentdesk.db.query(
-      "SELECT session_key, agent_id, tokens, status, last_heartbeat FROM sessions WHERE status != 'disconnected' AND tokens > 0"
+      "SELECT session_key, agent_id, tokens, status, last_heartbeat, provider FROM sessions WHERE status IN ('idle', 'working')"
     );
 
     var now = Date.now();
@@ -682,17 +682,12 @@ var timeouts = {
       var s = sessions[i];
       if (!s.session_key) continue;
 
-      var pct = (s.tokens / CONTEXT_WINDOW) * 100;
+      // Skip non-Claude sessions
+      var provider = s.provider || "claude";
+      if (provider !== "claude") continue;
 
       // Skip working sessions — don't interrupt active work
       if (s.status === "working") continue;
-
-      // Check provider — /compact and /clear are Claude Code commands only
-      var sessionInfo = agentdesk.db.query(
-        "SELECT provider FROM sessions WHERE session_key = ?", [s.session_key]
-      );
-      var provider = sessionInfo.length > 0 ? sessionInfo[0].provider : "claude";
-      if (provider !== "claude") continue; // Skip non-Claude sessions for now
 
       // Check cooldown (5 min) to avoid spamming commands
       var cooldownKey = "context_action_" + s.session_key;
@@ -702,6 +697,31 @@ var timeouts = {
       if (lastAction.length > 0) {
         var lastMs = parseInt(lastAction[0].value, 10);
         if (now - lastMs < 300000) continue; // 5 min cooldown
+      }
+
+      // Probe actual context usage via /context command + tmux capture
+      var pct = (s.tokens / CONTEXT_WINDOW) * 100; // fallback: stored tokens
+      var tmuxName = (s.session_key || "").split(":").pop();
+      if (tmuxName) {
+        try {
+          // Send /context and capture output
+          agentdesk.exec("tmux", JSON.stringify(["send-keys", "-t", tmuxName, "/context", "Enter"]));
+          agentdesk.exec("sleep", JSON.stringify(["3"]));
+          var captured = agentdesk.exec("tmux", JSON.stringify(["capture-pane", "-t", tmuxName, "-p", "-S", "-10"]));
+          // Parse: **Tokens:** 80.6k / 1000k (8%)
+          var match = captured && captured.match(/\*\*Tokens:\*\*\s*[\d.]+k?\s*\/\s*[\d.]+k?\s*\((\d+)%\)/);
+          if (match) {
+            pct = parseInt(match[1], 10);
+            var actualTokens = Math.round(pct / 100 * CONTEXT_WINDOW);
+            agentdesk.db.execute(
+              "UPDATE sessions SET tokens = ? WHERE session_key = ?",
+              [actualTokens, s.session_key]
+            );
+          }
+        } catch (e) {
+          // Fallback: use stored tokens
+          agentdesk.log.warn("[context] /context probe failed for " + s.session_key + ": " + e);
+        }
       }
 
       // Compact: >= compactPercent
