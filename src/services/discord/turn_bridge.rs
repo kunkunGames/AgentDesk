@@ -345,6 +345,38 @@ async fn guard_review_dispatch_completion(
 /// Explicitly complete implementation/rework dispatches at turn end.
 /// Unlike review dispatches (which auto-complete on session idle), these types
 /// require an explicit PATCH so the pipeline can advance deterministically.
+/// Fail a dispatch with retry on PATCH failure.
+async fn fail_dispatch_with_retry(
+    api_port: u16,
+    dispatch_id: Option<&str>,
+    error_msg: &str,
+) {
+    let Some(dispatch_id) = dispatch_id else {
+        return;
+    };
+    let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
+    let payload = serde_json::json!({
+        "status": "failed",
+        "result": {"error": error_msg.chars().take(500).collect::<String>()}
+    });
+    for attempt in 1..=3 {
+        match reqwest::Client::new().patch(&url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ Dispatch {dispatch_id} failed (transport error)");
+                return;
+            }
+            _ => {
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    eprintln!("  [{ts}] ❌ Failed to PATCH dispatch {dispatch_id} as failed after 3 retries");
+}
+
 async fn complete_work_dispatch_on_turn_end(
     api_port: u16,
     dispatch_id: Option<&str>,
@@ -353,15 +385,8 @@ async fn complete_work_dispatch_on_turn_end(
         return;
     };
     let Some(snapshot) = fetch_dispatch_snapshot(api_port, dispatch_id).await else {
-        // Snapshot fetch failed — fail the dispatch to prevent orphan
-        let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
-        let _ = reqwest::Client::new()
-            .patch(&url)
-            .json(&serde_json::json!({"status": "failed", "result": {"error": "dispatch snapshot fetch failed"}}))
-            .send()
-            .await;
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        eprintln!("  [{ts}] ⚠ Dispatch {dispatch_id} failed: snapshot fetch error");
+        // Snapshot fetch failed — fail the dispatch with retry to prevent orphan
+        fail_dispatch_with_retry(api_port, Some(dispatch_id), "dispatch snapshot fetch failed").await;
         return;
     };
     if snapshot.status != "pending" {
@@ -379,31 +404,39 @@ async fn complete_work_dispatch_on_turn_end(
             "completion_source": "turn_bridge_explicit",
         },
     });
-    match reqwest::Client::new()
-        .patch(&url)
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
-                dtype = snapshot.dispatch_type,
-            );
+    for attempt in 1..=3 {
+        match reqwest::Client::new()
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
+                    dtype = snapshot.dispatch_type,
+                );
+                return;
+            }
+            Ok(resp) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Explicit dispatch completion failed (attempt {attempt}/3): HTTP {}",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ Explicit dispatch completion error (attempt {attempt}/3): {e}");
+            }
         }
-        Ok(resp) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!(
-                "  [{ts}] ⚠ Explicit dispatch completion failed: HTTP {}",
-                resp.status()
-            );
-        }
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!("  [{ts}] ⚠ Explicit dispatch completion error: {e}");
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    eprintln!("  [{ts}] ❌ Explicit dispatch completion failed after 3 retries: {dispatch_id}");
 }
 
 pub(super) struct TurnBridgeContext {
@@ -470,6 +503,7 @@ pub(super) fn spawn_turn_bridge(
         let mut any_tool_used = bridge.inflight_state.any_tool_used;
         let mut has_post_tool_text = bridge.inflight_state.has_post_tool_text;
         let mut tmux_handed_off = false;
+        let mut transport_error = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
         let current_msg_id = bridge.current_msg_id;
         let response_sent_offset = bridge.response_sent_offset;
@@ -672,6 +706,7 @@ pub(super) fn spawn_turn_bridge(
                         StreamMessage::Error {
                             message, stderr, ..
                         } => {
+                            transport_error = true;
                             let combined = format!("{} {}", message, stderr).to_lowercase();
                             if combined.contains("prompt is too long")
                                 || combined.contains("prompt too long")
@@ -872,28 +907,22 @@ pub(super) fn spawn_turn_bridge(
         // Explicitly complete implementation/rework dispatches before sending idle.
         // These types are NOT auto-completed by the session idle hook — they require
         // this explicit PATCH call so the pipeline can advance.
-        // Skip if: cancelled, prompt too long, or error (don't promote failures to completed).
-        // tmux handoff is OK — Claude has finished work, watcher just delivers the output.
-        let has_error = full_response.contains("Error:") || full_response.contains("error:");
-        if !cancelled && !is_prompt_too_long && !has_error {
+        // Skip if: cancelled, prompt too long, or transport error.
+        // transport_error is set by StreamMessage::Error — not substring matching.
+        if !cancelled && !is_prompt_too_long && !transport_error {
             complete_work_dispatch_on_turn_end(
                 shared_owned.api_port,
                 dispatch_id.as_deref(),
             )
             .await;
-        } else if has_error && !cancelled {
-            // Error occurred — fail the dispatch instead of completing
-            if let Some(ref did) = dispatch_id {
-                let port = shared_owned.api_port;
-                let url = format!("http://127.0.0.1:{port}/api/dispatches/{did}");
-                let _ = reqwest::Client::new()
-                    .patch(&url)
-                    .json(&serde_json::json!({"status": "failed", "result": {"error": full_response.chars().take(500).collect::<String>()}}))
-                    .send()
-                    .await;
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!("  [{ts}] ⚠ Dispatch {did} failed due to error in response");
-            }
+        } else if transport_error && !cancelled {
+            // Transport error — fail the dispatch instead of completing
+            fail_dispatch_with_retry(
+                shared_owned.api_port,
+                dispatch_id.as_deref(),
+                &full_response,
+            )
+            .await;
         }
 
         post_adk_session_status(
