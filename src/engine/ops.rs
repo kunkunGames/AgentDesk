@@ -1020,13 +1020,19 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                                     .to_string();
                                 if let Ok(content) = std::fs::read_to_string(&path) {
                                     if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        // Map inflight file fields to output:
+                                        // channel_name → for agent identification
+                                        // tmux_session_name → for diagnostics
+                                        // session_id → Claude session ID
+                                        let channel_name = data.get("channel_name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let tmux_name = data.get("tmux_session_name").and_then(|v| v.as_str()).unwrap_or("");
                                         results.push(serde_json::json!({
                                             "channel_id": channel_id,
                                             "provider": provider,
                                             "started_at": data.get("started_at").and_then(|v| v.as_str()).unwrap_or(""),
-                                            "session_key": data.get("session_key").and_then(|v| v.as_str()).unwrap_or(""),
-                                            "agent_id": data.get("agent_id").and_then(|v| v.as_str()).unwrap_or(""),
-                                            "dispatch_id": data.get("dispatch_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "channel_name": channel_name,
+                                            "tmux_session_name": tmux_name,
+                                            "session_id": data.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
                                         }));
                                     }
                                 }

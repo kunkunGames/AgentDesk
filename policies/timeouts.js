@@ -854,17 +854,16 @@ var timeouts = {
         var elapsedMin = (Date.now() - startedAt.getTime()) / 60000;
         if (elapsedMin >= LONG_TURN_MINUTES) {
           sendDeadlockAlert(
-            "⚠️ [장시간 턴] " + (inf.agent_id || "unknown") + "\n" +
-            "session: " + (inf.session_key || "?") + "\n" +
+            "⚠️ [장시간 턴] " + (inf.channel_name || inf.channel_id) + "\n" +
+            "tmux: " + (inf.tmux_session_name || "?") + "\n" +
             "경과: " + Math.round(elapsedMin) + "분\n" +
-            "dispatch: " + (inf.dispatch_id || "none") + "\n" +
             "provider: " + (inf.provider || "?")
           );
           agentdesk.db.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
             [cooldownKey, "" + Date.now()]
           );
-          agentdesk.log.warn("[long-turn] " + (inf.session_key || inf.channel_id) + " — " + Math.round(elapsedMin) + "min");
+          agentdesk.log.warn("[long-turn] " + (inf.channel_name || inf.channel_id) + " — " + Math.round(elapsedMin) + "min");
         }
       }
     } catch(de) {
