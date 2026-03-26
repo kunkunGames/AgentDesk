@@ -1707,6 +1707,213 @@ pub async fn pm_decision(
     )
 }
 
+// ── PMD-only reopen (done → in_progress) ─────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ReopenBody {
+    pub review_status: Option<String>,
+    pub dispatch_type: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// POST /api/kanban-cards/:id/reopen
+///
+/// PMD-only endpoint. Reopens a done card by transitioning to in_progress,
+/// clearing completed_at, and optionally resetting recovery fields.
+/// Same two-factor auth as force-transition.
+pub async fn reopen_card(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ReopenBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // ── Auth: same two-factor check as force-transition ──
+    let config = crate::config::load_graceful();
+    if let Some(expected_token) = config.server.auth_token.as_deref() {
+        if !expected_token.is_empty() {
+            let provided = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            if provided != Some(expected_token) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "reopen requires explicit Bearer token"})),
+                );
+            }
+        }
+    }
+
+    let caller_channel = headers
+        .get("x-channel-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let pmd_channel: String = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        conn.query_row(
+            "SELECT value FROM kv_meta WHERE key = 'kanban_manager_channel_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+    };
+
+    if pmd_channel.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "kanban_manager_channel_id not configured"})),
+        );
+    }
+
+    if caller_channel != pmd_channel {
+        tracing::warn!(
+            "[kanban] reopen rejected: X-Channel-Id '{}' != PMD channel '{}'",
+            caller_channel,
+            pmd_channel
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "reopen requires X-Channel-Id matching kanban_manager_channel_id"})),
+        );
+    }
+
+    // ── Pre-check: card must be in done state ──
+    let current_status: String = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        match conn.query_row(
+            "SELECT status FROM kanban_cards WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("card not found: {id}")})),
+                );
+            }
+        }
+    };
+
+    if current_status != "done" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("card is not done (current: {current_status}), reopen only applies to done cards")})),
+        );
+    }
+
+    // ── Transition done → in_progress (force=true bypasses terminal guard) ──
+    let reason = body.reason.as_deref().unwrap_or("reopen via API");
+    match crate::kanban::transition_status_with_opts(
+        &state.db,
+        &state.engine,
+        &id,
+        "in_progress",
+        &format!("pmd:reopen({})", reason),
+        true,
+    ) {
+        Ok(result) => {
+            // ── Post-transition cleanup: clear completed_at and optional recovery fields ──
+            let conn = match state.db.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
+            };
+
+            // Always clear completed_at on reopen
+            conn.execute(
+                "UPDATE kanban_cards SET completed_at = NULL, updated_at = datetime('now') WHERE id = ?1",
+                [&id],
+            )
+            .ok();
+
+            // Optional: reset review_status
+            if let Some(ref rs) = body.review_status {
+                conn.execute(
+                    "UPDATE kanban_cards SET review_status = ?1 WHERE id = ?2",
+                    rusqlite::params![rs, &id],
+                )
+                .ok();
+            }
+
+            // Reactivate auto_queue_entries that were marked done
+            conn.execute(
+                "UPDATE auto_queue_entries SET status = 'dispatched', completed_at = NULL \
+                 WHERE kanban_card_id = ?1 AND status = 'done'",
+                [&id],
+            )
+            .ok();
+
+            // Re-open GitHub issue if linked
+            let gh_url: Option<String> = conn
+                .query_row(
+                    "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+
+            let card = conn
+                .query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+                    card_row_to_json(row)
+                });
+            drop(conn);
+
+            // Async: reopen GitHub issue
+            if let Some(url) = gh_url {
+                tokio::spawn(async move {
+                    if let Err(e) = crate::github::reopen_issue_by_url(&url).await {
+                        tracing::warn!("[kanban] Failed to reopen GitHub issue {url}: {e}");
+                    }
+                });
+            }
+
+            match card {
+                Ok(c) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "card": c,
+                        "reopened": true,
+                        "from": result.from,
+                        "to": result.to,
+                        "reason": reason,
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                ),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 // ── PMD-only force transition ────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

@@ -35,6 +35,31 @@ pub(crate) fn run_gh(args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("invalid utf8 from gh: {e}"))
 }
 
+/// Reopen a GitHub issue given its full URL (e.g. https://github.com/owner/repo/issues/42).
+pub async fn reopen_issue_by_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| format!("not a github url: {url}"))?;
+    let slash_pos = rest
+        .find("/issues/")
+        .ok_or_else(|| format!("no /issues/ segment in {url}"))?;
+    let repo = &rest[..slash_pos];
+    let number = &rest[slash_pos + "/issues/".len()..];
+
+    // gh issue reopen <number> --repo <owner/repo>
+    let output = tokio::process::Command::new("gh")
+        .args(["issue", "reopen", number, "--repo", repo])
+        .output()
+        .await
+        .map_err(|e| format!("gh exec: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh issue reopen failed: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 /// List all registered repos from the database.
 pub fn list_repos(db: &Db) -> Result<Vec<RepoRow>, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;

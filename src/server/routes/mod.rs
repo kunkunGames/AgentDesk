@@ -116,6 +116,10 @@ pub fn api_router(
         )
         .route("/kanban-cards/{id}/assign", post(kanban::assign_card))
         .route(
+            "/kanban-cards/{id}/reopen",
+            post(kanban::reopen_card),
+        )
+        .route(
             "/kanban-cards/{id}/force-transition",
             post(kanban::force_transition),
         )

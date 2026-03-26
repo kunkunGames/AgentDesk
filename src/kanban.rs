@@ -86,12 +86,12 @@ pub fn transition_status_with_opts(
     // Use YAML pipeline config if loaded, fall back to hardcoded rules otherwise.
     let pipeline = crate::pipeline::try_get();
 
-    // Terminal guard: terminal states cannot revert
+    // Terminal guard: terminal states cannot revert (unless force=true)
     let is_terminal = pipeline
         .map(|p| p.is_terminal(&old_status))
         .unwrap_or(old_status == "done");
 
-    if is_terminal && old_status != new_status {
+    if is_terminal && old_status != new_status && !force {
         log_audit(
             &conn,
             card_id,
