@@ -85,14 +85,17 @@ jobs:
       - name: shellcheck scripts
         run: |
           FAILED=0
-          find . -name '*.sh' -not -path './target/*' -not -path './.git/*' | while read f; do
+          while IFS= read -r f; do
             shellcheck -S warning "$f" || FAILED=1
-          done
+          done < <(find . -name '*.sh' -not -path './target/*' -not -path './.git/*')
           exit $FAILED
+        shell: bash
 
       - name: Check hardcoded port/path drift
         run: |
+          FAIL=0
           echo "=== Checking for hardcoded ports ==="
+          # List port references for visibility (informational — ports are expected in config/defaults)
           grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \
             --exclude-dir=target --exclude-dir=.git \
             | grep -v 'Cargo.lock' \
@@ -101,10 +104,13 @@ jobs:
 
           echo ""
           echo "=== Checking for hardcoded home paths (informational — see #100) ==="
-          grep -rn 'env!("HOME")' --include='*.rs' \
-            --exclude-dir=target --exclude-dir=.git 2>/dev/null && \
-            echo "NOTE: env!(\"HOME\") found — tracked in #100" || \
+          if grep -rn 'env!("HOME")' --include='*.rs' \
+            --exclude-dir=target --exclude-dir=.git 2>/dev/null; then
+            echo "NOTE: env!(\"HOME\") found — tracked in #100"
+          else
             echo "OK: No env!(\"HOME\") found"
+          fi
+          exit $FAIL
 
       - name: Path integrity check
         run: |
