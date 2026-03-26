@@ -3,27 +3,14 @@
 //! ALL card status transitions MUST go through `transition_status()`.
 //! This ensures hooks fire, auto-queue syncs, and notifications are sent.
 //!
-//! ## Transition Rules
+//! ## Pipeline-Driven Transitions (#106 P5)
 //!
-//! | From | To | Requires |
-//! |------|----|----------|
-//! | backlog | ready | Free (no dispatch needed) |
-//! | ready | backlog | Free (no dispatch needed) |
-//! | ready | requested | Active dispatch (pending/dispatched) |
-//! | requested | in_progress | Active dispatch + session working acknowledgement |
-//! | in_progress | review | Dispatch completion triggers this |
-//! | review | done | Review pass verdict |
-//! | review | in_progress | Rework dispatch (review-decision accept) |
-//! | * | pending_decision | Timeout/gate failure (force via policy) |
-//! | * | blocked | Agent signal or timeout (force via policy) |
+//! All transition rules, gates, hooks, clocks, and timeouts are defined in
+//! `policies/default-pipeline.yaml`. No hardcoded state names exist in this module.
+//! See the YAML file for the complete state machine specification.
 //!
-//! ## Dispatch Acknowledgement
-//!
-//! `requested → in_progress` requires an explicit dispatch acknowledgement:
-//! 1. Session must have `active_dispatch_id` set (links session to dispatch)
-//! 2. Session status must change to `working` (triggers onSessionStatusChange)
-//! 3. Policy checks `dispatch_type` is `implementation` or `rework` (not review)
-//! 4. Policy checks `card.status === "requested"` (prevents re-entry)
+//! Custom pipelines can override the default via repo or agent-level overrides
+//! (3-level inheritance: default → repo → agent).
 
 use crate::db::Db;
 use crate::engine::PolicyEngine;
@@ -227,23 +214,26 @@ pub fn transition_status_with_opts(
     );
     conn.execute(&sql, rusqlite::params![new_status, card_id])?;
 
-    // #117: Sync canonical review state on status transitions.
-    // Uses pipeline to determine terminal states and review state (hooks_for_state check).
-    if pipeline.is_terminal(new_status) || new_status == "ready" || new_status == "backlog" {
+    // #117: Sync canonical review state on status transitions (pipeline-driven).
+    // Idle: terminal states or states with no hooks (pre-work states like backlog/ready).
+    // Reviewing: states with OnReviewEnter hook.
+    // Otherwise: clear last_verdict on work state re-entry.
+    let has_hooks = pipeline.hooks_for_state(new_status).map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
+    let is_review_enter = pipeline.hooks_for_state(new_status).map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+    if pipeline.is_terminal(new_status) || !has_hooks {
         conn.execute(
             "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
              ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
             [card_id],
         ).ok();
-    } else if pipeline.hooks_for_state(new_status).map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter")) {
-        // States with OnReviewEnter hook → reviewing state
+    } else if is_review_enter {
         conn.execute(
             "INSERT INTO card_review_state (card_id, state, review_entered_at, updated_at) VALUES (?1, 'reviewing', datetime('now'), datetime('now')) \
              ON CONFLICT(card_id) DO UPDATE SET state = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now')",
             [card_id],
         ).ok();
-    } else if old_status == "review" || old_status == "requested" {
-        // #119: Clear last_verdict on re-entry to work states
+    } else {
+        // #119: Clear last_verdict on re-entry to work states (any non-idle, non-review state)
         conn.execute(
             "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
             [card_id],
@@ -265,15 +255,15 @@ pub fn transition_status_with_opts(
 
     drop(conn);
 
-    // GitHub auto-sync (close on done, comment on review)
-    github_sync_on_transition(db, card_id, new_status);
+    // GitHub auto-sync — pipeline-driven (terminal → close, OnReviewEnter → comment)
+    github_sync_on_transition(db, pipeline, card_id, new_status);
 
     // Fire hooks — driven by pipeline hooks section (#134/#135)
     // The effective pipeline's hooks_for_state() determines which hooks fire on entry.
     fire_dynamic_hooks(engine, pipeline, card_id, &old_status, new_status);
 
-    // #119: Record true_negative for cards that passed review and reached done
-    if new_status == "done" && record_true_negative_if_pass(db, card_id) {
+    // #119: Record true_negative for cards that passed review and reached terminal state
+    if pipeline.is_terminal(new_status) && record_true_negative_if_pass(db, card_id) {
         crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
     }
 
@@ -374,13 +364,13 @@ pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from
             }
         }
 
-        github_sync_on_transition(db, card_id, to);
+        github_sync_on_transition(db, pipeline, card_id, to);
         fire_dynamic_hooks(engine, pipeline, card_id, from, to);
-    }
 
-    // #119: Record true_negative for cards that passed review and reached done
-    if to == "done" && record_true_negative_if_pass(db, card_id) {
-        crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
+        // #119: Record true_negative for cards that passed review and reached terminal state
+        if pipeline.is_terminal(to) && record_true_negative_if_pass(db, card_id) {
+            crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
+        }
     }
 
     // After all hooks, check if a new dispatch was created (by onCardTerminal, onReviewEnter, etc.)
@@ -490,8 +480,17 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
     }
 }
 
-/// Sync GitHub issue state when kanban card transitions.
-fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
+/// Sync GitHub issue state when kanban card transitions (pipeline-driven).
+/// Terminal states → close issue. States with OnReviewEnter hook → comment.
+fn github_sync_on_transition(db: &Db, pipeline: &crate::pipeline::PipelineConfig, card_id: &str, new_status: &str) {
+    let is_terminal = pipeline.is_terminal(new_status);
+    let is_review_enter = pipeline.hooks_for_state(new_status)
+        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+
+    if !is_terminal && !is_review_enter {
+        return;
+    }
+
     let info: Option<(String, Option<i64>)> = db
         .lock()
         .ok()
@@ -520,27 +519,23 @@ fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
     };
     let Some(num) = issue_number else { return };
 
-    match new_status {
-        "done" => {
-            let _ = std::process::Command::new("gh")
-                .args(["issue", "close", &num.to_string(), "--repo", &repo])
-                .output();
-        }
-        "review" => {
-            let comment = "🔍 칸반 상태: **review** (카운터모델 리뷰 진행 중)";
-            let _ = std::process::Command::new("gh")
-                .args([
-                    "issue",
-                    "comment",
-                    &num.to_string(),
-                    "--repo",
-                    &repo,
-                    "--body",
-                    comment,
-                ])
-                .output();
-        }
-        _ => {}
+    if is_terminal {
+        let _ = std::process::Command::new("gh")
+            .args(["issue", "close", &num.to_string(), "--repo", &repo])
+            .output();
+    } else if is_review_enter {
+        let comment = "🔍 칸반 상태: **review** (카운터모델 리뷰 진행 중)";
+        let _ = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "comment",
+                &num.to_string(),
+                "--repo",
+                &repo,
+                "--body",
+                comment,
+            ])
+            .output();
     }
 }
 

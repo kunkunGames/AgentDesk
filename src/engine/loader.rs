@@ -16,6 +16,9 @@ pub struct LoadedPolicy {
     pub file: PathBuf,
     pub priority: i32,
     pub hooks: HashMap<Hook, Persistent<Function<'static>>>,
+    /// Dynamic hooks: custom function names not in the Hook enum.
+    /// Keyed by the JS function name (e.g. "onCustomStateEnter").
+    pub dynamic_hooks: HashMap<String, Persistent<Function<'static>>>,
 }
 
 // SAFETY: LoadedPolicy is only accessed while holding a Mutex.
@@ -48,12 +51,23 @@ pub fn load_policies_from_dir(ctx: &Context, dir: &Path) -> Result<Vec<LoadedPol
     for path in entries {
         match load_single_policy(ctx, &path) {
             Ok(policy) => {
-                tracing::info!(
-                    "Loaded policy '{}' from {} ({} hooks)",
-                    policy.name,
-                    path.display(),
-                    policy.hooks.len()
-                );
+                let dyn_count = policy.dynamic_hooks.len();
+                if dyn_count > 0 {
+                    tracing::info!(
+                        "Loaded policy '{}' from {} ({} hooks, {} dynamic)",
+                        policy.name,
+                        path.display(),
+                        policy.hooks.len(),
+                        dyn_count,
+                    );
+                } else {
+                    tracing::info!(
+                        "Loaded policy '{}' from {} ({} hooks)",
+                        policy.name,
+                        path.display(),
+                        policy.hooks.len()
+                    );
+                }
                 policies.push(policy);
             }
             Err(e) => {
@@ -137,8 +151,9 @@ pub fn load_single_policy(ctx: &Context, path: &Path) -> Result<LoadedPolicy> {
             .and_then(|v| v.as_int())
             .unwrap_or(100);
 
-        // Extract hooks
+        // Extract known hooks (Hook enum variants)
         let mut hooks = HashMap::new();
+        let known_js_names: Vec<&str> = Hook::all().iter().map(|h| h.js_name()).collect();
         for hook in Hook::all() {
             let hook_val: rquickjs::Result<rquickjs::Value> = policy_obj.get(hook.js_name());
             if let Ok(val) = hook_val {
@@ -150,11 +165,32 @@ pub fn load_single_policy(ctx: &Context, path: &Path) -> Result<LoadedPolicy> {
             }
         }
 
+        // Extract dynamic hooks: any function starting with "on" that isn't a known hook
+        let mut dynamic_hooks = HashMap::new();
+        let skip_keys = ["name", "priority"];
+        let props = policy_obj.keys::<String>();
+        for key_result in props {
+            if let Ok(key) = key_result {
+                if skip_keys.contains(&key.as_str()) || known_js_names.contains(&key.as_str())
+                {
+                    continue;
+                }
+                if let Ok(val) = policy_obj.get::<_, rquickjs::Value>(&key) {
+                    if val.is_function() {
+                        let func = val.into_function().unwrap();
+                        let persistent = Persistent::save(&ctx, func);
+                        dynamic_hooks.insert(key, persistent);
+                    }
+                }
+            }
+        }
+
         Ok(LoadedPolicy {
             name,
             file: path.to_path_buf(),
             priority,
             hooks,
+            dynamic_hooks,
         })
     })?;
 

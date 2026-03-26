@@ -222,38 +222,44 @@ impl PolicyEngine {
                 rows
             };
 
-            // Fire each hook, delete only after successful execution
+            // Fire each hook, delete only after successful execution.
+            // Supports both known Hook enum names and dynamic hook names.
             for (id, hook_name, payload_str) in &hooks {
-                if let Some(hook) = Hook::from_str(hook_name) {
-                    let payload: serde_json::Value =
-                        serde_json::from_str(payload_str).unwrap_or(serde_json::json!({}));
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] 🔄 [startup] replaying deferred {hook_name} (id={id})");
-                    if let Err(e) = self.try_fire_hook(hook, payload) {
-                        tracing::warn!("[startup] deferred hook {hook_name} failed: {e}");
-                        // Leave in DB as 'processing' — will be retried on next startup
-                        // after resetting status back to pending
-                        if let Ok(conn) = self.db.separate_conn() {
-                            let _ = conn.execute(
-                                "UPDATE deferred_hooks SET status = 'pending' WHERE id = ?1",
-                                [id],
-                            );
-                        }
-                        continue;
-                    }
-                    // Success — delete from DB
+                let payload: serde_json::Value =
+                    serde_json::from_str(payload_str).unwrap_or(serde_json::json!({}));
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] 🔄 [startup] replaying deferred {hook_name} (id={id})");
+
+                let fire_result = if let Some(hook) = Hook::from_str(hook_name) {
+                    self.try_fire_hook(hook, payload)
+                } else {
+                    self.try_fire_hook_by_name(hook_name, payload)
+                };
+
+                if let Err(e) = fire_result {
+                    tracing::warn!("[startup] deferred hook {hook_name} failed: {e}");
+                    // Leave in DB as 'processing' — will be retried on next startup
+                    // after resetting status back to pending
                     if let Ok(conn) = self.db.separate_conn() {
-                        let _ = conn.execute("DELETE FROM deferred_hooks WHERE id = ?1", [id]);
+                        let _ = conn.execute(
+                            "UPDATE deferred_hooks SET status = 'pending' WHERE id = ?1",
+                            [id],
+                        );
                     }
-                    // Drain pending transitions
-                    loop {
-                        let transitions = self.drain_pending_transitions();
-                        if transitions.is_empty() {
-                            break;
-                        }
-                        for (card_id, old_s, new_s) in &transitions {
-                            crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
-                        }
+                    continue;
+                }
+                // Success — delete from DB
+                if let Ok(conn) = self.db.separate_conn() {
+                    let _ = conn.execute("DELETE FROM deferred_hooks WHERE id = ?1", [id]);
+                }
+                // Drain pending transitions
+                loop {
+                    let transitions = self.drain_pending_transitions();
+                    if transitions.is_empty() {
+                        break;
+                    }
+                    for (card_id, old_s, new_s) in &transitions {
+                        crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
                     }
                 }
             }
@@ -267,7 +273,7 @@ impl PolicyEngine {
         if let Some(h) = Hook::from_str(hook_name) {
             return self.try_fire_hook(h, payload);
         }
-        // Dynamic: look up the JS function name directly in policy objects
+        // Dynamic: look up from policy dynamic_hooks (Rust-side, priority-ordered)
         let inner = match self.inner.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -285,40 +291,69 @@ impl PolicyEngine {
                 return Err(anyhow::anyhow!("engine lock poisoned: {e}"));
             }
         };
-        // Find policies that have a function with this name
+        Self::fire_dynamic_hook_with_guard(&inner, hook_name, payload)
+    }
+
+    /// Fire a dynamic (non-enum) hook by looking up `dynamic_hooks` on each
+    /// loaded policy, in priority order. Mirrors `fire_hook_with_guard` for
+    /// the well-known Hook enum variants.
+    fn fire_dynamic_hook_with_guard(
+        inner: &std::sync::MutexGuard<'_, PolicyEngineInner>,
+        hook_name: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
         let policies = inner
             .policies
             .lock()
             .map_err(|e| anyhow::anyhow!("policy store lock poisoned: {e}"))?;
-        let policy_names: Vec<String> = policies.iter().map(|p| p.name.clone()).collect();
+
+        let hook_fns: Vec<(String, Persistent<Function<'static>>)> = policies
+            .iter()
+            .filter_map(|p| {
+                p.dynamic_hooks
+                    .get(hook_name)
+                    .map(|f| (p.name.clone(), f.clone()))
+            })
+            .collect();
         drop(policies);
+
+        if hook_fns.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let names: Vec<&str> = hook_fns.iter().map(|(n, _)| n.as_str()).collect();
+            println!(
+                "  [{ts}] 🔥 fire_dynamic_hook({hook_name}) → {names:?} ({} policies)",
+                hook_fns.len()
+            );
+        }
 
         inner.context.with(|ctx| -> Result<()> {
             let js_payload = json_to_js(&ctx, &payload)?;
-            for policy_name in &policy_names {
-                // Try to get the policy object and call the named function
-                let result: std::result::Result<rquickjs::Value, _> = ctx.eval(format!(
-                    r#"(function() {{
-                        var policies = agentdesk.__registered_policies || [];
-                        for (var i = 0; i < policies.length; i++) {{
-                            if (policies[i].name === "{policy_name}" && typeof policies[i]["{hook_name}"] === "function") {{
-                                policies[i]["{hook_name}"](arguments[0]);
-                                return true;
-                            }}
-                        }}
-                        return false;
-                    }})()"#
-                ));
-                if let Ok(val) = result {
-                    if val.as_bool() == Some(true) {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 🔥 fire_hook_by_name({hook_name}) → {policy_name}");
+
+            for (policy_name, persistent_fn) in &hook_fns {
+                let func = match persistent_fn.clone().restore(&ctx) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to restore dynamic hook {hook_name} for policy '{policy_name}': {e}"
+                        );
+                        continue;
                     }
+                };
+
+                let result: rquickjs::Result<rquickjs::Value> = func.call((js_payload.clone(),));
+                if let Err(e) = result {
+                    tracing::error!(
+                        "Dynamic hook {hook_name} in policy '{policy_name}' failed: {e}"
+                    );
                 }
             }
+
             Ok(())
-        })?;
-        Ok(())
+        })
     }
 
     pub fn fire_hook(&self, hook: Hook, payload: serde_json::Value) -> Result<()> {
@@ -456,15 +491,19 @@ impl PolicyEngine {
 
         policies
             .iter()
-            .map(|p| PolicyInfo {
-                name: p.name.clone(),
-                file: p.file.display().to_string(),
-                priority: p.priority,
-                hooks: p
+            .map(|p| {
+                let mut hook_names: Vec<String> = p
                     .hooks
                     .keys()
                     .map(|h: &Hook| h.js_name().to_string())
-                    .collect(),
+                    .collect();
+                hook_names.extend(p.dynamic_hooks.keys().cloned());
+                PolicyInfo {
+                    name: p.name.clone(),
+                    file: p.file.display().to_string(),
+                    priority: p.priority,
+                    hooks: hook_names,
+                }
             })
             .collect()
     }
@@ -722,5 +761,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, "card-123");
+    }
+
+    #[test]
+    fn test_engine_fire_dynamic_hook_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("dynamic-hook.js");
+        std::fs::write(
+            &policy_path,
+            r#"
+            var policy = {
+                name: "dynamic-hook-policy",
+                priority: 1,
+                onCustomStateEnter: function(payload) {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('dyn_hook', '" + payload.status + "')",
+                        []
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        let config = test_config_with_dir(dir.path());
+        let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+
+        // Verify the dynamic hook was detected
+        let policies = engine.list_policies();
+        assert_eq!(policies.len(), 1);
+        assert!(
+            policies[0].hooks.contains(&"onCustomStateEnter".to_string()),
+            "dynamic hook should appear in list_policies"
+        );
+
+        // Fire by name — this should reach the dynamic_hooks path
+        engine
+            .try_fire_hook_by_name("onCustomStateEnter", serde_json::json!({"status": "custom_state"}))
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let val: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'dyn_hook'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, "custom_state");
+    }
+
+    #[test]
+    fn test_engine_dynamic_hook_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Low priority (runs second)
+        std::fs::write(
+            dir.path().join("aaa-low.js"),
+            r#"
+            var policy = {
+                name: "low-priority",
+                priority: 100,
+                onMyHook: function(payload) {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('order', 'low')",
+                        []
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+        // High priority (runs first)
+        std::fs::write(
+            dir.path().join("bbb-high.js"),
+            r#"
+            var policy = {
+                name: "high-priority",
+                priority: 1,
+                onMyHook: function(payload) {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('order', 'high')",
+                        []
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        let config = test_config_with_dir(dir.path());
+        let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+
+        engine
+            .try_fire_hook_by_name("onMyHook", serde_json::json!({}))
+            .unwrap();
+
+        // Both run in priority order: high(1) then low(100).
+        // Last write wins, so value should be "low".
+        let conn = db.lock().unwrap();
+        let val: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'order'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, "low", "low-priority policy runs last (priority=100)");
     }
 }

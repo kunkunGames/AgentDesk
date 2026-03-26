@@ -350,6 +350,13 @@ impl PipelineConfig {
             }
         }
 
+        // Hook bindings must reference valid states
+        for (state, _) in &self.hooks {
+            if !state_ids.contains(&state.as_str()) {
+                anyhow::bail!("hook binding for unknown state: {}", state);
+            }
+        }
+
         Ok(())
     }
 }

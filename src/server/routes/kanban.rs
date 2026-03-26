@@ -406,38 +406,42 @@ pub async fn update_card(
     drop(conn);
 
     // Discord notification for new dispatches (if hooks created them)
+    // Pipeline-driven: notify when the transition is gated (involves dispatches)
     if let Some(ref new_s) = new_status {
-        if new_s.as_str() != old_status {
-            // Send Discord notification for new dispatches created by hooks
-            if new_s == "requested" || new_s == "review" {
-                let db_clone = state.db.clone();
-                let card_id = id.clone();
-                tokio::spawn(async move {
-                    let dispatch_info: Option<(String, String, String)> = {
-                        let conn = match db_clone.lock() {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
-                        conn.query_row(
-                            "SELECT kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
-                             FROM kanban_cards kc WHERE kc.id = ?1",
-                            [&card_id],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                        )
-                        .ok()
+        let is_gated_transition = {
+            crate::pipeline::ensure_loaded();
+            crate::pipeline::try_get()
+                .and_then(|p| p.find_transition(&old_status, new_s))
+                .map_or(false, |t| t.transition_type == crate::pipeline::TransitionType::Gated)
+        };
+        if new_s.as_str() != old_status && is_gated_transition {
+            let db_clone = state.db.clone();
+            let card_id = id.clone();
+            tokio::spawn(async move {
+                let dispatch_info: Option<(String, String, String)> = {
+                    let conn = match db_clone.lock() {
+                        Ok(c) => c,
+                        Err(_) => return,
                     };
-                    if let Some((agent_id, title, dispatch_id)) = dispatch_info {
-                        super::dispatches::send_dispatch_to_discord(
-                            &db_clone,
-                            &agent_id,
-                            &title,
-                            &card_id,
-                            &dispatch_id,
-                        )
-                        .await;
-                    }
-                });
-            }
+                    conn.query_row(
+                        "SELECT kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
+                         FROM kanban_cards kc WHERE kc.id = ?1",
+                        [&card_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok()
+                };
+                if let Some((agent_id, title, dispatch_id)) = dispatch_info {
+                    super::dispatches::send_dispatch_to_discord(
+                        &db_clone,
+                        &agent_id,
+                        &title,
+                        &card_id,
+                        &dispatch_id,
+                    )
+                    .await;
+                }
+            });
         }
     }
 
@@ -937,7 +941,14 @@ pub async fn defer_dod(
             )
             .unwrap_or(("".to_string(), None));
 
-        if card_status == "review" && review_status.as_deref() == Some("awaiting_dod") {
+        // Pipeline-driven: check if state has OnReviewEnter hook (review-like state)
+        let is_review_state = {
+            crate::pipeline::ensure_loaded();
+            crate::pipeline::try_get()
+                .and_then(|p| p.hooks_for_state(&card_status))
+                .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
+        };
+        if is_review_state && review_status.as_deref() == Some("awaiting_dod") {
             // Check if all DoD items are verified.
             // Format: { items: ["task1", "task2"], verified: ["task1", "task2"] }
             let all_done = if let (Some(items), Some(verified)) =
