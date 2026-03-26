@@ -769,17 +769,30 @@ pub(crate) async fn send_dispatch_to_discord(
                          ORDER BY e.priority_rank ASC",
                     )
                     .ok()?;
+                // Get current card's issue number for highlighting
+                let current_issue: Option<i64> = conn
+                    .query_row(
+                        "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
+                        [card_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
                 let nums: Vec<String> = stmt2
                     .query_map([card_id], |row| row.get::<_, i64>(0))
                     .ok()?
                     .filter_map(|r| r.ok())
-                    .map(|n| format!("#{}", n))
+                    .map(|n| {
+                        if Some(n) == current_issue {
+                            format!("▸{}", n)
+                        } else {
+                            format!("#{}", n)
+                        }
+                    })
                     .collect();
                 if nums.is_empty() {
                     None
                 } else {
-                    let joined = nums.join(" ");
-                    Some(format!("[Queue] {}", joined))
+                    Some(nums.join(" "))
                 }
             });
 
@@ -1025,15 +1038,36 @@ async fn try_reuse_thread(
         }
     }
 
-    // 2a. Update thread name with current issue number (skip for unified [Queue] threads)
+    // 2a. Update thread name — for unified threads, move ▸ marker to current issue
     let current_thread_name = body
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let is_queue_thread = current_thread_name.starts_with("[Queue]");
-    if !is_queue_thread {
-        let new_name: Option<String> = db
+    let has_marker = current_thread_name.contains('▸');
+    let new_name: Option<String> = if has_marker {
+        // Unified thread — update ▸ marker position
+        let current_issue: Option<i64> = db
             .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+        current_issue.map(|cur| {
+            // Replace all ▸N with #N, then set ▸ on current
+            let mut name = current_thread_name.replace('▸', "#");
+            let target = format!("#{}", cur);
+            let replacement = format!("▸{}", cur);
+            name = name.replacen(&target, &replacement, 1);
+            name
+        })
+    } else {
+        // Single-card thread — update to current issue
+        db.lock()
             .ok()
             .and_then(|conn| {
                 conn.query_row(
@@ -1050,7 +1084,9 @@ async fn try_reuse_thread(
                 )
                 .ok()
                 .flatten()
-            });
+            })
+    };
+    {
         if let Some(ref name) = new_name {
             let _ = client
                 .patch(&thread_info_url)
@@ -1059,7 +1095,7 @@ async fn try_reuse_thread(
                 .send()
                 .await;
         }
-    } // end !is_queue_thread
+    }
 
     // 2b. Send separator message to visually distinguish dispatch phases
     let separator = format!("── {} dispatch ──", dispatch_type);
