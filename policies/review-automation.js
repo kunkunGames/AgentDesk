@@ -262,6 +262,52 @@ var reviewAutomation = {
   }
 };
 
+// #118: Tokenize text into normalized words for similarity comparison
+function tokenize(text) {
+  if (!text) return [];
+  return text.toLowerCase().replace(/[^a-z0-9가-힣\s]/g, " ").split(/\s+/).filter(function(w) { return w.length > 1; });
+}
+
+// #118: Jaccard similarity between two texts (word-level)
+function findingsSimilar(textA, textB) {
+  var tokensA = tokenize(textA);
+  var tokensB = tokenize(textB);
+  if (tokensA.length === 0 || tokensB.length === 0) return false;
+
+  var setA = {};
+  for (var i = 0; i < tokensA.length; i++) setA[tokensA[i]] = true;
+  var setB = {};
+  for (var j = 0; j < tokensB.length; j++) setB[tokensB[j]] = true;
+
+  var intersection = 0;
+  var unionKeys = {};
+  for (var k in setA) { unionKeys[k] = true; if (setB[k]) intersection++; }
+  for (var k2 in setB) { unionKeys[k2] = true; }
+
+  var unionSize = 0;
+  for (var k3 in unionKeys) unionSize++;
+
+  var similarity = unionSize > 0 ? intersection / unionSize : 0;
+  agentdesk.log.info("[review] #118 Finding similarity: " + similarity.toFixed(3) + " (threshold: 0.5)");
+  return similarity >= 0.5;
+}
+
+// #118: Normal suggestion_pending flow — extracted to avoid duplication
+function setNormalSuggestionPending(cardId, verdict) {
+  agentdesk.db.execute(
+    "UPDATE kanban_cards SET review_status = 'suggestion_pending', suggestion_pending_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND status != 'done'",
+    [cardId]
+  );
+  agentdesk.log.info("[review] Card " + cardId + " needs review decision → suggestion_pending");
+
+  agentdesk.db.execute(
+    "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) " +
+    "VALUES (?, 'suggestion_pending', ?, datetime('now')) " +
+    "ON CONFLICT(card_id) DO UPDATE SET state = 'suggestion_pending', last_verdict = ?, updated_at = datetime('now')",
+    [cardId, verdict, verdict]
+  );
+}
+
 function processVerdict(cardId, verdict, result) {
   // Guard: skip processing for done cards — prevents stale dispatches from
   // re-triggering review state changes after dismiss.
@@ -371,29 +417,98 @@ function processVerdict(cardId, verdict, result) {
     }
 
   } else if (verdict === "improve" || verdict === "reject" || verdict === "rework") {
-    // Store review notes
-    if (result.notes || result.feedback) {
+    var newNotes = result.notes || result.feedback || "";
+
+    // #118: Detect repeated findings — if same issues recur across rounds,
+    // switch approach instead of repeating the same rework.
+    var cardInfo118 = agentdesk.db.query(
+      "SELECT c.review_notes, c.review_round, c.assigned_agent_id, c.title, c.github_issue_number, " +
+      "rs.approach_change_round FROM kanban_cards c " +
+      "LEFT JOIN card_review_state rs ON rs.card_id = c.id WHERE c.id = ?",
+      [cardId]
+    );
+    var prevNotes = (cardInfo118.length > 0) ? (cardInfo118[0].review_notes || "") : "";
+    var currentRound = (cardInfo118.length > 0) ? (cardInfo118[0].review_round || 0) : 0;
+    var approachChangeRound = (cardInfo118.length > 0) ? cardInfo118[0].approach_change_round : null;
+    var assignedAgent = (cardInfo118.length > 0) ? cardInfo118[0].assigned_agent_id : null;
+    var cardTitle = (cardInfo118.length > 0) ? cardInfo118[0].title : "";
+    var issueNum = (cardInfo118.length > 0) ? (cardInfo118[0].github_issue_number || "?") : "?";
+
+    var repeatedFindings = false;
+    if (currentRound >= 2 && prevNotes && newNotes) {
+      repeatedFindings = findingsSimilar(prevNotes, newNotes);
+    }
+
+    // Store review notes (overwrite previous)
+    if (newNotes) {
       agentdesk.db.execute(
         "UPDATE kanban_cards SET review_notes = ? WHERE id = ?",
-        [result.notes || result.feedback, cardId]
+        [newNotes, cardId]
       );
     }
 
-    // Set review_status to suggestion_pending — agent must decide: accept/dispute/dismiss
-    // AND status != 'done' guards against race with concurrent dismiss clearing review_status
-    agentdesk.db.execute(
-      "UPDATE kanban_cards SET review_status = 'suggestion_pending', suggestion_pending_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND status != 'done'",
-      [cardId]
-    );
-    agentdesk.log.info("[review] Card " + cardId + " needs review decision → suggestion_pending");
+    if (repeatedFindings && assignedAgent) {
+      // Already tried approach change → escalate to PM
+      if (approachChangeRound) {
+        agentdesk.log.warn("[review] #118 Approach change already attempted at R" + approachChangeRound +
+          ", findings still repeat at R" + currentRound + " → pending_decision");
+        agentdesk.kanban.setStatus(cardId, "pending_decision");
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET review_status = 'dilemma_pending', blocked_reason = ? WHERE id = ?",
+          ["접근 전환 후에도 동일 finding 반복 (R" + approachChangeRound + "→R" + currentRound + ") — PM 판단 필요", cardId]
+        );
+        agentdesk.db.execute(
+          "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) " +
+          "VALUES (?, 'dilemma_pending', ?, datetime('now')) " +
+          "ON CONFLICT(card_id) DO UPDATE SET state = 'dilemma_pending', last_verdict = ?, updated_at = datetime('now')",
+          [cardId, verdict, verdict]
+        );
+        notifyPmdPendingDecision(cardId, "접근 전환 후에도 동일 finding 반복 — R" + approachChangeRound + "에서 접근 전환했으나 R" + currentRound + "에서 같은 문제 재발");
+        return;
+      }
 
-    // #117: Update canonical card_review_state
-    agentdesk.db.execute(
-      "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) " +
-      "VALUES (?, 'suggestion_pending', ?, datetime('now')) " +
-      "ON CONFLICT(card_id) DO UPDATE SET state = 'suggestion_pending', last_verdict = ?, updated_at = datetime('now')",
-      [cardId, verdict, verdict]
-    );
+      // First repeated finding → trigger approach change dispatch
+      agentdesk.log.info("[review] #118 Repeated findings detected at R" + currentRound + " — triggering approach change");
+
+      var approachPrompt = "[Approach Change R" + currentRound + "] #" + issueNum + " " + cardTitle +
+        "\n\n이전 접근이 " + currentRound + "회 연속 같은 리뷰 지적을 받았습니다." +
+        "\n기존 방식과 다른 접근으로 해결하세요." +
+        "\n\n반복된 finding:\n" + newNotes;
+
+      try {
+        var dispatchId = agentdesk.dispatch.create(
+          cardId,
+          assignedAgent,
+          "rework",
+          approachPrompt
+        );
+        agentdesk.log.info("[review] #118 Approach-change rework dispatch created: " + dispatchId);
+
+        // Record approach change round
+        agentdesk.db.execute(
+          "INSERT INTO card_review_state (card_id, state, last_verdict, approach_change_round, updated_at) " +
+          "VALUES (?, 'rework_pending', ?, ?, datetime('now')) " +
+          "ON CONFLICT(card_id) DO UPDATE SET state = 'rework_pending', last_verdict = ?, " +
+          "approach_change_round = ?, updated_at = datetime('now')",
+          [cardId, verdict, currentRound, verdict, currentRound]
+        );
+
+        // Transition card to in_progress for rework
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET review_status = 'rework_pending', updated_at = datetime('now') WHERE id = ? AND status != 'done'",
+          [cardId]
+        );
+        agentdesk.kanban.setStatus(cardId, "in_progress");
+      } catch (e) {
+        agentdesk.log.warn("[review] #118 Approach-change dispatch failed: " + e + " — falling back to suggestion_pending");
+        // Fall through to normal suggestion_pending below
+        setNormalSuggestionPending(cardId, verdict);
+      }
+      return;
+    }
+
+    // Normal path: suggestion_pending — agent must decide: accept/dispute/dismiss
+    setNormalSuggestionPending(cardId, verdict);
 
     // Notification to original agent's primary channel is handled by Rust
     // (dispatched_sessions.rs / dispatches.rs sends async Discord message after OnDispatchCompleted)

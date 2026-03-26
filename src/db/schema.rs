@@ -352,6 +352,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // #118: Track approach-change round for repeated-finding detection
+    let _ = conn.execute(
+        "ALTER TABLE card_review_state ADD COLUMN approach_change_round INTEGER",
+        [],
+    );
+
     // Rate limit cache table (provider → cached rate-limit JSON)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS rate_limit_cache (
