@@ -309,6 +309,58 @@ pub fn complete_dispatch(
     // These are dispatches created outside any card transition context.
     notify_hook_created_dispatches(db, pre_hook_max_rowid);
 
+    // #139: Safety net — if card transitioned to review but OnReviewEnter failed
+    // to create a review dispatch (engine lock contention, JS error, etc.),
+    // re-fire OnReviewEnter to guarantee review dispatch creation.
+    {
+        let needs_review_dispatch = db
+            .lock()
+            .ok()
+            .map(|conn| {
+                let card_status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM kanban_cards WHERE id = ?1",
+                        [&kanban_card_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                let has_review_dispatch: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM task_dispatches \
+                         WHERE kanban_card_id = ?1 AND dispatch_type IN ('review', 'review-decision') \
+                         AND status IN ('pending', 'dispatched')",
+                        [&kanban_card_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                card_status.as_deref() == Some("review") && !has_review_dispatch
+            })
+            .unwrap_or(false);
+
+        if needs_review_dispatch {
+            let cid = kanban_card_id.as_deref().unwrap_or("unknown");
+            tracing::warn!(
+                "[dispatch] Card {} in review but no review dispatch — re-firing OnReviewEnter (#139)",
+                cid
+            );
+            let _ = engine.try_fire_hook(
+                Hook::OnReviewEnter,
+                json!({ "card_id": cid, "from": "in_progress" }),
+            );
+            // Drain any transitions from the re-fired hook
+            loop {
+                let transitions = engine.drain_pending_transitions();
+                if transitions.is_empty() {
+                    break;
+                }
+                for (cid, old_s, new_s) in &transitions {
+                    crate::kanban::fire_transition_hooks(db, engine, cid, old_s, new_s);
+                }
+            }
+            notify_hook_created_dispatches(db, pre_hook_max_rowid);
+        }
+    }
+
     Ok(dispatch)
 }
 
