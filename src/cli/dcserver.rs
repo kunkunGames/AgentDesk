@@ -1007,7 +1007,7 @@ pub fn handle_dcserver(token: Option<String>) {
                         Err(e) => {
                             eprintln!("  ✖ Failed to load pipeline definition: {e}");
                             eprintln!("    path: {}", pipeline_path.display());
-                            return;
+                            std::process::exit(1);
                         }
                     }
                 }
