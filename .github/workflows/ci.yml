@@ -16,9 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
-    # Windows compilation requires P1 platform-compat issues (#98-#101)
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+        # Windows excluded until P1 platform-compat (#98-#101) is complete
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +39,7 @@ jobs:
         run: cargo check --all-targets
 
       - name: cargo test
-        run: cargo test --all-targets -- --skip engine::ops::tests::js_set_status --skip dispatches::tests::completed_review_dispatch --skip dispatches::tests::no_notified_marker --skip dispatches::tests::review_followup_skips --skip review_verdict::tests::submit_verdict_improve
+        run: cargo test --all-targets
         env:
           RUST_BACKTRACE: 1
 
@@ -72,3 +71,37 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -W clippy::all
+
+  scripts:
+    name: Script checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: shellcheck scripts
+        run: |
+          find . -name '*.sh' -not -path './target/*' -not -path './.git/*' | while read f; do
+            shellcheck -S warning "$f" || true
+          done
+        continue-on-error: true
+
+      - name: Check hardcoded port/path drift
+        run: |
+          echo "=== Checking for hardcoded ports ==="
+          # Port 8791/8799 should only appear in expected places
+          grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \
+            --exclude-dir=target --exclude-dir=.git \
+            | grep -v 'Cargo.lock' \
+            | grep -v '// port' \
+            | grep -v '# port' || echo "No unexpected port references found"
+
+          echo ""
+          echo "=== Checking for hardcoded home paths ==="
+          # env!("HOME") or hardcoded /Users/ paths (except tests)
+          grep -rn 'env!("HOME")\|/Users/itismyfield' --include='*.rs' \
+            --exclude-dir=target --exclude-dir=.git \
+            | grep -v '#\[test\]' \
+            | grep -v '// test' || echo "No hardcoded home paths found"
