@@ -1000,6 +1000,58 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     "#,
     )?;
 
+    // agentdesk.inflight.list() — list active inflight turns with started_at
+    let inflight_obj = rquickjs::Object::new(ctx.clone())?;
+    inflight_obj.set(
+        "list",
+        Function::new(ctx.clone(), || -> String {
+            let mut results = Vec::new();
+            if let Some(root) = crate::cli::agentdesk_runtime_root() {
+                let inflight_dir = root.join("runtime/discord_inflight");
+                for provider in &["claude", "codex"] {
+                    let dir = inflight_dir.join(provider);
+                    if let Ok(entries) = std::fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                                let channel_id = path.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                                        results.push(serde_json::json!({
+                                            "channel_id": channel_id,
+                                            "provider": provider,
+                                            "started_at": data.get("started_at").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "session_key": data.get("session_key").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "agent_id": data.get("agent_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "dispatch_id": data.get("dispatch_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
+        }),
+    )?;
+    ad.set("inflight", inflight_obj)?;
+
+    // JS wrapper
+    let _: rquickjs::Value = ctx.eval(
+        r#"
+        (function() {
+            var rawList = agentdesk.inflight.list;
+            agentdesk.inflight.list = function() {
+                return JSON.parse(rawList());
+            };
+        })();
+    "#,
+    )?;
+
     // agentdesk.session.sendCommand(sessionKey, command) — inject a slash command into a tmux session
     let session_obj = rquickjs::Object::new(ctx.clone())?;
     session_obj.set(
