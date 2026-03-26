@@ -1848,6 +1848,9 @@ pub async fn reopen_card(
             )
             .ok();
 
+            // #119: Correct true_negative → false_negative (pass missed a real bug)
+            crate::kanban::correct_tn_to_fn_on_reopen(&state.db, &id);
+
             // Optional: reset review_status
             if let Some(ref rs) = body.review_status {
                 conn.execute(

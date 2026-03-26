@@ -741,6 +741,25 @@ fn record_true_negative_if_pass(db: &Db, card_id: &str) {
     }
 }
 
+/// #119: When a card is reopened after reaching done with a pass verdict,
+/// correct any true_negative outcomes to false_negative — the review missed a real bug.
+pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
+    if let Ok(conn) = db.lock() {
+        let updated = conn
+            .execute(
+                "UPDATE review_tuning_outcomes SET outcome = 'false_negative' \
+                 WHERE card_id = ?1 AND outcome = 'true_negative'",
+                [card_id],
+            )
+            .unwrap_or(0);
+        if updated > 0 {
+            tracing::info!(
+                "[review-tuning] #119 corrected {updated} true_negative → false_negative: card={card_id} (reopen)"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
