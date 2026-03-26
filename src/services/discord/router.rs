@@ -108,9 +108,21 @@ pub(super) async fn handle_event(
                 }
             }
 
-            // Ignore messages that look like slash commands (but allow from trusted bots)
+            // If the message looks like a known slash command, skip it (poise handles it).
+            // Unknown `/`-prefixed messages fall through to the AI provider as regular text.
             if new_message.content.starts_with('/') && !new_message.author.bot {
-                return Ok(());
+                let cmd_name = new_message.content[1..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                let is_known = data
+                    .shared
+                    .known_slash_commands
+                    .get()
+                    .map_or(false, |set| set.contains(cmd_name));
+                if is_known {
+                    return Ok(());
+                }
             }
 
             // Ignore messages that mention other users (not directed at the bot)

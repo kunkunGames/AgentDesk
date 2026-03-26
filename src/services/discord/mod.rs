@@ -374,6 +374,10 @@ pub(super) struct SharedData {
     pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
     /// HTTP API port for self-referencing requests (from config server.port).
     pub(super) api_port: u16,
+    /// Set of registered slash command names (populated at framework setup).
+    /// Used by the router to distinguish known slash commands from arbitrary
+    /// `/`-prefixed user text that should fall through to the AI provider.
+    pub(super) known_slash_commands: tokio::sync::OnceCell<std::collections::HashSet<String>>,
 }
 
 /// Poise user data type
@@ -1341,6 +1345,7 @@ pub async fn run_bot(
         cached_serenity_ctx: tokio::sync::OnceCell::new(),
         cached_bot_token: tokio::sync::OnceCell::new(),
         api_port,
+        known_slash_commands: tokio::sync::OnceCell::new(),
     });
 
     {
@@ -1396,6 +1401,12 @@ pub async fn run_bot(
                 // Register in each guild for instant slash command propagation
                 // (register_globally can take up to 1 hour)
                 let commands = &framework.options().commands;
+                // Populate known slash command names for router fallback logic
+                let cmd_names: std::collections::HashSet<String> = commands
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let _ = shared_for_migrate.known_slash_commands.set(cmd_names);
                 for guild in &_ready.guilds {
                     if let Err(e) =
                         poise::builtins::register_in_guild(ctx, commands, guild.id).await
