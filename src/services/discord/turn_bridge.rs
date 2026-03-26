@@ -577,6 +577,7 @@ pub(super) fn spawn_turn_bridge(
         let mut inflight_state = bridge.inflight_state.clone();
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
+        let turn_start = std::time::Instant::now();
 
         let _ = save_inflight_state(&inflight_state);
 
@@ -1118,9 +1119,12 @@ pub(super) fn spawn_turn_bridge(
                 }
 
                 if full_response.is_empty() {
-                    // Check tmux output for resume failure ("No conversation found")
-                    // and clear the stale session_id so next turn starts fresh
+                    // Check for resume failure: "No conversation found" in output
+                    // OR quick exit (<10s) with empty response + session_id present
                     let mut resume_failed = false;
+                    let quick_exit = turn_start.elapsed().as_secs() < 10;
+                    let had_session_id = new_session_id.is_none() && bridge.new_session_id.is_none();
+                    // Method 1: check tmux output file
                     if let Some(ref path) = inflight_state.output_path {
                         if let Ok(content) = std::fs::read_to_string(path) {
                             if content.contains("No conversation found")
@@ -1183,6 +1187,53 @@ pub(super) fn spawn_turn_bridge(
                                 }
                                 full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
                             }
+                        }
+                    }
+                    // Method 2: quick exit (<10s) + empty response + had a session_id to resume
+                    // = Claude exited immediately due to stale session
+                    if !resume_failed && quick_exit && rx_disconnected {
+                        // Check if we attempted a resume (session_id was set at turn start)
+                        let attempted_resume = {
+                            let data = shared_owned.core.lock().await;
+                            data.sessions
+                                .get(&channel_id)
+                                .and_then(|s| s.session_id.as_ref())
+                                .is_some()
+                        };
+                        if attempted_resume {
+                            resume_failed = true;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ⚠ Quick exit with empty response — likely stale session_id (channel {})",
+                                channel_id
+                            );
+                            // Clear all 3 locations
+                            let stale_sid = {
+                                let mut data = shared_owned.core.lock().await;
+                                let old = data.sessions.get(&channel_id).and_then(|s| s.session_id.clone());
+                                if let Some(session) = data.sessions.get_mut(&channel_id) {
+                                    session.session_id = None;
+                                }
+                                old
+                            };
+                            if let Some(ref key) = adk_session_key {
+                                super::adk_session::save_claude_session_id(key, "", shared_owned.api_port).await;
+                            }
+                            if let Some(ref sid) = stale_sid {
+                                if let Some(root) = crate::cli::agentdesk_runtime_root() {
+                                    let f = root.join("ai_sessions").join(format!("{sid}.json"));
+                                    let _ = std::fs::remove_file(&f);
+                                }
+                                let port = shared_owned.api_port;
+                                let sid_c = sid.clone();
+                                tokio::spawn(async move {
+                                    let _ = reqwest::Client::new()
+                                        .post(format!("http://127.0.0.1:{port}/api/dispatched-sessions/clear-stale-session-id"))
+                                        .json(&serde_json::json!({"claude_session_id": sid_c}))
+                                        .send().await;
+                                });
+                            }
+                            full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
                         }
                     }
                     if !resume_failed {
