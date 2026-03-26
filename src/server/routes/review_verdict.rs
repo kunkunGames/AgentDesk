@@ -148,43 +148,50 @@ fn update_card_review_state(
 ///
 /// When `reviewed_commit` is provided, stamp that exact commit (the one that
 /// was actually reviewed). Falls back to current HEAD for backwards compat.
-fn stamp_review_passed_marker(reviewed_commit: Option<&str>) {
+/// Returns `Err` only when HOME directory cannot be resolved (environment
+/// misconfiguration).  Git or filesystem failures are logged but not fatal
+/// — the marker is best-effort when commit is not explicitly provided.
+fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), String> {
+    let resolve_home = || -> Result<std::path::PathBuf, String> {
+        dirs::home_dir().ok_or_else(|| {
+            "HOME directory not found; set AGENTDESK_REPO_DIR and AGENTDESK_ROOT_DIR".to_string()
+        })
+    };
+
     let commit = if let Some(c) = reviewed_commit {
         c.to_string()
     } else {
         let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
             Ok(d) => d,
-            Err(_) => match dirs::home_dir() {
-                Some(h) => h.join("AgentDesk").to_string_lossy().into_owned(),
-                None => {
-                    eprintln!("stamp_review_passed_marker: HOME not found, skipping");
-                    return;
-                }
-            },
+            Err(_) => resolve_home()?.join("AgentDesk").to_string_lossy().into_owned(),
         };
-        let out = std::process::Command::new("git")
+        match std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&repo_dir)
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let Some(c) = out else { return };
-        c
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        {
+            Some(c) => c,
+            None => {
+                eprintln!("stamp_review_passed_marker: git rev-parse HEAD failed, skipping marker");
+                return Ok(());
+            }
+        }
     };
     let root = match std::env::var("AGENTDESK_ROOT_DIR") {
         Ok(d) => d,
-        Err(_) => match dirs::home_dir() {
-            Some(h) => h.join(".adk/release").to_string_lossy().into_owned(),
-            None => {
-                eprintln!("stamp_review_passed_marker: HOME not found, skipping");
-                return;
-            }
-        },
+        Err(_) => resolve_home()?.join(".adk/release").to_string_lossy().into_owned(),
     };
     let dir = format!("{}/runtime/review_passed", root);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(format!("{}/{}", dir, commit), "");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("stamp_review_passed_marker: failed to create dir: {e}");
+    }
+    if let Err(e) = std::fs::write(format!("{}/{}", dir, commit), "") {
+        eprintln!("stamp_review_passed_marker: failed to write marker: {e}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,7 +487,15 @@ pub async fn submit_verdict(
 
     if body.overall == "pass" || body.overall == "approved" {
         // When review passes, stamp a marker so promote-release.sh can verify
-        stamp_review_passed_marker(effective_commit.as_deref());
+        if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("review passed but failed to write release marker: {e}"),
+                })),
+            );
+        }
     }
 
     (
