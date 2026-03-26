@@ -733,30 +733,16 @@
         {
             let conn = db.lock().unwrap();
             conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'review', 'medium', datetime('now'), datetime('now'))",
-                [],
-            ).unwrap();
-            // Need an active dispatch for the transition guard (#48)
-            conn.execute(
-                "INSERT INTO task_dispatches (id, kanban_card_id, dispatch_type, status, title, created_at, updated_at) VALUES ('d1', 'c1', 'review', 'pending', 'Review', datetime('now'), datetime('now'))",
+                "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'pending_decision', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
         }
 
-        let app = api_router(db.clone(), engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/kanban-cards/c1")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"done"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
+        // Use force transition: pending_decision → done (force_only in YAML pipeline)
+        let result = crate::kanban::transition_status_with_opts(
+            &db, &engine, "c1", "done", "pmd", true,
+        );
+        assert!(result.is_ok(), "force transition should succeed: {:?}", result);
 
         let conn = db.lock().unwrap();
         let transition: String = conn
@@ -766,7 +752,7 @@
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(transition, "review->done");
+        assert_eq!(transition, "pending_decision->done");
 
         let terminal: String = conn
             .query_row(

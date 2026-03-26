@@ -46,6 +46,29 @@ pub fn try_get() -> Option<&'static PipelineConfig> {
     PIPELINE.get()
 }
 
+/// Ensure the default pipeline is loaded. Loads from the standard path if not yet loaded.
+/// Safe to call multiple times (idempotent). Used by tests and server startup.
+pub fn ensure_loaded() {
+    if PIPELINE.get().is_some() {
+        return;
+    }
+    // Try standard paths in order
+    let candidates = [
+        std::path::PathBuf::from("policies/default-pipeline.yaml"),
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies/default-pipeline.yaml"),
+    ];
+    for path in &candidates {
+        if path.exists() {
+            if let Err(e) = load(path) {
+                tracing::warn!("Failed to load pipeline from {}: {e}", path.display());
+            } else {
+                return;
+            }
+        }
+    }
+    tracing::warn!("No pipeline YAML found — pipeline features disabled");
+}
+
 /// Parse a pipeline override from JSON (stored in DB).
 /// Returns None if the input is empty/null.
 pub fn parse_override(json_str: &str) -> Result<Option<PipelineOverride>> {
@@ -62,11 +85,14 @@ pub fn parse_override(json_str: &str) -> Result<Option<PipelineOverride>> {
 ///
 /// Merges: default → repo_override → agent_override.
 /// Each override only replaces the sections it explicitly provides.
+/// Panics if the default pipeline has not been loaded.
 pub fn resolve(
     repo_override: Option<&PipelineOverride>,
     agent_override: Option<&PipelineOverride>,
 ) -> PipelineConfig {
-    let base = get().clone();
+    let base = try_get()
+        .expect("pipeline not loaded — call pipeline::ensure_loaded() before resolve()")
+        .clone();
     let after_repo = match repo_override {
         Some(ovr) => base.merge(ovr),
         None => base,

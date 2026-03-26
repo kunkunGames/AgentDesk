@@ -51,9 +51,29 @@ impl Hook {
         ]
     }
 
+    /// The YAML/PascalCase name for this hook (used in pipeline YAML definitions).
+    pub fn yaml_name(&self) -> &'static str {
+        match self {
+            Hook::OnSessionStatusChange => "OnSessionStatusChange",
+            Hook::OnCardTransition => "OnCardTransition",
+            Hook::OnCardTerminal => "OnCardTerminal",
+            Hook::OnDispatchCompleted => "OnDispatchCompleted",
+            Hook::OnReviewEnter => "OnReviewEnter",
+            Hook::OnReviewVerdict => "OnReviewVerdict",
+            Hook::OnTick => "OnTick",
+            Hook::OnTick30s => "OnTick30s",
+            Hook::OnTick1min => "OnTick1min",
+            Hook::OnTick5min => "OnTick5min",
+        }
+    }
+
     /// Parse a hook name string back into a Hook variant.
+    /// Accepts both PascalCase (YAML: "OnCardTransition") and camelCase (JS: "onCardTransition").
     pub fn from_str(s: &str) -> Option<Hook> {
-        Hook::all().iter().find(|h| h.js_name() == s).copied()
+        Hook::all()
+            .iter()
+            .find(|h| h.js_name() == s || h.yaml_name() == s)
+            .copied()
     }
 }
 
