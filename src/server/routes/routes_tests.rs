@@ -1,703 +1,704 @@
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use std::sync::{Arc, Mutex};
-    use tower::ServiceExt;
 
-    fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::schema::migrate(&conn).unwrap();
-        crate::db::wrap_conn(conn)
-    }
+use super::*;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use std::sync::{Arc, Mutex};
+use tower::ServiceExt;
 
-    fn test_engine(db: &Db) -> PolicyEngine {
-        let config = crate::config::Config::default();
-        PolicyEngine::new(&config, db.clone()).unwrap()
-    }
+fn test_db() -> Db {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    crate::db::schema::migrate(&conn).unwrap();
+    crate::db::wrap_conn(conn)
+}
 
-    #[tokio::test]
-    async fn health_returns_ok_with_db_status() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+fn test_engine(db: &Db) -> PolicyEngine {
+    let config = crate::config::Config::default();
+    PolicyEngine::new(&config, db.clone()).unwrap()
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[tokio::test]
+async fn health_returns_ok_with_db_status() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["db"], true);
-        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
-    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn agents_empty_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["db"], true);
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agents")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[tokio::test]
+async fn agents_empty_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["agents"].as_array().unwrap().is_empty());
-    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn agents_returns_synced_agents() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["agents"].as_array().unwrap().is_empty());
+}
 
-        // Insert an agent
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+#[tokio::test]
+async fn agents_returns_synced_agents() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    // Insert an agent
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO agents (id, name, provider, status, xp) VALUES ('a1', 'Agent1', 'claude', 'idle', 0)",
                 [],
             )
             .unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agents")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let agents = json["agents"].as_array().unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0]["id"], "a1");
-        assert_eq!(agents[0]["name"], "Agent1");
     }
 
-    #[tokio::test]
-    async fn agents_include_current_thread_channel_id_from_working_session() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let agents = json["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], "a1");
+    assert_eq!(agents[0]["name"], "Agent1");
+}
+
+#[tokio::test]
+async fn agents_include_current_thread_channel_id_from_working_session() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO agents (id, name, provider, status, xp) VALUES ('a1', 'Agent1', 'codex', 'idle', 0)",
                 [],
             )
             .unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO sessions (session_key, agent_id, provider, status, thread_channel_id, last_heartbeat)
                  VALUES (?1, 'a1', 'codex', 'working', '1485506232256168011', datetime('now'))",
                 ["mac-mini:AgentDesk-codex-adk-cdx-t1485506232256168011"],
             )
             .unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-
-        let list_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/agents")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
-        assert_eq!(
-            list_json["agents"][0]["current_thread_channel_id"],
-            serde_json::Value::String("1485506232256168011".to_string())
-        );
-
-        let get_response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agents/a1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
-        assert_eq!(
-            get_json["agent"]["current_thread_channel_id"],
-            serde_json::Value::String("1485506232256168011".to_string())
-        );
     }
 
-    #[tokio::test]
-    async fn get_agent_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(
+        list_json["agents"][0]["current_thread_channel_id"],
+        serde_json::Value::String("1485506232256168011".to_string())
+    );
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/agents/a1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+    assert_eq!(
+        get_json["agent"]["current_thread_channel_id"],
+        serde_json::Value::String("1485506232256168011".to_string())
+    );
+}
+
+#[tokio::test]
+async fn get_agent_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO agents (id, name, provider, status, xp) VALUES ('a1', 'Agent1', 'claude', 'idle', 0)",
                 [],
             )
             .unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agents/a1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["agent"]["id"], "a1");
     }
 
-    #[tokio::test]
-    async fn get_agent_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/agents/a1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/agents/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["agent"]["id"], "a1");
+}
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "agent not found");
-    }
+#[tokio::test]
+async fn get_agent_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn sessions_empty_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/agents/nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/sessions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "agent not found");
+}
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["sessions"].as_array().unwrap().is_empty());
-    }
+#[tokio::test]
+async fn sessions_empty_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    // ── Kanban CRUD tests ──────────────────────────────────────────
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn kanban_create_card() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["sessions"].as_array().unwrap().is_empty());
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"title":"Test Card","priority":"high"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+// ── Kanban CRUD tests ──────────────────────────────────────────
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["card"]["title"], "Test Card");
-        assert_eq!(json["card"]["priority"], "high");
-        assert_eq!(json["card"]["status"], "backlog");
-        assert!(json["card"]["id"].as_str().unwrap().len() > 10); // UUID
-    }
+#[tokio::test]
+async fn kanban_create_card() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn kanban_list_cards_empty() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"Test Card","priority":"high"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/kanban-cards")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["card"]["title"], "Test Card");
+    assert_eq!(json["card"]["priority"], "high");
+    assert_eq!(json["card"]["status"], "backlog");
+    assert!(json["card"]["id"].as_str().unwrap().len() > 10); // UUID
+}
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["cards"].as_array().unwrap().is_empty());
-    }
+#[tokio::test]
+async fn kanban_list_cards_empty() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn kanban_list_cards_with_filter() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["cards"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn kanban_list_cards_with_filter() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'backlog', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c2', 'Card2', 'ready', 'high', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/kanban-cards?status=ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let cards = json["cards"].as_array().unwrap();
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0]["id"], "c2");
     }
 
-    #[tokio::test]
-    async fn kanban_get_card() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards?status=ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cards = json["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], "c2");
+}
+
+#[tokio::test]
+async fn kanban_get_card() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'backlog', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/kanban-cards/c1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["card"]["id"], "c1");
-        assert_eq!(json["card"]["title"], "Card1");
     }
 
-    #[tokio::test]
-    async fn kanban_get_card_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards/c1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/kanban-cards/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["card"]["id"], "c1");
+    assert_eq!(json["card"]["title"], "Card1");
+}
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+#[tokio::test]
+async fn kanban_get_card_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn kanban_update_card_status() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards/nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn kanban_update_card_status() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'backlog', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/kanban-cards/c1")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"ready"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["card"]["status"], "ready");
     }
 
-    #[tokio::test]
-    async fn kanban_update_card_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/kanban-cards/c1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri("/kanban-cards/nonexistent")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"ready"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["card"]["status"], "ready");
+}
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+#[tokio::test]
+async fn kanban_update_card_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn kanban_assign_card() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/kanban-cards/nonexistent")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn kanban_assign_card() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO agents (id, name, provider, status, xp) VALUES ('ch-td', 'Agent TD', 'claude', 'idle', 0)",
                 [],
             ).unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'backlog', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards/c1/assign")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"agent_id":"ch-td"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["card"]["status"], "ready");
-        assert_eq!(json["card"]["assigned_agent_id"], "ch-td");
     }
 
-    #[tokio::test]
-    async fn kanban_assign_card_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/c1/assign")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent_id":"ch-td"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards/nonexistent/assign")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"agent_id":"ch-td"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["card"]["status"], "ready");
+    assert_eq!(json["card"]["assigned_agent_id"], "ch-td");
+}
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+#[tokio::test]
+async fn kanban_assign_card_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    // ── Dispatch API tests ─────────────────────────────────────────
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/nonexistent/assign")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent_id":"ch-td"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn dispatch_list_empty() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/dispatches")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+// ── Dispatch API tests ─────────────────────────────────────────
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["dispatches"].as_array().unwrap().is_empty());
-    }
+#[tokio::test]
+async fn dispatch_list_empty() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn dispatch_create_and_get() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'ready', 'medium', datetime('now'), datetime('now'))",
-                [],
-            ).unwrap();
-        }
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["dispatches"].as_array().unwrap().is_empty());
+}
 
-        let app = api_router(db.clone(), engine.clone(), None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/dispatches")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"kanban_card_id":"c1","to_agent_id":"ch-td","title":"Do it"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[tokio::test]
+async fn dispatch_create_and_get() {
+    let db = test_db();
+    let engine = test_engine(&db);
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
-        assert_eq!(json["dispatch"]["status"], "pending");
-        assert_eq!(json["dispatch"]["kanban_card_id"], "c1");
-
-        // Card should be "requested"
+    {
         let conn = db.lock().unwrap();
-        let card_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(card_status, "requested");
-        drop(conn);
-
-        // GET single dispatch
-        let app2 = api_router(db, engine, None);
-        let response2 = app2
-            .oneshot(
-                Request::builder()
-                    .uri(&format!("/dispatches/{dispatch_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
-        assert_eq!(json2["dispatch"]["id"], dispatch_id);
-    }
-
-    #[tokio::test]
-    async fn dispatch_create_card_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/dispatches")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"kanban_card_id":"nope","to_agent_id":"ch-td","title":"Do it"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn dispatch_complete() {
-        let db = test_db();
-        let engine = test_engine(&db);
-
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'ready', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        // Create dispatch
-        let app = api_router(db.clone(), engine.clone(), None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/dispatches")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"kanban_card_id":"c1","to_agent_id":"ch-td","title":"Do it"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
-
-        // Complete dispatch
-        let app2 = api_router(db, engine, None);
-        let response2 = app2
-            .oneshot(
-                Request::builder()
-                    .method("PATCH")
-                    .uri(&format!("/dispatches/{dispatch_id}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"completed","result":{"ok":true}}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
-        assert_eq!(json2["dispatch"]["status"], "completed");
     }
 
-    #[tokio::test]
-    async fn dispatch_get_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let app = api_router(db.clone(), engine.clone(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"c1","to_agent_id":"ch-td","title":"Do it"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/dispatches/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
+    assert_eq!(json["dispatch"]["status"], "pending");
+    assert_eq!(json["dispatch"]["kanban_card_id"], "c1");
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // Card should be "requested"
+    let conn = db.lock().unwrap();
+    let card_status: String = conn
+        .query_row("SELECT status FROM kanban_cards WHERE id = 'c1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(card_status, "requested");
+    drop(conn);
+
+    // GET single dispatch
+    let app2 = api_router(db, engine, None);
+    let response2 = app2
+        .oneshot(
+            Request::builder()
+                .uri(&format!("/dispatches/{dispatch_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(json2["dispatch"]["id"], dispatch_id);
+}
+
+#[tokio::test]
+async fn dispatch_create_card_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"nope","to_agent_id":"ch-td","title":"Do it"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn dispatch_complete() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'ready', 'medium', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
     }
 
-    // ── Policy hook firing tests ───────────────────────────────────
+    // Create dispatch
+    let app = api_router(db.clone(), engine.clone(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"c1","to_agent_id":"ch-td","title":"Do it"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn kanban_terminal_status_fires_hook() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
+
+    // Complete dispatch
+    let app2 = api_router(db, engine, None);
+    let response2 = app2
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(&format!("/dispatches/{dispatch_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"completed","result":{"ok":true}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response2.status(), StatusCode::OK);
+    let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(json2["dispatch"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn dispatch_get_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatches/nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Policy hook firing tests ───────────────────────────────────
+
+#[tokio::test]
+async fn kanban_terminal_status_fires_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
             dir.path().join("test-hooks.js"),
             r#"
             var p = {
@@ -720,237 +721,240 @@
             "#,
         ).unwrap();
 
-        let db = test_db();
-        let config = crate::config::Config {
-            policies: crate::config::PoliciesConfig {
-                dir: dir.path().to_path_buf(),
-                hot_reload: false,
-            },
-            ..crate::config::Config::default()
-        };
-        let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+    let db = test_db();
+    let config = crate::config::Config {
+        policies: crate::config::PoliciesConfig {
+            dir: dir.path().to_path_buf(),
+            hot_reload: false,
+        },
+        ..crate::config::Config::default()
+    };
+    let engine = PolicyEngine::new(&config, db.clone()).unwrap();
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'pending_decision', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        // Use force transition: pending_decision → done (force_only in YAML pipeline)
-        let result = crate::kanban::transition_status_with_opts(
-            &db, &engine, "c1", "done", "pmd", true,
-        );
-        assert!(result.is_ok(), "force transition should succeed: {:?}", result);
-
-        let conn = db.lock().unwrap();
-        let transition: String = conn
-            .query_row(
-                "SELECT value FROM kv_meta WHERE key = 'transition'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(transition, "pending_decision->done");
-
-        let terminal: String = conn
-            .query_row(
-                "SELECT value FROM kv_meta WHERE key = 'terminal'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(terminal, "c1:done");
     }
 
-    #[tokio::test]
-    async fn dispatch_list_with_filter() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    // Use force transition: pending_decision → done (force_only in YAML pipeline)
+    let result =
+        crate::kanban::transition_status_with_opts(&db, &engine, "c1", "done", "pmd", true);
+    assert!(
+        result.is_ok(),
+        "force transition should succeed: {:?}",
+        result
+    );
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    let conn = db.lock().unwrap();
+    let transition: String = conn
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'transition'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(transition, "pending_decision->done");
+
+    let terminal: String = conn
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'terminal'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal, "c1:done");
+}
+
+#[tokio::test]
+async fn dispatch_list_with_filter() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'ready', 'medium', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, status, title, created_at, updated_at) VALUES ('d1', 'c1', 'ag1', 'pending', 'T1', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, status, title, created_at, updated_at) VALUES ('d2', 'c1', 'ag1', 'completed', 'T2', datetime('now'), datetime('now'))",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/dispatches?status=pending")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let dispatches = json["dispatches"].as_array().unwrap();
-        assert_eq!(dispatches.len(), 1);
-        assert_eq!(dispatches[0]["id"], "d1");
     }
 
-    // ── GitHub Repos API tests ────────────────────────────────────
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatches?status=pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn github_repos_empty_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let dispatches = json["dispatches"].as_array().unwrap();
+    assert_eq!(dispatches.len(), 1);
+    assert_eq!(dispatches[0]["id"], "d1");
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/github/repos")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+// ── GitHub Repos API tests ────────────────────────────────────
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["repos"].as_array().unwrap().is_empty());
-    }
+#[tokio::test]
+async fn github_repos_empty_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn github_repos_register_and_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/github/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        // Register
-        let app = api_router(db.clone(), engine.clone(), None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/github/repos")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"id":"owner/repo1"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["repos"].as_array().unwrap().is_empty());
+}
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["repo"]["id"], "owner/repo1");
+#[tokio::test]
+async fn github_repos_register_and_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
 
-        // List
-        let app2 = api_router(db, engine, None);
-        let response2 = app2
-            .oneshot(
-                Request::builder()
-                    .uri("/github/repos")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    // Register
+    let app = api_router(db.clone(), engine.clone(), None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/github/repos")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"owner/repo1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
-        assert_eq!(json2["repos"].as_array().unwrap().len(), 1);
-    }
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["repo"]["id"], "owner/repo1");
 
-    #[tokio::test]
-    async fn github_repos_register_bad_format() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    // List
+    let app2 = api_router(db, engine, None);
+    let response2 = app2
+        .oneshot(
+            Request::builder()
+                .uri("/github/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/github/repos")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"id":"noslash"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(json2["repos"].as_array().unwrap().len(), 1);
+}
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+#[tokio::test]
+async fn github_repos_register_bad_format() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn github_repos_sync_not_registered() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/github/repos")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"id":"noslash"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/github/repos/unknown/repo/sync")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+#[tokio::test]
+async fn github_repos_sync_not_registered() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    // ── Pipeline Stages API tests ─────────────────────────────────
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/github/repos/unknown/repo/sync")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn pipeline_stages_empty_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/pipeline-stages")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+// ── Pipeline Stages API tests ─────────────────────────────────
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["stages"].as_array().unwrap().is_empty());
-    }
+#[tokio::test]
+async fn pipeline_stages_empty_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-    #[tokio::test]
-    async fn pipeline_stages_create_and_list() {
-        let db = test_db();
-        let engine = test_engine(&db);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline-stages")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        // Create
-        let app = api_router(db.clone(), engine.clone(), None);
-        let response = app
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["stages"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pipeline_stages_create_and_list() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    // Create
+    let app = api_router(db.clone(), engine.clone(), None);
+    let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -964,205 +968,428 @@
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["stage"]["stage_name"], "qa-test");
-        assert_eq!(json["stage"]["trigger_after"], "review_pass");
-        assert_eq!(json["stage"]["timeout_minutes"], 60);
-        let stage_id = json["stage"]["id"].as_i64().unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["stage"]["stage_name"], "qa-test");
+    assert_eq!(json["stage"]["trigger_after"], "review_pass");
+    assert_eq!(json["stage"]["timeout_minutes"], 60);
+    let stage_id = json["stage"]["id"].as_i64().unwrap();
 
-        // List with filter
-        let app2 = api_router(db.clone(), engine.clone(), None);
-        let response2 = app2
-            .oneshot(
-                Request::builder()
-                    .uri("/pipeline-stages?repo_id=owner/repo")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    // List with filter
+    let app2 = api_router(db.clone(), engine.clone(), None);
+    let response2 = app2
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline-stages?repo_id=owner/repo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
-        assert_eq!(json2["stages"].as_array().unwrap().len(), 1);
+    let body2 = axum::body::to_bytes(response2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(json2["stages"].as_array().unwrap().len(), 1);
 
-        // Delete
-        let app3 = api_router(db, engine, None);
-        let response3 = app3
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(&format!("/pipeline-stages/{stage_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    // Delete
+    let app3 = api_router(db, engine, None);
+    let response3 = app3
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&format!("/pipeline-stages/{stage_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response3.status(), StatusCode::OK);
-        let body3 = axum::body::to_bytes(response3.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
-        assert_eq!(json3["deleted"], true);
-    }
+    assert_eq!(response3.status(), StatusCode::OK);
+    let body3 = axum::body::to_bytes(response3.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json3: serde_json::Value = serde_json::from_slice(&body3).unwrap();
+    assert_eq!(json3["deleted"], true);
+}
 
-    #[tokio::test]
-    async fn pipeline_stages_delete_not_found() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        let app = api_router(db, engine, None);
+#[tokio::test]
+async fn pipeline_stages_delete_not_found() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = api_router(db, engine, None);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/pipeline-stages/9999")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/pipeline-stages/9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
-    #[tokio::test]
-    async fn pipeline_stages_list_filtered_by_repo() {
-        let db = test_db();
-        let engine = test_engine(&db);
+#[tokio::test]
+async fn pipeline_stages_list_filtered_by_repo() {
+    let db = test_db();
+    let engine = test_engine(&db);
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
                 "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after, timeout_minutes) VALUES ('repo-a', 'test', 1, 'review_pass', 30)",
                 [],
             ).unwrap();
-            conn.execute(
+        conn.execute(
                 "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after, timeout_minutes) VALUES ('repo-b', 'deploy', 1, 'review_pass', 60)",
                 [],
             ).unwrap();
-        }
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/pipeline-stages?repo_id=repo-a")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let stages = json["stages"].as_array().unwrap();
-        assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0]["stage_name"], "test");
     }
 
-    // ── force-transition auth tests ──
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline-stages?repo_id=repo-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    fn seed_card_with_status(db: &Db, card_id: &str, status: &str) {
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO kanban_cards (id, title, status, priority, created_at, updated_at) \
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let stages = json["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 1);
+    assert_eq!(stages[0]["stage_name"], "test");
+}
+
+// ── Pipeline config hierarchy tests (#135) ──
+
+fn seed_repo(db: &Db, repo_id: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO github_repos (id, display_name) VALUES (?1, ?1)",
+        [repo_id],
+    )
+    .unwrap();
+}
+
+fn seed_agent(db: &Db, agent_id: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES (?1, ?1, 'ch1', 'ch2')",
+        [agent_id],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pipeline_config_repo_get_set_override() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_repo(&db, "owner/repo-a");
+
+    // GET — initially null
+    let app = api_router(db.clone(), engine.clone(), None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline/config/repo/owner/repo-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(body["pipeline_config"].is_null());
+
+    // PUT — set override
+    let app2 = api_router(db.clone(), engine.clone(), None);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/pipeline/config/repo/owner/repo-a")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config":{"hooks":{"review":{"on_enter":["CustomReviewHook"],"on_exit":[]}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    // GET — now has override
+    let app3 = api_router(db, engine, None);
+    let resp3 = app3
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline/config/repo/owner/repo-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body3: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp3.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(body3["pipeline_config"]["hooks"]["review"]["on_enter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "CustomReviewHook"));
+}
+
+#[tokio::test]
+async fn pipeline_config_agent_get_set_override() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-x");
+
+    // PUT
+    let app = api_router(db.clone(), engine.clone(), None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/pipeline/config/agent/agent-x")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config":{"timeouts":{"in_progress":{"duration":"4h","clock":"started_at"}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // GET
+    let app2 = api_router(db, engine, None);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline/config/agent/agent-x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["pipeline_config"]["timeouts"]["in_progress"]["duration"], "4h");
+}
+
+#[tokio::test]
+async fn pipeline_config_effective_merges_layers() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_repo(&db, "owner/repo-e");
+    seed_agent(&db, "agent-e");
+
+    // Set repo override (hooks)
+    let app = api_router(db.clone(), engine.clone(), None);
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/pipeline/config/repo/owner/repo-e")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"config":{"hooks":{"in_progress":{"on_enter":["RepoHook"],"on_exit":[]}}}}"#,
+            ))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Get effective — should include repo hook
+    let app2 = api_router(db.clone(), engine.clone(), None);
+    let resp = app2
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline/config/effective?repo=owner/repo-e&agent_id=agent-e")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["layers"]["repo"], true);
+    assert_eq!(body["layers"]["agent"], false);
+    // Hooks from repo override should be in effective pipeline
+    let hooks = &body["pipeline"]["hooks"]["in_progress"]["on_enter"];
+    assert!(hooks.as_array().unwrap().iter().any(|v| v == "RepoHook"));
+}
+
+#[tokio::test]
+async fn pipeline_config_graph_returns_nodes_and_edges() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    let app = api_router(db, engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/pipeline/config/graph")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    let edges = body["edges"].as_array().unwrap();
+    assert!(!nodes.is_empty());
+    assert!(!edges.is_empty());
+    // Each node has expected fields
+    assert!(nodes[0]["id"].is_string());
+    assert!(nodes[0]["label"].is_string());
+    // Each edge has from/to/type
+    assert!(edges[0]["from"].is_string());
+    assert!(edges[0]["to"].is_string());
+    assert!(edges[0]["type"].is_string());
+}
+
+#[tokio::test]
+async fn pipeline_config_repo_invalid_override_rejected() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_repo(&db, "owner/repo-bad");
+
+    let app = api_router(db, engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/pipeline/config/repo/owner/repo-bad")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"config":{"states":"not-an-array"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── force-transition auth tests ──
+
+fn seed_card_with_status(db: &Db, card_id: &str, status: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO kanban_cards (id, title, status, priority, created_at, updated_at) \
              VALUES (?1, 'test', ?2, 'medium', datetime('now'), datetime('now'))",
-            rusqlite::params![card_id, status],
+        rusqlite::params![card_id, status],
+    )
+    .unwrap();
+}
+
+fn set_pmd_channel(db: &Db, channel_id: &str) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('kanban_manager_channel_id', ?1)",
+        [channel_id],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn force_transition_rejects_without_channel_header() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_card_with_status(&db, "card-ft1", "backlog");
+    set_pmd_channel(&db, "pmd-chan-123");
+
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-ft1/force-transition")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
         )
+        .await
         .unwrap();
-    }
 
-    fn set_pmd_channel(db: &Db, channel_id: &str) {
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('kanban_manager_channel_id', ?1)",
-            [channel_id],
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn force_transition_rejects_wrong_channel() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_card_with_status(&db, "card-ft2", "backlog");
+    set_pmd_channel(&db, "pmd-chan-123");
+
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-ft2/force-transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "wrong-channel")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
         )
+        .await
         .unwrap();
-    }
 
-    #[tokio::test]
-    async fn force_transition_rejects_without_channel_header() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        seed_card_with_status(&db, "card-ft1", "backlog");
-        set_pmd_channel(&db, "pmd-chan-123");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
 
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards/card-ft1/force-transition")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"status":"ready"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+#[tokio::test]
+async fn force_transition_succeeds_with_correct_channel() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_card_with_status(&db, "card-ft3", "requested");
+    set_pmd_channel(&db, "pmd-chan-123");
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
+    let app = api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-ft3/force-transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"done"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn force_transition_rejects_wrong_channel() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        seed_card_with_status(&db, "card-ft2", "backlog");
-        set_pmd_channel(&db, "pmd-chan-123");
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards/card-ft2/force-transition")
-                    .header("content-type", "application/json")
-                    .header("x-channel-id", "wrong-channel")
-                    .body(Body::from(r#"{"status":"ready"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn force_transition_succeeds_with_correct_channel() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        seed_card_with_status(&db, "card-ft3", "requested");
-        set_pmd_channel(&db, "pmd-chan-123");
-
-        let app = api_router(db, engine, None);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-cards/card-ft3/force-transition")
-                    .header("content-type", "application/json")
-                    .header("x-channel-id", "pmd-chan-123")
-                    .body(Body::from(r#"{"status":"done"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["forced"], true);
-    }
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["forced"], true);
+}

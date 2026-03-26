@@ -419,4 +419,246 @@ impl PipelineConfig {
 
         Ok(())
     }
+
+    /// Produce a graph representation of the pipeline for dashboard visualization.
+    /// Returns states as nodes and transitions as edges with their gate/type info.
+    pub fn to_graph(&self) -> serde_json::Value {
+        let nodes: Vec<serde_json::Value> = self
+            .states
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "label": s.label,
+                    "terminal": s.terminal,
+                    "has_hooks": self.hooks.contains_key(&s.id),
+                    "has_clock": self.clocks.contains_key(&s.id),
+                    "has_timeout": self.timeouts.contains_key(&s.id),
+                })
+            })
+            .collect();
+
+        let edges: Vec<serde_json::Value> = self
+            .transitions
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "from": t.from,
+                    "to": t.to,
+                    "type": format!("{:?}", t.transition_type).to_lowercase(),
+                    "gates": t.gates,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "nodes": nodes,
+            "edges": edges,
+        })
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_pipeline() -> PipelineConfig {
+        PipelineConfig {
+            name: "test".into(),
+            version: 1,
+            states: vec![
+                StateConfig {
+                    id: "backlog".into(),
+                    label: "Backlog".into(),
+                    terminal: false,
+                },
+                StateConfig {
+                    id: "in_progress".into(),
+                    label: "In Progress".into(),
+                    terminal: false,
+                },
+                StateConfig {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    terminal: true,
+                },
+            ],
+            transitions: vec![
+                TransitionConfig {
+                    from: "backlog".into(),
+                    to: "in_progress".into(),
+                    transition_type: TransitionType::Free,
+                    gates: vec![],
+                },
+                TransitionConfig {
+                    from: "in_progress".into(),
+                    to: "done".into(),
+                    transition_type: TransitionType::Gated,
+                    gates: vec!["review_passed".into()],
+                },
+            ],
+            gates: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "review_passed".into(),
+                    GateConfig {
+                        gate_type: "builtin".into(),
+                        check: Some("review_verdict_pass".into()),
+                        description: None,
+                    },
+                );
+                m
+            },
+            hooks: HashMap::new(),
+            clocks: HashMap::new(),
+            timeouts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn merge_override_replaces_states() {
+        let base = minimal_pipeline();
+        let ovr = PipelineOverride {
+            states: Some(vec![
+                StateConfig {
+                    id: "todo".into(),
+                    label: "Todo".into(),
+                    terminal: false,
+                },
+                StateConfig {
+                    id: "done".into(),
+                    label: "Complete".into(),
+                    terminal: true,
+                },
+            ]),
+            ..Default::default()
+        };
+        let merged = base.merge(&ovr);
+        assert_eq!(merged.states.len(), 2);
+        assert_eq!(merged.states[0].id, "todo");
+        // Non-overridden sections preserved
+        assert_eq!(merged.transitions.len(), 2);
+        assert!(merged.gates.contains_key("review_passed"));
+    }
+
+    #[test]
+    fn merge_override_replaces_hooks() {
+        let base = minimal_pipeline();
+        let ovr = PipelineOverride {
+            hooks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "backlog".into(),
+                    HookBindings {
+                        on_enter: vec!["CustomHook".into()],
+                        on_exit: vec![],
+                    },
+                );
+                m
+            }),
+            ..Default::default()
+        };
+        let merged = base.merge(&ovr);
+        assert!(merged.hooks.contains_key("backlog"));
+        assert_eq!(merged.hooks["backlog"].on_enter, vec!["CustomHook"]);
+        // States unchanged
+        assert_eq!(merged.states.len(), 3);
+    }
+
+    #[test]
+    fn merge_empty_override_is_identity() {
+        let base = minimal_pipeline();
+        let ovr = PipelineOverride::default();
+        let merged = base.merge(&ovr);
+        assert_eq!(merged.states.len(), base.states.len());
+        assert_eq!(merged.transitions.len(), base.transitions.len());
+        assert_eq!(merged.gates.len(), base.gates.len());
+    }
+
+    #[test]
+    fn chained_merge_applies_both_layers() {
+        let base = minimal_pipeline();
+
+        // Repo override: add hooks
+        let repo_ovr = PipelineOverride {
+            hooks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "in_progress".into(),
+                    HookBindings {
+                        on_enter: vec!["RepoHook".into()],
+                        on_exit: vec![],
+                    },
+                );
+                m
+            }),
+            ..Default::default()
+        };
+
+        // Agent override: replace hooks entirely
+        let agent_ovr = PipelineOverride {
+            hooks: Some({
+                let mut m = HashMap::new();
+                m.insert(
+                    "in_progress".into(),
+                    HookBindings {
+                        on_enter: vec!["AgentHook".into()],
+                        on_exit: vec![],
+                    },
+                );
+                m
+            }),
+            ..Default::default()
+        };
+
+        let after_repo = base.merge(&repo_ovr);
+        assert_eq!(after_repo.hooks["in_progress"].on_enter, vec!["RepoHook"]);
+
+        let after_agent = after_repo.merge(&agent_ovr);
+        assert_eq!(
+            after_agent.hooks["in_progress"].on_enter,
+            vec!["AgentHook"]
+        );
+        // States still from base
+        assert_eq!(after_agent.states.len(), 3);
+    }
+
+    #[test]
+    fn resolve_with_no_overrides_returns_base() {
+        // Load pipeline for resolve()
+        ensure_loaded();
+        let result = resolve(None, None);
+        let default = get();
+        assert_eq!(result.name, default.name);
+        assert_eq!(result.states.len(), default.states.len());
+    }
+
+    #[test]
+    fn parse_override_empty_returns_none() {
+        assert!(parse_override("").unwrap().is_none());
+        assert!(parse_override("null").unwrap().is_none());
+        assert!(parse_override("{}").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_override_valid_json() {
+        let json = r#"{"hooks":{"review":{"on_enter":["MyHook"],"on_exit":[]}}}"#;
+        let ovr = parse_override(json).unwrap().unwrap();
+        assert!(ovr.hooks.is_some());
+        assert!(ovr.states.is_none());
+    }
+
+    #[test]
+    fn to_graph_produces_nodes_and_edges() {
+        let p = minimal_pipeline();
+        let graph = p.to_graph();
+        let nodes = graph["nodes"].as_array().unwrap();
+        let edges = graph["edges"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[1]["type"], "gated");
+        assert_eq!(edges[1]["gates"].as_array().unwrap().len(), 1);
+    }
 }

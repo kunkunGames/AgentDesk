@@ -716,7 +716,10 @@ pub async fn get_repo_pipeline(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(serde_json::Value::Null);
 
-    (StatusCode::OK, Json(json!({"repo": id, "pipeline_config": parsed})))
+    (
+        StatusCode::OK,
+        Json(json!({"repo": id, "pipeline_config": parsed})),
+    )
 }
 
 /// PUT /api/pipeline/config/repo/:owner/:repo
@@ -795,7 +798,10 @@ pub async fn get_agent_pipeline(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(serde_json::Value::Null);
 
-    (StatusCode::OK, Json(json!({"agent_id": agent_id, "pipeline_config": parsed})))
+    (
+        StatusCode::OK,
+        Json(json!({"agent_id": agent_id, "pipeline_config": parsed})),
+    )
 }
 
 /// PUT /api/pipeline/config/agent/:agent_id
@@ -845,6 +851,38 @@ pub async fn set_agent_pipeline(
             Json(json!({"error": format!("{e}")})),
         ),
     }
+}
+
+/// GET /api/pipeline/config/graph?repo=...&agent_id=...
+/// Returns the effective pipeline as a visual graph (nodes + edges).
+pub async fn get_pipeline_graph(
+    State(state): State<AppState>,
+    Query(params): Query<EffectivePipelineQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if crate::pipeline::try_get().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "default pipeline not loaded"})),
+        );
+    }
+
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let effective = crate::pipeline::resolve_for_card(
+        &conn,
+        params.repo.as_deref(),
+        params.agent_id.as_deref(),
+    );
+
+    (StatusCode::OK, Json(effective.to_graph()))
 }
 
 /// Extended version that includes dashboard v2 columns

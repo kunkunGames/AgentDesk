@@ -4,7 +4,6 @@ pub mod analytics;
 pub mod auth;
 pub mod auto_queue;
 pub mod cron_api;
-mod queue_api;
 pub mod departments;
 pub mod discord;
 pub mod dispatched_sessions;
@@ -20,6 +19,7 @@ pub mod messages;
 pub mod offices;
 pub mod onboarding;
 pub mod pipeline;
+mod queue_api;
 pub mod review_verdict;
 pub mod reviews;
 mod session_activity;
@@ -66,10 +66,15 @@ pub fn api_router(
         .route("/send", post(health_api::send_handler))
         .route("/senddm", post(health_api::senddm_handler))
         .route("/session/start", post(health_api::session_start_handler))
-        .route("/agents", get(agents_crud::list_agents).post(agents_crud::create_agent))
+        .route(
+            "/agents",
+            get(agents_crud::list_agents).post(agents_crud::create_agent),
+        )
         .route(
             "/agents/{id}",
-            get(agents_crud::get_agent).patch(agents_crud::update_agent).delete(agents_crud::delete_agent),
+            get(agents_crud::get_agent)
+                .patch(agents_crud::update_agent)
+                .delete(agents_crud::delete_agent),
         )
         // Onboarding
         .route("/onboarding/status", get(onboarding::status))
@@ -116,10 +121,7 @@ pub fn api_router(
                 .delete(kanban::delete_card),
         )
         .route("/kanban-cards/{id}/assign", post(kanban::assign_card))
-        .route(
-            "/kanban-cards/{id}/reopen",
-            post(kanban::reopen_card),
-        )
+        .route("/kanban-cards/{id}/reopen", post(kanban::reopen_card))
         .route(
             "/kanban-cards/{id}/force-transition",
             post(kanban::force_transition),
@@ -131,7 +133,10 @@ pub fn api_router(
         )
         .route("/kanban-cards/{id}/defer-dod", patch(kanban::defer_dod))
         .route("/kanban-cards/{id}/reviews", get(kanban::list_card_reviews))
-        .route("/kanban-cards/{id}/review-state", get(kanban::get_card_review_state))
+        .route(
+            "/kanban-cards/{id}/review-state",
+            get(kanban::get_card_review_state),
+        )
         .route("/kanban-cards/{id}/audit-log", get(kanban::card_audit_log))
         .route(
             "/kanban-cards/{id}/comments",
@@ -188,8 +193,14 @@ pub fn api_router(
             get(pipeline::get_card_history),
         )
         // Pipeline config hierarchy (#135)
-        .route("/pipeline/config/default", get(pipeline::get_default_pipeline))
-        .route("/pipeline/config/effective", get(pipeline::get_effective_pipeline))
+        .route(
+            "/pipeline/config/default",
+            get(pipeline::get_default_pipeline),
+        )
+        .route(
+            "/pipeline/config/effective",
+            get(pipeline::get_effective_pipeline),
+        )
         .route(
             "/pipeline/config/repo/{owner}/{repo}",
             get(pipeline::get_repo_pipeline).put(pipeline::set_repo_pipeline),
@@ -197,6 +208,10 @@ pub fn api_router(
         .route(
             "/pipeline/config/agent/{agent_id}",
             get(pipeline::get_agent_pipeline).put(pipeline::set_agent_pipeline),
+        )
+        .route(
+            "/pipeline/config/graph",
+            get(pipeline::get_pipeline_graph),
         )
         // GitHub repos
         .route(
@@ -287,6 +302,10 @@ pub fn api_router(
             "/dispatched-sessions/clear-stale-session-id",
             post(dispatched_sessions::clear_stale_session_id),
         )
+        .route(
+            "/sessions/force-kill",
+            post(dispatched_sessions::force_kill_session),
+        )
         // Messages
         .route(
             "/messages",
@@ -338,10 +357,20 @@ pub fn api_router(
         .route("/auto-queue/cancel", post(auto_queue::cancel))
         // Queue management (#138)
         .route("/channels/{id}/queue", get(queue_api::list_channel_queue))
-        .route("/dispatches/pending", get(queue_api::list_pending_dispatches))
+        .route(
+            "/dispatches/pending",
+            get(queue_api::list_pending_dispatches),
+        )
         .route("/dispatches/{id}/cancel", post(queue_api::cancel_dispatch))
-        .route("/dispatches/cancel-all", post(queue_api::cancel_all_dispatches))
+        .route(
+            "/dispatches/cancel-all",
+            post(queue_api::cancel_all_dispatches),
+        )
         .route("/turns/{channel_id}/cancel", post(queue_api::cancel_turn))
+        .route(
+            "/turns/{channel_id}/extend-timeout",
+            post(queue_api::extend_turn_timeout),
+        )
         .route(
             "/auto-queue/runs/{id}/order",
             post(auto_queue::submit_order),
@@ -372,7 +401,6 @@ pub fn api_router(
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .with_state(state)
 }
-
 
 #[cfg(test)]
 mod routes_tests;
