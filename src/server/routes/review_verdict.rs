@@ -400,6 +400,20 @@ pub async fn submit_verdict(
     });
     let result_str = result_json.to_string();
 
+    // #100: stamp release marker BEFORE completing dispatch — if this fails, we bail out
+    // without committing the dispatch, so no partial state is left behind.
+    if body.overall == "pass" || body.overall == "approved" {
+        if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("failed to write release marker: {e}"),
+                })),
+            );
+        }
+    }
+
     // Update dispatch with verdict result — only if still pending/dispatched.
     // Cancelled dispatches (e.g. after dismiss) must NOT be promoted to completed,
     // as that would re-trigger OnDispatchCompleted hooks and cause review loops (#80).
@@ -485,18 +499,7 @@ pub async fn submit_verdict(
     // record_true_negative_if_pass). FN (false_negative = pass but post-pass bug found)
     // requires an external bug-report signal that does not yet exist in the system.
 
-    if body.overall == "pass" || body.overall == "approved" {
-        // When review passes, stamp a marker so promote-release.sh can verify
-        if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "ok": false,
-                    "error": format!("review passed but failed to write release marker: {e}"),
-                })),
-            );
-        }
-    }
+    // #100: release marker was already stamped before dispatch completion (above).
 
     (
         StatusCode::OK,
