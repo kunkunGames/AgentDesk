@@ -1005,8 +1005,13 @@ async fn try_reuse_thread(
         }
     }
 
-    // 2a. Update thread name with current issue number (for unified thread mode)
-    {
+    // 2a. Update thread name with current issue number (skip for unified [Queue] threads)
+    let current_thread_name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_queue_thread = current_thread_name.starts_with("[Queue]");
+    if !is_queue_thread {
         let new_name: Option<String> = db
             .lock()
             .ok()
@@ -1034,7 +1039,7 @@ async fn try_reuse_thread(
                 .send()
                 .await;
         }
-    }
+    } // end !is_queue_thread
 
     // 2b. Send separator message to visually distinguish dispatch phases
     let separator = format!("── {} dispatch ──", dispatch_type);
