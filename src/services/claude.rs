@@ -2031,6 +2031,7 @@ pub(crate) fn read_output_file_until_result(
     let mut buf = [0u8; 8192];
     let mut no_data_count: u32 = 0;
     let mut consecutive_ready_count: u32 = 0;
+    let mut first_ready_at: Option<std::time::Instant> = None;
 
     loop {
         // Check cancellation
@@ -2072,10 +2073,16 @@ pub(crate) fn read_output_file_until_result(
                     // in the tmux pane — causing a false-positive completion.
                     let output_ever_grew = current_offset > start_offset;
                     if !has_new_bytes && output_ever_grew && (probe.is_ready_for_input)() {
+                        if first_ready_at.is_none() {
+                            first_ready_at = Some(std::time::Instant::now());
+                        }
                         consecutive_ready_count += 1;
-                        // Require 3 consecutive ready checks (~15s) to avoid false
-                        // positives during Claude Code auto-continue transitions.
-                        if consecutive_ready_count >= 3 {
+                        // Time-based guard: require at least 15 seconds of continuous
+                        // ready state to avoid false positives during Claude Code
+                        // auto-continue transitions. With adaptive backoff the loop
+                        // cadence varies, so wall-clock time is the reliable measure.
+                        let ready_elapsed = first_ready_at.unwrap().elapsed();
+                        if ready_elapsed >= Duration::from_secs(15) && consecutive_ready_count >= 3 {
                             debug_log(
                                 "Session returned to ready prompt without result event; synthesizing completion",
                             );
@@ -2095,6 +2102,7 @@ pub(crate) fn read_output_file_until_result(
                         }
                     } else {
                         consecutive_ready_count = 0;
+                        first_ready_at = None;
                     }
                 }
                 // Adaptive backoff: start fast (10ms), slow down to 200ms when idle
@@ -2110,6 +2118,7 @@ pub(crate) fn read_output_file_until_result(
             Ok(n) => {
                 no_data_count = 0;
                 consecutive_ready_count = 0;
+                first_ready_at = None;
                 current_offset += n as u64;
                 let _ = sender.send(StreamMessage::OutputOffset {
                     offset: current_offset,
