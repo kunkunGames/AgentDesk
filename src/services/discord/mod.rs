@@ -2491,7 +2491,7 @@ pub(super) async fn auto_restore_session(
             }
             drop(data);
 
-            // Restore claude_session_id from DB for quarantined sessions.
+            // Restore provider session_id from DB for quarantined sessions.
             // This runs outside the core lock to avoid deadlocks on the async API call.
             if need_db_restore {
                 if let Some(ref ch_name) = restore_ch_name {
@@ -2505,16 +2505,16 @@ pub(super) async fn auto_restore_session(
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "unknown".to_string());
                     let session_key = format!("{}:{}", hostname, tmux_name);
-                    if let Some(claude_sid) =
-                        adk_session::fetch_claude_session_id(&session_key, shared.api_port).await
+                    if let Some(restored_sid) =
+                        adk_session::fetch_provider_session_id(&session_key, shared.api_port).await
                     {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!(
-                            "  [{ts}] ↻ QUARANTINE: restored claude_session_id from DB for {last_path}"
+                            "  [{ts}] ↻ QUARANTINE: restored provider session_id from DB for {last_path}"
                         );
                         let mut data = shared.core.lock().await;
                         if let Some(session) = data.sessions.get_mut(&channel_id) {
-                            session.session_id = Some(claude_sid);
+                            session.session_id = Some(restored_sid);
                         }
                     }
                 }

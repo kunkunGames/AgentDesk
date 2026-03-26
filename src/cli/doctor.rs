@@ -133,6 +133,16 @@ fn check_codex_cli() -> Check {
     }
 }
 
+fn check_gemini_cli() -> Check {
+    match Command::new("gemini").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Check::ok("gemini CLI", ver)
+        }
+        _ => Check::ok("gemini CLI", "not found in PATH (optional)"),
+    }
+}
+
 fn check_server_running() -> Check {
     let base = super::client::api_base();
     match super::client::get_json("/api/health") {
@@ -223,6 +233,7 @@ pub fn cmd_doctor() -> Result<(), String> {
         check_tmux(),
         check_claude_cli(),
         check_codex_cli(),
+        check_gemini_cli(),
         check_launchd(),
         check_db_integrity(),
         check_disk_usage(),

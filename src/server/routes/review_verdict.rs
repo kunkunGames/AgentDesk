@@ -79,7 +79,7 @@ pub struct SubmitVerdictBody {
     /// The commit SHA that was actually reviewed. When provided, the
     /// review-passed marker stamps this commit instead of the current HEAD.
     pub commit: Option<String>,
-    /// Provider identifier (e.g. "claude", "codex") of the verdict submitter.
+    /// Provider identifier (e.g. "claude", "codex", "gemini") of the verdict submitter.
     /// Used for cross-provider validation in counter-model reviews.
     pub provider: Option<String>,
 }
@@ -191,7 +191,7 @@ pub async fn submit_verdict(
                             StatusCode::BAD_REQUEST,
                             Json(json!({
                                 "error": format!(
-                                    "unknown provider '{}' — expected 'claude' or 'codex'",
+                                    "unknown provider '{}' — expected a supported provider like 'claude', 'codex', or 'gemini'",
                                     raw_submitter
                                 )
                             })),
@@ -217,17 +217,6 @@ pub async fn submit_verdict(
                                 "error": format!(
                                     "provider mismatch: expected '{}' but got '{}'",
                                     target_p, s.as_str()
-                                )
-                            })),
-                        );
-                    }
-                    Some(s) if !matches!(s, ProviderKind::Claude | ProviderKind::Codex) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "error": format!(
-                                    "unsupported review provider '{}' — only claude/codex are allowed here",
-                                    s.as_str()
                                 )
                             })),
                         );
@@ -349,7 +338,11 @@ pub async fn submit_verdict(
             }
             for (t_card_id, old_s, new_s) in &transitions {
                 crate::kanban::fire_transition_hooks(
-                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                    &state.db,
+                    &state.engine,
+                    t_card_id,
+                    old_s,
+                    new_s,
                 );
             }
         }
@@ -545,7 +538,12 @@ pub async fn submit_review_decision(
                     });
 
                     // #117: Update canonical review state before returning
-                    update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
+                    update_card_review_state(
+                        &state.db,
+                        &body.card_id,
+                        "accept",
+                        pending_rd_id.as_deref(),
+                    );
 
                     return (
                         StatusCode::OK,
@@ -611,13 +609,22 @@ pub async fn submit_review_decision(
                 }
                 for (t_card_id, old_s, new_s) in &transitions {
                     crate::kanban::fire_transition_hooks(
-                        &state.db, &state.engine, &t_card_id, &old_s, &new_s,
+                        &state.db,
+                        &state.engine,
+                        &t_card_id,
+                        &old_s,
+                        &new_s,
                     );
                 }
             }
 
             // #117: Update canonical review state before returning
-            update_card_review_state(&state.db, &body.card_id, "dispute", pending_rd_id.as_deref());
+            update_card_review_state(
+                &state.db,
+                &body.card_id,
+                "dispute",
+                pending_rd_id.as_deref(),
+            );
 
             return (
                 StatusCode::OK,
@@ -662,7 +669,12 @@ pub async fn submit_review_decision(
     }
 
     // #117: Update canonical review state for all decision paths
-    update_card_review_state(&state.db, &body.card_id, &body.decision, pending_rd_id.as_deref());
+    update_card_review_state(
+        &state.db,
+        &body.card_id,
+        &body.decision,
+        pending_rd_id.as_deref(),
+    );
 
     (
         StatusCode::OK,
@@ -1280,8 +1292,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemini_cross_provider_allowed() {
+        let db = test_db();
+        seed_counter_model_review(&db, "dispatch-gemini-cross", "claude", "gemini");
+        let state = AppState {
+            db: db.clone(),
+            engine: test_engine(&db),
+            health_registry: None,
+        };
+
+        let (status, body) = submit_verdict(
+            State(state),
+            Json(SubmitVerdictBody {
+                dispatch_id: "dispatch-gemini-cross".to_string(),
+                overall: "pass".to_string(),
+                items: None,
+                notes: None,
+                feedback: None,
+                commit: None,
+                provider: Some("gemini".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.0.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
+
+    #[tokio::test]
     async fn unknown_provider_string_rejected() {
-        // "gemini" or random string → reject as unknown provider
+        // Unknown provider string → reject
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-unknown-prov", "claude", "codex");
         let state = AppState {
@@ -1299,7 +1339,7 @@ mod tests {
                 notes: None,
                 feedback: None,
                 commit: None,
-                provider: Some("gemini".to_string()),
+                provider: Some("gpt".to_string()),
             }),
         )
         .await;
@@ -1616,7 +1656,8 @@ mod tests {
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     dispatched_at DATETIME, completed_at DATETIME
                 );",
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, status, agent_id) VALUES ('run-drain', 'active', 'agent-1')",
                 [],
@@ -1654,7 +1695,11 @@ mod tests {
 
         // Card must be done
         let card_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = 'card-1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(card_status, "done");
 
@@ -1710,9 +1755,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "accept should be rejected as a verdict");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "accept should be rejected as a verdict"
+        );
         let err = body.0["error"].as_str().unwrap_or("");
-        assert!(err.contains("must be one of"), "error should list valid verdicts: {}", err);
+        assert!(
+            err.contains("must be one of"),
+            "error should list valid verdicts: {}",
+            err
+        );
     }
 
     /// #116: Creating a new review-decision cancels any existing pending ones for the same card.
@@ -1739,7 +1792,8 @@ mod tests {
             conn.execute(
                 "UPDATE kanban_cards SET latest_dispatch_id = 'rd-old' WHERE id = 'card-dup'",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Creating a new review-decision should cancel the old one
@@ -1751,7 +1805,10 @@ mod tests {
             "[New RD]",
             &serde_json::json!({"verdict": "improve"}),
         );
-        assert!(result.is_ok(), "new review-decision creation should succeed");
+        assert!(
+            result.is_ok(),
+            "new review-decision creation should succeed"
+        );
 
         let conn = db.lock().unwrap();
 
@@ -1763,7 +1820,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(old_status, "cancelled", "old review-decision must be cancelled");
+        assert_eq!(
+            old_status, "cancelled",
+            "old review-decision must be cancelled"
+        );
 
         // Only 1 pending review-decision should exist for this card
         let pending_count: i64 = conn
@@ -1773,7 +1833,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(pending_count, 1, "exactly 1 pending review-decision per card");
+        assert_eq!(
+            pending_count, 1,
+            "exactly 1 pending review-decision per card"
+        );
     }
 
     /// #117: card_review_state is updated when review-decision is consumed (accept path).
@@ -1825,7 +1888,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(rs_state, "rework_pending", "canonical state should be rework_pending after accept");
-        assert_eq!(last_decision.as_deref(), Some("accept"), "last_decision should be accept");
+        assert_eq!(
+            rs_state, "rework_pending",
+            "canonical state should be rework_pending after accept"
+        );
+        assert_eq!(
+            last_decision.as_deref(),
+            Some("accept"),
+            "last_decision should be accept"
+        );
     }
 }

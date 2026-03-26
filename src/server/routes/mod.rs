@@ -4,7 +4,6 @@ pub mod analytics;
 pub mod auth;
 pub mod auto_queue;
 pub mod cron_api;
-mod queue_api;
 pub mod departments;
 pub mod discord;
 pub mod dispatched_sessions;
@@ -20,6 +19,7 @@ pub mod messages;
 pub mod offices;
 pub mod onboarding;
 pub mod pipeline;
+mod queue_api;
 pub mod review_verdict;
 pub mod reviews;
 mod session_activity;
@@ -66,10 +66,15 @@ pub fn api_router(
         .route("/send", post(health_api::send_handler))
         .route("/senddm", post(health_api::senddm_handler))
         .route("/session/start", post(health_api::session_start_handler))
-        .route("/agents", get(agents_crud::list_agents).post(agents_crud::create_agent))
+        .route(
+            "/agents",
+            get(agents_crud::list_agents).post(agents_crud::create_agent),
+        )
         .route(
             "/agents/{id}",
-            get(agents_crud::get_agent).patch(agents_crud::update_agent).delete(agents_crud::delete_agent),
+            get(agents_crud::get_agent)
+                .patch(agents_crud::update_agent)
+                .delete(agents_crud::delete_agent),
         )
         // Onboarding
         .route("/onboarding/status", get(onboarding::status))
@@ -77,7 +82,10 @@ pub fn api_router(
             "/onboarding/validate-token",
             post(onboarding::validate_token),
         )
-        .route("/onboarding/channels", get(onboarding::channels))
+        .route(
+            "/onboarding/channels",
+            get(onboarding::channels).post(onboarding::channels_post),
+        )
         .route("/onboarding/complete", post(onboarding::complete))
         .route(
             "/onboarding/check-provider",
@@ -116,10 +124,7 @@ pub fn api_router(
                 .delete(kanban::delete_card),
         )
         .route("/kanban-cards/{id}/assign", post(kanban::assign_card))
-        .route(
-            "/kanban-cards/{id}/reopen",
-            post(kanban::reopen_card),
-        )
+        .route("/kanban-cards/{id}/reopen", post(kanban::reopen_card))
         .route(
             "/kanban-cards/{id}/force-transition",
             post(kanban::force_transition),
@@ -131,7 +136,10 @@ pub fn api_router(
         )
         .route("/kanban-cards/{id}/defer-dod", patch(kanban::defer_dod))
         .route("/kanban-cards/{id}/reviews", get(kanban::list_card_reviews))
-        .route("/kanban-cards/{id}/review-state", get(kanban::get_card_review_state))
+        .route(
+            "/kanban-cards/{id}/review-state",
+            get(kanban::get_card_review_state),
+        )
         .route("/kanban-cards/{id}/audit-log", get(kanban::card_audit_log))
         .route(
             "/kanban-cards/{id}/comments",
@@ -324,9 +332,15 @@ pub fn api_router(
         .route("/auto-queue/reset", post(auto_queue::reset))
         // Queue management (#138)
         .route("/channels/{id}/queue", get(queue_api::list_channel_queue))
-        .route("/dispatches/pending", get(queue_api::list_pending_dispatches))
+        .route(
+            "/dispatches/pending",
+            get(queue_api::list_pending_dispatches),
+        )
         .route("/dispatches/{id}/cancel", post(queue_api::cancel_dispatch))
-        .route("/dispatches/cancel-all", post(queue_api::cancel_all_dispatches))
+        .route(
+            "/dispatches/cancel-all",
+            post(queue_api::cancel_all_dispatches),
+        )
         .route("/turns/{channel_id}/cancel", post(queue_api::cancel_turn))
         .route(
             "/auto-queue/runs/{id}/order",
@@ -353,7 +367,6 @@ pub fn api_router(
         .layer(axum::middleware::from_fn(auth::auth_middleware))
         .with_state(state)
 }
-
 
 #[cfg(test)]
 mod routes_tests;

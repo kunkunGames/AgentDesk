@@ -45,7 +45,7 @@ impl ProviderKind {
         match self {
             Self::Claude => Self::Codex,
             Self::Codex => Self::Claude,
-            Self::Gemini => Self::Gemini,
+            Self::Gemini => Self::Codex,
             Self::Unsupported(_) => self.clone(),
         }
     }
@@ -65,7 +65,7 @@ impl ProviderKind {
         Self::from_str(raw).unwrap_or_else(|| Self::Unsupported(raw.trim().to_string()))
     }
 
-    /// Returns true if this is a known, supported provider (Claude or Codex).
+    /// Returns true if this is a known, supported provider.
     pub fn is_supported(&self) -> bool {
         !matches!(self, Self::Unsupported(_))
     }
@@ -159,10 +159,10 @@ mod tests {
 
     #[test]
     fn test_unsupported_provider() {
-        let p = ProviderKind::from_str_or_unsupported("gemini");
+        let p = ProviderKind::from_str_or_unsupported("gpt");
         assert!(!p.is_supported());
-        assert_eq!(p.as_str(), "gemini");
-        assert_eq!(p.display_name(), "gemini");
+        assert_eq!(p.as_str(), "gpt");
+        assert_eq!(p.display_name(), "gpt");
         assert!(!p.is_channel_supported(Some("test-cc"), false));
         assert!(!p.is_channel_supported(Some("test"), false));
         assert!(!p.is_channel_supported(None, true)); // unsupported even in DM
@@ -232,7 +232,6 @@ mod tests {
 
     #[test]
     fn test_provider_from_str_unknown() {
-        assert_eq!(ProviderKind::from_str("gemini"), None);
         assert_eq!(ProviderKind::from_str("gpt"), None);
         assert_eq!(ProviderKind::from_str(""), None);
     }
@@ -293,12 +292,12 @@ mod tests {
     fn test_counterpart_provider() {
         assert_eq!(ProviderKind::Claude.counterpart(), ProviderKind::Codex);
         assert_eq!(ProviderKind::Codex.counterpart(), ProviderKind::Claude);
-        assert_eq!(ProviderKind::Gemini.counterpart(), ProviderKind::Gemini);
+        assert_eq!(ProviderKind::Gemini.counterpart(), ProviderKind::Codex);
 
-        let unsupported = ProviderKind::Unsupported("gemini".to_string());
+        let unsupported = ProviderKind::Unsupported("gpt".to_string());
         assert_eq!(
             unsupported.counterpart(),
-            ProviderKind::Unsupported("gemini".to_string())
+            ProviderKind::Unsupported("gpt".to_string())
         );
     }
 }

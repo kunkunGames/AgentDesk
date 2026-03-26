@@ -436,7 +436,9 @@ pub fn parse_restart_dcserver_report_context(
             "--report-provider" => {
                 let raw = args
                     .get(i + 1)
-                    .ok_or_else(|| "--report-provider requires one of: claude, codex".to_string())?
+                    .ok_or_else(|| {
+                        "--report-provider requires one of: claude, codex, gemini".to_string()
+                    })?
                     .clone();
                 report_provider = Some(raw);
                 i += 2;
