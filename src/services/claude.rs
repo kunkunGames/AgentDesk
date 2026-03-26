@@ -266,6 +266,12 @@ pub struct CancelToken {
     pub ssh_cancel: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// tmux session name for cleanup on cancel
     pub tmux_session: std::sync::Mutex<Option<String>>,
+    /// Watchdog deadline as Unix timestamp in milliseconds.
+    /// The watchdog fires when `now_ms >= deadline_ms`. Extend by setting a future value.
+    /// Maximum absolute cap: initial deadline + MAX_EXTENSION (3 hours).
+    pub watchdog_deadline_ms: std::sync::atomic::AtomicI64,
+    /// The hard ceiling for watchdog_deadline_ms (initial + 3h). Extensions cannot exceed this.
+    pub watchdog_max_deadline_ms: std::sync::atomic::AtomicI64,
 }
 
 impl CancelToken {
@@ -275,6 +281,8 @@ impl CancelToken {
             child_pid: std::sync::Mutex::new(None),
             ssh_cancel: std::sync::Mutex::new(None),
             tmux_session: std::sync::Mutex::new(None),
+            watchdog_deadline_ms: std::sync::atomic::AtomicI64::new(0),
+            watchdog_max_deadline_ms: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -894,9 +902,11 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         last_model = Some(model.to_string());
                     }
                     if let Some(usage) = msg_obj.get("usage") {
-                        if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                            accum_input_tokens += inp;
-                        }
+                        // Include cache tokens in input total for accurate context occupancy
+                        let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        accum_input_tokens += inp + cache_read + cache_creation;
                         if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                             accum_output_tokens += out;
                         }
@@ -1191,9 +1201,11 @@ pub(crate) fn process_stream_line(
                 state.last_model = Some(model.to_string());
             }
             if let Some(usage) = msg_obj.get("usage") {
-                if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                    state.accum_input_tokens += inp;
-                }
+                // Include cache tokens in input total for accurate context occupancy
+                let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                state.accum_input_tokens += inp + cache_read + cache_creation;
                 if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                     state.accum_output_tokens += out;
                 }
@@ -2082,7 +2094,8 @@ pub(crate) fn read_output_file_until_result(
                         // auto-continue transitions. With adaptive backoff the loop
                         // cadence varies, so wall-clock time is the reliable measure.
                         let ready_elapsed = first_ready_at.unwrap().elapsed();
-                        if ready_elapsed >= Duration::from_secs(15) && consecutive_ready_count >= 3 {
+                        if ready_elapsed >= Duration::from_secs(15) && consecutive_ready_count >= 3
+                        {
                             debug_log(
                                 "Session returned to ready prompt without result event; synthesizing completion",
                             );
@@ -2776,10 +2789,8 @@ mod tests {
     #[test]
     fn test_extra_tool_uses_non_assistant() {
         // Non-assistant types should return empty.
-        let json: Value = serde_json::from_str(
-            r#"{"type":"result","subtype":"success","result":"ok"}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"result","subtype":"success","result":"ok"}"#).unwrap();
         let extras = parse_assistant_extra_tool_uses(&json);
         assert!(extras.is_empty());
     }
