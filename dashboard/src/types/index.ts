@@ -494,10 +494,32 @@ export interface PipelineHistoryEntry {
   completed_at: number | null;
 }
 
+// Pipeline Config Hierarchy (#135)
+export interface PipelineConfigFull {
+  name: string;
+  version: number;
+  states: { id: string; label: string; terminal?: boolean }[];
+  transitions: { from: string; to: string; type: "free" | "gated" | "force_only"; gates?: string[] }[];
+  gates: Record<string, { type: string; check?: string; description?: string }>;
+  hooks: Record<string, { on_enter: string[]; on_exit: string[] }>;
+  clocks: Record<string, { set: string; mode?: string }>;
+  timeouts: Record<string, { duration: string; clock: string; max_retries?: number; on_exhaust?: string; condition?: string }>;
+}
+
+export interface PipelineOverride {
+  states?: PipelineConfigFull["states"];
+  transitions?: PipelineConfigFull["transitions"];
+  gates?: PipelineConfigFull["gates"];
+  hooks?: PipelineConfigFull["hooks"];
+  clocks?: PipelineConfigFull["clocks"];
+  timeouts?: PipelineConfigFull["timeouts"];
+}
+
 export interface KanbanRepoSource {
   id: string;
   repo: string;
   default_agent_id: string | null;
+  pipeline_config: PipelineOverride | null;
   created_at: number;
 }
 

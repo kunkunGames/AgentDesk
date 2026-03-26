@@ -13,6 +13,9 @@ fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Optio
     None
 }
 
+/// Check whether a **successful** result record exists after the given offset.
+/// Error results are not considered completion — they should not trigger the
+/// recovery completed-turn path (✅ reaction, idle dispatch, etc.).
 fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {
     let Ok(bytes) = std::fs::read(output_path) else {
         return false;
@@ -29,16 +32,18 @@ fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool 
             if trimmed.is_empty() {
                 return false;
             }
-            serde_json::from_str::<serde_json::Value>(trimmed)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("type")
-                        .and_then(|kind| kind.as_str())
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some("result")
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                return false;
+            };
+            let is_result = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                == Some("result");
+            let is_error = value
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            is_result && !is_error
         })
 }
 
@@ -48,6 +53,10 @@ fn extract_response_from_output(output_path: &str, start_offset: u64) -> String 
 }
 
 /// Public wrapper for turn_bridge fallback recovery.
+///
+/// Mirrors the `resolve_done_response` logic from `turn_bridge.rs`:
+/// when tool_use was seen and no post-tool assistant text followed,
+/// prefer the `result` record over stale pre-tool narration.
 pub(super) fn extract_response_from_output_pub(output_path: &str, start_offset: u64) -> String {
     let Ok(bytes) = std::fs::read(output_path) else {
         return String::new();
@@ -58,6 +67,10 @@ pub(super) fn extract_response_from_output_pub(output_path: &str, start_offset: 
         .unwrap_or(bytes.len());
 
     let mut response = String::new();
+    let mut any_tool_used = false;
+    let mut has_post_tool_text = false;
+    let mut result_text = String::new();
+
     for line in String::from_utf8_lossy(&bytes[start..]).lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -67,18 +80,61 @@ pub(super) fn extract_response_from_output_pub(output_path: &str, start_offset: 
             continue;
         };
         let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if msg_type == "assistant" {
-            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
-                if let Some(arr) = content.as_array() {
-                    for block in arr {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                response.push_str(text);
+        match msg_type {
+            "assistant" => {
+                if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
+                    if let Some(arr) = content.as_array() {
+                        let mut block_has_tool = false;
+                        let mut block_has_text = false;
+                        for block in arr {
+                            match block.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => {
+                                    if let Some(text) =
+                                        block.get("text").and_then(|t| t.as_str())
+                                    {
+                                        if !text.is_empty() {
+                                            response.push_str(text);
+                                            block_has_text = true;
+                                        }
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    block_has_tool = true;
+                                }
+                                _ => {}
                             }
+                        }
+                        if block_has_tool {
+                            any_tool_used = true;
+                            // Reset: text in a block that also has tool_use is pre-tool narration
+                            has_post_tool_text = false;
+                        } else if block_has_text && any_tool_used {
+                            has_post_tool_text = true;
                         }
                     }
                 }
             }
+            "result" => {
+                let subtype = value.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                if subtype == "success" {
+                    if let Some(r) = value.get("result").and_then(|v| v.as_str()) {
+                        result_text = r.to_string();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Apply resolve_done_response logic: if tool was used and no post-tool
+    // assistant text followed, the accumulated response is stale narration —
+    // prefer the authoritative result record.
+    if !result_text.is_empty() {
+        if response.trim().is_empty() {
+            return result_text;
+        }
+        if any_tool_used && !has_post_tool_text {
+            return result_text;
         }
     }
     response
@@ -187,29 +243,81 @@ pub(super) async fn restore_inflight_turns(
                 super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
                 super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
                 // Complete the dispatch if this was a dispatch turn — the normal
-                // idle→auto_complete path was lost when dcserver restarted.
+                // completion path was lost when dcserver restarted.
+                // #142: Check dispatch type — implementation/rework need explicit completion,
+                // review can use idle auto-complete.
                 let recovered_dispatch_id = parse_dispatch_id(&state.user_text);
                 if let Some(ref did) = recovered_dispatch_id {
-                    let adk_session_key =
-                        build_adk_session_key(shared, ChannelId::new(state.channel_id), provider)
-                            .await;
-                    post_adk_session_status(
-                        adk_session_key.as_deref(),
-                        state.channel_name.as_deref(),
-                        Some(provider.as_str()),
-                        "idle",
-                        provider,
-                        None,
-                        None,
-                        None,
-                        Some(did),
-                        shared.api_port,
-                    )
-                    .await;
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ✓ posted idle with dispatch_id {did} for completed-during-downtime recovery"
+                    // #142: For implementation/rework, idle won't auto-complete (#115).
+                    // Use PATCH /api/dispatches/:id to complete directly.
+                    // For review, idle auto-complete works fine.
+                    let complete_url = format!(
+                        "http://127.0.0.1:{}/api/dispatches/{}",
+                        shared.api_port, did
                     );
+                    let client = reqwest::Client::new();
+                    let patch_result = client
+                        .patch(&complete_url)
+                        .json(&serde_json::json!({
+                            "status": "completed",
+                            "result": {"completion_source": "recovery_completed_during_downtime"},
+                        }))
+                        .send()
+                        .await;
+                    match patch_result {
+                        Ok(resp) if resp.status().is_success() => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!(
+                                "  [{ts}] ✓ recovery: completed dispatch {did} via API (completed-during-downtime)"
+                            );
+                        }
+                        Ok(resp) => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            let status = resp.status();
+                            println!(
+                                "  [{ts}] ⚠ recovery: dispatch {did} API completion failed ({status}), falling back to idle"
+                            );
+                            // Fallback: post idle (works for review type)
+                            let adk_session_key =
+                                build_adk_session_key(shared, ChannelId::new(state.channel_id), provider)
+                                    .await;
+                            post_adk_session_status(
+                                adk_session_key.as_deref(),
+                                state.channel_name.as_deref(),
+                                Some(provider.as_str()),
+                                "idle",
+                                provider,
+                                None,
+                                None,
+                                None,
+                                Some(did),
+                                shared.api_port,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!(
+                                "  [{ts}] ⚠ recovery: dispatch {did} API call failed ({e}), falling back to idle"
+                            );
+                            let adk_session_key =
+                                build_adk_session_key(shared, ChannelId::new(state.channel_id), provider)
+                                    .await;
+                            post_adk_session_status(
+                                adk_session_key.as_deref(),
+                                state.channel_name.as_deref(),
+                                Some(provider.as_str()),
+                                "idle",
+                                provider,
+                                None,
+                                None,
+                                None,
+                                Some(did),
+                                shared.api_port,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 super::restart_report::clear_restart_report(provider, state.channel_id);
                 clear_inflight_state(provider, state.channel_id);
@@ -626,7 +734,7 @@ pub(super) async fn restore_inflight_turns(
 
 #[cfg(test)]
 mod tests {
-    use super::{output_has_bytes_after_offset, output_has_result_after_offset};
+    use super::*;
     use std::io::Write;
 
     #[test]
@@ -693,6 +801,133 @@ mod tests {
         assert!(!output_has_bytes_after_offset(
             file.path().to_str().unwrap(),
             offset
+        ));
+    }
+
+    fn write_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn recovery_text_then_tool_then_result_prefers_result() {
+        // Text -> ToolUse -> Done(result): pre-tool narration should be replaced
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"이슈를 생성합니다."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"이슈 #42를 생성했습니다."}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "이슈 #42를 생성했습니다.");
+    }
+
+    #[test]
+    fn recovery_text_only_returns_text() {
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"안녕하세요"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"done"}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "안녕하세요");
+    }
+
+    #[test]
+    fn recovery_mixed_text_tool_in_single_block_prefers_result() {
+        // Single assistant message with [text, tool_use] — text is pre-tool narration
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"작업 시작"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"완료했습니다."}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "완료했습니다.");
+    }
+
+    #[test]
+    fn recovery_tool_then_post_tool_text_keeps_text() {
+        // Text -> ToolUse -> post-tool Text: should keep accumulated text
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"시작합니다."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"결과를 확인했습니다."}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"done"}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "시작합니다.결과를 확인했습니다.");
+    }
+
+    #[test]
+    fn recovery_empty_response_uses_result() {
+        let file = write_jsonl(&[
+            r#"{"type":"result","subtype":"success","result":"결과만 있음"}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "결과만 있음");
+    }
+
+    #[test]
+    fn recovery_error_result_not_used() {
+        // Error results should not override text
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"진행 중"}]}}"#,
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"crash"}"#,
+        ]);
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), 0);
+        assert_eq!(resp, "진행 중");
+    }
+
+    #[test]
+    fn recovery_respects_start_offset() {
+        // Only data after offset should be considered
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let line1 = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"이전 턴"}]}}"#;
+        writeln!(file, "{}", line1).unwrap();
+        let offset = file.as_file().metadata().unwrap().len();
+        let line2 = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"새 턴"}]}}"#;
+        writeln!(file, "{}", line2).unwrap();
+        file.flush().unwrap();
+
+        let resp = extract_response_from_output_pub(file.path().to_str().unwrap(), offset);
+        assert_eq!(resp, "새 턴");
+    }
+
+    // ========== output_has_result_after_offset: error result tests ==========
+
+    #[test]
+    fn error_result_not_treated_as_completion() {
+        let file = write_jsonl(&[
+            r#"{"type":"result","subtype":"error","is_error":true,"errors":["crash"]}"#,
+        ]);
+        assert!(!output_has_result_after_offset(
+            file.path().to_str().unwrap(),
+            0
+        ));
+    }
+
+    #[test]
+    fn success_result_treated_as_completion() {
+        let file = write_jsonl(&[
+            r#"{"type":"result","subtype":"success","result":"done"}"#,
+        ]);
+        assert!(output_has_result_after_offset(
+            file.path().to_str().unwrap(),
+            0
+        ));
+    }
+
+    #[test]
+    fn error_result_before_success_still_completes() {
+        // Error followed by success — the success should be detected
+        let file = write_jsonl(&[
+            r#"{"type":"result","subtype":"error","is_error":true,"errors":["retry"]}"#,
+            r#"{"type":"result","subtype":"success","result":"ok"}"#,
+        ]);
+        assert!(output_has_result_after_offset(
+            file.path().to_str().unwrap(),
+            0
         ));
     }
 }

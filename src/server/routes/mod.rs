@@ -195,6 +195,27 @@ pub fn api_router(
             "/pipeline/cards/{cardId}/history",
             get(pipeline::get_card_history),
         )
+        // Pipeline config hierarchy (#135)
+        .route(
+            "/pipeline/config/default",
+            get(pipeline::get_default_pipeline),
+        )
+        .route(
+            "/pipeline/config/effective",
+            get(pipeline::get_effective_pipeline),
+        )
+        .route(
+            "/pipeline/config/repo/{owner}/{repo}",
+            get(pipeline::get_repo_pipeline).put(pipeline::set_repo_pipeline),
+        )
+        .route(
+            "/pipeline/config/agent/{agent_id}",
+            get(pipeline::get_agent_pipeline).put(pipeline::set_agent_pipeline),
+        )
+        .route(
+            "/pipeline/config/graph",
+            get(pipeline::get_pipeline_graph),
+        )
         // GitHub repos
         .route(
             "/github/repos",
@@ -284,6 +305,10 @@ pub fn api_router(
             "/dispatched-sessions/clear-stale-session-id",
             post(dispatched_sessions::clear_stale_session_id),
         )
+        .route(
+            "/sessions/force-kill",
+            post(dispatched_sessions::force_kill_session),
+        )
         // Messages
         .route(
             "/messages",
@@ -330,6 +355,9 @@ pub fn api_router(
         .route("/auto-queue/runs/{id}", patch(auto_queue::update_run))
         .route("/auto-queue/reorder", patch(auto_queue::reorder))
         .route("/auto-queue/reset", post(auto_queue::reset))
+        .route("/auto-queue/pause", post(auto_queue::pause))
+        .route("/auto-queue/resume", post(auto_queue::resume_run))
+        .route("/auto-queue/cancel", post(auto_queue::cancel))
         // Queue management (#138)
         .route("/channels/{id}/queue", get(queue_api::list_channel_queue))
         .route(
@@ -342,6 +370,10 @@ pub fn api_router(
             post(queue_api::cancel_all_dispatches),
         )
         .route("/turns/{channel_id}/cancel", post(queue_api::cancel_turn))
+        .route(
+            "/turns/{channel_id}/extend-timeout",
+            post(queue_api::extend_turn_timeout),
+        )
         .route(
             "/auto-queue/runs/{id}/order",
             post(auto_queue::submit_order),
@@ -362,6 +394,11 @@ pub fn api_router(
         .route(
             "/review-decision",
             post(review_verdict::submit_review_decision),
+        )
+        // #119: Review tuning aggregation
+        .route(
+            "/review-tuning/aggregate",
+            post(review_verdict::aggregate_review_tuning),
         )
         .route("/pm-decision", post(kanban::pm_decision))
         .layer(axum::middleware::from_fn(auth::auth_middleware))

@@ -601,6 +601,290 @@ fn stage_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value>
     }))
 }
 
+// ── Pipeline Config Hierarchy (#135) ─────────────────────────
+
+/// Query params for effective pipeline resolution.
+#[derive(Debug, Deserialize)]
+pub struct EffectivePipelineQuery {
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+/// GET /api/pipeline/config/default — the base pipeline YAML as JSON
+pub async fn get_default_pipeline() -> (StatusCode, Json<serde_json::Value>) {
+    match crate::pipeline::try_get() {
+        Some(p) => (StatusCode::OK, Json(p.to_json())),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "default pipeline not loaded"})),
+        ),
+    }
+}
+
+/// GET /api/pipeline/config/effective?repo=...&agent_id=...
+/// Returns the merged effective pipeline for a repo/agent combination.
+pub async fn get_effective_pipeline(
+    State(state): State<AppState>,
+    Query(params): Query<EffectivePipelineQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if crate::pipeline::try_get().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "default pipeline not loaded"})),
+        );
+    }
+
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let effective = crate::pipeline::resolve_for_card(
+        &conn,
+        params.repo.as_deref(),
+        params.agent_id.as_deref(),
+    );
+
+    // Also return which layers had overrides
+    let repo_has_override = params.repo.as_ref().map_or(false, |rid| {
+        conn.query_row(
+            "SELECT pipeline_config IS NOT NULL AND pipeline_config != '' FROM github_repos WHERE id = ?1",
+            [rid],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
+    let agent_has_override = params.agent_id.as_ref().map_or(false, |aid| {
+        conn.query_row(
+            "SELECT pipeline_config IS NOT NULL AND pipeline_config != '' FROM agents WHERE id = ?1",
+            [aid],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "pipeline": effective.to_json(),
+            "layers": {
+                "default": true,
+                "repo": repo_has_override,
+                "agent": agent_has_override,
+            },
+        })),
+    )
+}
+
+/// Body for setting pipeline override
+#[derive(Debug, Deserialize)]
+pub struct SetPipelineOverrideBody {
+    pub config: Option<serde_json::Value>,
+}
+
+/// GET /api/pipeline/config/repo/:owner/:repo
+pub async fn get_repo_pipeline(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let id = format!("{owner}/{repo}");
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT pipeline_config FROM github_repos WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
+    let parsed: serde_json::Value = config
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    (
+        StatusCode::OK,
+        Json(json!({"repo": id, "pipeline_config": parsed})),
+    )
+}
+
+/// PUT /api/pipeline/config/repo/:owner/:repo
+pub async fn set_repo_pipeline(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(body): Json<SetPipelineOverrideBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let id = format!("{owner}/{repo}");
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    // Validate the override parses correctly if provided
+    let config_str = match &body.config {
+        Some(v) if !v.is_null() => {
+            let s = v.to_string();
+            if let Err(e) = crate::pipeline::parse_override(&s) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid pipeline config: {e}")})),
+                );
+            }
+            Some(s)
+        }
+        _ => None,
+    };
+
+    match conn.execute(
+        "UPDATE github_repos SET pipeline_config = ?1 WHERE id = ?2",
+        rusqlite::params![config_str, id],
+    ) {
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "repo not found"})),
+        ),
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true, "repo": id}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/pipeline/config/agent/:agent_id
+pub async fn get_agent_pipeline(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let config: Option<String> = conn
+        .query_row(
+            "SELECT pipeline_config FROM agents WHERE id = ?1",
+            [&agent_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
+    let parsed: serde_json::Value = config
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    (
+        StatusCode::OK,
+        Json(json!({"agent_id": agent_id, "pipeline_config": parsed})),
+    )
+}
+
+/// PUT /api/pipeline/config/agent/:agent_id
+pub async fn set_agent_pipeline(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(body): Json<SetPipelineOverrideBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let config_str = match &body.config {
+        Some(v) if !v.is_null() => {
+            let s = v.to_string();
+            if let Err(e) = crate::pipeline::parse_override(&s) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid pipeline config: {e}")})),
+                );
+            }
+            Some(s)
+        }
+        _ => None,
+    };
+
+    match conn.execute(
+        "UPDATE agents SET pipeline_config = ?1 WHERE id = ?2",
+        rusqlite::params![config_str, agent_id],
+    ) {
+        Ok(0) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "agent not found"})),
+        ),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "agent_id": agent_id})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/pipeline/config/graph?repo=...&agent_id=...
+/// Returns the effective pipeline as a visual graph (nodes + edges).
+pub async fn get_pipeline_graph(
+    State(state): State<AppState>,
+    Query(params): Query<EffectivePipelineQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if crate::pipeline::try_get().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "default pipeline not loaded"})),
+        );
+    }
+
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let effective = crate::pipeline::resolve_for_card(
+        &conn,
+        params.repo.as_deref(),
+        params.agent_id.as_deref(),
+    );
+
+    (StatusCode::OK, Json(effective.to_graph()))
+}
+
 /// Extended version that includes dashboard v2 columns
 fn extended_stage_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
     let repo_id = row.get::<_, Option<String>>(1)?;

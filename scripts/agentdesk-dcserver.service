@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 Environment=AGENTDESK_ROOT_DIR=%h/.adk/release
-ExecStart=%h/.adk/release/bin/agentdesk --dcserver
+ExecStart=%h/.adk/release/bin/agentdesk dcserver
 WorkingDirectory=%h/.adk/release
 Restart=on-failure
 RestartSec=5

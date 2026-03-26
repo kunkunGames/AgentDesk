@@ -241,6 +241,24 @@ pub(super) fn load_shared_prompt() -> Option<String> {
     Some(truncated)
 }
 
+/// #119: Load review tuning guidance from the well-known runtime file.
+/// Returns None if file doesn't exist or is empty.
+pub(super) fn load_review_tuning_guidance() -> Option<String> {
+    let root = super::runtime_store::agentdesk_root()?;
+    let path = root.join("runtime").join("review-tuning-guidance.txt");
+    let content = fs::read_to_string(path).ok()?;
+    if content.trim().is_empty() {
+        return None;
+    }
+    // Cap at 2000 chars to avoid bloating the prompt
+    const MAX_CHARS: usize = 2_000;
+    if content.chars().count() <= MAX_CHARS {
+        Some(content)
+    } else {
+        Some(content.chars().take(MAX_CHARS).collect())
+    }
+}
+
 /// Check if a role_id is a known agent in org schema or role_map channel bindings.
 /// Unlike load_peer_agents() which reads meeting.available_agents in legacy mode,
 /// this checks the full agent/channel binding registry.

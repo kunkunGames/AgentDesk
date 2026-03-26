@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>AGENTDESK_BIN</string>
-        <string>--dcserver</string>
+        <string>dcserver</string>
     </array>
 
     <key>EnvironmentVariables</key>

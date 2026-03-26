@@ -85,7 +85,7 @@ const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 ho
 const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
 const DEAD_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Minimum interval between Discord placeholder edits for progress status.
 /// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
@@ -111,6 +111,26 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
             .unwrap_or(3600);
         Duration::from_secs(secs)
     })
+}
+
+fn watchdog_deadline_overrides() -> &'static dashmap::DashMap<u64, i64> {
+    static OVERRIDES: std::sync::OnceLock<dashmap::DashMap<u64, i64>> =
+        std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(dashmap::DashMap::new)
+}
+
+pub(crate) fn set_watchdog_deadline_override(channel_id: u64, deadline_ms: i64) {
+    watchdog_deadline_overrides().insert(channel_id, deadline_ms);
+}
+
+pub(crate) fn watchdog_deadline_override(channel_id: u64) -> Option<i64> {
+    watchdog_deadline_overrides()
+        .get(&channel_id)
+        .map(|deadline| *deadline)
+}
+
+pub(crate) fn clear_watchdog_deadline_override(channel_id: u64) {
+    watchdog_deadline_overrides().remove(&channel_id);
 }
 
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
@@ -1443,14 +1463,14 @@ pub async fn run_bot(
                     }
                 });
 
-                // Background: hot-reload skills on file changes (10s polling)
+                // Background: hot-reload skills on file changes (30s polling)
                 // Scans home-level AND all active project-level skill directories.
                 let shared_for_skills = shared_for_tmux.clone();
                 let provider_for_skills = provider.clone();
                 tokio::spawn(async move {
                     let mut last_fingerprint: (usize, u64) = (0, 0); // (file_count, max_mtime_epoch)
                     loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                         // Collect unique project paths from active sessions
                         let project_paths: Vec<String> = {
                             let data = shared_for_skills.core.lock().await;
@@ -2496,14 +2516,7 @@ pub(super) async fn auto_restore_session(
             if need_db_restore {
                 if let Some(ref ch_name) = restore_ch_name {
                     let tmux_name = provider.build_tmux_session_name(ch_name);
-                    let hostname = std::process::Command::new("hostname")
-                        .arg("-s")
-                        .output()
-                        .ok()
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let hostname = crate::services::platform::hostname_short();
                     let session_key = format!("{}:{}", hostname, tmux_name);
                     if let Some(restored_sid) =
                         adk_session::fetch_provider_session_id(&session_key, shared.api_port).await

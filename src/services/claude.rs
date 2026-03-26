@@ -266,6 +266,12 @@ pub struct CancelToken {
     pub ssh_cancel: std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// tmux session name for cleanup on cancel
     pub tmux_session: std::sync::Mutex<Option<String>>,
+    /// Watchdog deadline as Unix timestamp in milliseconds.
+    /// The watchdog fires when `now_ms >= deadline_ms`. Extend by setting a future value.
+    /// Maximum absolute cap: initial deadline + MAX_EXTENSION (3 hours).
+    pub watchdog_deadline_ms: std::sync::atomic::AtomicI64,
+    /// The hard ceiling for watchdog_deadline_ms (initial + 3h). Extensions cannot exceed this.
+    pub watchdog_max_deadline_ms: std::sync::atomic::AtomicI64,
 }
 
 impl CancelToken {
@@ -275,6 +281,8 @@ impl CancelToken {
             child_pid: std::sync::Mutex::new(None),
             ssh_cancel: std::sync::Mutex::new(None),
             tmux_session: std::sync::Mutex::new(None),
+            watchdog_deadline_ms: std::sync::atomic::AtomicI64::new(0),
+            watchdog_max_deadline_ms: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -894,9 +902,11 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         last_model = Some(model.to_string());
                     }
                     if let Some(usage) = msg_obj.get("usage") {
-                        if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                            accum_input_tokens += inp;
-                        }
+                        // Include cache tokens in input total for accurate context occupancy
+                        let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        accum_input_tokens += inp + cache_read + cache_creation;
                         if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                             accum_output_tokens += out;
                         }
@@ -1191,9 +1201,11 @@ pub(crate) fn process_stream_line(
                 state.last_model = Some(model.to_string());
             }
             if let Some(usage) = msg_obj.get("usage") {
-                if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                    state.accum_input_tokens += inp;
-                }
+                // Include cache tokens in input total for accurate context occupancy
+                let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                state.accum_input_tokens += inp + cache_read + cache_creation;
                 if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                     state.accum_output_tokens += out;
                 }
@@ -1658,7 +1670,7 @@ fn execute_streaming_local_tmux(
     let script_content = format!(
         "#!/bin/bash\n\
         {env}\
-        exec {exe} --tmux-wrapper \\\n  \
+        exec {exe} tmux-wrapper \\\n  \
         --output-file {output} \\\n  \
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \
@@ -1995,7 +2007,10 @@ pub(crate) fn read_output_file_until_result(
     ));
 
     // Wait for output file to exist (wrapper might not have created it yet)
+    // Uses exponential backoff: 10ms → 500ms
     let wait_start = std::time::Instant::now();
+    let mut wait_interval = Duration::from_millis(10);
+    let max_wait_interval = Duration::from_millis(500);
     loop {
         if std::fs::metadata(output_path).is_ok() {
             break;
@@ -2010,7 +2025,11 @@ pub(crate) fn read_output_file_until_result(
                 });
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(wait_interval);
+        wait_interval = std::cmp::min(
+            Duration::from_millis((wait_interval.as_millis() as f64 * 1.5) as u64),
+            max_wait_interval,
+        );
     }
 
     let mut file = std::fs::File::open(output_path)
@@ -2024,6 +2043,7 @@ pub(crate) fn read_output_file_until_result(
     let mut buf = [0u8; 8192];
     let mut no_data_count: u32 = 0;
     let mut consecutive_ready_count: u32 = 0;
+    let mut first_ready_at: Option<std::time::Instant> = None;
 
     loop {
         // Check cancellation
@@ -2040,8 +2060,8 @@ pub(crate) fn read_output_file_until_result(
             Ok(0) => {
                 // No new data — check if session is still alive
                 no_data_count += 1;
-                if no_data_count % 50 == 0 {
-                    // Every ~5 seconds
+                if no_data_count % 25 == 0 {
+                    // Approximately every 3-5 seconds (varies with backoff)
                     if !(probe.is_alive)() {
                         debug_log("Session ended while reading output");
                         // Check for unread data before breaking
@@ -2065,10 +2085,17 @@ pub(crate) fn read_output_file_until_result(
                     // in the tmux pane — causing a false-positive completion.
                     let output_ever_grew = current_offset > start_offset;
                     if !has_new_bytes && output_ever_grew && (probe.is_ready_for_input)() {
+                        if first_ready_at.is_none() {
+                            first_ready_at = Some(std::time::Instant::now());
+                        }
                         consecutive_ready_count += 1;
-                        // Require 3 consecutive ready checks (~15s) to avoid false
-                        // positives during Claude Code auto-continue transitions.
-                        if consecutive_ready_count >= 3 {
+                        // Time-based guard: require at least 15 seconds of continuous
+                        // ready state to avoid false positives during Claude Code
+                        // auto-continue transitions. With adaptive backoff the loop
+                        // cadence varies, so wall-clock time is the reliable measure.
+                        let ready_elapsed = first_ready_at.unwrap().elapsed();
+                        if ready_elapsed >= Duration::from_secs(15) && consecutive_ready_count >= 3
+                        {
                             debug_log(
                                 "Session returned to ready prompt without result event; synthesizing completion",
                             );
@@ -2088,13 +2115,23 @@ pub(crate) fn read_output_file_until_result(
                         }
                     } else {
                         consecutive_ready_count = 0;
+                        first_ready_at = None;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                // Adaptive backoff: start fast (10ms), slow down to 200ms when idle
+                let read_interval = if no_data_count < 5 {
+                    Duration::from_millis(10)
+                } else if no_data_count < 20 {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_millis(200)
+                };
+                std::thread::sleep(read_interval);
             }
             Ok(n) => {
                 no_data_count = 0;
                 consecutive_ready_count = 0;
+                first_ready_at = None;
                 current_offset += n as u64;
                 let _ = sender.send(StreamMessage::OutputOffset {
                     offset: current_offset,

@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    # Windows may fail until P1 platform-compat (#98-#101) is complete
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test --all-targets
+        env:
+          RUST_BACKTRACE: 1
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+
+      - name: cargo fmt -- --check
+        run: cargo fmt -- --check
+        continue-on-error: true
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -W clippy::all
+
+  scripts:
+    name: Script checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: shellcheck scripts
+        run: |
+          FAILED=0
+          while IFS= read -r f; do
+            shellcheck -S error "$f" || FAILED=1
+          done < <(find . -name '*.sh' -not -path './target/*' -not -path './.git/*')
+          exit $FAILED
+        shell: bash
+
+      - name: Check hardcoded port/path drift
+        run: |
+          FAIL=0
+          echo "=== Checking for hardcoded ports ==="
+          # List port references for visibility (informational — ports are expected in config/defaults)
+          grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \
+            --exclude-dir=target --exclude-dir=.git \
+            | grep -v 'Cargo.lock' \
+            | grep -v '// port' \
+            | grep -v '# port' || true
+
+          echo ""
+          echo "=== Checking for hardcoded home paths (informational — see #100) ==="
+          if grep -rn 'env!("HOME")' --include='*.rs' \
+            --exclude-dir=target --exclude-dir=.git 2>/dev/null; then
+            echo "NOTE: env!(\"HOME\") found — tracked in #100"
+          else
+            echo "OK: No env!(\"HOME\") found"
+          fi
+          exit $FAIL
+
+      - name: Path integrity check
+        run: |
+          FAIL=0
+          echo "=== Checking Cargo.toml paths ==="
+          # Ensure no absolute paths in Cargo.toml
+          if grep -n '/Users/\|/home/' Cargo.toml 2>/dev/null; then
+            echo "ERROR: Absolute paths found in Cargo.toml"
+            FAIL=1
+          fi
+
+          echo "=== Checking policies/ exist ==="
+          # Core policy files must be present
+          for f in policies/default-pipeline.yaml policies/kanban-rules.js policies/timeouts.js policies/auto-queue.js policies/review-automation.js; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: Required policy file missing: $f"
+              FAIL=1
+            fi
+          done
+
+          echo "=== Checking dashboard source exists ==="
+          if [ ! -f "dashboard/package.json" ]; then
+            echo "ERROR: dashboard/package.json missing"
+            FAIL=1
+          fi
+
+          exit $FAIL

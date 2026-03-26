@@ -21,7 +21,7 @@ pub struct SessionConfig {
     pub prompt_path: String,
     /// Provider-specific wrapper args (e.g., --codex-bin, -- claude ...)
     pub wrapper_args: Vec<String>,
-    /// Whether this is a codex session (uses --codex-tmux-wrapper)
+    /// Whether this is a codex session (uses codex-tmux-wrapper subcommand)
     pub is_codex: bool,
     /// Environment variables to set
     pub env_vars: Vec<(String, String)>,
@@ -69,9 +69,9 @@ impl SessionBackend for ProcessBackend {
 
         // 2. Build wrapper command args
         let wrapper_flag = if config.is_codex {
-            "--codex-tmux-wrapper"
+            "codex-tmux-wrapper"
         } else {
-            "--tmux-wrapper"
+            "tmux-wrapper"
         };
 
         let mut args = vec![
@@ -120,6 +120,18 @@ impl SessionBackend for ProcessBackend {
         {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0); // new process group = wrapper PID
+        }
+
+        #[cfg(not(unix))]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            // CREATE_NO_WINDOW gives the wrapper a hidden console that children
+            // inherit. Without this, every cmd.exe spawned by Claude/Codex
+            // creates its own *visible* console window when the parent process
+            // has no console (e.g. running as a Windows service via NSSM).
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         }
 
         let mut child = cmd

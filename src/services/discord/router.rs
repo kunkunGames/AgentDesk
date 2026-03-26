@@ -1207,13 +1207,24 @@ pub(super) async fn handle_text_message(
         let watchdog_shared = shared.clone();
         let watchdog_http = ctx.http.clone();
         let timeout = super::turn_watchdog_timeout();
+        let initial_deadline_ms = chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
+        super::set_watchdog_deadline_override(channel_id.get(), initial_deadline_ms);
         tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            // If the token is still alive (not yet cancelled/completed), this turn is hung
-            if !watchdog_token
-                .cancelled
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if watchdog_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
+                }
+
+                let deadline_ms = super::watchdog_deadline_override(channel_id.get())
+                    .unwrap_or(initial_deadline_ms);
+                if chrono::Utc::now().timestamp_millis() < deadline_ms {
+                    continue;
+                }
+
                 // Verify this watchdog's token is still the CURRENT active token for this channel.
                 // A previous turn's watchdog must not cancel a newer turn that replaced the token.
                 // Using Arc::ptr_eq ensures we only fire if our token is still the active one.
@@ -1263,6 +1274,7 @@ pub(super) async fn handle_text_message(
                     };
                     let _ = channel_id.say(&watchdog_http, msg).await;
                 }
+                break;
             }
         });
     }

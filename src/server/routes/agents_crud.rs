@@ -45,6 +45,7 @@ pub(super) struct UpdateAgentBody {
     alias: Option<String>,
     cli_provider: Option<String>,
     sprite_number: Option<i64>,
+    pipeline_config: Option<serde_json::Value>,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────
@@ -64,7 +65,8 @@ pub(super) async fn list_agents(
                             (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                             (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
                             (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
-                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
+                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id,
+                            a.pipeline_config
                      FROM agents a
                      INNER JOIN office_agents oa ON oa.agent_id = a.id
                      LEFT JOIN departments d ON d.id = a.department
@@ -80,7 +82,8 @@ pub(super) async fn list_agents(
                             (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                             (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
                             (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
-                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
+                            (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id,
+                            a.pipeline_config
                      FROM agents a
                      LEFT JOIN departments d ON d.id = a.department
                      ORDER BY a.id".to_string(),
@@ -132,6 +135,8 @@ pub(super) async fn list_agents(
                         "personality": serde_json::Value::Null,
                         "current_task_id": row.get::<_, Option<String>>(17)?,
                         "current_thread_channel_id": row.get::<_, Option<String>>(18)?,
+                        "pipeline_config": row.get::<_, Option<String>>(19)?
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     }))
                 })
                 .ok();
@@ -160,7 +165,8 @@ pub(super) async fn get_agent(
                         (SELECT COUNT(DISTINCT kc.id) FROM kanban_cards kc WHERE kc.assigned_agent_id = a.id AND kc.status = 'done') AS tasks_done,
                         (SELECT COALESCE(SUM(s.tokens), 0) FROM sessions s WHERE s.agent_id = a.id) AS total_tokens,
                         (SELECT td2.id FROM task_dispatches td2 JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id WHERE td2.to_agent_id = a.id AND kc.status = 'in_progress' LIMIT 1) AS current_task,
-                        (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id
+                        (SELECT s.thread_channel_id FROM sessions s WHERE s.agent_id = a.id AND s.status = 'working' ORDER BY s.last_heartbeat DESC, s.id DESC LIMIT 1) AS current_thread_channel_id,
+                        a.pipeline_config
                  FROM agents a
                  LEFT JOIN departments d ON d.id = a.department
                  WHERE a.id = ?1",
@@ -196,6 +202,8 @@ pub(super) async fn get_agent(
                         "personality": serde_json::Value::Null,
                         "current_task_id": row.get::<_, Option<String>>(17)?,
                         "current_thread_channel_id": row.get::<_, Option<String>>(18)?,
+                        "pipeline_config": row.get::<_, Option<String>>(19)?
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     }))
                 },
             );
@@ -341,6 +349,22 @@ pub(super) async fn update_agent(
         values.push(Box::new(discord_channel_alt.clone()));
         idx += 1;
     }
+    if let Some(ref pipeline_config) = body.pipeline_config {
+        if pipeline_config.is_null() {
+            sets.push(format!("pipeline_config = NULL"));
+        } else {
+            let s = pipeline_config.to_string();
+            if let Err(e) = crate::pipeline::parse_override(&s) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid pipeline_config: {e}")})),
+                );
+            }
+            sets.push(format!("pipeline_config = ?{}", idx));
+            values.push(Box::new(s));
+            idx += 1;
+        }
+    }
 
     if sets.is_empty() {
         return (
@@ -373,7 +397,7 @@ pub(super) async fn update_agent(
 
     match conn.query_row(
         "SELECT id, name, name_ko, provider, department, avatar_emoji,
-                discord_channel_id, discord_channel_alt, status, xp
+                discord_channel_id, discord_channel_alt, status, xp, pipeline_config
          FROM agents WHERE id = ?1",
         [&id],
         |row| {
@@ -388,6 +412,8 @@ pub(super) async fn update_agent(
                 "discord_channel_alt": row.get::<_, Option<String>>(7)?,
                 "status": row.get::<_, Option<String>>(8)?,
                 "xp": row.get::<_, f64>(9).unwrap_or(0.0) as i64,
+                "pipeline_config": row.get::<_, Option<String>>(10)?
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
             }))
         },
     ) {

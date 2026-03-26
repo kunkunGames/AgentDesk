@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::db::Db;
-use crate::engine::{PolicyEngine, hooks::Hook};
+use crate::engine::PolicyEngine;
 
 /// Core dispatch creation: DB operations only, no hooks fired.
 ///
@@ -30,16 +30,17 @@ pub fn create_dispatch_core(
         };
         if let Some(obj) = ctx_val.as_object_mut() {
             if !obj.contains_key("reviewed_commit") {
-                let repo_dir = std::env::var("AGENTDESK_REPO_DIR")
-                    .unwrap_or_else(|_| format!("{}/AgentDesk", env!("HOME")));
-                if let Some(commit) = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .current_dir(&repo_dir)
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                {
+                let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
+                    Ok(d) => d,
+                    Err(_) => dirs::home_dir()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("HOME directory not found; set AGENTDESK_REPO_DIR")
+                        })?
+                        .join("AgentDesk")
+                        .to_string_lossy()
+                        .into_owned(),
+                };
+                if let Some(commit) = crate::services::platform::git_head_commit(&repo_dir) {
                     obj.insert("reviewed_commit".to_string(), json!(commit));
                 }
             }
@@ -91,13 +92,18 @@ pub fn create_dispatch_core(
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
-    // Guard: prevent ALL dispatches for done cards — done is terminal.
+    // Guard: prevent ALL dispatches for terminal cards (pipeline-driven).
     // No dispatch type should reopen a completed card.
-    if old_status == "done" {
+    crate::pipeline::ensure_loaded();
+    let is_terminal = crate::pipeline::try_get()
+        .map(|p| p.is_terminal(&old_status))
+        .unwrap_or(old_status == "done");
+    if is_terminal {
         return Err(anyhow::anyhow!(
-            "Cannot create {} dispatch for done card {} — cannot revert terminal card",
+            "Cannot create {} dispatch for terminal card {} (status: {}) — cannot revert terminal card",
             dispatch_type,
-            kanban_card_id
+            kanban_card_id,
+            old_status
         ));
     }
 
@@ -148,13 +154,168 @@ pub fn create_dispatch_core(
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     } else {
+        // Pipeline-driven: resolve the dispatch kickoff state (first gated target from dispatchable)
+        crate::pipeline::ensure_loaded();
+        let kickoff_state = crate::pipeline::try_get()
+            .and_then(|p| {
+                let dispatchable = p.dispatchable_states();
+                p.transitions.iter().find(|t| {
+                    t.transition_type == crate::pipeline::TransitionType::Gated
+                        && dispatchable.contains(&t.from.as_str())
+                }).map(|t| t.to.clone())
+            })
+            .unwrap_or_else(|| "requested".to_string());
+        // Build clock SQL from pipeline config
+        let clock_sql = crate::pipeline::try_get()
+            .and_then(|p| p.clock_for_state(&kickoff_state))
+            .map(|c| format!(", {} = datetime('now')", c.set))
+            .unwrap_or_else(|| ", requested_at = datetime('now')".to_string());
+        let sql = format!(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = ?2{clock_sql}, updated_at = datetime('now') WHERE id = ?3"
+        );
+        conn.execute(&sql, rusqlite::params![dispatch_id, kickoff_state, kanban_card_id])?;
+    }
+
+    Ok((dispatch_id, old_status))
+}
+
+/// Like `create_dispatch_core` but uses a pre-assigned dispatch ID (#121 intent model).
+/// Called by the intent executor when processing CreateDispatch intents.
+pub fn create_dispatch_core_with_id(
+    db: &Db,
+    dispatch_id: &str,
+    kanban_card_id: &str,
+    to_agent_id: &str,
+    dispatch_type: &str,
+    title: &str,
+    context: &serde_json::Value,
+) -> Result<(String, String)> {
+    // For review dispatches, inject reviewed_commit (HEAD) and provider info
+    let context_str = if dispatch_type == "review" {
+        let mut ctx_val = if context.is_object() {
+            context.clone()
+        } else {
+            json!({})
+        };
+        if let Some(obj) = ctx_val.as_object_mut() {
+            if !obj.contains_key("reviewed_commit") {
+                let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
+                    Ok(d) => d,
+                    Err(_) => dirs::home_dir()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("HOME directory not found; set AGENTDESK_REPO_DIR")
+                        })?
+                        .join("AgentDesk")
+                        .to_string_lossy()
+                        .into_owned(),
+                };
+                if let Some(commit) = crate::services::platform::git_head_commit(&repo_dir) {
+                    obj.insert("reviewed_commit".to_string(), json!(commit));
+                }
+            }
+            if !obj.contains_key("from_provider") || !obj.contains_key("target_provider") {
+                if let Ok(conn) = db.separate_conn() {
+                    if let Ok((ch, alt)) = conn.query_row(
+                        "SELECT discord_channel_id, discord_channel_alt FROM agents WHERE id = ?1",
+                        [to_agent_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    ) {
+                        if !obj.contains_key("from_provider") {
+                            if let Some(fp) = ch.as_deref().and_then(provider_from_channel_suffix) {
+                                obj.insert("from_provider".to_string(), json!(fp));
+                            }
+                        }
+                        if !obj.contains_key("target_provider") {
+                            if let Some(tp) =
+                                alt.as_deref().and_then(provider_from_channel_suffix)
+                            {
+                                obj.insert("target_provider".to_string(), json!(tp));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&ctx_val)?
+    } else {
+        serde_json::to_string(context)?
+    };
+
+    let conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+
+    let old_status: String = conn
+        .query_row(
+            "SELECT status FROM kanban_cards WHERE id = ?1",
+            [kanban_card_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
+
+    crate::pipeline::ensure_loaded();
+    let is_terminal = crate::pipeline::try_get()
+        .map(|p| p.is_terminal(&old_status))
+        .unwrap_or(old_status == "done");
+    if is_terminal {
+        return Err(anyhow::anyhow!(
+            "Cannot create {} dispatch for terminal card {} (status: {}) — cannot revert terminal card",
+            dispatch_type, kanban_card_id, old_status
+        ));
+    }
+
+    let is_review_type = dispatch_type == "review"
+        || dispatch_type == "review-decision"
+        || dispatch_type == "rework";
+
+    if dispatch_type == "review-decision" {
+        let cancelled = conn.execute(
+            "UPDATE task_dispatches SET status = 'cancelled', result = '{\"reason\":\"superseded_by_new_review_decision\"}', updated_at = datetime('now') \
+             WHERE kanban_card_id = ?1 AND dispatch_type = 'review-decision' AND status IN ('pending', 'dispatched')",
+            [kanban_card_id],
+        ).unwrap_or(0);
+        if cancelled > 0 {
+            tracing::info!(
+                "[dispatch] Cancelled {} stale review-decision(s) for card {} before creating new one",
+                cancelled, kanban_card_id
+            );
+        }
+    }
+
+    if let Err(e) = conn.execute(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, datetime('now'), datetime('now'))",
+        rusqlite::params![dispatch_id, kanban_card_id, to_agent_id, dispatch_type, title, context_str],
+    ) {
+        if dispatch_type == "review-decision"
+            && e.to_string().contains("UNIQUE constraint failed")
+        {
+            return Err(anyhow::anyhow!(
+                "review-decision already exists for card {} (concurrent race prevented by DB constraint)",
+                kanban_card_id
+            ));
+        }
+        return Err(e.into());
+    }
+
+    if is_review_type {
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![dispatch_id, kanban_card_id],
+        )?;
+    } else {
         conn.execute(
             "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = 'requested', requested_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     }
 
-    Ok((dispatch_id, old_status))
+    Ok((dispatch_id.to_string(), old_status))
 }
 
 /// Create a new dispatch for a kanban card.
@@ -188,17 +349,19 @@ pub fn create_dispatch(
     let dispatch = query_dispatch_row(&conn, &dispatch_id)?;
     drop(conn);
 
-    // Fire OnCardTransition hook — use try_fire_hook to avoid deadlock
-    // with concurrent onTick holding the engine lock. If engine is busy,
-    // the hook is skipped; the card state is already committed to DB.
-    let _ = engine.try_fire_hook(
-        Hook::OnCardTransition,
-        json!({
-            "card_id": kanban_card_id,
-            "from": old_status,
-            "to": "requested",
-        }),
-    );
+    // Fire pipeline-defined on_enter hooks for the kickoff state (#134).
+    // Resolve kickoff state from pipeline (same logic as create_dispatch_core).
+    crate::pipeline::ensure_loaded();
+    let kickoff = crate::pipeline::try_get()
+        .and_then(|p| {
+            let d = p.dispatchable_states();
+            p.transitions.iter().find(|t| {
+                t.transition_type == crate::pipeline::TransitionType::Gated
+                    && d.contains(&t.from.as_str())
+            }).map(|t| t.to.as_str())
+        })
+        .unwrap_or("requested");
+    crate::kanban::fire_state_hooks(db, engine, kanban_card_id, &old_status, kickoff);
 
     Ok(dispatch)
 }
@@ -278,9 +441,11 @@ pub fn complete_dispatch(
         .unwrap_or(0);
     drop(conn);
 
-    // Fire OnDispatchCompleted hook — try_fire_hook to avoid engine lock deadlock
-    let _ = engine.try_fire_hook(
-        Hook::OnDispatchCompleted,
+    // Fire event hooks for dispatch completion (#134 — pipeline-defined events)
+    crate::kanban::fire_event_hooks(
+        engine,
+        "on_dispatch_completed",
+        "OnDispatchCompleted",
         json!({
             "dispatch_id": dispatch_id,
             "kanban_card_id": kanban_card_id,
@@ -308,6 +473,64 @@ pub fn complete_dispatch(
     // that were NOT covered by fire_transition_hooks' notify_new_dispatches_after_hooks.
     // These are dispatches created outside any card transition context.
     notify_hook_created_dispatches(db, pre_hook_max_rowid);
+
+    // #139: Safety net — if card transitioned to review but OnReviewEnter failed
+    // to create a review dispatch (engine lock contention, JS error, etc.),
+    // re-fire OnReviewEnter to guarantee review dispatch creation.
+    {
+        let needs_review_dispatch = db
+            .lock()
+            .ok()
+            .map(|conn| {
+                let card_status: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM kanban_cards WHERE id = ?1",
+                        [&kanban_card_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                let has_review_dispatch: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM task_dispatches \
+                         WHERE kanban_card_id = ?1 AND dispatch_type IN ('review', 'review-decision') \
+                         AND status IN ('pending', 'dispatched')",
+                        [&kanban_card_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
+                // Pipeline-driven: check if current state has OnReviewEnter hook
+                let is_review_state = card_status.as_deref().map_or(false, |s| {
+                    crate::pipeline::try_get()
+                        .and_then(|p| p.hooks_for_state(s))
+                        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
+                });
+                is_review_state && !has_review_dispatch
+            })
+            .unwrap_or(false);
+
+        if needs_review_dispatch {
+            let cid = kanban_card_id.as_deref().unwrap_or("unknown");
+            tracing::warn!(
+                "[dispatch] Card {} in review-like state but no review dispatch — re-firing OnReviewEnter (#139)",
+                cid
+            );
+            let _ = engine.try_fire_hook_by_name(
+                "OnReviewEnter",
+                json!({ "card_id": cid }),
+            );
+            // Drain any transitions from the re-fired hook
+            loop {
+                let transitions = engine.drain_pending_transitions();
+                if transitions.is_empty() {
+                    break;
+                }
+                for (cid, old_s, new_s) in &transitions {
+                    crate::kanban::fire_transition_hooks(db, engine, cid, old_s, new_s);
+                }
+            }
+            notify_hook_created_dispatches(db, pre_hook_max_rowid);
+        }
+    }
 
     Ok(dispatch)
 }
@@ -393,6 +616,102 @@ pub fn query_dispatch_row(
         },
     )
     .map_err(|e| anyhow::anyhow!("Dispatch query error: {e}"))
+}
+
+/// Check whether a dispatch belongs to an active unified-thread auto-queue run.
+///
+/// Returns `true` when:
+/// - The dispatch's kanban card is part of an active/paused auto-queue run
+/// - That run has `unified_thread_id IS NOT NULL`
+/// - The run still has pending or dispatched entries remaining
+///
+/// When `true`, callers should **not** tear down the tmux session because the
+/// same thread will be reused for subsequent queue entries.
+///
+/// Uses a standalone `rusqlite::Connection` opened from the runtime DB path
+/// to avoid lock contention with the main `Db` mutex.
+pub fn is_unified_thread_active(dispatch_id: &str) -> bool {
+    let root = match crate::cli::agentdesk_runtime_root() {
+        Some(r) => r,
+        None => return false,
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let result: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 \
+             FROM auto_queue_entries e \
+             JOIN auto_queue_runs r ON e.run_id = r.id \
+             WHERE e.run_id = ( \
+                 SELECT e2.run_id FROM auto_queue_entries e2 \
+                 JOIN task_dispatches td ON td.kanban_card_id = e2.kanban_card_id \
+                 WHERE td.id = ?1 LIMIT 1 \
+             ) \
+             AND r.status IN ('active', 'paused') \
+             AND e.status IN ('pending', 'dispatched') \
+             AND r.unified_thread_id IS NOT NULL",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    result
+}
+
+/// Check whether a thread channel belongs to an active unified-thread auto-queue run.
+///
+/// Looks up `auto_queue_runs` by `unified_thread_channel_id` matching the
+/// given Discord channel ID. Returns `true` when a matching active/paused run
+/// still has pending or dispatched entries.
+pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
+    let root = match crate::cli::agentdesk_runtime_root() {
+        Some(r) => r,
+        None => return false,
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let channel_str = channel_id.to_string();
+    let result: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 \
+             FROM auto_queue_entries e \
+             JOIN auto_queue_runs r ON e.run_id = r.id \
+             WHERE r.unified_thread_channel_id = ?1 \
+             AND r.status IN ('active', 'paused') \
+             AND e.status IN ('pending', 'dispatched') \
+             AND r.unified_thread_id IS NOT NULL",
+            [&channel_str],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    result
+}
+
+/// Check whether a channel name (from tmux session parsing) belongs to an active
+/// unified-thread auto-queue run. Extracts the thread channel ID from the
+/// `-t{15+digit}` suffix in the channel name.
+pub fn is_unified_thread_channel_name_active(channel_name: &str) -> bool {
+    // Extract thread channel ID from channel name suffix (-t{15+digits})
+    let thread_channel_id: u64 = match channel_name.rfind("-t") {
+        Some(pos) => {
+            let suffix = &channel_name[pos + 2..];
+            if suffix.len() >= 15 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                suffix.parse().unwrap_or(0)
+            } else {
+                return false;
+            }
+        }
+        None => return false,
+    };
+    if thread_channel_id == 0 {
+        return false;
+    }
+    is_unified_thread_channel_active(thread_channel_id)
 }
 
 /// Determine provider from a Discord channel name suffix.

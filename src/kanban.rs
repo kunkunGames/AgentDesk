@@ -3,31 +3,17 @@
 //! ALL card status transitions MUST go through `transition_status()`.
 //! This ensures hooks fire, auto-queue syncs, and notifications are sent.
 //!
-//! ## Transition Rules
+//! ## Pipeline-Driven Transitions (#106 P5)
 //!
-//! | From | To | Requires |
-//! |------|----|----------|
-//! | backlog | ready | Free (no dispatch needed) |
-//! | ready | backlog | Free (no dispatch needed) |
-//! | ready | requested | Active dispatch (pending/dispatched) |
-//! | requested | in_progress | Active dispatch + session working acknowledgement |
-//! | in_progress | review | Dispatch completion triggers this |
-//! | review | done | Review pass verdict |
-//! | review | in_progress | Rework dispatch (review-decision accept) |
-//! | * | pending_decision | Timeout/gate failure (force via policy) |
-//! | * | blocked | Agent signal or timeout (force via policy) |
+//! All transition rules, gates, hooks, clocks, and timeouts are defined in
+//! `policies/default-pipeline.yaml`. No hardcoded state names exist in this module.
+//! See the YAML file for the complete state machine specification.
 //!
-//! ## Dispatch Acknowledgement
-//!
-//! `requested → in_progress` requires an explicit dispatch acknowledgement:
-//! 1. Session must have `active_dispatch_id` set (links session to dispatch)
-//! 2. Session status must change to `working` (triggers onSessionStatusChange)
-//! 3. Policy checks `dispatch_type` is `implementation` or `rework` (not review)
-//! 4. Policy checks `card.status === "requested"` (prevents re-entry)
+//! Custom pipelines can override the default via repo or agent-level overrides
+//! (3-level inheritance: default → repo → agent).
 
 use crate::db::Db;
 use crate::engine::PolicyEngine;
-use crate::engine::hooks::Hook;
 use anyhow::Result;
 use serde_json::json;
 
@@ -65,12 +51,12 @@ pub fn transition_status_with_opts(
 ) -> Result<TransitionResult> {
     let conn = db.lock().map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
 
-    // Get current status
-    let old_status: String = conn
+    // Get current status + repo/agent for pipeline resolution (#135)
+    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
+            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
             [card_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| anyhow::anyhow!("card not found: {card_id}"))?;
 
@@ -82,14 +68,16 @@ pub fn transition_status_with_opts(
         });
     }
 
-    // ── Pipeline-driven validation (#106) ──
-    // Use YAML pipeline config if loaded, fall back to hardcoded rules otherwise.
-    let pipeline = crate::pipeline::try_get();
+    // ── Pipeline-driven validation (#106 P5: YAML is the sole source of truth) ──
+    // Ensure pipeline is loaded (idempotent, safe to call repeatedly)
+    crate::pipeline::ensure_loaded();
+    // Resolve effective pipeline: default → repo override → agent override.
+    let effective =
+        crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let pipeline = &effective;
 
     // Terminal guard: terminal states cannot revert (unless force=true)
-    let is_terminal = pipeline
-        .map(|p| p.is_terminal(&old_status))
-        .unwrap_or(old_status == "done");
+    let is_terminal = pipeline.is_terminal(&old_status);
 
     if is_terminal && old_status != new_status && !force {
         log_audit(
@@ -122,9 +110,9 @@ pub fn transition_status_with_opts(
         ));
     }
 
-    // ── Transition rule lookup ──
-    if let Some(p) = pipeline {
-        let rule = p.find_transition(&old_status, new_status);
+    // ── Transition rule lookup (YAML-driven, no hardcoded fallback) ──
+    {
+        let rule = pipeline.find_transition(&old_status, new_status);
 
         match rule {
             Some(t) => {
@@ -135,7 +123,7 @@ pub fn transition_status_with_opts(
                     TransitionType::Gated => {
                         // Evaluate builtin gates from YAML
                         for gate_name in &t.gates {
-                            if let Some(gate) = p.gates.get(gate_name.as_str()) {
+                            if let Some(gate) = pipeline.gates.get(gate_name.as_str()) {
                                 if gate.gate_type == "builtin" {
                                     match gate.check.as_deref() {
                                         Some("has_active_dispatch") => {
@@ -239,119 +227,57 @@ pub fn transition_status_with_opts(
                 ));
             }
         }
-    } else {
-        // ── Legacy hardcoded validation (fallback when YAML not loaded) ──
-        let free_transition = matches!(
-            (old_status.as_str(), new_status),
-            ("backlog", "ready") | ("ready", "backlog")
-        );
-
-        if !free_transition && !force {
-            let has_active_dispatch: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM task_dispatches \
-                     WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
-                    [card_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-
-            if !has_active_dispatch {
-                log_audit(
-                    &conn,
-                    card_id,
-                    &old_status,
-                    new_status,
-                    source,
-                    "BLOCKED: no active dispatch",
-                );
-                tracing::warn!(
-                    "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
-                    old_status,
-                    new_status,
-                    card_id,
-                    source
-                );
-                notify_pmd_violation(
-                    &conn,
-                    card_id,
-                    &old_status,
-                    new_status,
-                    source,
-                    "no active dispatch",
-                );
-                return Err(anyhow::anyhow!(
-                    "Status transition {} → {} requires an active dispatch (pending/dispatched).",
-                    old_status,
-                    new_status
-                ));
-            }
-        }
-
-        if new_status == "done"
-            && !force
-            && !matches!(
-                old_status.as_str(),
-                "review" | "blocked" | "pending_decision" | "done"
-            )
-        {
-            log_audit(
-                &conn,
-                card_id,
-                &old_status,
-                new_status,
-                source,
-                "BLOCKED: review required",
-            );
-            return Err(anyhow::anyhow!(
-                "Cannot transition from {} to done directly. Must go through review first.",
-                old_status
-            ));
-        }
     }
 
-    // Build UPDATE with appropriate extra fields — driven by pipeline clocks
-    let extra = if let Some(p) = pipeline {
-        match p.clock_for_state(new_status) {
-            Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
-                // Only set if NULL (preserves original on re-entry)
-                format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
-            }
-            Some(clock) => {
-                format!(", {} = datetime('now')", clock.set)
-            }
-            None if new_status == "done" => {
-                // Terminal cleanup — always clear review fields
-                ", completed_at = datetime('now'), review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL".to_string()
-            }
-            None => String::new(),
+    // Build UPDATE with appropriate extra fields — driven by pipeline clocks (YAML-only)
+    let clock_extra = match pipeline.clock_for_state(new_status) {
+        Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
+            // Only set if NULL (preserves original on re-entry)
+            format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
         }
-    } else {
-        // Legacy hardcoded clocks
-        match new_status {
-            "in_progress" => ", started_at = datetime('now')".to_string(),
-            "requested" => ", requested_at = datetime('now')".to_string(),
-            "review" => ", review_entered_at = datetime('now')".to_string(),
-            "done" => ", completed_at = datetime('now'), review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL".to_string(),
-            _ => String::new(),
+        Some(clock) => {
+            format!(", {} = datetime('now')", clock.set)
         }
+        None => String::new(),
     };
+    // Terminal cleanup: clear review-related fields when entering a terminal state
+    let terminal_cleanup = if pipeline.is_terminal(new_status) {
+        ", review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL"
+    } else {
+        ""
+    };
+    let extra = format!("{clock_extra}{terminal_cleanup}");
     let sql = format!(
         "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){extra} WHERE id = ?2"
     );
     conn.execute(&sql, rusqlite::params![new_status, card_id])?;
 
-    // #117: Sync canonical review state on status transitions
-    if new_status == "done" || new_status == "ready" || new_status == "backlog" {
+    // #117: Sync canonical review state on status transitions (pipeline-driven).
+    // Idle: terminal states or states with no hooks (pre-work states like backlog/ready).
+    // Reviewing: states with OnReviewEnter hook.
+    // Otherwise: clear last_verdict on work state re-entry.
+    let has_hooks = pipeline
+        .hooks_for_state(new_status)
+        .map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
+    let is_review_enter = pipeline
+        .hooks_for_state(new_status)
+        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+    if pipeline.is_terminal(new_status) || !has_hooks {
         conn.execute(
             "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
              ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
             [card_id],
         ).ok();
-    } else if new_status == "review" {
+    } else if is_review_enter {
         conn.execute(
             "INSERT INTO card_review_state (card_id, state, review_entered_at, updated_at) VALUES (?1, 'reviewing', datetime('now'), datetime('now')) \
              ON CONFLICT(card_id) DO UPDATE SET state = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now')",
+            [card_id],
+        ).ok();
+    } else {
+        // #119: Clear last_verdict on re-entry to work states (any non-idle, non-review state)
+        conn.execute(
+            "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
             [card_id],
         ).ok();
     }
@@ -360,7 +286,7 @@ pub fn transition_status_with_opts(
     log_audit(&conn, card_id, &old_status, new_status, source, "OK");
 
     // Sync auto_queue_entries on terminal status
-    if new_status == "done" {
+    if pipeline.is_terminal(new_status) {
         conn.execute(
             "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
              WHERE kanban_card_id = ?1 AND status = 'dispatched'",
@@ -371,37 +297,16 @@ pub fn transition_status_with_opts(
 
     drop(conn);
 
-    // GitHub auto-sync (close on done, comment on review)
-    github_sync_on_transition(db, card_id, new_status);
+    // GitHub auto-sync — pipeline-driven (terminal → close, OnReviewEnter → comment)
+    github_sync_on_transition(db, pipeline, card_id, new_status);
 
-    // Fire hooks
-    let _ = engine.try_fire_hook(
-        Hook::OnCardTransition,
-        json!({
-            "card_id": card_id,
-            "from": old_status,
-            "to": new_status,
-        }),
-    );
+    // Fire hooks — driven by pipeline hooks section (#134/#135)
+    // The effective pipeline's hooks_for_state() determines which hooks fire on entry.
+    fire_dynamic_hooks(engine, pipeline, card_id, &old_status, new_status);
 
-    if new_status == "done" {
-        let _ = engine.try_fire_hook(
-            Hook::OnCardTerminal,
-            json!({
-                "card_id": card_id,
-                "status": "done",
-            }),
-        );
-    }
-
-    if new_status == "review" {
-        let _ = engine.try_fire_hook(
-            Hook::OnReviewEnter,
-            json!({
-                "card_id": card_id,
-                "from": old_status,
-            }),
-        );
+    // #119: Record true_negative for cards that passed review and reached terminal state
+    if pipeline.is_terminal(new_status) && record_true_negative_if_pass(db, card_id) {
+        crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
     }
 
     Ok(TransitionResult {
@@ -416,6 +321,129 @@ pub struct TransitionResult {
     pub changed: bool,
     pub from: String,
     pub to: String,
+}
+
+/// Fire hooks dynamically based on the effective pipeline's hooks section (#106 P5).
+///
+/// All hook bindings come from the YAML pipeline definition.
+/// States without hook bindings simply fire no hooks.
+fn fire_dynamic_hooks(
+    engine: &PolicyEngine,
+    pipeline: &crate::pipeline::PipelineConfig,
+    card_id: &str,
+    old_status: &str,
+    new_status: &str,
+) {
+    let payload = json!({
+        "card_id": card_id,
+        "from": old_status,
+        "to": new_status,
+        "status": new_status,
+    });
+
+    // Fire on_exit hooks for the state being LEFT
+    if let Some(bindings) = pipeline.hooks_for_state(old_status) {
+        for hook_name in &bindings.on_exit {
+            let _ = engine.try_fire_hook_by_name(hook_name, payload.clone());
+        }
+    }
+    // Fire on_enter hooks for the state being ENTERED
+    if let Some(bindings) = pipeline.hooks_for_state(new_status) {
+        for hook_name in &bindings.on_enter {
+            let _ = engine.try_fire_hook_by_name(hook_name, payload.clone());
+        }
+    }
+    // No fallback — YAML is the sole source of truth for hook bindings.
+}
+
+/// Fire pipeline-defined event hooks for a lifecycle event (#134).
+///
+/// Looks up the `events` section of the effective pipeline and fires each
+/// hook name via `try_fire_hook_by_name`. Falls back to firing the default
+/// hook name if no pipeline config or no event binding is found.
+pub fn fire_event_hooks(engine: &PolicyEngine, event: &str, default_hook: &str, payload: serde_json::Value) {
+    crate::pipeline::ensure_loaded();
+    let hooks: Vec<String> = crate::pipeline::try_get()
+        .and_then(|p| p.event_hooks(event).cloned())
+        .unwrap_or_else(|| vec![default_hook.to_string()]);
+    for hook_name in &hooks {
+        let _ = engine.try_fire_hook_by_name(hook_name, payload.clone());
+    }
+}
+
+/// Fire only the pipeline-defined on_enter/on_exit hooks for a transition.
+///
+/// Unlike `fire_transition_hooks`, this does NOT perform side-effects
+/// (audit log, GitHub sync, terminal-state sync, dispatch notifications).
+/// Use this when callers already handle those concerns separately
+/// (e.g. dispatch creation, route handlers).
+pub fn fire_state_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    crate::pipeline::ensure_loaded();
+    let effective = db.lock().ok().map(|conn| {
+        let repo_id: Option<String> = conn
+            .query_row(
+                "SELECT repo_id FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let agent_id: Option<String> = conn
+            .query_row(
+                "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref())
+    });
+    if let Some(ref pipeline) = effective {
+        fire_dynamic_hooks(engine, pipeline, card_id, from, to);
+    }
+}
+
+/// Fire only the on_enter hooks for a specific state, without requiring a transition.
+///
+/// Used when re-entering the same state (e.g., restarting review from awaiting_dod)
+/// where `fire_state_hooks` would no-op because from == to.
+pub fn fire_enter_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, state: &str) {
+    crate::pipeline::ensure_loaded();
+    let effective = db.lock().ok().map(|conn| {
+        let repo_id: Option<String> = conn
+            .query_row(
+                "SELECT repo_id FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let agent_id: Option<String> = conn
+            .query_row(
+                "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref())
+    });
+    if let Some(ref pipeline) = effective {
+        if let Some(bindings) = pipeline.hooks_for_state(state) {
+            let payload = json!({
+                "card_id": card_id,
+                "from": state,
+                "to": state,
+                "status": state,
+            });
+            for hook_name in &bindings.on_enter {
+                let _ = engine.try_fire_hook_by_name(hook_name, payload.clone());
+            }
+        }
+    }
 }
 
 /// Fire hooks for a status transition that already happened in the DB.
@@ -441,48 +469,48 @@ pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from
         .flatten()
     });
 
-    // Sync auto_queue_entries + GitHub on terminal status
-    if to == "done" {
-        if let Ok(conn) = db.lock() {
-            conn.execute(
-                "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
-                 WHERE kanban_card_id = ?1 AND status = 'dispatched'",
+    // Resolve effective pipeline for this card (#135)
+    crate::pipeline::ensure_loaded();
+    let effective = db.lock().ok().map(|conn| {
+        let repo_id: Option<String> = conn
+            .query_row(
+                "SELECT repo_id FROM kanban_cards WHERE id = ?1",
                 [card_id],
+                |r| r.get(0),
             )
-            .ok();
+            .ok()
+            .flatten();
+        let agent_id: Option<String> = conn
+            .query_row(
+                "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref())
+    });
+
+    if let Some(ref pipeline) = effective {
+        // Sync auto_queue_entries + GitHub on terminal status
+        if pipeline.is_terminal(to) {
+            if let Ok(conn) = db.lock() {
+                conn.execute(
+                    "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
+                     WHERE kanban_card_id = ?1 AND status = 'dispatched'",
+                    [card_id],
+                )
+                .ok();
+            }
         }
-    }
 
-    // GitHub auto-sync
-    github_sync_on_transition(db, card_id, to);
+        github_sync_on_transition(db, pipeline, card_id, to);
+        fire_dynamic_hooks(engine, pipeline, card_id, from, to);
 
-    let _ = engine.try_fire_hook(
-        Hook::OnCardTransition,
-        json!({
-            "card_id": card_id,
-            "from": from,
-            "to": to,
-        }),
-    );
-
-    if to == "done" {
-        let _ = engine.try_fire_hook(
-            Hook::OnCardTerminal,
-            json!({
-                "card_id": card_id,
-                "status": "done",
-            }),
-        );
-    }
-
-    if to == "review" {
-        let _ = engine.try_fire_hook(
-            Hook::OnReviewEnter,
-            json!({
-                "card_id": card_id,
-                "from": from,
-            }),
-        );
+        // #119: Record true_negative for cards that passed review and reached terminal state
+        if pipeline.is_terminal(to) && record_true_negative_if_pass(db, card_id) {
+            crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
+        }
     }
 
     // After all hooks, check if a new dispatch was created (by onCardTerminal, onReviewEnter, etc.)
@@ -592,8 +620,23 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
     }
 }
 
-/// Sync GitHub issue state when kanban card transitions.
-fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
+/// Sync GitHub issue state when kanban card transitions (pipeline-driven).
+/// Terminal states → close issue. States with OnReviewEnter hook → comment.
+fn github_sync_on_transition(
+    db: &Db,
+    pipeline: &crate::pipeline::PipelineConfig,
+    card_id: &str,
+    new_status: &str,
+) {
+    let is_terminal = pipeline.is_terminal(new_status);
+    let is_review_enter = pipeline
+        .hooks_for_state(new_status)
+        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+
+    if !is_terminal && !is_review_enter {
+        return;
+    }
+
     let info: Option<(String, Option<i64>)> = db
         .lock()
         .ok()
@@ -622,27 +665,23 @@ fn github_sync_on_transition(db: &Db, card_id: &str, new_status: &str) {
     };
     let Some(num) = issue_number else { return };
 
-    match new_status {
-        "done" => {
-            let _ = std::process::Command::new("gh")
-                .args(["issue", "close", &num.to_string(), "--repo", &repo])
-                .output();
-        }
-        "review" => {
-            let comment = "🔍 칸반 상태: **review** (카운터모델 리뷰 진행 중)";
-            let _ = std::process::Command::new("gh")
-                .args([
-                    "issue",
-                    "comment",
-                    &num.to_string(),
-                    "--repo",
-                    &repo,
-                    "--body",
-                    comment,
-                ])
-                .output();
-        }
-        _ => {}
+    if is_terminal {
+        let _ = std::process::Command::new("gh")
+            .args(["issue", "close", &num.to_string(), "--repo", &repo])
+            .output();
+    } else if is_review_enter {
+        let comment = "🔍 칸반 상태: **review** (카운터모델 리뷰 진행 중)";
+        let _ = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "comment",
+                &num.to_string(),
+                "--repo",
+                &repo,
+                "--body",
+                comment,
+            ])
+            .output();
     }
 }
 
@@ -759,6 +798,102 @@ fn log_audit(
         rusqlite::params![card_id, format!("{from}->{to} ({result})"), source],
     )
     .ok();
+}
+
+/// #119: When a card reaches done after a review pass verdict, record a true_negative
+/// tuning outcome. This confirms the review was correct in not finding issues.
+/// Returns true if a TN was actually inserted.
+fn record_true_negative_if_pass(db: &Db, card_id: &str) -> bool {
+    if let Ok(conn) = db.lock() {
+        // Check if the card's last review verdict was "pass" or "approved"
+        let last_verdict: Option<String> = conn
+            .query_row(
+                "SELECT last_verdict FROM card_review_state WHERE card_id = ?1",
+                [card_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        match last_verdict.as_deref() {
+            Some("pass") | Some("approved") => {
+                let review_round: Option<i64> = conn
+                    .query_row(
+                        "SELECT review_round FROM card_review_state WHERE card_id = ?1",
+                        [card_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+
+                // Carry forward finding_categories from the last completed review dispatch
+                // so that if this TN is later corrected to FN on reopen, the categories are preserved
+                let finding_cats: Option<String> = conn
+                    .query_row(
+                        "SELECT td.result FROM task_dispatches td \
+                         WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' \
+                         AND td.status = 'completed' ORDER BY td.rowid DESC LIMIT 1",
+                        [card_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten()
+                    .and_then(|r| {
+                        serde_json::from_str::<serde_json::Value>(&r)
+                            .ok()
+                            .and_then(|v| {
+                                v["items"].as_array().map(|items| {
+                                    let cats: Vec<String> = items
+                                        .iter()
+                                        .filter_map(|it| {
+                                            it["category"].as_str().map(|s| s.to_string())
+                                        })
+                                        .collect();
+                                    serde_json::to_string(&cats).unwrap_or_default()
+                                })
+                            })
+                    });
+
+                let inserted = conn.execute(
+                    "INSERT INTO review_tuning_outcomes \
+                     (card_id, dispatch_id, review_round, verdict, decision, outcome, finding_categories) \
+                     VALUES (?1, NULL, ?2, ?3, 'done', 'true_negative', ?4)",
+                    rusqlite::params![card_id, review_round, last_verdict.as_deref().unwrap_or("pass"), finding_cats],
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+                if inserted {
+                    tracing::info!(
+                        "[review-tuning] #119 recorded true_negative: card={card_id} (pass → done)"
+                    );
+                }
+                return inserted;
+            }
+            _ => {} // No review or non-pass verdict — nothing to record
+        }
+    }
+    false
+}
+
+/// #119: When a card is reopened after reaching done with a pass verdict,
+/// correct any true_negative outcomes to false_negative — the review missed a real bug.
+pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
+    if let Ok(conn) = db.lock() {
+        // Only correct the most recent TN (latest review_round) to avoid
+        // corrupting historical TN records from earlier rounds
+        let updated = conn
+            .execute(
+                "UPDATE review_tuning_outcomes SET outcome = 'false_negative' \
+                 WHERE card_id = ?1 AND outcome = 'true_negative' \
+                 AND review_round = (SELECT MAX(review_round) FROM review_tuning_outcomes WHERE card_id = ?1 AND outcome = 'true_negative')",
+                [card_id],
+            )
+            .unwrap_or(0);
+        if updated > 0 {
+            tracing::info!(
+                "[review-tuning] #119 corrected {updated} true_negative → false_negative: card={card_id} (reopen, latest round only)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1150,8 +1285,8 @@ mod tests {
         }
 
         // Fire OnDispatchCompleted — should NOT create a new dispatch for stage-2
-        let _ = engine.try_fire_hook(
-            Hook::OnDispatchCompleted,
+        let _ = engine.try_fire_hook_by_name(
+            "OnDispatchCompleted",
             json!({ "dispatch_id": dispatch_id }),
         );
 
@@ -1274,14 +1409,16 @@ mod tests {
     }
 
     /// #128: started_at must reset on every in_progress re-entry (rework/resume).
-    /// Without this, a card that was in_progress 3 hours ago and re-enters via rework
-    /// would immediately be flagged as stale by timeouts.js [B].
+    /// YAML pipeline uses `mode: coalesce` for in_progress clock, which preserves
+    /// the original started_at on rework re-entry. This prevents losing the original
+    /// start timestamp. Timeouts.js handles rework re-entry by checking the current
+    /// dispatch's created_at rather than started_at.
     #[test]
-    fn started_at_resets_on_in_progress_reentry() {
+    fn started_at_coalesces_on_in_progress_reentry() {
         let db = test_db();
         let engine = test_engine(&db);
 
-        // Create card already in_progress with an old started_at
+        // Create card in review with an old started_at (simulates work done 3h ago)
         {
             let conn = db.lock().unwrap();
             conn.execute(
@@ -1309,18 +1446,7 @@ mod tests {
         );
         assert!(result.is_ok(), "rework transition should succeed");
 
-        // Verify started_at was reset to now (not 3 hours ago)
-        let started_at: String = {
-            let conn = db.lock().unwrap();
-            conn.query_row(
-                "SELECT started_at FROM kanban_cards WHERE id = 'card-rework'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-
-        // started_at should be within the last minute, not 3 hours ago
+        // Verify started_at was PRESERVED (coalesce mode: original timestamp kept)
         let age_seconds: i64 = {
             let conn = db.lock().unwrap();
             conn.query_row(
@@ -1330,8 +1456,48 @@ mod tests {
             ).unwrap()
         };
         assert!(
+            age_seconds > 3500,
+            "started_at should be preserved (coalesce mode), but was only {} seconds ago",
+            age_seconds
+        );
+    }
+
+    /// When started_at is NULL (first-time entry), coalesce mode sets it to now.
+    #[test]
+    fn started_at_set_on_first_in_progress_entry() {
+        let db = test_db();
+        let engine = test_engine(&db);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES ('agent-1', 'Agent 1', '123', '456')",
+                [],
+            ).ok();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at)
+                 VALUES ('card-first', 'Test', 'requested', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        seed_dispatch(&db, "card-first", "pending");
+
+        let result =
+            transition_status_with_opts(&db, &engine, "card-first", "in_progress", "system", true);
+        assert!(result.is_ok());
+
+        let age_seconds: i64 = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER) FROM kanban_cards WHERE id = 'card-first'",
+                [],
+                |row| row.get(0),
+            ).unwrap()
+        };
+        assert!(
             age_seconds < 60,
-            "started_at should be reset to now on re-entry, but was {} seconds ago",
+            "started_at should be set to now on first entry, but was {} seconds ago",
             age_seconds
         );
     }

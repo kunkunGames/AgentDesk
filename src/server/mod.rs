@@ -45,10 +45,13 @@ pub async fn run(
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("policy-tick runtime");
+                    .unwrap_or_else(|e| {
+                        eprintln!("Fatal: failed to create policy-tick runtime: {e}");
+                        std::process::exit(1);
+                    });
                 rt.block_on(policy_tick_loop(tick_engine, tick_db));
             })
-            .expect("policy-tick thread");
+            .map_err(|e| anyhow::anyhow!("Failed to spawn policy-tick thread: {e}"))?;
     }
 
     // Spawn periodic rate-limit cache sync (every 120s)
@@ -137,7 +140,6 @@ pub async fn run(
 /// - OnTick5min (5m): reconciliation, deadlock detection, context check
 /// - OnTick (legacy, 5m): backward compat for policies that only register onTick
 async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
-    use crate::engine::hooks::Hook;
     use std::time::Duration;
 
     tracing::info!("[policy-tick] 3-tier tick started: 30s / 1min / 5min");
@@ -152,29 +154,30 @@ async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
         interval_30s.tick().await;
         count += 1;
 
-        // ── 30s tier: every tick ──
-        fire_tick_hook(&engine, &db, Hook::OnTick30s, "30s");
+        // ── 30s tier: every tick ── (#134: fire by name for dynamic hook binding)
+        fire_tick_hook_by_name(&engine, &db, "OnTick30s", "30s");
         drain_transitions(&engine, &db);
 
         // ── 1min tier: every 2nd tick (60s) ──
         if count % 2 == 0 {
-            fire_tick_hook(&engine, &db, Hook::OnTick1min, "1min");
+            fire_tick_hook_by_name(&engine, &db, "OnTick1min", "1min");
             drain_transitions(&engine, &db);
         }
 
         // ── 5min tier: every 10th tick (300s) ──
         if count % 10 == 0 {
-            fire_tick_hook(&engine, &db, Hook::OnTick5min, "5min");
+            fire_tick_hook_by_name(&engine, &db, "OnTick5min", "5min");
             drain_transitions(&engine, &db);
             // Also fire legacy OnTick for backward compat
-            fire_tick_hook(&engine, &db, Hook::OnTick, "legacy");
+            fire_tick_hook_by_name(&engine, &db, "OnTick", "legacy");
             drain_transitions(&engine, &db);
         }
     }
 }
 
-/// Fire a single tick hook, log timing, record telemetry, and notify any dispatches created by JS.
-fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Hook, label: &str) {
+/// Fire a single tick hook by name, log timing, record telemetry, and notify any dispatches created by JS.
+/// Uses try_fire_hook_by_name for dynamic hook binding (#134).
+fn fire_tick_hook_by_name(engine: &PolicyEngine, db: &Db, hook_name: &str, label: &str) {
     let start = std::time::Instant::now();
     let now_ms = chrono::Utc::now().timestamp_millis().to_string();
 
@@ -194,7 +197,7 @@ fn fire_tick_hook(engine: &PolicyEngine, db: &Db, hook: crate::engine::hooks::Ho
     let key_ms = format!("last_tick_{}_ms", label);
     let key_status = format!("last_tick_{}_status", label);
 
-    if let Err(e) = engine.try_fire_hook(hook, serde_json::json!({})) {
+    if let Err(e) = engine.try_fire_hook_by_name(hook_name, serde_json::json!({})) {
         tracing::warn!("[policy-tick] {} hook error: {e}", label);
         if let Ok(conn) = db.lock() {
             conn.execute(
@@ -706,19 +709,28 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 async fn message_outbox_loop(db: Db, port: u16) {
     use std::time::Duration;
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .expect("outbox HTTP client");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("[outbox] Failed to create HTTP client: {e}");
+            return;
+        }
+    };
 
     let url = format!("http://127.0.0.1:{port}/api/send");
 
     // Wait for server to be ready
     tokio::time::sleep(Duration::from_secs(3)).await;
-    tracing::info!("[outbox] Message outbox worker started (polling every 2s)");
+    tracing::info!("[outbox] Message outbox worker started (adaptive backoff 500ms-5s)");
+
+    let mut poll_interval = Duration::from_millis(500);
+    let max_interval = Duration::from_secs(5);
 
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(poll_interval).await;
 
         // Fetch pending messages
         let pending: Vec<(i64, String, String, String, String)> = {
@@ -746,6 +758,14 @@ async fn message_outbox_loop(db: Db, port: u16) {
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
         };
+
+        if pending.is_empty() {
+            // No work: increase interval (up to max)
+            poll_interval = (poll_interval.mul_f64(1.5)).min(max_interval);
+            continue;
+        }
+        // Work found: reset to fast polling
+        poll_interval = Duration::from_millis(500);
 
         for (id, target, content, bot, source) in pending {
             let body = serde_json::json!({

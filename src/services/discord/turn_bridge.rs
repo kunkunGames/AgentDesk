@@ -109,7 +109,7 @@ pub(super) fn stale_inflight_message(saved_response: &str) -> String {
 fn is_dcserver_restart_command(input: &str) -> bool {
     let lower = input.to_lowercase();
 
-    if lower.contains("--restart-dcserver") || lower.contains("restart_agentdesk.sh") {
+    if lower.contains("restart-dcserver") || lower.contains("restart_agentdesk.sh") {
         return true;
     }
 
@@ -586,6 +586,7 @@ pub(super) fn spawn_turn_bridge(
         let mut inflight_state = bridge.inflight_state.clone();
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
+        let turn_start = std::time::Instant::now();
 
         let _ = save_inflight_state(&inflight_state);
 
@@ -1005,6 +1006,8 @@ pub(super) fn spawn_turn_bridge(
                     .global_active
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
+            // Clean up any pending watchdog deadline override for this channel
+            super::clear_watchdog_deadline_override(channel_id.get());
             data.active_request_owner.remove(&channel_id);
             // Clean up dispatch-thread parent mapping when the thread turn ends.
             // Iterate and remove entries whose thread matches this channel_id.
@@ -1122,10 +1125,50 @@ pub(super) fn spawn_turn_bridge(
                     }
                 }
 
-                if full_response.is_empty() {
-                    // Check tmux output for resume failure ("No conversation found")
-                    // and clear the stale session_id so next turn starts fresh
+                // Check for resume failure BEFORE other response handling.
+                // Covers both empty response AND error text in response.
+                let resume_error_in_response = full_response.contains("No conversation found")
+                    || full_response.contains("Error: No conversation");
+                if resume_error_in_response {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⚠ Resume failed (error in response), clearing session_id (channel {})",
+                        channel_id
+                    );
+                    // Clear all 3 locations
+                    let stale_sid = {
+                        let mut data = shared_owned.core.lock().await;
+                        let old = data.sessions.get(&channel_id).and_then(|s| s.session_id.clone());
+                        if let Some(session) = data.sessions.get_mut(&channel_id) {
+                            session.session_id = None;
+                        }
+                        old
+                    };
+                    if let Some(ref key) = adk_session_key {
+                        super::adk_session::save_claude_session_id(key, "", shared_owned.api_port).await;
+                    }
+                    if let Some(ref sid) = stale_sid {
+                        if let Some(root) = crate::cli::agentdesk_runtime_root() {
+                            let f = root.join("ai_sessions").join(format!("{sid}.json"));
+                            let _ = std::fs::remove_file(&f);
+                        }
+                        let port = shared_owned.api_port;
+                        let sid_c = sid.clone();
+                        tokio::spawn(async move {
+                            let _ = reqwest::Client::new()
+                                .post(format!("http://127.0.0.1:{port}/api/dispatched-sessions/clear-stale-session-id"))
+                                .json(&serde_json::json!({"claude_session_id": sid_c}))
+                                .send().await;
+                        });
+                    }
+                    full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
+                } else if full_response.is_empty() {
+                    // Check for resume failure via other methods
                     let mut resume_failed = false;
+                    let quick_exit = turn_start.elapsed().as_secs() < 10;
+                    let _had_session_id =
+                        new_session_id.is_none() && bridge.new_session_id.is_none();
+                    // Method 1: check tmux output file
                     if let Some(ref path) = inflight_state.output_path {
                         if let Ok(content) = std::fs::read_to_string(path) {
                             if content.contains("No conversation found")
@@ -1191,6 +1234,61 @@ pub(super) fn spawn_turn_bridge(
                                 }
                                 full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
                             }
+                        }
+                    }
+                    // Method 2: quick exit (<10s) + empty response + had a session_id to resume
+                    // = Claude exited immediately due to stale session
+                    if !resume_failed && quick_exit && rx_disconnected {
+                        // Check if we attempted a resume (session_id was set at turn start)
+                        let attempted_resume = {
+                            let data = shared_owned.core.lock().await;
+                            data.sessions
+                                .get(&channel_id)
+                                .and_then(|s| s.session_id.as_ref())
+                                .is_some()
+                        };
+                        if attempted_resume {
+                            resume_failed = true;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ⚠ Quick exit with empty response — likely stale session_id (channel {})",
+                                channel_id
+                            );
+                            // Clear all 3 locations
+                            let stale_sid = {
+                                let mut data = shared_owned.core.lock().await;
+                                let old = data
+                                    .sessions
+                                    .get(&channel_id)
+                                    .and_then(|s| s.session_id.clone());
+                                if let Some(session) = data.sessions.get_mut(&channel_id) {
+                                    session.session_id = None;
+                                }
+                                old
+                            };
+                            if let Some(ref key) = adk_session_key {
+                                super::adk_session::save_claude_session_id(
+                                    key,
+                                    "",
+                                    shared_owned.api_port,
+                                )
+                                .await;
+                            }
+                            if let Some(ref sid) = stale_sid {
+                                if let Some(root) = crate::cli::agentdesk_runtime_root() {
+                                    let f = root.join("ai_sessions").join(format!("{sid}.json"));
+                                    let _ = std::fs::remove_file(&f);
+                                }
+                                let port = shared_owned.api_port;
+                                let sid_c = sid.clone();
+                                tokio::spawn(async move {
+                                    let _ = reqwest::Client::new()
+                                        .post(format!("http://127.0.0.1:{port}/api/dispatched-sessions/clear-stale-session-id"))
+                                        .json(&serde_json::json!({"claude_session_id": sid_c}))
+                                        .send().await;
+                                });
+                            }
+                            full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
                         }
                     }
                     if !resume_failed {
@@ -1362,59 +1460,83 @@ pub(super) fn spawn_turn_bridge(
         // For dispatch-based turns (threads), kill the tmux session after
         // finalization. Thread sessions are one-shot — keeping claude alive
         // in "Ready for input" blocks idle detection and the auto-complete pipeline.
+        //
+        // Exception (#145): unified-thread auto-queue runs reuse the same thread
+        // session across multiple entries. Skip kill if the run is still active.
         #[cfg(unix)]
         if dispatch_id.is_some() {
-            if let Some(ref name) = cancel_token
-                .tmux_session
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-            {
-                record_tmux_exit_reason(name, "dispatch turn completed — killing thread session");
-                let sess = name.clone();
-                let kill_result = tokio::task::spawn_blocking(move || {
-                    std::process::Command::new("tmux")
-                        .args(["kill-session", "-t", &sess])
-                        .output()
-                })
-                .await;
-                let kill_ok = matches!(&kill_result, Ok(Ok(o)) if o.status.success());
-                if !kill_ok {
-                    match &kill_result {
-                        Ok(Ok(o)) => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!(
-                                "  [{ts}] ⚠ tmux kill-session failed for {}: {}",
-                                name,
-                                String::from_utf8_lossy(&o.stderr)
-                            );
+            let should_kill = if let Some(ref did) = dispatch_id {
+                !crate::dispatch::is_unified_thread_active(did)
+            } else {
+                true
+            };
+            if should_kill {
+                if let Some(ref name) = cancel_token
+                    .tmux_session
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                {
+                    record_tmux_exit_reason(
+                        name,
+                        "dispatch turn completed — killing thread session",
+                    );
+                    let sess = name.clone();
+                    let kill_result = tokio::task::spawn_blocking(move || {
+                        std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", &sess])
+                            .output()
+                    })
+                    .await;
+                    let kill_ok = matches!(&kill_result, Ok(Ok(o)) if o.status.success());
+                    if !kill_ok {
+                        match &kill_result {
+                            Ok(Ok(o)) => {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                eprintln!(
+                                    "  [{ts}] ⚠ tmux kill-session failed for {}: {}",
+                                    name,
+                                    String::from_utf8_lossy(&o.stderr)
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                eprintln!("  [{ts}] ⚠ tmux kill-session error for {name}: {e}");
+                            }
+                            Err(e) => {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                eprintln!(
+                                    "  [{ts}] ⚠ tmux kill-session spawn error for {name}: {e}"
+                                );
+                            }
+                            _ => {}
                         }
-                        Ok(Err(e)) => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!("  [{ts}] ⚠ tmux kill-session error for {name}: {e}");
-                        }
-                        Err(e) => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!("  [{ts}] ⚠ tmux kill-session spawn error for {name}: {e}");
-                        }
-                        _ => {}
                     }
-                }
 
-                // Only delete the DB session row if tmux kill succeeded.
-                // If kill failed, leave the row so the periodic reaper can retry.
-                if kill_ok {
-                    if let Some(session_key) = super::adk_session::build_adk_session_key(
-                        &shared_owned,
-                        channel_id,
-                        &provider,
-                    )
-                    .await
-                    {
-                        super::adk_session::delete_adk_session(&session_key, shared_owned.api_port)
+                    // Only delete the DB session row if tmux kill succeeded.
+                    // If kill failed, leave the row so the periodic reaper can retry.
+                    if kill_ok {
+                        if let Some(session_key) = super::adk_session::build_adk_session_key(
+                            &shared_owned,
+                            channel_id,
+                            &provider,
+                        )
+                        .await
+                        {
+                            super::adk_session::delete_adk_session(
+                                &session_key,
+                                shared_owned.api_port,
+                            )
                             .await;
+                        }
                     }
                 }
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ♻ Skipping tmux kill for unified-thread dispatch {:?} — run still active",
+                    dispatch_id
+                );
             }
         }
 

@@ -1,6 +1,6 @@
 use super::settings::{
-    discord_token_hash, load_longterm_memory_catalog, load_role_prompt, load_shared_prompt,
-    render_peer_agent_guidance,
+    discord_token_hash, load_longterm_memory_catalog, load_review_tuning_guidance,
+    load_role_prompt, load_shared_prompt, render_peer_agent_guidance,
 };
 use super::*;
 
@@ -45,7 +45,7 @@ pub(super) fn build_system_prompt(
          Current working directory: {}\n\n\
          When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
          send it by running this bash command:\n\n\
-         agentdesk --discord-sendfile <filepath> --channel {} --key {}\n\n\
+         agentdesk discord-sendfile <filepath> --channel {} --key {}\n\n\
          This delivers the file directly to the user's Discord channel.\n\
          Do NOT tell the user to use /down — use the command above instead.\n\n\
          Always keep the user informed about what you are doing. Briefly explain each step as you work \
@@ -93,6 +93,16 @@ pub(super) fn build_system_prompt(
                      - 리뷰 verdict 제출 후 dispatch를 완료한다"
                         .to_string(),
             });
+
+            // #119: Inject review tuning guidance only for review dispatches (not review-decision).
+            // Injecting into review-decision would bias the labeler's accept/dispute/dismiss judgment,
+            // contaminating the FP/TP dataset that the guidance itself is derived from.
+            if dispatch_type != Some("review-decision") {
+                if let Some(guidance) = load_review_tuning_guidance() {
+                    system_prompt_owned.push_str("\n\n[Review Tuning — 과거 리뷰 정확도 기반 가이던스]\n");
+                    system_prompt_owned.push_str(&guidance);
+                }
+            }
         } else if let Some(shared_prompt) = load_shared_prompt() {
             // Full profile: inject complete shared agent prompt (AGENTS.md)
             system_prompt_owned.push_str("\n\n[Shared Agent Rules]\n");
@@ -225,8 +235,8 @@ mod tests {
     fn test_build_system_prompt_includes_file_send_command() {
         let output = call_build("ctx", "/tmp", 1, "tok", "", "");
         assert!(
-            output.contains("agentdesk --discord-sendfile"),
-            "System prompt should contain the agentdesk --discord-sendfile command"
+            output.contains("agentdesk discord-sendfile"),
+            "System prompt should contain the agentdesk discord-sendfile command"
         );
     }
 

@@ -1,0 +1,68 @@
+# simple-pipeline.yaml — review 없는 단순 파이프라인 예제
+# 이 파이프라인을 레포 또는 에이전트 override로 적용하면
+# 리뷰 단계 없이 바로 완료되는 워크플로우를 사용할 수 있습니다.
+#
+# 적용 방법:
+#   PUT /api/pipeline/config/repo/owner/repo
+#   { "config": { "states": [...], "transitions": [...], ... } }
+
+name: simple
+version: 1
+
+states:
+  - id: backlog
+    label: 백로그
+  - id: ready
+    label: 준비됨
+  - id: in_progress
+    label: 진행 중
+  - id: done
+    label: 완료
+    terminal: true
+
+transitions:
+  - from: backlog
+    to: ready
+    type: free
+
+  - from: ready
+    to: backlog
+    type: free
+
+  - from: ready
+    to: in_progress
+    type: gated
+    gates: [active_dispatch]
+
+  # review 없이 바로 done으로 전환
+  - from: in_progress
+    to: done
+    type: gated
+    gates: [active_dispatch]
+
+gates:
+  active_dispatch:
+    type: builtin
+    check: has_active_dispatch
+    description: Card must have a pending or dispatched dispatch
+
+hooks:
+  in_progress:
+    on_enter: [OnCardTransition]
+  done:
+    on_enter: [OnCardTransition, OnCardTerminal]
+
+events:
+  on_dispatch_completed: [OnDispatchCompleted]
+
+clocks:
+  in_progress:
+    set: started_at
+  done:
+    set: completed_at
+
+timeouts:
+  in_progress:
+    duration: 4h
+    clock: started_at
+    on_exhaust: done

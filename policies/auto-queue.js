@@ -116,6 +116,23 @@ function dispatchNextEntry(agentId) {
       [entry.run_id]
     );
     if (remaining.length > 0 && remaining[0].cnt === 0) {
+      // #145: If unified-thread run is done, kill the shared tmux session
+      var runInfo = agentdesk.db.query(
+        "SELECT unified_thread_id, unified_thread_channel_id FROM auto_queue_runs WHERE id = ?",
+        [entry.run_id]
+      );
+      if (runInfo.length > 0 && runInfo[0].unified_thread_id) {
+        var channelId = runInfo[0].unified_thread_channel_id;
+        if (channelId) {
+          agentdesk.log.info("[auto-queue] Unified-thread run " + entry.run_id + " complete — requesting tmux cleanup for channel " + channelId);
+          // Mark a kv_meta flag for the Rust runtime to pick up and kill the session
+          agentdesk.db.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
+            ["kill_unified_thread:" + channelId, entry.run_id]
+          );
+        }
+      }
+
       agentdesk.db.execute(
         "UPDATE auto_queue_runs SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
         [entry.run_id]

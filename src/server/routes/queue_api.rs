@@ -307,3 +307,63 @@ pub async fn cancel_turn(
         })),
     )
 }
+
+// ── POST /api/turns/:channel_id/extend-timeout ──────────────────
+
+/// Extend the active turn watchdog deadline for a channel by 30 minutes.
+pub async fn extend_turn_timeout(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let channel_id_num: u64 = match channel_id.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid channel_id"})),
+            );
+        }
+    };
+
+    let has_active_turn = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sessions \
+                 WHERE status = 'working' \
+                 AND (session_key LIKE '%' || ?1 || '%' OR agent_id IN \
+                      (SELECT id FROM agents WHERE discord_channel_id = ?1 OR discord_channel_alt = ?1))",
+                [&channel_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+
+    if !has_active_turn {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no active turn found for this channel"})),
+        );
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let extension_ms = 30_i64 * 60 * 1000;
+    let base_deadline_ms = crate::services::discord::watchdog_deadline_override(channel_id_num)
+        .unwrap_or(now_ms);
+    let new_deadline_ms = std::cmp::max(base_deadline_ms, now_ms) + extension_ms;
+
+    crate::services::discord::set_watchdog_deadline_override(channel_id_num, new_deadline_ms);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "channel_id": channel_id_num,
+            "extended_by_minutes": 30,
+            "deadline_ms": new_deadline_ms,
+        })),
+    )
+}

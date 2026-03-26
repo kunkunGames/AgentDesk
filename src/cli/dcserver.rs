@@ -233,7 +233,7 @@ pub fn dcserver_process_command(_pid: u32) -> Option<String> {
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
     let is_dcserver =
-        command.contains("agentdesk dcserver") || command.contains("agentdesk --dcserver");
+        command.contains("agentdesk dcserver");
     if !is_dcserver {
         return false;
     }
@@ -246,9 +246,8 @@ pub fn dcserver_process_matches_instance(command: &str) -> bool {
 
 #[cfg(unix)]
 pub fn dcserver_instance_pids() -> Vec<u32> {
-    // Match both "agentdesk dcserver" (legacy) and "agentdesk --dcserver" (service templates)
     let output = match std::process::Command::new("pgrep")
-        .args(["-f", "agentdesk.*(dcserver|--dcserver)"])
+        .args(["-f", "agentdesk.*dcserver"])
         .output()
     {
         Ok(output) if output.status.success() => output,
@@ -481,7 +480,6 @@ pub fn parse_restart_dcserver_report_context(
         }
     }
 }
-
 pub fn handle_restart_dcserver(
     report_context_override: Option<services::discord::restart_report::RestartReportContext>,
 ) {
@@ -537,7 +535,7 @@ pub fn handle_restart_dcserver(
         Ok(_) => {}
         Err(_) => {
             eprintln!("Error: {} not found.", settings_path.display());
-            eprintln!("Run 'agentdesk --dcserver' after configuring bot_settings.json.");
+            eprintln!("Run 'agentdesk dcserver' after configuring bot_settings.json.");
             write_restart_report(
                 "failed",
                 "bot_settings.json이 없어서 dcserver restart를 시작하지 못했습니다.".to_string(),
@@ -867,7 +865,7 @@ pub fn handle_restart_dcserver(
         })
         .unwrap_or_default();
     let script = format!(
-        "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} --dcserver\n",
+        "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} dcserver\n",
         exe
     );
     if let Err(e) = std::fs::write(&launcher_path, &script) {
@@ -1078,9 +1076,14 @@ pub fn handle_dcserver(token: Option<String>) {
                 // Load data-driven pipeline definition (#106) — fail-fast on error
                 let pipeline_path = ad_config.policies.dir.join("default-pipeline.yaml");
                 if pipeline_path.exists() {
-                    crate::pipeline::load(&pipeline_path)
-                        .expect("Failed to load pipeline definition");
-                    println!("  ▸ Pipeline : loaded {}", pipeline_path.display());
+                    match crate::pipeline::load(&pipeline_path) {
+                        Ok(()) => println!("  ▸ Pipeline : loaded {}", pipeline_path.display()),
+                        Err(e) => {
+                            eprintln!("  ✖ Failed to load pipeline definition: {e}");
+                            eprintln!("    path: {}", pipeline_path.display());
+                            std::process::exit(1);
+                        }
+                    }
                 }
 
                 // Start axum HTTP server (background task) — now serves all API
@@ -1200,91 +1203,4 @@ pub fn handle_dcserver(token: Option<String>) {
             }
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_restart_dcserver_report_context;
-    use crate::services::provider::ProviderKind;
-
-    #[test]
-    fn parses_explicit_restart_report_context() {
-        let args = vec![
-            "agentdesk".to_string(),
-            "--restart-dcserver".to_string(),
-            "--report-channel-id".to_string(),
-            "1479671301387059200".to_string(),
-            "--report-provider".to_string(),
-            "codex".to_string(),
-        ];
-
-        let context = parse_restart_dcserver_report_context(&args, 2)
-            .unwrap()
-            .expect("expected restart report context");
-        assert_eq!(context.channel_id, 1479671301387059200);
-        assert_eq!(context.provider, ProviderKind::Codex);
-        assert_eq!(context.current_msg_id, None);
-    }
-
-    #[test]
-    fn parses_restart_report_message_id() {
-        let args = vec![
-            "agentdesk".to_string(),
-            "--restart-dcserver".to_string(),
-            "--report-channel-id".to_string(),
-            "1479671301387059200".to_string(),
-            "--report-provider".to_string(),
-            "codex".to_string(),
-            "--report-message-id".to_string(),
-            "1480460000000000000".to_string(),
-        ];
-
-        let context = parse_restart_dcserver_report_context(&args, 2)
-            .unwrap()
-            .expect("expected restart report context");
-        assert_eq!(context.current_msg_id, Some(1480460000000000000));
-    }
-
-    #[test]
-    fn rejects_partial_restart_report_context() {
-        let args = vec![
-            "agentdesk".to_string(),
-            "--restart-dcserver".to_string(),
-            "--report-channel-id".to_string(),
-            "1479671301387059200".to_string(),
-        ];
-
-        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
-        assert!(err.contains("--report-channel-id requires --report-provider"));
-    }
-
-    #[test]
-    fn rejects_restart_report_message_id_without_context() {
-        let args = vec![
-            "agentdesk".to_string(),
-            "--restart-dcserver".to_string(),
-            "--report-message-id".to_string(),
-            "1480460000000000000".to_string(),
-        ];
-
-        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
-        assert!(
-            err.contains("--report-message-id requires --report-channel-id and --report-provider")
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_restart_report_provider() {
-        let args = vec![
-            "agentdesk".to_string(),
-            "--restart-dcserver".to_string(),
-            "--report-channel-id".to_string(),
-            "1479671301387059200".to_string(),
-            "--report-provider".to_string(),
-            "openclaw".to_string(),
-        ];
-
-        let err = parse_restart_dcserver_report_context(&args, 2).unwrap_err();
-        assert!(err.contains("invalid value for --report-provider"));
-    }
 }

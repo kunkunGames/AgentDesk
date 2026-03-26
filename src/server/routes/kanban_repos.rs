@@ -18,6 +18,7 @@ pub struct CreateRepoBody {
 #[derive(Debug, Deserialize)]
 pub struct UpdateRepoBody {
     pub default_agent_id: Option<String>,
+    pub pipeline_config: Option<serde_json::Value>,
 }
 
 // ── Handlers ───────────────────────────────────────────────────
@@ -38,7 +39,7 @@ pub async fn list_repos(State(state): State<AppState>) -> (StatusCode, Json<serd
     let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
 
     let mut stmt = match conn.prepare(
-        "SELECT id, display_name, sync_enabled, last_synced_at, default_agent_id
+        "SELECT id, display_name, sync_enabled, last_synced_at, default_agent_id, pipeline_config
          FROM github_repos
          ORDER BY id",
     ) {
@@ -54,6 +55,11 @@ pub async fn list_repos(State(state): State<AppState>) -> (StatusCode, Json<serd
     let rows = stmt
         .query_map([], |row| {
             let id = row.get::<_, String>(0)?;
+            let pipeline_raw = row.get::<_, Option<String>>(5)?;
+            let pipeline_config: serde_json::Value = pipeline_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Null);
             Ok(json!({
                 "id": id.clone(),
                 "repo": id,
@@ -61,6 +67,7 @@ pub async fn list_repos(State(state): State<AppState>) -> (StatusCode, Json<serd
                 "sync_enabled": row.get::<_, bool>(2).unwrap_or(true),
                 "last_synced_at": row.get::<_, Option<String>>(3)?,
                 "default_agent_id": row.get::<_, Option<String>>(4)?,
+                "pipeline_config": pipeline_config,
                 "created_at": 0,
             }))
         })

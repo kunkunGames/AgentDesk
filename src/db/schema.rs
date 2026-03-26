@@ -43,6 +43,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN sprite_number INTEGER DEFAULT NULL;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN description TEXT;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN system_prompt TEXT;");
+    // #135: Per-repo and per-agent pipeline override (JSON)
+    let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN pipeline_config TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN pipeline_config TEXT;");
     let _ = conn.execute_batch("ALTER TABLE task_dispatches ADD COLUMN thread_id TEXT;");
     let _ =
         conn.execute_batch("ALTER TABLE task_dispatches ADD COLUMN retry_count INTEGER DEFAULT 0;");
@@ -352,6 +355,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // #118: Track approach-change round for repeated-finding detection
+    let _ = conn.execute(
+        "ALTER TABLE card_review_state ADD COLUMN approach_change_round INTEGER",
+        [],
+    );
+
     // Rate limit cache table (provider → cached rate-limit JSON)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS rate_limit_cache (
@@ -411,6 +420,22 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             action      TEXT,
             timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
             actor       TEXT
+        );",
+    )?;
+
+    // #119: Review tuning outcomes — tracks verdict→decision classification
+    // for aggregating false positive/negative rates to auto-tune review prompts.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS review_tuning_outcomes (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_id            TEXT,
+            dispatch_id        TEXT,
+            review_round       INTEGER,
+            verdict            TEXT NOT NULL,
+            decision           TEXT,
+            outcome            TEXT NOT NULL,
+            finding_categories TEXT,
+            created_at         DATETIME DEFAULT (datetime('now'))
         );",
     )?;
 

@@ -21,8 +21,8 @@ mod integration_tests;
 // Re-export for crate-level access (used by services::discord::mod.rs)
 pub(crate) use cli::agentdesk_runtime_root;
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 // ── Clap CLI definition ──────────────────────────────────────
@@ -36,6 +36,123 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start Discord bot server(s)
+    Dcserver {
+        /// Bot token (defaults to bot_settings.json or AGENTDESK_TOKEN env)
+        token: Option<String>,
+    },
+    /// Run the initial setup wizard
+    Init,
+    /// Re-run the configuration wizard
+    Reconfigure,
+    /// Restart Discord bot server(s)
+    RestartDcserver {
+        /// Discord channel ID for restart completion report
+        #[arg(long)]
+        report_channel_id: Option<u64>,
+        /// Provider for restart report (claude, codex, or gemini)
+        #[arg(long, value_enum)]
+        report_provider: Option<ReportProvider>,
+        /// Existing message ID to edit for restart report
+        #[arg(long)]
+        report_message_id: Option<u64>,
+    },
+    /// Send a file to a Discord channel
+    DiscordSendfile {
+        /// File path to send
+        path: String,
+        /// Discord channel ID
+        #[arg(long)]
+        channel: u64,
+        /// Authentication key hash
+        #[arg(long)]
+        key: String,
+    },
+    /// Send a message to a Discord channel
+    DiscordSendmessage {
+        /// Discord channel ID
+        #[arg(long)]
+        channel: u64,
+        /// Message text
+        #[arg(long)]
+        message: String,
+        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or bot_settings.json)
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Send a direct message to a Discord user
+    DiscordSenddm {
+        /// Discord user ID
+        #[arg(long)]
+        user: u64,
+        /// Message text
+        #[arg(long)]
+        message: String,
+        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or bot_settings.json)
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// tmux + Claude CLI integration wrapper (Unix only)
+    #[cfg(unix)]
+    TmuxWrapper {
+        /// Path to the output capture file
+        #[arg(long)]
+        output_file: String,
+        /// Path to the input FIFO
+        #[arg(long)]
+        input_fifo: String,
+        /// Path to the prompt file
+        #[arg(long)]
+        prompt_file: String,
+        /// Working directory (defaults to ".")
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        /// Input mode: fifo (default) or pipe
+        #[arg(long, value_enum, default_value_t = InputModeArg::Fifo)]
+        input_mode: InputModeArg,
+        /// Claude command and arguments (after --)
+        #[arg(last = true)]
+        claude_cmd: Vec<String>,
+    },
+    /// tmux + Codex CLI integration wrapper (Unix only)
+    #[cfg(unix)]
+    CodexTmuxWrapper {
+        /// Path to the output capture file
+        #[arg(long)]
+        output_file: String,
+        /// Path to the input FIFO
+        #[arg(long)]
+        input_fifo: String,
+        /// Path to the prompt file
+        #[arg(long)]
+        prompt_file: String,
+        /// Path to codex binary
+        #[arg(long)]
+        codex_bin: String,
+        /// Optional codex model override
+        #[arg(long)]
+        codex_model: Option<String>,
+        /// Working directory (defaults to ".")
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        /// Input mode: fifo (default) or pipe
+        #[arg(long, value_enum, default_value_t = InputModeArg::Fifo)]
+        input_mode: InputModeArg,
+    },
+    /// Kill all AgentDesk-* tmux sessions and clean temp files
+    ResetTmux,
+    /// Check if MCP tool(s) are registered in .claude/settings.json
+    Ismcptool {
+        /// Tool names to check
+        #[arg(required = true)]
+        tools: Vec<String>,
+    },
+    /// Add MCP tool permission(s) to .claude/settings.json
+    Addmcptool {
+        /// Tool names to add
+        #[arg(required = true)]
+        tools: Vec<String>,
+    },
     /// Show server health, active sessions, and auto-queue status
     Status,
     /// List kanban cards
@@ -96,6 +213,20 @@ enum ConfigAction {
     },
 }
 
+#[derive(Clone, ValueEnum)]
+enum ReportProvider {
+    Claude,
+    Codex,
+    Gemini,
+}
+
+#[derive(Clone, ValueEnum)]
+#[cfg(unix)]
+enum InputModeArg {
+    Fifo,
+    Pipe,
+}
+
 fn exit_for_cli(result: std::result::Result<(), String>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -107,286 +238,117 @@ fn exit_for_cli(result: std::result::Result<(), String>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let parsed = Cli::try_parse();
 
-    // ── Legacy flag pre-check ────────────────────────────────
-    // These flags use custom sub-argument parsing and must be handled
-    // before clap takes over. They create their own tokio runtime.
-    for arg in &args[1..] {
-        match arg.as_str() {
-            "--dcserver" | "dcserver" => {
-                let token = args
-                    .iter()
-                    .skip_while(|a| a.as_str() != "--dcserver" && a.as_str() != "dcserver")
-                    .nth(1)
-                    .filter(|a| !a.starts_with('-'))
-                    .cloned()
-                    .or_else(|| std::env::var("AGENTDESK_TOKEN").ok());
+    match parsed {
+        Ok(cli) => match cli.command {
+            // ── Legacy commands (migrated from manual parsing) ──
+            Some(Commands::Dcserver { token }) => {
+                let token = token.or_else(|| std::env::var("AGENTDESK_TOKEN").ok());
                 cli::handle_dcserver(token);
                 return Ok(());
             }
-            "--init" | "init" => {
+            Some(Commands::Init) => {
                 cli::handle_init(false);
                 return Ok(());
             }
-            "--reconfigure" | "reconfigure" => {
+            Some(Commands::Reconfigure) => {
                 cli::handle_init(true);
                 return Ok(());
             }
-            "--restart-dcserver" => {
-                let start_index = args.iter().position(|a| a == "--restart-dcserver").unwrap() + 1;
-                match cli::parse_restart_dcserver_report_context(&args, start_index) {
-                    Ok(report_context) => cli::handle_restart_dcserver(report_context),
+            Some(Commands::RestartDcserver {
+                report_channel_id,
+                report_provider,
+                report_message_id,
+            }) => {
+                let report_context = build_restart_report_context(
+                    report_channel_id,
+                    report_provider,
+                    report_message_id,
+                );
+                match report_context {
+                    Ok(ctx) => cli::handle_restart_dcserver(ctx),
                     Err(err) => eprintln!("Error: {err}"),
                 }
                 return Ok(());
             }
-            "--discord-sendfile" => {
-                let mut file_path: Option<String> = None;
-                let mut channel_id: Option<u64> = None;
-                let mut key: Option<String> = None;
-                let mut j = args.iter().position(|a| a == "--discord-sendfile").unwrap() + 1;
-                while j < args.len() {
-                    match args[j].as_str() {
-                        "--channel" => {
-                            channel_id = args.get(j + 1).and_then(|v| v.parse().ok());
-                            j += 2;
-                        }
-                        "--key" => {
-                            key = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        _ if file_path.is_none() && !args[j].starts_with("--") => {
-                            file_path = Some(args[j].clone());
-                            j += 1;
-                        }
-                        _ => {
-                            j += 1;
-                        }
-                    }
-                }
-                match (file_path, channel_id, key) {
-                    (Some(fp), Some(cid), Some(k)) => cli::handle_discord_sendfile(&fp, cid, &k),
-                    _ => eprintln!(
-                        "Error: --discord-sendfile requires <PATH>, --channel <ID>, and --key <HASH>"
-                    ),
-                }
+            Some(Commands::DiscordSendfile { path, channel, key }) => {
+                cli::handle_discord_sendfile(&path, channel, &key);
                 return Ok(());
             }
-            "--discord-sendmessage" => {
-                let mut message: Option<String> = None;
-                let mut channel_id: Option<u64> = None;
-                let mut key: Option<String> = None;
-                let mut j = args
-                    .iter()
-                    .position(|a| a == "--discord-sendmessage")
-                    .unwrap()
-                    + 1;
-                while j < args.len() {
-                    match args[j].as_str() {
-                        "--channel" => {
-                            channel_id = args.get(j + 1).and_then(|v| v.parse().ok());
-                            j += 2;
-                        }
-                        "--message" => {
-                            message = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--key" => {
-                            key = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        _ => {
-                            j += 1;
-                        }
-                    }
-                }
-                match (message, channel_id) {
-                    (Some(msg), Some(cid)) => {
-                        cli::handle_discord_sendmessage(&msg, cid, key.as_deref())
-                    }
-                    _ => eprintln!(
-                        "Error: --discord-sendmessage requires --channel <ID> and --message <TEXT>"
-                    ),
-                }
+            Some(Commands::DiscordSendmessage {
+                channel,
+                message,
+                key,
+            }) => {
+                cli::handle_discord_sendmessage(&message, channel, key.as_deref());
                 return Ok(());
             }
-            "--discord-senddm" => {
-                let mut message: Option<String> = None;
-                let mut user_id: Option<u64> = None;
-                let mut key: Option<String> = None;
-                let mut j = args.iter().position(|a| a == "--discord-senddm").unwrap() + 1;
-                while j < args.len() {
-                    match args[j].as_str() {
-                        "--user" => {
-                            user_id = args.get(j + 1).and_then(|v| v.parse().ok());
-                            j += 2;
-                        }
-                        "--message" => {
-                            message = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--key" => {
-                            key = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        _ => {
-                            j += 1;
-                        }
-                    }
-                }
-                match (message, user_id) {
-                    (Some(msg), Some(uid)) => cli::handle_discord_senddm(&msg, uid, key.as_deref()),
-                    _ => eprintln!(
-                        "Error: --discord-senddm requires --user <ID> and --message <TEXT>"
-                    ),
-                }
+            Some(Commands::DiscordSenddm { user, message, key }) => {
+                cli::handle_discord_senddm(&message, user, key.as_deref());
                 return Ok(());
             }
             #[cfg(unix)]
-            "--tmux-wrapper" => {
-                let i = args.iter().position(|a| a == "--tmux-wrapper").unwrap();
-                let mut output_file: Option<String> = None;
-                let mut input_fifo: Option<String> = None;
-                let mut prompt_file: Option<String> = None;
-                let mut cwd: Option<String> = None;
-                let mut input_mode = services::tmux_wrapper::InputMode::Fifo;
-                let mut claude_cmd: Vec<String> = Vec::new();
-                let mut j = i + 1;
-                let mut after_separator = false;
-                while j < args.len() {
-                    if after_separator {
-                        claude_cmd.push(args[j].clone());
-                        j += 1;
-                        continue;
-                    }
-                    match args[j].as_str() {
-                        "--" => {
-                            after_separator = true;
-                            j += 1;
-                        }
-                        "--output-file" => {
-                            output_file = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--input-fifo" => {
-                            input_fifo = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--prompt-file" => {
-                            prompt_file = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--cwd" => {
-                            cwd = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--input-mode" => {
-                            if let Some(mode) = args.get(j + 1) {
-                                input_mode = match mode.as_str() {
-                                    "pipe" => services::tmux_wrapper::InputMode::Pipe,
-                                    _ => services::tmux_wrapper::InputMode::Fifo,
-                                };
-                            }
-                            j += 2;
-                        }
-                        _ => {
-                            j += 1;
-                        }
-                    }
-                }
-                match (output_file, input_fifo, prompt_file) {
-                    (Some(of), Some(inf), Some(pf)) => {
-                        let wd = cwd.unwrap_or_else(|| ".".to_string());
-                        services::tmux_wrapper::run(&of, &inf, &pf, &wd, &claude_cmd, input_mode);
-                    }
-                    _ => eprintln!(
-                        "Error: --tmux-wrapper requires --output-file, --input-fifo, and --prompt-file"
-                    ),
-                }
+            Some(Commands::TmuxWrapper {
+                output_file,
+                input_fifo,
+                prompt_file,
+                cwd,
+                input_mode,
+                claude_cmd,
+            }) => {
+                let mode = match input_mode {
+                    InputModeArg::Pipe => services::tmux_wrapper::InputMode::Pipe,
+                    InputModeArg::Fifo => services::tmux_wrapper::InputMode::Fifo,
+                };
+                services::tmux_wrapper::run(
+                    &output_file,
+                    &input_fifo,
+                    &prompt_file,
+                    &cwd,
+                    &claude_cmd,
+                    mode,
+                );
                 return Ok(());
             }
             #[cfg(unix)]
-            "--codex-tmux-wrapper" => {
-                let i = args
-                    .iter()
-                    .position(|a| a == "--codex-tmux-wrapper")
-                    .unwrap();
-                let mut output_file: Option<String> = None;
-                let mut input_fifo: Option<String> = None;
-                let mut prompt_file: Option<String> = None;
-                let mut cwd: Option<String> = None;
-                let mut codex_bin: Option<String> = None;
-                let mut codex_model: Option<String> = None;
-                let mut input_mode = services::tmux_wrapper::InputMode::Fifo;
-                let mut j = i + 1;
-                while j < args.len() {
-                    match args[j].as_str() {
-                        "--output-file" => {
-                            output_file = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--input-fifo" => {
-                            input_fifo = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--prompt-file" => {
-                            prompt_file = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--cwd" => {
-                            cwd = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--codex-bin" => {
-                            codex_bin = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--codex-model" => {
-                            codex_model = args.get(j + 1).cloned();
-                            j += 2;
-                        }
-                        "--input-mode" => {
-                            if let Some(mode) = args.get(j + 1) {
-                                input_mode = match mode.as_str() {
-                                    "pipe" => services::tmux_wrapper::InputMode::Pipe,
-                                    _ => services::tmux_wrapper::InputMode::Fifo,
-                                };
-                            }
-                            j += 2;
-                        }
-                        _ => {
-                            j += 1;
-                        }
-                    }
-                }
-                match (output_file, input_fifo, prompt_file, codex_bin) {
-                    (Some(of), Some(inf), Some(pf), Some(bin)) => {
-                        let wd = cwd.unwrap_or_else(|| ".".to_string());
-                        services::codex_tmux_wrapper::run(
-                            &of,
-                            &inf,
-                            &pf,
-                            &wd,
-                            &bin,
-                            codex_model.as_deref(),
-                            input_mode,
-                        );
-                    }
-                    _ => eprintln!(
-                        "Error: --codex-tmux-wrapper requires --output-file, --input-fifo, --prompt-file, and --codex-bin"
-                    ),
-                }
+            Some(Commands::CodexTmuxWrapper {
+                output_file,
+                input_fifo,
+                prompt_file,
+                codex_bin,
+                codex_model,
+                cwd,
+                input_mode,
+            }) => {
+                let mode = match input_mode {
+                    InputModeArg::Pipe => services::tmux_wrapper::InputMode::Pipe,
+                    InputModeArg::Fifo => services::tmux_wrapper::InputMode::Fifo,
+                };
+                services::codex_tmux_wrapper::run(
+                    &output_file,
+                    &input_fifo,
+                    &prompt_file,
+                    &cwd,
+                    &codex_bin,
+                    codex_model.as_deref(),
+                    mode,
+                );
                 return Ok(());
             }
-            _ => {}
-        }
-    }
-
-    // ── Clap subcommand parsing ──────────────────────────────
-    let parsed = Cli::try_parse();
-    match parsed {
-        Ok(cli) => match cli.command {
+            Some(Commands::ResetTmux) => {
+                cli::utils::handle_reset_tmux();
+                return Ok(());
+            }
+            Some(Commands::Ismcptool { tools }) => {
+                cli::utils::handle_ismcptool(&tools);
+                return Ok(());
+            }
+            Some(Commands::Addmcptool { tools }) => {
+                cli::utils::handle_addmcptool(&tools);
+                return Ok(());
+            }
+            // ── Client commands ──
             Some(Commands::Status) => {
                 return exit_for_cli(cli::client::cmd_status());
             }
@@ -429,7 +391,8 @@ fn main() -> Result<()> {
                 e.print().ok();
                 std::process::exit(0);
             }
-            if args.len() > 1 {
+            let has_args = std::env::args().count() > 1;
+            if has_args {
                 e.print().ok();
                 std::process::exit(1);
             }
@@ -440,24 +403,25 @@ fn main() -> Result<()> {
     // ── Default: start full AgentDesk server ─────────────────
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        let directive = "agentdesk=info"
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Failed to parse tracing directive: {e}"))?;
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive("agentdesk=info".parse().unwrap()),
-            )
+            .with_env_filter(EnvFilter::from_default_env().add_directive(directive))
             .init();
 
-        let config = config::load().expect("Failed to load config");
-        let db = db::init(&config).expect("Failed to init DB");
+        let config = config::load().context("Failed to load config")?;
+        let db = db::init(&config).context("Failed to init DB")?;
 
         // Load data-driven pipeline definition (#106)
         let pipeline_path = config.policies.dir.join("default-pipeline.yaml");
         if pipeline_path.exists() {
-            pipeline::load(&pipeline_path).expect("Failed to load pipeline definition");
+            pipeline::load(&pipeline_path).context("Failed to load pipeline definition")?;
             tracing::info!("Pipeline loaded: {}", pipeline_path.display());
         }
 
-        let engine =
-            engine::PolicyEngine::new(&config, db.clone()).expect("Failed to init policy engine");
+        let engine = engine::PolicyEngine::new(&config, db.clone())
+            .context("Failed to init policy engine")?;
 
         tracing::info!(
             "AgentDesk v{} starting on {}:{}",
@@ -466,14 +430,48 @@ fn main() -> Result<()> {
             config.server.port
         );
 
-        tokio::try_join!(server::run(
-            config.clone(),
-            db.clone(),
-            engine.clone(),
-            None
-        ),)
-        .expect("Server error");
-    });
+        server::run(config.clone(), db.clone(), engine.clone(), None)
+            .await
+            .context("Server error")?;
+
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     Ok(())
+}
+
+/// Build RestartReportContext from clap-parsed arguments, falling back to env vars.
+fn build_restart_report_context(
+    report_channel_id: Option<u64>,
+    report_provider: Option<ReportProvider>,
+    report_message_id: Option<u64>,
+) -> std::result::Result<
+    Option<services::discord::restart_report::RestartReportContext>,
+    String,
+> {
+    use services::discord::restart_report::{
+        RestartReportContext, restart_report_context_from_env,
+    };
+    use services::provider::ProviderKind;
+
+    match (report_provider, report_channel_id, report_message_id) {
+        (None, None, None) => Ok(restart_report_context_from_env()),
+        (None, None, Some(_)) => Err(
+            "--report-message-id requires --report-channel-id and --report-provider".to_string(),
+        ),
+        (Some(_), None, _) => Err("--report-provider requires --report-channel-id".to_string()),
+        (None, Some(_), _) => Err("--report-channel-id requires --report-provider".to_string()),
+        (Some(provider_arg), Some(channel_id), current_msg_id) => {
+            let provider = match provider_arg {
+                ReportProvider::Claude => ProviderKind::Claude,
+                ReportProvider::Codex => ProviderKind::Codex,
+                ReportProvider::Gemini => ProviderKind::Gemini,
+            };
+            Ok(Some(RestartReportContext {
+                provider,
+                channel_id,
+                current_msg_id,
+            }))
+        }
+    }
 }

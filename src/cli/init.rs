@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write as IoWrite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::dcserver;
 
@@ -217,7 +217,7 @@ fn generate_launchd_plist(home: &Path, agentdesk_bin: &Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{bin_str}</string>
-    <string>--dcserver</string>
+    <string>dcserver</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -291,7 +291,7 @@ pub fn handle_init(reconfigure: bool) {
 
     if !reconfigure && root.join("config").join("bot_settings.json").exists() {
         println!("기존 설정이 발견되었습니다: {}", root.display());
-        println!("재설정하려면 --reconfigure를 사용하세요.");
+        println!("재설정하려면 reconfigure를 사용하세요.");
         return;
     }
 
@@ -655,7 +655,7 @@ fn install_service(home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Res
          After=network.target\n\n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={bin} --dcserver\n\
+         ExecStart={bin} dcserver\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          Environment=AGENTDESK_ROOT_DIR={root}\n\
@@ -709,7 +709,7 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Re
     println!("  Windows 서비스 등록:");
     println!("  NSSM 사용 시:");
     println!(
-        "    nssm install {service_name} \"{}\" --dcserver",
+        "    nssm install {service_name} \"{}\" dcserver",
         agentdesk_bin.display()
     );
     println!(
@@ -723,7 +723,7 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Re
     println!("    nssm start {service_name}");
     println!("  sc.exe 사용 시:");
     println!(
-        "    sc create {service_name} binPath=\"{} --dcserver\" start=auto",
+        "    sc create {service_name} binPath=\"{} dcserver\" start=auto",
         agentdesk_bin.display()
     );
     println!("    sc start {service_name}");
@@ -735,7 +735,7 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Re
                 "install",
                 service_name,
                 &agentdesk_bin.to_string_lossy(),
-                "--dcserver",
+                "dcserver",
             ])
             .status();
         match status {
@@ -773,7 +773,7 @@ fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Re
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn install_service(_home: &Path, agentdesk_bin: &Path, _reconfigure: bool) -> Result<(), String> {
     println!("  이 플랫폼에서는 자동 서비스 등록이 지원되지 않습니다.");
-    println!("  수동으로 실행: {} --dcserver", agentdesk_bin.display());
+    println!("  수동으로 실행: {} dcserver", agentdesk_bin.display());
     Ok(())
 }
 

@@ -495,10 +495,19 @@ pub(super) async fn tmux_output_watcher(
 
     // Kill dead tmux session to prevent accumulation (especially for thread sessions
     // which are created per-dispatch and would otherwise linger for 24h).
+    // #145: skip kill for unified-thread sessions with active auto-queue runs.
     {
         let sess = tmux_session_name.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if tmux_session_exists(&sess) && !tmux_session_has_live_pane(&sess) {
+                // Check if this is a unified-thread session before killing
+                if let Some((_, ch_name)) =
+                    crate::services::provider::parse_provider_and_channel_from_tmux_name(&sess)
+                {
+                    if crate::dispatch::is_unified_thread_channel_name_active(&ch_name) {
+                        return;
+                    }
+                }
                 record_tmux_exit_reason(&sess, "watcher cleanup: dead session after turn");
                 let _ = std::process::Command::new("tmux")
                     .args(["kill-session", "-t", &sess])
@@ -1014,13 +1023,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         for dc in &dead_cleanups {
             let tmux_name = provider.build_tmux_session_name(&dc.channel_name);
-            let hostname = std::process::Command::new("hostname")
-                .arg("-s")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let hostname = crate::services::platform::hostname_short();
             let session_key = format!("{}:{}", hostname, tmux_name);
 
             super::adk_session::post_adk_session_status(
@@ -1104,6 +1107,16 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
             });
 
             if !has_owner {
+                // #145: skip orphan cleanup for unified-thread sessions with active runs
+                if let Some((_, ref ch_name)) =
+                    parse_provider_and_channel_from_tmux_name(session_name)
+                        .as_ref()
+                        .map(|(p, c)| (p.clone(), c.clone()))
+                {
+                    if crate::dispatch::is_unified_thread_channel_name_active(ch_name) {
+                        continue;
+                    }
+                }
                 result.push(session_name.to_string());
             }
         }
@@ -1224,13 +1237,7 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
         // Dead session with no watcher — report idle to DB and kill
         let tmux_name =
             provider.build_tmux_session_name(channel_name.as_deref().unwrap_or("unknown"));
-        let hostname = std::process::Command::new("hostname")
-            .arg("-s")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let hostname = crate::services::platform::hostname_short();
         let session_key = format!("{}:{}", hostname, tmux_name);
 
         // Check if this is a thread session (channel name contains -t{15+digit})
@@ -1243,11 +1250,16 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
             })
             .is_some();
 
-        if is_thread {
+        // #145: unified-thread sessions should NOT be killed or deleted while
+        // the auto-queue run is still active — mark idle instead and skip kill.
+        let is_unified_active = is_thread
+            && crate::dispatch::is_unified_thread_channel_active(channel_id.get());
+
+        if is_thread && !is_unified_active {
             // Thread sessions: delete from DB entirely (they are one-shot)
             super::adk_session::delete_adk_session(&session_key, api_port).await;
         } else {
-            // Fixed-channel sessions: just mark idle
+            // Fixed-channel sessions or active unified-thread: just mark idle
             super::adk_session::post_adk_session_status(
                 Some(&session_key),
                 channel_name.as_deref(),
@@ -1261,6 +1273,15 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
                 api_port,
             )
             .await;
+        }
+
+        if is_unified_active {
+            // Don't kill unified-thread sessions — they'll be reused
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ♻ reaper: skipping kill for unified-thread session {session_name} — run still active"
+            );
+            continue;
         }
 
         // Kill the dead tmux session

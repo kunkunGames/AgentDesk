@@ -208,6 +208,49 @@ pub async fn api_docs() -> (StatusCode, Json<Value>) {
             "pipeline",
             "Get card pipeline state",
         ),
+        // Pipeline config hierarchy (#135)
+        ep(
+            "GET",
+            "/api/pipeline/config/default",
+            "pipeline",
+            "Get default pipeline config",
+        ),
+        ep(
+            "GET",
+            "/api/pipeline/config/effective?repo=...&agent_id=...",
+            "pipeline",
+            "Get effective (merged) pipeline for repo/agent",
+        ),
+        ep(
+            "GET",
+            "/api/pipeline/config/repo/{owner}/{repo}",
+            "pipeline",
+            "Get repo pipeline override",
+        ),
+        ep(
+            "PUT",
+            "/api/pipeline/config/repo/{owner}/{repo}",
+            "pipeline",
+            "Set repo pipeline override",
+        ),
+        ep(
+            "GET",
+            "/api/pipeline/config/agent/{agent_id}",
+            "pipeline",
+            "Get agent pipeline override",
+        ),
+        ep(
+            "PUT",
+            "/api/pipeline/config/agent/{agent_id}",
+            "pipeline",
+            "Set agent pipeline override",
+        ),
+        ep(
+            "GET",
+            "/api/pipeline/config/graph?repo=...&agent_id=...",
+            "pipeline",
+            "Get pipeline as visual graph (nodes + edges)",
+        ),
         // GitHub
         ep("GET", "/api/github/repos", "github", "List GitHub repos"),
         ep(
@@ -437,6 +480,24 @@ pub async fn api_docs() -> (StatusCode, Json<Value>) {
             "/api/auto-queue/reorder",
             "auto-queue",
             "Reorder auto-queue",
+        ),
+        ep(
+            "POST",
+            "/api/auto-queue/pause",
+            "auto-queue",
+            "Pause all active runs",
+        ),
+        ep(
+            "POST",
+            "/api/auto-queue/resume",
+            "auto-queue",
+            "Resume paused runs + dispatch next",
+        ),
+        ep(
+            "POST",
+            "/api/auto-queue/cancel",
+            "auto-queue",
+            "Cancel all active/paused runs",
         ),
         // Analytics
         ep("GET", "/api/streaks", "analytics", "Agent activity streaks"),

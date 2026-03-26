@@ -3,8 +3,114 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
-use crate::engine::hooks::Hook;
 use crate::services::provider::ProviderKind;
+
+/// #119: Convenience wrapper — queries review state and records a tuning outcome.
+/// Called from each decision branch (accept, dispute, dismiss) to avoid
+/// relying on code after the match block that early-returning branches skip.
+fn record_decision_tuning(
+    db: &crate::db::Db,
+    card_id: &str,
+    decision: &str,
+    dispatch_id: Option<&str>,
+) {
+    let (review_round, last_verdict, finding_cats) = db
+        .lock()
+        .ok()
+        .map(|conn| {
+            let round: Option<i64> = conn
+                .query_row(
+                    "SELECT review_round FROM card_review_state WHERE card_id = ?1",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let verdict: Option<String> = conn
+                .query_row(
+                    "SELECT last_verdict FROM card_review_state WHERE card_id = ?1",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            let cats: Option<String> = conn
+                .query_row(
+                    "SELECT td.result FROM task_dispatches td \
+                     WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' \
+                     AND td.status = 'completed' ORDER BY td.rowid DESC LIMIT 1",
+                    [card_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .and_then(|r| {
+                    serde_json::from_str::<serde_json::Value>(&r)
+                        .ok()
+                        .and_then(|v| {
+                            v["items"].as_array().map(|items| {
+                                let cats: Vec<String> = items
+                                    .iter()
+                                    .filter_map(|it| it["category"].as_str().map(|s| s.to_string()))
+                                    .collect();
+                                serde_json::to_string(&cats).unwrap_or_default()
+                            })
+                        })
+                });
+            (round, verdict, cats)
+        })
+        .unwrap_or((None, None, None));
+
+    let outcome = match decision {
+        "accept" => "true_positive",
+        "dismiss" => "false_positive",
+        "dispute" => "disputed",
+        _ => "unknown",
+    };
+    record_tuning_outcome(
+        db,
+        card_id,
+        dispatch_id,
+        review_round,
+        last_verdict.as_deref().unwrap_or("unknown"),
+        Some(decision),
+        outcome,
+        finding_cats.as_deref(),
+    );
+}
+
+/// #119: Record a review tuning outcome for FP/FN aggregation.
+fn record_tuning_outcome(
+    db: &crate::db::Db,
+    card_id: &str,
+    dispatch_id: Option<&str>,
+    review_round: Option<i64>,
+    verdict: &str,
+    decision: Option<&str>,
+    outcome: &str,
+    finding_categories: Option<&str>,
+) {
+    if let Ok(conn) = db.lock() {
+        conn.execute(
+            "INSERT INTO review_tuning_outcomes \
+             (card_id, dispatch_id, review_round, verdict, decision, outcome, finding_categories) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                card_id,
+                dispatch_id,
+                review_round,
+                verdict,
+                decision,
+                outcome,
+                finding_categories,
+            ],
+        )
+        .ok();
+        tracing::info!(
+            "[review-tuning] #119 recorded outcome: card={card_id} verdict={verdict} decision={} outcome={outcome}",
+            decision.unwrap_or("none")
+        );
+    }
+}
 
 /// #117: Update the canonical card_review_state record after a review-decision action.
 fn update_card_review_state(
@@ -29,6 +135,7 @@ fn update_card_review_state(
                decided_by = NULL,
                decided_at = datetime('now'),
                pending_dispatch_id = NULL,
+               approach_change_round = NULL,
                updated_at = datetime('now')",
             rusqlite::params![card_id, state, decision],
         ).ok();
@@ -40,27 +147,49 @@ fn update_card_review_state(
 ///
 /// When `reviewed_commit` is provided, stamp that exact commit (the one that
 /// was actually reviewed). Falls back to current HEAD for backwards compat.
-fn stamp_review_passed_marker(reviewed_commit: Option<&str>) {
+/// Returns `Err` only when HOME directory cannot be resolved (environment
+/// misconfiguration).  Git or filesystem failures are logged but not fatal
+/// — the marker is best-effort when commit is not explicitly provided.
+fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), String> {
+    let resolve_home = || -> Result<std::path::PathBuf, String> {
+        dirs::home_dir().ok_or_else(|| {
+            "HOME directory not found; set AGENTDESK_REPO_DIR and AGENTDESK_ROOT_DIR".to_string()
+        })
+    };
+
     let commit = if let Some(c) = reviewed_commit {
         c.to_string()
     } else {
-        let repo_dir = std::env::var("AGENTDESK_REPO_DIR")
-            .unwrap_or_else(|_| format!("{}/AgentDesk", env!("HOME")));
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo_dir)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let Some(c) = out else { return };
-        c
+        let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
+            Ok(d) => d,
+            Err(_) => resolve_home()?
+                .join("AgentDesk")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        match crate::services::platform::git_head_commit(&repo_dir) {
+            Some(c) => c,
+            None => {
+                eprintln!("stamp_review_passed_marker: git rev-parse HEAD failed, skipping marker");
+                return Ok(());
+            }
+        }
     };
-    let root = std::env::var("AGENTDESK_ROOT_DIR")
-        .unwrap_or_else(|_| format!("{}/.adk/release", env!("HOME")));
+    let root = match std::env::var("AGENTDESK_ROOT_DIR") {
+        Ok(d) => d,
+        Err(_) => resolve_home()?
+            .join(".adk/release")
+            .to_string_lossy()
+            .into_owned(),
+    };
     let dir = format!("{}/runtime/review_passed", root);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(format!("{}/{}", dir, commit), "");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("stamp_review_passed_marker: failed to create dir: {e}");
+    }
+    if let Err(e) = std::fs::write(format!("{}/{}", dir, commit), "") {
+        eprintln!("stamp_review_passed_marker: failed to write marker: {e}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,10 +444,34 @@ pub async fn submit_verdict(
 
     drop(conn);
 
-    // Fire OnReviewVerdict hook — policy engine handles all state transitions
+    // #100: stamp release marker AFTER dispatch update confirmed, BEFORE hooks.
+    // This ensures: (1) stale/duplicate submissions don't write markers (updated==0 already returned),
+    // (2) marker failure prevents hooks from firing (no partial state).
+    if body.overall == "pass" || body.overall == "approved" {
+        if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
+            // Roll back the dispatch status since we can't complete the pass flow
+            if let Ok(conn) = state.db.lock() {
+                let _ = conn.execute(
+                    "UPDATE task_dispatches SET status = 'dispatched', updated_at = datetime('now') WHERE id = ?1",
+                    [&body.dispatch_id],
+                );
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("failed to write release marker: {e}"),
+                })),
+            );
+        }
+    }
+
+    // Fire event hooks for review verdict (#134 — pipeline-defined events)
     if let Some(ref cid) = card_id {
-        let _ = state.engine.try_fire_hook(
-            Hook::OnReviewVerdict,
+        crate::kanban::fire_event_hooks(
+            &state.engine,
+            "on_review_verdict",
+            "OnReviewVerdict",
             json!({
                 "card_id": cid,
                 "dispatch_id": body.dispatch_id,
@@ -354,10 +507,11 @@ pub async fn submit_verdict(
         });
     }
 
-    // When review passes, stamp a marker so promote-release.sh can verify
-    if body.overall == "pass" || body.overall == "approved" {
-        stamp_review_passed_marker(effective_commit.as_deref());
-    }
+    // #119: TN is recorded when a pass-reviewed card reaches done (see kanban.rs
+    // record_true_negative_if_pass). FN (false_negative = pass but post-pass bug found)
+    // requires an external bug-report signal that does not yet exist in the system.
+
+    // #100: release marker was already stamped before dispatch completion (above).
 
     (
         StatusCode::OK,
@@ -506,6 +660,15 @@ pub async fn submit_review_decision(
                             ],
                         ).ok();
                     }
+                    // #119: Record tuning outcome BEFORE transition (which clears last_verdict)
+                    record_decision_tuning(
+                        &state.db,
+                        &body.card_id,
+                        "accept",
+                        pending_rd_id.as_deref(),
+                    );
+                    spawn_aggregate_if_needed(&state.db);
+
                     let _ = crate::kanban::transition_status(
                         &state.db,
                         &state.engine,
@@ -592,14 +755,17 @@ pub async fn submit_review_decision(
             ).ok();
             drop(conn);
 
-            // Fire OnReviewEnter to create new review dispatch
-            let _ = state.engine.try_fire_hook(
-                Hook::OnReviewEnter,
-                json!({
-                    "card_id": body.card_id,
-                    "from": "review",
-                }),
+            // #119: Record tuning outcome BEFORE OnReviewEnter (which increments review_round)
+            record_decision_tuning(
+                &state.db,
+                &body.card_id,
+                "dispute",
+                pending_rd_id.as_deref(),
             );
+            spawn_aggregate_if_needed(&state.db);
+
+            // Fire on_enter hooks for review state to create new review dispatch (#134)
+            crate::kanban::fire_enter_hooks(&state.db, &state.engine, &body.card_id, "review");
 
             // Drain: onReviewEnter may call setStatus (e.g. pending_decision on max rounds)
             loop {
@@ -625,6 +791,31 @@ pub async fn submit_review_decision(
                 "dispute",
                 pending_rd_id.as_deref(),
             );
+
+            // Send newly created review dispatch to Discord (created by OnReviewEnter hook)
+            if let Ok(conn) = state.db.lock() {
+                let new_review: Option<(String, String, String)> = conn
+                    .query_row(
+                        "SELECT td.id, COALESCE(td.to_agent_id, ''), COALESCE(td.title, '') \
+                         FROM task_dispatches td \
+                         WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' AND td.status = 'pending' \
+                         ORDER BY td.rowid DESC LIMIT 1",
+                        [&body.card_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .ok();
+                drop(conn);
+                if let Some((did, aid, title)) = new_review {
+                    let db_clone = state.db.clone();
+                    let card_id = body.card_id.clone();
+                    tokio::spawn(async move {
+                        super::dispatches::send_dispatch_to_discord(
+                            &db_clone, &aid, &title, &card_id, &did,
+                        )
+                        .await;
+                    });
+                }
+            }
 
             return (
                 StatusCode::OK,
@@ -676,6 +867,15 @@ pub async fn submit_review_decision(
         pending_rd_id.as_deref(),
     );
 
+    // #119: Record tuning outcome (dismiss falls through here; accept/dispute call helper before returning)
+    record_decision_tuning(
+        &state.db,
+        &body.card_id,
+        &body.decision,
+        pending_rd_id.as_deref(),
+    );
+    spawn_aggregate_if_needed(&state.db);
+
     (
         StatusCode::OK,
         Json(json!({
@@ -684,6 +884,230 @@ pub async fn submit_review_decision(
             "decision": body.decision,
         })),
     )
+}
+
+// ── #119: Review tuning aggregation ──────────────────────────────────────────
+
+/// Minimum total outcomes required before generating any guidance.
+/// Prevents misleading guidance from tiny sample sizes.
+const MIN_OUTCOMES_FOR_GUIDANCE: i64 = 5;
+
+/// Minimum outcomes per category before including it in guidance.
+const MIN_CATEGORY_OUTCOMES: i64 = 3;
+
+/// Spawn a background task to re-aggregate review tuning data.
+/// Uses a lightweight debounce: skips if the last aggregate was < 60s ago.
+pub fn spawn_aggregate_if_needed(db: &crate::db::Db) {
+    let db = db.clone();
+    tokio::spawn(async move {
+        // Debounce: check if guidance file was written recently
+        let path = review_tuning_guidance_path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                if modified.elapsed().map_or(false, |d| d.as_secs() < 60) {
+                    return; // aggregated < 60s ago, skip
+                }
+            }
+        }
+        aggregate_review_tuning_core(&db);
+    });
+}
+
+/// Core aggregation logic shared by the HTTP endpoint and background trigger.
+fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64, usize) {
+    let conn = match db.lock() {
+        Ok(c) => c,
+        Err(_) => return (0, 0, 0, 0, 0, 0),
+    };
+
+    let mut total_tp = 0i64;
+    let mut total_fp = 0i64;
+    let mut total_tn = 0i64;
+    let mut total_fn = 0i64;
+    let mut total_disputed = 0i64;
+    let mut fp_categories: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut tp_categories: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+    let mut fn_categories: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+
+    {
+        let mut stmt = match conn.prepare(
+            "SELECT outcome, finding_categories \
+             FROM review_tuning_outcomes \
+             WHERE created_at > datetime('now', '-30 days')",
+        ) {
+            Ok(s) => s,
+            Err(_) => return (0, 0, 0, 0, 0, 0),
+        };
+
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .ok()
+            .into_iter()
+            .flat_map(|r| r.flatten())
+            .collect();
+
+        for (outcome, cats_json) in &rows {
+            match outcome.as_str() {
+                "true_positive" => total_tp += 1,
+                "false_positive" => total_fp += 1,
+                "true_negative" => total_tn += 1,
+                "false_negative" => total_fn += 1,
+                "disputed" => total_disputed += 1,
+                _ => {}
+            }
+            if let Some(cats) = cats_json {
+                if let Ok(cats_arr) = serde_json::from_str::<Vec<String>>(cats) {
+                    let target = match outcome.as_str() {
+                        "false_positive" => Some(&mut fp_categories),
+                        "true_positive" => Some(&mut tp_categories),
+                        "false_negative" => Some(&mut fn_categories),
+                        _ => None,
+                    };
+                    if let Some(map) = target {
+                        for cat in cats_arr {
+                            *map.entry(cat).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let total = total_tp + total_fp + total_tn + total_fn + total_disputed;
+    let mut guidance_lines: Vec<String> = Vec::new();
+
+    // Only generate guidance when we have enough data to be meaningful
+    if total >= MIN_OUTCOMES_FOR_GUIDANCE {
+        let actionable = total_tp + total_fp;
+        let fp_rate = if actionable > 0 {
+            total_fp as f64 / actionable as f64
+        } else {
+            0.0
+        };
+
+        guidance_lines.push(format!(
+            "지난 30일 리뷰 통계: 전체 {}건 (정탐 {}건, 오탐 {}건, 정상 {}건, 미탐 {}건, 반박 {}건, 오탐률 {:.0}%)",
+            total, total_tp, total_fp, total_tn, total_fn, total_disputed, fp_rate * 100.0
+        ));
+
+        // High FP categories (min sample guard)
+        let mut fp_sorted: Vec<_> = fp_categories.iter().collect();
+        fp_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (cat, count) in fp_sorted.iter().take(5) {
+            let tp_count = tp_categories.get(*cat).copied().unwrap_or(0);
+            let cat_total = *count + tp_count;
+            if cat_total >= MIN_CATEGORY_OUTCOMES && **count as f64 / cat_total as f64 > 0.5 {
+                guidance_lines.push(format!(
+                    "- 과도 지적 카테고리 '{}': 오탐 {}건/전체 {}건 — 이 유형은 엄격도를 낮춰라",
+                    cat, count, cat_total
+                ));
+            }
+        }
+
+        // High TP categories (min sample guard)
+        let mut tp_sorted: Vec<_> = tp_categories.iter().collect();
+        tp_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (cat, count) in tp_sorted.iter().take(3) {
+            let fp_count = fp_categories.get(*cat).copied().unwrap_or(0);
+            let cat_total = *count + fp_count;
+            if cat_total >= MIN_CATEGORY_OUTCOMES && **count as f64 / cat_total as f64 > 0.7 {
+                guidance_lines.push(format!(
+                    "- 정탐 빈출 카테고리 '{}': 정탐 {}건/전체 {}건 — 이 유형은 계속 주의 깊게 확인하라",
+                    cat, count, cat_total
+                ));
+            }
+        }
+
+        // FN categories — patterns the reviewer missed (reopen after pass)
+        if total_fn > 0 {
+            let mut fn_sorted: Vec<_> = fn_categories.iter().collect();
+            fn_sorted.sort_by(|a, b| b.1.cmp(a.1));
+            for (cat, count) in fn_sorted.iter().take(3) {
+                guidance_lines.push(format!(
+                    "- 미탐 카테고리 '{}': {}건 — 이 패턴은 리뷰에서 놓쳤다, 반드시 확인하라",
+                    cat, count
+                ));
+            }
+        }
+    }
+
+    let guidance = if guidance_lines.is_empty() {
+        String::new()
+    } else {
+        guidance_lines.join("\n")
+    };
+
+    // Store in kv_meta
+    conn.execute(
+        "INSERT INTO kv_meta (key, value) VALUES ('review_tuning_guidance', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [&guidance],
+    )
+    .ok();
+
+    // Write to file for prompt_builder to read
+    let guidance_path = review_tuning_guidance_path();
+    if let Some(parent) = guidance_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&guidance_path, &guidance);
+
+    let lines = guidance_lines.len();
+    tracing::info!(
+        "[review-tuning] #119 aggregation: tp={total_tp} fp={total_fp} tn={total_tn} fn={total_fn} disputed={total_disputed}, {lines} guidance lines → {}",
+        guidance_path.display()
+    );
+
+    (
+        total_tp,
+        total_fp,
+        total_tn,
+        total_fn,
+        total_disputed,
+        lines,
+    )
+}
+
+/// POST /api/review-tuning/aggregate
+///
+/// Aggregates review tuning outcomes (FP/FN rates per finding category)
+/// and writes tuning guidance to kv_meta + a file for prompt injection.
+pub async fn aggregate_review_tuning(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (total_tp, total_fp, total_tn, total_fn, total_disputed, guidance_lines) =
+        aggregate_review_tuning_core(&state.db);
+    let total = total_tp + total_fp + total_tn + total_fn + total_disputed;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "total": total,
+            "true_positive": total_tp,
+            "false_positive": total_fp,
+            "true_negative": total_tn,
+            "false_negative": total_fn,
+            "disputed": total_disputed,
+            "guidance_lines": guidance_lines,
+        })),
+    )
+}
+
+/// Well-known path for review tuning guidance file.
+/// Uses ~/.adk/release/runtime/ (same logic as agentdesk_runtime_root).
+pub fn review_tuning_guidance_path() -> std::path::PathBuf {
+    let root = std::env::var("AGENTDESK_ROOT_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".adk").join("release")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    root.join("runtime").join("review-tuning-guidance.txt")
 }
 
 #[cfg(test)]
@@ -779,6 +1203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // CI: handle_completed_dispatch_followups -> send_review_result_to_primary early-returns without ADK runtime
     async fn submit_verdict_improve_creates_review_decision_dispatch() {
         let db = test_db();
         seed_review_card(&db, "dispatch-improve");

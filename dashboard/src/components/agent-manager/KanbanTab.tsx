@@ -3,6 +3,7 @@ import * as api from "../../api";
 import type { GitHubIssue, GitHubRepoOption, KanbanRepoSource } from "../../api";
 import AutoQueuePanel from "./AutoQueuePanel";
 import PipelineEditor from "./PipelineEditor";
+import PipelineConfigView from "./PipelineConfigView";
 import PipelineProgress from "./PipelineProgress";
 import MarkdownContent from "../common/MarkdownContent";
 import KanbanColumn from "./KanbanColumn";
@@ -1416,6 +1417,13 @@ export default function KanbanTab({
             locale={locale}
             agents={agents}
             selectedRepo={selectedRepo}
+            selectedAgentId={selectedAgentId}
+          />
+          <PipelineConfigView
+            tr={tr}
+            locale={locale}
+            repo={selectedRepo}
+            agents={agents}
             selectedAgentId={selectedAgentId}
           />
           <PipelineEditor

@@ -72,6 +72,12 @@ export {
   saveRuntimeConfig,
   reorderAutoQueueEntries,
   resetAutoQueue,
+  getDefaultPipeline,
+  getEffectivePipeline,
+  getRepoPipeline,
+  setRepoPipeline,
+  getAgentPipeline,
+  setAgentPipeline,
   createDispatch,
   getKanbanReviews,
   saveReviewDecisions,
@@ -114,6 +120,7 @@ export type {
   ChatMessage,
   RuntimeConfigResponse,
   TimelineEvent,
+  PipelineConfigResponse,
 } from "./client";
 
 // ── Sprite processing (stub for PCD — no backend sprite processor) ──
