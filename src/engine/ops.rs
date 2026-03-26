@@ -721,37 +721,35 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return format!(r#"{{"ok":true,"changed":false,"status":"{}"}}"#, new_status);
             }
 
-            // Guard: prevent reverting terminal cards (#106 pipeline-driven)
-            let is_terminal = crate::pipeline::try_get()
-                .map(|p| p.is_terminal(&old_status))
-                .unwrap_or(old_status == "done");
-            if is_terminal && old_status != new_status {
+            // Pipeline-driven guard and clock fields (#106 P5)
+            crate::pipeline::ensure_loaded();
+            let Some(pipeline) = crate::pipeline::try_get() else {
+                return r#"{"error":"pipeline not loaded"}"#.to_string();
+            };
+
+            // Guard: prevent reverting terminal cards
+            if pipeline.is_terminal(&old_status) && old_status != new_status {
                 return format!(
                     r#"{{"error":"cannot revert terminal card from {} to {}"}}"#,
                     old_status, new_status
                 );
             }
 
-            // Clock fields from pipeline config (#106)
-            let extra: String = if let Some(p) = crate::pipeline::try_get() {
-                match p.clock_for_state(&new_status) {
-                    Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
-                        format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
-                    }
-                    Some(clock) => format!(", {} = datetime('now')", clock.set),
-                    None if new_status == "done" => {
-                        ", completed_at = datetime('now'), review_status = NULL".to_string()
-                    }
-                    None => String::new(),
+            // Clock fields from pipeline config
+            let clock_extra = match pipeline.clock_for_state(&new_status) {
+                Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
+                    format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
                 }
-            } else {
-                match new_status.as_str() {
-                    "in_progress" => ", started_at = datetime('now')".to_string(),
-                    "requested" => ", requested_at = datetime('now')".to_string(),
-                    "done" => ", completed_at = datetime('now'), review_status = NULL".to_string(),
-                    _ => String::new(),
-                }
+                Some(clock) => format!(", {} = datetime('now')", clock.set),
+                None => String::new(),
             };
+            // Terminal cleanup: clear review-related fields
+            let terminal_cleanup = if pipeline.is_terminal(&new_status) {
+                ", review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL"
+            } else {
+                ""
+            };
+            let extra = format!("{clock_extra}{terminal_cleanup}");
             let sql = format!(
                 "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){} WHERE id = ?2",
                 extra
@@ -761,21 +759,23 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             }
 
             // Also update auto_queue_entries if terminal
-            if new_status == "done" {
+            if pipeline.is_terminal(&new_status) {
                 conn.execute(
                     "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') WHERE kanban_card_id = ?1 AND status = 'dispatched'",
                     [&card_id],
                 ).ok();
             }
 
-            // #117: Sync canonical review state on status transitions
-            if new_status == "done" || new_status == "ready" || new_status == "backlog" {
+            // #117: Sync canonical review state on status transitions (pipeline-driven)
+            let has_hooks = pipeline.hooks_for_state(&new_status).map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
+            let is_review_enter = pipeline.hooks_for_state(&new_status).map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+            if pipeline.is_terminal(&new_status) || !has_hooks {
                 conn.execute(
                     "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
                      ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
                     [&card_id],
                 ).ok();
-            } else if new_status == "review" {
+            } else if is_review_enter {
                 conn.execute(
                     "INSERT INTO card_review_state (card_id, state, review_entered_at, updated_at) VALUES (?1, 'reviewing', datetime('now'), datetime('now')) \
                      ON CONFLICT(card_id) DO UPDATE SET state = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now')",
