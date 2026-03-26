@@ -45,7 +45,7 @@ pub(super) fn build_system_prompt(
          Current working directory: {}\n\n\
          When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
          send it by running this bash command:\n\n\
-         agentdesk --discord-sendfile <filepath> --channel {} --key {}\n\n\
+         agentdesk discord-sendfile <filepath> --channel {} --key {}\n\n\
          This delivers the file directly to the user's Discord channel.\n\
          Do NOT tell the user to use /down — use the command above instead.\n\n\
          Always keep the user informed about what you are doing. Briefly explain each step as you work \
@@ -235,8 +235,8 @@ mod tests {
     fn test_build_system_prompt_includes_file_send_command() {
         let output = call_build("ctx", "/tmp", 1, "tok", "", "");
         assert!(
-            output.contains("agentdesk --discord-sendfile"),
-            "System prompt should contain the agentdesk --discord-sendfile command"
+            output.contains("agentdesk discord-sendfile"),
+            "System prompt should contain the agentdesk discord-sendfile command"
         );
     }
 

@@ -109,7 +109,7 @@ pub(super) fn stale_inflight_message(saved_response: &str) -> String {
 fn is_dcserver_restart_command(input: &str) -> bool {
     let lower = input.to_lowercase();
 
-    if lower.contains("--restart-dcserver") || lower.contains("restart_agentdesk.sh") {
+    if lower.contains("restart-dcserver") || lower.contains("restart_agentdesk.sh") {
         return true;
     }
 

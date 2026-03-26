@@ -1658,7 +1658,7 @@ fn execute_streaming_local_tmux(
     let script_content = format!(
         "#!/bin/bash\n\
         {env}\
-        exec {exe} --tmux-wrapper \\\n  \
+        exec {exe} tmux-wrapper \\\n  \
         --output-file {output} \\\n  \
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \

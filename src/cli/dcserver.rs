@@ -233,7 +233,7 @@ pub fn dcserver_process_command(_pid: u32) -> Option<String> {
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
     let is_dcserver =
-        command.contains("agentdesk dcserver") || command.contains("agentdesk --dcserver");
+        command.contains("agentdesk dcserver");
     if !is_dcserver {
         return false;
     }
@@ -246,9 +246,8 @@ pub fn dcserver_process_matches_instance(command: &str) -> bool {
 
 #[cfg(unix)]
 pub fn dcserver_instance_pids() -> Vec<u32> {
-    // Match both "agentdesk dcserver" (legacy) and "agentdesk --dcserver" (service templates)
     let output = match std::process::Command::new("pgrep")
-        .args(["-f", "agentdesk.*(dcserver|--dcserver)"])
+        .args(["-f", "agentdesk.*dcserver"])
         .output()
     {
         Ok(output) if output.status.success() => output,
@@ -535,7 +534,7 @@ pub fn handle_restart_dcserver(
         Ok(_) => {}
         Err(_) => {
             eprintln!("Error: {} not found.", settings_path.display());
-            eprintln!("Run 'agentdesk --dcserver' after configuring bot_settings.json.");
+            eprintln!("Run 'agentdesk dcserver' after configuring bot_settings.json.");
             write_restart_report(
                 "failed",
                 "bot_settings.json이 없어서 dcserver restart를 시작하지 못했습니다.".to_string(),
@@ -865,7 +864,7 @@ pub fn handle_restart_dcserver(
         })
         .unwrap_or_default();
     let script = format!(
-        "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} --dcserver\n",
+        "#!/bin/bash\nunset CLAUDECODE\n{root_env}{label_env}exec {} dcserver\n",
         exe
     );
     if let Err(e) = std::fs::write(&launcher_path, &script) {

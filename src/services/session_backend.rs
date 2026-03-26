@@ -21,7 +21,7 @@ pub struct SessionConfig {
     pub prompt_path: String,
     /// Provider-specific wrapper args (e.g., --codex-bin, -- claude ...)
     pub wrapper_args: Vec<String>,
-    /// Whether this is a codex session (uses --codex-tmux-wrapper)
+    /// Whether this is a codex session (uses codex-tmux-wrapper subcommand)
     pub is_codex: bool,
     /// Environment variables to set
     pub env_vars: Vec<(String, String)>,
@@ -69,9 +69,9 @@ impl SessionBackend for ProcessBackend {
 
         // 2. Build wrapper command args
         let wrapper_flag = if config.is_codex {
-            "--codex-tmux-wrapper"
+            "codex-tmux-wrapper"
         } else {
-            "--tmux-wrapper"
+            "tmux-wrapper"
         };
 
         let mut args = vec![

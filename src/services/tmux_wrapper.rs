@@ -1,6 +1,6 @@
 //! Wrapper subprocess module (bidirectional).
 //!
-//! When invoked via `agentdesk --tmux-wrapper`, this module manages a Claude session.
+//! When invoked via `agentdesk tmux-wrapper`, this module manages a Claude session.
 //! It spawns Claude with `--input-format stream-json` and keeps stdin open for multi-turn.
 //!
 //! Supports two input modes:
