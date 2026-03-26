@@ -203,7 +203,7 @@ var timeouts = {
     var aCfg = agentdesk.pipeline.getConfig();
     var aInitial = agentdesk.pipeline.kickoffState(aCfg) || "requested";
     var aInProgress = agentdesk.pipeline.nextGatedTarget(aInitial, aCfg) || "in_progress";
-    var aForce = agentdesk.pipeline.forceOnlyTargets(aInProgress, aCfg) || [];
+    var aForce = agentdesk.pipeline.forceOnlyTargets(aInitial, aCfg) || [];
     var aPending = aForce[0] || "pending_decision";
     var staleRequested = agentdesk.db.query(
       "SELECT kc.id, kc.assigned_agent_id, kc.latest_dispatch_id, " +
