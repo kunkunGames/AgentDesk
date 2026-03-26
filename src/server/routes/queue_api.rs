@@ -210,3 +210,90 @@ pub async fn cancel_all_dispatches(
     tracing::info!("[queue-api] Cancelled {count} dispatches (card={:?}, agent={:?})", body.kanban_card_id, body.agent_id);
     (StatusCode::OK, Json(json!({"ok": true, "cancelled": count})))
 }
+
+// ── POST /api/turns/:channel_id/cancel ──────────────────────────
+
+/// Cancel the active turn in a channel by killing its tmux session.
+/// This is the hard-stop equivalent — the turn will not complete gracefully.
+pub async fn cancel_turn(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Find the active session for this channel
+    let session_info: Option<(String, Option<String>)> = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT session_key, active_dispatch_id FROM sessions \
+                 WHERE status = 'working' \
+                 AND (session_key LIKE '%' || ?1 || '%' OR agent_id IN \
+                      (SELECT id FROM agents WHERE discord_channel_id = ?1 OR discord_channel_alt = ?1)) \
+                 ORDER BY last_heartbeat DESC LIMIT 1",
+                [&channel_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .ok()
+        });
+
+    let Some((session_key, dispatch_id)) = session_info else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no active turn found for this channel"})),
+        );
+    };
+
+    // Extract tmux session name from session_key
+    // Format: hostname:AgentDesk-provider-channelname(-threadid)
+    let tmux_name = session_key
+        .split(':')
+        .last()
+        .unwrap_or(&session_key);
+
+    // Kill tmux session
+    let killed = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", tmux_name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    // Cancel the associated dispatch if any
+    if let Some(ref did) = dispatch_id {
+        if let Ok(conn) = state.db.lock() {
+            conn.execute(
+                "UPDATE task_dispatches SET status = 'cancelled', updated_at = datetime('now') \
+                 WHERE id = ?1 AND status IN ('pending', 'dispatched')",
+                [did],
+            )
+            .ok();
+        }
+    }
+
+    // Mark session as disconnected
+    if let Ok(conn) = state.db.lock() {
+        conn.execute(
+            "UPDATE sessions SET status = 'disconnected', active_dispatch_id = NULL WHERE session_key = ?1",
+            [&session_key],
+        )
+        .ok();
+    }
+
+    tracing::info!(
+        "[queue-api] Cancelled turn: session={}, tmux={}, killed={}, dispatch={:?}",
+        session_key, tmux_name, killed, dispatch_id
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "session_key": session_key,
+            "tmux_session": tmux_name,
+            "tmux_killed": killed,
+            "dispatch_cancelled": dispatch_id,
+        })),
+    )
+}

@@ -327,6 +327,7 @@ pub fn api_router(
         .route("/dispatches/pending", get(queue_api::list_pending_dispatches))
         .route("/dispatches/{id}/cancel", post(queue_api::cancel_dispatch))
         .route("/dispatches/cancel-all", post(queue_api::cancel_all_dispatches))
+        .route("/turns/{channel_id}/cancel", post(queue_api::cancel_turn))
         .route(
             "/auto-queue/runs/{id}/order",
             post(auto_queue::submit_order),
