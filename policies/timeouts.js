@@ -910,16 +910,9 @@ var timeouts = {
       for (var li = 0; li < inflights.length; li++) {
         var inf = inflights[li];
         if (!inf.started_at) continue;
-        // Stale inflight check: if no active turn exists for this channel, clean up
-        var activeSessions = agentdesk.db.query(
-          "SELECT status FROM sessions WHERE session_key LIKE ? AND status = 'working'",
-          ["%" + inf.channel_id + "%"]
-        );
-        if (activeSessions.length === 0) {
-          agentdesk.inflight.remove(inf.provider, inf.channel_id);
-          agentdesk.log.info("[long-turn] Cleaned stale inflight: " + inf.provider + "/" + inf.channel_id);
-          continue;
-        }
+        // Stale inflight check: skip cleanup here — let InflightCleanupGuard handle it.
+        // Previous approach (checking working sessions) caused false positives because
+        // DB session status can lag behind actual tmux state.
         var startedAt = new Date(inf.started_at);
         var elapsedMin = (Date.now() - startedAt.getTime()) / 60000;
         // Find the highest threshold that elapsed time exceeds
