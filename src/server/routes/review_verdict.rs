@@ -614,6 +614,10 @@ pub async fn submit_review_decision(
                             ],
                         ).ok();
                     }
+                    // #119: Record tuning outcome BEFORE transition (which clears last_verdict)
+                    record_decision_tuning(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
+                    spawn_aggregate_if_needed(&state.db);
+
                     let _ = crate::kanban::transition_status(
                         &state.db,
                         &state.engine,
@@ -647,10 +651,6 @@ pub async fn submit_review_decision(
 
                     // #117: Update canonical review state before returning
                     update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
-
-                    // #119: Record tuning outcome before returning
-                    record_decision_tuning(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
-                    spawn_aggregate_if_needed(&state.db);
 
                     return (
                         StatusCode::OK,
@@ -815,18 +815,20 @@ pub fn spawn_aggregate_if_needed(db: &crate::db::Db) {
 }
 
 /// Core aggregation logic shared by the HTTP endpoint and background trigger.
-fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usize) {
+fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64, usize) {
     let conn = match db.lock() {
         Ok(c) => c,
-        Err(_) => return (0, 0, 0, 0, 0),
+        Err(_) => return (0, 0, 0, 0, 0, 0),
     };
 
     let mut total_tp = 0i64;
     let mut total_fp = 0i64;
     let mut total_tn = 0i64;
+    let mut total_fn = 0i64;
     let mut total_disputed = 0i64;
     let mut fp_categories: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut tp_categories: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut fn_categories: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
     {
         let mut stmt = match conn.prepare(
@@ -835,7 +837,7 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
              WHERE created_at > datetime('now', '-30 days')",
         ) {
             Ok(s) => s,
-            Err(_) => return (0, 0, 0, 0, 0),
+            Err(_) => return (0, 0, 0, 0, 0, 0),
         };
 
         let rows: Vec<(String, Option<String>)> = stmt
@@ -855,6 +857,7 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
                 "true_positive" => total_tp += 1,
                 "false_positive" => total_fp += 1,
                 "true_negative" => total_tn += 1,
+                "false_negative" => total_fn += 1,
                 "disputed" => total_disputed += 1,
                 _ => {}
             }
@@ -863,6 +866,7 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
                     let target = match outcome.as_str() {
                         "false_positive" => Some(&mut fp_categories),
                         "true_positive" => Some(&mut tp_categories),
+                        "false_negative" => Some(&mut fn_categories),
                         _ => None,
                     };
                     if let Some(map) = target {
@@ -875,7 +879,7 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
         }
     }
 
-    let total = total_tp + total_fp + total_tn + total_disputed;
+    let total = total_tp + total_fp + total_tn + total_fn + total_disputed;
     let mut guidance_lines: Vec<String> = Vec::new();
 
     // Only generate guidance when we have enough data to be meaningful
@@ -888,8 +892,8 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
         };
 
         guidance_lines.push(format!(
-            "지난 30일 리뷰 통계: 전체 {}건 (정탐 {}건, 오탐 {}건, 정상 {}건, 반박 {}건, 오탐률 {:.0}%)",
-            total, total_tp, total_fp, total_tn, total_disputed, fp_rate * 100.0
+            "지난 30일 리뷰 통계: 전체 {}건 (정탐 {}건, 오탐 {}건, 정상 {}건, 미탐 {}건, 반박 {}건, 오탐률 {:.0}%)",
+            total, total_tp, total_fp, total_tn, total_fn, total_disputed, fp_rate * 100.0
         ));
 
         // High FP categories (min sample guard)
@@ -919,6 +923,18 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
                 ));
             }
         }
+
+        // FN categories — patterns the reviewer missed (reopen after pass)
+        if total_fn > 0 {
+            let mut fn_sorted: Vec<_> = fn_categories.iter().collect();
+            fn_sorted.sort_by(|a, b| b.1.cmp(a.1));
+            for (cat, count) in fn_sorted.iter().take(3) {
+                guidance_lines.push(format!(
+                    "- 미탐 카테고리 '{}': {}건 — 이 패턴은 리뷰에서 놓쳤다, 반드시 확인하라",
+                    cat, count
+                ));
+            }
+        }
     }
 
     let guidance = if guidance_lines.is_empty() {
@@ -944,11 +960,11 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
 
     let lines = guidance_lines.len();
     tracing::info!(
-        "[review-tuning] #119 aggregation: tp={total_tp} fp={total_fp} tn={total_tn} disputed={total_disputed}, {lines} guidance lines → {}",
+        "[review-tuning] #119 aggregation: tp={total_tp} fp={total_fp} tn={total_tn} fn={total_fn} disputed={total_disputed}, {lines} guidance lines → {}",
         guidance_path.display()
     );
 
-    (total_tp, total_fp, total_tn, total_disputed, lines)
+    (total_tp, total_fp, total_tn, total_fn, total_disputed, lines)
 }
 
 /// POST /api/review-tuning/aggregate
@@ -958,9 +974,9 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, usiz
 pub async fn aggregate_review_tuning(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let (total_tp, total_fp, total_tn, total_disputed, guidance_lines) =
+    let (total_tp, total_fp, total_tn, total_fn, total_disputed, guidance_lines) =
         aggregate_review_tuning_core(&state.db);
-    let total = total_tp + total_fp + total_tn + total_disputed;
+    let total = total_tp + total_fp + total_tn + total_fn + total_disputed;
     (
         StatusCode::OK,
         Json(json!({
@@ -969,6 +985,7 @@ pub async fn aggregate_review_tuning(
             "true_positive": total_tp,
             "false_positive": total_fp,
             "true_negative": total_tn,
+            "false_negative": total_fn,
             "disputed": total_disputed,
             "guidance_lines": guidance_lines,
         })),

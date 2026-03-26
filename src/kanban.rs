@@ -413,7 +413,9 @@ pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from
 
     if to == "done" {
         // #119: Record true_negative for cards that passed review and reached done
-        record_true_negative_if_pass(db, card_id);
+        if record_true_negative_if_pass(db, card_id) {
+            crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
+        }
 
         let _ = engine.try_fire_hook(
             Hook::OnCardTerminal,
