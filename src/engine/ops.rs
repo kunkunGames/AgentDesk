@@ -610,7 +610,11 @@ mod tests {
                 .eval(r#"JSON.stringify(agentdesk.kanban.setStatus("card-js", "in_progress"))"#)
                 .unwrap();
             // Should not contain error
-            assert!(!result.contains("error"), "setStatus should succeed: {}", result);
+            assert!(
+                !result.contains("error"),
+                "setStatus should succeed: {}",
+                result
+            );
         });
 
         // Verify started_at was reset
@@ -941,7 +945,8 @@ fn register_kv_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     ad.set("kv", kv_obj)?;
 
     // JS wrappers for optional TTL and null semantics
-    ctx.eval::<(), _>(r#"
+    ctx.eval::<(), _>(
+        r#"
         (function() {
             var raw = agentdesk.kv;
             agentdesk.kv.set = function(key, value, ttlSeconds) {
@@ -952,7 +957,8 @@ fn register_kv_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return r.found ? r.value : null;
             };
         })();
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }

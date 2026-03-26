@@ -317,6 +317,7 @@ fn main() -> Result<()> {
                 let mut prompt_file: Option<String> = None;
                 let mut cwd: Option<String> = None;
                 let mut codex_bin: Option<String> = None;
+                let mut codex_model: Option<String> = None;
                 let mut input_mode = services::tmux_wrapper::InputMode::Fifo;
                 let mut j = i + 1;
                 while j < args.len() {
@@ -341,6 +342,10 @@ fn main() -> Result<()> {
                             codex_bin = args.get(j + 1).cloned();
                             j += 2;
                         }
+                        "--codex-model" => {
+                            codex_model = args.get(j + 1).cloned();
+                            j += 2;
+                        }
                         "--input-mode" => {
                             if let Some(mode) = args.get(j + 1) {
                                 input_mode = match mode.as_str() {
@@ -358,7 +363,15 @@ fn main() -> Result<()> {
                 match (output_file, input_fifo, prompt_file, codex_bin) {
                     (Some(of), Some(inf), Some(pf), Some(bin)) => {
                         let wd = cwd.unwrap_or_else(|| ".".to_string());
-                        services::codex_tmux_wrapper::run(&of, &inf, &pf, &wd, &bin, input_mode);
+                        services::codex_tmux_wrapper::run(
+                            &of,
+                            &inf,
+                            &pf,
+                            &wd,
+                            &bin,
+                            codex_model.as_deref(),
+                            input_mode,
+                        );
                     }
                     _ => eprintln!(
                         "Error: --codex-tmux-wrapper requires --output-file, --input-fifo, --prompt-file, and --codex-bin"

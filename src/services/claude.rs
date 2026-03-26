@@ -2752,10 +2752,8 @@ mod tests {
     #[test]
     fn test_extra_tool_uses_non_assistant() {
         // Non-assistant types should return empty.
-        let json: Value = serde_json::from_str(
-            r#"{"type":"result","subtype":"success","result":"ok"}"#,
-        )
-        .unwrap();
+        let json: Value =
+            serde_json::from_str(r#"{"type":"result","subtype":"success","result":"ok"}"#).unwrap();
         let extras = parse_assistant_extra_tool_uses(&json);
         assert!(extras.is_empty());
     }

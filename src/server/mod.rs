@@ -137,8 +137,8 @@ pub async fn run(
 /// - OnTick5min (5m): reconciliation, deadlock detection, context check
 /// - OnTick (legacy, 5m): backward compat for policies that only register onTick
 async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
-    use std::time::Duration;
     use crate::engine::hooks::Hook;
+    use std::time::Duration;
 
     tracing::info!("[policy-tick] 3-tier tick started: 30s / 1min / 5min");
 

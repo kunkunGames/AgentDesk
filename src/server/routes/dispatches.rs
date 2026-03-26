@@ -295,7 +295,11 @@ pub async fn update_dispatch(
             }
             for (t_card_id, old_s, new_s) in &transitions {
                 crate::kanban::fire_transition_hooks(
-                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                    &state.db,
+                    &state.engine,
+                    t_card_id,
+                    old_s,
+                    new_s,
                 );
             }
         }
@@ -650,20 +654,17 @@ pub(crate) async fn send_dispatch_to_discord(
     let dispatch_type_label = dispatch_type.as_deref().unwrap_or("implementation");
 
     // #137: Check if this dispatch belongs to a unified-thread auto-queue run
-    let mut unified_thread_id: Option<String> = db
-        .lock()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT r.unified_thread_id FROM auto_queue_runs r \
+    let mut unified_thread_id: Option<String> = db.lock().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT r.unified_thread_id FROM auto_queue_runs r \
                  JOIN auto_queue_entries e ON e.run_id = r.id \
                  WHERE e.kanban_card_id = ?1 AND r.unified_thread = 1 AND r.status = 'active' \
                  AND r.unified_thread_id IS NOT NULL",
-                [card_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        });
+            [card_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    });
 
     // Try to reuse existing thread for this card (channel-specific)
     let existing_thread_id: Option<String> = if unified_thread_id.is_some() {
@@ -946,25 +947,22 @@ async fn try_reuse_thread(
 
     // 2a. Update thread name with current issue number (for unified thread mode)
     {
-        let new_name: Option<String> = db
-            .lock()
+        let new_name: Option<String> = db.lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT kc.github_issue_number, kc.title FROM kanban_cards kc WHERE kc.id = ?1",
+                [card_id],
+                |row| {
+                    let num: Option<i64> = row.get(0)?;
+                    let title: String = row.get(1)?;
+                    Ok(num.map(|n| {
+                        let short: String = title.chars().take(85).collect();
+                        format!("#{} {}", n, short)
+                    }))
+                },
+            )
             .ok()
-            .and_then(|conn| {
-                conn.query_row(
-                    "SELECT kc.github_issue_number, kc.title FROM kanban_cards kc WHERE kc.id = ?1",
-                    [card_id],
-                    |row| {
-                        let num: Option<i64> = row.get(0)?;
-                        let title: String = row.get(1)?;
-                        Ok(num.map(|n| {
-                            let short: String = title.chars().take(85).collect();
-                            format!("#{} {}", n, short)
-                        }))
-                    },
-                )
-                .ok()
-                .flatten()
-            });
+            .flatten()
+        });
         if let Some(ref name) = new_name {
             let _ = client
                 .patch(&thread_info_url)

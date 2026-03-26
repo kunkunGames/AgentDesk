@@ -726,9 +726,7 @@ pub async fn activate(
             )
             .unwrap_or(false);
         if busy {
-            tracing::info!(
-                "[auto-queue] Skipping activate for {agent_id}: agent has active cards"
-            );
+            tracing::info!("[auto-queue] Skipping activate for {agent_id}: agent has active cards");
             drop(conn);
             conn = state.db.separate_conn().unwrap();
             break;

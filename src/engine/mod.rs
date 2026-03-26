@@ -252,7 +252,9 @@ impl PolicyEngine {
                             break;
                         }
                         for (card_id, old_s, new_s) in &transitions {
-                            crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
+                            crate::kanban::fire_transition_hooks(
+                                &self.db, self, card_id, old_s, new_s,
+                            );
                         }
                     }
                 }

@@ -67,9 +67,7 @@ pub async fn list_channel_queue(
 // ── GET /api/dispatches/pending ─────────────────────────────────
 
 /// List all pending dispatches across all agents.
-pub async fn list_pending_dispatches(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn list_pending_dispatches(State(state): State<AppState>) -> Json<serde_json::Value> {
     let dispatches = match state.db.lock() {
         Ok(conn) => {
             let mut stmt = conn
@@ -144,7 +142,9 @@ pub async fn cancel_dispatch(
         ),
         Some("completed") | Some("cancelled") | Some("failed") => (
             StatusCode::CONFLICT,
-            Json(json!({"error": format!("dispatch already in terminal state: {}", current_status.unwrap())})),
+            Json(
+                json!({"error": format!("dispatch already in terminal state: {}", current_status.unwrap())}),
+            ),
         ),
         Some(_) => {
             conn.execute(
@@ -160,7 +160,10 @@ pub async fn cancel_dispatch(
             .ok();
 
             tracing::info!("[queue-api] Cancelled dispatch {dispatch_id}");
-            (StatusCode::OK, Json(json!({"ok": true, "dispatch_id": dispatch_id})))
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "dispatch_id": dispatch_id})),
+            )
         }
     }
 }
@@ -207,8 +210,15 @@ pub async fn cancel_all_dispatches(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let count = conn.execute(&sql, param_refs.as_slice()).unwrap_or(0);
 
-    tracing::info!("[queue-api] Cancelled {count} dispatches (card={:?}, agent={:?})", body.kanban_card_id, body.agent_id);
-    (StatusCode::OK, Json(json!({"ok": true, "cancelled": count})))
+    tracing::info!(
+        "[queue-api] Cancelled {count} dispatches (card={:?}, agent={:?})",
+        body.kanban_card_id,
+        body.agent_id
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "cancelled": count})),
+    )
 }
 
 // ── POST /api/turns/:channel_id/cancel ──────────────────────────
@@ -246,10 +256,7 @@ pub async fn cancel_turn(
 
     // Extract tmux session name from session_key
     // Format: hostname:AgentDesk-provider-channelname(-threadid)
-    let tmux_name = session_key
-        .split(':')
-        .last()
-        .unwrap_or(&session_key);
+    let tmux_name = session_key.split(':').last().unwrap_or(&session_key);
 
     // Kill tmux session
     let killed = std::process::Command::new("tmux")
@@ -283,7 +290,10 @@ pub async fn cancel_turn(
 
     tracing::info!(
         "[queue-api] Cancelled turn: session={}, tmux={}, killed={}, dispatch={:?}",
-        session_key, tmux_name, killed, dispatch_id
+        session_key,
+        tmux_name,
+        killed,
+        dispatch_id
     );
 
     (

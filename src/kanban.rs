@@ -148,15 +148,35 @@ pub fn transition_status_with_opts(
                                                 )
                                                 .unwrap_or(false);
                                             if !has {
-                                                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no active dispatch");
+                                                log_audit(
+                                                    &conn,
+                                                    card_id,
+                                                    &old_status,
+                                                    new_status,
+                                                    source,
+                                                    "BLOCKED: no active dispatch",
+                                                );
                                                 tracing::warn!(
                                                     "[kanban] Blocked transition {} → {} for card {} (gate: {}, source: {})",
-                                                    old_status, new_status, card_id, gate_name, source
+                                                    old_status,
+                                                    new_status,
+                                                    card_id,
+                                                    gate_name,
+                                                    source
                                                 );
-                                                notify_pmd_violation(&conn, card_id, &old_status, new_status, source, "no active dispatch");
+                                                notify_pmd_violation(
+                                                    &conn,
+                                                    card_id,
+                                                    &old_status,
+                                                    new_status,
+                                                    source,
+                                                    "no active dispatch",
+                                                );
                                                 return Err(anyhow::anyhow!(
                                                     "Status transition {} → {} requires an active dispatch (gate: {})",
-                                                    old_status, new_status, gate_name
+                                                    old_status,
+                                                    new_status,
+                                                    gate_name
                                                 ));
                                             }
                                         }
@@ -170,14 +190,25 @@ pub fn transition_status_with_opts(
                     }
                     TransitionType::ForceOnly if force => { /* allowed */ }
                     TransitionType::ForceOnly => {
-                        log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: force required");
+                        log_audit(
+                            &conn,
+                            card_id,
+                            &old_status,
+                            new_status,
+                            source,
+                            "BLOCKED: force required",
+                        );
                         tracing::warn!(
                             "[kanban] Blocked transition {} → {} for card {} (force_only, source: {})",
-                            old_status, new_status, card_id, source
+                            old_status,
+                            new_status,
+                            card_id,
+                            source
                         );
                         return Err(anyhow::anyhow!(
                             "Transition {} → {} requires force=true (PMD/policy only)",
-                            old_status, new_status
+                            old_status,
+                            new_status
                         ));
                     }
                 }
@@ -186,14 +217,25 @@ pub fn transition_status_with_opts(
                 // Force allows any non-terminal transition even without explicit rule
             }
             None => {
-                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no transition rule");
+                log_audit(
+                    &conn,
+                    card_id,
+                    &old_status,
+                    new_status,
+                    source,
+                    "BLOCKED: no transition rule",
+                );
                 tracing::warn!(
                     "[kanban] No pipeline rule for {} → {} (card: {}, source: {})",
-                    old_status, new_status, card_id, source
+                    old_status,
+                    new_status,
+                    card_id,
+                    source
                 );
                 return Err(anyhow::anyhow!(
                     "No transition rule from {} to {} in pipeline definition",
-                    old_status, new_status
+                    old_status,
+                    new_status
                 ));
             }
         }
@@ -215,15 +257,33 @@ pub fn transition_status_with_opts(
                 .unwrap_or(false);
 
             if !has_active_dispatch {
-                log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: no active dispatch");
+                log_audit(
+                    &conn,
+                    card_id,
+                    &old_status,
+                    new_status,
+                    source,
+                    "BLOCKED: no active dispatch",
+                );
                 tracing::warn!(
                     "[kanban] Blocked transition {} → {} for card {} (no active dispatch, source: {})",
-                    old_status, new_status, card_id, source
+                    old_status,
+                    new_status,
+                    card_id,
+                    source
                 );
-                notify_pmd_violation(&conn, card_id, &old_status, new_status, source, "no active dispatch");
+                notify_pmd_violation(
+                    &conn,
+                    card_id,
+                    &old_status,
+                    new_status,
+                    source,
+                    "no active dispatch",
+                );
                 return Err(anyhow::anyhow!(
                     "Status transition {} → {} requires an active dispatch (pending/dispatched).",
-                    old_status, new_status
+                    old_status,
+                    new_status
                 ));
             }
         }
@@ -235,7 +295,14 @@ pub fn transition_status_with_opts(
                 "review" | "blocked" | "pending_decision" | "done"
             )
         {
-            log_audit(&conn, card_id, &old_status, new_status, source, "BLOCKED: review required");
+            log_audit(
+                &conn,
+                card_id,
+                &old_status,
+                new_status,
+                source,
+                "BLOCKED: review required",
+            );
             return Err(anyhow::anyhow!(
                 "Cannot transition from {} to done directly. Must go through review first.",
                 old_status
@@ -989,7 +1056,8 @@ mod tests {
                 dispatched_at   DATETIME,
                 completed_at    DATETIME
             );",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn seed_card_with_repo(db: &Db, card_id: &str, status: &str, repo_id: &str) {
@@ -1012,13 +1080,15 @@ mod tests {
             "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after)
              VALUES (?1, 'Build', 1, 'ready')",
             [repo_id],
-        ).unwrap();
+        )
+        .unwrap();
         let stage1 = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after)
              VALUES (?1, 'Deploy', 2, 'review_pass')",
             [repo_id],
-        ).unwrap();
+        )
+        .unwrap();
         let stage2 = conn.last_insert_rowid();
         (stage1, stage2)
     }
@@ -1063,7 +1133,8 @@ mod tests {
             conn.execute(
                 "UPDATE kanban_cards SET pipeline_stage_id = ?1 WHERE id = 'card-pipe'",
                 [stage1],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Create and complete an implementation dispatch
@@ -1074,7 +1145,8 @@ mod tests {
             conn.execute(
                 "UPDATE task_dispatches SET status = 'completed', result = '{}' WHERE id = ?1",
                 [dispatch_id],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Fire OnDispatchCompleted — should NOT create a new dispatch for stage-2
@@ -1091,7 +1163,8 @@ mod tests {
                 "SELECT pipeline_stage_id FROM kanban_cards WHERE id = 'card-pipe'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
         assert_eq!(
             stage_id.as_deref(),
@@ -1139,9 +1212,13 @@ mod tests {
                 "SELECT status FROM auto_queue_entries WHERE id = ?1",
                 [&entry_a],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
-        assert_eq!(entry_status, "done", "Rust must mark auto_queue_entry as done");
+        assert_eq!(
+            entry_status, "done",
+            "Rust must mark auto_queue_entry as done"
+        );
     }
 
     /// #110: review → done → auto-queue should not conflict with pending_decision.
@@ -1170,7 +1247,14 @@ mod tests {
         }
 
         // Transition to pending_decision (NOT done)
-        let result = transition_status_with_opts(&db, &engine, "card-pd", "pending_decision", "pm-gate", true);
+        let result = transition_status_with_opts(
+            &db,
+            &engine,
+            "card-pd",
+            "pending_decision",
+            "pm-gate",
+            true,
+        );
         assert!(result.is_ok());
 
         // Verify: entry should still be 'dispatched' (not done)
@@ -1180,7 +1264,8 @@ mod tests {
                 "SELECT status FROM auto_queue_entries WHERE id = 'entry-pd'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
         assert_eq!(
             entry_status, "dispatched",
@@ -1215,7 +1300,12 @@ mod tests {
 
         // Transition back to in_progress (simulates rework)
         let result = transition_status_with_opts(
-            &db, &engine, "card-rework", "in_progress", "pm-decision", true,
+            &db,
+            &engine,
+            "card-rework",
+            "in_progress",
+            "pm-decision",
+            true,
         );
         assert!(result.is_ok(), "rework transition should succeed");
 
@@ -1226,7 +1316,8 @@ mod tests {
                 "SELECT started_at FROM kanban_cards WHERE id = 'card-rework'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
 
         // started_at should be within the last minute, not 3 hours ago
