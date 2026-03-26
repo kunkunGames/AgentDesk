@@ -1098,6 +1098,10 @@ pub(super) async fn handle_text_message(
                     "\n\nAvailable local Codex skills (use them by name when relevant):\n{}",
                     list.join("\n")
                 ),
+                ProviderKind::Gemini => format!(
+                    "\n\nAvailable local Gemini skills (use them by name when relevant):\n{}",
+                    list.join("\n")
+                ),
                 ProviderKind::Unsupported(_) => String::new(),
             }
         }
@@ -1489,6 +1493,20 @@ pub(super) async fn handle_text_message(
                         tmux_session_name.as_deref(),
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
+                    ),
+                    ProviderKind::Gemini => gemini::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
                     ),
                     ProviderKind::Unsupported(name) => {
                         let _ = tx.send(StreamMessage::Error {
@@ -2703,6 +2721,19 @@ Any other message is sent to {p}.
                     } else {
                         format!(
                             "Use the local Codex skill `/{skill}` now with this user request: {args_str}\n\
+                             Follow its SKILL.md instructions exactly and adapt them to the request."
+                        )
+                    }
+                }
+                ProviderKind::Gemini => {
+                    if args_str.is_empty() {
+                        format!(
+                            "Use the local Gemini skill `/{skill}` now. \
+                             Follow its SKILL.md instructions exactly and complete the task."
+                        )
+                    } else {
+                        format!(
+                            "Use the local Gemini skill `/{skill}` now with this user request: {args_str}\n\
                              Follow its SKILL.md instructions exactly and adapt them to the request."
                         )
                     }

@@ -467,7 +467,7 @@ pub fn parse_restart_dcserver_report_context(
         (Some(provider_raw), Some(channel_id), current_msg_id) => {
             let provider = ProviderKind::from_str(&provider_raw).ok_or_else(|| {
                 format!(
-                    "invalid value for --report-provider: {} (expected claude or codex)",
+                    "invalid value for --report-provider: {} (expected claude, codex, or gemini)",
                     provider_raw
                 )
             })?;
