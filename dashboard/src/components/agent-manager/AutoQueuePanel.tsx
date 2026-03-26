@@ -490,7 +490,13 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
                 <input
                   type="checkbox"
                   checked={unifiedThread}
-                  onChange={(e) => setUnifiedThread(e.target.checked)}
+                  onChange={(e) => {
+                  const val = e.target.checked;
+                  setUnifiedThread(val);
+                  if (run?.id) {
+                    void api.updateAutoQueueRun(run.id, undefined, val);
+                  }
+                }}
                   style={{ cursor: "pointer", accentColor: "#f59e0b" }}
                 />
                 {tr("통합 스레드", "Unified Thread")}

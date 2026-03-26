@@ -41,7 +41,8 @@ pub struct ReorderBody {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateRunBody {
-    pub status: String,
+    pub status: Option<String>,
+    pub unified_thread: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -986,25 +987,37 @@ pub async fn update_run(
     };
     ensure_tables(&conn);
 
-    let completed_at = if body.status == "completed" {
-        "datetime('now')"
-    } else {
-        "NULL"
-    };
+    let mut changed = 0usize;
 
-    let changed = conn
-        .execute(
-            &format!(
-                "UPDATE auto_queue_runs SET status = ?1, completed_at = {completed_at} WHERE id = ?2"
-            ),
-            rusqlite::params![body.status, id],
-        )
-        .unwrap_or(0);
+    if let Some(ref status) = body.status {
+        let completed_at = if status == "completed" {
+            "datetime('now')"
+        } else {
+            "NULL"
+        };
+        changed += conn
+            .execute(
+                &format!(
+                    "UPDATE auto_queue_runs SET status = ?1, completed_at = {completed_at} WHERE id = ?2"
+                ),
+                rusqlite::params![status, id],
+            )
+            .unwrap_or(0);
+    }
 
-    if changed == 0 {
+    if let Some(unified) = body.unified_thread {
+        changed += conn
+            .execute(
+                "UPDATE auto_queue_runs SET unified_thread = ?1 WHERE id = ?2",
+                rusqlite::params![unified as i32, id],
+            )
+            .unwrap_or(0);
+    }
+
+    if changed == 0 && body.status.is_none() && body.unified_thread.is_none() {
         return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "run not found"})),
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no fields to update"})),
         );
     }
 

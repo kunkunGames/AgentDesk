@@ -1013,11 +1013,15 @@ export async function skipAutoQueueEntry(id: string): Promise<{ ok: boolean }> {
 
 export async function updateAutoQueueRun(
   id: string,
-  status: "paused" | "active" | "completed",
+  status?: "paused" | "active" | "completed",
+  unified_thread?: boolean,
 ): Promise<{ ok: boolean }> {
+  const body: Record<string, unknown> = {};
+  if (status !== undefined) body.status = status;
+  if (unified_thread !== undefined) body.unified_thread = unified_thread;
   return request(`/api/auto-queue/runs/${id}`, {
     method: "PATCH",
-    body: JSON.stringify({ status }),
+    body: JSON.stringify(body),
   });
 }
 
