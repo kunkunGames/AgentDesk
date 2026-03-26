@@ -29,6 +29,7 @@ fn update_card_review_state(
                decided_by = NULL,
                decided_at = datetime('now'),
                pending_dispatch_id = NULL,
+               approach_change_round = NULL,
                updated_at = datetime('now')",
             rusqlite::params![card_id, state, decision],
         ).ok();

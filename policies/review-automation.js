@@ -303,7 +303,8 @@ function setNormalSuggestionPending(cardId, verdict) {
   agentdesk.db.execute(
     "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) " +
     "VALUES (?, 'suggestion_pending', ?, datetime('now')) " +
-    "ON CONFLICT(card_id) DO UPDATE SET state = 'suggestion_pending', last_verdict = ?, updated_at = datetime('now')",
+    "ON CONFLICT(card_id) DO UPDATE SET state = 'suggestion_pending', last_verdict = ?, " +
+    "approach_change_round = NULL, updated_at = datetime('now')",
     [cardId, verdict, verdict]
   );
 }
