@@ -24,75 +24,100 @@ struct ModelCatalogEntry {
 // Curated from current official provider model docs as of 2026-03-27.
 const CLAUDE_MODEL_CATALOG: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
+        value: "claude-opus-4-6",
+        label: "Claude Opus 4.6",
+        description: "latest flagship",
+    },
+    ModelCatalogEntry {
+        value: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        description: "latest balanced model",
+    },
+    ModelCatalogEntry {
+        value: "claude-opus-4-5-20251101",
+        label: "Claude Opus 4.5",
+        description: "previous opus generation",
+    },
+    ModelCatalogEntry {
+        value: "claude-sonnet-4-5-20250929",
+        label: "Claude Sonnet 4.5",
+        description: "strong coding and agents",
+    },
+    ModelCatalogEntry {
+        value: "claude-haiku-4-5-20251001",
+        label: "Claude Haiku 4.5",
+        description: "latest fast model",
+    },
+    ModelCatalogEntry {
         value: "claude-opus-4-1-20250805",
         label: "Claude Opus 4.1",
-        description: "latest flagship",
+        description: "stable legacy opus",
     },
     ModelCatalogEntry {
         value: "claude-opus-4-0",
         label: "Claude Opus 4",
-        description: "previous flagship",
+        description: "older opus generation",
     },
     ModelCatalogEntry {
         value: "claude-sonnet-4-0",
         label: "Claude Sonnet 4",
-        description: "balanced reasoning",
-    },
-    ModelCatalogEntry {
-        value: "claude-3-7-sonnet-latest",
-        label: "Claude Sonnet 3.7",
-        description: "extended thinking",
-    },
-    ModelCatalogEntry {
-        value: "claude-3-5-haiku-latest",
-        label: "Claude Haiku 3.5",
-        description: "fastest option",
+        description: "older balanced model",
     },
 ];
 
 const CODEX_MODEL_CATALOG: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
+        value: "gpt-5.4",
+        label: "GPT-5.4",
+        description: "latest frontier model",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.4-pro",
+        label: "GPT-5.4 Pro",
+        description: "highest precision reasoning",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.4-mini",
+        label: "GPT-5.4 Mini",
+        description: "fast strong mini",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5-mini",
+        label: "GPT-5 Mini",
+        description: "lower-latency general model",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5",
+        label: "GPT-5",
+        description: "previous frontier baseline",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.3-codex",
+        label: "GPT-5.3 Codex",
+        description: "latest codex-specific model",
+    },
+    ModelCatalogEntry {
         value: "gpt-5.2-codex",
         label: "GPT-5.2 Codex",
-        description: "latest coding flagship",
+        description: "long-horizon coding",
     },
     ModelCatalogEntry {
         value: "gpt-5.1-codex-max",
         label: "GPT-5.1 Codex Max",
         description: "best long-running agent",
     },
-    ModelCatalogEntry {
-        value: "gpt-5.1-codex",
-        label: "GPT-5.1 Codex",
-        description: "balanced coding model",
-    },
-    ModelCatalogEntry {
-        value: "gpt-5.1-codex-mini",
-        label: "GPT-5.1 Codex Mini",
-        description: "smaller and cheaper",
-    },
-    ModelCatalogEntry {
-        value: "gpt-5-codex",
-        label: "GPT-5 Codex",
-        description: "previous coding model",
-    },
 ];
 
 const GEMINI_MODEL_CATALOG: &[ModelCatalogEntry] = &[
     ModelCatalogEntry {
-        value: "gemini-3-pro-preview",
-        label: "Gemini 3 Pro Preview",
-        description: "latest reasoning preview",
-    },
-    ModelCatalogEntry {
         value: "gemini-3-flash-preview",
         label: "Gemini 3 Flash Preview",
-        description: "latest fast preview",
+        description: "latest general preview",
     },
     ModelCatalogEntry {
         value: "gemini-2.5-pro",
         label: "Gemini 2.5 Pro",
-        description: "stable high reasoning",
+        description: "best stable reasoning",
     },
     ModelCatalogEntry {
         value: "gemini-2.5-flash",
@@ -100,16 +125,36 @@ const GEMINI_MODEL_CATALOG: &[ModelCatalogEntry] = &[
         description: "stable fast model",
     },
     ModelCatalogEntry {
-        value: "gemini-2.0-flash",
-        label: "Gemini 2.0 Flash",
-        description: "fallback stable flash",
+        value: "gemini-2.5-flash-preview-09-2025",
+        label: "Gemini 2.5 Flash Preview",
+        description: "latest flash preview",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.5-flash-lite",
+        label: "Gemini 2.5 Flash-Lite",
+        description: "fastest cheap stable model",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.5-flash-lite-preview-09-2025",
+        label: "Gemini 2.5 Flash-Lite Preview",
+        description: "latest lite preview",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.5-flash-native-audio-preview-12-2025",
+        label: "Gemini 2.5 Flash Live",
+        description: "latest live audio model",
+    },
+    ModelCatalogEntry {
+        value: "gemini-flash-latest",
+        label: "Gemini Flash Latest",
+        description: "latest rolling flash alias",
     },
 ];
 
 const CLAUDE_MODEL_ALIASES: &[(&str, &str)] = &[
-    ("opus", "claude-opus-4-1-20250805"),
-    ("sonnet", "claude-sonnet-4-0"),
-    ("haiku", "claude-3-5-haiku-latest"),
+    ("opus", "claude-opus-4-6"),
+    ("sonnet", "claude-sonnet-4-6"),
+    ("haiku", "claude-haiku-4-5-20251001"),
 ];
 
 const CODEX_MODEL_ALIASES: &[(&str, &str)] = &[
@@ -133,9 +178,9 @@ pub(in crate::services::discord) fn provider_supports_model_override(provider: &
 
 pub(in crate::services::discord) fn model_hint(provider: &ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Claude => "default + 최신 Claude top 5",
-        ProviderKind::Codex => "default + 최신 Codex top 5",
-        ProviderKind::Gemini => "default + 최신 Gemini top 5",
+        ProviderKind::Claude => "default + 최신 Claude top 8",
+        ProviderKind::Codex => "default + 최신 Codex top 8",
+        ProviderKind::Gemini => "default + 최신 Gemini top 8",
         ProviderKind::Unsupported(_) => "모델 이름 또는 default",
     }
 }
