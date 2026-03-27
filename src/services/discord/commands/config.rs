@@ -1,18 +1,26 @@
+use std::sync::Arc;
+
+use poise::CreateReply;
 use poise::serenity_prelude as serenity;
 
 use super::super::formatting::{canonical_tool_name, risk_badge, send_long_message_ctx, tool_info};
 use super::super::settings::{resolve_role_binding, save_bot_settings};
-use super::super::{Context, Error, check_auth, check_owner};
+use super::super::{Context, Error, SharedData, check_auth, check_owner};
 use crate::services::provider::ProviderKind;
 
-fn provider_supports_model_override(provider: &ProviderKind) -> bool {
+const MODEL_CLEAR_KEYWORDS: &[&str] = &["default", "none", "clear"];
+const MODEL_INFO_KEYWORDS: &[&str] = &["info"];
+const MODEL_LIST_KEYWORDS: &[&str] = &["list"];
+pub(in crate::services::discord) const MODEL_PICKER_CUSTOM_ID: &str = "agentdesk:model-picker";
+
+pub(in crate::services::discord) fn provider_supports_model_override(provider: &ProviderKind) -> bool {
     matches!(
         provider,
         ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Gemini
     )
 }
 
-fn model_hint(provider: &ProviderKind) -> &'static str {
+pub(in crate::services::discord) fn model_hint(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Claude => "예: opus / sonnet / haiku",
         ProviderKind::Codex => "예: gpt-5-codex / o3 / o4-mini",
@@ -21,11 +29,288 @@ fn model_hint(provider: &ProviderKind) -> &'static str {
     }
 }
 
+fn known_models(provider: &ProviderKind) -> &'static [&'static str] {
+    match provider {
+        ProviderKind::Claude => &["opus", "sonnet", "haiku"],
+        ProviderKind::Codex => &["gpt-5-codex", "o3", "o4-mini"],
+        ProviderKind::Gemini => &["gemini-2.5-pro", "gemini-2.5-flash"],
+        ProviderKind::Unsupported(_) => &[],
+    }
+}
+
+fn normalize_keyword<'a>(raw: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    let trimmed = raw.trim();
+    if keywords.iter().any(|kw| kw.eq_ignore_ascii_case(trimmed)) {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+pub(in crate::services::discord) fn is_clear_model_keyword(raw: &str) -> bool {
+    normalize_keyword(raw, MODEL_CLEAR_KEYWORDS).is_some()
+}
+
+fn canonical_known_model(provider: &ProviderKind, raw: &str) -> Option<&'static str> {
+    known_models(provider)
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(raw.trim()))
+}
+
+fn looks_like_model_identifier(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
+pub(in crate::services::discord) fn validate_model_input(
+    provider: &ProviderKind,
+    raw: &str,
+) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Model name cannot be empty.".to_string());
+    }
+
+    if let Some(canonical) = canonical_known_model(provider, trimmed) {
+        return Ok(canonical.to_string());
+    }
+
+    if looks_like_model_identifier(trimmed) {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(format!(
+        "Unrecognized model `{}` for {}.\n{}\nUse `/model list` to see known examples.",
+        trimmed,
+        provider.display_name(),
+        model_hint(provider)
+    ))
+}
+
+fn doctor_guidance_suffix(provider: &ProviderKind) -> String {
+    match provider.probe_runtime() {
+        Some(probe) if probe.binary_path.is_some() && probe.version.is_some() => String::new(),
+        _ => format!(
+            "\nRuntime check: `{}` CLI probe is unavailable. Try `agentdesk doctor` or `agentdesk doctor --json`.",
+            provider.as_str()
+        ),
+    }
+}
+
+fn runtime_probe_detail(provider: &ProviderKind) -> (String, String, String) {
+    match provider.probe_runtime() {
+        Some(probe) => {
+            let binary_path = probe.binary_path.unwrap_or_else(|| "(not found)".to_string());
+            let version = probe.version.unwrap_or_else(|| "(version unavailable)".to_string());
+            let runtime_status = if binary_path == "(not found)" {
+                "missing"
+            } else if version == "(version unavailable)" {
+                "degraded"
+            } else {
+                "ok"
+            };
+            (runtime_status.to_string(), binary_path, version)
+        }
+        None => (
+            "unsupported".to_string(),
+            "(unsupported)".to_string(),
+            "(unsupported)".to_string(),
+        ),
+    }
+}
+
+async fn effective_model_snapshot(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> (Option<String>, Option<String>, String, String) {
+    let override_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
+    let ch_name = {
+        let d = shared.core.lock().await;
+        d.sessions
+            .get(&channel_id)
+            .and_then(|s| s.channel_name.clone())
+    };
+    let role_model = resolve_role_binding(channel_id, ch_name.as_deref()).and_then(|rb| rb.model);
+    let effective = override_model
+        .as_deref()
+        .or(role_model.as_deref())
+        .unwrap_or("(default)")
+        .to_string();
+    let source = if override_model.is_some() {
+        "runtime override"
+    } else if role_model.is_some() {
+        "role-map"
+    } else {
+        "system default"
+    }
+    .to_string();
+
+    (override_model, role_model, effective, source)
+}
+
+pub(in crate::services::discord) async fn build_model_status_message(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+) -> String {
+    let (override_model, role_model, effective, source) =
+        effective_model_snapshot(shared, channel_id).await;
+
+    format!(
+        "Provider: **{}**\nModel: **{}**\nSource: **{}**\nRuntime override: `{}`\nRole default: `{}`\nApplies: next turn\n{}",
+        provider.display_name(),
+        effective,
+        source,
+        override_model.as_deref().unwrap_or("(none)"),
+        role_model.as_deref().unwrap_or("(none)"),
+        model_hint(provider)
+    )
+}
+
+pub(in crate::services::discord) async fn build_model_info_message(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+) -> String {
+    let (override_model, role_model, effective, source) =
+        effective_model_snapshot(shared, channel_id).await;
+    let (runtime_status, binary_path, version) = runtime_probe_detail(provider);
+    let mut msg = format!(
+        "Provider: **{}**\nModel: **{}**\nSource: **{}**\nRuntime override: `{}`\nRole default: `{}`\nRuntime CLI: **{}**\nBinary: `{}`\nVersion: `{}`\nApplies: next turn\n{}",
+        provider.display_name(),
+        effective,
+        source,
+        override_model.as_deref().unwrap_or("(none)"),
+        role_model.as_deref().unwrap_or("(none)"),
+        runtime_status,
+        binary_path,
+        version,
+        model_hint(provider)
+    );
+    msg.push_str(&doctor_guidance_suffix(provider));
+    msg
+}
+
+pub(in crate::services::discord) fn build_model_list_message(provider: &ProviderKind) -> String {
+    let examples = known_models(provider);
+    let list = if examples.is_empty() {
+        "(no known examples)".to_string()
+    } else {
+        examples
+            .iter()
+            .map(|m| format!("- `{}`", m))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "**{} model examples**\n{}\n{}\nUse `/model <name>` to set one for this channel.{}",
+        provider.display_name(),
+        list,
+        model_hint(provider),
+        doctor_guidance_suffix(provider)
+    )
+}
+
+fn build_model_picker_options(
+    provider: &ProviderKind,
+    current_override: Option<&str>,
+) -> Vec<serenity::CreateSelectMenuOption> {
+    let mut options = vec![
+        serenity::CreateSelectMenuOption::new("default", "__default__")
+            .description("clear runtime override")
+            .default_selection(current_override.is_none()),
+    ];
+
+    for model in known_models(provider) {
+        let option = serenity::CreateSelectMenuOption::new(*model, *model)
+            .description(provider.display_name())
+            .default_selection(
+                current_override.is_some_and(|active| active.eq_ignore_ascii_case(model)),
+            );
+        options.push(option);
+    }
+
+    options
+}
+
+pub(in crate::services::discord) async fn build_model_picker_message(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+) -> String {
+    let mut msg = build_model_list_message(provider);
+    let status = build_model_status_message(shared, channel_id, provider).await;
+    msg.push_str("\n\nCurrent\n");
+    msg.push_str(&status);
+    msg.push_str("\nUse the select menu below or `/model <name>`.");
+    msg
+}
+
+pub(in crate::services::discord) async fn build_model_picker_components(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+) -> Vec<serenity::CreateActionRow> {
+    let (override_model, _, _, _) = effective_model_snapshot(shared, channel_id).await;
+    let menu = serenity::CreateSelectMenu::new(
+        MODEL_PICKER_CUSTOM_ID,
+        serenity::CreateSelectMenuKind::String {
+            options: build_model_picker_options(provider, override_model.as_deref()),
+        },
+    )
+    .placeholder("Select a model override")
+    .min_values(1)
+    .max_values(1);
+
+    vec![serenity::CreateActionRow::SelectMenu(menu)]
+}
+
+async fn autocomplete_model<'a>(
+    ctx: Context<'a>,
+    partial: &'a str,
+) -> Vec<serenity::AutocompleteChoice> {
+    let mut choices = Vec::new();
+    let partial_lower = partial.to_ascii_lowercase();
+    let provider = &ctx.data().provider;
+
+    for keyword in ["info", "list", "default"] {
+        if partial.is_empty() || keyword.contains(&partial_lower) {
+            let label = format!("{} — {}", keyword, match keyword {
+                "info" => "show provider, model, and source",
+                "list" => "show known model examples",
+                "default" => "clear runtime override",
+                _ => "",
+            });
+            choices.push(serenity::AutocompleteChoice::new(label, keyword.to_string()));
+        }
+    }
+
+    for model in known_models(provider) {
+        if choices.len() >= 25 {
+            break;
+        }
+        if partial.is_empty() || model.to_ascii_lowercase().contains(&partial_lower) {
+            let label = format!("{} — {}", model, provider.display_name());
+            choices.push(serenity::AutocompleteChoice::new(label, (*model).to_string()));
+        }
+    }
+
+    choices
+}
+
 /// /model — Set or view the model override for this channel
 #[poise::command(slash_command, rename = "model")]
 pub(in crate::services::discord) async fn cmd_model(
     ctx: Context<'_>,
-    #[description = "Model name or 'default' to clear"] model: Option<String>,
+    #[autocomplete = "autocomplete_model"]
+    #[description = "Model name or 'default' to clear"]
+    model: Option<String>,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let user_name = &ctx.author().name;
@@ -45,60 +330,83 @@ pub(in crate::services::discord) async fn cmd_model(
 
     match model {
         Some(m) => {
-            if m == "default" || m == "none" || m == "clear" {
-                ctx.data().shared.model_overrides.remove(&channel_id);
-            } else {
-                ctx.data()
-                    .shared
-                    .model_overrides
-                    .insert(channel_id, m.clone());
+            println!("  [{ts}] ◀ [{user_name}] /model {m}");
+
+            if normalize_keyword(&m, MODEL_LIST_KEYWORDS).is_some() {
+                let content = build_model_picker_message(
+                    &ctx.data().shared,
+                    channel_id,
+                    &ctx.data().provider,
+                )
+                .await;
+                let components = build_model_picker_components(
+                    &ctx.data().shared,
+                    channel_id,
+                    &ctx.data().provider,
+                )
+                .await;
+                ctx.send(
+                    CreateReply::default()
+                        .content(content)
+                        .components(components),
+                )
+                .await?;
+                return Ok(());
             }
-            let display = ctx
-                .data()
+
+            if normalize_keyword(&m, MODEL_INFO_KEYWORDS).is_some() {
+                let msg = build_model_info_message(
+                    &ctx.data().shared,
+                    channel_id,
+                    &ctx.data().provider,
+                )
+                .await;
+                ctx.say(msg).await?;
+                return Ok(());
+            }
+
+            if normalize_keyword(&m, MODEL_CLEAR_KEYWORDS).is_some() {
+                ctx.data().shared.model_overrides.remove(&channel_id);
+                let msg = build_model_status_message(
+                    &ctx.data().shared,
+                    channel_id,
+                    &ctx.data().provider,
+                )
+                .await;
+                ctx.say(format!("Model override cleared.\n{}", msg)).await?;
+                return Ok(());
+            }
+
+            let validated = match validate_model_input(&ctx.data().provider, &m) {
+                Ok(model) => model,
+                Err(message) => {
+                    ctx.say(message).await?;
+                    return Ok(());
+                }
+            };
+
+            ctx.data()
                 .shared
                 .model_overrides
-                .get(&channel_id)
-                .map(|v| v.clone())
-                .unwrap_or_else(|| "(default)".to_string());
-            println!("  [{ts}] ◀ [{user_name}] /model {m}");
+                .insert(channel_id, validated.clone());
+            let msg = build_model_status_message(
+                &ctx.data().shared,
+                channel_id,
+                &ctx.data().provider,
+            )
+            .await;
             ctx.say(format!(
-                "Model set to **{display}** for this channel. Takes effect on next turn.\n{}",
-                model_hint(&ctx.data().provider)
+                "Model set to **{}** for this channel.\n{}",
+                validated, msg
             ))
             .await?;
         }
         None => {
-            let override_model = ctx
-                .data()
-                .shared
-                .model_overrides
-                .get(&channel_id)
-                .map(|v| v.clone());
-            let ch_name = {
-                let d = ctx.data().shared.core.lock().await;
-                d.sessions
-                    .get(&channel_id)
-                    .and_then(|s| s.channel_name.clone())
-            };
-            let role_model =
-                resolve_role_binding(channel_id, ch_name.as_deref()).and_then(|rb| rb.model);
-            let effective = override_model
-                .as_deref()
-                .or(role_model.as_deref())
-                .unwrap_or("(default)");
-            let source = if override_model.is_some() {
-                "runtime override"
-            } else if role_model.is_some() {
-                "role-map"
-            } else {
-                "system default"
-            };
             println!("  [{ts}] ◀ [{user_name}] /model");
-            ctx.say(format!(
-                "Model: **{effective}** (source: {source})\n{}",
-                model_hint(&ctx.data().provider)
-            ))
-            .await?;
+            let msg =
+                build_model_status_message(&ctx.data().shared, channel_id, &ctx.data().provider)
+                    .await;
+            ctx.say(msg).await?;
         }
     }
     Ok(())

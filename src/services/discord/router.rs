@@ -17,6 +17,13 @@ pub(super) async fn handle_event(
 ) -> Result<(), Error> {
     maybe_cleanup_sessions(&data.shared).await;
     match event {
+        serenity::FullEvent::InteractionCreate { interaction } => {
+            if let Some(component) = interaction.as_message_component() {
+                if component.data.custom_id == super::commands::MODEL_PICKER_CUSTOM_ID {
+                    return handle_model_picker_interaction(ctx, component, data).await;
+                }
+            }
+        }
         serenity::FullEvent::Message { new_message } => {
             // ── Universal message-ID dedup ─────────────────────────────
             // Guards against the same Discord message being processed twice,
@@ -649,6 +656,104 @@ pub(super) async fn handle_event(
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn handle_model_picker_interaction(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let channel_id = component.channel_id;
+    let user_id = component.user.id;
+    let user_name = &component.user.name;
+    println!("  [{ts}] ◀ [{}] model picker {}", user_name, channel_id);
+
+    if !check_auth(user_id, user_name, &data.shared, &data.token).await {
+        component
+            .create_response(
+                ctx,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content("Not authorized for this bot.")
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    if !super::commands::provider_supports_model_override(&data.provider) {
+        component
+            .create_response(
+                ctx,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content("Model override is only supported for Claude, Codex, and Gemini channels.")
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let selected = match &component.data.kind {
+        serenity::ComponentInteractionDataKind::StringSelect { values } => values.first().cloned(),
+        _ => None,
+    };
+
+    let Some(selected) = selected else {
+        component
+            .create_response(
+                ctx,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content("Unsupported model picker interaction.")
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    };
+
+    if selected == "__default__" || super::commands::is_clear_model_keyword(&selected) {
+        data.shared.model_overrides.remove(&channel_id);
+    } else {
+        let validated = match super::commands::validate_model_input(&data.provider, &selected) {
+            Ok(model) => model,
+            Err(message) => {
+                component
+                    .create_response(
+                        ctx,
+                        serenity::CreateInteractionResponse::Message(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .content(message)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
+        data.shared.model_overrides.insert(channel_id, validated);
+    }
+
+    let content =
+        super::commands::build_model_picker_message(&data.shared, channel_id, &data.provider).await;
+    let components =
+        super::commands::build_model_picker_components(&data.shared, channel_id, &data.provider)
+            .await;
+    component
+        .create_response(
+            ctx,
+            serenity::CreateInteractionResponse::UpdateMessage(
+                serenity::CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .components(components),
+            ),
+        )
+        .await?;
     Ok(())
 }
 
@@ -2321,85 +2426,125 @@ Any other message is sent to {p}.
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
 
-            if !matches!(data.provider, ProviderKind::Claude) {
+            if !super::commands::provider_supports_model_override(&data.provider) {
                 let _ = msg
                     .reply(
                         &ctx.http,
-                        "Model override is only supported for Claude channels.",
+                        "Model override is only supported for Claude, Codex, and Gemini channels.",
                     )
                     .await;
                 return Ok(true);
             }
 
             match *arg1 {
+                "list" => {
+                    let content = super::commands::build_model_picker_message(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
+                    let components = super::commands::build_model_picker_components(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
+                    let _ = channel_id
+                        .send_message(
+                            &ctx.http,
+                            CreateMessage::new().content(content).components(components),
+                        )
+                        .await;
+                }
+                "info" => {
+                    let status = super::commands::build_model_info_message(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
+                    let _ = msg.reply(&ctx.http, status).await;
+                }
                 "set" => {
                     if arg2.is_empty() {
                         let _ = msg
                             .reply(&ctx.http, "Usage: `!model set <model_name>`")
                             .await;
                     } else {
+                        let validated =
+                            match super::commands::validate_model_input(&data.provider, arg2) {
+                                Ok(model) => model,
+                                Err(message) => {
+                                    let _ = msg.reply(&ctx.http, message).await;
+                                    return Ok(true);
+                                }
+                            };
                         data.shared
                             .model_overrides
-                            .insert(channel_id, arg2.to_string());
-                        let display = data
-                            .shared
-                            .model_overrides
-                            .get(&channel_id)
-                            .map(|v| v.clone())
-                            .unwrap_or_else(|| "(default)".to_string());
-                        let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                            .insert(channel_id, validated.clone());
+                        let status = super::commands::build_model_status_message(
+                            &data.shared,
+                            channel_id,
+                            &data.provider,
+                        )
+                        .await;
+                        let _ = msg
+                            .reply(
+                                &ctx.http,
+                                format!("Model set to **{}** for this channel.\n{}", validated, status),
+                            )
+                            .await;
                     }
                 }
                 "clear" | "default" | "none" => {
                     data.shared.model_overrides.remove(&channel_id);
+                    let status = super::commands::build_model_status_message(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
                     let _ = msg
-                        .reply(&ctx.http, "Model override cleared. Using default.")
+                        .reply(&ctx.http, format!("Model override cleared.\n{}", status))
                         .await;
                 }
                 "get" | "" => {
-                    let override_model = data
-                        .shared
-                        .model_overrides
-                        .get(&channel_id)
-                        .map(|v| v.clone());
-                    let ch_name = {
-                        let d = data.shared.core.lock().await;
-                        d.sessions
-                            .get(&channel_id)
-                            .and_then(|s| s.channel_name.clone())
-                    };
-                    let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
-                        .and_then(|rb| rb.model);
-                    let effective = override_model
-                        .as_deref()
-                        .or(role_model.as_deref())
-                        .unwrap_or("(default)");
-                    let source = if override_model.is_some() {
-                        "runtime override"
-                    } else if role_model.is_some() {
-                        "role-map"
-                    } else {
-                        "system default"
-                    };
+                    let status = super::commands::build_model_status_message(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
                     let _ = msg
-                        .reply(
-                            &ctx.http,
-                            format!("Model: **{effective}** (source: {source})"),
-                        )
+                        .reply(&ctx.http, status)
                         .await;
                 }
                 _ => {
                     // Treat bare arg as shorthand for "set"
+                    let validated = match super::commands::validate_model_input(&data.provider, arg1)
+                    {
+                        Ok(model) => model,
+                        Err(message) => {
+                            let _ = msg.reply(&ctx.http, message).await;
+                            return Ok(true);
+                        }
+                    };
                     data.shared
                         .model_overrides
-                        .insert(channel_id, arg1.to_string());
-                    let display = data
-                        .shared
-                        .model_overrides
-                        .get(&channel_id)
-                        .map(|v| v.clone())
-                        .unwrap_or_else(|| "(default)".to_string());
-                    let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                        .insert(channel_id, validated.clone());
+                    let status = super::commands::build_model_status_message(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
+                    let _ = msg
+                        .reply(
+                            &ctx.http,
+                            format!("Model set to **{}** for this channel.\n{}", validated, status),
+                        )
+                        .await;
                 }
             }
             return Ok(true);
