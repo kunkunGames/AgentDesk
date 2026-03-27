@@ -147,6 +147,24 @@ pub fn is_windows_service_installed() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+pub fn is_windows_service_running() -> bool {
+    let output = match std::process::Command::new("sc")
+        .args(["query", WINDOWS_SERVICE_NAME])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+
+    String::from_utf8_lossy(&output.stdout).contains("RUNNING")
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_windows_service_running() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
 pub fn restart_windows_service() -> bool {
     // Try NSSM first, fall back to sc.exe
     let nssm = std::process::Command::new("nssm")
@@ -306,6 +324,11 @@ pub fn update_release_link(_link_path: &Path, _target: &Path) -> Result<(), Stri
 }
 
 pub fn dcserver_process_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return is_windows_service_running();
+    }
+
     !dcserver_instance_pids().is_empty()
 }
 
