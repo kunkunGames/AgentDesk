@@ -174,13 +174,22 @@ pub(in crate::services::discord) async fn cmd_cc(
             format!("/{skill} {args_str}")
         };
         let channel_id = ctx.channel_id();
-        let msg_id = serenity::MessageId::new(ctx.id());
         let serenity_ctx = ctx.serenity_context();
+        ctx.defer().await?;
+        let confirm = channel_id
+            .send_message(
+                serenity_ctx,
+                CreateMessage::new().content(format!(
+                    "↪ Forwarding unknown skill `{}` to the AI provider as a regular prompt.",
+                    full_text
+                )),
+            )
+            .await?;
         auto_restore_session(&ctx.data().shared, channel_id, serenity_ctx).await;
         handle_text_message(
             serenity_ctx,
             channel_id,
-            msg_id,
+            confirm.id,
             ctx.author().id,
             &ctx.author().name,
             &full_text,
