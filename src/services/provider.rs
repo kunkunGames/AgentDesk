@@ -1,4 +1,5 @@
 use crate::utils::format::safe_prefix;
+use std::process::Command;
 
 /// Tmux session name prefix — always "AgentDesk".
 pub const TMUX_SESSION_PREFIX: &str = "AgentDesk";
@@ -20,6 +21,22 @@ pub enum ProviderKind {
     Codex,
     Gemini,
     Unsupported(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub binary_name: &'static str,
+    pub supports_structured_output: bool,
+    pub supports_resume: bool,
+    pub supports_tool_stream: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRuntimeProbe {
+    pub provider: ProviderKind,
+    pub capabilities: ProviderCapabilities,
+    pub binary_path: Option<String>,
+    pub version: Option<String>,
 }
 
 impl ProviderKind {
@@ -48,6 +65,59 @@ impl ProviderKind {
             Self::Gemini => Self::Codex,
             Self::Unsupported(_) => self.clone(),
         }
+    }
+
+    pub fn capabilities(&self) -> Option<ProviderCapabilities> {
+        match self {
+            Self::Claude => Some(ProviderCapabilities {
+                binary_name: "claude",
+                supports_structured_output: true,
+                supports_resume: true,
+                supports_tool_stream: true,
+            }),
+            Self::Codex => Some(ProviderCapabilities {
+                binary_name: "codex",
+                supports_structured_output: true,
+                supports_resume: true,
+                supports_tool_stream: true,
+            }),
+            Self::Gemini => Some(ProviderCapabilities {
+                binary_name: "gemini",
+                supports_structured_output: true,
+                supports_resume: true,
+                supports_tool_stream: true,
+            }),
+            Self::Unsupported(_) => None,
+        }
+    }
+
+    pub fn probe_runtime(&self) -> Option<ProviderRuntimeProbe> {
+        let capabilities = self.capabilities()?;
+        let binary_path =
+            crate::services::platform::resolve_binary_with_login_shell(capabilities.binary_name);
+        let version = binary_path.as_ref().and_then(|path| {
+            let mut command = Command::new(path);
+            crate::services::platform::apply_runtime_path(&mut command);
+            command
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if stdout.is_empty() {
+                        None
+                    } else {
+                        Some(stdout)
+                    }
+                })
+        });
+        Some(ProviderRuntimeProbe {
+            provider: self.clone(),
+            capabilities,
+            binary_path,
+            version,
+        })
     }
 
     /// Parse a known provider string. Returns None for unknown providers.
@@ -299,5 +369,20 @@ mod tests {
             unsupported.counterpart(),
             ProviderKind::Unsupported("gpt".to_string())
         );
+    }
+
+    #[test]
+    fn test_provider_capabilities_known_providers_support_agent_contract() {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+        ] {
+            let capabilities = provider.capabilities().expect("supported provider");
+            assert!(capabilities.supports_structured_output);
+            assert!(capabilities.supports_resume);
+            assert!(capabilities.supports_tool_stream);
+            assert!(!capabilities.binary_name.is_empty());
+        }
     }
 }

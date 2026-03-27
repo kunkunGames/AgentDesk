@@ -4,6 +4,7 @@ use std::process::Command;
 
 use super::dcserver;
 use crate::config;
+use crate::services::provider::ProviderKind;
 use serde_json::Value;
 
 struct Check {
@@ -113,34 +114,76 @@ fn check_tmux() -> Check {
     }
 }
 
-fn check_claude_cli() -> Check {
-    match Command::new("claude").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Check::ok("claude CLI", ver)
-        }
-        _ => Check::fail("claude CLI", "not found in PATH"),
+fn provider_capability_summary(provider: &ProviderKind) -> String {
+    provider
+        .capabilities()
+        .map(|caps| {
+            let mut parts = Vec::new();
+            if caps.supports_structured_output {
+                parts.push("structured-output");
+            }
+            if caps.supports_resume {
+                parts.push("resume");
+            }
+            if caps.supports_tool_stream {
+                parts.push("tool-stream");
+            }
+            parts.join(", ")
+        })
+        .unwrap_or_else(|| "unsupported".to_string())
+}
+
+fn check_provider_cli(name: &'static str, provider: ProviderKind, optional: bool) -> Check {
+    let capability_summary = provider_capability_summary(&provider);
+    match provider.probe_runtime() {
+        Some(probe) => match probe.version {
+            Some(ver) => {
+                let path = probe
+                    .binary_path
+                    .unwrap_or_else(|| "unknown path".to_string());
+                Check::ok(name, format!("{ver} — {path} [{capability_summary}]"))
+            }
+            None if optional => Check::ok(
+                name,
+                format!("not found in PATH (optional) [{capability_summary}]"),
+            ),
+            None => Check::fail(name, format!("not found in PATH [{capability_summary}]")),
+        },
+        None if optional => Check::ok(name, "unsupported provider (optional)"),
+        None => Check::fail(name, "unsupported provider"),
     }
+}
+
+fn check_runtime_path() -> Check {
+    let current = std::env::var("PATH").unwrap_or_default();
+    match crate::services::platform::merged_runtime_path() {
+        Some(merged) if merged == current => Check::ok(
+            "Runtime PATH",
+            "current PATH already matches provider runtime PATH",
+        ),
+        Some(merged) => {
+            let entry_count = std::env::split_paths(&merged).count();
+            Check::ok(
+                "Runtime PATH",
+                format!(
+                    "provider subprocesses will use merged login-shell PATH ({entry_count} entries)"
+                ),
+            )
+        }
+        None => Check::fail("Runtime PATH", "unable to resolve provider runtime PATH"),
+    }
+}
+
+fn check_claude_cli() -> Check {
+    check_provider_cli("claude CLI", ProviderKind::Claude, false)
 }
 
 fn check_codex_cli() -> Check {
-    match Command::new("codex").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Check::ok("codex CLI", ver)
-        }
-        _ => Check::ok("codex CLI", "not found in PATH (optional)"),
-    }
+    check_provider_cli("codex CLI", ProviderKind::Codex, true)
 }
 
 fn check_gemini_cli() -> Check {
-    match Command::new("gemini").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            Check::ok("gemini CLI", ver)
-        }
-        _ => Check::ok("gemini CLI", "not found in PATH (optional)"),
-    }
+    check_provider_cli("gemini CLI", ProviderKind::Gemini, true)
 }
 
 fn check_server_running() -> Check {
@@ -231,6 +274,7 @@ pub fn cmd_doctor() -> Result<(), String> {
         check_server_running(),
         check_discord_bot(),
         check_tmux(),
+        check_runtime_path(),
         check_claude_cli(),
         check_codex_cli(),
         check_gemini_cli(),
@@ -267,8 +311,9 @@ pub fn cmd_doctor() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::discord_bot_check_from_health;
+    use super::{discord_bot_check_from_health, provider_capability_summary};
     use crate::config::ServerConfig;
+    use crate::services::provider::ProviderKind;
     use serde_json::json;
 
     fn test_base_url() -> String {
@@ -307,5 +352,13 @@ mod tests {
         );
         assert!(!check.pass);
         assert!(check.detail.contains("standalone health only"));
+    }
+
+    #[test]
+    fn provider_capability_summary_mentions_structured_contract() {
+        let summary = provider_capability_summary(&ProviderKind::Codex);
+        assert!(summary.contains("structured-output"));
+        assert!(summary.contains("resume"));
+        assert!(summary.contains("tool-stream"));
     }
 }
