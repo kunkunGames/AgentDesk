@@ -169,16 +169,10 @@ pub fn create_dispatch_core(
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     } else {
-        // Pipeline-driven: resolve the dispatch kickoff state using card's effective pipeline
-        let dispatchable = effective.dispatchable_states();
+        // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
+        // kickoff_for() prefers gated transition FROM old_status; falls back to any dispatchable.
         let kickoff_state = effective
-            .transitions
-            .iter()
-            .find(|t| {
-                t.transition_type == crate::pipeline::TransitionType::Gated
-                    && dispatchable.contains(&t.from.as_str())
-            })
-            .map(|t| t.to.clone())
+            .kickoff_for(&old_status)
             .unwrap_or_else(|| {
                 tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
                 effective.initial_state().to_string()
@@ -331,16 +325,9 @@ pub fn create_dispatch_core_with_id(
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     } else {
-        // Pipeline-driven: resolve the dispatch kickoff state using card's effective pipeline
-        let dispatchable = effective.dispatchable_states();
+        // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
         let kickoff_state = effective
-            .transitions
-            .iter()
-            .find(|t| {
-                t.transition_type == crate::pipeline::TransitionType::Gated
-                    && dispatchable.contains(&t.from.as_str())
-            })
-            .map(|t| t.to.clone())
+            .kickoff_for(&old_status)
             .unwrap_or_else(|| {
                 tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
                 effective.initial_state().to_string()
@@ -403,15 +390,8 @@ pub fn create_dispatch(
         .unwrap_or((None, None));
     let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
     drop(conn);
-    let d = effective.dispatchable_states();
     let kickoff_owned = effective
-        .transitions
-        .iter()
-        .find(|t| {
-            t.transition_type == crate::pipeline::TransitionType::Gated
-                && d.contains(&t.from.as_str())
-        })
-        .map(|t| t.to.clone())
+        .kickoff_for(&old_status)
         .unwrap_or_else(|| {
             tracing::error!("Pipeline has no kickoff state for hook firing");
             effective.initial_state().to_string()

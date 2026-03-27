@@ -707,15 +707,10 @@ pub async fn submit_review_decision(
                         })
                         .map(|t| t.to.clone())
                         .unwrap_or_else(|| {
-                            // Fallback: find the first gated target from any dispatchable state
-                            let disp = effective_pipeline.dispatchable_states();
-                            effective_pipeline.transitions.iter()
-                                .find(|t| {
-                                    t.transition_type == crate::pipeline::TransitionType::Gated
-                                        && disp.contains(&t.from.as_str())
-                                })
-                                .map(|t| t.to.clone())
-                                .unwrap_or_else(|| "in_progress".to_string())
+                            // Fallback: kickoff from card's current state
+                            effective_pipeline
+                                .kickoff_for(&card_status_now)
+                                .unwrap_or_else(|| effective_pipeline.initial_state().to_string())
                         });
                     let _ = crate::kanban::transition_status(
                         &state.db,

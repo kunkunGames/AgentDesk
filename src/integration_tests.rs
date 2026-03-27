@@ -814,4 +814,102 @@ mod tests {
         assert!(result.is_ok(), "qa_test → in_progress force transition must work");
         assert_eq!(get_card_status(&db, "card-qa"), "in_progress");
     }
+
+    // ── Scenario 10: Multi-dispatchable pipeline — kickoff resolves from card's current state ──
+
+    #[test]
+    fn scenario_10_multi_dispatchable_kickoff_uses_current_state() {
+        let db = test_db();
+        seed_agent(&db);
+        crate::pipeline::ensure_loaded();
+
+        // Pipeline with TWO dispatchable states, each with a DIFFERENT gated target:
+        //   ready      → (gated) → in_progress
+        //   qa_ready   → (gated) → qa_test
+        // If kickoff resolution ignores old_status, it picks the first one arbitrarily.
+        let multi_disp_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "review", "label": "Review"},
+                {"id": "qa_ready", "label": "QA Ready"},
+                {"id": "qa_test", "label": "QA Test"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "review", "type": "free"},
+                {"from": "review", "to": "qa_ready", "type": "free"},
+                {"from": "qa_ready", "to": "qa_test", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "review", "to": "in_progress", "type": "gated", "gates": ["review_rework"]}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
+                "review_rework": {"type": "builtin", "check": "review_verdict_rework"}
+            },
+            "hooks": {},
+            "clocks": {},
+            "events": {},
+            "timeouts": {}
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO github_repos (id, display_name, pipeline_config) VALUES ('repo-multi', 'test/multi', ?1)",
+                [multi_disp_override.to_string()],
+            ).unwrap();
+        }
+
+        // Card A: in "ready" — dispatch should kick off to "in_progress"
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-multi-a', 'Multi A', 'ready', 'repo-multi', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-multi-a-old', 'card-multi-a', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        let result_a = dispatch::create_dispatch_core_with_id(
+            &db, "d-multi-a", "card-multi-a", "agent-1", "implementation", "[Multi A]", &serde_json::json!({}),
+        );
+        assert!(result_a.is_ok(), "dispatch for card-multi-a should succeed: {:?}", result_a.err());
+        assert_eq!(
+            get_card_status(&db, "card-multi-a"), "in_progress",
+            "card in 'ready' must kick off to 'in_progress', not 'qa_test'"
+        );
+
+        // Card B: in "qa_ready" — dispatch should kick off to "qa_test"
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-multi-b', 'Multi B', 'qa_ready', 'repo-multi', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-multi-b-old', 'card-multi-b', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        let result_b = dispatch::create_dispatch_core_with_id(
+            &db, "d-multi-b", "card-multi-b", "agent-1", "implementation", "[Multi B]", &serde_json::json!({}),
+        );
+        assert!(result_b.is_ok(), "dispatch for card-multi-b should succeed: {:?}", result_b.err());
+        assert_eq!(
+            get_card_status(&db, "card-multi-b"), "qa_test",
+            "card in 'qa_ready' must kick off to 'qa_test', not 'in_progress'"
+        );
+    }
 }
