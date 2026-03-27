@@ -232,8 +232,7 @@ pub fn dcserver_process_command(_pid: u32) -> Option<String> {
 }
 
 pub fn dcserver_process_matches_instance(command: &str) -> bool {
-    let is_dcserver =
-        command.contains("agentdesk dcserver");
+    let is_dcserver = command.contains("agentdesk dcserver");
     if !is_dcserver {
         return false;
     }

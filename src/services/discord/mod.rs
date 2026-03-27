@@ -113,23 +113,38 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
     })
 }
 
-fn watchdog_deadline_overrides() -> &'static dashmap::DashMap<u64, i64> {
-    static OVERRIDES: std::sync::OnceLock<dashmap::DashMap<u64, i64>> = std::sync::OnceLock::new();
-    OVERRIDES.get_or_init(dashmap::DashMap::new)
+/// Global watchdog deadline overrides, keyed by channel_id.
+/// Written by POST /api/turns/{channel_id}/extend-timeout, read by the watchdog loop.
+/// Values are Unix timestamp in milliseconds representing the new deadline.
+static WATCHDOG_DEADLINE_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, i64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Maximum watchdog extension: 3 hours from the original turn start.
+const WATCHDOG_MAX_EXTENSION_MS: i64 = 3 * 3600 * 1000;
+
+/// Extend the watchdog deadline for a channel. Returns the new deadline_ms or None if at cap.
+pub fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
+    let extend_ms = extend_by_secs as i64 * 1000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut map = WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?;
+    let current = map.get(&channel_id).copied().unwrap_or(now_ms);
+    let new_deadline = std::cmp::max(current, now_ms) + extend_ms;
+    // Don't enforce max here — the watchdog will clamp against its own max
+    map.insert(channel_id, new_deadline);
+    Some(new_deadline)
 }
 
-pub(crate) fn set_watchdog_deadline_override(channel_id: u64, deadline_ms: i64) {
-    watchdog_deadline_overrides().insert(channel_id, deadline_ms);
+/// Read and consume the deadline override for a channel (if any).
+pub(super) fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
+    WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?.remove(&channel_id)
 }
 
-pub(crate) fn watchdog_deadline_override(channel_id: u64) -> Option<i64> {
-    watchdog_deadline_overrides()
-        .get(&channel_id)
-        .map(|deadline| *deadline)
-}
-
-pub(crate) fn clear_watchdog_deadline_override(channel_id: u64) {
-    watchdog_deadline_overrides().remove(&channel_id);
+/// Remove the deadline override for a channel (on turn completion).
+pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
+    if let Ok(mut map) = WATCHDOG_DEADLINE_OVERRIDES.lock() {
+        map.remove(&channel_id);
+    }
 }
 
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
@@ -1964,18 +1979,27 @@ fn profile_probe_target_user_id(target: &str) -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
-fn pending_family_profile_probe_for_user(user_id: u64) -> Option<(String, String)> {
-    for path in family_profile_probe_state_paths() {
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(pending) = json.get("pending").and_then(|v| v.as_object()) else {
-            continue;
-        };
+fn profile_probe_target_key_for_user(user_id: u64) -> Option<&'static str> {
+    match user_id {
+        343742347365974026 => Some("obujang"),
+        429955158974136340 => Some("yohoejang"),
+        _ => None,
+    }
+}
 
+fn profile_probe_target_for_key(target_key: &str) -> Option<String> {
+    match target_key {
+        "obujang" => Some("user:343742347365974026".to_string()),
+        "yohoejang" => Some("user:429955158974136340".to_string()),
+        _ => None,
+    }
+}
+
+fn pending_family_profile_probe_from_state_value(
+    json: &serde_json::Value,
+    user_id: u64,
+) -> Option<(String, String)> {
+    if let Some(pending) = json.get("pending").and_then(|v| v.as_object()) {
         for (target, entry) in pending {
             if profile_probe_target_user_id(target) != Some(user_id) {
                 continue;
@@ -1987,7 +2011,103 @@ fn pending_family_profile_probe_for_user(user_id: u64) -> Option<(String, String
         }
     }
 
+    let target_key = profile_probe_target_key_for_user(user_id)?;
+    let topic_key = json
+        .get("perTarget")
+        .and_then(|v| v.as_object())
+        .and_then(|per| per.get(target_key))
+        .and_then(|v| v.as_object())
+        .and_then(|bucket| bucket.get("pendingProbe"))
+        .and_then(|v| v.as_object())
+        .and_then(|pending| pending.get("topicKey"))
+        .and_then(|v| v.as_str())?;
+    let target = profile_probe_target_for_key(target_key)?;
+    Some((topic_key.to_string(), target))
+}
+
+fn pending_family_profile_probe_for_user(user_id: u64) -> Option<(String, String)> {
+    for path in family_profile_probe_state_paths() {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if let Some(pending) = pending_family_profile_probe_from_state_value(&json, user_id) {
+            return Some(pending);
+        }
+    }
+
     None
+}
+
+fn clear_family_profile_probe_pending_from_state_value(
+    json: &mut serde_json::Value,
+    target: &str,
+) -> bool {
+    let Some(root) = json.as_object_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    let target_user_id = profile_probe_target_user_id(target);
+
+    if let Some(pending) = root.get_mut("pending").and_then(|v| v.as_object_mut()) {
+        let remove_targets: Vec<String> = pending
+            .keys()
+            .filter(|entry_target| {
+                if entry_target.as_str() == target {
+                    return true;
+                }
+                target_user_id
+                    .map(|uid| profile_probe_target_user_id(entry_target) == Some(uid))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for entry_target in remove_targets {
+            if pending.remove(&entry_target).is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(target_key) = target_user_id.and_then(profile_probe_target_key_for_user) {
+        if let Some(bucket) = root
+            .get_mut("perTarget")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|per| per.get_mut(target_key))
+            .and_then(|v| v.as_object_mut())
+        {
+            if bucket.remove("pendingProbe").is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
+fn clear_family_profile_probe_pending(target: &str) -> Result<bool, String> {
+    let mut changed_any = false;
+    for path in family_profile_probe_state_paths() {
+        if !path.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        let mut json = serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|err| format!("clear_pending_parse_failed:{err}: {}", path.display()))?;
+
+        if clear_family_profile_probe_pending_from_state_value(&mut json, target) {
+            let pretty = serde_json::to_string_pretty(&json)
+                .map_err(|err| format!("clear_pending_serialize_failed:{err}"))?;
+            fs::write(&path, pretty + "\n").map_err(|err| err.to_string())?;
+            changed_any = true;
+        }
+    }
+
+    Ok(changed_any)
 }
 
 fn record_family_profile_probe_answer(
@@ -2028,6 +2148,23 @@ fn record_family_profile_probe_answer(
     Ok(payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
+fn record_and_clear_family_profile_probe_answer(
+    topic_key: &str,
+    target: &str,
+    answer: &str,
+) -> Result<bool, String> {
+    let recorded = record_family_profile_probe_answer(topic_key, target, answer)?;
+    if recorded {
+        if let Err(err) = clear_family_profile_probe_pending(target) {
+            eprintln!(
+                "  [profile-probe] recorded answer but failed to clear pending target={} topic={} error={}",
+                target, topic_key, err
+            );
+        }
+    }
+    Ok(recorded)
+}
+
 async fn try_handle_family_profile_probe_reply(
     ctx: &serenity::Context,
     msg: &serenity::Message,
@@ -2052,7 +2189,7 @@ async fn try_handle_family_profile_probe_reply(
     let target_owned = target.clone();
     let answer_owned = answer.to_string();
     let recorded = tokio::task::spawn_blocking(move || {
-        record_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
+        record_and_clear_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
     })
     .await
     .map_err(|err| format!("profile_probe_join_failed:{err}"))?;
@@ -3062,5 +3199,97 @@ fn save_session_to_file(session: &DiscordSession, current_path: &str) {
 
     if let Ok(json) = serde_json::to_string_pretty(&session_data) {
         let _ = fs::write(file_path, json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        clear_family_profile_probe_pending_from_state_value,
+        pending_family_profile_probe_from_state_value,
+    };
+
+    #[test]
+    fn legacy_pending_probe_is_detected() {
+        let json = serde_json::json!({
+            "pending": {
+                "user:343742347365974026": {
+                    "topicKey": "nar.vaccination_history"
+                }
+            }
+        });
+
+        let pending = pending_family_profile_probe_from_state_value(&json, 343742347365974026);
+        assert_eq!(
+            pending,
+            Some((
+                "nar.vaccination_history".to_string(),
+                "user:343742347365974026".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn per_target_pending_probe_is_detected() {
+        let json = serde_json::json!({
+            "perTarget": {
+                "yohoejang": {
+                    "pendingProbe": {
+                        "topicKey": "yunho.newborn_screening",
+                        "question": "질문",
+                        "sentAt": "2026-03-26T18:45:42.764539+09:00"
+                    }
+                }
+            }
+        });
+
+        let pending = pending_family_profile_probe_from_state_value(&json, 429955158974136340);
+        assert_eq!(
+            pending,
+            Some((
+                "yunho.newborn_screening".to_string(),
+                "user:429955158974136340".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn clear_pending_probe_removes_legacy_and_per_target_entries() {
+        let mut json = serde_json::json!({
+            "pending": {
+                "user:343742347365974026": {
+                    "topicKey": "nar.vaccination_history"
+                }
+            },
+            "perTarget": {
+                "obujang": {
+                    "pendingProbe": {
+                        "topicKey": "nar.vaccination_history",
+                        "question": "질문",
+                        "sentAt": "2026-03-26T19:00:41.734890+09:00"
+                    }
+                }
+            }
+        });
+
+        let changed = clear_family_profile_probe_pending_from_state_value(
+            &mut json,
+            "user:343742347365974026",
+        );
+
+        assert!(changed);
+        assert!(
+            json.get("pending")
+                .and_then(|v| v.as_object())
+                .map(|pending| pending.is_empty())
+                .unwrap_or(true)
+        );
+        assert!(
+            json.get("perTarget")
+                .and_then(|v| v.get("obujang"))
+                .and_then(|v| v.as_object())
+                .and_then(|bucket| bucket.get("pendingProbe"))
+                .is_none()
+        );
     }
 }

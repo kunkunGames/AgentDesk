@@ -2,11 +2,26 @@ var pipeline = {
   name: "pipeline",
   priority: 200,
 
-  // Card transition — check if ready cards should enter pipeline
+  // Card transition — check if dispatchable cards should enter pipeline
   onCardTransition: function(payload) {
-    if (payload.to !== "ready") return;
+    // Pipeline-driven: check if target state is a dispatchable state
+    var cfg = agentdesk.pipeline.resolveForCard(payload.card_id);
+    if (!cfg || !cfg.states || !cfg.transitions) return;
+    var isDispatchable = false;
+    for (var si = 0; si < cfg.states.length; si++) {
+      var s = cfg.states[si];
+      if (s.id !== payload.to || s.terminal) continue;
+      for (var ti = 0; ti < cfg.transitions.length; ti++) {
+        if (cfg.transitions[ti].from === s.id && cfg.transitions[ti].type === "gated") {
+          isDispatchable = true;
+          break;
+        }
+      }
+      break;
+    }
+    if (!isDispatchable) return;
 
-    // Check if repo has pipeline stages triggered on 'ready'
+    // Check if repo has pipeline stages triggered on this dispatchable state
     var cards = agentdesk.db.query(
       "SELECT repo_id FROM kanban_cards WHERE id = ?",
       [payload.card_id]
@@ -14,8 +29,8 @@ var pipeline = {
     if (cards.length === 0) return;
 
     var stages = agentdesk.db.query(
-      "SELECT id, stage_name, agent_override_id FROM pipeline_stages WHERE repo_id = ? AND trigger_after = 'ready' ORDER BY stage_order ASC LIMIT 1",
-      [cards[0].repo_id]
+      "SELECT id, stage_name, agent_override_id FROM pipeline_stages WHERE repo_id = ? AND trigger_after = ? ORDER BY stage_order ASC LIMIT 1",
+      [cards[0].repo_id, payload.to]
     );
     if (stages.length > 0) {
       agentdesk.db.execute(

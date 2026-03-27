@@ -363,11 +363,13 @@ impl PipelineConfig {
     /// Check if a state requires a gated inbound transition (dispatch-entry states).
     /// These states should only be entered via dispatch API, not direct PATCH.
     pub fn requires_dispatch_entry(&self, state: &str) -> bool {
-        self.transitions.iter().any(|t| {
-            t.to == state && t.transition_type == TransitionType::Gated
-        }) && !self.transitions.iter().any(|t| {
-            t.to == state && t.transition_type == TransitionType::Free
-        })
+        self.transitions
+            .iter()
+            .any(|t| t.to == state && t.transition_type == TransitionType::Gated)
+            && !self
+                .transitions
+                .iter()
+                .any(|t| t.to == state && t.transition_type == TransitionType::Free)
     }
 
     /// Check if a state is a dispatch kickoff state — the first gated target
@@ -386,9 +388,10 @@ impl PipelineConfig {
     pub fn is_force_only_state(&self, state: &str) -> bool {
         let has_inbound = self.transitions.iter().any(|t| t.to == state);
         has_inbound
-            && self.transitions.iter().all(|t| {
-                t.to != state || t.transition_type == TransitionType::ForceOnly
-            })
+            && self
+                .transitions
+                .iter()
+                .all(|t| t.to != state || t.transition_type == TransitionType::ForceOnly)
     }
 
     /// Validate internal consistency.
@@ -430,6 +433,29 @@ impl PipelineConfig {
         for (state, _) in &self.hooks {
             if !state_ids.contains(&state.as_str()) {
                 anyhow::bail!("hook binding for unknown state: {}", state);
+            }
+        }
+
+        // Timeout entries: state-keyed timeouts must reference valid states.
+        // Condition-based timeouts (e.g. awaiting_dod) are pseudo-state timeouts
+        // that manage their own clock columns — skip all cross-reference checks.
+        let known_clock_fields: Vec<&str> = self.clocks.values().map(|c| c.set.as_str()).collect();
+        for (key, timeout) in &self.timeouts {
+            // Condition-based timeouts are self-contained; skip validation
+            if timeout.condition.is_some() {
+                continue;
+            }
+            if !state_ids.contains(&key.as_str()) {
+                anyhow::bail!("timeout for unknown state: {}", key);
+            }
+            if !self.clocks.contains_key(&timeout.clock)
+                && !known_clock_fields.contains(&timeout.clock.as_str())
+            {
+                anyhow::bail!(
+                    "timeout '{}' references unknown clock: {}",
+                    key,
+                    timeout.clock
+                );
             }
         }
 
@@ -634,10 +660,7 @@ mod tests {
         assert_eq!(after_repo.hooks["in_progress"].on_enter, vec!["RepoHook"]);
 
         let after_agent = after_repo.merge(&agent_ovr);
-        assert_eq!(
-            after_agent.hooks["in_progress"].on_enter,
-            vec!["AgentHook"]
-        );
+        assert_eq!(after_agent.hooks["in_progress"].on_enter, vec!["AgentHook"]);
         // States still from base
         assert_eq!(after_agent.states.len(), 3);
     }
@@ -665,6 +688,86 @@ mod tests {
         let ovr = parse_override(json).unwrap().unwrap();
         assert!(ovr.hooks.is_some());
         assert!(ovr.states.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_timeout_unknown_state() {
+        let mut p = minimal_pipeline();
+        p.clocks.insert(
+            "in_progress".into(),
+            ClockConfig {
+                set: "started_at".into(),
+                mode: None,
+            },
+        );
+        p.timeouts.insert(
+            "nonexistent".into(),
+            TimeoutConfig {
+                duration: "1h".into(),
+                clock: "started_at".into(),
+                max_retries: None,
+                on_exhaust: None,
+                condition: None,
+            },
+        );
+        let err = p.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown state"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_timeout_unknown_clock() {
+        let mut p = minimal_pipeline();
+        p.timeouts.insert(
+            "in_progress".into(),
+            TimeoutConfig {
+                duration: "1h".into(),
+                clock: "no_such_clock".into(),
+                max_retries: None,
+                on_exhaust: None,
+                condition: None,
+            },
+        );
+        let err = p.validate().unwrap_err();
+        assert!(err.to_string().contains("unknown clock"), "{err}");
+    }
+
+    #[test]
+    fn validate_allows_condition_based_timeout_pseudo_state() {
+        let mut p = minimal_pipeline();
+        p.timeouts.insert(
+            "awaiting_something".into(),
+            TimeoutConfig {
+                duration: "15m".into(),
+                clock: "custom_at".into(),
+                max_retries: None,
+                on_exhaust: None,
+                condition: Some("some_field = 'value'".into()),
+            },
+        );
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_timeout_with_clock_field_ref() {
+        let mut p = minimal_pipeline();
+        p.clocks.insert(
+            "in_progress".into(),
+            ClockConfig {
+                set: "started_at".into(),
+                mode: None,
+            },
+        );
+        p.timeouts.insert(
+            "in_progress".into(),
+            TimeoutConfig {
+                duration: "2h".into(),
+                clock: "started_at".into(),
+                max_retries: None,
+                on_exhaust: None,
+                condition: None,
+            },
+        );
+        assert!(p.validate().is_ok());
     }
 
     #[test]

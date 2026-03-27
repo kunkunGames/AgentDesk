@@ -469,6 +469,7 @@ pub async fn submit_verdict(
     // Fire event hooks for review verdict (#134 — pipeline-defined events)
     if let Some(ref cid) = card_id {
         crate::kanban::fire_event_hooks(
+            &state.db,
             &state.engine,
             "on_review_verdict",
             "OnReviewVerdict",
@@ -633,6 +634,23 @@ pub async fn submit_review_decision(
                 );
             }
 
+            // Complete the consumed review-decision dispatch BEFORE creating
+            // the rework dispatch.  The pending-dispatch guard in
+            // create_dispatch_core refuses to insert when a pending dispatch
+            // already exists for the card, so we must clear it first.
+            if let (Some(rd_id), Ok(conn)) = (&pending_rd_id, state.db.lock()) {
+                conn.execute(
+                    "UPDATE task_dispatches SET status = 'completed', \
+                     result = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    rusqlite::params![
+                        json!({"decision": "accept", "completion_source": "review_decision_api"})
+                            .to_string(),
+                        rd_id,
+                    ],
+                )
+                .ok();
+            }
+
             // Dispatch-first: create rework dispatch BEFORE transitioning card status.
             // If dispatch creation fails (e.g. done terminal guard), card stays in
             // current status instead of being stranded in in_progress with no dispatch.
@@ -649,17 +667,6 @@ pub async fn submit_review_decision(
 
             match rework_result {
                 Ok(ref d) => {
-                    // Dispatch succeeded → complete the consumed review-decision, then transition
-                    if let (Some(rd_id), Ok(conn)) = (&pending_rd_id, state.db.lock()) {
-                        conn.execute(
-                            "UPDATE task_dispatches SET status = 'completed', \
-                             result = ?1, updated_at = datetime('now') WHERE id = ?2",
-                            rusqlite::params![
-                                json!({"decision": "accept", "completion_source": "review_decision_api"}).to_string(),
-                                rd_id,
-                            ],
-                        ).ok();
-                    }
                     // #119: Record tuning outcome BEFORE transition (which clears last_verdict)
                     record_decision_tuning(
                         &state.db,
@@ -669,11 +676,39 @@ pub async fn submit_review_decision(
                     );
                     spawn_aggregate_if_needed(&state.db);
 
+                    // Pipeline-driven: find rework target (gated transition with review_rework gate)
+                    let card_status_now: String = state
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|c| {
+                            c.query_row(
+                                "SELECT status FROM kanban_cards WHERE id = ?1",
+                                [&body.card_id],
+                                |r| r.get(0),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default();
+                    crate::pipeline::ensure_loaded();
+                    let rework_target = crate::pipeline::try_get()
+                        .and_then(|p| {
+                            p.transitions
+                                .iter()
+                                .find(|t| {
+                                    t.from == card_status_now
+                                        && t.transition_type
+                                            == crate::pipeline::TransitionType::Gated
+                                        && t.gates.iter().any(|g| g == "review_rework")
+                                })
+                                .map(|t| t.to.clone())
+                        })
+                        .unwrap_or_else(|| "in_progress".to_string());
                     let _ = crate::kanban::transition_status(
                         &state.db,
                         &state.engine,
                         &body.card_id,
-                        "in_progress",
+                        &rework_target,
                     );
                     if let Ok(conn) = state.db.lock() {
                         conn.execute(
@@ -764,8 +799,26 @@ pub async fn submit_review_decision(
             );
             spawn_aggregate_if_needed(&state.db);
 
-            // Fire on_enter hooks for review state to create new review dispatch (#134)
-            crate::kanban::fire_enter_hooks(&state.db, &state.engine, &body.card_id, "review");
+            // Fire on_enter hooks for current state (should be a review-like state with OnReviewEnter)
+            let dispute_status: String = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT status FROM kanban_cards WHERE id = ?1",
+                        [&body.card_id],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| "review".to_string());
+            crate::kanban::fire_enter_hooks(
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                &dispute_status,
+            );
 
             // Drain: onReviewEnter may call setStatus (e.g. pending_decision on max rounds)
             loop {
@@ -828,12 +881,22 @@ pub async fn submit_review_decision(
             );
         }
         "dismiss" => {
-            // Agent dismisses review → transition to done, then clean up stale state.
+            // Agent dismisses review → transition to terminal state, then clean up stale state.
             // Order matters: transition_status requires an active dispatch, so we must
             // transition BEFORE cancelling pending dispatches.
             drop(conn);
+            crate::pipeline::ensure_loaded();
+            let terminal = crate::pipeline::try_get()
+                .map(|p| {
+                    p.states
+                        .iter()
+                        .find(|s| s.terminal)
+                        .map(|s| s.id.as_str())
+                        .unwrap_or("done")
+                })
+                .unwrap_or("done");
             let _ =
-                crate::kanban::transition_status(&state.db, &state.engine, &body.card_id, "done");
+                crate::kanban::transition_status(&state.db, &state.engine, &body.card_id, terminal);
 
             // Post-transition cleanup: cancel remaining pending review dispatches to prevent
             // stale dispatches from re-triggering review loops after dismiss.

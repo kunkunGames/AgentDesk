@@ -408,6 +408,7 @@ pub async fn hook_session(
 
             // Fire event hooks for session status change (#134)
             crate::kanban::fire_event_hooks(
+                &state.db,
                 &state.engine,
                 "on_session_status_change",
                 "OnSessionStatusChange",
@@ -806,8 +807,9 @@ pub async fn force_kill_session(
 
     // 3. Update session → disconnected, clear active fields
     // 4. Mark dispatch → failed
-    // 5. Optionally create retry dispatch
+    // 5. Optionally create retry dispatch via central path (#108)
     let mut retry_dispatch_id: Option<String> = None;
+    let mut retry_meta: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>, i64)> = None;
     {
         let conn = match state.db.lock() {
             Ok(c) => c,
@@ -834,9 +836,76 @@ pub async fn force_kill_session(
             )
             .ok();
 
-            // Create retry dispatch by cloning the failed one
+            // Prepare retry metadata from the failed dispatch (read while lock held)
             if body.retry {
-                retry_dispatch_id = create_retry_dispatch(&conn, did);
+                retry_meta = conn
+                    .query_row(
+                        "SELECT kanban_card_id, to_agent_id, dispatch_type, title, context, retry_count \
+                         FROM task_dispatches WHERE id = ?1",
+                        [did],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ))
+                        },
+                    )
+                    .ok();
+            }
+        }
+    }
+
+    // Create retry dispatch via central authoritative path (#108)
+    if let Some((card_id, to_agent_id, dispatch_type, title, context, retry_count)) = retry_meta {
+        let agent = to_agent_id.as_deref().unwrap_or("unknown");
+        let dtype = dispatch_type.as_deref().unwrap_or("implementation");
+        let dtitle = title.as_deref().unwrap_or("retry dispatch");
+        let ctx: serde_json::Value = context
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+
+        match crate::dispatch::create_dispatch(
+            &state.db,
+            &state.engine,
+            &card_id,
+            agent,
+            dtype,
+            dtitle,
+            &ctx,
+        ) {
+            Ok(dispatch_row) => {
+                // Stamp retry_count on the new dispatch
+                let new_id = dispatch_row["id"].as_str().unwrap_or("").to_string();
+                if let Ok(conn) = state.db.lock() {
+                    conn.execute(
+                        "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
+                        rusqlite::params![retry_count + 1, new_id],
+                    )
+                    .ok();
+                }
+                retry_dispatch_id = Some(new_id.clone());
+
+                // Send to Discord (hooks already fired by create_dispatch)
+                let db2 = state.db.clone();
+                let agent_s = agent.to_string();
+                let title_s = dtitle.to_string();
+                let card_s = card_id.clone();
+                tokio::spawn(async move {
+                    crate::server::routes::dispatches::send_dispatch_to_discord(
+                        &db2, &agent_s, &title_s, &card_s, &new_id,
+                    ).await;
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[force-kill] retry dispatch creation via central path failed for card {}: {e}",
+                    card_id
+                );
             }
         }
     }
@@ -896,11 +965,7 @@ fn clear_inflight_by_tmux_name(
         }
         if let Ok(data) = std::fs::read_to_string(&path) {
             if let Ok(state) = serde_json::from_str::<serde_json::Value>(&data) {
-                if state
-                    .get("tmux_session_name")
-                    .and_then(|v| v.as_str())
-                    == Some(tmux_name)
-                {
+                if state.get("tmux_session_name").and_then(|v| v.as_str()) == Some(tmux_name) {
                     let _ = std::fs::remove_file(&path);
                     return true;
                 }
@@ -910,54 +975,6 @@ fn clear_inflight_by_tmux_name(
     false
 }
 
-/// Create a retry dispatch by cloning the failed dispatch's metadata.
-fn create_retry_dispatch(conn: &rusqlite::Connection, failed_dispatch_id: &str) -> Option<String> {
-    let row = conn
-        .query_row(
-            "SELECT kanban_card_id, to_agent_id, dispatch_type, title, context, retry_count \
-             FROM task_dispatches WHERE id = ?1",
-            [failed_dispatch_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .ok()?;
-
-    let (card_id, to_agent_id, dispatch_type, title, context, retry_count) = row;
-    let new_id = format!("d-retry-{}", uuid::Uuid::new_v4());
-
-    conn.execute(
-        "INSERT INTO task_dispatches \
-         (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, retry_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, datetime('now'), datetime('now'))",
-        rusqlite::params![
-            new_id,
-            card_id,
-            to_agent_id,
-            dispatch_type,
-            title,
-            context,
-            retry_count + 1,
-        ],
-    )
-    .ok()?;
-
-    // Update card's latest_dispatch_id
-    conn.execute(
-        "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![new_id, card_id],
-    )
-    .ok();
-
-    Some(new_id)
-}
 
 #[cfg(test)]
 mod tests {

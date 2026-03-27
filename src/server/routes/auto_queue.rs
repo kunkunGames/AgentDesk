@@ -256,7 +256,13 @@ pub async fn generate(
     // Build filter — pipeline-driven dispatchable states
     crate::pipeline::ensure_loaded();
     let dispatchable = crate::pipeline::try_get()
-        .map(|p| p.dispatchable_states().iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(","))
+        .map(|p| {
+            p.dispatchable_states()
+                .iter()
+                .map(|s| format!("'{}'", s))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
         .unwrap_or_else(|| "'ready'".to_string());
     let mut conditions = vec![format!("kc.status IN ({})", dispatchable)];
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -1359,7 +1365,12 @@ pub async fn enqueue(
     // Validate card is dispatchable AFTER duplicate check to preserve idempotent retry,
     // but BEFORE run creation to prevent empty active runs
     let dispatchable_states = crate::pipeline::try_get()
-        .map(|p| p.dispatchable_states().iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        .map(|p| {
+            p.dispatchable_states()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_else(|| vec!["ready".to_string()]);
     if !dispatchable_states.iter().any(|s| s == &card_status) {
         return (
