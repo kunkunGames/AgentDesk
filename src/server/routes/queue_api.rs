@@ -67,9 +67,7 @@ pub async fn list_channel_queue(
 // ── GET /api/dispatches/pending ─────────────────────────────────
 
 /// List all pending dispatches across all agents.
-pub async fn list_pending_dispatches(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn list_pending_dispatches(State(state): State<AppState>) -> Json<serde_json::Value> {
     let dispatches = match state.db.lock() {
         Ok(conn) => {
             let mut stmt = conn
@@ -144,7 +142,9 @@ pub async fn cancel_dispatch(
         ),
         Some("completed") | Some("cancelled") | Some("failed") => (
             StatusCode::CONFLICT,
-            Json(json!({"error": format!("dispatch already in terminal state: {}", current_status.unwrap())})),
+            Json(
+                json!({"error": format!("dispatch already in terminal state: {}", current_status.unwrap())}),
+            ),
         ),
         Some(_) => {
             conn.execute(
@@ -160,7 +160,10 @@ pub async fn cancel_dispatch(
             .ok();
 
             tracing::info!("[queue-api] Cancelled dispatch {dispatch_id}");
-            (StatusCode::OK, Json(json!({"ok": true, "dispatch_id": dispatch_id})))
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "dispatch_id": dispatch_id})),
+            )
         }
     }
 }
@@ -207,8 +210,15 @@ pub async fn cancel_all_dispatches(
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let count = conn.execute(&sql, param_refs.as_slice()).unwrap_or(0);
 
-    tracing::info!("[queue-api] Cancelled {count} dispatches (card={:?}, agent={:?})", body.kanban_card_id, body.agent_id);
-    (StatusCode::OK, Json(json!({"ok": true, "cancelled": count})))
+    tracing::info!(
+        "[queue-api] Cancelled {count} dispatches (card={:?}, agent={:?})",
+        body.kanban_card_id,
+        body.agent_id
+    );
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "cancelled": count})),
+    )
 }
 
 // ── POST /api/turns/:channel_id/cancel ──────────────────────────
@@ -246,10 +256,7 @@ pub async fn cancel_turn(
 
     // Extract tmux session name from session_key
     // Format: hostname:AgentDesk-provider-channelname(-threadid)
-    let tmux_name = session_key
-        .split(':')
-        .last()
-        .unwrap_or(&session_key);
+    let tmux_name = session_key.split(':').last().unwrap_or(&session_key);
 
     // Kill tmux session
     let killed = std::process::Command::new("tmux")
@@ -283,7 +290,10 @@ pub async fn cancel_turn(
 
     tracing::info!(
         "[queue-api] Cancelled turn: session={}, tmux={}, killed={}, dispatch={:?}",
-        session_key, tmux_name, killed, dispatch_id
+        session_key,
+        tmux_name,
+        killed,
+        dispatch_id
     );
 
     (
@@ -296,4 +306,54 @@ pub async fn cancel_turn(
             "dispatch_cancelled": dispatch_id,
         })),
     )
+}
+
+// ── POST /api/turns/:channel_id/extend-timeout ───────────────────
+
+#[derive(Deserialize)]
+pub struct ExtendTimeoutBody {
+    /// Seconds to extend. Default: 1800 (30 min).
+    #[serde(default = "default_extend_secs")]
+    pub extend_secs: u64,
+}
+
+fn default_extend_secs() -> u64 {
+    1800
+}
+
+/// Extend the watchdog timeout for an active turn in a channel.
+/// The deadline will be clamped to 3 hours from the original turn start.
+pub async fn extend_turn_timeout(
+    Path(channel_id): Path<String>,
+    Json(body): Json<ExtendTimeoutBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let channel_num: u64 = match channel_id.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "channel_id must be a numeric Discord channel ID"})),
+            );
+        }
+    };
+
+    match crate::services::discord::extend_watchdog_deadline(channel_num, body.extend_secs) {
+        Some(new_deadline_ms) => {
+            let remaining_min =
+                (new_deadline_ms - chrono::Utc::now().timestamp_millis()) / 1000 / 60;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "channel_id": channel_id,
+                    "new_deadline_ms": new_deadline_ms,
+                    "remaining_minutes": remaining_min,
+                })),
+            )
+        }
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to extend watchdog deadline"})),
+        ),
+    }
 }
