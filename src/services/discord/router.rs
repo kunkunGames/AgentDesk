@@ -451,13 +451,7 @@ pub(super) async fn handle_event(
                 data.shared
                     .last_message_ids
                     .insert(channel_id, new_message.id.get());
-                formatting::add_reaction_raw(
-                    &ctx.http,
-                    channel_id,
-                    new_message.id,
-                    '🔄',
-                )
-                .await;
+                formatting::add_reaction_raw(&ctx.http, channel_id, new_message.id, '🔄').await;
                 return Ok(());
             }
 
@@ -742,7 +736,11 @@ pub(super) async fn handle_text_message(
                         drop(data);
                         let needs_worktree = is_thread || conflict.is_some();
                         if needs_worktree {
-                            let reason = if is_thread { "thread session" } else { "conflict" };
+                            let reason = if is_thread {
+                                "thread session"
+                            } else {
+                                "conflict"
+                            };
                             let ch = ch_name.as_deref().unwrap_or("unknown");
                             match create_git_worktree(&canonical, ch, provider.as_str()) {
                                 Ok((wt_path, branch)) => {
@@ -1199,22 +1197,118 @@ pub(super) async fn handle_text_message(
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
 
-    // Spawn turn watchdog — cancels the turn if it exceeds the timeout
+    // Spawn turn watchdog — cancels the turn if it exceeds the deadline.
+    // The deadline is stored in cancel_token.watchdog_deadline_ms and can be
+    // extended via POST /api/turns/{channel_id}/extend-timeout (up to 3h cap).
     {
         let watchdog_token = cancel_token.clone();
         let watchdog_shared = shared.clone();
         let watchdog_http = ctx.http.clone();
         let timeout = super::turn_watchdog_timeout();
+
+        // Set initial deadline and max ceiling (initial + 3h)
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let deadline_ms = now_ms + timeout.as_millis() as i64;
+        let max_deadline_ms = now_ms + 3 * 3600 * 1000; // 3 hours absolute cap
+        watchdog_token
+            .watchdog_deadline_ms
+            .store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
+        watchdog_token
+            .watchdog_max_deadline_ms
+            .store(max_deadline_ms, std::sync::atomic::Ordering::Relaxed);
+
+        let watchdog_channel_id_num = channel_id.get();
         tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            // If the token is still alive (not yet cancelled/completed), this turn is hung
-            if !watchdog_token
-                .cancelled
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+
+                // Exit early if the turn already completed/cancelled
+                if watchdog_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    super::clear_watchdog_deadline_override(watchdog_channel_id_num);
+                    return;
+                }
+
+                // Check for API-based deadline extension
+                if let Some(new_deadline) =
+                    super::take_watchdog_deadline_override(watchdog_channel_id_num)
+                {
+                    let max_dl = watchdog_token
+                        .watchdog_max_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let clamped = std::cmp::min(new_deadline, max_dl);
+                    watchdog_token
+                        .watchdog_deadline_ms
+                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    let remaining_min =
+                        (clamped - chrono::Utc::now().timestamp_millis()) / 1000 / 60;
+                    println!(
+                        "  [{ts}] ⏰ WATCHDOG: deadline extended for channel {} — {remaining_min}m remaining",
+                        channel_id
+                    );
+                }
+
+                // Auto-extend based on inflight updated_at: if inflight was updated recently
+                // (within last 5 min), push deadline forward by the default timeout
+                {
+                    let current_dl = watchdog_token
+                        .watchdog_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let now_ms_check = chrono::Utc::now().timestamp_millis();
+                    // Only auto-extend when close to deadline (within 2 minutes)
+                    if now_ms_check > current_dl - 120_000 {
+                        if let Some(inflight) = super::inflight::load_inflight_state(
+                            &crate::services::provider::ProviderKind::Claude,
+                            watchdog_channel_id_num,
+                        ) {
+                            if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(
+                                &inflight.updated_at,
+                                "%Y-%m-%d %H:%M:%S",
+                            ) {
+                                let updated_ms = updated.and_utc().timestamp_millis();
+                                let age_ms = now_ms_check - updated_ms;
+                                // If inflight was updated within the last 5 minutes, auto-extend
+                                if age_ms < 300_000 {
+                                    let max_dl = watchdog_token
+                                        .watchdog_max_deadline_ms
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let new_dl = std::cmp::min(
+                                        now_ms_check + timeout.as_millis() as i64,
+                                        max_dl,
+                                    );
+                                    if new_dl > current_dl {
+                                        watchdog_token
+                                            .watchdog_deadline_ms
+                                            .store(new_dl, std::sync::atomic::Ordering::Relaxed);
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        let remaining_min = (new_dl - now_ms_check) / 1000 / 60;
+                                        println!(
+                                            "  [{ts}] ⏰ WATCHDOG: auto-extended for channel {} (inflight active) — {remaining_min}m remaining",
+                                            channel_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let current_deadline = watchdog_token
+                    .watchdog_deadline_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let now = chrono::Utc::now().timestamp_millis();
+
+                if now < current_deadline {
+                    continue; // Not yet — deadline may have been extended
+                }
+
+                // Deadline reached — fire watchdog
                 // Verify this watchdog's token is still the CURRENT active token for this channel.
-                // A previous turn's watchdog must not cancel a newer turn that replaced the token.
-                // Using Arc::ptr_eq ensures we only fire if our token is still the active one.
                 let is_current_token = {
                     let data = watchdog_shared.core.lock().await;
                     data.cancel_tokens
@@ -1224,24 +1318,20 @@ pub(super) async fn handle_text_message(
                         })
                 };
                 if is_current_token {
+                    let elapsed_mins =
+                        (now - (current_deadline - timeout.as_millis() as i64)) / 1000 / 60;
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
-                        "  [{ts}] ⏰ WATCHDOG: turn timeout ({:.0}s) for channel {}, cancelling",
-                        timeout.as_secs_f64(),
+                        "  [{ts}] ⏰ WATCHDOG: turn timeout (~{elapsed_mins}m) for channel {}, cancelling",
                         channel_id
                     );
-                    // Only send cancel signal — do NOT remove cancel_tokens here.
-                    // turn_bridge finalization handles cleanup (cancel_tokens removal,
-                    // global_active decrement, queued turn kickoff) to preserve
-                    // the single-active-turn invariant.
                     super::turn_bridge::cancel_active_token(
                         &watchdog_token,
                         true,
                         "watchdog timeout",
                     );
 
-                    // Notify Discord — check queue to tailor message
-                    let timeout_mins = timeout.as_secs() / 60;
+                    // Notify Discord
                     let has_queued = {
                         let mut data = watchdog_shared.core.lock().await;
                         data.intervention_queue
@@ -1250,17 +1340,14 @@ pub(super) async fn handle_text_message(
                     };
                     let msg = if has_queued {
                         format!(
-                            "⚠️ 턴이 {}분 타임아웃으로 자동 중단되었습니다. 대기 중인 메시지로 다음 턴을 시작합니다.",
-                            timeout_mins
+                            "⚠️ 턴이 {elapsed_mins}분 타임아웃으로 자동 중단되었습니다. 대기 중인 메시지로 다음 턴을 시작합니다.",
                         )
                     } else {
-                        format!(
-                            "⚠️ 턴이 {}분 타임아웃으로 자동 중단되었습니다.",
-                            timeout_mins
-                        )
+                        format!("⚠️ 턴이 {elapsed_mins}분 타임아웃으로 자동 중단되었습니다.",)
                     };
                     let _ = channel_id.say(&watchdog_http, msg).await;
                 }
+                return; // Watchdog done regardless
             }
         });
     }
