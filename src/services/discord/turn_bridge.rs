@@ -1381,8 +1381,23 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if let Some(warning) = review_dispatch_warning.as_deref() {
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id.say(&http, warning).await;
+                // Send via announce bot so the agent sees this as an external
+                // message and re-triggers a turn to handle the pending review.
+                // Using the provider bot (claude/codex) would be ignored as
+                // the agent treats its own bot's messages as self-messages.
+                let _ = reqwest::Client::new()
+                    .post(crate::config::local_api_url(
+                        shared_owned.api_port,
+                        "/api/send",
+                    ))
+                    .json(&serde_json::json!({
+                        "target": format!("channel:{}", channel_id),
+                        "content": warning,
+                        "source": "pipeline",
+                        "bot": "announce",
+                    }))
+                    .send()
+                    .await;
             }
 
             // Record turn metrics
