@@ -12,6 +12,117 @@ const MODEL_CLEAR_KEYWORDS: &[&str] = &["default", "none", "clear"];
 const MODEL_INFO_KEYWORDS: &[&str] = &["info"];
 const MODEL_LIST_KEYWORDS: &[&str] = &["list"];
 pub(in crate::services::discord) const MODEL_PICKER_CUSTOM_ID: &str = "agentdesk:model-picker";
+pub(in crate::services::discord) const MODEL_RESET_CUSTOM_ID: &str = "agentdesk:model-reset";
+
+#[derive(Clone, Copy)]
+struct ModelCatalogEntry {
+    value: &'static str,
+    label: &'static str,
+    description: &'static str,
+}
+
+// Curated from current official provider model docs as of 2026-03-27.
+const CLAUDE_MODEL_CATALOG: &[ModelCatalogEntry] = &[
+    ModelCatalogEntry {
+        value: "claude-opus-4-1-20250805",
+        label: "Claude Opus 4.1",
+        description: "latest flagship",
+    },
+    ModelCatalogEntry {
+        value: "claude-opus-4-0",
+        label: "Claude Opus 4",
+        description: "previous flagship",
+    },
+    ModelCatalogEntry {
+        value: "claude-sonnet-4-0",
+        label: "Claude Sonnet 4",
+        description: "balanced reasoning",
+    },
+    ModelCatalogEntry {
+        value: "claude-3-7-sonnet-latest",
+        label: "Claude Sonnet 3.7",
+        description: "extended thinking",
+    },
+    ModelCatalogEntry {
+        value: "claude-3-5-haiku-latest",
+        label: "Claude Haiku 3.5",
+        description: "fastest option",
+    },
+];
+
+const CODEX_MODEL_CATALOG: &[ModelCatalogEntry] = &[
+    ModelCatalogEntry {
+        value: "gpt-5.2-codex",
+        label: "GPT-5.2 Codex",
+        description: "latest coding flagship",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.1-codex-max",
+        label: "GPT-5.1 Codex Max",
+        description: "best long-running agent",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.1-codex",
+        label: "GPT-5.1 Codex",
+        description: "balanced coding model",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5.1-codex-mini",
+        label: "GPT-5.1 Codex Mini",
+        description: "smaller and cheaper",
+    },
+    ModelCatalogEntry {
+        value: "gpt-5-codex",
+        label: "GPT-5 Codex",
+        description: "previous coding model",
+    },
+];
+
+const GEMINI_MODEL_CATALOG: &[ModelCatalogEntry] = &[
+    ModelCatalogEntry {
+        value: "gemini-3-pro-preview",
+        label: "Gemini 3 Pro Preview",
+        description: "latest reasoning preview",
+    },
+    ModelCatalogEntry {
+        value: "gemini-3-flash-preview",
+        label: "Gemini 3 Flash Preview",
+        description: "latest fast preview",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.5-pro",
+        label: "Gemini 2.5 Pro",
+        description: "stable high reasoning",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.5-flash",
+        label: "Gemini 2.5 Flash",
+        description: "stable fast model",
+    },
+    ModelCatalogEntry {
+        value: "gemini-2.0-flash",
+        label: "Gemini 2.0 Flash",
+        description: "fallback stable flash",
+    },
+];
+
+const CLAUDE_MODEL_ALIASES: &[(&str, &str)] = &[
+    ("opus", "claude-opus-4-1-20250805"),
+    ("sonnet", "claude-sonnet-4-0"),
+    ("haiku", "claude-3-5-haiku-latest"),
+];
+
+const CODEX_MODEL_ALIASES: &[(&str, &str)] = &[
+    ("gpt-5-codex", "gpt-5-codex"),
+    ("o3", "o3"),
+    ("o4-mini", "o4-mini"),
+];
+
+const GEMINI_MODEL_ALIASES: &[(&str, &str)] = &[
+    ("gemini-2.5-pro", "gemini-2.5-pro"),
+    ("gemini-2.5-flash", "gemini-2.5-flash"),
+    ("gemini-2.0-flash", "gemini-2.0-flash"),
+];
 
 pub(in crate::services::discord) fn provider_supports_model_override(provider: &ProviderKind) -> bool {
     matches!(
@@ -22,18 +133,27 @@ pub(in crate::services::discord) fn provider_supports_model_override(provider: &
 
 pub(in crate::services::discord) fn model_hint(provider: &ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Claude => "예: opus / sonnet / haiku",
-        ProviderKind::Codex => "예: gpt-5-codex / o3 / o4-mini",
-        ProviderKind::Gemini => "예: gemini-2.5-pro / gemini-2.5-flash",
+        ProviderKind::Claude => "default + 최신 Claude top 5",
+        ProviderKind::Codex => "default + 최신 Codex top 5",
+        ProviderKind::Gemini => "default + 최신 Gemini top 5",
         ProviderKind::Unsupported(_) => "모델 이름 또는 default",
     }
 }
 
-fn known_models(provider: &ProviderKind) -> &'static [&'static str] {
+fn known_models(provider: &ProviderKind) -> &'static [ModelCatalogEntry] {
     match provider {
-        ProviderKind::Claude => &["opus", "sonnet", "haiku"],
-        ProviderKind::Codex => &["gpt-5-codex", "o3", "o4-mini"],
-        ProviderKind::Gemini => &["gemini-2.5-pro", "gemini-2.5-flash"],
+        ProviderKind::Claude => CLAUDE_MODEL_CATALOG,
+        ProviderKind::Codex => CODEX_MODEL_CATALOG,
+        ProviderKind::Gemini => GEMINI_MODEL_CATALOG,
+        ProviderKind::Unsupported(_) => &[],
+    }
+}
+
+fn model_aliases(provider: &ProviderKind) -> &'static [(&'static str, &'static str)] {
+    match provider {
+        ProviderKind::Claude => CLAUDE_MODEL_ALIASES,
+        ProviderKind::Codex => CODEX_MODEL_ALIASES,
+        ProviderKind::Gemini => GEMINI_MODEL_ALIASES,
         ProviderKind::Unsupported(_) => &[],
     }
 }
@@ -52,10 +172,18 @@ pub(in crate::services::discord) fn is_clear_model_keyword(raw: &str) -> bool {
 }
 
 fn canonical_known_model(provider: &ProviderKind, raw: &str) -> Option<&'static str> {
-    known_models(provider)
+    let trimmed = raw.trim();
+    if let Some(entry) = known_models(provider)
         .iter()
-        .copied()
-        .find(|candidate| candidate.eq_ignore_ascii_case(raw.trim()))
+        .find(|entry| entry.value.eq_ignore_ascii_case(trimmed))
+    {
+        return Some(entry.value);
+    }
+
+    model_aliases(provider)
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(trimmed))
+        .map(|(_, canonical)| *canonical)
 }
 
 fn looks_like_model_identifier(raw: &str) -> bool {
@@ -127,7 +255,7 @@ fn runtime_probe_detail(provider: &ProviderKind) -> (String, String, String) {
 async fn effective_model_snapshot(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
-) -> (Option<String>, Option<String>, String, String) {
+) -> (Option<String>, Option<String>, String, String, String) {
     let override_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
     let ch_name = {
         let d = shared.core.lock().await;
@@ -149,8 +277,11 @@ async fn effective_model_snapshot(
         "system default"
     }
     .to_string();
+    let default_model = role_model
+        .clone()
+        .unwrap_or_else(|| "system default".to_string());
 
-    (override_model, role_model, effective, source)
+    (override_model, role_model, effective, source, default_model)
 }
 
 pub(in crate::services::discord) async fn build_model_status_message(
@@ -158,7 +289,7 @@ pub(in crate::services::discord) async fn build_model_status_message(
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
 ) -> String {
-    let (override_model, role_model, effective, source) =
+    let (override_model, role_model, effective, source, _) =
         effective_model_snapshot(shared, channel_id).await;
 
     format!(
@@ -177,7 +308,7 @@ pub(in crate::services::discord) async fn build_model_info_message(
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
 ) -> String {
-    let (override_model, role_model, effective, source) =
+    let (override_model, role_model, effective, source, _) =
         effective_model_snapshot(shared, channel_id).await;
     let (runtime_status, binary_path, version) = runtime_probe_detail(provider);
     let mut msg = format!(
@@ -203,7 +334,7 @@ pub(in crate::services::discord) fn build_model_list_message(provider: &Provider
     } else {
         examples
             .iter()
-            .map(|m| format!("- `{}`", m))
+            .map(|entry| format!("- {} — `{}`", entry.label, entry.value))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -223,15 +354,15 @@ fn build_model_picker_options(
 ) -> Vec<serenity::CreateSelectMenuOption> {
     let mut options = vec![
         serenity::CreateSelectMenuOption::new("default", "__default__")
-            .description("clear runtime override")
+            .description("use role-map or system default")
             .default_selection(current_override.is_none()),
     ];
 
-    for model in known_models(provider) {
-        let option = serenity::CreateSelectMenuOption::new(*model, *model)
-            .description(provider.display_name())
+    for entry in known_models(provider) {
+        let option = serenity::CreateSelectMenuOption::new(entry.label, entry.value)
+            .description(entry.description)
             .default_selection(
-                current_override.is_some_and(|active| active.eq_ignore_ascii_case(model)),
+                current_override.is_some_and(|active| active.eq_ignore_ascii_case(entry.value)),
             );
         options.push(option);
     }
@@ -239,17 +370,28 @@ fn build_model_picker_options(
     options
 }
 
-pub(in crate::services::discord) async fn build_model_picker_message(
+pub(in crate::services::discord) async fn build_model_picker_embed(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
-) -> String {
-    let mut msg = build_model_list_message(provider);
-    let status = build_model_status_message(shared, channel_id, provider).await;
-    msg.push_str("\n\nCurrent\n");
-    msg.push_str(&status);
-    msg.push_str("\nUse the select menu below or `/model <name>`.");
-    msg
+) -> serenity::CreateEmbed {
+    let (_, _, effective, source, default_model) = effective_model_snapshot(shared, channel_id).await;
+    let mut description = format!(
+        "Provider: **{}** (fixed)\nCurrent model: **{}**\nDefault: **{}**\nSource: **{}**\nApply: next turn\n\nSelect menu changes the server value immediately.",
+        provider.display_name(),
+        effective,
+        default_model,
+        source,
+    );
+    let doctor_hint = doctor_guidance_suffix(provider);
+    if !doctor_hint.is_empty() {
+        description.push_str(&format!("\n{}", doctor_hint.trim()));
+    }
+
+    serenity::CreateEmbed::new()
+        .title("Model Picker")
+        .description(description)
+        .color(0x5865F2)
 }
 
 pub(in crate::services::discord) async fn build_model_picker_components(
@@ -257,7 +399,7 @@ pub(in crate::services::discord) async fn build_model_picker_components(
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
 ) -> Vec<serenity::CreateActionRow> {
-    let (override_model, _, _, _) = effective_model_snapshot(shared, channel_id).await;
+    let (override_model, _, _, _, _) = effective_model_snapshot(shared, channel_id).await;
     let menu = serenity::CreateSelectMenu::new(
         MODEL_PICKER_CUSTOM_ID,
         serenity::CreateSelectMenuKind::String {
@@ -268,7 +410,15 @@ pub(in crate::services::discord) async fn build_model_picker_components(
     .min_values(1)
     .max_values(1);
 
-    vec![serenity::CreateActionRow::SelectMenu(menu)]
+    let reset_button = serenity::CreateButton::new(MODEL_RESET_CUSTOM_ID)
+        .label("Reset to default")
+        .style(serenity::ButtonStyle::Secondary)
+        .disabled(override_model.is_none());
+
+    vec![
+        serenity::CreateActionRow::SelectMenu(menu),
+        serenity::CreateActionRow::Buttons(vec![reset_button]),
+    ]
 }
 
 async fn autocomplete_model<'a>(
@@ -291,13 +441,22 @@ async fn autocomplete_model<'a>(
         }
     }
 
-    for model in known_models(provider) {
+    for entry in known_models(provider) {
         if choices.len() >= 25 {
             break;
         }
-        if partial.is_empty() || model.to_ascii_lowercase().contains(&partial_lower) {
-            let label = format!("{} — {}", model, provider.display_name());
-            choices.push(serenity::AutocompleteChoice::new(label, (*model).to_string()));
+        let searchable = format!(
+            "{} {} {}",
+            entry.label.to_ascii_lowercase(),
+            entry.value.to_ascii_lowercase(),
+            entry.description.to_ascii_lowercase()
+        );
+        if partial.is_empty() || searchable.contains(&partial_lower) {
+            let label = format!("{} — {}", entry.label, entry.description);
+            choices.push(serenity::AutocompleteChoice::new(
+                label,
+                entry.value.to_string(),
+            ));
         }
     }
 
@@ -333,7 +492,7 @@ pub(in crate::services::discord) async fn cmd_model(
             println!("  [{ts}] ◀ [{user_name}] /model {m}");
 
             if normalize_keyword(&m, MODEL_LIST_KEYWORDS).is_some() {
-                let content = build_model_picker_message(
+                let embed = build_model_picker_embed(
                     &ctx.data().shared,
                     channel_id,
                     &ctx.data().provider,
@@ -347,7 +506,7 @@ pub(in crate::services::discord) async fn cmd_model(
                 .await;
                 ctx.send(
                     CreateReply::default()
-                        .content(content)
+                        .embed(embed)
                         .components(components),
                 )
                 .await?;
@@ -403,10 +562,21 @@ pub(in crate::services::discord) async fn cmd_model(
         }
         None => {
             println!("  [{ts}] ◀ [{user_name}] /model");
-            let msg =
-                build_model_status_message(&ctx.data().shared, channel_id, &ctx.data().provider)
+            let embed =
+                build_model_picker_embed(&ctx.data().shared, channel_id, &ctx.data().provider)
                     .await;
-            ctx.say(msg).await?;
+            let components = build_model_picker_components(
+                &ctx.data().shared,
+                channel_id,
+                &ctx.data().provider,
+            )
+            .await;
+            ctx.send(
+                CreateReply::default()
+                    .embed(embed)
+                    .components(components),
+            )
+            .await?;
         }
     }
     Ok(())
