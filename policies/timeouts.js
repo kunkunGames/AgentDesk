@@ -544,11 +544,9 @@ var timeouts = {
     // 실제 cadence는 onTick 60초 간격이므로 ~60-90초.
     // 10분 윈도우 제거 — latest_dispatch_id 체크로 stale 방지 충분.
     var jCfg = agentdesk.pipeline.getConfig();
-    var jTerminal = agentdesk.pipeline.terminalState(jCfg);
     var jInitial = agentdesk.pipeline.kickoffState(jCfg);
     var jInProgress = agentdesk.pipeline.nextGatedTarget(jInitial, jCfg);
-    var jForce = agentdesk.pipeline.forceOnlyTargets(jInProgress, jCfg);
-    var jPending = jForce[0];
+    var jBlocked = agentdesk.pipeline.forceOnlyTargets(jInProgress, jCfg)[0];
     var failedForRetry = agentdesk.db.query(
       "SELECT td.id, td.kanban_card_id, td.to_agent_id, td.dispatch_type, td.title, " +
       "COALESCE(td.retry_count, 0) as retry_count, kc.github_issue_url, kc.github_issue_number " +
@@ -558,8 +556,8 @@ var timeouts = {
       "AND COALESCE(td.retry_count, 0) < " + MAX_DISPATCH_RETRIES + " " +
       "AND td.updated_at < datetime('now', '-30 seconds') " +
       "AND kc.latest_dispatch_id = td.id " +
-      "AND kc.status NOT IN (?, ?)",
-      [jTerminal, jPending]
+      "AND kc.status IN (?, ?)",
+      [jInitial, jInProgress]
     );
     for (var jr = 0; jr < failedForRetry.length; jr++) {
       var fd = failedForRetry[jr];
@@ -608,7 +606,7 @@ var timeouts = {
         agentdesk.log.error("[retry] Failed to create retry dispatch for card " +
           fd.kanban_card_id + ": " + e);
         // 재시도 디스패치 생성 실패 → pending state로 이관
-        agentdesk.kanban.setStatus(fd.kanban_card_id, jPending);
+        agentdesk.kanban.setStatus(fd.kanban_card_id, jBlocked);
         agentdesk.db.execute(
           "UPDATE kanban_cards SET blocked_reason = 'Auto-retry dispatch creation failed: " + e + "' WHERE id = ?",
           [fd.kanban_card_id]
