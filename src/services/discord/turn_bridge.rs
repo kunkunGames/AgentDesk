@@ -3,6 +3,8 @@ use super::restart_report::{RestartCompletionReport, clear_restart_report, save_
 use super::*;
 use crate::config::local_api_url;
 #[cfg(unix)]
+use crate::services::tmux_common::tmux_exact_target;
+#[cfg(unix)]
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 use crate::utils::format::{safe_suffix, tail_with_ellipsis};
 
@@ -50,8 +52,9 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
                 #[cfg(unix)]
                 {
                     record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
+                    let exact_target = tmux_exact_target(&name);
                     let _ = std::process::Command::new("tmux")
-                        .args(["kill-session", "-t", &name])
+                        .args(["kill-session", "-t", &exact_target])
                         .output();
                 }
                 #[cfg(not(unix))]
@@ -779,11 +782,14 @@ pub(super) fn spawn_turn_bridge(
                             output_tokens,
                             ..
                         } => {
+                            // Use latest value (not cumulative) — each StatusUpdate
+                            // from claude.rs already includes cumulative cache tokens,
+                            // representing the current context window occupancy.
                             if let Some(it) = input_tokens {
-                                accumulated_input_tokens += it;
+                                accumulated_input_tokens = it;
                             }
                             if let Some(ot) = output_tokens {
-                                accumulated_output_tokens += ot;
+                                accumulated_output_tokens = ot;
                             }
                         }
                         StreamMessage::TmuxReady {
@@ -983,6 +989,31 @@ pub(super) fn spawn_turn_bridge(
             shared_owned.api_port,
         )
         .await;
+
+        // ─── Auto-compact: send /compact if context window usage exceeds threshold ───
+        // Only for non-dispatch (main channel) sessions with a live tmux session.
+        #[cfg(unix)]
+        if dispatch_id.is_none() && !is_prompt_too_long {
+            let total_tokens = accumulated_input_tokens + accumulated_output_tokens;
+            const CONTEXT_WINDOW: u64 = 1_000_000;
+            const COMPACT_THRESHOLD_PCT: u64 = 60;
+            let pct = (total_tokens * 100) / CONTEXT_WINDOW.max(1);
+            if pct >= COMPACT_THRESHOLD_PCT {
+                if let Some(ref tmux_name) = inflight_state.tmux_session_name {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⚡ Auto-compact: {tmux_name} at {pct}% ({total_tokens} tokens)"
+                    );
+                    let exact_target = tmux_exact_target(tmux_name);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        std::process::Command::new("tmux")
+                            .args(["send-keys", "-t", &exact_target, "/compact", "Enter"])
+                            .output()
+                    })
+                    .await;
+                }
+            }
+        }
 
         let can_chain_locally =
             serenity_ctx.is_some() && request_owner.is_some() && token.is_some();
@@ -1493,10 +1524,10 @@ pub(super) fn spawn_turn_bridge(
                         name,
                         "dispatch turn completed — killing thread session",
                     );
-                    let sess = name.clone();
+                    let exact_target = tmux_exact_target(&name);
                     let kill_result = tokio::task::spawn_blocking(move || {
                         std::process::Command::new("tmux")
-                            .args(["kill-session", "-t", &sess])
+                            .args(["kill-session", "-t", &exact_target])
                             .output()
                     })
                     .await;

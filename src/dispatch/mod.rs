@@ -83,18 +83,19 @@ pub fn create_dispatch_core(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
 
-    // Get current card status for the transition hook
-    let old_status: String = conn
+    // Get current card status + repo/agent IDs for effective pipeline resolution
+    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
+            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
             [kanban_card_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
     // Guard: prevent ALL dispatches for terminal cards (pipeline-driven).
     crate::pipeline::ensure_loaded();
-    let is_terminal = crate::pipeline::get().is_terminal(&old_status);
+    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let is_terminal = effective.is_terminal(&old_status);
     if is_terminal {
         return Err(anyhow::anyhow!(
             "Cannot create {} dispatch for terminal card {} (status: {}) — cannot revert terminal card",
@@ -168,24 +169,16 @@ pub fn create_dispatch_core(
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     } else {
-        // Pipeline-driven: resolve the dispatch kickoff state (first gated target from dispatchable)
-        crate::pipeline::ensure_loaded();
-        let pipeline = crate::pipeline::get();
-        let dispatchable = pipeline.dispatchable_states();
-        let kickoff_state = pipeline
-            .transitions
-            .iter()
-            .find(|t| {
-                t.transition_type == crate::pipeline::TransitionType::Gated
-                    && dispatchable.contains(&t.from.as_str())
-            })
-            .map(|t| t.to.clone())
+        // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
+        // kickoff_for() prefers gated transition FROM old_status; falls back to any dispatchable.
+        let kickoff_state = effective
+            .kickoff_for(&old_status)
             .unwrap_or_else(|| {
                 tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
-                pipeline.initial_state().to_string()
+                effective.initial_state().to_string()
             });
         // Build clock SQL from pipeline config
-        let clock_sql = pipeline
+        let clock_sql = effective
             .clock_for_state(&kickoff_state)
             .map(|c| format!(", {} = datetime('now')", c.set))
             .unwrap_or_default();
@@ -271,16 +264,17 @@ pub fn create_dispatch_core_with_id(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
 
-    let old_status: String = conn
+    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
+            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
             [kanban_card_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
     crate::pipeline::ensure_loaded();
-    let is_terminal = crate::pipeline::get().is_terminal(&old_status);
+    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let is_terminal = effective.is_terminal(&old_status);
     if is_terminal {
         return Err(anyhow::anyhow!(
             "Cannot create {} dispatch for terminal card {} (status: {}) — cannot revert terminal card",
@@ -331,9 +325,23 @@ pub fn create_dispatch_core_with_id(
             rusqlite::params![dispatch_id, kanban_card_id],
         )?;
     } else {
+        // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
+        let kickoff_state = effective
+            .kickoff_for(&old_status)
+            .unwrap_or_else(|| {
+                tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
+                effective.initial_state().to_string()
+            });
+        let clock_sql = effective
+            .clock_for_state(&kickoff_state)
+            .map(|c| format!(", {} = datetime('now')", c.set))
+            .unwrap_or_default();
+        let sql = format!(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = ?2{clock_sql}, updated_at = datetime('now') WHERE id = ?3"
+        );
         conn.execute(
-            "UPDATE kanban_cards SET latest_dispatch_id = ?1, status = 'requested', requested_at = datetime('now'), updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![dispatch_id, kanban_card_id],
+            &sql,
+            rusqlite::params![dispatch_id, kickoff_state, kanban_card_id],
         )?;
     }
 
@@ -369,26 +377,26 @@ pub fn create_dispatch(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
     let dispatch = query_dispatch_row(&conn, &dispatch_id)?;
-    drop(conn);
 
     // Fire pipeline-defined on_enter hooks for the kickoff state (#134).
-    // Resolve kickoff state from pipeline (same logic as create_dispatch_core).
+    // Resolve kickoff state from card's effective pipeline (repo/agent overrides).
     crate::pipeline::ensure_loaded();
-    let pipeline = crate::pipeline::get();
-    let d = pipeline.dispatchable_states();
-    let kickoff = pipeline
-        .transitions
-        .iter()
-        .find(|t| {
-            t.transition_type == crate::pipeline::TransitionType::Gated
-                && d.contains(&t.from.as_str())
-        })
-        .map(|t| t.to.as_str())
+    let (card_repo_id, card_agent_id): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+            [kanban_card_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None));
+    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    drop(conn);
+    let kickoff_owned = effective
+        .kickoff_for(&old_status)
         .unwrap_or_else(|| {
             tracing::error!("Pipeline has no kickoff state for hook firing");
-            pipeline.initial_state()
+            effective.initial_state().to_string()
         });
-    crate::kanban::fire_state_hooks(db, engine, kanban_card_id, &old_status, kickoff);
+    crate::kanban::fire_state_hooks(db, engine, kanban_card_id, &old_status, &kickoff_owned);
 
     Ok(dispatch)
 }
@@ -499,13 +507,13 @@ pub fn complete_dispatch(
             .lock()
             .ok()
             .map(|conn| {
-                let card_status: Option<String> = conn
+                let (card_status, repo_id, agent_id): (Option<String>, Option<String>, Option<String>) = conn
                     .query_row(
-                        "SELECT status FROM kanban_cards WHERE id = ?1",
+                        "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
                         [&kanban_card_id],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
-                    .ok();
+                    .unwrap_or((None, None, None));
                 let has_review_dispatch: bool = conn
                     .query_row(
                         "SELECT COUNT(*) > 0 FROM task_dispatches \
@@ -515,10 +523,10 @@ pub fn complete_dispatch(
                         |row| row.get(0),
                     )
                     .unwrap_or(false);
-                // Pipeline-driven: check if current state has OnReviewEnter hook
+                // Pipeline-driven: check if current state has OnReviewEnter hook (card's effective pipeline)
                 let is_review_state = card_status.as_deref().map_or(false, |s| {
-                    crate::pipeline::try_get()
-                        .and_then(|p| p.hooks_for_state(s))
+                    let eff = crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
+                    eff.hooks_for_state(s)
                         .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
                 });
                 is_review_state && !has_review_dispatch

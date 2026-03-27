@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use crate::services::tmux_common::tmux_exact_target;
 
 pub(super) fn should_process_turn_message(kind: serenity::model::channel::MessageType) -> bool {
     matches!(
@@ -113,11 +115,18 @@ pub(super) async fn handle_event(
                 return Ok(());
             }
 
-            // Ignore messages that mention other users (not directed at the bot)
+            // Ignore messages that mention other (human) users — not directed at
+            // this bot.  Bot mentions are excluded because Discord auto-adds the
+            // replied-to author to the mentions array for InlineReply messages;
+            // filtering on those would silently drop legitimate replies to
+            // announce/notify/codex bot messages.
             if !new_message.mentions.is_empty() {
                 let bot_id = ctx.cache.current_user().id;
-                let mentions_others = new_message.mentions.iter().any(|u| u.id != bot_id);
-                if mentions_others {
+                let mentions_other_humans = new_message
+                    .mentions
+                    .iter()
+                    .any(|u| u.id != bot_id && !u.bot);
+                if mentions_other_humans {
                     return Ok(());
                 }
             }
@@ -2100,6 +2109,10 @@ async fn handle_text_command(
             if let Some(token) = d.cancel_tokens.remove(&channel_id) {
                 token.cancel_with_tmux_cleanup();
             }
+            // Build tmux session name from channel name
+            let tmux_name = d.sessions.get(&channel_id)
+                .and_then(|s| s.channel_name.as_ref())
+                .map(|ch_name| data.provider.build_tmux_session_name(ch_name));
             if let Some(session) = d.sessions.get_mut(&channel_id) {
                 session.history.clear();
                 session.pending_uploads.clear();
@@ -2108,6 +2121,17 @@ async fn handle_text_command(
             }
             d.intervention_queue.remove(&channel_id);
             drop(d);
+            // Send /clear to the actual Claude Code session via tmux
+            #[cfg(unix)]
+            if let Some(ref name) = tmux_name {
+                let exact_target = tmux_exact_target(name);
+                let _ = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("tmux")
+                        .args(["send-keys", "-t", &exact_target, "/clear", "Enter"])
+                        .output()
+                })
+                .await;
+            }
             let _ = msg.reply(&ctx.http, "Session cleared.").await;
             return Ok(true);
         }

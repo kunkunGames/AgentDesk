@@ -487,4 +487,430 @@ mod tests {
             );
         }
     }
+
+    // ── Scenario 7: dispatch uses card's effective pipeline, not global default (#134/#136) ──
+
+    #[test]
+    fn scenario_7_dispatch_uses_card_effective_pipeline() {
+        let db = test_db();
+        seed_agent(&db);
+        crate::pipeline::ensure_loaded();
+
+        // Simple pipeline override: ready→in_progress (gated), in_progress→done (gated)
+        // No "requested" state at all — kickoff should be "in_progress"
+        let simple_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "done", "type": "gated", "gates": ["active_dispatch"]}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"}
+            },
+            "hooks": {
+                "in_progress": {"on_enter": ["OnCardTransition"], "on_exit": []},
+                "done": {"on_enter": ["OnCardTransition", "OnCardTerminal"], "on_exit": []}
+            },
+            "clocks": {
+                "in_progress": {"set": "started_at"},
+                "done": {"set": "completed_at"}
+            },
+            "events": {
+                "on_dispatch_completed": ["OnDispatchCompleted"]
+            },
+            "timeouts": {
+                "in_progress": {"duration": "4h", "clock": "started_at", "on_exhaust": "done"}
+            }
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO github_repos (id, display_name, pipeline_config) VALUES ('repo-s7', 'test/s7', ?1)",
+                [simple_override.to_string()],
+            ).unwrap();
+            // Card with repo_id pointing to override — in "ready" (dispatchable in simple pipeline)
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-s7', 'S7 Card', 'ready', 'repo-s7', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            // Need a completed dispatch so the pending-dispatch guard doesn't block
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-s7-old', 'card-s7', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        // Default pipeline kickoff is "requested", but simple pipeline kickoff is "in_progress"
+        let default_kickoff = crate::pipeline::get()
+            .transitions.iter()
+            .find(|t| {
+                t.transition_type == crate::pipeline::TransitionType::Gated
+                    && crate::pipeline::get().dispatchable_states().contains(&t.from.as_str())
+            })
+            .map(|t| t.to.as_str())
+            .unwrap();
+        assert_eq!(default_kickoff, "requested", "default pipeline kickoff must be 'requested'");
+
+        // Create dispatch via create_dispatch_core_with_id — should use card's effective pipeline
+        let result = dispatch::create_dispatch_core_with_id(
+            &db,
+            "d-s7-new",
+            "card-s7",
+            "agent-1",
+            "implementation",
+            "[S7 test]",
+            &serde_json::json!({}),
+        );
+        assert!(result.is_ok(), "dispatch creation should succeed: {:?}", result.err());
+
+        // Card status must be "in_progress" (override kickoff), NOT "requested" (default kickoff)
+        let status = get_card_status(&db, "card-s7");
+        assert_eq!(
+            status, "in_progress",
+            "dispatch must use card's effective pipeline kickoff, not global default"
+        );
+
+        // Also test create_dispatch_core (the non-ID path)
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-s7b', 'S7b Card', 'ready', 'repo-s7', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-s7b-old', 'card-s7b', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+        let result2 = dispatch::create_dispatch_core(
+            &db,
+            "card-s7b",
+            "agent-1",
+            "implementation",
+            "[S7b test]",
+            &serde_json::json!({}),
+        );
+        assert!(result2.is_ok(), "create_dispatch_core should succeed: {:?}", result2.err());
+        assert_eq!(
+            get_card_status(&db, "card-s7b"),
+            "in_progress",
+            "create_dispatch_core must also use card's effective pipeline kickoff"
+        );
+    }
+
+    // ── Scenario 8: Custom pipeline override — resolve and validate (#135/#136) ──
+
+    #[test]
+    fn scenario_8_custom_pipeline_override_resolve_and_validate() {
+        let db = test_db();
+        seed_agent(&db);
+        crate::pipeline::ensure_loaded();
+
+        // Insert a repo with a simple pipeline override (no review state)
+        let simple_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "done", "type": "gated", "gates": ["active_dispatch"]}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"}
+            },
+            "hooks": {
+                "in_progress": {"on_enter": ["OnCardTransition"], "on_exit": []},
+                "done": {"on_enter": ["OnCardTransition", "OnCardTerminal"], "on_exit": []}
+            },
+            "clocks": {
+                "in_progress": {"set": "started_at"},
+                "done": {"set": "completed_at"}
+            },
+            "events": {
+                "on_dispatch_completed": ["OnDispatchCompleted"]
+            },
+            "timeouts": {
+                "in_progress": {"duration": "4h", "clock": "started_at", "on_exhaust": "done"}
+            }
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO github_repos (id, display_name, pipeline_config) VALUES ('repo-simple', 'test/simple', ?1)",
+                [simple_override.to_string()],
+            )
+            .unwrap();
+        }
+
+        // Resolve effective pipeline for this repo
+        let conn = db.lock().unwrap();
+        let effective = crate::pipeline::resolve_for_card(&conn, Some("repo-simple"), None);
+        drop(conn);
+
+        // Validate the effective pipeline
+        assert!(effective.validate().is_ok(), "simple pipeline override must be valid");
+
+        // Verify states: no "review" or "requested" state
+        let state_ids: Vec<&str> = effective.states.iter().map(|s| s.id.as_str()).collect();
+        assert!(!state_ids.contains(&"review"), "simple pipeline has no review state");
+        assert!(!state_ids.contains(&"requested"), "simple pipeline has no requested state");
+        assert!(state_ids.contains(&"in_progress"), "simple pipeline has in_progress");
+        assert!(state_ids.contains(&"done"), "simple pipeline has done");
+
+        // Verify terminal state
+        assert!(effective.is_terminal("done"), "done is terminal");
+        assert!(!effective.is_terminal("in_progress"), "in_progress is not terminal");
+
+        // Verify dispatchable state
+        let dispatchable = effective.dispatchable_states();
+        assert_eq!(dispatchable, vec!["ready"], "ready is the only dispatchable state");
+
+        // Verify transitions work: card can go ready → in_progress (gated)
+        assert!(
+            effective.find_transition("ready", "in_progress").is_some(),
+            "ready → in_progress transition must exist"
+        );
+        assert!(
+            effective.find_transition("in_progress", "done").is_some(),
+            "in_progress → done transition must exist"
+        );
+        // No review transition
+        assert!(
+            effective.find_transition("in_progress", "review").is_none(),
+            "in_progress → review must NOT exist in simple pipeline"
+        );
+    }
+
+    // ── Scenario 9: QA pipeline override with custom qa_test state (#136) ──
+
+    #[test]
+    fn scenario_9_qa_pipeline_override_transitions() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        crate::pipeline::ensure_loaded();
+
+        // Store QA pipeline as repo override
+        let qa_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "requested", "label": "Requested"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "review", "label": "Review"},
+                {"id": "qa_test", "label": "QA Test"},
+                {"id": "pending_decision", "label": "Pending"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "requested", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "requested", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "review", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "review", "to": "qa_test", "type": "gated", "gates": ["review_passed"]},
+                {"from": "review", "to": "in_progress", "type": "gated", "gates": ["review_rework"]},
+                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "qa_test", "to": "in_progress", "type": "force_only"},
+                {"from": "requested", "to": "pending_decision", "type": "force_only"},
+                {"from": "pending_decision", "to": "done", "type": "force_only"}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
+                "review_passed": {"type": "builtin", "check": "review_verdict_pass"},
+                "review_rework": {"type": "builtin", "check": "review_verdict_rework"}
+            },
+            "hooks": {
+                "in_progress": {"on_enter": ["OnCardTransition"], "on_exit": []},
+                "review": {"on_enter": ["OnCardTransition", "OnReviewEnter"], "on_exit": []},
+                "qa_test": {"on_enter": ["OnCardTransition"], "on_exit": []},
+                "done": {"on_enter": ["OnCardTransition", "OnCardTerminal"], "on_exit": []}
+            },
+            "clocks": {
+                "requested": {"set": "requested_at"},
+                "in_progress": {"set": "started_at", "mode": "coalesce"},
+                "review": {"set": "review_entered_at"},
+                "done": {"set": "completed_at"}
+            }
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO github_repos (id, display_name, pipeline_config) VALUES ('repo-qa', 'test/qa', ?1)",
+                [qa_override.to_string()],
+            )
+            .unwrap();
+        }
+
+        // Resolve and validate
+        let conn = db.lock().unwrap();
+        let effective = crate::pipeline::resolve_for_card(&conn, Some("repo-qa"), None);
+        drop(conn);
+        assert!(effective.validate().is_ok(), "QA pipeline must be valid");
+
+        // Key assertion: review → qa_test transition exists (not review → done)
+        let review_pass = effective.find_transition("review", "qa_test");
+        assert!(review_pass.is_some(), "review → qa_test must exist in QA pipeline");
+        let review_done = effective.find_transition("review", "done");
+        assert!(review_done.is_none(), "review → done must NOT exist in QA pipeline");
+
+        // qa_test → done transition
+        let qa_done = effective.find_transition("qa_test", "done");
+        assert!(qa_done.is_some(), "qa_test → done must exist");
+
+        // qa_test → in_progress force transition
+        let qa_rework = effective.find_transition("qa_test", "in_progress");
+        assert!(qa_rework.is_some(), "qa_test → in_progress (force) must exist");
+
+        // Verify custom state has hooks
+        let qa_hooks = effective.hooks_for_state("qa_test");
+        assert!(qa_hooks.is_some(), "qa_test must have hook bindings");
+        assert!(
+            qa_hooks.unwrap().on_enter.contains(&"OnCardTransition".to_string()),
+            "qa_test on_enter must include OnCardTransition"
+        );
+
+        // Test actual card transition through qa_test
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-qa', 'QA Card', 'qa_test', 'repo-qa', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-qa', 'card-qa', 'agent-1', 'implementation', 'dispatched', 'QA test', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET latest_dispatch_id = 'd-qa' WHERE id = 'card-qa'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Force transition qa_test → in_progress (simulating QA failure)
+        let result = kanban::transition_status_with_opts(
+            &db, &engine, "card-qa", "in_progress", "qa-fail", true,
+        );
+        assert!(result.is_ok(), "qa_test → in_progress force transition must work");
+        assert_eq!(get_card_status(&db, "card-qa"), "in_progress");
+    }
+
+    // ── Scenario 10: Multi-dispatchable pipeline — kickoff resolves from card's current state ──
+
+    #[test]
+    fn scenario_10_multi_dispatchable_kickoff_uses_current_state() {
+        let db = test_db();
+        seed_agent(&db);
+        crate::pipeline::ensure_loaded();
+
+        // Pipeline with TWO dispatchable states, each with a DIFFERENT gated target:
+        //   ready      → (gated) → in_progress
+        //   qa_ready   → (gated) → qa_test
+        // If kickoff resolution ignores old_status, it picks the first one arbitrarily.
+        let multi_disp_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "review", "label": "Review"},
+                {"id": "qa_ready", "label": "QA Ready"},
+                {"id": "qa_test", "label": "QA Test"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "review", "type": "free"},
+                {"from": "review", "to": "qa_ready", "type": "free"},
+                {"from": "qa_ready", "to": "qa_test", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "review", "to": "in_progress", "type": "gated", "gates": ["review_rework"]}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
+                "review_rework": {"type": "builtin", "check": "review_verdict_rework"}
+            },
+            "hooks": {},
+            "clocks": {},
+            "events": {},
+            "timeouts": {}
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO github_repos (id, display_name, pipeline_config) VALUES ('repo-multi', 'test/multi', ?1)",
+                [multi_disp_override.to_string()],
+            ).unwrap();
+        }
+
+        // Card A: in "ready" — dispatch should kick off to "in_progress"
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-multi-a', 'Multi A', 'ready', 'repo-multi', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-multi-a-old', 'card-multi-a', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        let result_a = dispatch::create_dispatch_core_with_id(
+            &db, "d-multi-a", "card-multi-a", "agent-1", "implementation", "[Multi A]", &serde_json::json!({}),
+        );
+        assert!(result_a.is_ok(), "dispatch for card-multi-a should succeed: {:?}", result_a.err());
+        assert_eq!(
+            get_card_status(&db, "card-multi-a"), "in_progress",
+            "card in 'ready' must kick off to 'in_progress', not 'qa_test'"
+        );
+
+        // Card B: in "qa_ready" — dispatch should kick off to "qa_test"
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-multi-b', 'Multi B', 'qa_ready', 'repo-multi', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+                 VALUES ('d-multi-b-old', 'card-multi-b', 'agent-1', 'implementation', 'completed', 'old', datetime('now'), datetime('now'))",
+                [],
+            ).unwrap();
+        }
+
+        let result_b = dispatch::create_dispatch_core_with_id(
+            &db, "d-multi-b", "card-multi-b", "agent-1", "implementation", "[Multi B]", &serde_json::json!({}),
+        );
+        assert!(result_b.is_ok(), "dispatch for card-multi-b should succeed: {:?}", result_b.err());
+        assert_eq!(
+            get_card_status(&db, "card-multi-b"), "qa_test",
+            "card in 'qa_ready' must kick off to 'qa_test', not 'in_progress'"
+        );
+    }
 }

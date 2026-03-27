@@ -360,6 +360,31 @@ impl PipelineConfig {
             .collect()
     }
 
+    /// Resolve the kickoff state for a card currently in `current_state`.
+    ///
+    /// 1. If there is a gated transition FROM `current_state`, return its target.
+    /// 2. Otherwise fall back to the first gated transition from any dispatchable state.
+    ///
+    /// Returns `None` only when the pipeline has no gated transitions at all.
+    pub fn kickoff_for(&self, current_state: &str) -> Option<String> {
+        // Prefer the concrete gated transition from the card's actual state
+        self.transitions
+            .iter()
+            .find(|t| t.from == current_state && t.transition_type == TransitionType::Gated)
+            .map(|t| t.to.clone())
+            .or_else(|| {
+                // Fallback: first dispatchable state's gated target
+                let dispatchable = self.dispatchable_states();
+                self.transitions
+                    .iter()
+                    .find(|t| {
+                        t.transition_type == TransitionType::Gated
+                            && dispatchable.contains(&t.from.as_str())
+                    })
+                    .map(|t| t.to.clone())
+            })
+    }
+
     /// Check if a state requires a gated inbound transition (dispatch-entry states).
     /// These states should only be entered via dispatch API, not direct PATCH.
     pub fn requires_dispatch_entry(&self, state: &str) -> bool {
