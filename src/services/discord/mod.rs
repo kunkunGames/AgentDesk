@@ -2552,48 +2552,24 @@ pub(super) async fn auto_restore_session(
             session.last_active = tokio::time::Instant::now();
             session.current_path = Some(last_path.clone());
             let current_gen = runtime_store::load_generation();
-            let mut need_db_restore = false;
-            let restore_ch_name = session.channel_name.clone();
             if let Some((session_data, _)) = existing {
                 if session_data.born_generation < current_gen && current_gen > 0 {
                     // Old generation session — quarantine: start fresh without
                     // reusing session_id/history from the previous generation.
-                    // However, for thread sessions we can restore the Claude session_id
-                    // from DB so --resume continues the conversation.
+                    // Do NOT restore claude_session_id from DB either — the old
+                    // Claude CLI session is almost certainly dead after a restart,
+                    // and --resume with a stale ID causes immediate termination.
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
-                        "  [{ts}] 🔒 QUARANTINE: auto-restore skipping old session_id/history for {last_path} (saved_gen={}, current_gen={current_gen})",
-                        session_data.born_generation
+                        "  [{ts}] 🔒 QUARANTINE: auto-restore skipping old session_id/history for {last_path} (saved_gen={}, current_gen={current_gen})"
+                        , session_data.born_generation
                     );
-                    need_db_restore = true;
                 } else {
                     session.session_id = Some(session_data.session_id.clone());
                     session.history = session_data.history.clone();
                 }
             }
             drop(data);
-
-            // Restore claude_session_id from DB for quarantined sessions.
-            // This runs outside the core lock to avoid deadlocks on the async API call.
-            if need_db_restore {
-                if let Some(ref ch_name) = restore_ch_name {
-                    let tmux_name = provider.build_tmux_session_name(ch_name);
-                    let hostname = crate::services::platform::hostname_short();
-                    let session_key = format!("{}:{}", hostname, tmux_name);
-                    if let Some(claude_sid) =
-                        adk_session::fetch_claude_session_id(&session_key, shared.api_port).await
-                    {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] ↻ QUARANTINE: restored claude_session_id from DB for {last_path}"
-                        );
-                        let mut data = shared.core.lock().await;
-                        if let Some(session) = data.sessions.get_mut(&channel_id) {
-                            session.session_id = Some(claude_sid);
-                        }
-                    }
-                }
-            }
 
             // Rescan skills with project path
             let new_skills = scan_skills(&provider, Some(&last_path));
