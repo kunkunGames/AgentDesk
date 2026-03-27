@@ -1252,8 +1252,8 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
 
         // #145: unified-thread sessions should NOT be killed or deleted while
         // the auto-queue run is still active — mark idle instead and skip kill.
-        let is_unified_active = is_thread
-            && crate::dispatch::is_unified_thread_channel_active(channel_id.get());
+        let is_unified_active =
+            is_thread && crate::dispatch::is_unified_thread_channel_active(channel_id.get());
 
         if is_thread && !is_unified_active {
             // Thread sessions: delete from DB entirely (they are one-shot)

@@ -113,9 +113,6 @@ impl SessionRuntime for TmuxRuntime {
     }
 
     fn death_diagnostic(&self, session_name: &str, output_path: Option<&str>) -> Option<String> {
-        crate::services::tmux_diagnostics::build_tmux_death_diagnostic(
-            session_name,
-            output_path,
-        )
+        crate::services::tmux_diagnostics::build_tmux_death_diagnostic(session_name, output_path)
     }
 }

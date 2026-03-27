@@ -91,23 +91,14 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!(
-        "  [{ts}] 📋 execute_intents: {} intent(s)",
-        intents.len()
-    );
+    println!("  [{ts}] 📋 execute_intents: {} intent(s)", intents.len());
 
     for intent in intents {
         match intent {
-            Intent::TransitionCard {
-                card_id,
-                from,
-                to,
-            } => {
+            Intent::TransitionCard { card_id, from, to } => {
                 if let Err(e) = execute_transition(db, &card_id, &from, &to) {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ⚠ intent TransitionCard({card_id} {from}→{to}) failed: {e}"
-                    );
+                    println!("  [{ts}] ⚠ intent TransitionCard({card_id} {from}→{to}) failed: {e}");
                     result.errors += 1;
                 } else {
                     result.transitions.push((card_id, from, to));
@@ -223,8 +214,8 @@ fn execute_transition(
 
     // Pipeline-driven validation and clock fields
     crate::pipeline::ensure_loaded();
-    let pipeline = crate::pipeline::try_get()
-        .ok_or_else(|| anyhow::anyhow!("pipeline not loaded"))?;
+    let pipeline =
+        crate::pipeline::try_get().ok_or_else(|| anyhow::anyhow!("pipeline not loaded"))?;
 
     // Terminal guard
     if pipeline.is_terminal(&current) {
@@ -267,9 +258,9 @@ fn execute_transition(
     let has_hooks = pipeline
         .hooks_for_state(to)
         .map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
-    let is_review_enter = pipeline.hooks_for_state(to).map_or(false, |h| {
-        h.on_enter.iter().any(|n| n == "OnReviewEnter")
-    });
+    let is_review_enter = pipeline
+        .hooks_for_state(to)
+        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
     if pipeline.is_terminal(to) || !has_hooks {
         conn.execute(
             "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
@@ -361,11 +352,7 @@ fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {
     }
 }
 
-fn execute_sql(
-    db: &crate::db::Db,
-    sql: &str,
-    params: &[serde_json::Value],
-) -> anyhow::Result<()> {
+fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> anyhow::Result<()> {
     // Block direct kanban_cards status UPDATE (same guard as ops.rs)
     let sql_upper = sql.to_uppercase();
     if sql_upper.contains("UPDATE") && sql_upper.contains("KANBAN_CARDS") {

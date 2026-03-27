@@ -209,10 +209,7 @@ pub fn api_router(
             "/pipeline/config/agent/{agent_id}",
             get(pipeline::get_agent_pipeline).put(pipeline::set_agent_pipeline),
         )
-        .route(
-            "/pipeline/config/graph",
-            get(pipeline::get_pipeline_graph),
-        )
+        .route("/pipeline/config/graph", get(pipeline::get_pipeline_graph))
         // GitHub repos
         .route(
             "/github/repos",
