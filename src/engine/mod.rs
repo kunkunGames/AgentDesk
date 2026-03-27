@@ -142,6 +142,7 @@ impl PolicyEngine {
         Self::fire_hook_with_guard(&inner, hook, payload)?;
         // Drain deferred hooks from DB while holding inner guard
         // (fire_hook_with_guard doesn't need separate lock)
+        let mut had_deferred = false;
         loop {
             let rows: Vec<(i64, String, String)> = {
                 let conn = match self.db.separate_conn() {
@@ -163,6 +164,7 @@ impl PolicyEngine {
             if rows.is_empty() {
                 break;
             }
+            had_deferred = true;
             for (id, hook_name, payload_str) in &rows {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] 🔄 fire_hook(deferred {hook_name}, id={id})");
@@ -180,6 +182,24 @@ impl PolicyEngine {
                 if let Ok(conn) = self.db.separate_conn() {
                     let _ = conn.execute("DELETE FROM deferred_hooks WHERE id = ?1", [id]);
                 }
+            }
+        }
+        // Must drop inner (engine lock) BEFORE draining intents — intent
+        // execution needs a fresh lock acquisition via drain_pending_intents.
+        drop(inner);
+        // Deferred hooks (e.g. OnReviewEnter that was deferred due to lock
+        // contention) may have pushed intents to __pendingIntents. Drain them
+        // now so they don't get lost — callers of try_fire_hook don't always
+        // call drain_pending_intents themselves.
+        if had_deferred {
+            let result = self.drain_pending_intents();
+            if !result.created_dispatches.is_empty() || result.errors > 0 {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] 🔄 deferred hook drain: {} dispatches created, {} errors",
+                    result.created_dispatches.len(),
+                    result.errors
+                );
             }
         }
         Ok(())
