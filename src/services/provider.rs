@@ -91,10 +91,18 @@ impl ProviderKind {
         }
     }
 
+    pub fn resolve_runtime_path(&self) -> Option<String> {
+        match self {
+            Self::Claude => crate::services::claude::resolve_claude_path(),
+            Self::Codex => crate::services::codex::resolve_codex_path(),
+            Self::Gemini => crate::services::gemini::resolve_gemini_path(),
+            Self::Unsupported(_) => None,
+        }
+    }
+
     pub fn probe_runtime(&self) -> Option<ProviderRuntimeProbe> {
         let capabilities = self.capabilities()?;
-        let binary_path =
-            crate::services::platform::resolve_binary_with_login_shell(capabilities.binary_name);
+        let binary_path = self.resolve_runtime_path();
         let version = binary_path.as_ref().and_then(|path| {
             let mut command = Command::new(path);
             crate::services::platform::apply_runtime_path(&mut command);
