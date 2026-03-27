@@ -10,9 +10,7 @@ pub mod provider;
 pub mod provider_exec;
 pub mod remote_stub;
 pub mod session_backend;
-#[cfg(unix)]
 pub mod tmux_common;
-#[cfg(unix)]
 pub mod tmux_diagnostics;
 #[cfg(unix)]
 pub mod tmux_wrapper;
