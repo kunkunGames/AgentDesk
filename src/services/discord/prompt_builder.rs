@@ -99,7 +99,8 @@ pub(super) fn build_system_prompt(
             // contaminating the FP/TP dataset that the guidance itself is derived from.
             if dispatch_type != Some("review-decision") {
                 if let Some(guidance) = load_review_tuning_guidance() {
-                    system_prompt_owned.push_str("\n\n[Review Tuning — 과거 리뷰 정확도 기반 가이던스]\n");
+                    system_prompt_owned
+                        .push_str("\n\n[Review Tuning — 과거 리뷰 정확도 기반 가이던스]\n");
                     system_prompt_owned.push_str(&guidance);
                 }
             }

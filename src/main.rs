@@ -439,10 +439,7 @@ fn build_restart_report_context(
     report_channel_id: Option<u64>,
     report_provider: Option<ReportProvider>,
     report_message_id: Option<u64>,
-) -> std::result::Result<
-    Option<services::discord::restart_report::RestartReportContext>,
-    String,
-> {
+) -> std::result::Result<Option<services::discord::restart_report::RestartReportContext>, String> {
     use services::discord::restart_report::{
         RestartReportContext, restart_report_context_from_env,
     };

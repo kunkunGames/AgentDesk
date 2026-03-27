@@ -363,11 +363,13 @@ impl PipelineConfig {
     /// Check if a state requires a gated inbound transition (dispatch-entry states).
     /// These states should only be entered via dispatch API, not direct PATCH.
     pub fn requires_dispatch_entry(&self, state: &str) -> bool {
-        self.transitions.iter().any(|t| {
-            t.to == state && t.transition_type == TransitionType::Gated
-        }) && !self.transitions.iter().any(|t| {
-            t.to == state && t.transition_type == TransitionType::Free
-        })
+        self.transitions
+            .iter()
+            .any(|t| t.to == state && t.transition_type == TransitionType::Gated)
+            && !self
+                .transitions
+                .iter()
+                .any(|t| t.to == state && t.transition_type == TransitionType::Free)
     }
 
     /// Check if a state is a dispatch kickoff state — the first gated target
@@ -386,9 +388,10 @@ impl PipelineConfig {
     pub fn is_force_only_state(&self, state: &str) -> bool {
         let has_inbound = self.transitions.iter().any(|t| t.to == state);
         has_inbound
-            && self.transitions.iter().all(|t| {
-                t.to != state || t.transition_type == TransitionType::ForceOnly
-            })
+            && self
+                .transitions
+                .iter()
+                .all(|t| t.to != state || t.transition_type == TransitionType::ForceOnly)
     }
 
     /// Validate internal consistency.
@@ -657,10 +660,7 @@ mod tests {
         assert_eq!(after_repo.hooks["in_progress"].on_enter, vec!["RepoHook"]);
 
         let after_agent = after_repo.merge(&agent_ovr);
-        assert_eq!(
-            after_agent.hooks["in_progress"].on_enter,
-            vec!["AgentHook"]
-        );
+        assert_eq!(after_agent.hooks["in_progress"].on_enter, vec!["AgentHook"]);
         // States still from base
         assert_eq!(after_agent.states.len(), 3);
     }

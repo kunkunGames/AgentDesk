@@ -391,7 +391,8 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     ad.set("dispatch", dispatch_obj)?;
 
     // JS wrapper — #121: push CreateDispatch intent with pre-assigned ID
-    let _: rquickjs::Value = ctx.eval(r#"
+    let _: rquickjs::Value = ctx.eval(
+        r#"
         (function() {
             var raw = agentdesk.dispatch.__create_raw;
             agentdesk.dispatch.create = function(cardId, agentId, dispatchType, title) {
@@ -414,7 +415,8 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return dispatchId;
             };
         })();
-    "#)?;
+    "#,
+    )?;
 
     Ok(())
 }
@@ -456,20 +458,14 @@ fn dispatch_create_raw(
     }
     // Validate: agent exists
     let agent_exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM agents WHERE id = ?1",
-            [agent_id],
-            |_| Ok(()),
-        )
+        .query_row("SELECT 1 FROM agents WHERE id = ?1", [agent_id], |_| Ok(()))
         .is_ok();
     if !agent_exists {
         return format!(r#"{{"error":"agent not found: {agent_id}"}}"#);
     }
     // Generate pre-assigned dispatch ID (actual DB write deferred to intent executor)
     let dispatch_id = uuid::Uuid::new_v4().to_string();
-    format!(
-        r#"{{"dispatch_id":"{dispatch_id}","card_id":"{card_id}","agent_id":"{agent_id}"}}"#
-    )
+    format!(r#"{{"dispatch_id":"{dispatch_id}","card_id":"{card_id}","agent_id":"{agent_id}"}}"#)
 }
 
 #[cfg(test)]
@@ -1200,7 +1196,9 @@ fn register_pipeline_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
         Function::new(ctx.clone(), || -> String {
             crate::pipeline::ensure_loaded();
             match crate::pipeline::try_get() {
-                Some(p) => serde_json::to_string(&p.to_json()).unwrap_or_else(|_| "null".to_string()),
+                Some(p) => {
+                    serde_json::to_string(&p.to_json()).unwrap_or_else(|_| "null".to_string())
+                }
                 None => "null".to_string(),
             }
         })?,
@@ -1216,19 +1214,31 @@ fn register_pipeline_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 Ok(c) => c,
                 Err(_) => {
                     return crate::pipeline::try_get()
-                        .map(|p| serde_json::to_string(&p.to_json()).unwrap_or_else(|_| "null".to_string()))
+                        .map(|p| {
+                            serde_json::to_string(&p.to_json())
+                                .unwrap_or_else(|_| "null".to_string())
+                        })
                         .unwrap_or_else(|| "null".to_string());
                 }
             };
             let repo_id: Option<String> = conn
-                .query_row("SELECT repo_id FROM kanban_cards WHERE id = ?1", [&card_id], |r| r.get(0))
+                .query_row(
+                    "SELECT repo_id FROM kanban_cards WHERE id = ?1",
+                    [&card_id],
+                    |r| r.get(0),
+                )
                 .ok()
                 .flatten();
             let agent_id: Option<String> = conn
-                .query_row("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1", [&card_id], |r| r.get(0))
+                .query_row(
+                    "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                    [&card_id],
+                    |r| r.get(0),
+                )
                 .ok()
                 .flatten();
-            let effective = crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
+            let effective =
+                crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
             serde_json::to_string(&effective.to_json()).unwrap_or_else(|_| "null".to_string())
         })?,
     )?;

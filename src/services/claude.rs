@@ -903,9 +903,18 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     }
                     if let Some(usage) = msg_obj.get("usage") {
                         // Include cache tokens in input total for accurate context occupancy
-                        let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let inp = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_creation = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
                         accum_input_tokens += inp + cache_read + cache_creation;
                         if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                             accum_output_tokens += out;
@@ -1202,9 +1211,18 @@ pub(crate) fn process_stream_line(
             }
             if let Some(usage) = msg_obj.get("usage") {
                 // Include cache tokens in input total for accurate context occupancy
-                let inp = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let inp = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_creation = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 state.accum_input_tokens += inp + cache_read + cache_creation;
                 if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
                     state.accum_output_tokens += out;
