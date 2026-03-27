@@ -1219,7 +1219,8 @@ pub(super) async fn handle_text_message(
         let watchdog_shared = shared.clone();
         let watchdog_http = ctx.http.clone();
         let timeout = super::turn_watchdog_timeout();
-        let initial_deadline_ms = chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
+        let initial_deadline_ms =
+            chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64;
         super::set_watchdog_deadline_override(channel_id.get(), initial_deadline_ms);
         tokio::spawn(async move {
             loop {

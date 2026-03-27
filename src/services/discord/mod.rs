@@ -114,8 +114,7 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
 }
 
 fn watchdog_deadline_overrides() -> &'static dashmap::DashMap<u64, i64> {
-    static OVERRIDES: std::sync::OnceLock<dashmap::DashMap<u64, i64>> =
-        std::sync::OnceLock::new();
+    static OVERRIDES: std::sync::OnceLock<dashmap::DashMap<u64, i64>> = std::sync::OnceLock::new();
     OVERRIDES.get_or_init(dashmap::DashMap::new)
 }
 
