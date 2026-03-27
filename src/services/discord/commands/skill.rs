@@ -167,10 +167,30 @@ pub(in crate::services::discord) async fn cmd_cc(
     };
 
     if !skill_exists {
-        ctx.say(format!(
-            "Unknown skill: `{}`. Use `/cc` to see available skills.",
-            skill
-        ))
+        // Treat unregistered skill as a regular user prompt forwarded to the AI provider.
+        let full_text = if args_str.is_empty() {
+            format!("/{skill}")
+        } else {
+            format!("/{skill} {args_str}")
+        };
+        let channel_id = ctx.channel_id();
+        let msg_id = serenity::MessageId::new(ctx.id());
+        let serenity_ctx = ctx.serenity_context();
+        auto_restore_session(&ctx.data().shared, channel_id, serenity_ctx).await;
+        handle_text_message(
+            serenity_ctx,
+            channel_id,
+            msg_id,
+            ctx.author().id,
+            &ctx.author().name,
+            &full_text,
+            &ctx.data().shared,
+            &ctx.data().token,
+            false,
+            false,
+            false,
+            None,
+        )
         .await?;
         return Ok(());
     }

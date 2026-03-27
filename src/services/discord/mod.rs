@@ -146,7 +146,6 @@ pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
         map.remove(&channel_id);
     }
 }
-
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
