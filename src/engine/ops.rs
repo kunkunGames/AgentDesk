@@ -114,6 +114,12 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 if (/UPDATE\s+kanban_cards\b/i.test(sql) && /(?<![_a-z])status\s*=/i.test(sql)) {
                     throw new Error("Direct kanban_cards status UPDATE is blocked. Use agentdesk.kanban.setStatus(cardId, newStatus) instead.");
                 }
+                // Block direct INSERT/UPDATE on task_dispatches — use agentdesk.dispatch.create() instead.
+                // Direct writes bypass send_dispatch_to_discord(), unified thread routing,
+                // dispatch_notified guard, and channel_thread_map updates.
+                if (/(?:INSERT\s+INTO|UPDATE)\s+task_dispatches\b/i.test(sql)) {
+                    throw new Error("Direct task_dispatches mutation is blocked. Use agentdesk.dispatch.create() instead.");
+                }
                 // Direct write — db.execute remains synchronous by design.
                 // dispatch.create and kanban.setStatus use intent/transition model;
                 // converting db.execute to intents requires typed intents for each
