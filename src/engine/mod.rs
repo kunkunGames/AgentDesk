@@ -1,4 +1,5 @@
 pub mod hooks;
+pub mod intent;
 pub mod loader;
 pub mod ops;
 
@@ -481,6 +482,53 @@ impl PolicyEngine {
                 }
             }
         })
+    }
+
+    /// Drain pending intents accumulated by bridge functions during hook execution.
+    /// Calls `intent::execute_intents` to apply them and returns the result.
+    /// Transitions in the result should be fed into `fire_transition_hooks`.
+    pub fn drain_pending_intents(&self) -> intent::IntentExecutionResult {
+        let inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ drain_pending_intents: engine lock poisoned: {e}");
+                return intent::IntentExecutionResult {
+                    transitions: Vec::new(),
+                    created_dispatches: Vec::new(),
+                    errors: 0,
+                };
+            }
+        };
+        let json_str: String = inner.context.with(|ctx| {
+            let code = r#"
+                var arr = agentdesk.__pendingIntents || [];
+                agentdesk.__pendingIntents = [];
+                JSON.stringify(arr);
+            "#;
+            let result: rquickjs::Result<String> = ctx.eval(code);
+            match result {
+                Ok(json) => json,
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] ⚠ drain_pending_intents: JS eval error: {e}");
+                    "[]".to_string()
+                }
+            }
+        });
+        // Must drop inner (engine lock) before executing intents,
+        // because intent execution may need DB access that could deadlock.
+        drop(inner);
+
+        let intents: Vec<intent::Intent> = serde_json::from_str(&json_str).unwrap_or_default();
+        if intents.is_empty() {
+            return intent::IntentExecutionResult {
+                transitions: Vec::new(),
+                created_dispatches: Vec::new(),
+                errors: 0,
+            };
+        }
+        intent::execute_intents(&self.db, intents)
     }
 
     /// List loaded policies (for API endpoint).

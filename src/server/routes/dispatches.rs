@@ -279,6 +279,7 @@ pub async fn update_dispatch(
         drop(conn);
 
         crate::kanban::fire_event_hooks(
+            &state.db,
             &state.engine,
             "on_dispatch_completed",
             "OnDispatchCompleted",

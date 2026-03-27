@@ -356,12 +356,38 @@ fn fire_dynamic_hooks(
     // No fallback — YAML is the sole source of truth for hook bindings.
 }
 
+/// Drain deferred side-effects produced while hooks were executing.
+///
+/// Hooks cannot re-enter the engine, so transition requests and dispatch
+/// creations are accumulated for post-hook replay.
+pub fn drain_hook_side_effects(db: &Db, engine: &PolicyEngine) {
+    loop {
+        let intent_result = engine.drain_pending_intents();
+        let mut transitions = intent_result.transitions;
+        transitions.extend(engine.drain_pending_transitions());
+
+        if transitions.is_empty() {
+            break;
+        }
+
+        for (card_id, old_status, new_status) in &transitions {
+            fire_transition_hooks(db, engine, card_id, old_status, new_status);
+        }
+    }
+}
+
 /// Fire pipeline-defined event hooks for a lifecycle event (#134).
 ///
 /// Looks up the `events` section of the effective pipeline and fires each
 /// hook name via `try_fire_hook_by_name`. Falls back to firing the default
 /// hook name if no pipeline config or no event binding is found.
-pub fn fire_event_hooks(engine: &PolicyEngine, event: &str, default_hook: &str, payload: serde_json::Value) {
+pub fn fire_event_hooks(
+    db: &Db,
+    engine: &PolicyEngine,
+    event: &str,
+    default_hook: &str,
+    payload: serde_json::Value,
+) {
     crate::pipeline::ensure_loaded();
     let hooks: Vec<String> = crate::pipeline::try_get()
         .and_then(|p| p.event_hooks(event).cloned())
@@ -369,6 +395,10 @@ pub fn fire_event_hooks(engine: &PolicyEngine, event: &str, default_hook: &str, 
     for hook_name in &hooks {
         let _ = engine.try_fire_hook_by_name(hook_name, payload.clone());
     }
+    // Event hook callers already own transition draining; only materialize
+    // deferred dispatch intents here so follow-up notification queries can see them.
+    let _ = db;
+    let _ = engine.drain_pending_intents();
 }
 
 /// Fire only the pipeline-defined on_enter/on_exit hooks for a transition.
@@ -404,6 +434,7 @@ pub fn fire_state_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &st
     if let Some(ref pipeline) = effective {
         fire_dynamic_hooks(engine, pipeline, card_id, from, to);
     }
+    drain_hook_side_effects(db, engine);
 }
 
 /// Fire only the on_enter hooks for a specific state, without requiring a transition.
@@ -444,6 +475,7 @@ pub fn fire_enter_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, state: &s
             }
         }
     }
+    drain_hook_side_effects(db, engine);
 }
 
 /// Fire hooks for a status transition that already happened in the DB.
@@ -512,6 +544,8 @@ pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from
             crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
         }
     }
+
+    drain_hook_side_effects(db, engine);
 
     // After all hooks, check if a new dispatch was created (by onCardTerminal, onReviewEnter, etc.)
     // and send Discord notification. This handles auto-queue's next dispatch creation.
@@ -901,6 +935,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -912,6 +947,13 @@ mod tests {
     fn test_engine(db: &Db) -> PolicyEngine {
         let mut config = crate::config::Config::default();
         config.policies.dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+        config.policies.hot_reload = false;
+        PolicyEngine::new(&config, db.clone()).unwrap()
+    }
+
+    fn test_engine_with_dir(db: &Db, dir: &std::path::Path) -> PolicyEngine {
+        let mut config = crate::config::Config::default();
+        config.policies.dir = dir.to_path_buf();
         config.policies.hot_reload = false;
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
@@ -1162,6 +1204,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn drain_hook_side_effects_materializes_tick_dispatch_intents() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("tick-dispatch.js"),
+            r#"
+            var policy = {
+                name: "tick-dispatch",
+                priority: 1,
+                onTick30s: function() {
+                    agentdesk.dispatch.create(
+                        "card-tick",
+                        "agent-1",
+                        "rework",
+                        "Tick Rework"
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, dir.path());
+        seed_card(&db, "card-tick", "requested");
+
+        engine
+            .try_fire_hook_by_name("onTick30s", json!({}))
+            .unwrap();
+        drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-tick' AND dispatch_type = 'rework'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "tick hook dispatch intent should be persisted");
+    }
+
     // ── Pipeline / auto-queue regression tests (#110) ──────────────
 
     /// Ensure auto_queue tables exist (created lazily by auto_queue routes, not main migration)
@@ -1285,10 +1370,8 @@ mod tests {
         }
 
         // Fire OnDispatchCompleted — should NOT create a new dispatch for stage-2
-        let _ = engine.try_fire_hook_by_name(
-            "OnDispatchCompleted",
-            json!({ "dispatch_id": dispatch_id }),
-        );
+        let _ = engine
+            .try_fire_hook_by_name("OnDispatchCompleted", json!({ "dispatch_id": dispatch_id }));
 
         // Verify: pipeline_stage_id should still be stage-1 (not advanced)
         // pipeline_stage_id is TEXT, pipeline_stages.id is INTEGER AUTOINCREMENT
