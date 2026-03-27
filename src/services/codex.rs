@@ -40,7 +40,9 @@ pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let args = base_exec_args(None, prompt, None);
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let output = Command::new(codex_bin)
+    let mut command = Command::new(codex_bin);
+    crate::services::platform::apply_runtime_path(&mut command);
+    let output = command
         .args(&args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
@@ -233,6 +235,7 @@ fn execute_streaming_direct(
     let args = base_exec_args(session_id, prompt, model);
 
     let mut command = Command::new(codex_bin);
+    crate::services::platform::apply_runtime_path(&mut command);
     command
         .args(&args)
         .current_dir(working_dir)

@@ -81,6 +81,12 @@ impl ProviderKind {
                 supports_resume: true,
                 supports_tool_stream: true,
             }),
+            Self::Gemini => Some(ProviderCapabilities {
+                binary_name: "gemini",
+                supports_structured_output: true,
+                supports_resume: true,
+                supports_tool_stream: true,
+            }),
             Self::Unsupported(_) => None,
         }
     }
@@ -89,6 +95,7 @@ impl ProviderKind {
         match self {
             Self::Claude => crate::services::claude::resolve_claude_path(),
             Self::Codex => crate::services::codex::resolve_codex_path(),
+            Self::Gemini => crate::services::gemini::resolve_gemini_path(),
             Self::Unsupported(_) => None,
         }
     }
@@ -569,7 +576,11 @@ mod tests {
 
     #[test]
     fn test_provider_capabilities_known_providers_support_agent_contract() {
-        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+        ] {
             let capabilities = provider.capabilities().expect("supported provider");
             assert!(capabilities.supports_structured_output);
             assert!(capabilities.supports_resume);

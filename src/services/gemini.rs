@@ -47,7 +47,9 @@ fn get_gemini_path() -> Option<&'static str> {
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let gemini_bin = get_gemini_path().ok_or_else(|| "Gemini CLI not found".to_string())?;
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let output = Command::new(gemini_bin)
+    let mut command = Command::new(gemini_bin);
+    crate::services::platform::apply_runtime_path(&mut command);
+    let output = command
         .args(build_exec_args(prompt, None, None))
         .current_dir(working_dir)
         .stdin(Stdio::null())
@@ -97,7 +99,9 @@ pub fn execute_command_streaming(
     let gemini_bin = get_gemini_path().ok_or_else(|| "Gemini CLI not found".to_string())?;
     let prompt = compose_gemini_prompt(prompt, system_prompt, allowed_tools);
 
-    let mut child = Command::new(gemini_bin)
+    let mut command = Command::new(gemini_bin);
+    crate::services::platform::apply_runtime_path(&mut command);
+    let mut child = command
         .args(build_exec_args(&prompt, model, session_id))
         .current_dir(working_dir)
         .stdin(Stdio::null())
