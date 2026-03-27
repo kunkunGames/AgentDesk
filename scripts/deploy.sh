@@ -145,7 +145,11 @@ else
   if [ "$SKIP_DASHBOARD" = true ]; then
     BUILD_ARGS+=("--skip-dashboard")
   fi
-  "$SCRIPT_DIR/build-release.sh" "${BUILD_ARGS[@]}"
+  if [ ${#BUILD_ARGS[@]} -gt 0 ]; then
+    "$SCRIPT_DIR/build-release.sh" "${BUILD_ARGS[@]}"
+  else
+    "$SCRIPT_DIR/build-release.sh"
+  fi
 fi
 
 # ── Step 2: Copy binary ──────────────────────────────────────────────────────
