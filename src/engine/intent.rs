@@ -356,15 +356,20 @@ fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> a
     // Block direct kanban_cards status UPDATE (same guard as ops.rs)
     let sql_upper = sql.to_uppercase();
     if sql_upper.contains("UPDATE") && sql_upper.contains("KANBAN_CARDS") {
-        // Simple check: ensure "status" appears as a column assignment, not as part of
-        // review_status or other compound names. We check that "status" is preceded by
-        // whitespace, comma, or SET keyword.
         let re_status = regex::Regex::new(r"(?i)(?:^|[\s,])status\s*=").unwrap();
         if re_status.is_match(sql) {
             return Err(anyhow::anyhow!(
                 "Direct kanban_cards status UPDATE is blocked. Use TransitionCard intent."
             ));
         }
+    }
+    // Block direct task_dispatches mutation (same guard as ops.rs)
+    if sql_upper.contains("TASK_DISPATCHES")
+        && (sql_upper.contains("INSERT") || sql_upper.contains("UPDATE"))
+    {
+        return Err(anyhow::anyhow!(
+            "Direct task_dispatches mutation is blocked. Use CreateDispatch intent."
+        ));
     }
 
     let conn = db.separate_conn()?;

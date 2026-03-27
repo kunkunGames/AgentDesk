@@ -742,7 +742,8 @@ pub(crate) async fn send_dispatch_to_discord(
             let existing: String = conn
                 .query_row(
                     "SELECT COALESCE(unified_thread_id, '{}') FROM auto_queue_runs \
-                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1)",
+                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1) \
+                     AND status IN ('active', 'paused')",
                     [card_id],
                     |row| row.get(0),
                 )
@@ -753,7 +754,8 @@ pub(crate) async fn send_dispatch_to_discord(
                 }
                 conn.execute(
                     "UPDATE auto_queue_runs SET unified_thread_id = ?1 \
-                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?2)",
+                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?2) \
+                     AND status IN ('active', 'paused')",
                     rusqlite::params![map.to_string(), card_id],
                 )
                 .ok();
@@ -897,7 +899,8 @@ pub(crate) async fn send_dispatch_to_discord(
                                 let existing: String = conn
                                     .query_row(
                                         "SELECT COALESCE(unified_thread_id, '{}') FROM auto_queue_runs \
-                                         WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1)",
+                                         WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1) \
+                                         AND status IN ('active', 'paused')",
                                         [card_id],
                                         |row| row.get(0),
                                     )
@@ -930,16 +933,22 @@ pub(crate) async fn send_dispatch_to_discord(
                                         ch.parse().ok().or_else(|| resolve_channel_alias(&ch))
                                     });
                                     if let Some(pch) = primary_num {
+                                        // Backfill channel_thread_map with the legacy primary mapping
+                                        // so get_thread_for_channel() resolves correctly for primary channel
+                                        set_thread_for_channel(&conn, card_id, pch, &legacy_tid);
                                         serde_json::json!({ pch.to_string(): legacy_tid })
                                     } else {
                                         serde_json::json!({})
                                     }
                                 });
                                 map[channel_id_num.to_string()] = serde_json::json!(thread_id);
+                                // #145: Only update active/paused runs to prevent stale-run
+                                // collision when the same card is re-queued into a new run
                                 conn.execute(
-                                    "UPDATE auto_queue_runs SET unified_thread_id = ?1 \
-                                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?2)",
-                                    rusqlite::params![map.to_string(), card_id],
+                                    "UPDATE auto_queue_runs SET unified_thread_id = ?1, unified_thread_channel_id = ?2 \
+                                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?3) \
+                                     AND status IN ('active', 'paused')",
+                                    rusqlite::params![map.to_string(), thread_id, card_id],
                                 )
                                 .ok();
                             }
@@ -1071,6 +1080,19 @@ async fn try_reuse_thread(
         tracing::info!(
             "[dispatch] Thread {thread_id} belongs to channel {parent_id}, expected {expected_parent}, skipping reuse"
         );
+        // Clear stale cross-channel thread references so retries don't keep
+        // probing the wrong thread via active_thread_id fallback
+        if let Ok(conn) = db.lock() {
+            clear_thread_for_channel(&conn, card_id, expected_parent);
+            // Also clear active_thread_id if it points to the mismatched thread,
+            // preventing get_thread_for_channel() fallback from re-selecting it
+            conn.execute(
+                "UPDATE kanban_cards SET active_thread_id = NULL \
+                 WHERE id = ?1 AND active_thread_id = ?2",
+                rusqlite::params![card_id, thread_id],
+            )
+            .ok();
+        }
         return None;
     }
 

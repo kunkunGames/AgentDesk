@@ -2632,8 +2632,8 @@ pub(super) async fn auto_restore_session(
                 if session_data.born_generation < current_gen && current_gen > 0 {
                     // Old generation session — quarantine: start fresh without
                     // reusing session_id/history from the previous generation.
-                    // However, for thread sessions we can restore the Claude session_id
-                    // from DB so --resume continues the conversation.
+                    // However, for thread sessions we can restore the provider
+                    // session_id from DB so resume can continue the conversation.
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
                         "  [{ts}] 🔒 QUARANTINE: auto-restore skipping old session_id/history for {last_path} (saved_gen={}, current_gen={current_gen})",
@@ -2668,7 +2668,6 @@ pub(super) async fn auto_restore_session(
                     }
                 }
             }
-
             // Rescan skills with project path
             let new_skills = scan_skills(&provider, Some(&last_path));
             *shared.skills_cache.write().await = new_skills;

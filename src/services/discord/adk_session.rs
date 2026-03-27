@@ -161,6 +161,34 @@ pub(super) async fn delete_adk_session(session_key: &str, api_port: u16) {
     }
 }
 
+/// Clear the stored claude_session_id from DB for a given session_key.
+/// Called when the user runs /clear so the next turn doesn't resume a dead session.
+pub(super) async fn clear_claude_session_id(session_key: &str, api_port: u16) {
+    let body = serde_json::json!({ "session_key": session_key });
+    match reqwest::Client::new()
+        .post(local_api_url(
+            api_port,
+            "/api/dispatched-sessions/clear-session-id",
+        ))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ⚠ clear_claude_session_id failed: HTTP {}",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ clear_claude_session_id error: {e}");
+        }
+        _ => {}
+    }
+}
+
 /// Save a provider session_id to DB so it survives dcserver restarts.
 /// Stored in the legacy `claude_session_id` column for compatibility.
 pub(super) async fn save_provider_session_id(session_key: &str, session_id: &str, api_port: u16) {
@@ -530,5 +558,44 @@ mod tests {
         let key = format!("{}:{}", hostname, tmux_name);
         assert!(key.contains(':'));
         assert!(key.starts_with("mac-mini:AgentDesk-claude-"));
+    }
+}
+
+/// Context window management thresholds.
+/// Single source of truth used by both Rust turn-end compact and JS onContextCheck.
+pub(super) struct ContextThresholds {
+    pub compact_pct: u64,
+    pub context_window: u64,
+}
+
+impl Default for ContextThresholds {
+    fn default() -> Self {
+        Self {
+            compact_pct: 60,
+            context_window: 1_000_000,
+        }
+    }
+}
+
+/// Fetch context thresholds from the ADK runtime config API.
+/// Falls back to defaults on any error.
+pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds {
+    let defaults = ContextThresholds::default();
+    let url = local_api_url(api_port, "/api/settings/runtime-config");
+    let resp = match reqwest::Client::new().get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return defaults,
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        _ => return defaults,
+    };
+    let current = body.get("current").unwrap_or(&body);
+    ContextThresholds {
+        compact_pct: current
+            .get("context_compact_percent")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(defaults.compact_pct),
+        context_window: defaults.context_window,
     }
 }

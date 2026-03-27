@@ -156,6 +156,10 @@ fi
 info "Installing binary..."
 mkdir -p "$BIN_DIR"
 mkdir -p "$LIBEXEC_DIR"
+if [ "$OS" = "darwin" ]; then
+  chflags nouchg "$WRAPPER_BIN" 2>/dev/null || true
+  chflags nouchg "$REAL_BIN" 2>/dev/null || true
+fi
 if [ -e "$WRAPPER_BIN" ]; then
   BACKUP_WRAPPER="$(mktemp "$BIN_DIR/agentdesk.wrapper.backup.XXXXXX")"
   cp "$WRAPPER_BIN" "$BACKUP_WRAPPER"
@@ -166,8 +170,18 @@ if [ -e "$REAL_BIN" ]; then
 fi
 cp "$PROJECT_DIR/target/release/agentdesk" "$REAL_BIN"
 chmod +x "$REAL_BIN"
-codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$REAL_BIN" 2>/dev/null || true
+if [ "$OS" = "darwin" ]; then
+  codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$REAL_BIN" 2>/dev/null || true
+  if ! codesign -v "$REAL_BIN" 2>/dev/null; then
+    restore_previous_install
+    fail "Codesign verification failed — aborting"
+  fi
+fi
 write_wrapper_script
+if [ "$OS" = "darwin" ]; then
+  chflags uchg "$WRAPPER_BIN" 2>/dev/null || true
+  chflags uchg "$REAL_BIN" 2>/dev/null || true
+fi
 ok "Binary wrapper: $WRAPPER_BIN -> $REAL_BIN"
 run_installed_binary_self_check
 rm -f "$BIN_DIR/agentdesk-real"

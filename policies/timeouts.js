@@ -544,11 +544,9 @@ var timeouts = {
     // 실제 cadence는 onTick 60초 간격이므로 ~60-90초.
     // 10분 윈도우 제거 — latest_dispatch_id 체크로 stale 방지 충분.
     var jCfg = agentdesk.pipeline.getConfig();
-    var jTerminal = agentdesk.pipeline.terminalState(jCfg);
     var jInitial = agentdesk.pipeline.kickoffState(jCfg);
     var jInProgress = agentdesk.pipeline.nextGatedTarget(jInitial, jCfg);
-    var jForce = agentdesk.pipeline.forceOnlyTargets(jInProgress, jCfg);
-    var jPending = jForce[0];
+    var jBlocked = agentdesk.pipeline.forceOnlyTargets(jInProgress, jCfg)[0];
     var failedForRetry = agentdesk.db.query(
       "SELECT td.id, td.kanban_card_id, td.to_agent_id, td.dispatch_type, td.title, " +
       "COALESCE(td.retry_count, 0) as retry_count, kc.github_issue_url, kc.github_issue_number " +
@@ -558,8 +556,8 @@ var timeouts = {
       "AND COALESCE(td.retry_count, 0) < " + MAX_DISPATCH_RETRIES + " " +
       "AND td.updated_at < datetime('now', '-30 seconds') " +
       "AND kc.latest_dispatch_id = td.id " +
-      "AND kc.status NOT IN (?, ?)",
-      [jTerminal, jPending]
+      "AND kc.status IN (?, ?)",
+      [jInitial, jInProgress]
     );
     for (var jr = 0; jr < failedForRetry.length; jr++) {
       var fd = failedForRetry[jr];
@@ -608,7 +606,7 @@ var timeouts = {
         agentdesk.log.error("[retry] Failed to create retry dispatch for card " +
           fd.kanban_card_id + ": " + e);
         // 재시도 디스패치 생성 실패 → pending state로 이관
-        agentdesk.kanban.setStatus(fd.kanban_card_id, jPending);
+        agentdesk.kanban.setStatus(fd.kanban_card_id, jBlocked);
         agentdesk.db.execute(
           "UPDATE kanban_cards SET blocked_reason = 'Auto-retry dispatch creation failed: " + e + "' WHERE id = ?",
           [fd.kanban_card_id]
@@ -984,7 +982,7 @@ var timeouts = {
       var provider = s.provider || "claude";
       if (provider !== "claude") continue;
 
-      // Skip working sessions — don't interrupt active work
+      // Skip working sessions — turn-end handler in tmux watcher handles compact
       if (s.status === "working") continue;
 
       // Check cooldown (5 min) to avoid spamming commands
@@ -997,30 +995,8 @@ var timeouts = {
         if (now - lastMs < 300000) continue; // 5 min cooldown
       }
 
-      // Probe actual context usage via /context command + tmux capture
-      var pct = (s.tokens / CONTEXT_WINDOW) * 100; // fallback: stored tokens
-      var tmuxName = (s.session_key || "").split(":").pop();
-      if (tmuxName) {
-        try {
-          // Send /context and capture output
-          agentdesk.exec("tmux", JSON.stringify(["send-keys", "-t", tmuxName, "/context", "Enter"]));
-          agentdesk.exec("sleep", JSON.stringify(["3"]));
-          var captured = agentdesk.exec("tmux", JSON.stringify(["capture-pane", "-t", tmuxName, "-p", "-S", "-10"]));
-          // Parse: **Tokens:** 80.6k / 1000k (8%)
-          var match = captured && captured.match(/\*\*Tokens:\*\*\s*[\d.]+k?\s*\/\s*[\d.]+k?\s*\((\d+)%\)/);
-          if (match) {
-            pct = parseInt(match[1], 10);
-            var actualTokens = Math.round(pct / 100 * CONTEXT_WINDOW);
-            agentdesk.db.execute(
-              "UPDATE sessions SET tokens = ? WHERE session_key = ?",
-              [actualTokens, s.session_key]
-            );
-          }
-        } catch (e) {
-          // Fallback: use stored tokens
-          agentdesk.log.warn("[context] /context probe failed for " + s.session_key + ": " + e);
-        }
-      }
+      // Use DB tokens directly — updated from result events by tmux watcher/turn_bridge
+      var pct = (s.tokens / CONTEXT_WINDOW) * 100;
 
       // Compact: >= compactPercent
       if (pct >= compactPercent) {

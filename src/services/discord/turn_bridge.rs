@@ -51,11 +51,20 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
             {
                 #[cfg(unix)]
                 {
-                    record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
-                    let exact_target = tmux_exact_target(&name);
-                    let _ = std::process::Command::new("tmux")
-                        .args(["kill-session", "-t", &exact_target])
-                        .output();
+                    // #145: skip kill for unified-thread sessions with active runs
+                    let is_unified = crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
+                        .map(|(_, ch)| crate::dispatch::is_unified_thread_channel_name_active(&ch))
+                        .unwrap_or(false);
+                    if !is_unified {
+                        record_tmux_exit_reason(
+                            &name,
+                            &format!("explicit cleanup via {reason}"),
+                        );
+                        let exact_target = tmux_exact_target(&name);
+                        let _ = std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", &exact_target])
+                            .output();
+                    }
                 }
                 #[cfg(not(unix))]
                 {
@@ -131,6 +140,15 @@ fn should_resume_watcher_after_turn(
     can_chain_locally: bool,
 ) -> bool {
     !defer_watcher_resume && !(has_local_queued_turns && can_chain_locally)
+}
+
+fn total_context_tokens(input_tokens: u64, output_tokens: u64) -> u64 {
+    input_tokens.saturating_add(output_tokens)
+}
+
+fn persisted_context_tokens(input_tokens: u64, output_tokens: u64) -> Option<u64> {
+    let total = total_context_tokens(input_tokens, output_tokens);
+    (total > 0).then_some(total)
 }
 
 #[derive(Debug)]
@@ -979,11 +997,7 @@ pub(super) fn spawn_turn_bridge(
             "idle",
             &provider,
             adk_session_info.as_deref(),
-            {
-                // Use input_tokens only — better proxy for context window occupancy.
-                // output_tokens don't contribute to context window size.
-                (accumulated_input_tokens > 0).then_some(accumulated_input_tokens)
-            },
+            persisted_context_tokens(accumulated_input_tokens, accumulated_output_tokens),
             adk_cwd.as_deref(),
             dispatch_id.as_deref(),
             shared_owned.api_port,
@@ -994,11 +1008,12 @@ pub(super) fn spawn_turn_bridge(
         // Only for non-dispatch (main channel) sessions with a live tmux session.
         #[cfg(unix)]
         if dispatch_id.is_none() && !is_prompt_too_long {
-            let total_tokens = accumulated_input_tokens + accumulated_output_tokens;
-            const CONTEXT_WINDOW: u64 = 1_000_000;
-            const COMPACT_THRESHOLD_PCT: u64 = 60;
-            let pct = (total_tokens * 100) / CONTEXT_WINDOW.max(1);
-            if pct >= COMPACT_THRESHOLD_PCT {
+            let total_tokens =
+                total_context_tokens(accumulated_input_tokens, accumulated_output_tokens);
+            let ctx_cfg =
+                super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
+            let pct = (total_tokens * 100) / ctx_cfg.context_window.max(1);
+            if pct >= ctx_cfg.compact_pct {
                 if let Some(ref tmux_name) = inflight_state.tmux_session_name {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
@@ -1381,8 +1396,23 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if let Some(warning) = review_dispatch_warning.as_deref() {
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id.say(&http, warning).await;
+                // Send via announce bot so the agent sees this as an external
+                // message and re-triggers a turn to handle the pending review.
+                // Using the provider bot (claude/codex) would be ignored as
+                // the agent treats its own bot's messages as self-messages.
+                let _ = reqwest::Client::new()
+                    .post(crate::config::local_api_url(
+                        shared_owned.api_port,
+                        "/api/send",
+                    ))
+                    .json(&serde_json::json!({
+                        "target": format!("channel:{}", channel_id),
+                        "content": warning,
+                        "source": "pipeline",
+                        "bot": "announce",
+                    }))
+                    .send()
+                    .await;
             }
 
             // Record turn metrics
@@ -1711,7 +1741,8 @@ pub(super) fn spawn_turn_bridge(
 mod tests {
     use super::{
         build_verdict_payload, extract_explicit_review_verdict, extract_review_decision,
-        resolve_done_response, should_resume_watcher_after_turn,
+        persisted_context_tokens, resolve_done_response, should_resume_watcher_after_turn,
+        total_context_tokens,
     };
 
     #[test]
@@ -1727,6 +1758,17 @@ mod tests {
     #[test]
     fn final_turn_without_remaining_queue_resumes_watcher() {
         assert!(should_resume_watcher_after_turn(false, false, true));
+    }
+
+    #[test]
+    fn persisted_context_tokens_counts_input_and_output() {
+        assert_eq!(persisted_context_tokens(610_000, 90_000), Some(700_000));
+        assert_eq!(persisted_context_tokens(0, 0), None);
+    }
+
+    #[test]
+    fn total_context_tokens_saturates_on_overflow() {
+        assert_eq!(total_context_tokens(u64::MAX, 1), u64::MAX);
     }
 
     #[test]
