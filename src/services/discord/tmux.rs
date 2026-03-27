@@ -1012,11 +1012,17 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 .await;
             }
             // Kill old-gen session so it doesn't block new session creation.
+            // Use spawn_blocking to avoid blocking the async runtime (matches
+            // startup cleanup and reaper patterns).
             let exact = tmux_exact_target(session_name);
-            record_tmux_exit_reason(session_name, "quarantine: old generation");
-            let _ = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &exact])
-                .output();
+            let sess = session_name.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                record_tmux_exit_reason(&sess, "quarantine: old generation");
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &exact])
+                    .output();
+            })
+            .await;
             continue;
         }
 
