@@ -94,7 +94,8 @@ pub fn create_dispatch_core(
 
     // Guard: prevent ALL dispatches for terminal cards (pipeline-driven).
     crate::pipeline::ensure_loaded();
-    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let effective =
+        crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
     let is_terminal = effective.is_terminal(&old_status);
     if is_terminal {
         return Err(anyhow::anyhow!(
@@ -171,12 +172,10 @@ pub fn create_dispatch_core(
     } else {
         // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
         // kickoff_for() prefers gated transition FROM old_status; falls back to any dispatchable.
-        let kickoff_state = effective
-            .kickoff_for(&old_status)
-            .unwrap_or_else(|| {
-                tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
-                effective.initial_state().to_string()
-            });
+        let kickoff_state = effective.kickoff_for(&old_status).unwrap_or_else(|| {
+            tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
+            effective.initial_state().to_string()
+        });
         // Build clock SQL from pipeline config
         let clock_sql = effective
             .clock_for_state(&kickoff_state)
@@ -273,7 +272,8 @@ pub fn create_dispatch_core_with_id(
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
     crate::pipeline::ensure_loaded();
-    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let effective =
+        crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
     let is_terminal = effective.is_terminal(&old_status);
     if is_terminal {
         return Err(anyhow::anyhow!(
@@ -326,12 +326,10 @@ pub fn create_dispatch_core_with_id(
         )?;
     } else {
         // Pipeline-driven: resolve the dispatch kickoff state from card's current state.
-        let kickoff_state = effective
-            .kickoff_for(&old_status)
-            .unwrap_or_else(|| {
-                tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
-                effective.initial_state().to_string()
-            });
+        let kickoff_state = effective.kickoff_for(&old_status).unwrap_or_else(|| {
+            tracing::error!("Pipeline has no kickoff state — check pipeline configuration");
+            effective.initial_state().to_string()
+        });
         let clock_sql = effective
             .clock_for_state(&kickoff_state)
             .map(|c| format!(", {} = datetime('now')", c.set))
@@ -388,14 +386,13 @@ pub fn create_dispatch(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or((None, None));
-    let effective = crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
+    let effective =
+        crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
     drop(conn);
-    let kickoff_owned = effective
-        .kickoff_for(&old_status)
-        .unwrap_or_else(|| {
-            tracing::error!("Pipeline has no kickoff state for hook firing");
-            effective.initial_state().to_string()
-        });
+    let kickoff_owned = effective.kickoff_for(&old_status).unwrap_or_else(|| {
+        tracing::error!("Pipeline has no kickoff state for hook firing");
+        effective.initial_state().to_string()
+    });
     crate::kanban::fire_state_hooks(db, engine, kanban_card_id, &old_status, &kickoff_owned);
 
     Ok(dispatch)
@@ -725,6 +722,40 @@ pub fn is_unified_thread_channel_name_active(channel_name: &str) -> bool {
         return false;
     }
     is_unified_thread_channel_active(thread_channel_id)
+}
+
+/// Drain `kill_unified_thread:*` kv_meta entries and return the channel names to kill.
+/// Each entry is consumed (deleted from DB) on read.
+pub fn drain_unified_thread_kill_signals() -> Vec<String> {
+    let root = match crate::cli::agentdesk_runtime_root() {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT key, value FROM kv_meta WHERE key LIKE 'kill_unified_thread:%'",
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let entries: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    let mut channels = Vec::new();
+    for (key, _run_id) in &entries {
+        if let Some(ch) = key.strip_prefix("kill_unified_thread:") {
+            channels.push(ch.to_string());
+        }
+        conn.execute("DELETE FROM kv_meta WHERE key = ?1", [key]).ok();
+    }
+    channels
 }
 
 /// Determine provider from a Discord channel name suffix.

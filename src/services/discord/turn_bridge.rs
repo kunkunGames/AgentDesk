@@ -51,11 +51,20 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
             {
                 #[cfg(unix)]
                 {
-                    record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
-                    let exact_target = tmux_exact_target(&name);
-                    let _ = std::process::Command::new("tmux")
-                        .args(["kill-session", "-t", &exact_target])
-                        .output();
+                    // #145: skip kill for unified-thread sessions with active runs
+                    let is_unified = crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
+                        .map(|(_, ch)| crate::dispatch::is_unified_thread_channel_name_active(&ch))
+                        .unwrap_or(false);
+                    if !is_unified {
+                        record_tmux_exit_reason(
+                            &name,
+                            &format!("explicit cleanup via {reason}"),
+                        );
+                        let exact_target = tmux_exact_target(&name);
+                        let _ = std::process::Command::new("tmux")
+                            .args(["kill-session", "-t", &exact_target])
+                            .output();
+                    }
                 }
                 #[cfg(not(unix))]
                 {

@@ -1399,4 +1399,36 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}] 🪦 Reaped {reaped} dead tmux session(s)");
     }
+
+    // #145: Process kill_unified_thread signals from auto-queue.js
+    // When a unified-thread run completes, the JS policy writes a kv_meta flag
+    // for us to pick up and kill the shared tmux session.
+    process_unified_thread_kill_signals(shared).await;
+}
+
+/// Kill tmux sessions flagged for cleanup by auto-queue.js after unified run completion.
+async fn process_unified_thread_kill_signals(shared: &Arc<SharedData>) {
+    let channels = tokio::task::spawn_blocking(crate::dispatch::drain_unified_thread_kill_signals)
+        .await
+        .unwrap_or_default();
+
+    for channel_name in channels {
+        let provider = shared.settings.read().await.provider.clone();
+        let tmux_name = provider.build_tmux_session_name(&channel_name);
+        let exact_target = tmux_exact_target(&tmux_name);
+        let sess = tmux_name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if tmux_session_exists(&sess) {
+                record_tmux_exit_reason(&sess, "unified-thread run completed");
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &exact_target])
+                    .output();
+            }
+        })
+        .await;
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ♻ Killed unified-thread tmux session: {tmux_name} (channel: {channel_name})"
+        );
+    }
 }
