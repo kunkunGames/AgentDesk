@@ -19,7 +19,9 @@ pub(super) async fn handle_event(
     match event {
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(component) = interaction.as_message_component() {
-                if component.data.custom_id == super::commands::MODEL_PICKER_CUSTOM_ID {
+                if component.data.custom_id == super::commands::MODEL_PICKER_CUSTOM_ID
+                    || component.data.custom_id == super::commands::MODEL_RESET_CUSTOM_ID
+                {
                     return handle_model_picker_interaction(ctx, component, data).await;
                 }
             }
@@ -698,49 +700,55 @@ async fn handle_model_picker_interaction(
         return Ok(());
     }
 
-    let selected = match &component.data.kind {
-        serenity::ComponentInteractionDataKind::StringSelect { values } => values.first().cloned(),
-        _ => None,
-    };
-
-    let Some(selected) = selected else {
-        component
-            .create_response(
-                ctx,
-                serenity::CreateInteractionResponse::Message(
-                    serenity::CreateInteractionResponseMessage::new()
-                        .content("Unsupported model picker interaction.")
-                        .ephemeral(true),
-                ),
-            )
-            .await?;
-        return Ok(());
-    };
-
-    if selected == "__default__" || super::commands::is_clear_model_keyword(&selected) {
+    if component.data.custom_id == super::commands::MODEL_RESET_CUSTOM_ID {
         data.shared.model_overrides.remove(&channel_id);
     } else {
-        let validated = match super::commands::validate_model_input(&data.provider, &selected) {
-            Ok(model) => model,
-            Err(message) => {
-                component
-                    .create_response(
-                        ctx,
-                        serenity::CreateInteractionResponse::Message(
-                            serenity::CreateInteractionResponseMessage::new()
-                                .content(message)
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await?;
-                return Ok(());
+        let selected = match &component.data.kind {
+            serenity::ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().cloned()
             }
+            _ => None,
         };
-        data.shared.model_overrides.insert(channel_id, validated);
+
+        let Some(selected) = selected else {
+            component
+                .create_response(
+                    ctx,
+                    serenity::CreateInteractionResponse::Message(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .content("Unsupported model picker interaction.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
+        };
+
+        if selected == "__default__" || super::commands::is_clear_model_keyword(&selected) {
+            data.shared.model_overrides.remove(&channel_id);
+        } else {
+            let validated = match super::commands::validate_model_input(&data.provider, &selected) {
+                Ok(model) => model,
+                Err(message) => {
+                    component
+                        .create_response(
+                            ctx,
+                            serenity::CreateInteractionResponse::Message(
+                                serenity::CreateInteractionResponseMessage::new()
+                                    .content(message)
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
+            data.shared.model_overrides.insert(channel_id, validated);
+        }
     }
 
-    let content =
-        super::commands::build_model_picker_message(&data.shared, channel_id, &data.provider).await;
+    let embed =
+        super::commands::build_model_picker_embed(&data.shared, channel_id, &data.provider).await;
     let components =
         super::commands::build_model_picker_components(&data.shared, channel_id, &data.provider)
             .await;
@@ -749,7 +757,7 @@ async fn handle_model_picker_interaction(
             ctx,
             serenity::CreateInteractionResponse::UpdateMessage(
                 serenity::CreateInteractionResponseMessage::new()
-                    .content(content)
+                    .embed(embed)
                     .components(components),
             ),
         )
@@ -2445,7 +2453,7 @@ Any other message is sent to {p}.
 
             match *arg1 {
                 "list" => {
-                    let content = super::commands::build_model_picker_message(
+                    let embed = super::commands::build_model_picker_embed(
                         &data.shared,
                         channel_id,
                         &data.provider,
@@ -2460,7 +2468,7 @@ Any other message is sent to {p}.
                     let _ = channel_id
                         .send_message(
                             &ctx.http,
-                            CreateMessage::new().content(content).components(components),
+                            CreateMessage::new().embed(embed).components(components),
                         )
                         .await;
                 }
@@ -2517,14 +2525,24 @@ Any other message is sent to {p}.
                         .await;
                 }
                 "get" | "" => {
-                    let status = super::commands::build_model_status_message(
+                    let embed = super::commands::build_model_picker_embed(
+                        &data.shared,
+                        channel_id,
+                        &data.provider,
+                    )
+                    .await;
+                    let components = super::commands::build_model_picker_components(
                         &data.shared,
                         channel_id,
                         &data.provider,
                     )
                     .await;
                     let _ = msg
-                        .reply(&ctx.http, status)
+                        .channel_id
+                        .send_message(
+                            &ctx.http,
+                            CreateMessage::new().embed(embed).components(components),
+                        )
                         .await;
                 }
                 _ => {
