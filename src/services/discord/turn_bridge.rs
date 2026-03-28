@@ -305,15 +305,19 @@ fn extract_review_decision(full_response: &str) -> Option<&'static str> {
 async fn submit_review_decision_fallback(
     api_port: u16,
     card_id: &str,
+    dispatch_id: &str,
     decision: &str,
     full_response: &str,
 ) -> Result<(), String> {
     let comment = truncate_str(full_response.trim(), 4000).to_string();
     let url = local_api_url(api_port, "/api/review-decision");
+    // #109: Include dispatch_id so the server can atomically consume the
+    // specific review-decision dispatch, preventing replay attacks.
     let resp = reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({
             "card_id": card_id,
+            "dispatch_id": dispatch_id,
             "decision": decision,
             "comment": comment,
         }))
@@ -431,6 +435,7 @@ async fn guard_review_dispatch_completion(
                     match submit_review_decision_fallback(
                         api_port,
                         card_id,
+                        dispatch_id,
                         decision,
                         full_response,
                     )
