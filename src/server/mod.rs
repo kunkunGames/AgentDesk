@@ -71,6 +71,14 @@ pub async fn run(
         });
     }
 
+    // #144: Spawn dispatch notification outbox worker — centralizes Discord side-effects
+    {
+        let dispatch_outbox_db = db.clone();
+        tokio::spawn(async move {
+            routes::dispatches::dispatch_outbox_loop(dispatch_outbox_db).await;
+        });
+    }
+
     // Resolve dashboard dist path relative to runtime root or binary location
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
         .map(|r| r.join("dashboard/dist"))

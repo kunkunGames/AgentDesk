@@ -487,26 +487,16 @@ fn notify_new_dispatches_after_hooks(db: &Db, card_id: &str, pre_dispatch_id: Op
         return;
     }
 
-    // Delegate to send_dispatch_to_discord which handles:
-    // - Thread creation/reuse
-    // - dispatch_notified guard (dedup)
-    // - Proper channel routing (primary vs alt for review)
+    // #144: Queue via dispatch outbox instead of tokio::spawn.
     // Each dispatch uses its own kanban_card_id for correct thread/issue routing.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let db_clone = db.clone();
-        for (dispatch_id, agent_id, dispatch_card_id, title) in pending_dispatches {
-            let db_c = db_clone.clone();
-            handle.spawn(async move {
-                crate::server::routes::dispatches::send_dispatch_to_discord(
-                    &db_c,
-                    &agent_id,
-                    &title,
-                    &dispatch_card_id,
-                    &dispatch_id,
-                )
-                .await;
-            });
-        }
+    for (dispatch_id, agent_id, dispatch_card_id, title) in pending_dispatches {
+        crate::server::routes::dispatches::queue_dispatch_notify(
+            db,
+            &dispatch_id,
+            &agent_id,
+            &dispatch_card_id,
+            &title,
+        );
     }
 }
 

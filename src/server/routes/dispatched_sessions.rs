@@ -357,13 +357,13 @@ pub async fn hook_session(
             drop(conn);
 
             if let Some(ref did) = idle_auto_complete_dispatch {
-                let auto_result = json!({
-                    "auto_completed": true,
-                    "completion_source": "session_idle",
-                });
-                if let Err(e) =
-                    crate::dispatch::complete_dispatch(&state.db, &state.engine, did, &auto_result)
-                {
+                if let Err(e) = crate::dispatch::finalize_dispatch(
+                    &state.db,
+                    &state.engine,
+                    did,
+                    "session_idle",
+                    Some(&json!({ "auto_completed": true })),
+                ) {
                     tracing::warn!(
                         "[session] Failed to auto-complete dispatch {} on idle: {}",
                         did,
@@ -376,14 +376,7 @@ pub async fn hook_session(
                     );
                     // Send any follow-up dispatch (e.g. review dispatch) that was
                     // created by hooks during complete_dispatch to Discord.
-                    let db_clone = state.db.clone();
-                    let did_owned = did.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::handle_completed_dispatch_followups(
-                            &db_clone, &did_owned,
-                        )
-                        .await;
-                    });
+                    super::dispatches::queue_dispatch_followup(&state.db, did);
                 }
             }
 
@@ -918,16 +911,9 @@ pub async fn force_kill_session(
                 retry_dispatch_id = Some(new_id.clone());
 
                 // Send to Discord (hooks already fired by create_dispatch)
-                let db2 = state.db.clone();
-                let agent_s = agent.to_string();
-                let title_s = dtitle.to_string();
-                let card_s = card_id.clone();
-                tokio::spawn(async move {
-                    crate::server::routes::dispatches::send_dispatch_to_discord(
-                        &db2, &agent_s, &title_s, &card_s, &new_id,
-                    )
-                    .await;
-                });
+                crate::server::routes::dispatches::queue_dispatch_notify(
+                    &state.db, &new_id, agent, dtitle, &card_id,
+                );
             }
             Err(e) => {
                 tracing::warn!(
