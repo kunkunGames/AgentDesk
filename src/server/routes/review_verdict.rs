@@ -697,12 +697,22 @@ pub async fn submit_review_decision(
                 })
                 .unwrap_or_else(|| "review".to_string());
 
-            let _ = crate::kanban::transition_status(
+            // #155: Fail closed if transition is blocked (e.g., terminal card)
+            if let Err(e) = crate::kanban::transition_status(
                 &state.db,
                 &state.engine,
                 &body.card_id,
                 &review_target,
-            );
+            ) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!("transition failed: {e}"),
+                        "card_id": body.card_id,
+                        "decision": "accept",
+                    })),
+                );
+            }
 
             // #117: Update canonical review state
             update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
