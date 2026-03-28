@@ -2,6 +2,7 @@ pub mod hooks;
 pub mod intent;
 pub mod loader;
 pub mod ops;
+pub mod transition;
 
 use std::sync::{Arc, Mutex};
 

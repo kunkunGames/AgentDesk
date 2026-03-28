@@ -41,6 +41,12 @@ pub fn transition_status(
 }
 
 /// Full transition with source tracking and force override.
+///
+/// #155: Uses the TransitionDecision + Executor pattern.
+/// 1. Assemble TransitionContext from DB
+/// 2. Call decide_status_transition (pure function — no I/O)
+/// 3. Execute decision intents via Executor
+/// 4. Fire post-transition hooks (GitHub sync, policy hooks)
 pub fn transition_status_with_opts(
     db: &Db,
     engine: &PolicyEngine,
@@ -49,14 +55,25 @@ pub fn transition_status_with_opts(
     source: &str,
     force: bool,
 ) -> Result<TransitionResult> {
+    use crate::engine::transition::{
+        self, CardState, GateSnapshot, TransitionContext, TransitionOutcome,
+    };
+
+    // ── 1. Assemble TransitionContext (DB reads) ──
     let conn = db.lock().map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
 
-    // Get current status + repo/agent for pipeline resolution (#135)
-    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
+    let (old_status, review_status, latest_dispatch_id, card_repo_id, card_agent_id): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+            "SELECT status, review_status, latest_dispatch_id, repo_id, assigned_agent_id \
+             FROM kanban_cards WHERE id = ?1",
             [card_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|_| anyhow::anyhow!("card not found: {card_id}"))?;
 
@@ -68,244 +85,83 @@ pub fn transition_status_with_opts(
         });
     }
 
-    // ── Pipeline-driven validation (#106 P5: YAML is the sole source of truth) ──
-    // Ensure pipeline is loaded (idempotent, safe to call repeatedly)
     crate::pipeline::ensure_loaded();
-    // Resolve effective pipeline: default → repo override → agent override.
     let effective =
         crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
-    let pipeline = &effective;
 
-    // Terminal guard: terminal states cannot revert (unless force=true)
-    let is_terminal = pipeline.is_terminal(&old_status);
-
-    if is_terminal && old_status != new_status && !force {
-        log_audit(
-            &conn,
-            card_id,
-            &old_status,
-            new_status,
-            source,
-            "BLOCKED: cannot revert terminal card",
-        );
-        tracing::warn!(
-            "[kanban] Blocked transition {} → {} for card {} (cannot revert terminal card, source: {})",
-            old_status,
-            new_status,
-            card_id,
-            source
-        );
-        notify_pmd_violation(
-            &conn,
-            card_id,
-            &old_status,
-            new_status,
-            source,
-            "cannot revert terminal card",
-        );
-        return Err(anyhow::anyhow!(
-            "cannot revert terminal card: {} → {} is not allowed",
-            old_status,
-            new_status
-        ));
-    }
-
-    // ── Transition rule lookup (YAML-driven, no hardcoded fallback) ──
-    {
-        let rule = pipeline.find_transition(&old_status, new_status);
-
-        match rule {
-            Some(t) => {
-                use crate::pipeline::TransitionType;
-                match t.transition_type {
-                    TransitionType::Free => { /* no checks needed */ }
-                    TransitionType::Gated if force => { /* force bypasses gates */ }
-                    TransitionType::Gated => {
-                        // Evaluate builtin gates from YAML
-                        for gate_name in &t.gates {
-                            if let Some(gate) = pipeline.gates.get(gate_name.as_str()) {
-                                if gate.gate_type == "builtin" {
-                                    match gate.check.as_deref() {
-                                        Some("has_active_dispatch") => {
-                                            let has: bool = conn
-                                                .query_row(
-                                                    "SELECT COUNT(*) > 0 FROM task_dispatches \
-                                                     WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
-                                                    [card_id],
-                                                    |row| row.get(0),
-                                                )
-                                                .unwrap_or(false);
-                                            if !has {
-                                                log_audit(
-                                                    &conn,
-                                                    card_id,
-                                                    &old_status,
-                                                    new_status,
-                                                    source,
-                                                    "BLOCKED: no active dispatch",
-                                                );
-                                                tracing::warn!(
-                                                    "[kanban] Blocked transition {} → {} for card {} (gate: {}, source: {})",
-                                                    old_status,
-                                                    new_status,
-                                                    card_id,
-                                                    gate_name,
-                                                    source
-                                                );
-                                                notify_pmd_violation(
-                                                    &conn,
-                                                    card_id,
-                                                    &old_status,
-                                                    new_status,
-                                                    source,
-                                                    "no active dispatch",
-                                                );
-                                                return Err(anyhow::anyhow!(
-                                                    "Status transition {} → {} requires an active dispatch (gate: {})",
-                                                    old_status,
-                                                    new_status,
-                                                    gate_name
-                                                ));
-                                            }
-                                        }
-                                        // review_verdict_pass and review_verdict_rework are checked
-                                        // by the calling code (review_verdict.rs), not here.
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    TransitionType::ForceOnly if force => { /* allowed */ }
-                    TransitionType::ForceOnly => {
-                        log_audit(
-                            &conn,
-                            card_id,
-                            &old_status,
-                            new_status,
-                            source,
-                            "BLOCKED: force required",
-                        );
-                        tracing::warn!(
-                            "[kanban] Blocked transition {} → {} for card {} (force_only, source: {})",
-                            old_status,
-                            new_status,
-                            card_id,
-                            source
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Transition {} → {} requires force=true (PMD/policy only)",
-                            old_status,
-                            new_status
-                        ));
-                    }
-                }
-            }
-            None if force => {
-                // Force allows any non-terminal transition even without explicit rule
-            }
-            None => {
-                log_audit(
-                    &conn,
-                    card_id,
-                    &old_status,
-                    new_status,
-                    source,
-                    "BLOCKED: no transition rule",
-                );
-                tracing::warn!(
-                    "[kanban] No pipeline rule for {} → {} (card: {}, source: {})",
-                    old_status,
-                    new_status,
-                    card_id,
-                    source
-                );
-                return Err(anyhow::anyhow!(
-                    "No transition rule from {} to {} in pipeline definition",
-                    old_status,
-                    new_status
-                ));
-            }
-        }
-    }
-
-    // Build UPDATE with appropriate extra fields — driven by pipeline clocks (YAML-only)
-    let clock_extra = match pipeline.clock_for_state(new_status) {
-        Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
-            // Only set if NULL (preserves original on re-entry)
-            format!(", {} = COALESCE({}, datetime('now'))", clock.set, clock.set)
-        }
-        Some(clock) => {
-            format!(", {} = datetime('now')", clock.set)
-        }
-        None => String::new(),
-    };
-    // Terminal cleanup: clear review-related fields when entering a terminal state
-    let terminal_cleanup = if pipeline.is_terminal(new_status) {
-        ", review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL"
-    } else {
-        ""
-    };
-    let extra = format!("{clock_extra}{terminal_cleanup}");
-    let sql = format!(
-        "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){extra} WHERE id = ?2"
-    );
-    conn.execute(&sql, rusqlite::params![new_status, card_id])?;
-
-    // #117: Sync canonical review state on status transitions (pipeline-driven).
-    // Idle: terminal states or states with no hooks (pre-work states like backlog/ready).
-    // Reviewing: states with OnReviewEnter hook.
-    // Otherwise: clear last_verdict on work state re-entry.
-    let has_hooks = pipeline
-        .hooks_for_state(new_status)
-        .map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
-    let is_review_enter = pipeline
-        .hooks_for_state(new_status)
-        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
-    if pipeline.is_terminal(new_status) || !has_hooks {
-        conn.execute(
-            "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
-             ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
+    // Pre-evaluate gate checks (DB queries done before calling pure function)
+    let has_active_dispatch: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM task_dispatches \
+             WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
             [card_id],
-        ).ok();
-    } else if is_review_enter {
-        conn.execute(
-            "INSERT INTO card_review_state (card_id, state, review_entered_at, updated_at) VALUES (?1, 'reviewing', datetime('now'), datetime('now')) \
-             ON CONFLICT(card_id) DO UPDATE SET state = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now')",
-            [card_id],
-        ).ok();
-    } else {
-        // #119: Clear last_verdict on re-entry to work states (any non-idle, non-review state)
-        conn.execute(
-            "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
-            [card_id],
-        ).ok();
-    }
-
-    // ── D: Audit log ──
-    log_audit(&conn, card_id, &old_status, new_status, source, "OK");
-
-    // Sync auto_queue_entries on terminal status
-    if pipeline.is_terminal(new_status) {
-        conn.execute(
-            "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
-             WHERE kanban_card_id = ?1 AND status = 'dispatched'",
-            [card_id],
+            |row| row.get(0),
         )
-        .ok();
+        .unwrap_or(false);
+
+    let ctx = TransitionContext {
+        card: CardState {
+            id: card_id.to_string(),
+            status: old_status.clone(),
+            review_status,
+            latest_dispatch_id,
+        },
+        pipeline: effective.clone(),
+        gates: GateSnapshot {
+            has_active_dispatch,
+        },
+    };
+
+    // ── 2. Pure decision (no I/O) ──
+    let decision = transition::decide_status_transition(&ctx, new_status, source, force);
+
+    // ── 3. Handle blocked decisions ──
+    if let TransitionOutcome::Blocked(ref reason) = decision.outcome {
+        // Execute audit log intents for blocked decisions
+        for intent in &decision.intents {
+            if let transition::TransitionIntent::AuditLog {
+                card_id: aid,
+                from,
+                to,
+                source: src,
+                message,
+            } = intent
+            {
+                log_audit(&conn, aid, from, to, src, message);
+            }
+        }
+        tracing::warn!(
+            "[kanban] Blocked transition {} → {} for card {} (source: {}): {}",
+            old_status,
+            new_status,
+            card_id,
+            source,
+            reason
+        );
+        notify_pmd_violation(&conn, card_id, &old_status, new_status, source, reason);
+        return Err(anyhow::anyhow!("{}", reason));
+    }
+
+    if decision.outcome == TransitionOutcome::NoOp {
+        return Ok(TransitionResult {
+            changed: false,
+            from: old_status,
+            to: new_status.to_string(),
+        });
+    }
+
+    // ── 4. Execute intents (DB writes, still holding lock) ──
+    for intent in &decision.intents {
+        transition::execute_intent_on_conn(&conn, intent)?;
     }
 
     drop(conn);
 
-    // GitHub auto-sync — pipeline-driven (terminal → close, OnReviewEnter → comment)
-    github_sync_on_transition(db, pipeline, card_id, new_status);
+    // ── 5. Post-transition side-effects (hooks, GitHub sync) ──
+    github_sync_on_transition(db, &effective, card_id, new_status);
+    fire_dynamic_hooks(engine, &effective, card_id, &old_status, new_status);
 
-    // Fire hooks — driven by pipeline hooks section (#134/#135)
-    // The effective pipeline's hooks_for_state() determines which hooks fire on entry.
-    fire_dynamic_hooks(engine, pipeline, card_id, &old_status, new_status);
-
-    // #119: Record true_negative for cards that passed review and reached terminal state
-    if pipeline.is_terminal(new_status) && record_true_negative_if_pass(db, card_id) {
+    if effective.is_terminal(new_status) && record_true_negative_if_pass(db, card_id) {
         crate::server::routes::review_verdict::spawn_aggregate_if_needed(db);
     }
 
