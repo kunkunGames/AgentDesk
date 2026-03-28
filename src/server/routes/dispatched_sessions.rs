@@ -219,7 +219,7 @@ pub async fn list_dispatched_sessions(
                     return None;
                 }
                 Some(json!({
-                    "id": row.id,
+                    "id": row.id.to_string(),
                     "session_key": row.session_key,
                     "agent_id": row.agent_id,
                     "provider": row.provider,
@@ -473,15 +473,20 @@ pub async fn hook_session(
                     "SELECT s.id, s.session_key, s.agent_id, s.provider, s.status, \
                      s.active_dispatch_id, s.model, s.tokens, s.cwd, s.last_heartbeat, \
                      s.session_info, a.department, a.sprite_number, a.avatar_emoji, \
-                     COALESCE(a.xp, 0), s.thread_channel_id \
-                     FROM sessions s LEFT JOIN agents a ON s.agent_id = a.id \
+                     COALESCE(a.xp, 0), s.thread_channel_id, \
+                     d.name, d.name_ko, d.color \
+                     FROM sessions s \
+                     LEFT JOIN agents a ON s.agent_id = a.id \
+                     LEFT JOIN departments d ON a.department = d.id \
                      WHERE s.session_key = ?1",
                     [&body.session_key],
                     |row| {
                         let sid: i64 = row.get(0)?;
+                        let skey: Option<String> = row.get(1)?;
                         Ok((sid, json!({
                             "id": sid.to_string(),
-                            "session_key": row.get::<_, Option<String>>(1)?,
+                            "session_key": skey,
+                            "name": skey,
                             "linked_agent_id": row.get::<_, Option<String>>(2)?,
                             "provider": row.get::<_, Option<String>>(3)?,
                             "status": row.get::<_, Option<String>>(4)?,
@@ -493,9 +498,13 @@ pub async fn hook_session(
                             "session_info": row.get::<_, Option<String>>(10)?,
                             "department_id": row.get::<_, Option<String>>(11)?,
                             "sprite_number": row.get::<_, Option<i64>>(12)?,
-                            "avatar_emoji": row.get::<_, Option<String>>(13).ok().flatten().unwrap_or_default(),
+                            "avatar_emoji": row.get::<_, Option<String>>(13).ok().flatten().unwrap_or_else(|| "\u{1F916}".to_string()),
                             "stats_xp": row.get::<_, i64>(14).unwrap_or(0),
                             "thread_channel_id": row.get::<_, Option<String>>(15).ok().flatten(),
+                            "department_name": row.get::<_, Option<String>>(16)?,
+                            "department_name_ko": row.get::<_, Option<String>>(17)?,
+                            "department_color": row.get::<_, Option<String>>(18)?,
+                            "connected_at": null,
                         }), false))
                     },
                 ).ok();
@@ -832,7 +841,7 @@ pub async fn update_dispatched_session(
                 [id],
                 |row| {
                     Ok(json!({
-                        "id": row.get::<_, i64>(0)?,
+                        "id": row.get::<_, i64>(0)?.to_string(),
                         "session_key": row.get::<_, String>(1)?,
                         "agent_id": row.get::<_, Option<String>>(2)?,
                         "status": row.get::<_, Option<String>>(3)?,
