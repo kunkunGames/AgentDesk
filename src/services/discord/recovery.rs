@@ -395,19 +395,15 @@ pub(super) async fn restore_inflight_turns(
             if session_alive {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
-                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, proceeding with watcher recovery",
+                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, watcher will adopt",
                     state.channel_id
                 );
                 super::restart_report::clear_restart_report(provider, state.channel_id);
-                // Add 👀 reaction to bot placeholder to indicate watcher re-attached
-                super::formatting::add_reaction_raw(
-                    http,
-                    ChannelId::new(state.channel_id),
-                    MessageId::new(state.current_msg_id),
-                    '👀',
-                )
-                .await;
-                // Fall through to normal recovery path below (watcher re-attach)
+                // Session is alive — skip read_output_file_until_result entirely.
+                // restore_tmux_watchers will adopt the session and attach a watcher.
+                // No recovery turn needed — the session continues where it left off.
+                clear_inflight_state(provider, state.channel_id);
+                continue;
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 if let Some(diag) = tmux_name.as_deref().and_then(|name| {
