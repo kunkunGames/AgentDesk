@@ -243,7 +243,7 @@ pub async fn submit_verdict(
     };
 
     // A: Validate dispatch_type — only 'review' dispatches should go through the verdict API.
-    //    implementation/rework dispatches have their own completion path (session idle auto-complete),
+    //    implementation/rework dispatches have their own completion path (turn_bridge explicit completion),
     //    review-decision dispatches should use /api/review-decision (accept/dispute/dismiss).
     let dispatch_type: Option<String> = conn
         .query_row(
@@ -539,6 +539,11 @@ pub struct ReviewDecisionBody {
     pub card_id: String,
     pub decision: String, // "accept", "dispute", "dismiss"
     pub comment: Option<String>,
+    /// #109: dispatch-scoped targeting — when provided, the server validates
+    /// that this dispatch_id matches the pending review-decision dispatch for
+    /// the card. Prevents replayed/stale decisions from consuming the wrong
+    /// dispatch.
+    pub dispatch_id: Option<String>,
 }
 
 /// POST /api/review-decision
@@ -619,6 +624,25 @@ pub async fn submit_review_decision(
                 "card_id": body.card_id,
             })),
         );
+    }
+
+    // #109: When dispatch_id is provided, validate it matches the pending
+    // review-decision dispatch. This prevents replayed or stale decisions from
+    // consuming a different dispatch than the one they were issued for.
+    if let Some(ref submitted_did) = body.dispatch_id {
+        if pending_rd_id.as_deref() != Some(submitted_did.as_str()) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "dispatch_id mismatch: submitted {} but pending is {}",
+                        submitted_did,
+                        pending_rd_id.as_deref().unwrap_or("(none)")
+                    ),
+                    "card_id": body.card_id,
+                })),
+            );
+        }
     }
 
     match body.decision.as_str() {
@@ -797,22 +821,12 @@ pub async fn submit_review_decision(
                 &dispute_status,
             );
 
-            // Drain: onReviewEnter may call setStatus (e.g. pending_decision on max rounds)
-            loop {
-                let transitions = state.engine.drain_pending_transitions();
-                if transitions.is_empty() {
-                    break;
-                }
-                for (t_card_id, old_s, new_s) in &transitions {
-                    crate::kanban::fire_transition_hooks(
-                        &state.db,
-                        &state.engine,
-                        &t_card_id,
-                        &old_s,
-                        &new_s,
-                    );
-                }
-            }
+            // #108: Drain all pending intents and transitions from OnReviewEnter hooks.
+            // drain_hook_side_effects handles both transition processing (e.g. setStatus
+            // for pending_decision on max rounds) and Discord notifications for any
+            // dispatches created by the hooks, eliminating the previous manual drain loop
+            // that only handled transitions and missed dispatch notifications.
+            crate::kanban::drain_hook_side_effects(&state.db, &state.engine);
 
             // #117: Update canonical review state before returning
             update_card_review_state(
@@ -821,30 +835,6 @@ pub async fn submit_review_decision(
                 "dispute",
                 pending_rd_id.as_deref(),
             );
-
-            // Send newly created review dispatch to Discord (created by OnReviewEnter hook)
-            if let Ok(conn) = state.db.lock() {
-                let new_review: Option<(String, String, String)> = conn
-                    .query_row(
-                        "SELECT td.id, COALESCE(td.to_agent_id, ''), COALESCE(td.title, '') \
-                         FROM task_dispatches td \
-                         WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' AND td.status = 'pending' \
-                         ORDER BY td.rowid DESC LIMIT 1",
-                        [&body.card_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .ok();
-                drop(conn);
-                if let Some((did, aid, title)) = new_review {
-                    super::dispatches::queue_dispatch_notify(
-                        &state.db,
-                        &did,
-                        &aid,
-                        &body.card_id,
-                        &title,
-                    );
-                }
-            }
 
             // Emit kanban_card_updated for real-time dashboard
             if let Ok(conn) = state.db.lock() {
@@ -970,17 +960,31 @@ const MIN_OUTCOMES_FOR_GUIDANCE: i64 = 5;
 const MIN_CATEGORY_OUTCOMES: i64 = 3;
 
 /// Spawn a background task to re-aggregate review tuning data.
-/// Uses a lightweight debounce: skips if the last aggregate was < 60s ago.
+/// Debounce: skips if the max outcome rowid hasn't changed since the last aggregation.
+/// This avoids the old mtime-based debounce that could miss outcomes inserted
+/// shortly after the previous aggregate (e.g. a 5th sample crossing the threshold
+/// 10s after a 4-sample aggregate).
 pub fn spawn_aggregate_if_needed(db: &crate::db::Db) {
     let db = db.clone();
     tokio::spawn(async move {
-        // Debounce: check if guidance file was written recently
-        let path = review_tuning_guidance_path();
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(modified) = meta.modified() {
-                if modified.elapsed().map_or(false, |d| d.as_secs() < 60) {
-                    return; // aggregated < 60s ago, skip
-                }
+        // Debounce: compare latest outcome rowid against last aggregated rowid
+        if let Ok(conn) = db.lock() {
+            let max_rowid: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM review_tuning_outcomes",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let last_aggregated_rowid: i64 = conn
+                .query_row(
+                    "SELECT CAST(COALESCE(value, '0') AS INTEGER) FROM kv_meta WHERE key = 'review_tuning_last_aggregated_rowid'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if max_rowid <= last_aggregated_rowid {
+                return; // no new outcomes since last aggregation, skip
             }
         }
         aggregate_review_tuning_core(&db);
@@ -993,6 +997,16 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64,
         Ok(c) => c,
         Err(_) => return (0, 0, 0, 0, 0, 0),
     };
+
+    // Snapshot the current max rowid BEFORE reading outcomes.
+    // This is stored in kv_meta after aggregation for rowid-based debounce.
+    let snapshot_max_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM review_tuning_outcomes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     let mut total_tp = 0i64;
     let mut total_fp = 0i64;
@@ -1130,6 +1144,15 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64,
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&guidance_path, &guidance);
+
+    // #119: Store the snapshot rowid so the debounce check in spawn_aggregate_if_needed
+    // can skip re-aggregation until new outcomes arrive.
+    conn.execute(
+        "INSERT INTO kv_meta (key, value) VALUES ('review_tuning_last_aggregated_rowid', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [&snapshot_max_rowid.to_string()],
+    )
+    .ok();
 
     let lines = guidance_lines.len();
     tracing::info!(
@@ -1462,6 +1485,7 @@ mod tests {
                 card_id: "card-d".to_string(),
                 decision: "dismiss".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -1880,6 +1904,7 @@ mod tests {
                 card_id: "card-done".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -1946,6 +1971,7 @@ mod tests {
                 card_id: "card-dismissed".to_string(),
                 decision: "accept".to_string(),
                 comment: Some("late accept after dismiss".to_string()),
+                dispatch_id: None,
             }),
         )
         .await;
@@ -1998,6 +2024,7 @@ mod tests {
                 card_id: "card-dup".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2010,6 +2037,7 @@ mod tests {
                 card_id: "card-dup".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2047,6 +2075,7 @@ mod tests {
                 card_id: "card-ad".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2059,6 +2088,7 @@ mod tests {
                 card_id: "card-ad".to_string(),
                 decision: "dispute".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2296,6 +2326,7 @@ mod tests {
                 card_id: "card-rs".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;

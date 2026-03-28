@@ -439,38 +439,12 @@ pub async fn update_card(
     });
     drop(conn);
 
-    // Discord notification for new dispatches (if hooks created them)
-    // Pipeline-driven: notify when the transition is gated (involves dispatches)
-    // Uses effective_pipeline resolved earlier (already accounts for repo/agent overrides)
-    if let Some(ref new_s) = new_status {
-        let is_gated_transition = effective_pipeline
-            .find_transition(&old_status, new_s)
-            .map_or(false, |t| {
-                t.transition_type == crate::pipeline::TransitionType::Gated
-            });
-        if new_s.as_str() != old_status && is_gated_transition {
-            // #144: Queue via dispatch outbox instead of tokio::spawn
-            let dispatch_info: Option<(String, String, String)> =
-                state.db.lock().ok().and_then(|conn| {
-                    conn.query_row(
-                        "SELECT kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
-                         FROM kanban_cards kc WHERE kc.id = ?1",
-                        [&id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .ok()
-                });
-            if let Some((agent_id, title, dispatch_id)) = dispatch_info {
-                super::dispatches::queue_dispatch_notify(
-                    &state.db,
-                    &dispatch_id,
-                    &agent_id,
-                    &id,
-                    &title,
-                );
-            }
-        }
-    }
+    // #108: Drain pending intents from hooks fired during transition_status_with_opts.
+    // fire_dynamic_hooks fires policy hooks that may create dispatch intents, but
+    // doesn't drain them itself. drain_hook_side_effects now also queues Discord
+    // notifications for created dispatches, replacing the previous latest_dispatch_id
+    // re-query that was susceptible to race conditions.
+    crate::kanban::drain_hook_side_effects(&state.db, &state.engine);
 
     match card {
         Ok(c) => {
