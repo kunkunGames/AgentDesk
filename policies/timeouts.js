@@ -409,6 +409,16 @@ var timeouts = {
               [sc.id, rs.review_round || null, rs.last_verdict || "unknown", findingCats]
             );
             agentdesk.log.info("[review-tuning] #119 recorded true_positive (auto-accept): card=" + sc.id);
+            // #119: Trigger re-aggregation — other outcome paths (Rust) call
+            // spawn_aggregate_if_needed directly; from JS we hit the HTTP API.
+            try {
+              var aggPort = agentdesk.config.get("server_port");
+              if (aggPort) {
+                agentdesk.http.post("http://127.0.0.1:" + aggPort + "/api/review-tuning/aggregate", {});
+              }
+            } catch (aggErr) {
+              agentdesk.log.warn("[review-tuning] aggregate trigger failed (non-fatal): " + aggErr);
+            }
           }
           // #117: sync canonical review state
           agentdesk.db.execute(
