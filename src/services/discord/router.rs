@@ -136,8 +136,7 @@ pub(super) async fn handle_event(
                 }
             }
 
-            // Ignore messages that mention other (human) users — not directed at
-            // this bot.  Bot mentions are excluded because Discord auto-adds the
+            // this bot. Bot mentions are excluded because Discord auto-adds the
             // replied-to author to the mentions array for InlineReply messages;
             // filtering on those would silently drop legitimate replies to
             // announce/notify/codex bot messages.
