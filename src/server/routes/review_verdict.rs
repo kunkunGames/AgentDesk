@@ -398,13 +398,14 @@ pub async fn submit_verdict(
     });
     let result_str = result_json.to_string();
 
-    // Update dispatch with verdict result — only if still pending/dispatched.
-    // Cancelled dispatches (e.g. after dismiss) must NOT be promoted to completed,
-    // as that would re-trigger OnDispatchCompleted hooks and cause review loops (#80).
-    let updated = match conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?2, updated_at = datetime('now') \
-         WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-        rusqlite::params![body.dispatch_id, result_str],
+    // #143: Mark dispatch completed via shared helper (DB-only, no OnDispatchCompleted).
+    // Review verdict fires OnReviewVerdict — specialized hook, not the generic completion hook.
+    // Cancelled dispatches must NOT be promoted to completed (review loop guard #80).
+    drop(conn);
+    let updated = match crate::dispatch::mark_dispatch_completed(
+        &state.db,
+        &body.dispatch_id,
+        &result_json,
     ) {
         Ok(n) => n,
         Err(e) => {
@@ -416,7 +417,7 @@ pub async fn submit_verdict(
     };
 
     if updated == 0 {
-        // Check if dispatch exists but was cancelled/completed
+        let conn = state.db.lock().unwrap();
         let current_status: Option<String> = conn
             .query_row(
                 "SELECT status FROM task_dispatches WHERE id = ?1",
@@ -433,16 +434,15 @@ pub async fn submit_verdict(
     }
 
     // Find associated card
-    let card_id: Option<String> = conn
-        .query_row(
+    let card_id: Option<String> = state.db.separate_conn().ok().and_then(|conn| {
+        conn.query_row(
             "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
             [&body.dispatch_id],
             |row| row.get(0),
         )
         .ok()
-        .flatten();
-
-    drop(conn);
+        .flatten()
+    });
 
     // #100: stamp release marker AFTER dispatch update confirmed, BEFORE hooks.
     // This ensures: (1) stale/duplicate submissions don't write markers (updated==0 already returned),
@@ -618,31 +618,26 @@ pub async fn submit_review_decision(
             // the same turn that called this API.
             drop(conn);
 
-            // Complete the review-decision dispatch
-            if let (Some(rd_id), Ok(conn)) = (&pending_rd_id, state.db.lock()) {
-                conn.execute(
-                    "UPDATE task_dispatches SET status = 'completed', \
-                     result = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![
-                        json!({"decision": "accept", "completion_source": "review_decision_api"})
-                            .to_string(),
-                        rd_id,
-                    ],
+            // #143: Complete review-decision dispatch via shared helper
+            if let Some(ref rd_id) = pending_rd_id {
+                crate::dispatch::mark_dispatch_completed(
+                    &state.db,
+                    rd_id,
+                    &json!({"decision": "accept", "completion_source": "review_decision_api"}),
                 )
                 .ok();
             }
 
             // #119: Record tuning outcome
-            record_decision_tuning(
-                &state.db,
-                &body.card_id,
-                "accept",
-                pending_rd_id.as_deref(),
-            );
+            record_decision_tuning(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
             spawn_aggregate_if_needed(&state.db);
 
             // Transition card back to review for re-review of the rework
-            let (card_status_now, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = state
+            let (card_status_now, card_repo_id, card_agent_id): (
+                String,
+                Option<String>,
+                Option<String>,
+            ) = state
                 .db
                 .lock()
                 .ok()
@@ -699,12 +694,7 @@ pub async fn submit_review_decision(
             );
 
             // #117: Update canonical review state
-            update_card_review_state(
-                &state.db,
-                &body.card_id,
-                "accept",
-                pending_rd_id.as_deref(),
-            );
+            update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
 
             return (
                 StatusCode::OK,
@@ -717,16 +707,12 @@ pub async fn submit_review_decision(
             );
         }
         "dispute" => {
-            // Agent disputes → complete the review-decision dispatch, then create new review
+            // #143: Agent disputes → complete review-decision dispatch via shared helper
             if let Some(ref rd_id) = pending_rd_id {
-                conn.execute(
-                    "UPDATE task_dispatches SET status = 'completed', \
-                     result = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![
-                        json!({"decision": "dispute", "completion_source": "review_decision_api"})
-                            .to_string(),
-                        rd_id,
-                    ],
+                crate::dispatch::mark_dispatch_completed(
+                    &state.db,
+                    rd_id,
+                    &json!({"decision": "dispute", "completion_source": "review_decision_api"}),
                 )
                 .ok();
             }
@@ -806,7 +792,11 @@ pub async fn submit_review_decision(
                 drop(conn);
                 if let Some((did, aid, title)) = new_review {
                     super::dispatches::queue_dispatch_notify(
-                        &state.db, &did, &aid, &body.card_id, &title,
+                        &state.db,
+                        &did,
+                        &aid,
+                        &body.card_id,
+                        &title,
                     );
                 }
             }
