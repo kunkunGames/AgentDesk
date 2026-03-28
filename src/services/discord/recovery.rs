@@ -278,13 +278,9 @@ pub(super) async fn restore_inflight_turns(
                                 }
                             }
                         }
-                        // All retries exhausted — DB fallback + reconciliation marker
+                        // All retries exhausted — DB fallback via pool, then runtime-root
                         if !dispatch_completed {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!(
-                                "  [{ts}] ❌ recovery: finalize_dispatch failed after 3 retries, DB fallback for {did}"
-                            );
-                            if let Ok(conn) = db.separate_conn() {
+                            let pool_ok = db.separate_conn().ok().map_or(false, |conn| {
                                 let changed = conn.execute(
                                     "UPDATE task_dispatches SET status = 'completed', \
                                      result = '{\"completion_source\":\"recovery_db_fallback\",\"needs_reconcile\":true}', \
@@ -292,12 +288,20 @@ pub(super) async fn restore_inflight_turns(
                                     [did.as_str()],
                                 ).unwrap_or(0);
                                 if changed > 0 {
-                                    let _ = conn.execute(
+                                    conn.execute(
                                         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
                                         rusqlite::params![format!("reconcile_dispatch:{did}"), did.as_str()],
-                                    );
-                                    dispatch_completed = true;
+                                    ).ok();
                                 }
+                                changed > 0
+                            });
+                            if pool_ok {
+                                dispatch_completed = true;
+                            } else {
+                                dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
+                                    did,
+                                    "recovery_db_fallback",
+                                );
                             }
                         }
                     } else {
@@ -342,6 +346,13 @@ pub(super) async fn restore_inflight_turns(
                             if attempt < 3 {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             }
+                        }
+                        // API retries exhausted — runtime-root DB fallback
+                        if !dispatch_completed {
+                            dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
+                                did,
+                                "recovery_db_fallback",
+                            );
                         }
                     }
                 }

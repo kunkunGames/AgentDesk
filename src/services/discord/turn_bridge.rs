@@ -364,6 +364,39 @@ async fn guard_review_dispatch_completion(
 }
 
 /// Explicitly complete implementation/rework dispatches at turn end.
+/// Last-resort dispatch completion via runtime-root SQLite file.
+///
+/// Opens a fresh connection to the on-disk DB (bypassing the Db pool) and writes
+/// a status + reconciliation marker so onTick can run the hook chain later.
+/// Returns `true` if the UPDATE affected at least one row.
+pub(super) fn runtime_db_fallback_complete(dispatch_id: &str, source: &str) -> bool {
+    let Some(root) = crate::cli::agentdesk_runtime_root() else {
+        return false;
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+        return false;
+    };
+    let result_json = format!(
+        "{{\"completion_source\":\"{source}\",\"needs_reconcile\":true}}"
+    );
+    let changed = conn
+        .execute(
+            "UPDATE task_dispatches SET status = 'completed', result = ?1, \
+             updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+            rusqlite::params![result_json, dispatch_id],
+        )
+        .unwrap_or(0);
+    if changed > 0 {
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
+        )
+        .ok();
+    }
+    changed > 0
+}
+
 /// Unlike review dispatches (which auto-complete on session idle), these types
 /// require an explicit PATCH so the pipeline can advance deterministically.
 /// Fail a dispatch with retry on PATCH failure.
@@ -477,22 +510,30 @@ async fn complete_work_dispatch_on_turn_end(
                 }
             }
         }
-        // All retries exhausted — DB fallback + reconciliation marker for onTick
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        eprintln!(
-            "  [{ts}] ❌ finalize_dispatch failed after 3 retries, falling back to direct DB for {dispatch_id}"
-        );
-        if let Ok(conn) = db.separate_conn() {
-            let _ = conn.execute(
+        // All retries exhausted — DB fallback via pool, then runtime-root file
+        let fallback_ok = db.separate_conn().ok().map_or(false, |conn| {
+            let changed = conn.execute(
                 "UPDATE task_dispatches SET status = 'completed', \
                  result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', \
                  updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
                 [dispatch_id],
-            );
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
-            );
+            ).unwrap_or(0);
+            if changed > 0 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
+                ).ok();
+            }
+            changed > 0
+        });
+        if !fallback_ok {
+            let ok = runtime_db_fallback_complete(dispatch_id, "turn_bridge_db_fallback");
+            if !ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] 🔴 CRITICAL: all completion paths exhausted for dispatch {dispatch_id} — dispatch stranded"
+                );
+            }
         }
     } else {
         // Db/Engine not available — fall back to API PATCH with retry
@@ -534,21 +575,12 @@ async fn complete_work_dispatch_on_turn_end(
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        // API retries exhausted — DB fallback
-        if let Some(root) = crate::cli::agentdesk_runtime_root() {
-            let db_path = root.join("data/agentdesk.sqlite");
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                let _ = conn.execute(
-                    "UPDATE task_dispatches SET status = 'completed', \
-                     result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', \
-                     updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-                    [dispatch_id],
-                );
-                let _ = conn.execute(
-                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                    rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
-                );
-            }
+        // API retries exhausted — runtime-root DB fallback
+        if !runtime_db_fallback_complete(dispatch_id, "turn_bridge_db_fallback") {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] 🔴 CRITICAL: all completion paths exhausted for dispatch {dispatch_id} — dispatch stranded"
+            );
         }
     }
 }
