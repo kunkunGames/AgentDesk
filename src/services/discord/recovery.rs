@@ -729,20 +729,37 @@ pub(super) async fn restore_inflight_turns(
                         last_offset: offset,
                     });
                 }
-                Ok(ReadOutputResult::SessionDied { .. }) => {
-                    // Signal auto-retry via a special marker in Done result.
-                    // The turn_bridge will detect the empty result + retry info
-                    // and handle the async re-send with Discord history.
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
-                        "  [{ts}] ↻ Recovery: session died, signaling auto-retry (channel {})",
-                        retry_channel_id
+                Ok(ReadOutputResult::SessionDied { offset }) => {
+                    // Check if tmux pane is actually alive — dcserver restart
+                    // may cause SessionDied because no new output arrived, but
+                    // the Claude CLI process could still be idle (waiting for input).
+                    let pane_alive = crate::services::tmux_diagnostics::tmux_session_has_live_pane(
+                        &tmux_for_reader,
                     );
-                    // Send marker so turn_bridge triggers auto-retry with Discord history.
-                    let _ = tx.send(StreamMessage::Done {
-                        result: "__session_died_retry__".to_string(),
-                        session_id: recovery_session_id,
-                    });
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    if pane_alive {
+                        // Session is alive but idle — hand off to watcher instead of retrying
+                        eprintln!(
+                            "  [{ts}] ↻ Recovery: session idle but pane alive — handing off to watcher (channel {})",
+                            retry_channel_id
+                        );
+                        let _ = tx.send(StreamMessage::TmuxReady {
+                            output_path: output_for_reader,
+                            input_fifo_path: input_for_reader,
+                            tmux_session_name: tmux_for_reader,
+                            last_offset: offset,
+                        });
+                    } else {
+                        // Session truly dead — auto-retry with fresh session
+                        eprintln!(
+                            "  [{ts}] ↻ Recovery: session died, signaling auto-retry (channel {})",
+                            retry_channel_id
+                        );
+                        let _ = tx.send(StreamMessage::Done {
+                            result: "__session_died_retry__".to_string(),
+                            session_id: recovery_session_id,
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(StreamMessage::Error {
