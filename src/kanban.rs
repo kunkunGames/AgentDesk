@@ -239,6 +239,32 @@ pub fn drain_hook_side_effects(db: &Db, engine: &PolicyEngine) {
         let mut transitions = intent_result.transitions;
         transitions.extend(engine.drain_pending_transitions());
 
+        // #108: Immediately notify dispatches created by JS policy intents.
+        // Without this, dispatches created outside fire_transition_hooks
+        // (e.g. timeouts.js, review-automation.js) would sit pending until
+        // the [I-0] 2min recovery sweep picked them up.
+        for cd in &intent_result.created_dispatches {
+            let title: String = db
+                .separate_conn()
+                .ok()
+                .and_then(|conn| {
+                    conn.query_row(
+                        "SELECT title FROM kanban_cards WHERE id = ?1",
+                        [&cd.card_id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            crate::server::routes::dispatches::queue_dispatch_notify(
+                db,
+                &cd.dispatch_id,
+                &cd.agent_id,
+                &cd.card_id,
+                &title,
+            );
+        }
+
         if transitions.is_empty() {
             break;
         }
@@ -314,7 +340,23 @@ pub fn fire_state_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &st
 ///
 /// Used when re-entering the same state (e.g., restarting review from awaiting_dod)
 /// where `fire_state_hooks` would no-op because from == to.
+///
+/// #108: Also detects dispatches created by on_enter hooks (e.g., OnReviewEnter
+/// creating a review dispatch during dispute) and queues Discord notifications.
+/// Without this, callers had to manually re-query the DB to find new dispatches,
+/// which introduced race conditions.
 pub fn fire_enter_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, state: &str) {
+    // Capture pre-hook dispatch ID to detect new dispatches created by hooks (#108)
+    let pre_dispatch_id: Option<String> = db.lock().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    });
+
     crate::pipeline::ensure_loaded();
     let effective = db.lock().ok().map(|conn| {
         let repo_id: Option<String> = conn
@@ -349,6 +391,10 @@ pub fn fire_enter_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, state: &s
         }
     }
     drain_hook_side_effects(db, engine);
+
+    // #108: After all hooks, check if new dispatches were created and queue
+    // Discord notifications. Same pattern as fire_transition_hooks.
+    notify_new_dispatches_after_hooks(db, card_id, pre_dispatch_id.as_deref());
 }
 
 /// Fire hooks for a status transition that already happened in the DB.
@@ -722,32 +768,42 @@ fn record_true_negative_if_pass(db: &Db, card_id: &str) -> bool {
                     )
                     .ok();
 
-                // Carry forward finding_categories from the last completed review dispatch
-                // so that if this TN is later corrected to FN on reopen, the categories are preserved
+                // Carry forward finding_categories from the review dispatch that found issues.
+                // The most recent review dispatch is typically the pass/approved one with
+                // empty items, so we walk backwards to find one with actual findings.
+                // This ensures that if TN is later corrected to FN on reopen, categories
+                // are already present.
                 let finding_cats: Option<String> = conn
-                    .query_row(
+                    .prepare(
                         "SELECT td.result FROM task_dispatches td \
                          WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' \
-                         AND td.status = 'completed' ORDER BY td.rowid DESC LIMIT 1",
-                        [card_id],
-                        |row| row.get::<_, Option<String>>(0),
+                         AND td.status = 'completed' ORDER BY td.rowid DESC",
                     )
                     .ok()
-                    .flatten()
-                    .and_then(|r| {
-                        serde_json::from_str::<serde_json::Value>(&r)
-                            .ok()
-                            .and_then(|v| {
-                                v["items"].as_array().map(|items| {
-                                    let cats: Vec<String> = items
-                                        .iter()
-                                        .filter_map(|it| {
-                                            it["category"].as_str().map(|s| s.to_string())
-                                        })
-                                        .collect();
-                                    serde_json::to_string(&cats).unwrap_or_default()
-                                })
-                            })
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map([card_id], |row| row.get::<_, Option<String>>(0))
+                            .ok()?;
+                        for row_result in rows {
+                            if let Ok(Some(result_str)) = row_result {
+                                if let Ok(v) =
+                                    serde_json::from_str::<serde_json::Value>(&result_str)
+                                {
+                                    if let Some(items) = v["items"].as_array() {
+                                        let cats: Vec<String> = items
+                                            .iter()
+                                            .filter_map(|it| {
+                                                it["category"].as_str().map(|s| s.to_string())
+                                            })
+                                            .collect();
+                                        if !cats.is_empty() {
+                                            return serde_json::to_string(&cats).ok();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
                     });
 
                 let inserted = conn.execute(
@@ -773,6 +829,12 @@ fn record_true_negative_if_pass(db: &Db, card_id: &str) -> bool {
 
 /// #119: When a card is reopened after reaching done with a pass verdict,
 /// correct any true_negative outcomes to false_negative — the review missed a real bug.
+///
+/// Also backfills finding_categories if the TN record had empty categories.
+/// TN is typically recorded using categories from the last completed review dispatch,
+/// which is the pass/approved dispatch with empty items. On reopen we look for the
+/// most recent review dispatch that actually reported findings (non-empty items array)
+/// to carry those categories forward into the FN record.
 pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
     if let Ok(conn) = db.lock() {
         // Only correct the most recent TN (latest review_round) to avoid
@@ -789,6 +851,77 @@ pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
             tracing::info!(
                 "[review-tuning] #119 corrected {updated} true_negative → false_negative: card={card_id} (reopen, latest round only)"
             );
+
+            // Backfill finding_categories if empty. The TN was recorded using the
+            // last review dispatch (the pass/approved one with empty items). Look
+            // for an earlier review dispatch that actually found issues.
+            let needs_backfill: bool = conn
+                .query_row(
+                    "SELECT finding_categories IS NULL OR finding_categories = '' OR finding_categories = '[]' \
+                     FROM review_tuning_outcomes \
+                     WHERE card_id = ?1 AND outcome = 'false_negative' \
+                     ORDER BY rowid DESC LIMIT 1",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            if needs_backfill {
+                // Walk through review dispatches (most recent first) to find
+                // one with a non-empty items array containing categories
+                let finding_cats: Option<String> = conn
+                    .prepare(
+                        "SELECT td.result FROM task_dispatches td \
+                         WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' \
+                         AND td.status = 'completed' \
+                         ORDER BY td.rowid DESC",
+                    )
+                    .ok()
+                    .and_then(|mut stmt| {
+                        let rows = stmt
+                            .query_map([card_id], |row| row.get::<_, Option<String>>(0))
+                            .ok()?;
+                        for row_result in rows {
+                            if let Ok(Some(result_str)) = row_result {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_str)
+                                {
+                                    if let Some(items) = v["items"].as_array() {
+                                        if !items.is_empty() {
+                                            let cats: Vec<String> = items
+                                                .iter()
+                                                .filter_map(|it| {
+                                                    it["category"]
+                                                        .as_str()
+                                                        .map(|s| s.to_string())
+                                                })
+                                                .collect();
+                                            if !cats.is_empty() {
+                                                return serde_json::to_string(&cats).ok();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    });
+
+                if let Some(ref cats) = finding_cats {
+                    let backfilled = conn
+                        .execute(
+                            "UPDATE review_tuning_outcomes SET finding_categories = ?1 \
+                             WHERE card_id = ?2 AND outcome = 'false_negative' \
+                             AND (finding_categories IS NULL OR finding_categories = '' OR finding_categories = '[]')",
+                            rusqlite::params![cats, card_id],
+                        )
+                        .unwrap_or(0);
+                    if backfilled > 0 {
+                        tracing::info!(
+                            "[review-tuning] #119 backfilled {backfilled} FN finding_categories: card={card_id} categories={cats}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
