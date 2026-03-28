@@ -538,9 +538,10 @@ pub async fn assign_card(
             tracing::warn!("Pipeline has no dispatchable states, using initial state");
             pipeline.initial_state().to_string()
         });
+    // #155: Split into assignee update (metadata) + status transition via reducer
     match conn.execute(
-        "UPDATE kanban_cards SET assigned_agent_id = ?1, status = ?2, updated_at = datetime('now') WHERE id = ?3",
-        rusqlite::params![body.agent_id, ready_state, id],
+        "UPDATE kanban_cards SET assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+        rusqlite::params![body.agent_id, id],
     ) {
         Ok(0) => {
             return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
@@ -553,11 +554,22 @@ pub async fn assign_card(
             );
         }
     }
-
-    let card = conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    });
     drop(conn);
+
+    // Status transition via reducer (ensures hooks, clocks, audit)
+    if old_status != ready_state {
+        if let Err(e) = crate::kanban::transition_status_with_opts(
+            &state.db, &state.engine, &id, &ready_state, "assign", false,
+        ) {
+            tracing::warn!("[assign_card] transition failed: {e}");
+        }
+    }
+
+    let card = state.db.lock().ok().and_then(|conn| {
+        conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+            card_row_to_json(row)
+        }).ok()
+    });
 
     // Fire pipeline-defined hooks for the state transition (#134)
     if old_status != ready_state {
@@ -565,13 +577,13 @@ pub async fn assign_card(
     }
 
     match card {
-        Ok(c) => {
+        Some(c) => {
             crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", c.clone());
             (StatusCode::OK, Json(json!({"card": c})))
         }
-        Err(e) => (
+        None => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
+            Json(json!({"error": "failed to read card after assign"})),
         ),
     }
 }
