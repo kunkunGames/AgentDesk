@@ -353,13 +353,25 @@ fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {
 }
 
 fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> anyhow::Result<()> {
-    // Block direct kanban_cards status UPDATE (same guard as ops.rs)
+    // Block direct kanban_cards status/review_status/latest_dispatch_id UPDATE (#155)
     let sql_upper = sql.to_uppercase();
     if sql_upper.contains("UPDATE") && sql_upper.contains("KANBAN_CARDS") {
         let re_status = regex::Regex::new(r"(?i)(?:^|[\s,])status\s*=").unwrap();
         if re_status.is_match(sql) {
             return Err(anyhow::anyhow!(
                 "Direct kanban_cards status UPDATE is blocked. Use TransitionCard intent."
+            ));
+        }
+        let re_review = regex::Regex::new(r"(?i)(?:^|[\s,])review_status\s*=").unwrap();
+        if re_review.is_match(sql) {
+            return Err(anyhow::anyhow!(
+                "Direct kanban_cards review_status UPDATE is blocked. Use the transition reducer."
+            ));
+        }
+        let re_dispatch = regex::Regex::new(r"(?i)(?:^|[\s,])latest_dispatch_id\s*=").unwrap();
+        if re_dispatch.is_match(sql) {
+            return Err(anyhow::anyhow!(
+                "Direct kanban_cards latest_dispatch_id UPDATE is blocked. Use the transition reducer."
             ));
         }
     }
@@ -529,6 +541,28 @@ mod tests {
             card_id: "nonexistent".into(),
             from: "requested".into(),
             to: "in_progress".into(),
+        }];
+        let result = execute_intents(&db, intents);
+        assert_eq!(result.errors, 1);
+    }
+
+    #[test]
+    fn test_blocked_review_status_update_sql() {
+        let db = test_db();
+        let intents = vec![Intent::ExecuteSQL {
+            sql: "UPDATE kanban_cards SET review_status = 'rework' WHERE id = 'x'".into(),
+            params: vec![],
+        }];
+        let result = execute_intents(&db, intents);
+        assert_eq!(result.errors, 1);
+    }
+
+    #[test]
+    fn test_blocked_latest_dispatch_id_update_sql() {
+        let db = test_db();
+        let intents = vec![Intent::ExecuteSQL {
+            sql: "UPDATE kanban_cards SET latest_dispatch_id = 'abc' WHERE id = 'x'".into(),
+            params: vec![],
         }];
         let result = execute_intents(&db, intents);
         assert_eq!(result.errors, 1);
