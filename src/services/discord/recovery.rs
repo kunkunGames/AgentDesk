@@ -259,13 +259,9 @@ pub(super) async fn restore_inflight_turns(
                                 println!(
                                     "  [{ts}] ✓ recovery: completed dispatch {did} via finalize_dispatch"
                                 );
-                                let db_clone = db.clone();
-                                let did_owned = did.clone();
-                                tokio::spawn(async move {
-                                    crate::server::routes::dispatches::handle_completed_dispatch_followups(
-                                        &db_clone, &did_owned,
-                                    ).await;
-                                });
+                                crate::server::routes::dispatches::queue_dispatch_followup(
+                                    db, &did,
+                                );
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");

@@ -52,14 +52,14 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
                 #[cfg(unix)]
                 {
                     // #145: skip kill for unified-thread sessions with active runs
-                    let is_unified = crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
-                        .map(|(_, ch)| crate::dispatch::is_unified_thread_channel_name_active(&ch))
-                        .unwrap_or(false);
+                    let is_unified =
+                        crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
+                            .map(|(_, ch)| {
+                                crate::dispatch::is_unified_thread_channel_name_active(&ch)
+                            })
+                            .unwrap_or(false);
                     if !is_unified {
-                        record_tmux_exit_reason(
-                            &name,
-                            &format!("explicit cleanup via {reason}"),
-                        );
+                        record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
                         let exact_target = tmux_exact_target(&name);
                         let _ = std::process::Command::new("tmux")
                             .args(["kill-session", "-t", &exact_target])
@@ -422,7 +422,10 @@ async fn fail_dispatch_with_retry(api_port: u16, dispatch_id: Option<&str>, erro
 ///
 /// Uses the shared Db+PolicyEngine directly (no HTTP round-trip, no DB fallback).
 /// Falls back to API PATCH only when Db/Engine are unavailable.
-async fn complete_work_dispatch_on_turn_end(shared: &Arc<super::SharedData>, dispatch_id: Option<&str>) {
+async fn complete_work_dispatch_on_turn_end(
+    shared: &Arc<super::SharedData>,
+    dispatch_id: Option<&str>,
+) {
     let Some(dispatch_id) = dispatch_id else {
         return;
     };
@@ -458,21 +461,12 @@ async fn complete_work_dispatch_on_turn_end(shared: &Arc<super::SharedData>, dis
                     "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
                     dtype = snapshot.dispatch_type,
                 );
-                let db_clone = db.clone();
-                let did = dispatch_id.to_string();
-                tokio::spawn(async move {
-                    crate::server::routes::dispatches::handle_completed_dispatch_followups(
-                        &db_clone, &did,
-                    )
-                    .await;
-                });
+                crate::server::routes::dispatches::queue_dispatch_followup(db, dispatch_id);
                 return;
             }
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
-                    "  [{ts}] ⚠ finalize_dispatch failed for {dispatch_id}: {e}"
-                );
+                eprintln!("  [{ts}] ⚠ finalize_dispatch failed for {dispatch_id}: {e}");
             }
         }
     } else {
@@ -482,7 +476,12 @@ async fn complete_work_dispatch_on_turn_end(shared: &Arc<super::SharedData>, dis
             "status": "completed",
             "result": { "completion_source": "turn_bridge_explicit" },
         });
-        match reqwest::Client::new().patch(&url).json(&payload).send().await {
+        match reqwest::Client::new()
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
@@ -1015,8 +1014,7 @@ pub(super) fn spawn_turn_bridge(
         if dispatch_id.is_none() && !is_prompt_too_long {
             let total_tokens =
                 total_context_tokens(accumulated_input_tokens, accumulated_output_tokens);
-            let ctx_cfg =
-                super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
+            let ctx_cfg = super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
             let pct = (total_tokens * 100) / ctx_cfg.context_window.max(1);
             if pct >= ctx_cfg.compact_pct {
                 if let Some(ref tmux_name) = inflight_state.tmux_session_name {

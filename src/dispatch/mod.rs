@@ -457,6 +457,28 @@ pub fn finalize_dispatch(
     complete_dispatch_inner(db, engine, dispatch_id, &result)
 }
 
+/// #143: DB-only dispatch completion — marks status='completed' without firing hooks.
+///
+/// Used by specialized paths (review_verdict, pm-decision) that fire their own
+/// domain-specific hooks instead of the generic OnDispatchCompleted.
+/// Returns the number of rows updated (0 = already completed/cancelled/not found).
+pub fn mark_dispatch_completed(
+    db: &Db,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<usize> {
+    let result_str = serde_json::to_string(result)?;
+    let conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+    let changed = conn.execute(
+        "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+         WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+        rusqlite::params![result_str, dispatch_id],
+    )?;
+    Ok(changed)
+}
+
 /// Legacy wrapper — delegates to [`finalize_dispatch`] for callers that already
 /// have a fully-formed result JSON (e.g. API PATCH handler).
 pub fn complete_dispatch(
@@ -801,9 +823,9 @@ pub fn drain_unified_thread_kill_signals() -> Vec<String> {
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let mut stmt = match conn.prepare(
-        "SELECT key, value FROM kv_meta WHERE key LIKE 'kill_unified_thread:%'",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT key, value FROM kv_meta WHERE key LIKE 'kill_unified_thread:%'")
+    {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -818,7 +840,8 @@ pub fn drain_unified_thread_kill_signals() -> Vec<String> {
         if let Some(ch) = key.strip_prefix("kill_unified_thread:") {
             channels.push(ch.to_string());
         }
-        conn.execute("DELETE FROM kv_meta WHERE key = ?1", [key]).ok();
+        conn.execute("DELETE FROM kv_meta WHERE key = ?1", [key])
+            .ok();
     }
     channels
 }
@@ -1167,18 +1190,15 @@ mod tests {
         .unwrap();
         let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
 
-        let completed = finalize_dispatch(
-            &db,
-            &engine,
-            &dispatch_id,
-            "turn_bridge_explicit",
-            None,
-        )
-        .unwrap();
+        let completed =
+            finalize_dispatch(&db, &engine, &dispatch_id, "turn_bridge_explicit", None).unwrap();
 
         assert_eq!(completed["status"], "completed");
         // result is parsed JSON (query_dispatch_row parses it)
-        assert_eq!(completed["result"]["completion_source"], "turn_bridge_explicit");
+        assert_eq!(
+            completed["result"]["completion_source"],
+            "turn_bridge_explicit"
+        );
     }
 
     #[test]

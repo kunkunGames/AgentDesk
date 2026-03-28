@@ -181,10 +181,10 @@ pub async fn update_dispatch(
     Path(id): Path<String>,
     Json(body): Json<UpdateDispatchBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // If status is "completed", use the dispatch engine's complete_dispatch
+    // #143: Route all API-driven completions through finalize_dispatch
     if body.status.as_deref() == Some("completed") {
-        let result = body.result.unwrap_or(json!({}));
-        match dispatch::complete_dispatch(&state.db, &state.engine, &id, &result) {
+        let context = body.result.as_ref();
+        match dispatch::finalize_dispatch(&state.db, &state.engine, &id, "api", context) {
             Ok(d) => {
                 queue_dispatch_followup(&state.db, &id);
                 return (StatusCode::OK, Json(json!({"dispatch": d})));
@@ -1985,7 +1985,14 @@ pub(crate) async fn dispatch_outbox_loop(db: crate::db::Db) {
         tokio::time::sleep(poll_interval).await;
 
         // Fetch pending entries (oldest first, limit 5)
-        let pending: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>)> = {
+        let pending: Vec<(
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = {
             let conn = match db.lock() {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -2030,8 +2037,7 @@ pub(crate) async fn dispatch_outbox_loop(db: crate::db::Db) {
 
             match action.as_str() {
                 "notify" => {
-                    if let (Some(ref aid), Some(ref cid), Some(ref t)) =
-                        (agent_id, card_id, title)
+                    if let (Some(ref aid), Some(ref cid), Some(ref t)) = (agent_id, card_id, title)
                     {
                         send_dispatch_to_discord(&db, aid, t, cid, &dispatch_id).await;
                     }
