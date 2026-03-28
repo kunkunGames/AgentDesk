@@ -616,28 +616,13 @@ pub async fn submit_review_decision(
 
     match body.decision.as_str() {
         "accept" => {
-            // Agent accepts review feedback → dispatch-first rework creation
-            let (agent_id, title): (String, String) = conn
-                .query_row(
-                    "SELECT COALESCE(assigned_agent_id, ''), title FROM kanban_cards WHERE id = ?1",
-                    [&body.card_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap_or_default();
-
+            // Agent accepts review feedback — the review-decision dispatch itself
+            // serves as the rework turn. No separate rework dispatch is created.
+            // The agent already read the review comments and committed fixes in
+            // the same turn that called this API.
             drop(conn);
 
-            if agent_id.is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "no assigned agent for card", "card_id": body.card_id})),
-                );
-            }
-
-            // Complete the consumed review-decision dispatch BEFORE creating
-            // the rework dispatch.  The pending-dispatch guard in
-            // create_dispatch_core refuses to insert when a pending dispatch
-            // already exists for the card, so we must clear it first.
+            // Complete the review-decision dispatch
             if let (Some(rd_id), Ok(conn)) = (&pending_rd_id, state.db.lock()) {
                 conn.execute(
                     "UPDATE task_dispatches SET status = 'completed', \
@@ -651,132 +636,89 @@ pub async fn submit_review_decision(
                 .ok();
             }
 
-            // Dispatch-first: create rework dispatch BEFORE transitioning card status.
-            // If dispatch creation fails (e.g. done terminal guard), card stays in
-            // current status instead of being stranded in in_progress with no dispatch.
-            let rework_title = format!("[Rework] {title}");
-            let rework_result = crate::dispatch::create_dispatch(
+            // #119: Record tuning outcome
+            record_decision_tuning(
                 &state.db,
-                &state.engine,
                 &body.card_id,
-                &agent_id,
-                "rework",
-                &rework_title,
-                &json!({"review_decision": "accept", "comment": body.comment}),
+                "accept",
+                pending_rd_id.as_deref(),
             );
+            spawn_aggregate_if_needed(&state.db);
 
-            match rework_result {
-                Ok(ref d) => {
-                    // #119: Record tuning outcome BEFORE transition (which clears last_verdict)
-                    record_decision_tuning(
-                        &state.db,
-                        &body.card_id,
-                        "accept",
-                        pending_rd_id.as_deref(),
-                    );
-                    spawn_aggregate_if_needed(&state.db);
+            // Transition card back to review for re-review of the rework
+            let (card_status_now, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                        [&body.card_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            crate::pipeline::ensure_loaded();
+            let effective_pipeline = {
+                let conn = state.db.lock().unwrap();
+                crate::pipeline::resolve_for_card(
+                    &conn,
+                    card_repo_id.as_deref(),
+                    card_agent_id.as_deref(),
+                )
+            };
 
-                    // Pipeline-driven: find rework target using card's effective pipeline
-                    let (card_status_now, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = state
-                        .db
-                        .lock()
-                        .ok()
-                        .and_then(|c| {
-                            c.query_row(
-                                "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
-                                [&body.card_id],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_default();
-                    crate::pipeline::ensure_loaded();
-                    let effective_pipeline = crate::pipeline::resolve_for_card(
-                        &state.db.lock().unwrap(),
-                        card_repo_id.as_deref(),
-                        card_agent_id.as_deref(),
-                    );
-                    let rework_target = effective_pipeline
+            // Find the review state from pipeline transitions
+            let review_target = effective_pipeline
+                .transitions
+                .iter()
+                .find(|t| {
+                    // Find the gated transition that leads to a state with OnReviewEnter hook
+                    let target_has_review = effective_pipeline
+                        .hooks_for_state(&t.to)
+                        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
+                    t.from == card_status_now && target_has_review
+                })
+                .map(|t| t.to.clone())
+                .or_else(|| {
+                    // Fallback: look for review_rework gated transition
+                    effective_pipeline
                         .transitions
                         .iter()
                         .find(|t| {
                             t.from == card_status_now
-                                && t.transition_type
-                                    == crate::pipeline::TransitionType::Gated
+                                && t.transition_type == crate::pipeline::TransitionType::Gated
                                 && t.gates.iter().any(|g| g == "review_rework")
                         })
                         .map(|t| t.to.clone())
-                        .unwrap_or_else(|| {
-                            // Fallback: kickoff from card's current state
-                            effective_pipeline
-                                .kickoff_for(&card_status_now)
-                                .unwrap_or_else(|| effective_pipeline.initial_state().to_string())
-                        });
-                    let _ = crate::kanban::transition_status(
-                        &state.db,
-                        &state.engine,
-                        &body.card_id,
-                        &rework_target,
-                    );
-                    if let Ok(conn) = state.db.lock() {
-                        conn.execute(
-                            "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
-                            [&body.card_id],
-                        )
-                        .ok();
-                    }
+                })
+                .unwrap_or_else(|| "review".to_string());
 
-                    // Async Discord notification
-                    let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
-                    let db_clone = state.db.clone();
-                    let card_id = body.card_id.clone();
-                    let agent_id_c = agent_id.clone();
-                    let title_c = rework_title.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::send_dispatch_to_discord(
-                            &db_clone,
-                            &agent_id_c,
-                            &title_c,
-                            &card_id,
-                            &dispatch_id,
-                        )
-                        .await;
-                    });
+            let _ = crate::kanban::transition_status(
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                &review_target,
+            );
 
-                    // #117: Update canonical review state before returning
-                    update_card_review_state(
-                        &state.db,
-                        &body.card_id,
-                        "accept",
-                        pending_rd_id.as_deref(),
-                    );
+            // #117: Update canonical review state
+            update_card_review_state(
+                &state.db,
+                &body.card_id,
+                "accept",
+                pending_rd_id.as_deref(),
+            );
 
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "ok": true,
-                            "card_id": body.card_id,
-                            "decision": "accept",
-                            "message": "Rework dispatch created",
-                        })),
-                    );
-                }
-                Err(e) => {
-                    // Dispatch failed → fail closed, do NOT move card to in_progress
-                    tracing::warn!(
-                        "[review-decision] accept dispatch creation failed for card {}: {e}",
-                        body.card_id
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!("rework dispatch creation failed: {e}"),
-                            "card_id": body.card_id,
-                            "fallback": "card stays in current status",
-                        })),
-                    );
-                }
-            }
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "card_id": body.card_id,
+                    "decision": "accept",
+                    "message": "Review-decision accepted, card moved to re-review",
+                })),
+            );
         }
         "dispute" => {
             // Agent disputes → complete the review-decision dispatch, then create new review
@@ -903,11 +845,23 @@ pub async fn submit_review_decision(
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .unwrap_or((None, None));
-                let eff = crate::pipeline::resolve_for_card(&conn_lock, repo_id.as_deref(), agent_id.as_deref());
-                eff.states.iter().find(|s| s.terminal).map(|s| s.id.clone()).unwrap_or_else(|| "done".to_string())
+                let eff = crate::pipeline::resolve_for_card(
+                    &conn_lock,
+                    repo_id.as_deref(),
+                    agent_id.as_deref(),
+                );
+                eff.states
+                    .iter()
+                    .find(|s| s.terminal)
+                    .map(|s| s.id.clone())
+                    .unwrap_or_else(|| "done".to_string())
             };
-            let _ =
-                crate::kanban::transition_status(&state.db, &state.engine, &body.card_id, &terminal_state);
+            let _ = crate::kanban::transition_status(
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                &terminal_state,
+            );
 
             // Post-transition cleanup: cancel remaining pending review dispatches to prevent
             // stale dispatches from re-triggering review loops after dismiss.
@@ -1880,7 +1834,12 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.0["error"].as_str().unwrap().contains("provider mismatch"));
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider mismatch")
+        );
     }
 
     #[tokio::test]
