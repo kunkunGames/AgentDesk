@@ -520,8 +520,7 @@ pub(super) async fn tmux_output_watcher(
             )
             .await;
 
-            let ctx_cfg =
-                super::adk_session::fetch_context_thresholds(shared.api_port).await;
+            let ctx_cfg = super::adk_session::fetch_context_thresholds(shared.api_port).await;
             let pct = (tokens * 100) / ctx_cfg.context_window.max(1);
             if pct >= ctx_cfg.compact_pct && !is_prompt_too_long {
                 let exact_target =
@@ -1011,6 +1010,10 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 )
                 .await;
             }
+            // Clear restart report for this channel so recovery won't try to
+            // resume a session we're about to kill, which would show the
+            // "세션을 복구하지 못했습니다" error message.
+            super::restart_report::clear_restart_report(&provider, channel_id.get());
             // Kill old-gen session so it doesn't block new session creation.
             // Use spawn_blocking to avoid blocking the async runtime (matches
             // startup cleanup and reaper patterns).
