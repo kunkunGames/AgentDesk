@@ -144,34 +144,20 @@ pub fn create_dispatch_core(
         }
     }
 
-    // Insert dispatch.
-    // #116: For review-decision, the partial unique index idx_single_active_review_decision
-    // prevents concurrent race conditions from creating duplicates at the DB level.
-    if let Err(e) = conn.execute(
-        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, datetime('now'), datetime('now'))",
-        rusqlite::params![dispatch_id, kanban_card_id, to_agent_id, dispatch_type, title, context_str],
-    ) {
-        if dispatch_type == "review-decision"
-            && e.to_string().contains("UNIQUE constraint failed")
-        {
-            return Err(anyhow::anyhow!(
-                "review-decision already exists for card {} (concurrent race prevented by DB constraint)",
-                kanban_card_id
-            ));
-        }
-        return Err(e.into());
-    }
-
-    // #155: Use transition reducer for kanban_cards UPDATE
+    // #155: Dispatch INSERT + card-state intents in a single transaction.
+    // The dispatch row and card-state update must be atomic — if intents fail,
+    // the dispatch row must also be rolled back to prevent orphaned dispatches.
     apply_dispatch_attached_intents(
         &conn,
         kanban_card_id,
+        to_agent_id,
         &dispatch_id,
         dispatch_type,
         is_review_type,
         &old_status,
         &effective,
+        title,
+        &context_str,
     )?;
 
     Ok((dispatch_id, old_status))
@@ -287,31 +273,18 @@ pub fn create_dispatch_core_with_id(
         }
     }
 
-    if let Err(e) = conn.execute(
-        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, datetime('now'), datetime('now'))",
-        rusqlite::params![dispatch_id, kanban_card_id, to_agent_id, dispatch_type, title, context_str],
-    ) {
-        if dispatch_type == "review-decision"
-            && e.to_string().contains("UNIQUE constraint failed")
-        {
-            return Err(anyhow::anyhow!(
-                "review-decision already exists for card {} (concurrent race prevented by DB constraint)",
-                kanban_card_id
-            ));
-        }
-        return Err(e.into());
-    }
-
-    // #155: Use transition reducer for kanban_cards UPDATE
+    // #155: Dispatch INSERT + card-state intents in a single transaction
     apply_dispatch_attached_intents(
         &conn,
         kanban_card_id,
+        to_agent_id,
         dispatch_id,
         dispatch_type,
         is_review_type,
         &old_status,
         &effective,
+        title,
+        &context_str,
     )?;
 
     Ok((dispatch_id.to_string(), old_status))
@@ -369,18 +342,21 @@ pub fn create_dispatch(
     Ok(dispatch)
 }
 
-/// #155: Apply DispatchAttached transition intents via the reducer pattern.
+/// #155: Insert dispatch row + apply DispatchAttached transition intents atomically.
 ///
-/// Replaces the direct `UPDATE kanban_cards SET latest_dispatch_id/status` SQL
-/// with `decide_transition(DispatchAttached)` → Executor.
+/// Both the `task_dispatches` INSERT and the card-state intents execute inside
+/// a single transaction so that reducer failure rolls back the dispatch row too.
 fn apply_dispatch_attached_intents(
     conn: &rusqlite::Connection,
     card_id: &str,
+    to_agent_id: &str,
     dispatch_id: &str,
     dispatch_type: &str,
     is_review_type: bool,
     old_status: &str,
     effective: &crate::pipeline::PipelineConfig,
+    title: &str,
+    context_str: &str,
 ) -> Result<()> {
     use crate::engine::transition::{
         self, CardState, GateSnapshot, TransitionContext, TransitionEvent, TransitionOutcome,
@@ -421,6 +397,22 @@ fn apply_dispatch_attached_intents(
 
     conn.execute_batch("BEGIN")?;
     let exec_result = (|| -> anyhow::Result<()> {
+        // Insert dispatch row inside the transaction (#155 review fix)
+        if let Err(e) = conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, datetime('now'), datetime('now'))",
+            rusqlite::params![dispatch_id, card_id, to_agent_id, dispatch_type, title, context_str],
+        ) {
+            if dispatch_type == "review-decision"
+                && e.to_string().contains("UNIQUE constraint failed")
+            {
+                return Err(anyhow::anyhow!(
+                    "review-decision already exists for card {} (concurrent race prevented by DB constraint)",
+                    card_id
+                ));
+            }
+            return Err(e.into());
+        }
         for intent in &decision.intents {
             transition::execute_intent_on_conn(conn, intent)?;
         }
