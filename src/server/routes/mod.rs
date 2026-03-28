@@ -125,7 +125,10 @@ pub fn api_router(
         )
         .route("/kanban-cards/{id}/defer-dod", patch(kanban::defer_dod))
         .route("/kanban-cards/{id}/reviews", get(kanban::list_card_reviews))
-        .route("/kanban-cards/{id}/review-state", get(kanban::get_card_review_state))
+        .route(
+            "/kanban-cards/{id}/review-state",
+            get(kanban::get_card_review_state),
+        )
         .route("/kanban-cards/{id}/audit-log", get(kanban::card_audit_log))
         .route(
             "/kanban-cards/{id}/comments",

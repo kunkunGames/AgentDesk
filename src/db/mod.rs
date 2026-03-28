@@ -50,7 +50,9 @@ impl DbPool {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )?;
         Ok(conn)
     }
 }
@@ -61,7 +63,8 @@ pub type Db = Arc<DbPool>;
 #[cfg(test)]
 pub fn test_db() -> Db {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").ok();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        .ok();
     schema::migrate(&conn).unwrap();
     Arc::new(DbPool {
         path: std::path::PathBuf::from(":memory:"),
@@ -107,7 +110,9 @@ pub fn init(config: &Config) -> Result<Db> {
     let db_path = config.data.dir.join(&config.data.db_name);
     let conn = Connection::open(&db_path)?;
 
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
     schema::migrate(&conn)?;
 
     tracing::info!("Database initialized at {}", db_path.display());

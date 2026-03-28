@@ -310,8 +310,7 @@ pub async fn hook_session(
                 // Only review dispatches are auto-completed on idle.
                 // implementation/rework require explicit completion via
                 // PATCH /api/dispatches/:id (turn_bridge calls this at turn end).
-                (dtype == "review" && dstatus == "pending")
-                    .then_some(did.clone())
+                (dtype == "review" && dstatus == "pending").then_some(did.clone())
             })
         })
     } else {
@@ -805,7 +804,10 @@ mod tests {
             card_status == "requested" || card_status == "in_progress",
             "card should not advance past in_progress, got: {card_status}"
         );
-        assert_eq!(dispatch_status, "pending", "implementation dispatch should stay pending on idle");
+        assert_eq!(
+            dispatch_status, "pending",
+            "implementation dispatch should stay pending on idle"
+        );
     }
 
     #[tokio::test]
@@ -893,7 +895,10 @@ mod tests {
         // Card stays in rework — must NOT advance to review (which would happen
         // if idle auto-completed the rework dispatch).
         assert_eq!(card_status, "rework", "card should not advance past rework");
-        assert_eq!(dispatch_status, "pending", "rework dispatch should stay pending on idle");
+        assert_eq!(
+            dispatch_status, "pending",
+            "rework dispatch should stay pending on idle"
+        );
     }
 
     #[tokio::test]

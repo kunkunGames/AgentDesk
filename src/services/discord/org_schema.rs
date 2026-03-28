@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use poise::serenity_prelude::ChannelId;
 use serde::Deserialize;
 
 use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
-use super::runtime_store::org_schema_path;
+use super::runtime_store::{agentdesk_root, org_schema_path};
 use super::settings::{PeerAgentInfo, RoleBinding};
 use crate::services::provider::ProviderKind;
 
@@ -100,6 +101,19 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn resolve_runtime_path(path: &str) -> String {
+    let expanded = expand_tilde(path);
+    if Path::new(&expanded).is_absolute() {
+        return expanded;
+    }
+
+    if let Some(root) = agentdesk_root() {
+        return root.join(expanded).display().to_string();
+    }
+
+    expanded
+}
+
 // ─── Loading ────────────────────────────────────────────────────────────────
 
 fn load_org_schema() -> Option<OrgSchema> {
@@ -176,10 +190,10 @@ pub(super) fn resolve_role_binding(
     let prompt_file = agent_def
         .prompt_file
         .as_deref()
-        .map(expand_tilde)
+        .map(resolve_runtime_path)
         .or_else(|| {
             schema.prompts_root.as_deref().map(|root| {
-                let base = expand_tilde(root);
+                let base = resolve_runtime_path(root);
                 format!("{}/agents/{}/IDENTITY.md", base, ch_binding.agent)
             })
         })
@@ -206,7 +220,7 @@ pub(super) fn resolve_workspace(
         .as_deref()
         .or(agent_def.workspace.as_deref())?;
 
-    Some(expand_tilde(ws))
+    Some(resolve_runtime_path(ws))
 }
 
 pub(super) fn load_shared_prompt_path() -> Option<String> {
@@ -215,9 +229,9 @@ pub(super) fn load_shared_prompt_path() -> Option<String> {
     schema
         .shared_prompt
         .as_deref()
-        .map(expand_tilde)
+        .map(resolve_runtime_path)
         .or_else(|| {
-            let root = expand_tilde(schema.prompts_root.as_deref()?);
+            let root = resolve_runtime_path(schema.prompts_root.as_deref()?);
             let path = format!("{}/_shared.md", root);
             if std::path::Path::new(&path).exists() {
                 Some(path)
@@ -230,7 +244,7 @@ pub(super) fn load_shared_prompt_path() -> Option<String> {
 /// Return the configured skills_root path (expanded).
 pub(super) fn load_skills_root() -> Option<String> {
     let schema = load_org_schema()?;
-    schema.skills_root.as_deref().map(expand_tilde)
+    schema.skills_root.as_deref().map(resolve_runtime_path)
 }
 
 pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
@@ -576,6 +590,46 @@ channels:
                     .contains("/prompts/agents/my-agent/IDENTITY.md"),
                 "Expected auto-derived prompt path, got: {}",
                 binding.prompt_file
+            );
+        });
+    }
+
+    #[test]
+    fn test_relative_paths_resolve_against_agentdesk_root() {
+        with_temp_root(|temp_home: &TempDir| {
+            write_org_yaml(
+                temp_home.path(),
+                r#"
+version: 1
+prompts_root: "prompts"
+skills_root: "skills"
+agents:
+  my-agent:
+    display_name: "Agent"
+channels:
+  by_id:
+    "201":
+      agent: my-agent
+      workspace: "workspace/my-agent"
+"#,
+            );
+
+            let root = temp_home.path().join(".adk");
+            let binding = resolve_role_binding(ChannelId::new(201), None).unwrap();
+            assert_eq!(
+                binding.prompt_file,
+                root.join("prompts/agents/my-agent/IDENTITY.md")
+                    .display()
+                    .to_string()
+            );
+
+            let skills_root = load_skills_root().unwrap();
+            assert_eq!(skills_root, root.join("skills").display().to_string());
+
+            let workspace = resolve_workspace(ChannelId::new(201), None).unwrap();
+            assert_eq!(
+                workspace,
+                root.join("workspace/my-agent").display().to_string()
             );
         });
     }

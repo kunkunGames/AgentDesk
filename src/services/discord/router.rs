@@ -1252,7 +1252,75 @@ pub(super) async fn handle_text_message(
             .map(|name| provider.build_tmux_session_name(name));
         (channel_name, tmux_session_name)
     };
+
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
+
+    if shared
+        .pending_model_session_resets
+        .remove(&channel_id)
+        .is_some()
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        let previous_session_id = {
+            let mut data = shared.core.lock().await;
+            data.sessions
+                .get_mut(&channel_id)
+                .and_then(|session| session.session_id.take())
+        };
+        let previous_session_id =
+            if previous_session_id.is_none() && matches!(provider, ProviderKind::Claude) {
+                if let Some(ref session_key) = adk_session_key {
+                    super::adk_session::fetch_claude_session_id(session_key, shared.api_port).await
+                } else {
+                    None
+                }
+            } else {
+                previous_session_id
+            };
+
+        if let Some(ref session_name) = tmux_session_name {
+            #[cfg(unix)]
+            {
+                if crate::services::tmux_diagnostics::tmux_session_exists(session_name) {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["kill-session", "-t", session_name])
+                        .output();
+                }
+            }
+
+            if let Some(handle) = crate::services::claude::PROCESS_HANDLES
+                .lock()
+                .unwrap()
+                .remove(session_name)
+            {
+                match handle {
+                    crate::services::session_backend::SessionHandle::Process { child, .. } => {
+                        if let Ok(mut guard) = child.lock() {
+                            if let Some(mut process) = guard.take() {
+                                crate::services::claude::kill_child_tree(&mut process);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(provider, ProviderKind::Claude) {
+            if let Some(previous_session_id) = previous_session_id.as_deref() {
+                super::adk_session::clear_stale_claude_session_id(
+                    previous_session_id,
+                    shared.api_port,
+                )
+                .await;
+            }
+        }
+
+        println!(
+            "  [{ts}] ↻ MODEL-RESET: cleared stored session state for channel {} ({})",
+            channel_id,
+            provider.as_str()
+        );
+    }
 
     // If in-memory session_id is None (e.g. after dcserver restart),
     // try to restore it from the DB's claude_session_id.
@@ -1448,6 +1516,7 @@ pub(super) async fn handle_text_message(
                         tmux_session_name.as_deref(),
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
                     ),
                     ProviderKind::Unsupported(name) => {
                         let _ = tx.send(StreamMessage::Error {
@@ -2098,7 +2167,7 @@ Any other message is sent to {p}.
 `!cc <skill>` — Run a provider skill
 
 **Settings**
-`!model [get|set|clear] [name]` — Model management
+`!model [get|set|clear] [name]` — Model management with curated provider catalog
 `!debug` — Toggle debug logging
 `!metrics [date]` — Show turn metrics
 `!queue [all]` — Show pending queue
@@ -2146,16 +2215,6 @@ Any other message is sent to {p}.
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
 
-            if !matches!(data.provider, ProviderKind::Claude) {
-                let _ = msg
-                    .reply(
-                        &ctx.http,
-                        "Model override is only supported for Claude channels.",
-                    )
-                    .await;
-                return Ok(true);
-            }
-
             match *arg1 {
                 "set" => {
                     if arg2.is_empty() {
@@ -2163,68 +2222,106 @@ Any other message is sent to {p}.
                             .reply(&ctx.http, "Usage: `!model set <model_name>`")
                             .await;
                     } else {
-                        data.shared
-                            .model_overrides
-                            .insert(channel_id, arg2.to_string());
-                        let display = data
-                            .shared
-                            .model_overrides
-                            .get(&channel_id)
-                            .map(|v| v.clone())
-                            .unwrap_or_else(|| "(default)".to_string());
-                        let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                        let response = match super::commands::config::apply_model_override(
+                            &data.shared,
+                            &data.provider,
+                            channel_id,
+                            arg2,
+                            &data.token,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(message) => {
+                                super::commands::config::model_error_response(&data.provider, message)
+                            }
+                        };
+                        if super::commands::config::send_model_response_raw(
+                            &ctx.http,
+                            channel_id,
+                            msg.id,
+                            &response,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            let _ = msg.reply(&ctx.http, response.plain_text()).await;
+                        }
                     }
                 }
                 "clear" | "default" | "none" => {
-                    data.shared.model_overrides.remove(&channel_id);
-                    let _ = msg
-                        .reply(&ctx.http, "Model override cleared. Using default.")
-                        .await;
+                    let response = match super::commands::config::apply_model_override(
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        "default",
+                        &data.token,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(message) => {
+                            super::commands::config::model_error_response(&data.provider, message)
+                        }
+                    };
+                    if super::commands::config::send_model_response_raw(
+                        &ctx.http,
+                        channel_id,
+                        msg.id,
+                        &response,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = msg.reply(&ctx.http, response.plain_text()).await;
+                    }
                 }
                 "get" | "" => {
-                    let override_model = data
-                        .shared
-                        .model_overrides
-                        .get(&channel_id)
-                        .map(|v| v.clone());
-                    let ch_name = {
-                        let d = data.shared.core.lock().await;
-                        d.sessions
-                            .get(&channel_id)
-                            .and_then(|s| s.channel_name.clone())
-                    };
-                    let role_model = resolve_role_binding(channel_id, ch_name.as_deref())
-                        .and_then(|rb| rb.model);
-                    let effective = override_model
-                        .as_deref()
-                        .or(role_model.as_deref())
-                        .unwrap_or("(default)");
-                    let source = if override_model.is_some() {
-                        "runtime override"
-                    } else if role_model.is_some() {
-                        "role-map"
-                    } else {
-                        "system default"
-                    };
-                    let _ = msg
-                        .reply(
-                            &ctx.http,
-                            format!("Model: **{effective}** (source: {source})"),
-                        )
-                        .await;
+                    let response = super::commands::config::describe_model_override(
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                    )
+                    .await;
+                    if super::commands::config::send_model_response_raw(
+                        &ctx.http,
+                        channel_id,
+                        msg.id,
+                        &response,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = msg.reply(&ctx.http, response.plain_text()).await;
+                    }
                 }
                 _ => {
                     // Treat bare arg as shorthand for "set"
-                    data.shared
-                        .model_overrides
-                        .insert(channel_id, arg1.to_string());
-                    let display = data
-                        .shared
-                        .model_overrides
-                        .get(&channel_id)
-                        .map(|v| v.clone())
-                        .unwrap_or_else(|| "(default)".to_string());
-                    let _ = msg.reply(&ctx.http, format!("Model set to **{display}** for this channel. Takes effect on next turn.")).await;
+                    let response = match super::commands::config::apply_model_override(
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        arg1,
+                        &data.token,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(message) => {
+                            super::commands::config::model_error_response(&data.provider, message)
+                        }
+                    };
+                    if super::commands::config::send_model_response_raw(
+                        &ctx.http,
+                        channel_id,
+                        msg.id,
+                        &response,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let _ = msg.reply(&ctx.http, response.plain_text()).await;
+                    }
                 }
             }
             return Ok(true);

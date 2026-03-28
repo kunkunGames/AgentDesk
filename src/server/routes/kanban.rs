@@ -943,8 +943,7 @@ pub async fn defer_dod(
             let all_done = if let (Some(items), Some(verified)) =
                 (dod["items"].as_array(), dod["verified"].as_array())
             {
-                !items.is_empty()
-                    && items.iter().all(|item| verified.contains(item))
+                !items.is_empty() && items.iter().all(|item| verified.contains(item))
             } else {
                 false
             };
@@ -981,7 +980,10 @@ pub async fn defer_dod(
             crate::engine::hooks::Hook::OnReviewEnter,
             json!({"card_id": id}),
         );
-        tracing::info!("[dod] Card {} DoD all-complete — restarting review from awaiting_dod", id);
+        tracing::info!(
+            "[dod] Card {} DoD all-complete — restarting review from awaiting_dod",
+            id
+        );
     }
 
     match card_result {
@@ -1598,7 +1600,9 @@ pub async fn pm_decision(
             if !has_live {
                 return (
                     StatusCode::CONFLICT,
-                    Json(json!({"error": "cannot resume: no live dispatch/session for this card. Use 'rework' or 'requeue' instead."})),
+                    Json(
+                        json!({"error": "cannot resume: no live dispatch/session for this card. Use 'rework' or 'requeue' instead."}),
+                    ),
                 );
             }
             let _ = crate::kanban::transition_status_with_opts(

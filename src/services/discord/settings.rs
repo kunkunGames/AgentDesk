@@ -42,7 +42,7 @@ pub(super) struct RoleBinding {
     pub role_id: String,
     pub prompt_file: String,
     pub provider: Option<ProviderKind>,
-    /// Optional model override (e.g. "opus", "sonnet", "haiku")
+    /// Optional provider-specific CLI-safe model override.
     pub model: Option<String>,
 }
 
@@ -400,6 +400,15 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
                 .collect()
         })
         .unwrap_or_default();
+    let channel_model_overrides = entry
+        .get("channel_model_overrides")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let allowed_user_ids = entry
         .get("allowed_user_ids")
         .and_then(|v| v.as_array())
@@ -422,6 +431,7 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
                     owner_user_id,
                     last_sessions,
                     last_remotes,
+                    channel_model_overrides,
                     allowed_user_ids,
                     allowed_bot_ids,
                     ..DiscordBotSettings::default()
@@ -435,6 +445,7 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         allowed_tools,
         last_sessions,
         last_remotes,
+        channel_model_overrides,
         owner_user_id,
         allowed_user_ids,
         allowed_bot_ids,
@@ -462,6 +473,7 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
         "allowed_tools": normalized_tools,
         "last_sessions": settings.last_sessions,
         "last_remotes": settings.last_remotes,
+        "channel_model_overrides": settings.channel_model_overrides,
         "allowed_user_ids": settings.allowed_user_ids,
         "allowed_bot_ids": settings.allowed_bot_ids,
     });
@@ -531,12 +543,13 @@ mod tests {
     use poise::serenity_prelude::ChannelId;
     use tempfile::TempDir;
 
+    use super::super::DiscordBotSettings;
     use crate::services::provider::ProviderKind;
 
     use super::{
         channel_supports_provider, discord_token_hash, load_bot_settings,
         load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
-        resolve_role_binding,
+        resolve_role_binding, save_bot_settings,
     };
 
     fn with_temp_home<F>(f: F)
@@ -661,6 +674,60 @@ mod tests {
             assert_eq!(settings.owner_user_id, Some(343742347365974000));
             assert_eq!(settings.allowed_user_ids, vec![429955158974136300]);
             assert_eq!(settings.allowed_bot_ids, vec![1479017284805722200]);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_settings_reads_channel_model_overrides() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "channel_model_overrides": {
+                        "123": "gpt-5.4",
+                        "456": "opus"
+                    }
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert_eq!(
+                settings.channel_model_overrides.get("123"),
+                Some(&"gpt-5.4".to_string())
+            );
+            assert_eq!(
+                settings.channel_model_overrides.get("456"),
+                Some(&"opus".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_save_bot_settings_persists_channel_model_overrides() {
+        with_temp_home(|_temp_home: &TempDir| {
+            let token = "test-token";
+            let mut settings = DiscordBotSettings::default();
+            settings.channel_model_overrides.insert(
+                "1486017489027469493".to_string(),
+                "gpt-5.4-mini".to_string(),
+            );
+
+            save_bot_settings(token, &settings);
+
+            let loaded = load_bot_settings(token);
+            assert_eq!(
+                loaded.channel_model_overrides.get("1486017489027469493"),
+                Some(&"gpt-5.4-mini".to_string())
+            );
         });
     }
 

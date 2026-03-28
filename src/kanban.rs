@@ -928,7 +928,8 @@ mod tests {
                 dispatched_at   DATETIME,
                 completed_at    DATETIME
             );",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn seed_card_with_repo(db: &Db, card_id: &str, status: &str, repo_id: &str) {
@@ -951,13 +952,15 @@ mod tests {
             "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after)
              VALUES (?1, 'Build', 1, 'ready')",
             [repo_id],
-        ).unwrap();
+        )
+        .unwrap();
         let stage1 = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after)
              VALUES (?1, 'Deploy', 2, 'review_pass')",
             [repo_id],
-        ).unwrap();
+        )
+        .unwrap();
         let stage2 = conn.last_insert_rowid();
         (stage1, stage2)
     }
@@ -1002,7 +1005,8 @@ mod tests {
             conn.execute(
                 "UPDATE kanban_cards SET pipeline_stage_id = ?1 WHERE id = 'card-pipe'",
                 [stage1],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Create and complete an implementation dispatch
@@ -1013,7 +1017,8 @@ mod tests {
             conn.execute(
                 "UPDATE task_dispatches SET status = 'completed', result = '{}' WHERE id = ?1",
                 [dispatch_id],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Fire OnDispatchCompleted — should NOT create a new dispatch for stage-2
@@ -1030,7 +1035,8 @@ mod tests {
                 "SELECT pipeline_stage_id FROM kanban_cards WHERE id = 'card-pipe'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
         assert_eq!(
             stage_id.as_deref(),
@@ -1078,9 +1084,13 @@ mod tests {
                 "SELECT status FROM auto_queue_entries WHERE id = ?1",
                 [&entry_a],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
-        assert_eq!(entry_status, "done", "Rust must mark auto_queue_entry as done");
+        assert_eq!(
+            entry_status, "done",
+            "Rust must mark auto_queue_entry as done"
+        );
     }
 
     /// #110: review → done → auto-queue should not conflict with pending_decision.
@@ -1109,7 +1119,14 @@ mod tests {
         }
 
         // Transition to pending_decision (NOT done)
-        let result = transition_status_with_opts(&db, &engine, "card-pd", "pending_decision", "pm-gate", true);
+        let result = transition_status_with_opts(
+            &db,
+            &engine,
+            "card-pd",
+            "pending_decision",
+            "pm-gate",
+            true,
+        );
         assert!(result.is_ok());
 
         // Verify: entry should still be 'dispatched' (not done)
@@ -1119,7 +1136,8 @@ mod tests {
                 "SELECT status FROM auto_queue_entries WHERE id = 'entry-pd'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
         assert_eq!(
             entry_status, "dispatched",
@@ -1154,7 +1172,12 @@ mod tests {
 
         // Transition back to in_progress (simulates rework)
         let result = transition_status_with_opts(
-            &db, &engine, "card-rework", "in_progress", "pm-decision", true,
+            &db,
+            &engine,
+            "card-rework",
+            "in_progress",
+            "pm-decision",
+            true,
         );
         assert!(result.is_ok(), "rework transition should succeed");
 
@@ -1165,7 +1188,8 @@ mod tests {
                 "SELECT started_at FROM kanban_cards WHERE id = 'card-rework'",
                 [],
                 |row| row.get(0),
-            ).unwrap()
+            )
+            .unwrap()
         };
 
         // started_at should be within the last minute, not 3 hours ago

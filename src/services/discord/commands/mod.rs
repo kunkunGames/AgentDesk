@@ -1,4 +1,4 @@
-mod config;
+pub(in crate::services::discord) mod config;
 mod control;
 mod diagnostics;
 mod help;

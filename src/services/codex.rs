@@ -37,7 +37,7 @@ use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
-    let args = base_exec_args(None, prompt);
+    let args = base_exec_args(None, prompt, None);
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let output = Command::new(codex_bin)
@@ -109,6 +109,7 @@ pub fn execute_command_streaming(
     tmux_session_name: Option<&str>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    model_override: Option<&str>,
 ) -> Result<(), String> {
     let prompt = compose_codex_prompt(prompt, system_prompt, allowed_tools);
 
@@ -157,6 +158,7 @@ pub fn execute_command_streaming(
                 tmux_name,
                 report_channel_id,
                 report_provider,
+                model_override,
             );
         }
         // ProcessBackend fallback for Codex (no tmux or non-unix)
@@ -166,12 +168,14 @@ pub fn execute_command_streaming(
             sender,
             cancel_token,
             tmux_name,
+            model_override,
         );
     }
 
     execute_streaming_direct(
         &prompt,
         session_id,
+        model_override,
         working_dir,
         sender,
         cancel_token,
@@ -216,6 +220,7 @@ Follow them over any generic assistant persona unless the user explicitly asks t
 fn execute_streaming_direct(
     prompt: &str,
     session_id: Option<&str>,
+    model_override: Option<&str>,
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
@@ -223,7 +228,7 @@ fn execute_streaming_direct(
     report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
     let codex_bin = get_codex_path().ok_or_else(|| "Codex CLI not found".to_string())?;
-    let args = base_exec_args(session_id, prompt);
+    let args = base_exec_args(session_id, prompt, model_override);
 
     let mut command = Command::new(codex_bin);
     command
@@ -352,6 +357,7 @@ fn execute_streaming_local_tmux(
     tmux_session_name: &str,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    model_override: Option<&str>,
 ) -> Result<(), String> {
     let output_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
     let input_fifo_path =
@@ -451,7 +457,7 @@ fn execute_streaming_local_tmux(
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \
         --cwd {wd} \\\n  \
-        --codex-bin {codex_bin}\n",
+        --codex-bin {codex_bin}{model_flag}\n",
         env = env_lines,
         exe = shell_escape(&exe.display().to_string()),
         output = shell_escape(&output_path),
@@ -459,6 +465,9 @@ fn execute_streaming_local_tmux(
         prompt = shell_escape(&prompt_path),
         wd = shell_escape(working_dir),
         codex_bin = shell_escape(codex_bin),
+        model_flag = model_override
+            .map(|model| format!(" \\\n  --model {}", shell_escape(model)))
+            .unwrap_or_default(),
     );
 
     std::fs::write(&script_path, &script_content)
@@ -603,6 +612,7 @@ fn execute_streaming_local_process_codex(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
+    model_override: Option<&str>,
 ) -> Result<(), String> {
     use crate::services::session_backend::{
         ProcessBackend, SessionBackend, SessionConfig, SessionHandle,
@@ -684,7 +694,7 @@ fn execute_streaming_local_process_codex(
     let exe =
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
-    let config = SessionConfig {
+    let mut config = SessionConfig {
         session_name: session_name.to_string(),
         working_dir: working_dir.to_string(),
         agentdesk_exe: exe.display().to_string(),
@@ -694,6 +704,11 @@ fn execute_streaming_local_process_codex(
         is_codex: true,
         env_vars: vec![],
     };
+    if let Some(model) = model_override {
+        config
+            .wrapper_args
+            .extend(["--model".to_string(), model.to_string()]);
+    }
 
     let backend = ProcessBackend::new();
     let handle = backend.create_session(&config)?;
@@ -736,11 +751,19 @@ fn execute_streaming_local_process_codex(
     Ok(())
 }
 
-fn base_exec_args(session_id: Option<&str>, prompt: &str) -> Vec<String> {
+fn base_exec_args(
+    session_id: Option<&str>,
+    prompt: &str,
+    model_override: Option<&str>,
+) -> Vec<String> {
     let mut args = vec!["exec".to_string()];
     if let Some(existing_thread_id) = session_id {
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
+    }
+    if let Some(model) = model_override {
+        args.push("--model".to_string());
+        args.push(model.to_string());
     }
     args.extend([
         "--skip-git-repo-check".to_string(),
@@ -886,7 +909,9 @@ fn handle_codex_json_line(
 mod tests {
     use std::sync::mpsc;
 
-    use super::{TMUX_PROMPT_B64_PREFIX, compose_codex_prompt, handle_codex_json_line};
+    use super::{
+        TMUX_PROMPT_B64_PREFIX, base_exec_args, compose_codex_prompt, handle_codex_json_line,
+    };
     use crate::services::claude::StreamMessage;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
@@ -1013,5 +1038,24 @@ mod tests {
         );
 
         assert!(!encoded.contains('\n'));
+    }
+
+    #[test]
+    fn test_base_exec_args_includes_model_override() {
+        let args = base_exec_args(Some("thread-1"), "hello", Some("gpt-5.4"));
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "thread-1",
+                "--model",
+                "gpt-5.4",
+                "--skip-git-repo-check",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "hello",
+            ]
+        );
     }
 }

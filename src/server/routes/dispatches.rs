@@ -295,7 +295,11 @@ pub async fn update_dispatch(
             }
             for (t_card_id, old_s, new_s) in &transitions {
                 crate::kanban::fire_transition_hooks(
-                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                    &state.db,
+                    &state.engine,
+                    t_card_id,
+                    old_s,
+                    new_s,
                 );
             }
         }

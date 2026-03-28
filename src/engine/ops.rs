@@ -604,7 +604,11 @@ mod tests {
                 .eval(r#"JSON.stringify(agentdesk.kanban.setStatus("card-js", "in_progress"))"#)
                 .unwrap();
             // Should not contain error
-            assert!(!result.contains("error"), "setStatus should succeed: {}", result);
+            assert!(
+                !result.contains("error"),
+                "setStatus should succeed: {}",
+                result
+            );
         });
 
         // Verify started_at was reset

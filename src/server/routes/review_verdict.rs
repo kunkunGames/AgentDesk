@@ -338,7 +338,11 @@ pub async fn submit_verdict(
             }
             for (t_card_id, old_s, new_s) in &transitions {
                 crate::kanban::fire_transition_hooks(
-                    &state.db, &state.engine, t_card_id, old_s, new_s,
+                    &state.db,
+                    &state.engine,
+                    t_card_id,
+                    old_s,
+                    new_s,
                 );
             }
         }
@@ -534,7 +538,12 @@ pub async fn submit_review_decision(
                     });
 
                     // #117: Update canonical review state before returning
-                    update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
+                    update_card_review_state(
+                        &state.db,
+                        &body.card_id,
+                        "accept",
+                        pending_rd_id.as_deref(),
+                    );
 
                     return (
                         StatusCode::OK,
@@ -600,13 +609,22 @@ pub async fn submit_review_decision(
                 }
                 for (t_card_id, old_s, new_s) in &transitions {
                     crate::kanban::fire_transition_hooks(
-                        &state.db, &state.engine, &t_card_id, &old_s, &new_s,
+                        &state.db,
+                        &state.engine,
+                        &t_card_id,
+                        &old_s,
+                        &new_s,
                     );
                 }
             }
 
             // #117: Update canonical review state before returning
-            update_card_review_state(&state.db, &body.card_id, "dispute", pending_rd_id.as_deref());
+            update_card_review_state(
+                &state.db,
+                &body.card_id,
+                "dispute",
+                pending_rd_id.as_deref(),
+            );
 
             return (
                 StatusCode::OK,
@@ -651,7 +669,12 @@ pub async fn submit_review_decision(
     }
 
     // #117: Update canonical review state for all decision paths
-    update_card_review_state(&state.db, &body.card_id, &body.decision, pending_rd_id.as_deref());
+    update_card_review_state(
+        &state.db,
+        &body.card_id,
+        &body.decision,
+        pending_rd_id.as_deref(),
+    );
 
     (
         StatusCode::OK,
@@ -1605,7 +1628,8 @@ mod tests {
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     dispatched_at DATETIME, completed_at DATETIME
                 );",
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, status, agent_id) VALUES ('run-drain', 'active', 'agent-1')",
                 [],
@@ -1643,7 +1667,11 @@ mod tests {
 
         // Card must be done
         let card_status: String = conn
-            .query_row("SELECT status FROM kanban_cards WHERE id = 'card-1'", [], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(card_status, "done");
 
@@ -1699,9 +1727,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "accept should be rejected as a verdict");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "accept should be rejected as a verdict"
+        );
         let err = body.0["error"].as_str().unwrap_or("");
-        assert!(err.contains("must be one of"), "error should list valid verdicts: {}", err);
+        assert!(
+            err.contains("must be one of"),
+            "error should list valid verdicts: {}",
+            err
+        );
     }
 
     /// #116: Creating a new review-decision cancels any existing pending ones for the same card.
@@ -1728,7 +1764,8 @@ mod tests {
             conn.execute(
                 "UPDATE kanban_cards SET latest_dispatch_id = 'rd-old' WHERE id = 'card-dup'",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Creating a new review-decision should cancel the old one
@@ -1740,7 +1777,10 @@ mod tests {
             "[New RD]",
             &serde_json::json!({"verdict": "improve"}),
         );
-        assert!(result.is_ok(), "new review-decision creation should succeed");
+        assert!(
+            result.is_ok(),
+            "new review-decision creation should succeed"
+        );
 
         let conn = db.lock().unwrap();
 
@@ -1752,7 +1792,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(old_status, "cancelled", "old review-decision must be cancelled");
+        assert_eq!(
+            old_status, "cancelled",
+            "old review-decision must be cancelled"
+        );
 
         // Only 1 pending review-decision should exist for this card
         let pending_count: i64 = conn
@@ -1762,7 +1805,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(pending_count, 1, "exactly 1 pending review-decision per card");
+        assert_eq!(
+            pending_count, 1,
+            "exactly 1 pending review-decision per card"
+        );
     }
 
     /// #117: card_review_state is updated when review-decision is consumed (accept path).
@@ -1814,7 +1860,14 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(rs_state, "rework_pending", "canonical state should be rework_pending after accept");
-        assert_eq!(last_decision.as_deref(), Some("accept"), "last_decision should be accept");
+        assert_eq!(
+            rs_state, "rework_pending",
+            "canonical state should be rework_pending after accept"
+        );
+        assert_eq!(
+            last_decision.as_deref(),
+            Some("accept"),
+            "last_decision should be accept"
+        );
     }
 }

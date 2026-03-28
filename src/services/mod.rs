@@ -3,6 +3,7 @@ pub mod codex;
 #[cfg(unix)]
 pub mod codex_tmux_wrapper;
 pub mod discord;
+pub mod model_catalog;
 pub mod platform;
 pub mod process;
 pub mod provider;

@@ -13,6 +13,7 @@ pub fn run(
     prompt_file: &str,
     working_dir: &str,
     codex_bin: &str,
+    model_override: Option<&str>,
     input_mode: InputMode,
 ) {
     let mode_label = match input_mode {
@@ -118,6 +119,12 @@ pub fn run(
         });
     }
 
+    // The main thread must not keep an extra sender alive. In pipe-mode the
+    // input thread exits when the parent closes stdin; dropping this last sender
+    // lets prompt_rx.recv() return EOF so the wrapper can terminate cleanly
+    // instead of lingering as an orphan process.
+    drop(prompt_tx);
+
     let mut output = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -136,6 +143,7 @@ pub fn run(
         codex_bin,
         &expanded_dir,
         &prompt,
+        model_override,
         &mut thread_id,
     ) {
         emit_result_error(&mut output, &err);
@@ -153,6 +161,7 @@ pub fn run(
             codex_bin,
             &expanded_dir,
             next_prompt.trim(),
+            model_override,
             &mut thread_id,
         ) {
             emit_result_error(&mut output, &err);
@@ -199,6 +208,7 @@ fn run_turn(
     codex_bin: &str,
     working_dir: &str,
     prompt: &str,
+    model_override: Option<&str>,
     thread_id: &mut Option<String>,
 ) -> Result<(), String> {
     emit_status("[sending...]");
@@ -207,6 +217,10 @@ fn run_turn(
     if let Some(existing_thread_id) = thread_id.as_deref() {
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
+    }
+    if let Some(model) = model_override {
+        args.push("--model".to_string());
+        args.push(model.to_string());
     }
     args.extend([
         "--skip-git-repo-check".to_string(),

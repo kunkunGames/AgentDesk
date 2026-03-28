@@ -219,6 +219,35 @@ pub(super) async fn fetch_claude_session_id(session_key: &str, api_port: u16) ->
         .map(|s| s.to_string())
 }
 
+pub(super) async fn clear_stale_claude_session_id(claude_session_id: &str, api_port: u16) {
+    let body = serde_json::json!({
+        "claude_session_id": claude_session_id,
+    });
+
+    match reqwest::Client::new()
+        .post(local_api_url(
+            api_port,
+            "/api/dispatched-sessions/clear-stale-session-id",
+        ))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if !resp.status().is_success() => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ⚠ clear_stale_claude_session_id failed: HTTP {}",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ clear_stale_claude_session_id error: {e}");
+        }
+        _ => {}
+    }
+}
+
 fn normalize_user_task_summary(input: &str) -> Option<String> {
     let first_line = input
         .lines()
