@@ -805,20 +805,9 @@ pub async fn activate(
         )
         .ok();
         drop(conn_reacquired);
-        let db_clone = state.db.clone();
-        let card_id_c = card_id.clone();
-        let agent_id_c = agent_id.clone();
-        let title_c = title.clone();
-        tokio::spawn(async move {
-            super::dispatches::send_dispatch_to_discord(
-                &db_clone,
-                &agent_id_c,
-                &title_c,
-                &card_id_c,
-                &dispatch_id,
-            )
-            .await;
-        });
+        super::dispatches::queue_dispatch_notify(
+            &state.db, &dispatch_id, &agent_id, &card_id, &title,
+        );
 
         let conn_inner = state.db.separate_conn().unwrap();
         dispatched.push(entry_to_json(&conn_inner, entry_id));

@@ -426,9 +426,49 @@ fn apply_dispatch_attached_intents(
     Ok(())
 }
 
-/// Complete a dispatch, setting its status to "completed" with the given result.
-/// Fires `OnDispatchCompleted` hook.
+/// Single authority for dispatch completion.
+///
+/// All dispatch completion paths — turn_bridge explicit, recovery, API PATCH,
+/// session idle — MUST route through this function.  It performs:
+///   1. DB status update  (task_dispatches → completed)
+///   2. OnDispatchCompleted hook firing  (pipeline event hooks)
+///   3. Side-effect draining  (intents, transitions, follow-up dispatches)
+///   4. Safety-net re-fire of OnReviewEnter (#139)
+pub fn finalize_dispatch(
+    db: &Db,
+    engine: &PolicyEngine,
+    dispatch_id: &str,
+    completion_source: &str,
+    context: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let result = match context {
+        Some(ctx) => {
+            let mut merged = ctx.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "completion_source".to_string(),
+                    serde_json::Value::String(completion_source.to_string()),
+                );
+            }
+            merged
+        }
+        None => json!({ "completion_source": completion_source }),
+    };
+    complete_dispatch_inner(db, engine, dispatch_id, &result)
+}
+
+/// Legacy wrapper — delegates to [`finalize_dispatch`] for callers that already
+/// have a fully-formed result JSON (e.g. API PATCH handler).
 pub fn complete_dispatch(
+    db: &Db,
+    engine: &PolicyEngine,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    complete_dispatch_inner(db, engine, dispatch_id, result)
+}
+
+fn complete_dispatch_inner(
     db: &Db,
     engine: &PolicyEngine,
     dispatch_id: &str,
@@ -607,21 +647,15 @@ pub(crate) fn notify_hook_created_dispatches(db: &Db, pre_hook_max_rowid: i64) {
         return;
     }
 
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let db_clone = db.clone();
-        for (dispatch_id, agent_id, card_id, title) in dispatches {
-            let db_c = db_clone.clone();
-            handle.spawn(async move {
-                crate::server::routes::dispatches::send_dispatch_to_discord(
-                    &db_c,
-                    &agent_id,
-                    &title,
-                    &card_id,
-                    &dispatch_id,
-                )
-                .await;
-            });
-        }
+    // #144: Queue via dispatch outbox instead of tokio::spawn.
+    for (dispatch_id, agent_id, card_id, title) in dispatches {
+        crate::server::routes::dispatches::queue_dispatch_notify(
+            db,
+            &dispatch_id,
+            &agent_id,
+            &card_id,
+            &title,
+        );
     }
 }
 
@@ -1113,5 +1147,69 @@ mod tests {
         assert_eq!(latest_a, id_a);
         assert_eq!(latest_b, id_b);
         assert_ne!(latest_a, latest_b, "card dispatch IDs must not cross");
+    }
+
+    #[test]
+    fn finalize_dispatch_sets_completion_source() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-fin", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-fin",
+            "agent-1",
+            "implementation",
+            "Finalize test",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        let completed = finalize_dispatch(
+            &db,
+            &engine,
+            &dispatch_id,
+            "turn_bridge_explicit",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(completed["status"], "completed");
+        // result is parsed JSON (query_dispatch_row parses it)
+        assert_eq!(completed["result"]["completion_source"], "turn_bridge_explicit");
+    }
+
+    #[test]
+    fn finalize_dispatch_merges_context() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-ctx", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-ctx",
+            "agent-1",
+            "implementation",
+            "Context test",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        let completed = finalize_dispatch(
+            &db,
+            &engine,
+            &dispatch_id,
+            "session_idle",
+            Some(&json!({ "auto_completed": true })),
+        )
+        .unwrap();
+
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["result"]["completion_source"], "session_idle");
+        assert_eq!(completed["result"]["auto_completed"], true);
     }
 }

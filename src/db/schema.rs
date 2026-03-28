@@ -411,6 +411,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // #144: Dispatch notification outbox — durable queue for Discord side-effects.
+    // Replaces tokio::spawn fire-and-forget calls with a persistent outbox pattern.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dispatch_outbox (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatch_id  TEXT NOT NULL,
+            action       TEXT NOT NULL,
+            agent_id     TEXT,
+            card_id      TEXT,
+            title        TEXT,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   DATETIME DEFAULT (datetime('now')),
+            processed_at DATETIME,
+            error        TEXT
+        );",
+    )?;
+
     // Audit logs table for analytics dashboard
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS audit_logs (

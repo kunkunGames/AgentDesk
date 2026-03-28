@@ -501,11 +501,7 @@ pub async fn submit_verdict(
             }
         }
 
-        let db_clone = state.db.clone();
-        let dispatch_id = body.dispatch_id.clone();
-        tokio::spawn(async move {
-            super::dispatches::handle_completed_dispatch_followups(&db_clone, &dispatch_id).await;
-        });
+        super::dispatches::queue_dispatch_followup(&state.db, &body.dispatch_id);
     }
 
     // #119: TN is recorded when a pass-reviewed card reaches done (see kanban.rs
@@ -809,14 +805,9 @@ pub async fn submit_review_decision(
                     .ok();
                 drop(conn);
                 if let Some((did, aid, title)) = new_review {
-                    let db_clone = state.db.clone();
-                    let card_id = body.card_id.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::send_dispatch_to_discord(
-                            &db_clone, &aid, &title, &card_id, &did,
-                        )
-                        .await;
-                    });
+                    super::dispatches::queue_dispatch_notify(
+                        &state.db, &did, &aid, &body.card_id, &title,
+                    );
                 }
             }
 

@@ -446,33 +446,25 @@ pub async fn update_card(
                 t.transition_type == crate::pipeline::TransitionType::Gated
             });
         if new_s.as_str() != old_status && is_gated_transition {
-            let db_clone = state.db.clone();
-            let card_id = id.clone();
-            tokio::spawn(async move {
-                let dispatch_info: Option<(String, String, String)> = {
-                    let conn = match db_clone.lock() {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
+            // #144: Queue via dispatch outbox instead of tokio::spawn
+            let dispatch_info: Option<(String, String, String)> = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|conn| {
                     conn.query_row(
                         "SELECT kc.assigned_agent_id, kc.title, kc.latest_dispatch_id \
                          FROM kanban_cards kc WHERE kc.id = ?1",
-                        [&card_id],
+                        [&id],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .ok()
-                };
-                if let Some((agent_id, title, dispatch_id)) = dispatch_info {
-                    super::dispatches::send_dispatch_to_discord(
-                        &db_clone,
-                        &agent_id,
-                        &title,
-                        &card_id,
-                        &dispatch_id,
-                    )
-                    .await;
-                }
-            });
+                });
+            if let Some((agent_id, title, dispatch_id)) = dispatch_info {
+                super::dispatches::queue_dispatch_notify(
+                    &state.db, &dispatch_id, &agent_id, &id, &title,
+                );
+            }
         }
     }
 
@@ -700,18 +692,13 @@ pub async fn retry_card(
             // latest_dispatch_id re-query race.
             if let Ok(ref d) = retry_result {
                 let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
-                let db_clone = state.db.clone();
-                let title_c = card_title.clone();
-                tokio::spawn(async move {
-                    super::dispatches::send_dispatch_to_discord(
-                        &db_clone,
-                        &agent_id_for_dispatch,
-                        &title_c,
-                        &card_id_owned,
-                        &dispatch_id,
-                    )
-                    .await;
-                });
+                super::dispatches::queue_dispatch_notify(
+                    &state.db,
+                    &dispatch_id,
+                    &agent_id_for_dispatch,
+                    &card_id_owned,
+                    &card_title,
+                );
             }
         }
     } // drop conn lock
@@ -814,19 +801,13 @@ pub async fn redispatch_card(
             // latest_dispatch_id re-query race.
             if let Ok(ref d) = redispatch_result {
                 let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
-                let db_clone = state.db.clone();
-                let agent_id_clone = agent_id.clone();
-                let title_c = card_title.clone();
-                tokio::spawn(async move {
-                    super::dispatches::send_dispatch_to_discord(
-                        &db_clone,
-                        &agent_id_clone,
-                        &title_c,
-                        &card_id_owned,
-                        &dispatch_id,
-                    )
-                    .await;
-                });
+                super::dispatches::queue_dispatch_notify(
+                    &state.db,
+                    &dispatch_id,
+                    &agent_id,
+                    &card_id_owned,
+                    &card_title,
+                );
             }
         }
     }
