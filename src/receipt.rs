@@ -21,6 +21,7 @@ pub struct ReceiptData {
     pub total: f64,
     pub stats: ReceiptStats,
     pub providers: Vec<ProviderShare>,
+    pub agents: Vec<AgentShare>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,15 +43,25 @@ pub struct ReceiptStats {
     pub total_messages: u64,
     pub total_sessions: u64,
     /// Per-provider message and session counts (provider → (messages, sessions)).
-    /// Populated by `collect()`, used by `split_by_provider()`.
     #[serde(skip)]
     pub per_provider: HashMap<String, (u64, u64)>,
+    /// Provider → list of AgentShare for that provider (pre-computed for split).
+    #[serde(skip)]
+    pub per_provider_agents: HashMap<String, Vec<AgentShare>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderShare {
     pub provider: String,
     pub tokens: u64,
+    pub percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentShare {
+    pub agent: String,
+    pub tokens: u64,
+    pub cost: f64,
     pub percentage: f64,
 }
 
@@ -63,6 +74,7 @@ struct UsageRecord {
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     provider: String,
+    agent: String,
 }
 
 #[derive(Default)]
@@ -154,6 +166,137 @@ fn shorten_model(model: &str) -> String {
     }
 }
 
+// ── Agent name extraction ──────────────────────────────────────
+
+/// Build a map from paths → agent names by scanning:
+/// 1. `~/.adk/*/workspaces/` — canonical workspace directories
+/// 2. `~/.adk/*/worktrees/`  — git worktrees, resolved to parent workspace via `.git` file
+fn build_workspace_map() -> HashMap<PathBuf, String> {
+    let mut map = HashMap::new();
+    let home = dirs::home_dir().unwrap_or_default();
+    let adk = home.join(".adk");
+    let Ok(entries) = fs::read_dir(&adk) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let env_dir = entry.path();
+
+        // 1. Workspace directories
+        let ws_dir = env_dir.join("workspaces");
+        if ws_dir.is_dir() {
+            if let Ok(ws_entries) = fs::read_dir(&ws_dir) {
+                for ws in ws_entries.flatten() {
+                    let ws_path = ws.path();
+                    if ws_path.is_dir() {
+                        if let Some(name) = ws_path.file_name().and_then(|n| n.to_str()) {
+                            let name = name.to_string();
+                            let canonical =
+                                ws_path.canonicalize().unwrap_or_else(|_| ws_path.clone());
+                            map.insert(canonical, name.clone());
+                            map.insert(ws_path, name);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Worktree directories — resolve to parent workspace via .git file
+        //    .git file contains: gitdir: /.../.adk/.../workspaces/{agent}/.git/worktrees/{name}
+        let wt_dir = env_dir.join("worktrees");
+        if wt_dir.is_dir() {
+            if let Ok(wt_entries) = fs::read_dir(&wt_dir) {
+                for wt in wt_entries.flatten() {
+                    let wt_path = wt.path();
+                    if !wt_path.is_dir() {
+                        continue;
+                    }
+                    let git_file = wt_path.join(".git");
+                    if let Ok(content) = fs::read_to_string(&git_file) {
+                        // Parse: "gitdir: .../workspaces/{agent}/.git/worktrees/..."
+                        if let Some(gitdir) = content.trim().strip_prefix("gitdir: ") {
+                            let gp = Path::new(gitdir);
+                            for (i, comp) in gp.components().enumerate() {
+                                let s = comp.as_os_str().to_string_lossy();
+                                if s == "workspaces" {
+                                    if let Some(next) = gp.components().nth(i + 1) {
+                                        let agent = next.as_os_str().to_string_lossy().to_string();
+                                        let canonical = wt_path
+                                            .canonicalize()
+                                            .unwrap_or_else(|_| wt_path.clone());
+                                        map.insert(canonical, agent.clone());
+                                        map.insert(wt_path.clone(), agent);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Extract agent name from a JSONL file path (Claude) or cwd (any provider).
+///
+/// Resolution order:
+/// 1. Claude file path: encoded workspace dir always contains `workspaces-{name}`
+/// 2. cwd path: check `workspaces/` or `worktrees/` marker
+/// 3. cwd path: match against known workspace paths from filesystem
+/// 4. Fallback to provider name
+fn resolve_agent(
+    file_path: &Path,
+    cwd: Option<&str>,
+    ws_map: &HashMap<PathBuf, String>,
+    default: &str,
+) -> String {
+    // 1. Claude JSONL file path: encoded workspace name in directory
+    for ancestor in file_path.ancestors() {
+        if let Some(name) = ancestor.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('-') && name.contains("workspaces-") {
+                if let Some(ws) = name.rsplit("workspaces-").next() {
+                    if !ws.is_empty() {
+                        return ws.to_string();
+                    }
+                }
+            }
+        }
+        if ancestor.ends_with("projects") || ancestor.ends_with("sessions") {
+            break;
+        }
+    }
+
+    // 2-3. cwd-based resolution
+    if let Some(cwd) = cwd {
+        let cwd_path = Path::new(cwd);
+
+        // 2. Look for workspaces/ or worktrees/ marker
+        let mut found_marker = false;
+        for component in cwd_path.components() {
+            if found_marker {
+                let name = component.as_os_str().to_string_lossy();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+            let s = component.as_os_str().to_string_lossy();
+            if s == "workspaces" || s == "worktrees" {
+                found_marker = true;
+            }
+        }
+
+        // 3. Match cwd against known workspace paths
+        for (ws_path, agent_name) in ws_map {
+            if cwd_path.starts_with(ws_path) {
+                return agent_name.clone();
+            }
+        }
+    }
+
+    default.into()
+}
+
 // ── File discovery ─────────────────────────────────────────────
 
 fn find_jsonl(root: &Path) -> Vec<PathBuf> {
@@ -182,11 +325,18 @@ fn parse_claude(
     path: &Path,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    ws_map: &HashMap<PathBuf, String>,
 ) -> (Vec<UsageRecord>, u64, Option<String>) {
+    // Resolve agent from file path first (Claude paths always encode workspace)
+    let mut agent_name = {
+        let resolved = resolve_agent(path, None, ws_map, "claude");
+        if resolved != "claude" {
+            Some(resolved)
+        } else {
+            None
+        }
+    };
     let mut sid: Option<String> = None;
-    // Deduplicate by requestId: a single API request can produce multiple
-    // assistant entries in the JSONL (streaming chunks). Only the last entry
-    // per requestId carries the final cumulative usage.
     let mut by_request: HashMap<String, UsageRecord> = HashMap::new();
     let mut no_reqid_records: Vec<UsageRecord> = Vec::new();
 
@@ -200,6 +350,16 @@ fn parse_claude(
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+
+        // Fallback: try cwd from records if file path didn't resolve
+        if agent_name.is_none() {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                let name = resolve_agent(path, Some(cwd), ws_map, "claude");
+                if name != "claude" {
+                    agent_name = Some(name);
+                }
+            }
+        }
 
         let Some(ts_str) = v.get("timestamp").and_then(|t| t.as_str()) else {
             continue;
@@ -252,6 +412,7 @@ fn parse_claude(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             provider: "Claude".into(),
+            agent: agent_name.clone().unwrap_or_else(|| "claude".into()),
         };
 
         // Use requestId to deduplicate — last entry wins (cumulative usage)
@@ -274,7 +435,9 @@ fn parse_codex(
     path: &Path,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    ws_map: &HashMap<PathBuf, String>,
 ) -> (Vec<UsageRecord>, u64, Option<String>) {
+    let mut agent_name: Option<String> = None;
     let mut records = Vec::new();
     let mut sid: Option<String> = None;
     let mut current_model = String::from("codex");
@@ -302,6 +465,19 @@ fn parse_codex(
                 .and_then(|s| s.as_str())
                 .or_else(|| v.get("id").and_then(|s| s.as_str()))
                 .map(String::from);
+            // Extract agent from session_meta.payload.cwd
+            if agent_name.is_none() {
+                if let Some(cwd) = v
+                    .get("payload")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|c| c.as_str())
+                {
+                    let name = resolve_agent(path, Some(cwd), ws_map, "codex");
+                    if name != "codex" {
+                        agent_name = Some(name);
+                    }
+                }
+            }
             continue;
         }
         if rtype == "turn_context" {
@@ -368,6 +544,7 @@ fn parse_codex(
             cache_read_tokens: cached,
             cache_creation_tokens: 0,
             provider: "Codex".into(),
+            agent: agent_name.clone().unwrap_or_else(|| "codex".into()),
         });
     }
     // Flush final turn
@@ -417,6 +594,7 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
     let home = dirs::home_dir().unwrap_or_default();
     let claude_files = find_jsonl(&home.join(".claude").join("projects"));
     let codex_files = find_jsonl(&home.join(".codex").join("sessions"));
+    let ws_map = build_workspace_map();
 
     let mut all: Vec<UsageRecord> = Vec::new();
     let mut total_msgs = 0u64;
@@ -427,7 +605,7 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
     let mut prov_sessions: HashMap<String, HashSet<String>> = HashMap::new();
 
     for f in &claude_files {
-        let (recs, msgs, sid) = parse_claude(f, start, end);
+        let (recs, msgs, sid) = parse_claude(f, start, end, &ws_map);
         if !recs.is_empty() {
             total_msgs += msgs;
             *prov_msgs.entry("Claude".into()).or_default() += msgs;
@@ -439,7 +617,7 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
         }
     }
     for f in &codex_files {
-        let (recs, msgs, sid) = parse_codex(f, start, end);
+        let (recs, msgs, sid) = parse_codex(f, start, end, &ws_map);
         if !recs.is_empty() {
             total_msgs += msgs;
             *prov_msgs.entry("Codex".into()).or_default() += msgs;
@@ -499,6 +677,53 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
         });
     }
 
+    // Agent shares — per-(agent, provider) for accurate provider-split filtering.
+    // Key: (agent, provider) → (tokens, cost)
+    let mut ap_tokens: HashMap<(String, String), u64> = HashMap::new();
+    let mut ap_costs: HashMap<(String, String), f64> = HashMap::new();
+    for r in &all {
+        let tok = r.input_tokens + r.output_tokens + r.cache_read_tokens + r.cache_creation_tokens;
+        let key = (r.agent.clone(), r.provider.clone());
+        *ap_tokens.entry(key.clone()).or_default() += tok;
+        let p = pricing_for(&r.model);
+        let acc = ModelAccum {
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cache_read_tokens: r.cache_read_tokens,
+            cache_creation_tokens: r.cache_creation_tokens,
+            provider: String::new(),
+        };
+        *ap_costs.entry(key).or_default() += actual_cost(&acc, &p);
+    }
+    // Collapse to per-agent for the combined receipt
+    let mut agent_tokens: HashMap<String, u64> = HashMap::new();
+    let mut agent_costs: HashMap<String, f64> = HashMap::new();
+    for ((agent, _prov), tok) in &ap_tokens {
+        *agent_tokens.entry(agent.clone()).or_default() += tok;
+    }
+    for ((agent, _prov), cost) in &ap_costs {
+        *agent_costs.entry(agent.clone()).or_default() += cost;
+    }
+    let agent_total_tok: u64 = agent_tokens.values().sum();
+    let mut agents: Vec<AgentShare> = agent_tokens
+        .into_iter()
+        .map(|(agent, tok)| AgentShare {
+            cost: *agent_costs.get(&agent).unwrap_or(&0.0),
+            percentage: if agent_total_tok > 0 {
+                tok as f64 / agent_total_tok as f64 * 100.0
+            } else {
+                0.0
+            },
+            agent,
+            tokens: tok,
+        })
+        .collect();
+    agents.sort_by(|a, b| {
+        b.percentage
+            .partial_cmp(&a.percentage)
+            .unwrap_or(cmp::Ordering::Equal)
+    });
+
     // Provider shares
     let mut prov_tokens: HashMap<String, u64> = HashMap::new();
     let mut total_tok = 0u64;
@@ -535,6 +760,7 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
         subtotal: grand_sub,
         cache_discount: (grand_sub - grand_total).max(0.0),
         total: grand_total,
+        agents,
         stats: ReceiptStats {
             total_messages: total_msgs,
             total_sessions: sessions.len() as u64,
@@ -548,6 +774,34 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
                     (prov, (msgs, sess))
                 })
                 .collect(),
+            per_provider_agents: {
+                let mut by_prov: HashMap<String, Vec<(String, u64, f64)>> = HashMap::new();
+                for ((agent, prov), tok) in &ap_tokens {
+                    let cost = ap_costs.get(&(agent.clone(), prov.clone())).copied().unwrap_or(0.0);
+                    by_prov.entry(prov.clone()).or_default().push((agent.clone(), *tok, cost));
+                }
+                by_prov
+                    .into_iter()
+                    .map(|(prov, items)| {
+                        let prov_total: u64 = items.iter().map(|(_, t, _)| t).sum();
+                        let mut shares: Vec<AgentShare> = items
+                            .into_iter()
+                            .map(|(agent, tok, cost)| AgentShare {
+                                agent,
+                                tokens: tok,
+                                cost,
+                                percentage: if prov_total > 0 {
+                                    tok as f64 / prov_total as f64 * 100.0
+                                } else {
+                                    0.0
+                                },
+                            })
+                            .collect();
+                        shares.sort_by(|a, b| b.percentage.partial_cmp(&a.percentage).unwrap_or(cmp::Ordering::Equal));
+                        (prov, shares)
+                    })
+                    .collect()
+            },
         },
         providers,
     }
@@ -599,12 +853,19 @@ pub fn split_by_provider(data: &ReceiptData) -> Vec<ReceiptData> {
                     total_messages: prov_msgs,
                     total_sessions: prov_sess,
                     per_provider: HashMap::new(),
+                    per_provider_agents: HashMap::new(),
                 },
                 providers: vec![ProviderShare {
-                    provider: prov,
+                    provider: prov.clone(),
                     tokens: total_tokens,
                     percentage: 100.0,
                 }],
+                agents: data
+                    .stats
+                    .per_provider_agents
+                    .get(&prov)
+                    .cloned()
+                    .unwrap_or_default(),
                 models,
             }
         })
@@ -664,6 +925,19 @@ pub fn render_html(data: &ReceiptData) -> String {
                     pct,
                 ));
             }
+        }
+    }
+
+    // Agent usage percentage breakdown
+    let mut agent_pct_rows = String::new();
+    for a in &data.agents {
+        if a.percentage >= 0.1 {
+            agent_pct_rows.push_str(&format!(
+                r#"<div class="sl sm"><span>{}</span><span>{:.1}%</span></div>
+"#,
+                esc(&a.agent),
+                a.percentage,
+            ));
         }
     }
 
@@ -727,8 +1001,7 @@ body{{font-family:'Courier New',Courier,monospace;background:transparent;padding
 <div class="ss">
 <div class="st">MODEL USAGE</div>
 {model_pct_rows}</div>
-<hr class="sp">
-<div class="ss">
+{agent_section}<div class="ss">
 <div class="st">STATISTICS</div>
 <div class="sl sm"><span>Requests</span><span>{messages}</span></div>
 <div class="sl sm"><span>Sessions</span><span>{sessions}</span></div>
@@ -772,6 +1045,18 @@ body{{font-family:'Courier New',Courier,monospace;background:transparent;padding
             )
         },
         model_pct_rows = model_pct_rows,
+        agent_section = if !agent_pct_rows.is_empty() {
+            format!(
+                r#"<hr class="sp">
+<div class="ss">
+<div class="st">AGENT USAGE</div>
+{agent_pct_rows}</div>
+"#,
+                agent_pct_rows = agent_pct_rows,
+            )
+        } else {
+            String::new()
+        },
         messages = fmt_num(data.stats.total_messages),
         sessions = fmt_num(data.stats.total_sessions),
         version = env!("CARGO_PKG_VERSION"),
