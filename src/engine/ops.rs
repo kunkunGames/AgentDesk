@@ -126,8 +126,8 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 if (/(?:INSERT\s+INTO|UPDATE)\s+task_dispatches\b/i.test(sql)) {
                     throw new Error("Direct task_dispatches mutation is blocked. Use agentdesk.dispatch.create() instead.");
                 }
-                // Block direct INSERT/UPDATE on card_review_state — use agentdesk.reviewState.sync() instead (#158).
-                if (/(?:INSERT\s+INTO|UPDATE)\s+card_review_state\b/i.test(sql)) {
+                // Block direct INSERT/UPDATE/DELETE on card_review_state — use agentdesk.reviewState.sync() instead (#158).
+                if (/(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|UPDATE|DELETE\s+FROM)\s+card_review_state\b/i.test(sql)) {
                     throw new Error("Direct card_review_state mutation is blocked. Use agentdesk.reviewState.sync(cardId, state, opts) instead.");
                 }
                 // Direct write — db.execute remains synchronous by design.
@@ -774,6 +774,189 @@ mod tests {
             "started_at should be set after transitioning to in_progress"
         );
     }
+
+    /// Seed a minimal kanban_cards row for FK satisfaction in review state tests.
+    fn seed_card_for_review(conn: &rusqlite::Connection, card_id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('agent-t', 'Test', '0', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES (?1, 'T', 'review', 'agent-t', datetime('now'), datetime('now'))",
+            [card_id],
+        )
+        .unwrap();
+    }
+
+    // #158: review_state_sync_on_conn — idle state sets state and clears pending_dispatch_id
+    #[test]
+    fn test_review_state_sync_idle() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-1");
+        // Seed existing review state with pending_dispatch_id
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
+             VALUES ('rs-1', 'suggestion_pending', 'disp-1', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-1", "state": "idle"}).to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, pd): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "idle");
+        assert!(pd.is_none(), "idle should clear pending_dispatch_id");
+    }
+
+    // #158: leaving suggestion_pending must clear stale pending_dispatch_id
+    #[test]
+    fn test_review_state_sync_non_suggestion_pending_clears_pending_dispatch_id() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-1b");
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
+             VALUES ('rs-1b', 'suggestion_pending', 'disp-2', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({
+                "card_id": "rs-1b",
+                "state": "rework_pending",
+                "last_decision": "pm_rework"
+            })
+            .to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, pd): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1b'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "rework_pending");
+        assert!(
+            pd.is_none(),
+            "non-suggestion_pending states must clear stale pending_dispatch_id"
+        );
+    }
+
+    // #158: review_state_sync_on_conn — reviewing state auto-sets review_entered_at
+    #[test]
+    fn test_review_state_sync_reviewing() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-2");
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-2", "state": "reviewing", "review_round": 1})
+                .to_string(),
+        );
+        assert!(result.contains("\"ok\":true"));
+
+        let (state, rr, entered): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT state, review_round, review_entered_at FROM card_review_state WHERE card_id = 'rs-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "reviewing");
+        assert_eq!(rr, Some(1));
+        assert!(
+            entered.is_some(),
+            "reviewing should auto-set review_entered_at"
+        );
+    }
+
+    // #158: review_state_sync_on_conn — clear_verdict only NULLs last_verdict
+    #[test]
+    fn test_review_state_sync_clear_verdict() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-3");
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) \
+             VALUES ('rs-3', 'reviewing', 'improve', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-3", "state": "clear_verdict"}).to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, verdict): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_verdict FROM card_review_state WHERE card_id = 'rs-3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "reviewing", "clear_verdict should not change state");
+        assert!(verdict.is_none(), "clear_verdict should NULL last_verdict");
+    }
+
+    // #158: review_state_sync (JSON wrapper) — round-trip test
+    #[test]
+    fn test_review_state_sync_json_wrapper() {
+        let db = test_db();
+        {
+            let conn = db.separate_conn().unwrap();
+            seed_card_for_review(&conn, "rs-4");
+        }
+        let result = review_state_sync(
+            &db,
+            r#"{"card_id":"rs-4","state":"suggestion_pending","last_verdict":"improve","pending_dispatch_id":"d-99"}"#,
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        let (state, verdict, pd): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_verdict, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-4'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "suggestion_pending");
+        assert_eq!(verdict.as_deref(), Some("improve"));
+        assert_eq!(pd.as_deref(), Some("d-99"));
+    }
 }
 
 // ── Message queue ops ─────────────────────────────────────────────
@@ -1287,6 +1470,18 @@ pub fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &str) ->
         return r#"{"error":"card_id and state are required"}"#.to_string();
     }
 
+    // Special case: clear_verdict only NULLs last_verdict without changing state
+    if state == "clear_verdict" {
+        let result = conn.execute(
+            "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
+            rusqlite::params![card_id],
+        );
+        return match result {
+            Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+            Err(e) => format!(r#"{{"error":"sql error: {}"}}"#, e),
+        };
+    }
+
     // Build dynamic SET clause based on provided fields
     let review_round = params["review_round"].as_i64();
     let last_verdict = params["last_verdict"].as_str();
@@ -1304,7 +1499,11 @@ pub fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &str) ->
          review_round = COALESCE(?3, review_round), \
          last_verdict = COALESCE(?4, last_verdict), \
          last_decision = COALESCE(?5, last_decision), \
-         pending_dispatch_id = CASE WHEN ?2 = 'idle' THEN NULL ELSE COALESCE(?6, pending_dispatch_id) END, \
+         pending_dispatch_id = CASE \
+             WHEN ?6 IS NOT NULL THEN ?6 \
+             WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id \
+             ELSE NULL \
+         END, \
          approach_change_round = COALESCE(?7, approach_change_round), \
          review_entered_at = COALESCE(?8, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
          updated_at = datetime('now')",
