@@ -369,11 +369,11 @@ pub(super) async fn restore_inflight_turns(
             if session_alive {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
-                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, watcher will adopt",
+                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, spawning watcher immediately",
                     state.channel_id
                 );
                 super::restart_report::clear_restart_report(provider, state.channel_id);
-                // Register session in-memory so restore_tmux_watchers can find it.
+                // Register session in-memory so handlers can find it.
                 // Derive channel_name from tmux session name if not in inflight state.
                 let effective_channel_name = state.channel_name.clone().or_else(|| {
                     tmux_name.as_deref().and_then(|name| {
@@ -407,6 +407,64 @@ pub(super) async fn restore_inflight_turns(
                         session.channel_name = effective_channel_name;
                     }
                 }
+
+                // Immediately spawn a tmux watcher instead of deferring to
+                // restore_tmux_watchers().  The previous "watcher will adopt"
+                // approach had a race condition: the tmux session could die
+                // between recovery (now) and restore_tmux_watchers (~50s later),
+                // losing the in-progress response entirely.
+                if let Some(ref tmux_session_name) = tmux_name {
+                    let output_path = crate::services::tmux_common::session_temp_path(
+                        tmux_session_name,
+                        "jsonl",
+                    );
+                    if std::fs::metadata(&output_path).is_ok()
+                        && !shared.tmux_watchers.contains_key(&channel_id)
+                    {
+                        let initial_offset = std::fs::metadata(&output_path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        let cancel =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let paused =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let resume_offset =
+                            std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+                        let pause_epoch =
+                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let turn_delivered =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        shared.tmux_watchers.insert(
+                            channel_id,
+                            TmuxWatcherHandle {
+                                paused: paused.clone(),
+                                resume_offset: resume_offset.clone(),
+                                cancel: cancel.clone(),
+                                pause_epoch: pause_epoch.clone(),
+                                turn_delivered: turn_delivered.clone(),
+                            },
+                        );
+                        let ts2 = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                            tmux_session_name, initial_offset
+                        );
+                        tokio::spawn(super::tmux::tmux_output_watcher(
+                            channel_id,
+                            http.clone(),
+                            shared.clone(),
+                            output_path,
+                            tmux_session_name.clone(),
+                            initial_offset,
+                            cancel,
+                            paused,
+                            resume_offset,
+                            pause_epoch,
+                            turn_delivered,
+                        ));
+                    }
+                }
+
                 clear_inflight_state(provider, state.channel_id);
                 continue;
             } else {
@@ -623,18 +681,18 @@ pub(super) async fn restore_inflight_turns(
         };
 
         // If tmux pane is alive, skip recovery reader entirely.
-        // The session is idle (waiting for input) — restore_tmux_watchers will
-        // adopt it and attach a watcher. Recovery reader would just time out
-        // and declare SessionDied on an otherwise healthy session.
+        // The session is idle (waiting for input) — spawn a watcher immediately
+        // instead of deferring to restore_tmux_watchers() to avoid a race
+        // condition where the session could die in the gap between recovery and
+        // restore_tmux_watchers (~50s), losing the response.
         let pane_alive = tmux_session_has_live_pane(&tmux_session_name);
         if pane_alive {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
-                "  [{ts}] ↻ inflight recovery: pane alive for channel {}, skipping reader → watcher adopt",
+                "  [{ts}] ↻ inflight recovery: pane alive for channel {}, spawning watcher immediately",
                 state.channel_id
             );
-            // Register session in-memory so restore_tmux_watchers can find it.
-            // Derive channel_name from tmux session name if not in inflight state.
+            // Register session in-memory so handlers can find it.
             let effective_channel_name = channel_name.clone().or_else(|| {
                 crate::services::provider::parse_provider_and_channel_from_tmux_name(
                     &tmux_session_name,
@@ -672,6 +730,50 @@ pub(super) async fn restore_inflight_turns(
                     session.channel_name = effective_channel_name;
                 }
             }
+
+            // Immediately spawn watcher to avoid race condition.
+            if std::fs::metadata(&output_path).is_ok()
+                && !shared.tmux_watchers.contains_key(&channel_id)
+            {
+                let initial_offset = std::fs::metadata(&output_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+                let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let turn_delivered =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                shared.tmux_watchers.insert(
+                    channel_id,
+                    TmuxWatcherHandle {
+                        paused: paused.clone(),
+                        resume_offset: resume_offset.clone(),
+                        cancel: cancel.clone(),
+                        pause_epoch: pause_epoch.clone(),
+                        turn_delivered: turn_delivered.clone(),
+                    },
+                );
+                let ts2 = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                    tmux_session_name, initial_offset
+                );
+                tokio::spawn(super::tmux::tmux_output_watcher(
+                    channel_id,
+                    http.clone(),
+                    shared.clone(),
+                    output_path.clone(),
+                    tmux_session_name.clone(),
+                    initial_offset,
+                    cancel,
+                    paused,
+                    resume_offset,
+                    pause_epoch,
+                    turn_delivered,
+                ));
+            }
+
             clear_inflight_state(provider, state.channel_id);
             continue;
         }
