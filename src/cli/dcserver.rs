@@ -203,14 +203,7 @@ pub fn restart_windows_dcserver_and_verify(timeout: Duration) -> Result<(), Stri
 }
 
 pub fn agentdesk_runtime_root() -> Option<PathBuf> {
-    if let Ok(override_root) = env::var(AGENTDESK_ROOT_DIR_ENV) {
-        let trimmed = override_root.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-
-    dirs::home_dir().map(|h| h.join(".adk").join("release"))
+    crate::config::runtime_root()
 }
 
 pub fn current_dcserver_launchd_label() -> String {
@@ -910,31 +903,17 @@ pub fn handle_restart_dcserver(
     let tmux_session = "AgentDesk-dcserver";
 
     // Kill existing tmux session if it exists
-    let _ = std::process::Command::new("tmux")
-        .args(["kill-session", "-t", tmux_session])
-        .output();
+    crate::services::platform::tmux::kill_session(tmux_session);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let launcher_str = launcher_path.to_string_lossy();
-    let child = std::process::Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            tmux_session,
-            launcher_str.as_ref(),
-        ])
-        .spawn();
+    let create_result =
+        crate::services::platform::tmux::create_session(tmux_session, None, launcher_str.as_ref());
 
-    match child {
-        Ok(_) => {
+    match create_result {
+        Ok(output) if output.status.success() => {
             // Verify the session exists
-            let check = std::process::Command::new("tmux")
-                .args(["has-session", "-t", tmux_session])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if check.map(|s| s.success()).unwrap_or(false) {
+            if crate::services::platform::tmux::has_session(tmux_session) {
                 // Use current log size as offset to avoid matching stale "Bot connected" lines
                 let log_offset = dcserver_stdout_log_path()
                     .and_then(|p| fs::metadata(&p).ok())
@@ -978,6 +957,14 @@ pub fn handle_restart_dcserver(
                     format!("tmux fallback restart 실패\n- session: `{}`", tmux_session),
                 );
             }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("❌ tmux new-session failed: {}", stderr.trim());
+            write_restart_report(
+                "failed",
+                format!("tmux fallback restart 실패\n- stderr: `{}`", stderr.trim()),
+            );
         }
         Err(e) => {
             eprintln!("❌ Failed to start tmux session: {}", e);
