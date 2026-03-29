@@ -830,8 +830,8 @@ pub async fn generate(
     };
     let ai_model_str = ai_model.to_string();
     conn.execute(
-        "INSERT INTO auto_queue_runs (id, repo, agent_id, ai_model, ai_rationale, max_concurrent_threads, max_concurrent_per_agent, thread_group_count) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, max_concurrent_threads, max_concurrent_per_agent, thread_group_count) \
+         VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![run_id, body.repo, body.agent_id, ai_model_str, ai_rationale, max_concurrent, max_per_agent, thread_group_count],
     )
     .ok();
@@ -880,8 +880,8 @@ pub async fn activate(
     };
     ensure_tables(&conn);
 
-    // Find active run
-    let mut run_filter = "status = 'active'".to_string();
+    // Find active or generated run (generated runs are activated on first activate call)
+    let mut run_filter = "status IN ('active', 'generated')".to_string();
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(ref repo) = body.repo {
         run_filter.push_str(&format!(
@@ -915,6 +915,13 @@ pub async fn activate(
             Json(json!({ "dispatched": [], "count": 0, "message": "No active run" })),
         );
     };
+
+    // Promote generated → active on first activate call
+    conn.execute(
+        "UPDATE auto_queue_runs SET status = 'active' WHERE id = ?1 AND status = 'generated'",
+        [&run_id],
+    )
+    .ok();
 
     // #137: Apply unified_thread toggle if provided
     if let Some(unified) = body.unified_thread {
