@@ -1383,8 +1383,7 @@ pub(super) fn spawn_turn_bridge(
                     old
                 };
                 if let Some(ref key) = adk_session_key {
-                    super::adk_session::clear_claude_session_id(key, shared_owned.api_port)
-                        .await;
+                    super::adk_session::clear_claude_session_id(key, shared_owned.api_port).await;
                 }
                 if let Some(ref sid) = stale_sid {
                     let port = shared_owned.api_port;
@@ -1427,9 +1426,8 @@ pub(super) fn spawn_turn_bridge(
                 }
 
                 // Check for resume failure in recovered output
-                let resume_error_in_recovered =
-                    full_response.contains("No conversation found")
-                        || full_response.contains("Error: No conversation");
+                let resume_error_in_recovered = full_response.contains("No conversation found")
+                    || full_response.contains("Error: No conversation");
                 if resume_error_in_recovered {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     eprintln!(
@@ -1469,8 +1467,7 @@ pub(super) fn spawn_turn_bridge(
                     let retry_text = user_text_owned.clone();
                     let retry_port = shared_owned.api_port;
                     tokio::spawn(async move {
-                        auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port)
-                            .await;
+                        auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
                     });
                     full_response = String::new();
                 } else {
