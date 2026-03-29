@@ -16,9 +16,13 @@ fn test_engine(db: &Db) -> PolicyEngine {
     PolicyEngine::new(&config, db.clone()).unwrap()
 }
 
-fn test_api_router(db: Db, engine: PolicyEngine, health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>) -> axum::Router {
+fn test_api_router(
+    db: Db,
+    engine: PolicyEngine,
+    health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
+) -> axum::Router {
     let tx = crate::server::ws::new_broadcast();
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
     api_router(db, engine, tx, buf, health_registry)
 }
 

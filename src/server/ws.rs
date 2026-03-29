@@ -7,15 +7,60 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 
 /// Shared broadcast sender for pushing events to all connected WS clients.
 pub type BroadcastTx = Arc<broadcast::Sender<String>>;
 
+/// Buffer for batched events — groups events by key, flushes periodically.
+pub type BatchBuffer = Arc<Mutex<HashMap<String, serde_json::Value>>>;
+
 pub fn new_broadcast() -> BroadcastTx {
     let (tx, _) = broadcast::channel::<String>(256);
     Arc::new(tx)
+}
+
+/// Immediately emit an event to all connected WebSocket clients.
+pub fn emit_event(tx: &BroadcastTx, event_name: &str, payload: serde_json::Value) {
+    let msg = json!({"type": event_name, "data": payload}).to_string();
+    let _ = tx.send(msg);
+}
+
+/// Queue a batched event — deduplicates by key, flushed periodically.
+pub fn emit_batched_event(
+    buffer: &BatchBuffer,
+    event_name: &str,
+    key: impl Into<String>,
+    payload: serde_json::Value,
+) {
+    let msg = json!({"type": event_name, "data": payload});
+    let key = key.into();
+    let buffer = buffer.clone();
+    tokio::spawn(async move {
+        buffer.lock().await.insert(key, msg);
+    });
+}
+
+/// Spawn background flusher that drains batch buffer every 200ms.
+pub fn spawn_batch_flusher(tx: BroadcastTx) -> BatchBuffer {
+    let buffer: BatchBuffer = Arc::new(Mutex::new(HashMap::new()));
+    let flush_buffer = buffer.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+        loop {
+            interval.tick().await;
+            let mut buf = flush_buffer.lock().await;
+            if buf.is_empty() {
+                continue;
+            }
+            for (_key, msg) in buf.drain() {
+                let _ = tx.send(msg.to_string());
+            }
+        }
+    });
+    buffer
 }
 
 pub async fn ws_handler(
