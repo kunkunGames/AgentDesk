@@ -509,18 +509,27 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             agentdesk.dispatch.markFailed = function(dispatchId, reason) {
                 var result = JSON.parse(rawFail(dispatchId, reason || ""));
                 if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.markFailed] no rows affected for " + dispatchId + " — already terminal or missing");
+                }
                 return result;
             };
             var rawComplete = agentdesk.dispatch.__mark_completed_raw;
             agentdesk.dispatch.markCompleted = function(dispatchId, resultJson) {
                 var result = JSON.parse(rawComplete(dispatchId, resultJson || "{}"));
                 if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.markCompleted] no rows affected for " + dispatchId + " — already terminal or missing");
+                }
                 return result;
             };
             var rawRetry = agentdesk.dispatch.__set_retry_count_raw;
             agentdesk.dispatch.setRetryCount = function(dispatchId, count) {
                 var result = JSON.parse(rawRetry(dispatchId, count));
                 if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.setRetryCount] no rows affected for " + dispatchId + " — missing");
+                }
                 return result;
             };
         })();
@@ -961,93 +970,108 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     let db_review = db.clone();
     kanban_obj.set(
         "__setReviewStatusRaw",
-        Function::new(ctx.clone(), move |card_id: String, opts_json: String| -> String {
-            let opts: serde_json::Value = match serde_json::from_str(&opts_json) {
-                Ok(v) => v,
-                Err(e) => return format!(r#"{{"error":"bad opts: {}"}}"#, e),
-            };
-            let conn = match db_review.separate_conn() {
-                Ok(c) => c,
-                Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
-            };
+        Function::new(
+            ctx.clone(),
+            move |card_id: String, opts_json: String| -> String {
+                let opts: serde_json::Value = match serde_json::from_str(&opts_json) {
+                    Ok(v) => v,
+                    Err(e) => return format!(r#"{{"error":"bad opts: {}"}}"#, e),
+                };
+                let conn = match db_review.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+                };
 
-            // Build dynamic SET clause
-            let mut sets = vec!["updated_at = datetime('now')".to_string()];
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+                // Build dynamic SET clause
+                let mut sets = vec!["updated_at = datetime('now')".to_string()];
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
 
-            if let Some(rs) = opts.get("review_status") {
-                if rs.is_null() {
-                    sets.push("review_status = NULL".to_string());
-                } else if let Some(s) = rs.as_str() {
-                    params.push(Box::new(s.to_string()));
-                    sets.push(format!("review_status = ?{}", params.len()));
+                if let Some(rs) = opts.get("review_status") {
+                    if rs.is_null() {
+                        sets.push("review_status = NULL".to_string());
+                    } else if let Some(s) = rs.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        sets.push(format!("review_status = ?{}", params.len()));
+                    }
                 }
-            }
-            if let Some(v) = opts.get("suggestion_pending_at") {
-                if v.is_null() {
-                    sets.push("suggestion_pending_at = NULL".to_string());
-                } else if v.as_str() == Some("now") {
-                    sets.push("suggestion_pending_at = datetime('now')".to_string());
+                if let Some(v) = opts.get("suggestion_pending_at") {
+                    if v.is_null() {
+                        sets.push("suggestion_pending_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("suggestion_pending_at = datetime('now')".to_string());
+                    }
                 }
-            }
-            if let Some(v) = opts.get("review_entered_at") {
-                if v.is_null() {
-                    sets.push("review_entered_at = NULL".to_string());
-                } else if v.as_str() == Some("now") {
-                    sets.push("review_entered_at = datetime('now')".to_string());
+                if let Some(v) = opts.get("review_entered_at") {
+                    if v.is_null() {
+                        sets.push("review_entered_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("review_entered_at = datetime('now')".to_string());
+                    }
                 }
-            }
-            if let Some(v) = opts.get("awaiting_dod_at") {
-                if v.is_null() {
-                    sets.push("awaiting_dod_at = NULL".to_string());
-                } else if v.as_str() == Some("now") {
-                    sets.push("awaiting_dod_at = datetime('now')".to_string());
+                if let Some(v) = opts.get("awaiting_dod_at") {
+                    if v.is_null() {
+                        sets.push("awaiting_dod_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("awaiting_dod_at = datetime('now')".to_string());
+                    }
                 }
-            }
-            if let Some(v) = opts.get("blocked_reason") {
-                if v.is_null() {
-                    sets.push("blocked_reason = NULL".to_string());
-                } else if let Some(s) = v.as_str() {
-                    params.push(Box::new(s.to_string()));
-                    sets.push(format!("blocked_reason = ?{}", params.len()));
+                if let Some(v) = opts.get("blocked_reason") {
+                    if v.is_null() {
+                        sets.push("blocked_reason = NULL".to_string());
+                    } else if let Some(s) = v.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        sets.push(format!("blocked_reason = ?{}", params.len()));
+                    }
                 }
-            }
 
-            // Optional terminal guard: only update if status != terminal
-            let where_clause = if let Some(excl) = opts.get("exclude_status") {
-                if let Some(s) = excl.as_str() {
-                    params.push(Box::new(s.to_string()));
-                    params.push(Box::new(card_id.clone()));
-                    format!("WHERE id = ?{} AND status != ?{}", params.len(), params.len() - 1)
+                // Optional terminal guard: only update if status != terminal
+                let where_clause = if let Some(excl) = opts.get("exclude_status") {
+                    if let Some(s) = excl.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        params.push(Box::new(card_id.clone()));
+                        format!(
+                            "WHERE id = ?{} AND status != ?{}",
+                            params.len(),
+                            params.len() - 1
+                        )
+                    } else {
+                        params.push(Box::new(card_id.clone()));
+                        format!("WHERE id = ?{}", params.len())
+                    }
                 } else {
                     params.push(Box::new(card_id.clone()));
                     format!("WHERE id = ?{}", params.len())
-                }
-            } else {
-                params.push(Box::new(card_id.clone()));
-                format!("WHERE id = ?{}", params.len())
-            };
-
-            let sql = format!("UPDATE kanban_cards SET {} {}", sets.join(", "), where_clause);
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-            if let Err(e) = conn.execute(&sql, param_refs.as_slice()) {
-                return format!(r#"{{"error":"UPDATE: {}"}}"#, e);
-            }
-
-            // #117/#158: Sync card_review_state via unified entrypoint
-            if let Some(rs) = opts.get("review_status") {
-                let review_state = if rs.is_null() {
-                    Some("idle")
-                } else {
-                    rs.as_str()
                 };
-                if let Some(s) = review_state {
-                    review_state_sync_on_conn(&conn, &serde_json::json!({"card_id": card_id, "state": s}).to_string());
-                }
-            }
 
-            r#"{"ok":true}"#.to_string()
-        })?,
+                let sql = format!(
+                    "UPDATE kanban_cards SET {} {}",
+                    sets.join(", "),
+                    where_clause
+                );
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                if let Err(e) = conn.execute(&sql, param_refs.as_slice()) {
+                    return format!(r#"{{"error":"UPDATE: {}"}}"#, e);
+                }
+
+                // #117/#158: Sync card_review_state via unified entrypoint
+                if let Some(rs) = opts.get("review_status") {
+                    let review_state = if rs.is_null() {
+                        Some("idle")
+                    } else {
+                        rs.as_str()
+                    };
+                    if let Some(s) = review_state {
+                        review_state_sync_on_conn(
+                            &conn,
+                            &serde_json::json!({"card_id": card_id, "state": s}).to_string(),
+                        );
+                    }
+                }
+
+                r#"{"ok":true}"#.to_string()
+            },
+        )?,
     )?;
 
     ad.set("kanban", kanban_obj)?;

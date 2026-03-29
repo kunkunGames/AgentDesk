@@ -196,22 +196,31 @@ function cleanupMergedWorktrees() {
         var branch = merged[i].headRefName;
         if (!branch || branch.indexOf("wt/") !== 0) continue;
 
-        // Check if worktree still exists in sessions
+        // Match worktree dir by the part after "wt/" — dir names don't have "wt/" prefix
+        // Branch: "wt/claude-channel-20260329-070702" → dir suffix: "claude-channel-20260329-070702"
+        var dirSuffix = branch.replace(/^wt\//, "");
         var sessions = agentdesk.db.query(
           "SELECT cwd FROM sessions WHERE cwd LIKE ?",
-          ["%" + branch + "%"]
+          ["%/worktrees/%" + dirSuffix + "%"]
         );
 
         if (sessions.length > 0) {
           var cwd = sessions[0].cwd;
-          agentdesk.log.info("[merge] Cleaning up merged worktree: " + branch);
-          agentdesk.exec("git", ["-C", cwd, "checkout", "--detach"]);
+          agentdesk.log.info("[merge] Cleaning up merged worktree: " + branch + " at " + cwd);
 
-          // Find the main repo path (parent of worktrees dir)
-          var mainRepo = cwd.replace(/\/worktrees\/[^\/]+$/, "/workspaces/agentdesk");
-          agentdesk.exec("git", ["-C", mainRepo, "worktree", "remove", cwd, "--force"]);
-          agentdesk.exec("git", ["-C", mainRepo, "branch", "-d", branch]);
-          agentdesk.log.info("[merge] Worktree removed: " + cwd);
+          // Discover the main repo root dynamically via git
+          var mainRepo = agentdesk.exec("git", [
+            "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"
+          ]);
+          if (mainRepo && mainRepo.indexOf("ERROR") !== 0) {
+            // git-common-dir returns e.g. "/path/to/repo/.git" — strip /.git
+            mainRepo = mainRepo.replace(/\/.git\/?$/, "");
+            agentdesk.exec("git", ["-C", mainRepo, "worktree", "remove", cwd, "--force"]);
+            agentdesk.exec("git", ["-C", mainRepo, "branch", "-d", branch]);
+            agentdesk.log.info("[merge] Worktree removed: " + cwd);
+          } else {
+            agentdesk.log.warn("[merge] Could not determine main repo for worktree: " + cwd);
+          }
         }
 
         // Clear kv entries

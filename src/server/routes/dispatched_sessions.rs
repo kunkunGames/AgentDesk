@@ -514,17 +514,23 @@ pub async fn hook_session(
                 ).ok();
 
                 if let Some((_sid, payload, _)) = session_event {
-                    let event_name = if is_new_session {
-                        "dispatched_session_new"
+                    if is_new_session {
+                        // New sessions must be emitted immediately — batching
+                        // can suppress the insert if an update arrives within
+                        // the same flush window (dashboard needs the "new" first).
+                        crate::server::ws::emit_event(
+                            &state.broadcast_tx,
+                            "dispatched_session_new",
+                            payload,
+                        );
                     } else {
-                        "dispatched_session_update"
-                    };
-                    crate::server::ws::emit_batched_event(
-                        &state.batch_buffer,
-                        event_name,
-                        &body.session_key,
-                        payload,
-                    );
+                        crate::server::ws::emit_batched_event(
+                            &state.batch_buffer,
+                            "dispatched_session_update",
+                            &body.session_key,
+                            payload,
+                        );
+                    }
                 }
             }
 
