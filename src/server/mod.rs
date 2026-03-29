@@ -117,8 +117,10 @@ pub async fn run(
     let broadcast_tx = ws::new_broadcast();
     let batch_buffer = ws::spawn_batch_flusher(broadcast_tx.clone());
 
-    // Store server port in kv_meta so policy JS can read it
+    // Seed config defaults + store server port in kv_meta so policy JS can read them
     if let Ok(conn) = db.lock() {
+        routes::settings::seed_config_defaults(&conn);
+        // server_port is always overwritten (not INSERT OR IGNORE) to match current config
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
             [config.server.port.to_string()],
