@@ -793,8 +793,14 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
             per_provider_agents: {
                 let mut by_prov: HashMap<String, Vec<(String, u64, f64)>> = HashMap::new();
                 for ((agent, prov), tok) in &ap_tokens {
-                    let cost = ap_costs.get(&(agent.clone(), prov.clone())).copied().unwrap_or(0.0);
-                    by_prov.entry(prov.clone()).or_default().push((agent.clone(), *tok, cost));
+                    let cost = ap_costs
+                        .get(&(agent.clone(), prov.clone()))
+                        .copied()
+                        .unwrap_or(0.0);
+                    by_prov
+                        .entry(prov.clone())
+                        .or_default()
+                        .push((agent.clone(), *tok, cost));
                 }
                 by_prov
                     .into_iter()
@@ -813,7 +819,11 @@ pub fn collect(start: DateTime<Utc>, end: DateTime<Utc>, period_label: &str) -> 
                                 },
                             })
                             .collect();
-                        shares.sort_by(|a, b| b.percentage.partial_cmp(&a.percentage).unwrap_or(cmp::Ordering::Equal));
+                        shares.sort_by(|a, b| {
+                            b.percentage
+                                .partial_cmp(&a.percentage)
+                                .unwrap_or(cmp::Ordering::Equal)
+                        });
                         (prov, shares)
                     })
                     .collect()

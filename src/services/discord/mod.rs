@@ -2343,10 +2343,9 @@ async fn try_handle_family_profile_probe_reply(
     // record succeeds.  If we only clear on success, the pending entry survives
     // and the *next* unrelated DM will be re-matched as a probe answer.
     let target_for_clear = target.clone();
-    let clear_result = tokio::task::spawn_blocking(move || {
-        clear_family_profile_probe_pending(&target_for_clear)
-    })
-    .await;
+    let clear_result =
+        tokio::task::spawn_blocking(move || clear_family_profile_probe_pending(&target_for_clear))
+            .await;
     match clear_result {
         Ok(Err(err)) => {
             eprintln!(

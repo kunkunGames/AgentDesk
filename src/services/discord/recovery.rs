@@ -384,23 +384,23 @@ pub(super) async fn restore_inflight_turns(
                 let channel_id = ChannelId::new(state.channel_id);
                 {
                     let mut data = shared.core.lock().await;
-                    let session = data
-                        .sessions
-                        .entry(channel_id)
-                        .or_insert_with(|| DiscordSession {
-                            session_id: state.session_id.clone(),
-                            current_path: None,
-                            history: Vec::new(),
-                            pending_uploads: Vec::new(),
-                            cleared: false,
-                            remote_profile_name: None,
-                            channel_id: Some(state.channel_id),
-                            channel_name: effective_channel_name.clone(),
-                            category_name: None,
-                            last_active: tokio::time::Instant::now(),
-                            worktree: None,
-                            born_generation: super::runtime_store::load_generation(),
-                        });
+                    let session =
+                        data.sessions
+                            .entry(channel_id)
+                            .or_insert_with(|| DiscordSession {
+                                session_id: state.session_id.clone(),
+                                current_path: None,
+                                history: Vec::new(),
+                                pending_uploads: Vec::new(),
+                                cleared: false,
+                                remote_profile_name: None,
+                                channel_id: Some(state.channel_id),
+                                channel_name: effective_channel_name.clone(),
+                                category_name: None,
+                                last_active: tokio::time::Instant::now(),
+                                worktree: None,
+                                born_generation: super::runtime_store::load_generation(),
+                            });
                     session.channel_id = Some(state.channel_id);
                     session.last_active = tokio::time::Instant::now();
                     if session.channel_name.is_none() {
@@ -414,24 +414,18 @@ pub(super) async fn restore_inflight_turns(
                 // between recovery (now) and restore_tmux_watchers (~50s later),
                 // losing the in-progress response entirely.
                 if let Some(ref tmux_session_name) = tmux_name {
-                    let output_path = crate::services::tmux_common::session_temp_path(
-                        tmux_session_name,
-                        "jsonl",
-                    );
+                    let output_path =
+                        crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
                     if std::fs::metadata(&output_path).is_ok()
                         && !shared.tmux_watchers.contains_key(&channel_id)
                     {
                         let initial_offset = std::fs::metadata(&output_path)
                             .map(|m| m.len())
                             .unwrap_or(0);
-                        let cancel =
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let paused =
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        let resume_offset =
-                            std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
-                        let pause_epoch =
-                            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+                        let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                         let turn_delivered =
                             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         shared.tmux_watchers.insert(
@@ -742,8 +736,7 @@ pub(super) async fn restore_inflight_turns(
                 let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
                 let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let turn_delivered =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let turn_delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 shared.tmux_watchers.insert(
                     channel_id,
                     TmuxWatcherHandle {
