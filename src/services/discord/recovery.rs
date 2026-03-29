@@ -178,6 +178,18 @@ fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
         .unwrap_or(false)
 }
 
+fn recovery_watcher_start_offset(output_path: &str, saved_last_offset: u64) -> (u64, u64, bool) {
+    let current_len = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    if current_len >= saved_last_offset {
+        (saved_last_offset, current_len, false)
+    } else {
+        // The output file was recreated or truncated while dcserver was down.
+        // Resume from the beginning of the new file so we do not skip the
+        // entire restarted session output.
+        (0, current_len, true)
+    }
+}
+
 pub(super) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -455,9 +467,8 @@ pub(super) async fn restore_inflight_turns(
                     if std::fs::metadata(&output_path).is_ok()
                         && !shared.tmux_watchers.contains_key(&channel_id)
                     {
-                        let initial_offset = std::fs::metadata(&output_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let (initial_offset, current_len, truncated) =
+                            recovery_watcher_start_offset(&output_path, state.last_offset);
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
@@ -475,6 +486,12 @@ pub(super) async fn restore_inflight_turns(
                             },
                         );
                         let ts2 = chrono::Local::now().format("%H:%M:%S");
+                        if truncated {
+                            println!(
+                                "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                                tmux_session_name, state.last_offset, current_len
+                            );
+                        }
                         println!(
                             "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
                             tmux_session_name, initial_offset
@@ -766,9 +783,8 @@ pub(super) async fn restore_inflight_turns(
             if std::fs::metadata(&output_path).is_ok()
                 && !shared.tmux_watchers.contains_key(&channel_id)
             {
-                let initial_offset = std::fs::metadata(&output_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let (initial_offset, current_len, truncated) =
+                    recovery_watcher_start_offset(&output_path, state.last_offset);
                 let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
@@ -785,6 +801,12 @@ pub(super) async fn restore_inflight_turns(
                     },
                 );
                 let ts2 = chrono::Local::now().format("%H:%M:%S");
+                if truncated {
+                    println!(
+                        "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                        tmux_session_name, state.last_offset, current_len
+                    );
+                }
                 println!(
                     "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
                     tmux_session_name, initial_offset
@@ -1244,5 +1266,34 @@ mod tests {
                 .context
                 .contains("이어서 원인과 대응을 설명하겠습니다")
         );
+    }
+
+    #[test]
+    fn recovery_watcher_resume_uses_saved_offset_when_file_grew() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "before").unwrap();
+        let saved_offset = file.as_file().metadata().unwrap().len();
+        writeln!(file, "after").unwrap();
+        file.flush().unwrap();
+
+        let (offset, current_len, truncated) =
+            recovery_watcher_start_offset(file.path().to_str().unwrap(), saved_offset);
+        assert_eq!(offset, saved_offset);
+        assert!(current_len >= saved_offset);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn recovery_watcher_resume_rewinds_when_file_was_truncated() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "new session output").unwrap();
+        file.flush().unwrap();
+
+        let saved_offset = file.as_file().metadata().unwrap().len() + 100;
+        let (offset, current_len, truncated) =
+            recovery_watcher_start_offset(file.path().to_str().unwrap(), saved_offset);
+        assert_eq!(offset, 0);
+        assert!(current_len < saved_offset);
+        assert!(truncated);
     }
 }
