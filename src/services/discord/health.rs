@@ -321,11 +321,8 @@ pub async fn handle_send<'a>(registry: &HealthRegistry, body: &str) -> (&'a str,
                         } else {
                             None
                         };
-                        if super::settings::resolve_role_binding(
-                            parent_id,
-                            parent_name.as_deref(),
-                        )
-                        .is_some()
+                        if super::settings::resolve_role_binding(parent_id, parent_name.as_deref())
+                            .is_some()
                         {
                             authorized = true;
                         }

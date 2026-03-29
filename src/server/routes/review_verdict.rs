@@ -404,7 +404,7 @@ pub async fn submit_verdict(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("update dispatch: {e}")})),
-            )
+            );
         }
     };
 
@@ -771,8 +771,14 @@ pub async fn submit_review_decision(
             // #155: Use intents for review_status mutation (executor boundary)
             use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
             let dispute_intents = vec![
-                TransitionIntent::SetReviewStatus { card_id: body.card_id.clone(), review_status: Some("reviewing".to_string()) },
-                TransitionIntent::SyncReviewState { card_id: body.card_id.clone(), state: "reviewing".to_string() },
+                TransitionIntent::SetReviewStatus {
+                    card_id: body.card_id.clone(),
+                    review_status: Some("reviewing".to_string()),
+                },
+                TransitionIntent::SyncReviewState {
+                    card_id: body.card_id.clone(),
+                    state: "reviewing".to_string(),
+                },
             ];
             for intent in &dispute_intents {
                 execute_intent_on_conn(&conn, intent).ok();
@@ -780,7 +786,8 @@ pub async fn submit_review_decision(
             conn.execute(
                 "UPDATE kanban_cards SET review_entered_at = datetime('now') WHERE id = ?1",
                 [&body.card_id],
-            ).ok();
+            )
+            .ok();
             drop(conn);
 
             // #119: Record tuning outcome BEFORE OnReviewEnter (which increments review_round)
@@ -893,10 +900,14 @@ pub async fn submit_review_decision(
                 .ok();
                 // #155: Belt-and-suspenders via intent (executor boundary)
                 use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
-                execute_intent_on_conn(&conn, &TransitionIntent::SetReviewStatus {
-                    card_id: body.card_id.clone(),
-                    review_status: None,
-                }).ok();
+                execute_intent_on_conn(
+                    &conn,
+                    &TransitionIntent::SetReviewStatus {
+                        card_id: body.card_id.clone(),
+                        review_status: None,
+                    },
+                )
+                .ok();
                 // Clear thread mappings so dismissed review threads are not reused.
                 super::dispatches::clear_all_threads(&conn, &body.card_id);
             }

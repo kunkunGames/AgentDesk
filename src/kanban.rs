@@ -883,16 +883,15 @@ pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
                             .ok()?;
                         for row_result in rows {
                             if let Ok(Some(result_str)) = row_result {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&result_str)
+                                if let Ok(v) =
+                                    serde_json::from_str::<serde_json::Value>(&result_str)
                                 {
                                     if let Some(items) = v["items"].as_array() {
                                         if !items.is_empty() {
                                             let cats: Vec<String> = items
                                                 .iter()
                                                 .filter_map(|it| {
-                                                    it["category"]
-                                                        .as_str()
-                                                        .map(|s| s.to_string())
+                                                    it["category"].as_str().map(|s| s.to_string())
                                                 })
                                                 .collect();
                                             if !cats.is_empty() {

@@ -460,11 +460,7 @@ pub(super) async fn tmux_output_watcher(
             {
                 let hostname = crate::services::platform::hostname_short();
                 let session_key = format!("{}:{}", hostname, tmux_session_name);
-                super::adk_session::clear_claude_session_id(
-                    &session_key,
-                    shared.api_port,
-                )
-                .await;
+                super::adk_session::clear_claude_session_id(&session_key, shared.api_port).await;
             }
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
             if let Some(msg_id) = placeholder_msg_id {

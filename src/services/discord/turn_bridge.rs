@@ -40,10 +40,7 @@ async fn auto_retry_with_history(
 
     // Fetch last 10 messages from Discord
     let history = match channel_id
-        .messages(
-            http,
-            serenity::builder::GetMessages::new().limit(10),
-        )
+        .messages(http, serenity::builder::GetMessages::new().limit(10))
         .await
     {
         Ok(msgs) => {
@@ -473,9 +470,7 @@ pub(super) fn runtime_db_fallback_complete(dispatch_id: &str, source: &str) -> b
     let Ok(conn) = rusqlite::Connection::open(&db_path) else {
         return false;
     };
-    let result_json = format!(
-        "{{\"completion_source\":\"{source}\",\"needs_reconcile\":true}}"
-    );
+    let result_json = format!("{{\"completion_source\":\"{source}\",\"needs_reconcile\":true}}");
     let changed = conn
         .execute(
             "UPDATE task_dispatches SET status = 'completed', result = ?1, \
@@ -1267,7 +1262,10 @@ pub(super) fn spawn_turn_bridge(
         let recovery_retry = full_response.contains("__session_died_retry__");
         if recovery_retry {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!("  [{ts}] ↻ Recovery session died — triggering auto-retry with history (channel {})", channel_id);
+            eprintln!(
+                "  [{ts}] ↻ Recovery session died — triggering auto-retry with history (channel {})",
+                channel_id
+            );
             // Clear stale session_id
             {
                 let mut data = shared_owned.core.lock().await;
@@ -1506,7 +1504,13 @@ pub(super) fn spawn_turn_bridge(
                                 let retry_text = user_text_owned.clone();
                                 let retry_port = shared_owned.api_port;
                                 tokio::spawn(async move {
-                                    auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                                    auto_retry_with_history(
+                                        &http_c,
+                                        channel_id,
+                                        &retry_text,
+                                        retry_port,
+                                    )
+                                    .await;
                                 });
                                 full_response = String::new(); // Suppress error message
                             }
@@ -1571,7 +1575,13 @@ pub(super) fn spawn_turn_bridge(
                             let retry_text = user_text_owned.clone();
                             let retry_port = shared_owned.api_port;
                             tokio::spawn(async move {
-                                auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                                auto_retry_with_history(
+                                    &http_c,
+                                    channel_id,
+                                    &retry_text,
+                                    retry_port,
+                                )
+                                .await;
                             });
                             full_response = String::new(); // Suppress error message
                         }
