@@ -173,6 +173,98 @@ async fn agents_include_current_thread_channel_id_from_working_session() {
 }
 
 #[tokio::test]
+async fn claude_session_id_get_clears_stale_fixed_working_session() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_key, provider, status, active_dispatch_id, claude_session_id, last_heartbeat, created_at
+             ) VALUES (
+                'test:stale-working', 'claude', 'working', 'dispatch-123', 'stale-sid',
+                datetime('now', '-7 hours'), datetime('now', '-7 hours')
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatched-sessions/claude-session-id?session_key=test:stale-working")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["claude_session_id"].is_null());
+    assert!(json["session_id"].is_null());
+
+    let conn = db.lock().unwrap();
+    let (status, dispatch_id, session_id): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT status, active_dispatch_id, claude_session_id
+             FROM sessions
+             WHERE session_key = 'test:stale-working'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "disconnected");
+    assert!(dispatch_id.is_none());
+    assert!(session_id.is_none());
+}
+
+#[tokio::test]
+async fn claude_session_id_get_keeps_old_idle_fixed_session() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_key, provider, status, claude_session_id, last_heartbeat, created_at
+             ) VALUES (
+                'test:old-idle', 'claude', 'idle', 'idle-sid',
+                datetime('now', '-7 hours'), datetime('now', '-7 hours')
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db, engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatched-sessions/claude-session-id?session_key=test:old-idle")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["claude_session_id"], "idle-sid");
+    assert_eq!(json["session_id"], "idle-sid");
+}
+
+#[tokio::test]
 async fn get_agent_found() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -1587,4 +1679,322 @@ async fn hook_session_normalizes_empty_claude_session_id_to_null() {
         json["claude_session_id"].is_null(),
         "GET should return null after clear"
     );
+}
+
+// ── #140: Parallel thread group auto-queue tests ──────────────────
+
+/// Helper: seed kanban cards for the parallel dispatch test scenario.
+/// Creates 7 cards:
+///   - 3 independent (issue #1, #2, #3)
+///   - 4 in a dependency chain: #4 → #5 → #6 → #7
+/// Returns card IDs in order [A, B, C, D, E, F, G].
+fn seed_parallel_test_cards(db: &Db) -> Vec<String> {
+    let conn = db.lock().unwrap();
+    // Create separate agents so busy-agent guard doesn't block parallel dispatch
+    for i in 1..=4 {
+        conn.execute(
+            &format!(
+                "INSERT INTO agents (id, name, provider, status) VALUES ('agent-{i}', 'Agent{i}', 'claude', 'idle')"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut card_ids = Vec::new();
+    let labels = ["A", "B", "C", "D", "E", "F", "G"];
+    let issue_nums = [1, 2, 3, 4, 5, 6, 7];
+    // Each independent card gets its own agent; chain cards share agent-4
+    let agents = [
+        "agent-1", // A: independent
+        "agent-2", // B: independent
+        "agent-3", // C: independent
+        "agent-4", // D: chain start
+        "agent-4", // E: depends on D
+        "agent-4", // F: depends on E
+        "agent-4", // G: depends on E and F
+    ];
+    // Dependency metadata: cards E(#5), F(#6), G(#7) reference their predecessor
+    let metadata = [
+        None,          // A: independent
+        None,          // B: independent
+        None,          // C: independent
+        None,          // D: chain start
+        Some("#4"),    // E: depends on D
+        Some("#5"),    // F: depends on E
+        Some("#5 #6"), // G: depends on E and F (still same component)
+    ];
+
+    for i in 0..7 {
+        let card_id = format!("card-{}", labels[i]);
+        let meta_val = metadata[i]
+            .map(|m| format!("'{}'", m))
+            .unwrap_or("NULL".to_string());
+        conn.execute(
+            &format!(
+                "INSERT INTO kanban_cards (id, repo_id, title, status, priority, assigned_agent_id, github_issue_number, metadata)
+                 VALUES ('{}', 'test-repo', 'Task {}', 'ready', 'medium', '{}', {}, {})",
+                card_id, labels[i], agents[i], issue_nums[i], meta_val
+            ),
+            [],
+        )
+        .unwrap();
+        card_ids.push(card_id);
+    }
+
+    card_ids
+}
+
+#[tokio::test]
+async fn parallel_generate_creates_correct_thread_groups() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let _card_ids = seed_parallel_test_cards(&db);
+
+    let app = test_api_router(db, engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "parallel": true,
+                        "max_concurrent_threads": 3,
+                        "max_concurrent_per_agent": 3,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let entries = json["entries"].as_array().expect("entries must be array");
+    assert_eq!(entries.len(), 7, "all 7 cards should be queued");
+
+    // Verify run has correct parallel config
+    let run = &json["run"];
+    assert_eq!(run["max_concurrent_threads"], 3);
+    assert_eq!(run["max_concurrent_per_agent"], 3);
+
+    // Collect thread_group assignments per issue number
+    let mut groups: std::collections::HashMap<i64, Vec<(i64, i64)>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let issue_num = entry["github_issue_number"].as_i64().unwrap();
+        let thread_group = entry["thread_group"].as_i64().unwrap();
+        let priority_rank = entry["priority_rank"].as_i64().unwrap();
+        groups
+            .entry(thread_group)
+            .or_default()
+            .push((issue_num, priority_rank));
+    }
+
+    let group_count = run["thread_group_count"].as_i64().unwrap();
+    assert_eq!(
+        group_count,
+        groups.len() as i64,
+        "thread_group_count must match actual distinct groups"
+    );
+
+    // Independent cards (issues 1, 2, 3) should each be in their own group (size 1)
+    let mut independent_groups = 0;
+    let mut chain_group = None;
+    for (group_num, members) in &groups {
+        if members.len() == 1 {
+            let issue = members[0].0;
+            assert!(
+                [1, 2, 3].contains(&issue),
+                "single-member group should be an independent card, got issue #{issue}"
+            );
+            independent_groups += 1;
+        } else {
+            // This must be the dependency chain group
+            assert!(
+                chain_group.is_none(),
+                "only one multi-member group expected"
+            );
+            chain_group = Some(*group_num);
+        }
+    }
+    assert_eq!(independent_groups, 3, "3 independent cards → 3 groups");
+
+    // Verify the chain group: issues 4,5,6,7 in topological order
+    let chain = chain_group.expect("dependency chain group must exist");
+    let mut chain_members = groups[&chain].clone();
+    chain_members.sort_by_key(|(_, rank)| *rank);
+    let chain_issues: Vec<i64> = chain_members.iter().map(|(num, _)| *num).collect();
+    // Issue #4 must come first (rank 0), #5 second, then #6 and #7 (order between 6,7 may vary
+    // since #7 depends on both #5 and #6, making #6 and #7 at different levels)
+    assert_eq!(
+        chain_issues[0], 4,
+        "chain start (#4) must have lowest rank"
+    );
+    assert_eq!(
+        chain_issues[1], 5,
+        "#5 depends on #4, must be second"
+    );
+    // #6 depends on #5, #7 depends on #5 and #6 — so #6 before #7
+    assert_eq!(chain_issues[2], 6, "#6 depends on #5, must be third");
+    assert_eq!(chain_issues[3], 7, "#7 depends on #5 and #6, must be last");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_activate_dispatches_multiple_groups() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    let _card_ids = seed_parallel_test_cards(&db);
+
+    let app = test_api_router(db.clone(), engine.clone(), None);
+
+    // Step 1: Generate with parallel mode (no agent_id filter — cards have mixed agents)
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "parallel": true,
+                        "max_concurrent_threads": 3,
+                        "max_concurrent_per_agent": 3,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Step 2: Activate without agent_id — allows dispatching across different agents
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "unified_thread": false,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let activate_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Should dispatch 3 entries (one per group, up to max_concurrent_threads=3)
+    let dispatched_count = activate_json["count"].as_i64().unwrap();
+    assert_eq!(
+        dispatched_count, 3,
+        "activate should dispatch 3 groups (max_concurrent_threads=3)"
+    );
+    assert_eq!(activate_json["active_groups"], 3);
+
+    // Step 3: Verify status API shows group-level info
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/auto-queue/status?repo=test-repo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // thread_groups should be present with group-level statuses
+    let thread_groups = status_json["thread_groups"]
+        .as_object()
+        .expect("thread_groups must be an object");
+    assert!(
+        thread_groups.len() >= 2,
+        "status should have multiple thread groups"
+    );
+
+    // At least some groups should be "active" (dispatched) and some "pending"
+    let active_count = thread_groups
+        .values()
+        .filter(|g| g["status"] == "active")
+        .count();
+    let pending_count = thread_groups
+        .values()
+        .filter(|g| g["status"] == "pending")
+        .count();
+    assert!(active_count > 0, "should have active groups");
+    assert!(pending_count > 0, "should have pending groups (4th group not yet started)");
+}
+
+#[tokio::test]
+async fn parallel_false_keeps_single_group_sequential() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let _card_ids = seed_parallel_test_cards(&db);
+
+    let app = test_api_router(db, engine, None);
+
+    // Generate WITHOUT parallel — should put all entries in group 0
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let entries = json["entries"].as_array().unwrap();
+    let run = &json["run"];
+
+    // All entries should be in thread_group 0
+    for entry in entries {
+        assert_eq!(
+            entry["thread_group"].as_i64().unwrap(),
+            0,
+            "non-parallel mode: all entries must be in group 0"
+        );
+    }
+    assert_eq!(run["thread_group_count"], 1);
+    assert_eq!(run["max_concurrent_threads"], 1);
 }
