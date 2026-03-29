@@ -635,7 +635,11 @@ pub async fn generate(
     }
 
     let is_parallel = body.parallel.unwrap_or(false);
-    let max_concurrent = body.max_concurrent_threads.unwrap_or(3).max(1);
+    let max_concurrent = if is_parallel {
+        body.max_concurrent_threads.unwrap_or(3).max(1)
+    } else {
+        1 // Non-parallel: sequential dispatch, single group
+    };
     let max_per_agent = body.max_concurrent_per_agent.unwrap_or(1).max(1);
 
     // ── Parallel mode: build dependency DAG, connected components, topo-sort (#140) ──
