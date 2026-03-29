@@ -60,10 +60,16 @@ pub(in crate::services::discord) async fn cmd_receipt(
         .await
         .unwrap_or_else(|| "playwright".into());
 
-    // Split into per-provider receipts
-    let receipts = receipt::split_by_provider(&data);
+    // Build the list of receipts to render:
+    // 1. Unified receipt (always)
+    // 2. Per-provider receipts (only when multi-provider)
+    let per_provider = receipt::split_by_provider(&data);
+    let multi_provider = per_provider.len() > 1;
+    let mut to_render: Vec<&receipt::ReceiptData> = vec![&data];
+    if multi_provider {
+        to_render.extend(per_provider.iter());
+    }
 
-    // Render each provider receipt as a separate PNG
     let tmp_dir = std::env::temp_dir();
     let unique_id = uuid::Uuid::new_v4();
     let mut temp_files: Vec<PathBuf> = Vec::new();
@@ -73,12 +79,15 @@ pub(in crate::services::discord) async fn cmd_receipt(
         data.period_label, data.period_start, data.period_end
     ));
 
-    for (i, r) in receipts.iter().enumerate() {
-        let prov_name = r
-            .providers
-            .first()
-            .map(|p| p.provider.as_str())
-            .unwrap_or("unknown");
+    for (i, r) in to_render.iter().enumerate() {
+        let label = if i == 0 {
+            "combined"
+        } else {
+            r.providers
+                .first()
+                .map(|p| p.provider.as_str())
+                .unwrap_or("unknown")
+        };
         let html = receipt::render_html(r);
 
         let html_path = tmp_dir.join(format!("adk_receipt_{unique_id}_{i}.html"));
@@ -95,7 +104,6 @@ pub(in crate::services::discord) async fn cmd_receipt(
             &format!("file://{}", html_path.display()),
             &png_path.display().to_string(),
         ]);
-        // Apply merged runtime PATH so playwright can find chromium in service environments
         if let Some(merged) = platform::merged_runtime_path() {
             cmd.env("PATH", merged);
         }
@@ -109,7 +117,7 @@ pub(in crate::services::discord) async fn cmd_receipt(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("  [{ts}] \u{2716} Playwright error for {prov_name}: {stderr}");
+            eprintln!("  [{ts}] \u{2716} Playwright error for {label}: {stderr}");
             continue;
         }
 
@@ -136,7 +144,7 @@ pub(in crate::services::discord) async fn cmd_receipt(
 
     println!(
         "  [{ts}] \u{25b6} [{user_name}] Receipt sent ({} providers, total: {})",
-        receipts.len(),
+        to_render.len(),
         receipt_fmt_cost(data.total)
     );
     Ok(())

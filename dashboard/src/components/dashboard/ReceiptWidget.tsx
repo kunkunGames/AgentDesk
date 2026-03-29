@@ -20,6 +20,13 @@ interface ReceiptStats {
   total_sessions: number;
 }
 
+interface AgentShare {
+  agent: string;
+  tokens: number;
+  cost: number;
+  percentage: number;
+}
+
 interface ReceiptData {
   period_label: string;
   period_start: string;
@@ -30,6 +37,7 @@ interface ReceiptData {
   total: number;
   stats: ReceiptStats;
   providers: ProviderShare[];
+  agents: AgentShare[];
 }
 
 type Period = "today" | "week" | "month" | "all";
@@ -214,6 +222,18 @@ export default function ReceiptWidget({ t }: ReceiptWidgetProps) {
             <span>Sessions</span>
             <span>{data.stats.total_sessions.toLocaleString()}</span>
           </div>
+
+          {data.agents && data.agents.length > 0 && (
+            <>
+              <div className="text-[9px] font-bold mt-2 mb-0.5" style={{ color: "#666" }}>AGENT USAGE</div>
+              {data.agents.filter((a) => a.percentage >= 0.1).map((a) => (
+                <div key={a.agent} className="flex justify-between text-[10px]" style={{ color: "#555" }}>
+                  <span>{a.agent}</span>
+                  <span>{a.percentage.toFixed(0)}%</span>
+                </div>
+              ))}
+            </>
+          )}
 
           {data.providers.length > 1 && (
             <>
