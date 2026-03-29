@@ -437,10 +437,7 @@ fn execute_streaming_local_tmux(
         if !path.split(':').any(|p| p == "/opt/homebrew/bin") {
             path = format!("/opt/homebrew/bin:{}", path);
         }
-        env_lines.push_str(&format!(
-            "export PATH='{}'\n",
-            path.replace('\'', "'\\''")
-        ));
+        env_lines.push_str(&format!("export PATH='{}'\n", path.replace('\'', "'\\''")));
     }
     if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
         let trimmed = root_dir.trim();
@@ -513,13 +510,7 @@ fn execute_streaming_local_tmux(
     // Keep tmux session alive after process exits for post-mortem analysis
     let exact_target = tmux_exact_target(tmux_session_name);
     let _ = Command::new("tmux")
-        .args([
-            "set-option",
-            "-t",
-            &exact_target,
-            "remain-on-exit",
-            "on",
-        ])
+        .args(["set-option", "-t", &exact_target, "remain-on-exit", "on"])
         .output();
 
     // Stamp generation marker so post-restart watcher restore can detect old sessions

@@ -272,10 +272,11 @@ pub(super) async fn restore_inflight_turns(
                             if pool_ok {
                                 dispatch_completed = true;
                             } else {
-                                dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
-                                    did,
-                                    "recovery_db_fallback",
-                                );
+                                dispatch_completed =
+                                    super::turn_bridge::runtime_db_fallback_complete(
+                                        did,
+                                        "recovery_db_fallback",
+                                    );
                             }
                         }
                     } else {

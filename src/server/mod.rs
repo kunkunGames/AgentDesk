@@ -130,7 +130,13 @@ pub async fn run(
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
         .nest(
             "/api",
-            routes::api_router(db.clone(), engine.clone(), broadcast_tx.clone(), batch_buffer, health_registry),
+            routes::api_router(
+                db.clone(),
+                engine.clone(),
+                broadcast_tx.clone(),
+                batch_buffer,
+                health_registry,
+            ),
         )
         .fallback_service(ServeDir::new(&dashboard_dir));
 

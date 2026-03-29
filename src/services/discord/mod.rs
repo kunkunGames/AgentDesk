@@ -921,8 +921,8 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
     // Boot timestamp from dcserver.pid mtime — represents actual process start,
     // not a wall-clock offset that could mis-classify old pending dispatches.
     let boot_time: String = {
-        let pid_path = crate::cli::agentdesk_runtime_root()
-            .map(|r| r.join("runtime").join("dcserver.pid"));
+        let pid_path =
+            crate::cli::agentdesk_runtime_root().map(|r| r.join("runtime").join("dcserver.pid"));
         let mtime = pid_path
             .as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -1024,7 +1024,11 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
         );
 
         crate::server::routes::dispatches::send_dispatch_to_discord(
-            db, agent_id, title, card_id, dispatch_id,
+            db,
+            agent_id,
+            title,
+            card_id,
+            dispatch_id,
         )
         .await;
     }
@@ -2696,12 +2700,7 @@ pub(super) async fn auto_restore_session(
         });
         let last_path = db_cwd.or(yaml_path);
 
-        (
-            last_path,
-            is_remote,
-            saved_remote,
-            provider,
-        )
+        (last_path, is_remote, saved_remote, provider)
     };
 
     let mut data = shared.core.lock().await;

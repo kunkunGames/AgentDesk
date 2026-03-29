@@ -300,10 +300,7 @@ pub async fn hook_session(
     let tokens = body.tokens.unwrap_or(0) as i64;
     // #107: Normalize empty claude_session_id to None (SQL NULL) so stale empty
     // strings are never persisted — prevents invalid --resume attempts after restart.
-    let claude_session_id = body
-        .claude_session_id
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let claude_session_id = body.claude_session_id.as_deref().filter(|s| !s.is_empty());
     let idle_auto_complete_dispatch = if status == "idle" {
         body.dispatch_id.as_ref().and_then(|did| {
             conn.query_row(
@@ -522,7 +519,10 @@ pub async fn hook_session(
                         "dispatched_session_update"
                     };
                     crate::server::ws::emit_batched_event(
-                        &state.batch_buffer, event_name, &body.session_key, payload,
+                        &state.batch_buffer,
+                        event_name,
+                        &body.session_key,
+                        payload,
                     );
                 }
             }
@@ -554,7 +554,10 @@ pub async fn hook_session(
                         },
                     ) {
                         crate::server::ws::emit_batched_event(
-                            &state.batch_buffer, "agent_status", aid, agent,
+                            &state.batch_buffer,
+                            "agent_status",
+                            aid,
+                            agent,
                         );
                     }
                 }

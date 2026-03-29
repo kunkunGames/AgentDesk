@@ -533,7 +533,12 @@ pub async fn assign_card(
     // Status transition via reducer (ensures hooks, clocks, audit)
     if old_status != ready_state {
         if let Err(e) = crate::kanban::transition_status_with_opts(
-            &state.db, &state.engine, &id, &ready_state, "assign", false,
+            &state.db,
+            &state.engine,
+            &id,
+            &ready_state,
+            "assign",
+            false,
         ) {
             tracing::warn!("[assign_card] transition failed: {e}");
         }
@@ -542,7 +547,8 @@ pub async fn assign_card(
     let card = state.db.lock().ok().and_then(|conn| {
         conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
             card_row_to_json(row)
-        }).ok()
+        })
+        .ok()
     });
 
     // Fire pipeline-defined hooks for the state transition (#134)
@@ -583,7 +589,11 @@ pub async fn delete_card(
             Json(json!({"error": "card not found"})),
         ),
         Ok(_) => {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_deleted", json!({"id": id}));
+            crate::server::ws::emit_event(
+                &state.broadcast_tx,
+                "kanban_card_deleted",
+                json!({"id": id}),
+            );
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => (
@@ -648,7 +658,14 @@ pub async fn retry_card(
                 "UPDATE kanban_cards SET assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
                 rusqlite::params![agent_id, id],
             ).ok();
-            exec2(&conn, &TI2::SetLatestDispatchId { card_id: id.clone(), dispatch_id: None }).ok();
+            exec2(
+                &conn,
+                &TI2::SetLatestDispatchId {
+                    card_id: id.clone(),
+                    dispatch_id: None,
+                },
+            )
+            .ok();
             agent_id.clone()
         } else {
             let current: String = conn
@@ -658,7 +675,14 @@ pub async fn retry_card(
                     |row| row.get(0),
                 )
                 .unwrap_or_default();
-            exec2(&conn, &TI2::SetLatestDispatchId { card_id: id.clone(), dispatch_id: None }).ok();
+            exec2(
+                &conn,
+                &TI2::SetLatestDispatchId {
+                    card_id: id.clone(),
+                    dispatch_id: None,
+                },
+            )
+            .ok();
             current
         };
         // Note: status → 'requested' is handled by create_dispatch() below
@@ -763,9 +787,18 @@ pub async fn redispatch_card(
         // #155: Clear review_status and latest_dispatch_id via intents (executor boundary)
         use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
         let clear_intents = vec![
-            TransitionIntent::SetReviewStatus { card_id: id.clone(), review_status: None },
-            TransitionIntent::SetLatestDispatchId { card_id: id.clone(), dispatch_id: None },
-            TransitionIntent::SyncReviewState { card_id: id.clone(), state: "idle".to_string() },
+            TransitionIntent::SetReviewStatus {
+                card_id: id.clone(),
+                review_status: None,
+            },
+            TransitionIntent::SetLatestDispatchId {
+                card_id: id.clone(),
+                dispatch_id: None,
+            },
+            TransitionIntent::SyncReviewState {
+                card_id: id.clone(),
+                state: "idle".to_string(),
+            },
         ];
         conn.execute_batch("BEGIN").ok();
         let mut exec_ok = true;
@@ -773,10 +806,15 @@ pub async fn redispatch_card(
             if let Err(e) = execute_intent_on_conn(&conn, intent) {
                 conn.execute_batch("ROLLBACK").ok();
                 exec_ok = false;
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{e}")})));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
             }
         }
-        if exec_ok { conn.execute_batch("COMMIT").ok(); }
+        if exec_ok {
+            conn.execute_batch("COMMIT").ok();
+        }
 
         // Get agent + title for direct dispatch creation
         let (agent_id, card_title): (String, String) = conn
@@ -986,8 +1024,14 @@ pub async fn defer_dod(
                 // #155: Use intents for review_status mutation
                 use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
                 let dod_intents = vec![
-                    TransitionIntent::SetReviewStatus { card_id: id.clone(), review_status: Some("reviewing".to_string()) },
-                    TransitionIntent::SyncReviewState { card_id: id.clone(), state: "reviewing".to_string() },
+                    TransitionIntent::SetReviewStatus {
+                        card_id: id.clone(),
+                        review_status: Some("reviewing".to_string()),
+                    },
+                    TransitionIntent::SyncReviewState {
+                        card_id: id.clone(),
+                        state: "reviewing".to_string(),
+                    },
                 ];
                 for intent in &dod_intents {
                     execute_intent_on_conn(&conn, intent).ok();
@@ -1234,7 +1278,11 @@ pub async fn bulk_action(
                         [card_id],
                         |row| card_row_to_json(row),
                     ) {
-                        crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
+                        crate::server::ws::emit_event(
+                            &state.broadcast_tx,
+                            "kanban_card_updated",
+                            card,
+                        );
                     }
                 }
                 results.push(json!({"id": card_id, "ok": true}));
@@ -1310,7 +1358,11 @@ pub async fn assign_issue(
             |row| card_row_to_json(row),
         ) {
             Ok(card) => {
-                crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
+                crate::server::ws::emit_event(
+                    &state.broadcast_tx,
+                    "kanban_card_updated",
+                    card.clone(),
+                );
                 (
                     StatusCode::OK,
                     Json(json!({"card": card, "deduplicated": true})),
@@ -1795,10 +1847,14 @@ pub async fn pm_decision(
                     );
                     if let Ok(conn) = state.db.lock() {
                         // #155: Use intent for review_status mutation
-                        crate::engine::transition::execute_intent_on_conn(&conn, &crate::engine::transition::TransitionIntent::SetReviewStatus {
-                            card_id: body.card_id.clone(),
-                            review_status: Some("rework_pending".to_string()),
-                        }).ok();
+                        crate::engine::transition::execute_intent_on_conn(
+                            &conn,
+                            &crate::engine::transition::TransitionIntent::SetReviewStatus {
+                                card_id: body.card_id.clone(),
+                                review_status: Some("rework_pending".to_string()),
+                            },
+                        )
+                        .ok();
                         // #117: sync canonical review state
                         conn.execute(
                             "INSERT INTO card_review_state (card_id, state, last_decision, updated_at) \
@@ -2047,10 +2103,14 @@ pub async fn reopen_card(
 
             // #155: Optional review_status via intent
             if let Some(ref rs) = body.review_status {
-                crate::engine::transition::execute_intent_on_conn(&conn, &crate::engine::transition::TransitionIntent::SetReviewStatus {
-                    card_id: id.clone(),
-                    review_status: Some(rs.clone()),
-                }).ok();
+                crate::engine::transition::execute_intent_on_conn(
+                    &conn,
+                    &crate::engine::transition::TransitionIntent::SetReviewStatus {
+                        card_id: id.clone(),
+                        review_status: Some(rs.clone()),
+                    },
+                )
+                .ok();
             }
 
             // Reactivate auto_queue_entries that were marked done
@@ -2087,7 +2147,11 @@ pub async fn reopen_card(
 
             match card {
                 Ok(c) => {
-                    crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", c.clone());
+                    crate::server::ws::emit_event(
+                        &state.broadcast_tx,
+                        "kanban_card_updated",
+                        c.clone(),
+                    );
                     (
                         StatusCode::OK,
                         Json(json!({
@@ -2208,10 +2272,16 @@ pub async fn force_transition(
             drop(conn);
             match card {
                 Ok(c) => {
-                    crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", c.clone());
+                    crate::server::ws::emit_event(
+                        &state.broadcast_tx,
+                        "kanban_card_updated",
+                        c.clone(),
+                    );
                     (
                         StatusCode::OK,
-                        Json(json!({"card": c, "forced": true, "from": result.from, "to": result.to})),
+                        Json(
+                            json!({"card": c, "forced": true, "from": result.from, "to": result.to}),
+                        ),
                     )
                 }
                 Err(e) => (
