@@ -2348,7 +2348,7 @@ async fn try_handle_family_profile_probe_reply(
     .await
     .map_err(|err| format!("profile_probe_join_failed:{err}"))?;
 
-    let response = match recorded {
+    let (dm_response, should_forward) = match recorded {
         Ok(true) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
@@ -2356,7 +2356,7 @@ async fn try_handle_family_profile_probe_reply(
                 msg.author.id.get(),
                 topic_key
             );
-            "답변 고마워요. 프로필에 반영해둘게요."
+            ("답변 기록했어요. 상담봇이 좀 더 자세히 응답할게요.", true)
         }
         Ok(false) => {
             eprintln!(
@@ -2364,7 +2364,10 @@ async fn try_handle_family_profile_probe_reply(
                 msg.author.id.get(),
                 topic_key
             );
-            "답변은 받았는데 저장 대상에 바로 반영하지 못했어요. 제가 다시 확인할게요."
+            (
+                "답변은 받았는데 저장 대상에 바로 반영하지 못했어요. 제가 다시 확인할게요.",
+                true,
+            )
         }
         Err(err) => {
             eprintln!(
@@ -2373,12 +2376,37 @@ async fn try_handle_family_profile_probe_reply(
                 topic_key,
                 err
             );
-            "답변은 받았는데 저장 중 오류가 있었어요. 다시 확인해서 반영할게요."
+            (
+                "답변은 받았는데 저장 중 오류가 있었어요. 다시 확인해서 반영할게요.",
+                false,
+            )
         }
     };
 
     rate_limit_wait(shared, msg.channel_id).await;
-    let _ = msg.channel_id.say(&ctx.http, response).await;
+    let _ = msg.channel_id.say(&ctx.http, dm_response).await;
+
+    // Forward the answer to family-counsel agent for contextual follow-up.
+    if should_forward {
+        const FAMILY_COUNSEL_CHANNEL: &str = "1473922824350601297";
+        let forward_content = format!(
+            "[프로필 probe 답변] 주제: {topic_key}\n사용자 답변: {answer}",
+            answer = answer
+        );
+        let _ = reqwest::Client::new()
+            .post(crate::config::local_api_url(
+                shared.api_port,
+                "/api/send",
+            ))
+            .json(&serde_json::json!({
+                "target": format!("channel:{FAMILY_COUNSEL_CHANNEL}"),
+                "content": forward_content,
+                "bot": "announce",
+            }))
+            .send()
+            .await;
+    }
+
     Ok(true)
 }
 
