@@ -4,8 +4,8 @@
  *
  * Hook: onTick (1분 간격 — Rust 서버에서 주기적으로 fire)
  *
- * [A] Requested 타임아웃 (45분) → retry_count < 10이면 재시도 대기, ≥ 10이면 pending_decision
- * [B] In-Progress 스테일 (2시간) → blocked
+ * [A] Requested 타임아웃 (requested_timeout_min, 기본 45분) → retry_count < 10이면 재시도 대기, ≥ 10이면 pending_decision
+ * [B] In-Progress 스테일 (in_progress_stale_min, 기본 120분) → blocked
  * [C] 스테일 리뷰 (dispatch 완료인데 verdict 없음) → pending_decision
  * [D] DoD 대기 타임아웃 (15분) → pending_decision
  * [E] 자동-수용 결정 타임아웃 → auto-accept + rework
@@ -49,6 +49,13 @@ function sendDeadlockAlert(message) {
 
 // Shared constant used by sections [A] and [J]
 var MAX_DISPATCH_RETRIES = 10;
+
+// Helper: read timeout config as SQL interval string
+function getTimeoutInterval(key, fallbackMinutes) {
+  var val = parseInt(agentdesk.config.get(key), 10);
+  if (!val || val <= 0) val = fallbackMinutes;
+  return "-" + val + " minutes";
+}
 
 var timeouts = {
   name: "timeouts",
@@ -185,19 +192,20 @@ var timeouts = {
   },
 
   _section_A: function() {
-    // ─── [A] Requested 타임아웃 (45분) ─────────────────────
+    // ─── [A] Requested 타임아웃 ─────────────────────
     // retry_count < 10이면 pending_decision 대신 failed만 마크 → [J]가 30초 후 재시도
     var aCfg = agentdesk.pipeline.getConfig();
     var aInitial = agentdesk.pipeline.kickoffState(aCfg);
     var aInProgress = agentdesk.pipeline.nextGatedTarget(aInitial, aCfg);
     var aForce = agentdesk.pipeline.forceOnlyTargets(aInitial, aCfg);
     var aPending = aForce[0];
+    var requestedInterval = getTimeoutInterval("requested_timeout_min", 45);
     var staleRequested = agentdesk.db.query(
       "SELECT kc.id, kc.assigned_agent_id, kc.latest_dispatch_id, " +
       "COALESCE(td.retry_count, 0) as retry_count " +
       "FROM kanban_cards kc " +
       "LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id " +
-      "WHERE kc.status = ? AND kc.requested_at IS NOT NULL AND kc.requested_at < datetime('now', '-45 minutes')",
+      "WHERE kc.status = ? AND kc.requested_at IS NOT NULL AND kc.requested_at < datetime('now', '" + requestedInterval + "')",
       [aInitial]
     );
     for (var i = 0; i < staleRequested.length; i++) {
@@ -250,20 +258,22 @@ var timeouts = {
   },
 
   _section_B: function() {
-    // ─── [B] In-Progress 스테일 (2시간) ────────────────────
+    // ─── [B] In-Progress 스테일 ────────────────────
     var bCfg = agentdesk.pipeline.getConfig();
     var bInitial = agentdesk.pipeline.kickoffState(bCfg);
     var bInProgress = agentdesk.pipeline.nextGatedTarget(bInitial, bCfg);
     var bForce = agentdesk.pipeline.forceOnlyTargets(bInProgress, bCfg);
     var bBlocked = bForce.length > 1 ? bForce[1] : bForce[0];
+    var inProgressInterval = getTimeoutInterval("in_progress_stale_min", 120);
     var staleInProgress = agentdesk.db.query(
-      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '-2 hours')",
+      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '" + inProgressInterval + "')",
       [bInProgress]
     );
     for (var j = 0; j < staleInProgress.length; j++) {
       agentdesk.kanban.setStatus(staleInProgress[j].id, bBlocked);
+      var staleMin = parseInt(agentdesk.config.get("in_progress_stale_min"), 10) || 120;
       agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'Stalled: no activity for 2+ hours' WHERE id = ?",
+        "UPDATE kanban_cards SET blocked_reason = 'Stalled: no activity for " + staleMin + "+ min' WHERE id = ?",
         [staleInProgress[j].id]
       );
       agentdesk.log.warn("[timeout] Card " + staleInProgress[j].id + " " + bInProgress + " stale → " + bBlocked);
@@ -279,7 +289,7 @@ var timeouts = {
       if (kmChannel2) {
         agentdesk.message.queue(
           kmChannel2,
-          "[Stalled] " + stalledTitle + " (담당: " + stalledAssignee + ")" + stalledUrl + "\n2시간+ 활동 없음 → blocked",
+          "[Stalled] " + stalledTitle + " (담당: " + stalledAssignee + ")" + stalledUrl + "\n" + staleMin + "분+ 활동 없음 → blocked",
           "announce",
           "system"
         );

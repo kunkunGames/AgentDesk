@@ -59,39 +59,88 @@ pub async fn put_settings(
 }
 
 /// Known config keys with metadata for the settings UI.
-const CONFIG_KEYS: &[(&str, &str, &str, &str)] = &[
+/// (key, category, label_ko, label_en, default_value)
+/// default_value is seeded into kv_meta on startup if absent.
+const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
     (
         "kanban_manager_channel_id",
         "pipeline",
         "칸반매니저 채널 ID",
         "Kanban Manager Channel ID",
+        None,
     ),
     (
         "deadlock_manager_channel_id",
         "pipeline",
         "데드락 매니저 채널 ID",
         "Deadlock Manager Channel ID",
+        None,
     ),
-    ("review_enabled", "review", "리뷰 활성화", "Review Enabled"),
+    ("review_enabled", "review", "리뷰 활성화", "Review Enabled", None),
     (
         "counter_model_review_enabled",
         "review",
         "카운터모델 리뷰 활성화",
         "Counter-Model Review",
+        None,
     ),
     (
         "max_review_rounds",
         "review",
         "최대 리뷰 라운드",
         "Max Review Rounds",
+        Some("3"),
     ),
     (
         "pm_decision_gate_enabled",
         "pipeline",
         "PM 판단 게이트",
         "PM Decision Gate",
+        None,
     ),
-    ("server_port", "system", "서버 포트", "Server Port"),
+    ("server_port", "system", "서버 포트", "Server Port", None),
+    (
+        "requested_timeout_min",
+        "timeout",
+        "요청됨 타임아웃 (분)",
+        "Requested Timeout (min)",
+        Some("45"),
+    ),
+    (
+        "in_progress_stale_min",
+        "timeout",
+        "진행 중 정체 판정 (분)",
+        "In-Progress Stale (min)",
+        Some("120"),
+    ),
+    (
+        "max_chain_depth",
+        "dispatch",
+        "최대 체인 깊이",
+        "Max Chain Depth",
+        Some("5"),
+    ),
+    (
+        "context_compact_percent",
+        "context",
+        "컨텍스트 compact 임계값 (%)",
+        "Context Compact Threshold (%)",
+        Some("60"),
+    ),
+    (
+        "context_clear_percent",
+        "context",
+        "컨텍스트 clear 임계값 (%)",
+        "Context Clear Threshold (%)",
+        Some("40"),
+    ),
+    (
+        "context_clear_idle_minutes",
+        "context",
+        "컨텍스트 clear 유휴 시간 (분)",
+        "Context Clear Idle Time (min)",
+        Some("60"),
+    ),
 ];
 
 /// GET /api/settings/config
@@ -108,7 +157,7 @@ pub async fn get_config_entries(
         }
     };
     let mut entries = Vec::new();
-    for (key, category, label_ko, label_en) in CONFIG_KEYS {
+    for (key, category, label_ko, label_en, default_val) in CONFIG_KEYS {
         let value: Option<String> = conn
             .query_row("SELECT value FROM kv_meta WHERE key = ?1", [key], |row| {
                 row.get(0)
@@ -117,6 +166,7 @@ pub async fn get_config_entries(
         entries.push(json!({
             "key": key, "value": value, "category": category,
             "label_ko": label_ko, "label_en": label_en,
+            "default": default_val,
         }));
     }
     // Only return whitelisted CONFIG_KEYS — unknown kv_meta keys are not exposed.
@@ -147,7 +197,7 @@ pub async fn patch_config_entries(
         }
     };
     let allowed: std::collections::HashSet<&str> =
-        CONFIG_KEYS.iter().map(|(k, _, _, _)| *k).collect();
+        CONFIG_KEYS.iter().map(|(k, _, _, _, _)| *k).collect();
     let mut updated = 0;
     let mut rejected = Vec::new();
     for (key, value) in entries {
@@ -178,7 +228,9 @@ pub async fn patch_config_entries(
     )
 }
 
-/// Default runtime config values
+/// Default runtime config values.
+/// Only polling intervals and Rust-only settings live here.
+/// Kanban/timeout/review/context settings are in CONFIG_KEYS (individual kv_meta keys).
 fn runtime_config_defaults() -> serde_json::Value {
     json!({
         "dispatchPollSec": 30,
@@ -187,21 +239,28 @@ fn runtime_config_defaults() -> serde_json::Value {
         "claudeRateLimitPollSec": 120,
         "codexRateLimitPollSec": 120,
         "issueTriagePollSec": 300,
-        "requestedAckTimeoutMin": 45,
-        "inProgressStaleMin": 120,
-        "maxChainDepth": 5,
         "ceoWarnDepth": 3,
         "maxRetries": 3,
-        "maxReviewRounds": 3,
         "reviewReminderMin": 30,
         "rateLimitWarningPct": 80,
         "rateLimitDangerPct": 95,
         "githubRepoCacheSec": 300,
         "rateLimitStaleSec": 600,
-        "context_compact_percent": 60,
-        "context_clear_percent": 40,
-        "context_clear_idle_minutes": 60,
     })
+}
+
+/// Seed default values for CONFIG_KEYS into kv_meta on startup.
+/// Only inserts if the key doesn't already exist (INSERT OR IGNORE).
+pub fn seed_config_defaults(conn: &rusqlite::Connection) {
+    for (key, _, _, _, default_val) in CONFIG_KEYS {
+        if let Some(val) = default_val {
+            conn.execute(
+                "INSERT OR IGNORE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, val],
+            )
+            .ok();
+        }
+    }
 }
 
 /// GET /api/settings/runtime-config

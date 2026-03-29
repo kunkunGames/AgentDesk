@@ -581,11 +581,11 @@ impl Default for ContextThresholds {
     }
 }
 
-/// Fetch context thresholds from the ADK runtime config API.
+/// Fetch context thresholds from the ADK config API (individual kv_meta keys).
 /// Falls back to defaults on any error.
 pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds {
     let defaults = ContextThresholds::default();
-    let url = local_api_url(api_port, "/api/settings/runtime-config");
+    let url = local_api_url(api_port, "/api/settings/config");
     let resp = match reqwest::Client::new().get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return defaults,
@@ -594,12 +594,17 @@ pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds
         Ok(v) => v,
         _ => return defaults,
     };
-    let current = body.get("current").unwrap_or(&body);
+    let entries = body.get("entries").and_then(|v| v.as_array());
+    let compact_pct = entries
+        .and_then(|arr| {
+            arr.iter().find(|e| e.get("key").and_then(|k| k.as_str()) == Some("context_compact_percent"))
+        })
+        .and_then(|e| e.get("value"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(defaults.compact_pct);
     ContextThresholds {
-        compact_pct: current
-            .get("context_compact_percent")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(defaults.compact_pct),
+        compact_pct,
         context_window: defaults.context_window,
     }
 }
