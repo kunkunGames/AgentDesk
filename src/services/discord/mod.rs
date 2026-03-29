@@ -2343,10 +2343,29 @@ async fn try_handle_family_profile_probe_reply(
     // record succeeds.  If we only clear on success, the pending entry survives
     // and the *next* unrelated DM will be re-matched as a probe answer.
     let target_for_clear = target.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let clear_result = tokio::task::spawn_blocking(move || {
         clear_family_profile_probe_pending(&target_for_clear)
     })
     .await;
+    match clear_result {
+        Ok(Err(err)) => {
+            eprintln!(
+                "  [profile-probe] failed to clear pending state for user={} topic={} error={}",
+                msg.author.id.get(),
+                topic_key,
+                err
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "  [profile-probe] clear pending task panicked for user={} topic={} error={}",
+                msg.author.id.get(),
+                topic_key,
+                err
+            );
+        }
+        _ => {}
+    }
 
     // Record the answer (best-effort). Return Ok(false) so the message
     // continues to the normal DM handling path, where the agent responds
