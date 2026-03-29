@@ -549,11 +549,7 @@ mod tests {
     async fn agent_dispatched_sessions_include_thread_channel_id() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         {
             let conn = db.lock().unwrap();
