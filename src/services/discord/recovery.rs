@@ -1,6 +1,5 @@
 use super::turn_bridge::stale_inflight_message;
 use super::*;
-#[cfg(unix)]
 use crate::services::tmux_common::tmux_exact_target;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
