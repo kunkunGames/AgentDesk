@@ -1029,6 +1029,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
     for session_name in &agent_sessions {
         let Some((channel_id, channel_name)) = name_to_channel.get(*session_name) else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — channel mapping not found",
+                session_name
+            );
             continue;
         };
 
@@ -1062,6 +1067,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         let output_path = crate::services::tmux_common::session_temp_path(session_name, "jsonl");
         if std::fs::metadata(&output_path).is_err() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — no output file",
+                session_name
+            );
             continue;
         }
 
@@ -1080,6 +1090,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             // Skip sessions belonging to other runtimes
             let current_owner_marker = current_tmux_owner_marker();
             if !session_belongs_to_current_runtime(session_name, &current_owner_marker) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏭ watcher skip for {} — owned by other runtime",
+                    session_name
+                );
                 continue;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
