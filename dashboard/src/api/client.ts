@@ -944,6 +944,9 @@ export interface AutoQueueRun {
   unified_thread_id: string | null;
   created_at: number;
   completed_at: number | null;
+  max_concurrent_threads?: number;
+  max_concurrent_per_agent?: number;
+  thread_group_count?: number;
 }
 
 export interface DispatchQueueEntry {
@@ -959,12 +962,23 @@ export interface DispatchQueueEntry {
   card_title?: string;
   github_issue_number?: number | null;
   github_repo?: string | null;
+  thread_group?: number;
+}
+
+export interface ThreadGroupStatus {
+  pending: number;
+  dispatched: number;
+  done: number;
+  skipped: number;
+  status: string;
+  entries: { id: string; card_id: string; github_issue_number?: number | null; status: string }[];
 }
 
 export interface AutoQueueStatus {
   run: AutoQueueRun | null;
   entries: DispatchQueueEntry[];
   agents: Record<string, { pending: number; dispatched: number; done: number; skipped: number }>;
+  thread_groups?: Record<string, ThreadGroupStatus>;
 }
 
 export async function generateAutoQueue(repo?: string | null, agentId?: string | null, mode?: string | null): Promise<{
