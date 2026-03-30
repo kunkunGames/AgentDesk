@@ -76,7 +76,13 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         "Deadlock Manager Channel ID",
         None,
     ),
-    ("review_enabled", "review", "리뷰 활성화", "Review Enabled", None),
+    (
+        "review_enabled",
+        "review",
+        "리뷰 활성화",
+        "Review Enabled",
+        None,
+    ),
     (
         "counter_model_review_enabled",
         "review",

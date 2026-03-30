@@ -597,7 +597,8 @@ pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds
     let entries = body.get("entries").and_then(|v| v.as_array());
     let compact_pct = entries
         .and_then(|arr| {
-            arr.iter().find(|e| e.get("key").and_then(|k| k.as_str()) == Some("context_compact_percent"))
+            arr.iter()
+                .find(|e| e.get("key").and_then(|k| k.as_str()) == Some("context_compact_percent"))
         })
         .and_then(|e| e.get("value"))
         .and_then(|v| v.as_str())

@@ -39,6 +39,12 @@ pub(super) struct InflightTurnState {
     /// Whether text was streamed after the last tool_use (persisted for restart recovery).
     #[serde(default)]
     pub has_post_tool_text: bool,
+    /// ADK session key (hostname:session-name) for long-turn diagnostics.
+    #[serde(default)]
+    pub session_key: Option<String>,
+    /// Active dispatch ID for long-turn diagnostics.
+    #[serde(default)]
+    pub dispatch_id: Option<String>,
 }
 
 impl InflightTurnState {
@@ -80,6 +86,8 @@ impl InflightTurnState {
             born_generation: super::runtime_store::load_generation(),
             any_tool_used: false,
             has_post_tool_text: false,
+            session_key: None,
+            dispatch_id: None,
         }
     }
 

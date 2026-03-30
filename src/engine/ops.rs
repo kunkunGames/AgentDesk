@@ -493,6 +493,8 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 // If validation fails, it returns an error that we throw immediately.
                 var result = JSON.parse(raw(cardId, agentId, dt, t));
                 if (result.error) throw new Error(result.error);
+                // #173: If dedup'd, return existing ID without pushing intent
+                if (result.reused) return result.dispatch_id;
                 // #121: Push CreateDispatch intent — execution deferred to Rust
                 var dispatchId = result.dispatch_id;
                 agentdesk.__pendingIntents.push({
@@ -580,6 +582,29 @@ fn dispatch_create_raw(
         .is_ok();
     if !agent_exists {
         return format!(r#"{{"error":"agent not found: {agent_id}"}}"#);
+    }
+    // #173: Dedup — if same card + same type already has pending/dispatched, return existing.
+    if dispatch_type != "review-decision" {
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM task_dispatches \
+                 WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
+                 AND status IN ('pending', 'dispatched') LIMIT 1",
+                rusqlite::params![card_id, dispatch_type],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(eid) = existing_id {
+            tracing::info!(
+                "DEDUP: reusing existing dispatch {} for card {} type {}",
+                eid,
+                card_id,
+                dispatch_type
+            );
+            return format!(
+                r#"{{"dispatch_id":"{eid}","card_id":"{card_id}","agent_id":"{agent_id}","reused":true}}"#
+            );
+        }
     }
     // Generate pre-assigned dispatch ID (actual DB write deferred to intent executor)
     let dispatch_id = uuid::Uuid::new_v4().to_string();
@@ -1592,6 +1617,7 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                                         // channel_name → for agent identification
                                         // tmux_session_name → for diagnostics
                                         // session_id → Claude session ID
+                                        // session_key, dispatch_id → for long-turn detection (#130)
                                         let channel_name = data.get("channel_name").and_then(|v| v.as_str()).unwrap_or("");
                                         let tmux_name = data.get("tmux_session_name").and_then(|v| v.as_str()).unwrap_or("");
                                         results.push(serde_json::json!({
@@ -1601,6 +1627,8 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                                             "channel_name": channel_name,
                                             "tmux_session_name": tmux_name,
                                             "session_id": data.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "session_key": data.get("session_key").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "dispatch_id": data.get("dispatch_id").and_then(|v| v.as_str()).unwrap_or(""),
                                         }));
                                     }
                                 }

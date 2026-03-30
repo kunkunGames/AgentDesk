@@ -83,6 +83,49 @@ pub fn hostname_short() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
+/// Resolve the AgentDesk git repository directory.
+///
+/// Priority: `AGENTDESK_REPO_DIR` env → scan all known roots for a git workspace → `~/AgentDesk`.
+pub fn resolve_repo_dir() -> Option<String> {
+    if let Ok(d) = std::env::var("AGENTDESK_REPO_DIR") {
+        let trimmed = d.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+
+    let is_git_dir = |p: &std::path::Path| p.join(".git").exists();
+
+    // Try runtime_root/workspaces/agentdesk first (covers current deployment),
+    // then the sibling root (dev ↔ release) so the dev server can find the
+    // release repo where worktrees actually live.
+    let mut candidates = Vec::new();
+    if let Some(root) = crate::config::runtime_root() {
+        candidates.push(root.join("workspaces").join("agentdesk"));
+        // Sibling: if runtime_root is .adk/dev, also try .adk/release and vice versa
+        if let Some(parent) = root.parent() {
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let sibling = if name == "dev" { "release" } else { "dev" };
+            candidates.push(parent.join(sibling).join("workspaces").join("agentdesk"));
+        }
+    }
+    for ws in &candidates {
+        if is_git_dir(ws) {
+            return Some(ws.to_string_lossy().into_owned());
+        }
+    }
+
+    // Legacy fallback
+    let legacy = dirs::home_dir().map(|h| h.join("AgentDesk"));
+    if let Some(ref p) = legacy {
+        if is_git_dir(p) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    // Return legacy path even without .git — callers handle failures gracefully
+    legacy.map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Get the current HEAD commit hash from a git repo directory.
 ///
 /// Returns `None` if git is unavailable or the directory is not a repo.
@@ -157,10 +200,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
         }
     }
     // Handle last block (porcelain may not end with blank line)
-    if !wt_path.is_empty()
-        && wt_branch != "main"
-        && wt_branch != "master"
-        && !wt_branch.is_empty()
+    if !wt_path.is_empty() && wt_branch != "main" && wt_branch != "master" && !wt_branch.is_empty()
     {
         candidates.push((wt_path, wt_branch, wt_head));
     }
@@ -222,5 +262,21 @@ mod tests {
 
         let output = shell_command_builder(cmd_str).output().unwrap();
         assert!(output.status.success());
+    }
+
+    #[test]
+    fn resolve_repo_dir_returns_some() {
+        // In CI/dev environments, should always resolve to *something*
+        let dir = resolve_repo_dir();
+        assert!(dir.is_some(), "resolve_repo_dir should return Some");
+    }
+
+    #[test]
+    fn resolve_repo_dir_env_override() {
+        // When AGENTDESK_REPO_DIR is set, it takes priority
+        unsafe { std::env::set_var("AGENTDESK_REPO_DIR", "/tmp/fake-repo") };
+        let dir = resolve_repo_dir();
+        unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
+        assert_eq!(dir, Some("/tmp/fake-repo".to_string()));
     }
 }

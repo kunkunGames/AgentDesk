@@ -83,7 +83,6 @@ pub struct DataConfig {
     pub db_name: String,
 }
 
-
 /// Compile-time defaults loaded from the project-root `defaults.json`.
 /// This is the single source of truth for port/host values shared across
 /// Rust, Vite, and shell scripts.
@@ -195,7 +194,6 @@ impl Default for DataConfig {
         }
     }
 }
-
 
 impl Default for Config {
     fn default() -> Self {
