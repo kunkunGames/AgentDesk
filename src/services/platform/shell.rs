@@ -152,16 +152,41 @@ pub fn git_branch_name(dir: &str) -> Option<String> {
 }
 
 /// Worktree info: (path, branch, commit).
+#[derive(Clone)]
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: String,
     pub commit: String,
 }
 
+/// Determine the upstream base ref for commit range comparisons.
+///
+/// Prefers `origin/main` over local `main` to avoid false negatives when
+/// local main has already fast-forwarded past the worktree's commits.
+fn upstream_base_ref(repo_dir: &str) -> String {
+    let check = Command::new("git")
+        .args(["rev-parse", "--verify", "origin/main"])
+        .current_dir(repo_dir)
+        .output();
+    if let Ok(out) = check {
+        if out.status.success() {
+            return "origin/main".to_string();
+        }
+    }
+    "main".to_string()
+}
+
 /// Find an active git worktree whose recent commits reference the given issue number.
 ///
 /// Scans `git worktree list --porcelain`, then checks each non-main worktree for
-/// commits mentioning `#<issue_number>` that are not reachable from main.
+/// commits mentioning `#<issue_number>` not reachable from the upstream base ref.
+///
+/// Uses `origin/main` (not local `main`) as the base ref so that worktrees remain
+/// discoverable even after local main fast-forwards past their commits.
+///
+/// When multiple worktrees match, disambiguates by:
+/// 1. Preferring branches whose name contains the issue number
+/// 2. Among ties, preferring the worktree with the newest HEAD commit
 pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<WorktreeInfo> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -205,9 +230,13 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
         candidates.push((wt_path, wt_branch, wt_head));
     }
 
+    // Use origin/main as base ref to avoid false negatives when local main
+    // has already fast-forwarded past the worktree's commits.
+    let base_ref = upstream_base_ref(repo_dir);
     let needle = format!("#{}", issue_number);
+    let mut matches: Vec<WorktreeInfo> = Vec::new();
+
     for (path, branch, head) in &candidates {
-        // Check if this branch has commits not on main that mention the issue
         let check = Command::new("git")
             .args([
                 "-C",
@@ -216,7 +245,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
                 "--oneline",
                 "--grep",
                 &needle,
-                &format!("main..{}", branch),
+                &format!("{}..{}", base_ref, branch),
             ])
             .output()
             .ok();
@@ -224,8 +253,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
             if out.status.success() {
                 let log = String::from_utf8_lossy(&out.stdout);
                 if !log.trim().is_empty() {
-                    // Found a worktree with commits for this issue
-                    return Some(WorktreeInfo {
+                    matches.push(WorktreeInfo {
                         path: path.clone(),
                         branch: branch.clone(),
                         commit: head.clone(),
@@ -234,7 +262,51 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
             }
         }
     }
-    None
+
+    if matches.len() <= 1 {
+        return matches.into_iter().next();
+    }
+
+    // Multiple matches: disambiguate.
+    // Step 1: prefer branches whose name contains the issue number.
+    let issue_str = issue_number.to_string();
+    let name_hits: Vec<usize> = matches
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.branch.contains(&issue_str))
+        .map(|(i, _)| i)
+        .collect();
+
+    let finalists: Vec<usize> = if name_hits.len() == 1 {
+        return Some(matches.swap_remove(name_hits[0]));
+    } else if !name_hits.is_empty() {
+        name_hits
+    } else {
+        (0..matches.len()).collect()
+    };
+
+    // Step 2: among finalists, pick the one with the newest HEAD commit.
+    let mut best_idx = finalists[0];
+    let mut best_ts: i64 = 0;
+    for &idx in &finalists {
+        let ts = Command::new("git")
+            .args(["log", "-1", "--format=%ct", &matches[idx].commit])
+            .current_dir(repo_dir)
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        if ts > best_ts {
+            best_ts = ts;
+            best_idx = idx;
+        }
+    }
+    Some(matches[best_idx].clone())
 }
 
 #[cfg(test)]
@@ -278,5 +350,192 @@ mod tests {
         let dir = resolve_repo_dir();
         unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
         assert_eq!(dir, Some("/tmp/fake-repo".to_string()));
+    }
+
+    /// Helper: create a temporary git repo with an "origin" remote for testing.
+    /// Returns (repo_dir, origin_dir) as temp dirs that are cleaned up on drop.
+    fn setup_test_repo() -> (tempfile::TempDir, tempfile::TempDir) {
+        let origin = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        // Init bare origin
+        Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        // Clone it to get a repo with origin/main
+        Command::new("git")
+            .args([
+                "clone",
+                origin.path().to_str().unwrap(),
+                repo.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        // Create initial commit on main
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+
+        (repo, origin)
+    }
+
+    #[test]
+    fn find_worktree_for_issue_uses_origin_main() {
+        // Regression: when local main has already merged the issue commit,
+        // the function should still find the worktree via origin/main base ref.
+        let (repo, _origin) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+
+        // Create a worktree branch with a commit referencing #42
+        let wt_dir = repo.path().join("wt-42");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "wt/fix-42", wt_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "fix: something (#42)"])
+            .current_dir(wt_dir.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        // Merge the worktree branch into local main (simulating fast-forward)
+        Command::new("git")
+            .args(["merge", "wt/fix-42"])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+
+        // Do NOT push to origin — origin/main is still behind.
+        // With the old code (main..branch), this would return None
+        // because the commit is reachable from local main.
+        let result = find_worktree_for_issue(repo_dir, 42);
+        assert!(
+            result.is_some(),
+            "Should find worktree even when local main has the commit (origin/main hasn't)"
+        );
+        let info = result.unwrap();
+        assert_eq!(info.branch, "wt/fix-42");
+
+        // Cleanup worktree
+        Command::new("git")
+            .args(["worktree", "remove", "--force", wt_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .ok();
+    }
+
+    #[test]
+    fn find_worktree_for_issue_disambiguates_multiple() {
+        // Regression: when multiple worktrees have commits for the same issue,
+        // prefer the branch whose name contains the issue number.
+        let (repo, _origin) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+
+        // Create two worktrees, both with commits mentioning #99
+        let wt1_dir = repo.path().join("wt-generic");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "wt/generic-branch", wt1_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "chore: related to #99"])
+            .current_dir(wt1_dir.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let wt2_dir = repo.path().join("wt-99");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "wt/fix-99", wt2_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "fix: the real fix (#99)"])
+            .current_dir(wt2_dir.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let result = find_worktree_for_issue(repo_dir, 99);
+        assert!(result.is_some(), "Should find a worktree for issue #99");
+        let info = result.unwrap();
+        assert_eq!(
+            info.branch, "wt/fix-99",
+            "Should prefer the branch whose name contains '99'"
+        );
+
+        // Cleanup worktrees
+        for d in [&wt1_dir, &wt2_dir] {
+            Command::new("git")
+                .args(["worktree", "remove", "--force", d.to_str().unwrap()])
+                .current_dir(repo_dir)
+                .output()
+                .ok();
+        }
+    }
+
+    #[test]
+    fn find_worktree_for_issue_newest_when_no_name_match() {
+        // When no branch name contains the issue number, pick the most recent.
+        let (repo, _origin) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+
+        let wt1_dir = repo.path().join("wt-old");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "wt/old-branch", wt1_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        // Older commit with backdated author date
+        Command::new("git")
+            .args([
+                "commit", "--allow-empty", "-m", "old work on #77",
+                "--date", "2020-01-01T00:00:00",
+            ])
+            .current_dir(wt1_dir.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let wt2_dir = repo.path().join("wt-new");
+        Command::new("git")
+            .args(["worktree", "add", "-b", "wt/new-branch", wt2_dir.to_str().unwrap()])
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        // Newer commit (current date)
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "recent work on #77"])
+            .current_dir(wt2_dir.to_str().unwrap())
+            .output()
+            .unwrap();
+
+        let result = find_worktree_for_issue(repo_dir, 77);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(
+            info.branch, "wt/new-branch",
+            "Should prefer the worktree with the newest HEAD commit"
+        );
+
+        for d in [&wt1_dir, &wt2_dir] {
+            Command::new("git")
+                .args(["worktree", "remove", "--force", d.to_str().unwrap()])
+                .current_dir(repo_dir)
+                .output()
+                .ok();
+        }
     }
 }

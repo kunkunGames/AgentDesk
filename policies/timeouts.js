@@ -1007,6 +1007,53 @@ var timeouts = {
     }
   },
 
+  // ─── [N] Orphan review — review 상태인데 dispatch가 없는 카드 자동 복구 ──
+  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched review dispatch 0건
+  // 원인: force-transition 후 dispatch 누락, dispatch 생성 중 에러, race condition 등
+  // 복구: in_progress → review 재진입으로 OnReviewEnter 훅이 dispatch를 생성하도록 유도
+  _section_N: function() {
+    var nCfg = agentdesk.pipeline.getConfig();
+    var nInitial = agentdesk.pipeline.kickoffState(nCfg);
+    var nInProgress = agentdesk.pipeline.nextGatedTarget(nInitial, nCfg);
+    var nReview = agentdesk.pipeline.nextGatedTarget(nInProgress, nCfg);
+    if (!nReview) return;
+
+    var orphanReviews = agentdesk.db.query(
+      "SELECT kc.id, kc.title, kc.github_issue_number, kc.assigned_agent_id " +
+      "FROM kanban_cards kc " +
+      "WHERE kc.status = ? " +
+      "AND kc.review_entered_at IS NOT NULL " +
+      "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
+      "AND NOT EXISTS (" +
+      "  SELECT 1 FROM task_dispatches td " +
+      "  WHERE td.kanban_card_id = kc.id " +
+      "  AND td.dispatch_type IN ('review', 'review-decision') " +
+      "  AND td.status IN ('pending', 'dispatched')" +
+      ")",
+      [nReview]
+    );
+
+    for (var n = 0; n < orphanReviews.length; n++) {
+      var oc = orphanReviews[n];
+      agentdesk.log.warn("[timeout] Orphan review detected: card " + oc.id +
+        " (#" + (oc.github_issue_number || "?") + ") in review with no active dispatch — re-entering review");
+      // Bounce: review → in_progress → review to trigger dispatch creation
+      agentdesk.kanban.setStatus(oc.id, nInProgress);
+      agentdesk.kanban.setStatus(oc.id, nReview);
+
+      var kmChannel = getPMDChannel();
+      if (kmChannel) {
+        agentdesk.message.queue(
+          kmChannel,
+          "🔄 [orphan-review] #" + (oc.github_issue_number || "?") + " " +
+          (oc.title || oc.id) + "\nreview 상태인데 dispatch 없음 → 자동 재진입",
+          "notify",
+          "system"
+        );
+      }
+    }
+  },
+
   // ─── [I] 컨텍스트 윈도우 자동 관리 ─────────────────────
   // onTick에서 세션 토큰 사용량을 모니터링하고 compact/clear 자동 호출
   onContextCheck: function() {
@@ -1129,6 +1176,8 @@ timeouts.onTick1min = function(ev) {
   agentdesk.log.debug("[tick1min][E] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_L(); } catch(e) { agentdesk.log.warn("[tick1min] L error: " + e); }
   agentdesk.log.debug("[tick1min][L] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_N(); } catch(e) { agentdesk.log.warn("[tick1min] N error: " + e); }
+  agentdesk.log.debug("[tick1min][N] " + (Date.now() - t) + "ms");
   agentdesk.log.debug("[tick1min] total " + (Date.now() - start) + "ms");
 };
 
