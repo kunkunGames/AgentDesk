@@ -47,6 +47,26 @@ fn build_restart_handoff_context(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartHandoffScope {
+    ExactMetadata,
+    ProviderChannelScopedFallback,
+}
+
+fn resolve_restart_handoff_scope(
+    state: &super::inflight::InflightTurnState,
+    tmux_session_name: &str,
+    output_path: &str,
+) -> RestartHandoffScope {
+    let tmux_matches = state.tmux_session_name.as_deref() == Some(tmux_session_name);
+    let output_matches = state.output_path.as_deref() == Some(output_path);
+    if tmux_matches || output_matches {
+        RestartHandoffScope::ExactMetadata
+    } else {
+        RestartHandoffScope::ProviderChannelScopedFallback
+    }
+}
+
 async fn resume_aborted_restart_turn(
     channel_id: ChannelId,
     http: &Arc<serenity::Http>,
@@ -56,16 +76,36 @@ async fn resume_aborted_restart_turn(
 ) -> bool {
     let Some((provider_kind, _)) = parse_provider_and_channel_from_tmux_name(tmux_session_name)
     else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⚠ watcher death recovery: failed to parse provider/channel from tmux session {}",
+            tmux_session_name
+        );
         return false;
     };
     let Some(state) = super::inflight::load_inflight_state(&provider_kind, channel_id.get()) else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⚠ watcher death recovery: no inflight state for channel {} (provider {})",
+            channel_id.get(),
+            provider_kind.as_str()
+        );
         return false;
     };
 
-    let tmux_matches = state.tmux_session_name.as_deref() == Some(tmux_session_name);
-    let output_matches = state.output_path.as_deref() == Some(output_path);
-    if !tmux_matches && !output_matches {
-        return false;
+    if matches!(
+        resolve_restart_handoff_scope(&state, tmux_session_name, output_path),
+        RestartHandoffScope::ProviderChannelScopedFallback
+    ) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ↻ watcher death recovery: inflight metadata mismatch for channel {} (state tmux: {:?}, watcher tmux: {}, state output: {:?}, watcher output: {}) — proceeding with provider/channel scoped handoff",
+            channel_id.get(),
+            state.tmux_session_name.as_deref(),
+            tmux_session_name,
+            state.output_path.as_deref(),
+            output_path
+        );
     }
 
     let extracted_full = super::recovery::extract_response_from_output_pub(output_path, 0);
@@ -1750,5 +1790,51 @@ async fn process_unified_thread_kill_signals(shared: &Arc<SharedData>) {
                 "  [{ts}] ♻ Killed unified-thread tmux session: {name} (thread: {thread_channel_id})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RestartHandoffScope, resolve_restart_handoff_scope};
+    use crate::services::discord::inflight::InflightTurnState;
+    use crate::services::provider::ProviderKind;
+
+    fn sample_inflight_state() -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Claude,
+            1479671298497183835,
+            Some("adk-cc".to_string()),
+            1,
+            10,
+            11,
+            "restart me".to_string(),
+            Some("session-123".to_string()),
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/adk-cc.jsonl".to_string()),
+            None,
+            0,
+        )
+    }
+
+    #[test]
+    fn restart_handoff_prefers_exact_metadata_match() {
+        let state = sample_inflight_state();
+        let scope = resolve_restart_handoff_scope(
+            &state,
+            "AgentDesk-claude-adk-cc",
+            "/tmp/other-output.jsonl",
+        );
+        assert_eq!(scope, RestartHandoffScope::ExactMetadata);
+    }
+
+    #[test]
+    fn restart_handoff_allows_provider_channel_fallback_on_metadata_drift() {
+        let state = sample_inflight_state();
+        let scope = resolve_restart_handoff_scope(
+            &state,
+            "AgentDesk-claude-adk-cc-restarted",
+            "/tmp/new-output.jsonl",
+        );
+        assert_eq!(scope, RestartHandoffScope::ProviderChannelScopedFallback);
     }
 }
