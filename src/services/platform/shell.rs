@@ -358,9 +358,9 @@ mod tests {
         let origin = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
 
-        // Init bare origin
+        // Init bare origin with explicit main branch (CI may default to master)
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "--initial-branch=main"])
             .current_dir(origin.path())
             .output()
             .unwrap();
@@ -375,6 +375,13 @@ mod tests {
             .output()
             .unwrap();
 
+        // Ensure we're on main branch (some git versions default to master)
+        Command::new("git")
+            .args(["checkout", "-B", "main"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+
         // Create initial commit on main
         Command::new("git")
             .args(["commit", "--allow-empty", "-m", "initial"])
@@ -383,7 +390,7 @@ mod tests {
             .unwrap();
 
         Command::new("git")
-            .args(["push", "origin", "main"])
+            .args(["push", "-u", "origin", "main"])
             .current_dir(repo.path())
             .output()
             .unwrap();
