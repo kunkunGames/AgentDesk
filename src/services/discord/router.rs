@@ -765,7 +765,7 @@ async fn handle_model_picker_interaction(
     } else if let Some(selected) =
         super::commands::config::parse_model_picker_save_custom_id(&component.data.custom_id)
     {
-        let raw_model = if selected == "__default__" {
+        let raw_model = if selected == "__default__" || selected.eq_ignore_ascii_case("default") {
             "default"
         } else {
             selected

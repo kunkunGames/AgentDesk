@@ -18,6 +18,8 @@ pub(in crate::services::discord) const MODEL_PICKER_CUSTOM_ID: &str = "agentdesk
 pub(in crate::services::discord) const MODEL_DEFAULT_CUSTOM_ID: &str = "agentdesk:model-default";
 pub(in crate::services::discord) const MODEL_CANCEL_CUSTOM_ID: &str = "agentdesk:model-cancel";
 pub(in crate::services::discord) const MODEL_SAVE_CUSTOM_ID_PREFIX: &str = "agentdesk:model-save:";
+pub(in crate::services::discord) const MODEL_SAVE_DEFAULT_CUSTOM_ID: &str =
+    "agentdesk:model-save-default";
 const MODEL_PICKER_OPTION_DESCRIPTION_LIMIT: usize = 100;
 const MODEL_DEFAULT_PICKER_VALUE: &str = "__default__";
 const RUNTIME_OVERRIDE_SOURCE: &str = "runtime override";
@@ -72,16 +74,24 @@ pub(in crate::services::discord) fn is_model_picker_interaction_custom_id(custom
     custom_id == MODEL_PICKER_CUSTOM_ID
         || custom_id == MODEL_DEFAULT_CUSTOM_ID
         || custom_id == MODEL_CANCEL_CUSTOM_ID
+        || custom_id == MODEL_SAVE_DEFAULT_CUSTOM_ID
         || custom_id.starts_with(MODEL_SAVE_CUSTOM_ID_PREFIX)
 }
 
 pub(in crate::services::discord) fn parse_model_picker_save_custom_id(
     custom_id: &str,
 ) -> Option<&str> {
-    custom_id.strip_prefix(MODEL_SAVE_CUSTOM_ID_PREFIX)
+    if custom_id == MODEL_SAVE_DEFAULT_CUSTOM_ID {
+        Some("default")
+    } else {
+        custom_id.strip_prefix(MODEL_SAVE_CUSTOM_ID_PREFIX)
+    }
 }
 
 fn build_model_picker_save_custom_id(selected_value: &str) -> String {
+    if selected_value == MODEL_DEFAULT_PICKER_VALUE {
+        return MODEL_SAVE_DEFAULT_CUSTOM_ID.to_string();
+    }
     format!("{MODEL_SAVE_CUSTOM_ID_PREFIX}{selected_value}")
 }
 pub(in crate::services::discord) fn provider_supports_model_override(
@@ -1181,8 +1191,9 @@ mod tests {
     use super::{
         DISPATCH_ROLE_OVERRIDE_SOURCE, PARENT_DISPATCH_ROLE_OVERRIDE_SOURCE,
         PARENT_RUNTIME_OVERRIDE_SOURCE, RUNTIME_OVERRIDE_SOURCE, build_model_picker_options,
-        build_model_picker_save_custom_id, parse_model_picker_save_custom_id,
-        picker_option_description, resolve_effective_model, resolve_fallback_model, serenity,
+        MODEL_DEFAULT_PICKER_VALUE, MODEL_SAVE_DEFAULT_CUSTOM_ID, build_model_picker_save_custom_id,
+        parse_model_picker_save_custom_id, picker_option_description, resolve_effective_model,
+        resolve_fallback_model, serenity,
     };
     use crate::services::model_catalog::catalog_for_provider;
     use crate::services::provider::ProviderKind;
@@ -1334,5 +1345,12 @@ mod tests {
             parse_model_picker_save_custom_id(&custom_id),
             Some("gemini-3-flash-preview")
         );
+    }
+
+    #[test]
+    fn test_model_save_default_custom_id_round_trips() {
+        let custom_id = build_model_picker_save_custom_id(MODEL_DEFAULT_PICKER_VALUE);
+        assert_eq!(custom_id, MODEL_SAVE_DEFAULT_CUSTOM_ID);
+        assert_eq!(parse_model_picker_save_custom_id(&custom_id), Some("default"));
     }
 }
