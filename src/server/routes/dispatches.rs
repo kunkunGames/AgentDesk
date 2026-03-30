@@ -792,18 +792,15 @@ pub(crate) async fn send_dispatch_to_discord(
     };
 
     // Read dispatch context for reason/source info
-    let dispatch_context: Option<String> = db
-        .lock()
+    let dispatch_context: Option<String> = db.lock().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT context FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
         .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT context FROM task_dispatches WHERE id = ?1",
-                [dispatch_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten()
-        });
+        .flatten()
+    });
 
     let message = format_dispatch_message(
         dispatch_id,
@@ -1883,17 +1880,20 @@ fn format_dispatch_message(
                 .or_else(|| {
                     if v.get("retry").and_then(|r| r.as_bool()).unwrap_or(false) {
                         Some("retry".to_string())
-                    } else if v.get("redispatch")
+                    } else if v
+                        .get("redispatch")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false)
                     {
                         Some("redispatch".to_string())
-                    } else if v.get("auto_queue")
+                    } else if v
+                        .get("auto_queue")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false)
                     {
                         Some("auto-queue".to_string())
-                    } else if v.get("auto_accept")
+                    } else if v
+                        .get("auto_accept")
                         .and_then(|r| r.as_bool())
                         .unwrap_or(false)
                     {
@@ -1904,9 +1904,7 @@ fn format_dispatch_message(
                 })
         });
 
-    let reason_suffix = reason
-        .map(|r| format!(" ({r})"))
-        .unwrap_or_default();
+    let reason_suffix = reason.map(|r| format!(" ({r})")).unwrap_or_default();
 
     if use_alt {
         let mut message = format!(

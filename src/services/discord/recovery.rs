@@ -536,6 +536,7 @@ pub(super) async fn restore_inflight_turns(
                             "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
                             tmux_session_name, initial_offset
                         );
+                        #[cfg(unix)]
                         tokio::spawn(super::tmux::tmux_output_watcher(
                             channel_id,
                             http.clone(),
@@ -856,6 +857,7 @@ pub(super) async fn restore_inflight_turns(
                     "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
                     tmux_session_name, initial_offset
                 );
+                #[cfg(unix)]
                 tokio::spawn(super::tmux::tmux_output_watcher(
                     channel_id,
                     http.clone(),
