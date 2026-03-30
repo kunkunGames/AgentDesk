@@ -19,9 +19,9 @@ pub(super) async fn handle_event(
     match event {
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(component) = interaction.as_message_component() {
-                if component.data.custom_id == super::commands::MODEL_PICKER_CUSTOM_ID
-                    || component.data.custom_id == super::commands::MODEL_RESET_CUSTOM_ID
-                {
+                if super::commands::config::is_model_picker_interaction_custom_id(
+                    &component.data.custom_id,
+                ) {
                     return handle_model_picker_interaction(ctx, component, data).await;
                 }
             }
@@ -711,8 +711,87 @@ async fn handle_model_picker_interaction(
         return Ok(());
     }
 
-    if component.data.custom_id == super::commands::MODEL_RESET_CUSTOM_ID {
-        data.shared.model_overrides.remove(&channel_id);
+    if component.data.custom_id == super::commands::MODEL_DEFAULT_CUSTOM_ID {
+        if let Err(message) = super::commands::config::apply_model_override(
+            ctx,
+            &data.shared,
+            &data.provider,
+            channel_id,
+            "default",
+            &data.token,
+        )
+        .await
+        {
+            component
+                .create_response(
+                    ctx,
+                    serenity::CreateInteractionResponse::Message(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+    } else if component.data.custom_id == super::commands::MODEL_CANCEL_CUSTOM_ID {
+        let embed = super::commands::build_model_picker_embed(
+            ctx,
+            &data.shared,
+            channel_id,
+            &data.provider,
+            None,
+        )
+        .await;
+        let components = super::commands::build_model_picker_components(
+            ctx,
+            &data.shared,
+            channel_id,
+            &data.provider,
+            None,
+        )
+        .await;
+        component
+            .create_response(
+                ctx,
+                serenity::CreateInteractionResponse::UpdateMessage(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .components(components),
+                ),
+            )
+            .await?;
+        return Ok(());
+    } else if let Some(selected) =
+        super::commands::config::parse_model_picker_save_custom_id(&component.data.custom_id)
+    {
+        let raw_model = if selected == "__default__" {
+            "default"
+        } else {
+            selected
+        };
+        if let Err(message) = super::commands::config::apply_model_override(
+            ctx,
+            &data.shared,
+            &data.provider,
+            channel_id,
+            raw_model,
+            &data.token,
+        )
+        .await
+        {
+            component
+                .create_response(
+                    ctx,
+                    serenity::CreateInteractionResponse::Message(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
     } else {
         let selected = match &component.data.kind {
             serenity::ComponentInteractionDataKind::StringSelect { values } => {
@@ -735,34 +814,51 @@ async fn handle_model_picker_interaction(
             return Ok(());
         };
 
-        if selected == "__default__" || super::commands::is_clear_model_keyword(&selected) {
-            data.shared.model_overrides.remove(&channel_id);
-        } else {
-            let validated = match super::commands::validate_model_input(&data.provider, &selected) {
-                Ok(model) => model,
-                Err(message) => {
-                    component
-                        .create_response(
-                            ctx,
-                            serenity::CreateInteractionResponse::Message(
-                                serenity::CreateInteractionResponseMessage::new()
-                                    .content(message)
-                                    .ephemeral(true),
-                            ),
-                        )
-                        .await?;
-                    return Ok(());
-                }
-            };
-            data.shared.model_overrides.insert(channel_id, validated);
-        }
+        let embed = super::commands::build_model_picker_embed(
+            ctx,
+            &data.shared,
+            channel_id,
+            &data.provider,
+            Some(selected.as_str()),
+        )
+        .await;
+        let components = super::commands::build_model_picker_components(
+            ctx,
+            &data.shared,
+            channel_id,
+            &data.provider,
+            Some(selected.as_str()),
+        )
+        .await;
+        component
+            .create_response(
+                ctx,
+                serenity::CreateInteractionResponse::UpdateMessage(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .components(components),
+                ),
+            )
+            .await?;
+        return Ok(());
     }
 
-    let embed =
-        super::commands::build_model_picker_embed(&data.shared, channel_id, &data.provider).await;
-    let components =
-        super::commands::build_model_picker_components(&data.shared, channel_id, &data.provider)
-            .await;
+    let embed = super::commands::build_model_picker_embed(
+        ctx,
+        &data.shared,
+        channel_id,
+        &data.provider,
+        None,
+    )
+    .await;
+    let components = super::commands::build_model_picker_components(
+        ctx,
+        &data.shared,
+        channel_id,
+        &data.provider,
+        None,
+    )
+    .await;
     component
         .create_response(
             ctx,
@@ -1534,6 +1630,75 @@ pub(super) async fn handle_text_message(
     };
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
 
+    if shared
+        .pending_model_session_resets
+        .remove(&channel_id)
+        .is_some()
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        let previous_session_id = {
+            let mut data = shared.core.lock().await;
+            data.sessions
+                .get_mut(&channel_id)
+                .and_then(|session| session.session_id.take())
+        };
+        let previous_session_id = if previous_session_id.is_none() {
+            if let Some(ref session_key) = adk_session_key {
+                super::adk_session::fetch_provider_session_id(
+                    session_key,
+                    &provider,
+                    shared.api_port,
+                )
+                .await
+            } else {
+                None
+            }
+        } else {
+            previous_session_id
+        };
+
+        if let Some(ref session_name) = tmux_session_name {
+            #[cfg(unix)]
+            {
+                if crate::services::tmux_diagnostics::tmux_session_exists(session_name) {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["kill-session", "-t", session_name])
+                        .output();
+                }
+            }
+
+            if let Some(handle) = crate::services::claude::PROCESS_HANDLES
+                .lock()
+                .unwrap()
+                .remove(session_name)
+            {
+                match handle {
+                    crate::services::session_backend::SessionHandle::Process { child, .. } => {
+                        if let Ok(mut guard) = child.lock() {
+                            if let Some(mut process) = guard.take() {
+                                crate::services::claude::kill_child_tree(&mut process);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(previous_session_id) = previous_session_id.as_deref() {
+            super::adk_session::clear_stale_provider_session_id(
+                previous_session_id,
+                shared.api_port,
+            )
+            .await;
+        }
+
+        println!(
+            "  [{ts}] ↻ MODEL-RESET: cleared stored session state for channel {} ({})",
+            channel_id,
+            provider.as_str()
+        );
+    }
+
     // If in-memory session_id is None (e.g. after dcserver restart),
     // try to restore it from the DB's persisted provider session_id.
     let session_id = if session_id.is_none() {
@@ -1684,18 +1849,16 @@ pub(super) async fn handle_text_message(
         }
     }
 
-    // Resolve model + reasoning_effort: DashMap override > dispatch role override > role-map > default
-    let (model_for_turn, reasoning_effort_for_turn): (Option<String>, Option<String>) = {
+    let model_for_turn =
+        super::commands::config::resolve_model_for_turn(ctx, &shared, channel_id).await;
+    // Keep upstream reasoning_effort routing while using the newer model resolution flow.
+    let reasoning_effort_for_turn: Option<String> = {
         let dashmap_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
         if dashmap_model.is_some() {
-            (dashmap_model, None)
+            None
         } else if let Some(override_ch) = shared.dispatch_role_overrides.get(&channel_id) {
             let alt_ch = *override_ch;
-            let rb = resolve_role_binding(alt_ch, None);
-            (
-                rb.as_ref().and_then(|r| r.model.clone()),
-                rb.as_ref().and_then(|r| r.reasoning_effort.clone()),
-            )
+            resolve_role_binding(alt_ch, None).and_then(|rb| rb.reasoning_effort)
         } else {
             let ch_name = {
                 let data = shared.core.lock().await;
@@ -1703,11 +1866,7 @@ pub(super) async fn handle_text_message(
                     .get(&channel_id)
                     .and_then(|s| s.channel_name.clone())
             };
-            let rb = resolve_role_binding(channel_id, ch_name.as_deref());
-            (
-                rb.as_ref().and_then(|r| r.model.clone()),
-                rb.as_ref().and_then(|r| r.reasoning_effort.clone()),
-            )
+            resolve_role_binding(channel_id, ch_name.as_deref()).and_then(|rb| rb.reasoning_effort)
         }
     };
 
@@ -2436,7 +2595,7 @@ Any other message is sent to {p}.
 `!cc <skill>` — Run a provider skill
 
 **Settings**
-`!model [get|set|clear] [name]` — Model management
+`!model [get|set|clear] [name]` — Model management with curated provider catalog
 `!debug` — Toggle debug logging
 `!metrics [date]` — Show turn metrics
 `!queue [all]` — Show pending queue
@@ -2497,15 +2656,19 @@ Any other message is sent to {p}.
             match *arg1 {
                 "list" => {
                     let embed = super::commands::build_model_picker_embed(
+                        ctx,
                         &data.shared,
                         channel_id,
                         &data.provider,
+                        None,
                     )
                     .await;
                     let components = super::commands::build_model_picker_components(
+                        ctx,
                         &data.shared,
                         channel_id,
                         &data.provider,
+                        None,
                     )
                     .await;
                     let _ = channel_id
@@ -2517,6 +2680,7 @@ Any other message is sent to {p}.
                 }
                 "info" => {
                     let status = super::commands::build_model_info_message(
+                        ctx,
                         &data.shared,
                         channel_id,
                         &data.provider,
@@ -2538,49 +2702,83 @@ Any other message is sent to {p}.
                                     return Ok(true);
                                 }
                             };
-                        data.shared
-                            .model_overrides
-                            .insert(channel_id, validated.clone());
-                        let status = super::commands::build_model_status_message(
+                        match super::commands::config::apply_model_override(
+                            ctx,
                             &data.shared,
-                            channel_id,
                             &data.provider,
+                            channel_id,
+                            &validated,
+                            &data.token,
                         )
-                        .await;
-                        let _ = msg
-                            .reply(
-                                &ctx.http,
-                                format!(
-                                    "Model set to **{}** for this channel.\n{}",
-                                    validated, status
-                                ),
-                            )
-                            .await;
+                        .await
+                        {
+                            Ok(_) => {
+                                let status = super::commands::build_model_status_message(
+                                    ctx,
+                                    &data.shared,
+                                    channel_id,
+                                    &data.provider,
+                                )
+                                .await;
+                                let _ = msg
+                                    .reply(
+                                        &ctx.http,
+                                        format!(
+                                            "Model set to **{}** for this channel.\n{}",
+                                            validated, status
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(message) => {
+                                let _ = msg.reply(&ctx.http, message).await;
+                            }
+                        }
                     }
                 }
                 "clear" | "default" | "none" => {
-                    data.shared.model_overrides.remove(&channel_id);
-                    let status = super::commands::build_model_status_message(
+                    match super::commands::config::apply_model_override(
+                        ctx,
                         &data.shared,
-                        channel_id,
                         &data.provider,
+                        channel_id,
+                        "default",
+                        &data.token,
                     )
-                    .await;
-                    let _ = msg
-                        .reply(&ctx.http, format!("Model override cleared.\n{}", status))
-                        .await;
+                    .await
+                    {
+                        Ok(_) => {
+                            let status = super::commands::build_model_status_message(
+                                ctx,
+                                &data.shared,
+                                channel_id,
+                                &data.provider,
+                            )
+                            .await;
+                            let _ = msg
+                                .reply(&ctx.http, format!("Model override cleared.\n{}", status))
+                                .await;
+                        }
+                        Err(message) => {
+                            let _ = msg.reply(&ctx.http, message).await;
+                        }
+                    }
                 }
                 "get" | "" => {
                     let embed = super::commands::build_model_picker_embed(
+                        ctx,
                         &data.shared,
                         channel_id,
                         &data.provider,
+                        None,
                     )
                     .await;
                     let components = super::commands::build_model_picker_components(
+                        ctx,
                         &data.shared,
                         channel_id,
                         &data.provider,
+                        None,
                     )
                     .await;
                     let _ = msg
@@ -2601,24 +2799,38 @@ Any other message is sent to {p}.
                                 return Ok(true);
                             }
                         };
-                    data.shared
-                        .model_overrides
-                        .insert(channel_id, validated.clone());
-                    let status = super::commands::build_model_status_message(
+                    match super::commands::config::apply_model_override(
+                        ctx,
                         &data.shared,
-                        channel_id,
                         &data.provider,
+                        channel_id,
+                        &validated,
+                        &data.token,
                     )
-                    .await;
-                    let _ = msg
-                        .reply(
-                            &ctx.http,
-                            format!(
-                                "Model set to **{}** for this channel.\n{}",
-                                validated, status
-                            ),
-                        )
-                        .await;
+                    .await
+                    {
+                        Ok(_) => {
+                            let status = super::commands::build_model_status_message(
+                                ctx,
+                                &data.shared,
+                                channel_id,
+                                &data.provider,
+                            )
+                            .await;
+                            let _ = msg
+                                .reply(
+                                    &ctx.http,
+                                    format!(
+                                        "Model set to **{}** for this channel.\n{}",
+                                        validated, status
+                                    ),
+                                )
+                                .await;
+                        }
+                        Err(message) => {
+                            let _ = msg.reply(&ctx.http, message).await;
+                        }
+                    }
                 }
             }
             return Ok(true);

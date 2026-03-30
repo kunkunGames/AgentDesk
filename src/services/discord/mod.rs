@@ -257,6 +257,8 @@ pub(super) struct DiscordBotSettings {
     pub(super) last_sessions: std::collections::HashMap<String, String>,
     /// channel_id (string) → last remote profile name
     pub(super) last_remotes: std::collections::HashMap<String, String>,
+    /// channel_id (string) → explicit CLI model override set via `/model`
+    pub(super) channel_model_overrides: std::collections::HashMap<String, String>,
     /// Discord user ID of the registered owner (imprinting auth)
     pub(super) owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
@@ -275,6 +277,7 @@ impl Default for DiscordBotSettings {
                 .collect(),
             last_sessions: std::collections::HashMap::new(),
             last_remotes: std::collections::HashMap::new(),
+            channel_model_overrides: std::collections::HashMap::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
             allowed_bot_ids: Vec::new(),
@@ -371,6 +374,9 @@ pub(super) struct SharedData {
     /// Per-channel model override, independent of session lifecycle.
     /// Takes priority over role-map model. Cleared via `/model default`.
     pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
+    /// Per-channel marker that the next turn must start a fresh provider session
+    /// because the effective model changed since the previous turn.
+    pub(super) pending_model_session_resets: dashmap::DashMap<ChannelId, bool>,
     /// Per-thread role/model override for cross-channel dispatch reuse.
     /// When a review dispatch reuses an implementation thread, this maps
     /// thread_channel_id → alt_channel_id so role_binding and model_for_turn
@@ -1459,6 +1465,7 @@ pub async fn run_bot(
 
     let mut bot_settings = load_bot_settings(token);
     bot_settings.provider = provider.clone();
+    let restored_model_overrides = bot_settings.channel_model_overrides.clone();
 
     match bot_settings.owner_user_id {
         Some(owner_id) => println!("  ✓ Owner: {owner_id}"),
@@ -1506,6 +1513,7 @@ pub async fn run_bot(
         bot_connected: std::sync::atomic::AtomicBool::new(false),
         last_turn_at: std::sync::Mutex::new(None),
         model_overrides: dashmap::DashMap::new(),
+        pending_model_session_resets: dashmap::DashMap::new(),
         dispatch_role_overrides: dashmap::DashMap::new(),
         last_message_ids: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
@@ -1517,12 +1525,31 @@ pub async fn run_bot(
         known_slash_commands: tokio::sync::OnceCell::new(),
     });
 
+    let mut restored_override_count = 0usize;
+    for (channel_id_raw, model) in restored_model_overrides {
+        let Ok(channel_id_raw) = channel_id_raw.parse::<u64>() else {
+            continue;
+        };
+        let channel_id = ChannelId::new(channel_id_raw);
+        shared.model_overrides.insert(channel_id, model);
+        // Force a fresh provider session on the first turn after restart so
+        // restored session state cannot silently ignore a persisted override.
+        shared.pending_model_session_resets.insert(channel_id, true);
+        restored_override_count += 1;
+    }
+
     {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!(
             "  [{ts}] 🔑 dcserver generation: {}",
             shared.current_generation
         );
+        if restored_override_count > 0 {
+            println!(
+                "  [{ts}] 🎛 Restored {} channel model override(s); first turn will start fresh sessions",
+                restored_override_count
+            );
+        }
     }
 
     // Register this provider with the health check registry
@@ -2982,7 +3009,7 @@ pub(super) async fn resolve_channel_category(
 
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.
 /// For non-thread channels, returns `None`.
-async fn resolve_thread_parent(
+pub(in crate::services::discord) async fn resolve_thread_parent(
     ctx: &serenity::prelude::Context,
     channel_id: serenity::model::id::ChannelId,
 ) -> Option<(serenity::model::id::ChannelId, Option<String>)> {
