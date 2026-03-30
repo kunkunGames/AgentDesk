@@ -13,7 +13,7 @@ interface Props {
   selectedAgentId?: string | null;
 }
 
-type ViewMode = "all" | "agent";
+type ViewMode = "all" | "agent" | "thread";
 
 function formatTs(value: number | null | undefined, locale: UiLanguage): string {
   if (!value) return "-";
@@ -53,6 +53,15 @@ function shiftPendingId(ids: string[], entryId: string, offset: -1 | 1): string[
 
 // ── Draggable Entry Row ──
 
+const THREAD_GROUP_COLORS = [
+  "#a78bfa", "#38bdf8", "#f472b6", "#fbbf24", "#4ade80",
+  "#fb923c", "#e879f9", "#22d3ee", "#a3e635", "#f87171",
+];
+
+function threadGroupColor(group: number): string {
+  return THREAD_GROUP_COLORS[group % THREAD_GROUP_COLORS.length];
+}
+
 function EntryRow({
   entry,
   idx,
@@ -63,6 +72,7 @@ function EntryRow({
   isDropTarget,
   dragHandlers,
   moveControls,
+  showThreadGroup,
 }: {
   entry: DispatchQueueEntryType;
   idx: number;
@@ -71,6 +81,7 @@ function EntryRow({
   onSkip: (id: string) => void;
   isDragging?: boolean;
   isDropTarget?: boolean;
+  showThreadGroup?: boolean;
   dragHandlers?: {
     draggable: boolean;
     onDragStart: (e: React.DragEvent) => void;
@@ -121,6 +132,17 @@ function EntryRow({
       </span>
       <div className="flex-1 min-w-0">
         <div className="text-xs truncate" style={{ color: "var(--th-text-primary)" }}>
+          {showThreadGroup && entry.thread_group != null && (
+            <span
+              className="mr-1 text-[9px] font-mono px-1 py-0.5 rounded"
+              style={{
+                backgroundColor: `${threadGroupColor(entry.thread_group)}22`,
+                color: threadGroupColor(entry.thread_group),
+              }}
+            >
+              G{entry.thread_group}
+            </span>
+          )}
           {entry.github_issue_number && (
             <span className="mr-1 font-medium" style={{ color: "var(--th-text-muted)" }}>#{entry.github_issue_number}</span>
           )}
@@ -311,7 +333,7 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
   const [unifiedThread, setUnifiedThread] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [noReadyCards, setNoReadyCards] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>("agent");
+  const [viewMode, setViewMode] = useState<ViewMode>("thread");
 
   const agentMap = new Map(agents.map((a) => [a.id, a]));
 
@@ -439,6 +461,21 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
     const list = entriesByAgent.get(entry.agent_id) ?? [];
     list.push(entry);
     entriesByAgent.set(entry.agent_id, list);
+  }
+
+  // Thread group info
+  const threadGroups = status?.thread_groups ?? {};
+  const threadGroupCount = run?.thread_group_count ?? 0;
+  const hasThreadGroups = threadGroupCount > 1 || Object.keys(threadGroups).length > 1;
+  const maxConcurrent = run?.max_concurrent_threads ?? 1;
+
+  // Group entries by thread_group
+  const entriesByThreadGroup = new Map<number, DispatchQueueEntryType[]>();
+  for (const entry of entries) {
+    const g = entry.thread_group ?? 0;
+    const list = entriesByThreadGroup.get(g) ?? [];
+    list.push(entry);
+    entriesByThreadGroup.set(g, list);
   }
 
   // All-queue view: merge all entries sorted by status then rank
@@ -689,11 +726,23 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
                 )}
 
                 {/* View mode toggle */}
-                {Object.keys(agentStats).length > 1 && (
+                {(Object.keys(agentStats).length > 1 || hasThreadGroups) && (
                   <div
                     className="inline-flex rounded-lg border overflow-hidden"
                     style={{ borderColor: "rgba(148,163,184,0.22)" }}
                   >
+                    {hasThreadGroups && (
+                      <button
+                        onClick={() => setViewMode("thread")}
+                        className="text-[10px] px-2 py-1 transition-colors"
+                        style={{
+                          backgroundColor: viewMode === "thread" ? "rgba(139,92,246,0.2)" : "transparent",
+                          color: viewMode === "thread" ? "#a78bfa" : "var(--th-text-muted)",
+                        }}
+                      >
+                        {tr("스레드", "Thread")}
+                      </button>
+                    )}
                     <button
                       onClick={() => setViewMode("all")}
                       className="text-[10px] px-2 py-1 transition-colors"
@@ -704,16 +753,18 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
                     >
                       {tr("전체", "All")}
                     </button>
-                    <button
-                      onClick={() => setViewMode("agent")}
-                      className="text-[10px] px-2 py-1 transition-colors"
-                      style={{
-                        backgroundColor: viewMode === "agent" ? "rgba(139,92,246,0.2)" : "transparent",
-                        color: viewMode === "agent" ? "#a78bfa" : "var(--th-text-muted)",
-                      }}
-                    >
-                      {tr("에이전트별", "By Agent")}
-                    </button>
+                    {Object.keys(agentStats).length > 1 && (
+                      <button
+                        onClick={() => setViewMode("agent")}
+                        className="text-[10px] px-2 py-1 transition-colors"
+                        style={{
+                          backgroundColor: viewMode === "agent" ? "rgba(139,92,246,0.2)" : "transparent",
+                          color: viewMode === "agent" ? "#a78bfa" : "var(--th-text-muted)",
+                        }}
+                      >
+                        {tr("에이전트별", "By Agent")}
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -738,6 +789,7 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
                       tr={tr}
                       locale={locale}
                       onSkip={handleSkip}
+                      showThreadGroup={hasThreadGroups}
                       isDragging={allDrag.dragId === entry.id}
                       isDropTarget={allDrag.dropTargetId === entry.id}
                       dragHandlers={allDrag.makeDragHandlers(entry)}
@@ -746,6 +798,73 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* ── Thread group view ── */}
+          {viewMode === "thread" && (
+            <div className="space-y-3">
+              {hasThreadGroups && (
+                <div className="flex items-center gap-2 text-[11px] px-1" style={{ color: "var(--th-text-muted)" }}>
+                  <span>{tr(`동시 ${maxConcurrent}그룹 실행`, `${maxConcurrent} concurrent groups`)}</span>
+                  <span style={{ color: "#4ade80" }}>{entriesByThreadGroup.size}{tr("그룹", " groups")}</span>
+                </div>
+              )}
+              {Array.from(entriesByThreadGroup.entries())
+                .sort(([a], [b]) => a - b)
+                .map(([groupNum, groupEntries]) => {
+                  const tgStatus = threadGroups[String(groupNum)];
+                  const isActive = tgStatus?.status === "active" || groupEntries.some((e) => e.status === "dispatched");
+                  const isDone = tgStatus?.status === "done" || groupEntries.every((e) => e.status === "done" || e.status === "skipped");
+                  const groupStatusLabel = isActive
+                    ? tr("진행", "Active")
+                    : isDone
+                      ? tr("완료", "Done")
+                      : tr("대기", "Pending");
+                  const color = threadGroupColor(groupNum);
+                  return (
+                    <div
+                      key={groupNum}
+                      className="rounded-xl border p-2 space-y-1"
+                      style={{
+                        borderColor: isActive ? `${color}55` : isDone ? "rgba(34,197,94,0.2)" : "rgba(148,163,184,0.12)",
+                        backgroundColor: isActive ? `${color}0a` : "transparent",
+                      }}
+                    >
+                      <div className="flex items-center gap-2 px-1 mb-1">
+                        <span
+                          className="text-[11px] font-mono font-bold px-2 py-0.5 rounded"
+                          style={{ backgroundColor: `${color}30`, color }}
+                        >
+                          G{groupNum}
+                        </span>
+                        <span
+                          className="text-[10px] px-1.5 py-0.5 rounded"
+                          style={{
+                            backgroundColor: isActive ? "rgba(245,158,11,0.18)" : isDone ? "rgba(34,197,94,0.18)" : "rgba(100,116,139,0.18)",
+                            color: isActive ? "#fbbf24" : isDone ? "#4ade80" : "#94a3b8",
+                          }}
+                        >
+                          {groupStatusLabel}
+                        </span>
+                        <div className="flex-1 h-px" style={{ backgroundColor: `${color}40` }} />
+                        <span className="text-[10px] font-mono" style={{ color: "var(--th-text-muted)" }}>
+                          {groupEntries.filter((e) => e.status === "done").length}/{groupEntries.length}
+                        </span>
+                      </div>
+                      {groupEntries.map((entry, idx) => (
+                        <EntryRow
+                          key={entry.id}
+                          entry={entry}
+                          idx={idx}
+                          tr={tr}
+                          locale={locale}
+                          onSkip={handleSkip}
+                        />
+                      ))}
+                    </div>
+                  );
+                })}
             </div>
           )}
 
@@ -768,6 +887,9 @@ export default function AutoQueuePanel({ tr, locale, agents, selectedRepo, selec
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] px-1" style={{ color: "var(--th-text-muted)" }}>
               <span>AI: {run.ai_model ?? "-"}</span>
               <span>{tr("생성", "Created")}: {formatTs(run.created_at, locale)}</span>
+              {hasThreadGroups && (
+                <span>{tr("동시", "Concur")}: {maxConcurrent}{tr("그룹", "grp")}</span>
+              )}
               <span>{tr("타임아웃", "Timeout")}: {run.timeout_minutes}{tr("분", "m")}</span>
               {run.status !== "completed" && (
                 <button
