@@ -290,7 +290,7 @@ fn execute_create_dispatch(
     // create_dispatch_core generates its own UUID — we override by using a
     // variant that accepts a pre-assigned ID.
     let context = serde_json::json!({});
-    let (dispatch_id, _old_status) = crate::dispatch::create_dispatch_core_with_id(
+    let (dispatch_id, _old_status, _reused) = crate::dispatch::create_dispatch_core_with_id(
         db,
         pre_id,
         card_id,

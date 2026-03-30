@@ -973,6 +973,12 @@ pub(super) async fn restore_inflight_turns(
             }
         });
 
+        let recovery_dispatch_id = parse_dispatch_id(&state.user_text);
+        // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
+        let mut state = state;
+        state.session_key = state.session_key.or_else(|| adk_session_key.clone());
+        state.dispatch_id = state.dispatch_id.or_else(|| recovery_dispatch_id.clone());
+
         spawn_turn_bridge(
             http.clone(),
             shared.clone(),
@@ -992,7 +998,7 @@ pub(super) async fn restore_inflight_turns(
                 adk_session_name,
                 adk_session_info: Some(adk_session_info),
                 adk_cwd: last_path.clone(),
-                dispatch_id: parse_dispatch_id(&state.user_text),
+                dispatch_id: recovery_dispatch_id,
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),
@@ -1245,6 +1251,8 @@ mod tests {
             born_generation: 7,
             any_tool_used: true,
             has_post_tool_text: false,
+            session_key: None,
+            dispatch_id: None,
         };
 
         save_missing_session_handoff(

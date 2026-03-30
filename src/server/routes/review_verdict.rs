@@ -143,22 +143,12 @@ fn update_card_review_state(
 /// misconfiguration).  Git or filesystem failures are logged but not fatal
 /// — the marker is best-effort when commit is not explicitly provided.
 fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), String> {
-    let resolve_home = || -> Result<std::path::PathBuf, String> {
-        dirs::home_dir().ok_or_else(|| {
-            "HOME directory not found; set AGENTDESK_REPO_DIR and AGENTDESK_ROOT_DIR".to_string()
-        })
-    };
-
     let commit = if let Some(c) = reviewed_commit {
         c.to_string()
     } else {
-        let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
-            Ok(d) => d,
-            Err(_) => resolve_home()?
-                .join("AgentDesk")
-                .to_string_lossy()
-                .into_owned(),
-        };
+        let repo_dir = crate::services::platform::resolve_repo_dir().ok_or_else(|| {
+            "Cannot resolve repo dir; set AGENTDESK_REPO_DIR".to_string()
+        })?;
         match crate::services::platform::git_head_commit(&repo_dir) {
             Some(c) => c,
             None => {
@@ -643,19 +633,14 @@ pub async fn submit_review_decision(
 
     match body.decision.as_str() {
         "accept" => {
-            // Agent accepts review feedback — the review-decision dispatch itself
-            // serves as the rework turn. No separate rework dispatch is created.
-            // The agent already read the review comments and committed fixes in
-            // the same turn that called this API.
+            // #195: Agent accepts review feedback — create a rework dispatch so the
+            // agent can address the findings. When the rework dispatch completes,
+            // OnDispatchCompleted (kanban-rules.js) transitions to review for re-review.
             drop(conn);
 
-            // #155: Validate transition BEFORE consuming the review-decision dispatch.
-            // If transition fails (e.g., terminal card), we must NOT mark the dispatch
-            // completed — otherwise the card is stranded with no active pending_rd_id.
-
-            // Transition card back to review for re-review of the rework
-            let (card_status_now, card_repo_id, card_agent_id): (
+            let (card_status_now, card_repo_id, card_agent_id, card_title): (
                 String,
+                Option<String>,
                 Option<String>,
                 Option<String>,
             ) = state
@@ -664,9 +649,9 @@ pub async fn submit_review_decision(
                 .ok()
                 .and_then(|c| {
                     c.query_row(
-                        "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                        "SELECT status, repo_id, assigned_agent_id, title FROM kanban_cards WHERE id = ?1",
                         [&body.card_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                     )
                     .ok()
                 })
@@ -689,51 +674,38 @@ pub async fn submit_review_decision(
                 )
             };
 
-            // Find the review state from pipeline transitions
-            let review_target = effective_pipeline
-                .transitions
-                .iter()
-                .find(|t| {
-                    // Find the gated transition that leads to a state with OnReviewEnter hook
-                    let target_has_review = effective_pipeline
-                        .hooks_for_state(&t.to)
-                        .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
-                    t.from == card_status_now && target_has_review
-                })
-                .map(|t| t.to.clone())
-                .or_else(|| {
-                    // Fallback: look for review_rework gated transition
-                    effective_pipeline
-                        .transitions
-                        .iter()
-                        .find(|t| {
-                            t.from == card_status_now
-                                && t.transition_type == crate::pipeline::TransitionType::Gated
-                                && t.gates.iter().any(|g| g == "review_rework")
-                        })
-                        .map(|t| t.to.clone())
-                })
-                .unwrap_or_else(|| "review".to_string());
-
-            // #155: Fail closed if transition is blocked (e.g., terminal card).
-            // Dispatch is NOT yet consumed — on failure, pending_rd_id remains active.
-            if let Err(e) = crate::kanban::transition_status(
-                &state.db,
-                &state.engine,
-                &body.card_id,
-                &review_target,
-            ) {
+            // Guard: terminal card
+            if effective_pipeline.is_terminal(&card_status_now) {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::CONFLICT,
                     Json(json!({
-                        "error": format!("transition failed: {e}"),
+                        "error": "card is terminal, cannot accept review feedback",
                         "card_id": body.card_id,
-                        "decision": "accept",
                     })),
                 );
             }
 
-            // Transition succeeded — now safe to consume the review-decision dispatch
+            // Find rework target via review_rework gate (same logic as timeouts.js section E)
+            let rework_target = effective_pipeline
+                .transitions
+                .iter()
+                .find(|t| {
+                    t.from == card_status_now
+                        && t.transition_type == crate::pipeline::TransitionType::Gated
+                        && t.gates.iter().any(|g| g == "review_rework")
+                })
+                .map(|t| t.to.clone())
+                .unwrap_or_else(|| {
+                    effective_pipeline
+                        .dispatchable_states()
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| effective_pipeline.initial_state().to_string())
+                });
+
+            // Consume review-decision dispatch FIRST — frees the duplicate dispatch guard
+            // so the rework dispatch can be created (create_dispatch_core rejects when
+            // any pending/dispatched dispatch already exists for the card).
             if let Some(ref rd_id) = pending_rd_id {
                 crate::dispatch::mark_dispatch_completed(
                     &state.db,
@@ -743,11 +715,72 @@ pub async fn submit_review_decision(
                 .ok();
             }
 
+            // Create rework dispatch for the assigned agent
+            let rework_dispatch_created = if let Some(ref agent_id) = card_agent_id {
+                let rework_title = format!(
+                    "[Rework] {}",
+                    card_title.as_deref().unwrap_or(&body.card_id)
+                );
+                match crate::dispatch::create_dispatch_core(
+                    &state.db,
+                    &body.card_id,
+                    agent_id,
+                    "rework",
+                    &rework_title,
+                    &json!({}),
+                ) {
+                    Ok((dispatch_id, _, _reused)) => {
+                        tracing::info!(
+                            "[review-decision] #195 Rework dispatch created: card={} dispatch={}",
+                            body.card_id,
+                            dispatch_id
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        // Duplicate guard or other failure — log but continue with transition
+                        tracing::warn!(
+                            "[review-decision] #195 Rework dispatch creation failed for card {}: {e}",
+                            body.card_id
+                        );
+                        false
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[review-decision] #195 No agent assigned to card {} — cannot create rework dispatch",
+                    body.card_id
+                );
+                false
+            };
+
+            // Transition card to rework target (e.g., in_progress)
+            if let Err(e) = crate::kanban::transition_status(
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                &rework_target,
+            ) {
+                tracing::warn!(
+                    "[review-decision] #195 Transition to rework target failed for card {}: {e}",
+                    body.card_id
+                );
+            }
+
+            // Clear suggestion_pending_at (same as timeouts.js auto-accept)
+            if let Ok(c) = state.db.lock() {
+                c.execute(
+                    "UPDATE kanban_cards SET suggestion_pending_at = NULL WHERE id = ?1",
+                    [&body.card_id],
+                )
+                .ok();
+            }
+
             // #119: Record tuning outcome
             record_decision_tuning(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
             spawn_aggregate_if_needed(&state.db);
 
-            // #117: Update canonical review state
+            // #117: Update canonical review state → rework_pending
             update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
 
             // Emit kanban_card_updated for real-time dashboard
@@ -766,7 +799,8 @@ pub async fn submit_review_decision(
                     "ok": true,
                     "card_id": body.card_id,
                     "decision": "accept",
-                    "message": "Review-decision accepted, card moved to re-review",
+                    "rework_dispatch_created": rework_dispatch_created,
+                    "message": "Review-decision accepted, rework dispatch created",
                 })),
             );
         }
@@ -1949,8 +1983,8 @@ mod tests {
         )
         .await;
 
-        // Dispatch creation should fail (done terminal guard) → 500
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // #195: Terminal card guard returns 409 CONFLICT (was 500 before #195 refactor)
+        assert_eq!(status, StatusCode::CONFLICT);
 
         // Card must NOT have moved to in_progress — it should stay done
         let conn = db.lock().unwrap();

@@ -907,6 +907,8 @@ var timeouts = {
         if (currentTier <= lastAlertedTier) continue; // already alerted at this tier or higher
         sendDeadlockAlert(
           "⚠️ [장시간 턴] " + (inf.channel_name || inf.channel_id) + "\n" +
+          "session_key: " + (inf.session_key || "?") + "\n" +
+          "dispatch_id: " + (inf.dispatch_id || "?") + "\n" +
           "tmux: " + (inf.tmux_session_name || "?") + "\n" +
           "경과: " + Math.round(elapsedMin) + "분 (" + ALERT_THRESHOLDS[currentTier] + "분 단계)\n" +
           "provider: " + (inf.provider || "?")

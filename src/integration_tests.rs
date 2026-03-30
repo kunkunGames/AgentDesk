@@ -409,7 +409,7 @@ mod tests {
         seed_card(&db, "card-s6", "in_progress");
 
         // Step 1: Create implementation dispatch via canonical path
-        let (dispatch_id, _) = dispatch::create_dispatch_core(
+        let (dispatch_id, _, _) = dispatch::create_dispatch_core(
             &db,
             "card-s6",
             "agent-1",
@@ -1630,6 +1630,163 @@ mod tests {
                     dispatch_id: "d-160m-f".into(),
                 },
             ]
+        );
+    }
+
+    // ── #195: review-decision accept creates rework dispatch ──────────
+    //
+    // Verifies that when an agent accepts review feedback via POST /api/review-decision,
+    // a rework dispatch is automatically created and the card transitions to the
+    // rework target state (in_progress), NOT directly to review.
+    // This prevents the pipeline from getting stuck when the accept decision
+    // was the only active dispatch for the card.
+
+    #[tokio::test]
+    async fn scenario_195_accept_creates_rework_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-195", "review");
+
+        // Set up a pending review-decision dispatch (simulates the state after
+        // counter-model review found suggestions and agent received decision prompt)
+        seed_dispatch(&db, "rd-195", "card-195", "review-decision", "pending");
+
+        // Set up card_review_state with pending_dispatch_id pointing to the review-decision
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
+                 VALUES ('card-195', 'suggestion_pending', 'rd-195')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+
+        // Call the review-decision handler with accept
+        let (status, json) =
+            crate::server::routes::review_verdict::submit_review_decision(
+                axum::extract::State(state),
+                axum::Json(
+                    crate::server::routes::review_verdict::ReviewDecisionBody {
+                        card_id: "card-195".to_string(),
+                        decision: "accept".to_string(),
+                        comment: None,
+                        dispatch_id: Some("rd-195".to_string()),
+                    },
+                ),
+            )
+            .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK, "accept should succeed: {json:?}");
+        assert_eq!(
+            json.0["rework_dispatch_created"], true,
+            "rework_dispatch_created must be true in response"
+        );
+
+        // Review-decision dispatch must be completed
+        assert_eq!(
+            get_dispatch_status(&db, "rd-195"),
+            "completed",
+            "review-decision dispatch must be completed after accept"
+        );
+
+        // Card must be in rework target state (in_progress), NOT review
+        let card_status = get_card_status(&db, "card-195");
+        assert_eq!(
+            card_status, "in_progress",
+            "#195: accept must transition card to rework target (in_progress), not review"
+        );
+
+        // A rework dispatch must exist for this card
+        let conn = db.lock().unwrap();
+        let rework_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-195' AND dispatch_type = 'rework' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rework_count, 1,
+            "#195: accept must create exactly 1 rework dispatch"
+        );
+
+        // Verify canonical review state is rework_pending
+        let review_state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM card_review_state WHERE card_id = 'card-195'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        assert_eq!(
+            review_state.as_deref(),
+            Some("rework_pending"),
+            "#195: canonical review state must be 'rework_pending' after accept"
+        );
+    }
+
+    // ── #195: rework dispatch completion triggers re-review cycle ──────
+    //
+    // Verifies the full accept → rework → re-review cycle:
+    // After rework dispatch completes, OnDispatchCompleted (kanban-rules.js)
+    // transitions the card to review, and OnReviewEnter creates a new review dispatch.
+
+    #[test]
+    fn scenario_195_rework_completion_triggers_review() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-195b", "in_progress");
+
+        // Create and complete a rework dispatch — simulates the rework turn finishing
+        seed_dispatch(&db, "rw-195b", "card-195b", "rework", "pending");
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "rw-195b",
+            &serde_json::json!({"completion_source": "test_harness"}),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        // Rework completion → card must transition to review (via kanban-rules.js)
+        let status = get_card_status(&db, "card-195b");
+        assert_eq!(
+            status, "review",
+            "#195: rework completion must transition card to review"
+        );
+
+        // OnReviewEnter must create a review dispatch for re-review
+        let conn = db.lock().unwrap();
+        let review_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-195b' AND dispatch_type = 'review' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_count, 1,
+            "#195: rework completion must trigger OnReviewEnter → review dispatch"
         );
     }
 }
