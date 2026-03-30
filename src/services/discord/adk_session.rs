@@ -191,12 +191,13 @@ pub(super) async fn clear_claude_session_id(session_key: &str, api_port: u16) {
 
 /// Save a provider session_id to DB so it survives dcserver restarts.
 /// Stored in the legacy `claude_session_id` column for compatibility.
-pub(super) async fn save_provider_session_id(session_key: &str, session_id: &str, api_port: u16) {
-    let body = serde_json::json!({
-        "session_key": session_key,
-        "session_id": session_id,
-        "claude_session_id": session_id,
-    });
+pub(super) async fn save_provider_session_id(
+    session_key: &str,
+    session_id: &str,
+    provider: &ProviderKind,
+    api_port: u16,
+) {
+    let body = build_provider_session_payload(session_key, session_id, provider);
     match reqwest::Client::new()
         .post(local_api_url(api_port, "/api/hook/session"))
         .json(&body)
@@ -220,11 +221,18 @@ pub(super) async fn save_provider_session_id(session_key: &str, session_id: &str
 
 /// Fetch the stored provider session_id from DB for a given session_key.
 /// Reads the legacy `claude_session_id` field for compatibility.
-pub(super) async fn fetch_provider_session_id(session_key: &str, api_port: u16) -> Option<String> {
+pub(super) async fn fetch_provider_session_id(
+    session_key: &str,
+    provider: &ProviderKind,
+    api_port: u16,
+) -> Option<String> {
     let url = local_api_url(api_port, "/api/dispatched-sessions/claude-session-id");
     let resp = reqwest::Client::new()
         .get(&url)
-        .query(&[("session_key", session_key)])
+        .query(&[
+            ("session_key", session_key),
+            ("provider", provider.as_str()),
+        ])
         .send()
         .await
         .ok()?;
@@ -232,9 +240,13 @@ pub(super) async fn fetch_provider_session_id(session_key: &str, api_port: u16) 
         return None;
     }
     let json: serde_json::Value = resp.json().await.ok()?;
+    // #107: Filter empty strings — a stale clear path may have stored ""
+    // instead of NULL; treat it as no session ID.
+    // Also try session_id field as fallback for provider-agnostic lookup.
     json.get("session_id")
         .and_then(|v| v.as_str())
         .or_else(|| json.get("claude_session_id").and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
 
@@ -243,11 +255,17 @@ pub(super) async fn save_claude_session_id(
     claude_session_id: &str,
     api_port: u16,
 ) {
-    save_provider_session_id(session_key, claude_session_id, api_port).await
+    save_provider_session_id(
+        session_key,
+        claude_session_id,
+        &ProviderKind::Claude,
+        api_port,
+    )
+    .await
 }
 
 pub(super) async fn fetch_claude_session_id(session_key: &str, api_port: u16) -> Option<String> {
-    fetch_provider_session_id(session_key, api_port).await
+    fetch_provider_session_id(session_key, &ProviderKind::Claude, api_port).await
 }
 
 fn normalize_user_task_summary(input: &str) -> Option<String> {
@@ -268,6 +286,19 @@ fn normalize_user_task_summary(input: &str) -> Option<String> {
     }
 
     Some(truncate_chars(&collapsed, SESSION_INFO_MAX_CHARS))
+}
+
+fn build_provider_session_payload(
+    session_key: &str,
+    session_id: &str,
+    provider: &ProviderKind,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_key": session_key,
+        "session_id": session_id,
+        "claude_session_id": session_id,
+        "provider": provider.as_str(),
+    })
 }
 
 fn trim_leading_marker(input: &str) -> &str {
@@ -559,6 +590,22 @@ mod tests {
         assert!(key.contains(':'));
         assert!(key.starts_with("mac-mini:AgentDesk-claude-"));
     }
+
+    #[test]
+    fn test_build_provider_session_payload_includes_provider() {
+        use crate::services::provider::ProviderKind;
+
+        let payload = super::build_provider_session_payload(
+            "host:AgentDesk-codex-adk-cdx",
+            "session-123",
+            &ProviderKind::Codex,
+        );
+
+        assert_eq!(payload["session_key"], "host:AgentDesk-codex-adk-cdx");
+        assert_eq!(payload["session_id"], "session-123");
+        assert_eq!(payload["claude_session_id"], "session-123");
+        assert_eq!(payload["provider"], "codex");
+    }
 }
 
 /// Context window management thresholds.
@@ -577,11 +624,11 @@ impl Default for ContextThresholds {
     }
 }
 
-/// Fetch context thresholds from the ADK runtime config API.
+/// Fetch context thresholds from the ADK config API (individual kv_meta keys).
 /// Falls back to defaults on any error.
 pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds {
     let defaults = ContextThresholds::default();
-    let url = local_api_url(api_port, "/api/settings/runtime-config");
+    let url = local_api_url(api_port, "/api/settings/config");
     let resp = match reqwest::Client::new().get(&url).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return defaults,
@@ -590,12 +637,18 @@ pub(super) async fn fetch_context_thresholds(api_port: u16) -> ContextThresholds
         Ok(v) => v,
         _ => return defaults,
     };
-    let current = body.get("current").unwrap_or(&body);
+    let entries = body.get("entries").and_then(|v| v.as_array());
+    let compact_pct = entries
+        .and_then(|arr| {
+            arr.iter()
+                .find(|e| e.get("key").and_then(|k| k.as_str()) == Some("context_compact_percent"))
+        })
+        .and_then(|e| e.get("value"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(defaults.compact_pct);
     ContextThresholds {
-        compact_pct: current
-            .get("context_compact_percent")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(defaults.compact_pct),
+        compact_pct,
         context_window: defaults.context_window,
     }
 }

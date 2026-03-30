@@ -21,7 +21,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -42,6 +44,14 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: CLI smoke test (help)
+        run: cargo run -- --help
+
+      - name: CLI smoke test (doctor — no config)
+        run: cargo run -- doctor || true
+        env:
+          AGENTDESK_ROOT_DIR: ${{ runner.temp }}/adk-smoke
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -49,8 +59,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94.1"
           components: clippy, rustfmt
 
       - name: Cache cargo registry & build
@@ -83,7 +94,7 @@ jobs:
         run: |
           FAILED=0
           while IFS= read -r f; do
-            shellcheck -S error "$f" || FAILED=1
+            shellcheck -S warning "$f" || FAILED=1
           done < <(find . -name '*.sh' -not -path './target/*' -not -path './.git/*')
           exit $FAILED
         shell: bash

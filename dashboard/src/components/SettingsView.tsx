@@ -40,18 +40,9 @@ const CATEGORIES: Array<{
     ],
   },
   {
-    titleKo: "칸반 타임아웃",
-    titleEn: "Kanban Timeouts",
-    fields: [
-      { key: "requestedAckTimeoutMin", labelKo: "요청됨 ACK 타임아웃", labelEn: "Requested ACK timeout", unit: "min", min: 5, max: 120, step: 5 },
-      { key: "inProgressStaleMin", labelKo: "진행 중 정체 판정", labelEn: "In-progress stale detection", unit: "min", min: 15, max: 480, step: 15 },
-    ],
-  },
-  {
     titleKo: "디스패치 제한",
     titleEn: "Dispatch Limits",
     fields: [
-      { key: "maxChainDepth", labelKo: "최대 체인 깊이", labelEn: "Max chain depth", unit: "", min: 1, max: 20, step: 1 },
       { key: "ceoWarnDepth", labelKo: "CEO 경고 깊이", labelEn: "CEO warning depth", unit: "", min: 1, max: 10, step: 1 },
       { key: "maxRetries", labelKo: "최대 재시도 횟수", labelEn: "Max retries", unit: "", min: 1, max: 10, step: 1 },
     ],
@@ -60,7 +51,6 @@ const CATEGORIES: Array<{
     titleKo: "리뷰",
     titleEn: "Review",
     fields: [
-      { key: "maxReviewRounds", labelKo: "최대 리뷰 라운드", labelEn: "Max review rounds", unit: "", min: 1, max: 5, step: 1 },
       { key: "reviewReminderMin", labelKo: "리뷰 리마인드 간격", labelEn: "Review reminder interval", unit: "min", min: 5, max: 120, step: 5 },
     ],
   },
@@ -368,12 +358,15 @@ export default function SettingsView({
           <p className="text-sm" style={{ color: "var(--th-text-muted)" }}>{tr("설정 로딩 중...", "Loading config...")}</p>
         ) : (
           <>
-            {["pipeline", "review", "system"].map((cat) => {
+            {["pipeline", "review", "timeout", "dispatch", "context", "system"].map((cat) => {
               const items = configEntries.filter((e) => e.category === cat);
               if (items.length === 0) return null;
               const catLabel: Record<string, string> = {
                 pipeline: tr("파이프라인", "Pipeline"),
                 review: tr("리뷰", "Review"),
+                timeout: tr("칸반 타임아웃", "Kanban Timeouts"),
+                dispatch: tr("디스패치", "Dispatch"),
+                context: tr("컨텍스트 관리", "Context Management"),
                 system: tr("시스템", "System"),
               };
               return (

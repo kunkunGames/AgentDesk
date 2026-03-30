@@ -119,13 +119,24 @@ pub(super) async fn handle_event(
                 }
             }
 
-            // Ignore messages that look like slash commands (but allow from trusted bots)
+            // If the message looks like a known slash command, skip it (poise handles it).
+            // Unknown `/`-prefixed messages fall through to the AI provider as regular text.
             if new_message.content.starts_with('/') && !new_message.author.bot {
-                return Ok(());
+                let cmd_name = new_message.content[1..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                let is_known = data
+                    .shared
+                    .known_slash_commands
+                    .get()
+                    .map_or(false, |set| set.contains(cmd_name));
+                if is_known {
+                    return Ok(());
+                }
             }
 
-            // Ignore messages that mention other (human) users — not directed at
-            // this bot.  Bot mentions are excluded because Discord auto-adds the
+            // this bot. Bot mentions are excluded because Discord auto-adds the
             // replied-to author to the mentions array for InlineReply messages;
             // filtering on those would silently drop legitimate replies to
             // announce/notify/codex bot messages.
@@ -889,8 +900,8 @@ pub(super) async fn handle_text_message(
                         .unwrap_or_else(|| canonical.clone());
                     let (ch_name_resolved, cat_name) =
                         resolve_channel_category(ctx, channel_id).await;
-                    let existing = load_existing_session(&eff_path, Some(channel_id.get()));
                     {
+                        // Session ID comes from DB (sessions.claude_session_id), not from file.
                         let mut data = shared.core.lock().await;
                         let session =
                             data.sessions
@@ -916,14 +927,6 @@ pub(super) async fn handle_text_message(
                         session.channel_id = Some(channel_id.get());
                         session.last_active = tokio::time::Instant::now();
                         session.worktree = wt_info;
-                        if let Some((session_data, _)) = &existing {
-                            session.history = session_data.history.clone();
-                            session.session_id = if session_data.session_id.is_empty() {
-                                None
-                            } else {
-                                Some(session_data.session_id.clone())
-                            };
-                        }
                     }
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] ▶ Auto-started session from workspace: {eff_path}");
@@ -1262,7 +1265,7 @@ pub(super) async fn handle_text_message(
             .and_then(|_| dispatch_type_str.as_deref()),
     );
 
-    let system_prompt_owned = build_system_prompt(
+    let mut system_prompt_owned = build_system_prompt(
         &discord_context,
         &current_path,
         channel_id,
@@ -1274,6 +1277,29 @@ pub(super) async fn handle_text_message(
         dispatch_profile,
         dispatch_type_str.as_deref(),
     );
+
+    // Inject session retry context (Discord history from stale session auto-retry).
+    // Consumed once — deleted after reading so subsequent turns don't see it.
+    if let Some(ref db) = shared.db {
+        let kv_key = format!("session_retry_context:{}", channel_id);
+        if let Ok(conn) = db.lock() {
+            let ctx: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM kv_meta WHERE key = ?1",
+                    [&kv_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(history) = ctx {
+                system_prompt_owned.push_str(&format!(
+                    "\n\n[이전 대화 복원 — 세션이 만료되어 최근 대화를 컨텍스트로 제공합니다]\n{}",
+                    history
+                ));
+                conn.execute("DELETE FROM kv_meta WHERE key = ?1", [&kv_key])
+                    .ok();
+            }
+        }
+    }
 
     // Create cancel token — with second check to close the TOCTOU race window.
     // Multiple messages can pass the initial cancel_tokens check (line 169) concurrently
@@ -1513,7 +1539,8 @@ pub(super) async fn handle_text_message(
     let session_id = if session_id.is_none() {
         if let Some(ref key) = adk_session_key {
             let restored =
-                super::adk_session::fetch_provider_session_id(key, shared.api_port).await;
+                super::adk_session::fetch_provider_session_id(key, &provider, shared.api_port)
+                    .await;
             if restored.is_some() {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
@@ -1585,7 +1612,7 @@ pub(super) async fn handle_text_message(
         }
     };
 
-    let inflight_state = InflightTurnState::new(
+    let mut inflight_state = InflightTurnState::new(
         provider.clone(),
         channel_id.get(),
         channel_name.clone(),
@@ -1599,6 +1626,8 @@ pub(super) async fn handle_text_message(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
+    inflight_state.session_key = adk_session_key.clone();
+    inflight_state.dispatch_id = dispatch_id.clone();
     if let Err(e) = save_inflight_state(&inflight_state) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}]   ⚠ inflight state save failed: {e}");
@@ -1655,14 +1684,18 @@ pub(super) async fn handle_text_message(
         }
     }
 
-    // Resolve model: DashMap override > dispatch role override > role-map > default
-    let model_for_turn: Option<String> = {
+    // Resolve model + reasoning_effort: DashMap override > dispatch role override > role-map > default
+    let (model_for_turn, reasoning_effort_for_turn): (Option<String>, Option<String>) = {
         let dashmap_model = shared.model_overrides.get(&channel_id).map(|v| v.clone());
         if dashmap_model.is_some() {
-            dashmap_model
+            (dashmap_model, None)
         } else if let Some(override_ch) = shared.dispatch_role_overrides.get(&channel_id) {
             let alt_ch = *override_ch;
-            resolve_role_binding(alt_ch, None).and_then(|rb| rb.model)
+            let rb = resolve_role_binding(alt_ch, None);
+            (
+                rb.as_ref().and_then(|r| r.model.clone()),
+                rb.as_ref().and_then(|r| r.reasoning_effort.clone()),
+            )
         } else {
             let ch_name = {
                 let data = shared.core.lock().await;
@@ -1670,9 +1703,22 @@ pub(super) async fn handle_text_message(
                     .get(&channel_id)
                     .and_then(|s| s.channel_name.clone())
             };
-            resolve_role_binding(channel_id, ch_name.as_deref()).and_then(|rb| rb.model)
+            let rb = resolve_role_binding(channel_id, ch_name.as_deref());
+            (
+                rb.as_ref().and_then(|r| r.model.clone()),
+                rb.as_ref().and_then(|r| r.reasoning_effort.clone()),
+            )
         }
     };
+
+    // Pass reasoning_effort to codex via environment variable
+    if let Some(ref effort) = reasoning_effort_for_turn {
+        // SAFETY: This runs on the tokio blocking thread pool before spawning the provider.
+        // No concurrent reads of this env var occur at this point.
+        unsafe {
+            std::env::set_var("AGENTDESK_CODEX_REASONING_EFFORT", effort);
+        }
+    }
 
     // Run the provider in a blocking thread
     let provider_for_blocking = provider.clone();
@@ -1894,9 +1940,6 @@ async fn handle_file_upload(
                     content: upload_record.clone(),
                 });
                 session.pending_uploads.push(upload_record);
-                if let Some(ref path) = session.current_path {
-                    save_session_to_file(session, path);
-                }
             }
         }
     }
@@ -2223,7 +2266,9 @@ async fn handle_text_command(
                 token.cancel_with_tmux_cleanup();
             }
             // Build tmux session name from channel name
-            let tmux_name = d.sessions.get(&channel_id)
+            let tmux_name = d
+                .sessions
+                .get(&channel_id)
                 .and_then(|s| s.channel_name.as_ref())
                 .map(|ch_name| data.provider.build_tmux_session_name(ch_name));
             if let Some(session) = d.sessions.get_mut(&channel_id) {
@@ -2244,11 +2289,9 @@ async fn handle_text_command(
             // Send /clear to the actual Claude Code session via tmux
             #[cfg(unix)]
             if let Some(ref name) = tmux_name {
-                let exact_target = tmux_exact_target(name);
+                let name = name.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    std::process::Command::new("tmux")
-                        .args(["send-keys", "-t", &exact_target, "/clear", "Enter"])
-                        .output()
+                    crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
                 })
                 .await;
             }
@@ -2507,7 +2550,10 @@ Any other message is sent to {p}.
                         let _ = msg
                             .reply(
                                 &ctx.http,
-                                format!("Model set to **{}** for this channel.\n{}", validated, status),
+                                format!(
+                                    "Model set to **{}** for this channel.\n{}",
+                                    validated, status
+                                ),
                             )
                             .await;
                     }
@@ -2547,14 +2593,14 @@ Any other message is sent to {p}.
                 }
                 _ => {
                     // Treat bare arg as shorthand for "set"
-                    let validated = match super::commands::validate_model_input(&data.provider, arg1)
-                    {
-                        Ok(model) => model,
-                        Err(message) => {
-                            let _ = msg.reply(&ctx.http, message).await;
-                            return Ok(true);
-                        }
-                    };
+                    let validated =
+                        match super::commands::validate_model_input(&data.provider, arg1) {
+                            Ok(model) => model,
+                            Err(message) => {
+                                let _ = msg.reply(&ctx.http, message).await;
+                                return Ok(true);
+                            }
+                        };
                     data.shared
                         .model_overrides
                         .insert(channel_id, validated.clone());
@@ -2567,7 +2613,10 @@ Any other message is sent to {p}.
                     let _ = msg
                         .reply(
                             &ctx.http,
-                            format!("Model set to **{}** for this channel.\n{}", validated, status),
+                            format!(
+                                "Model set to **{}** for this channel.\n{}",
+                                validated, status
+                            ),
                         )
                         .await;
                 }

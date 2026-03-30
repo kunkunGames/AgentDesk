@@ -109,16 +109,26 @@ fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return JSON.parse(json);
             };
             agentdesk.db.execute = function(sql, params) {
-                // Block direct status updates on kanban_cards — use agentdesk.kanban.setStatus() instead
-                // Only blocks "status =" but not "review_status =", "blocked_reason =" etc.
-                if (/UPDATE\s+kanban_cards\b/i.test(sql) && /(?<![_a-z])status\s*=/i.test(sql)) {
-                    throw new Error("Direct kanban_cards status UPDATE is blocked. Use agentdesk.kanban.setStatus(cardId, newStatus) instead.");
+                // #155: Block direct mutations on kanban_cards CardState fields.
+                // status, review_status, latest_dispatch_id must go through controlled helpers.
+                if (/UPDATE\s+kanban_cards\b/i.test(sql)) {
+                    if (/(?<![_a-z])status\s*=/i.test(sql)) {
+                        throw new Error("Direct kanban_cards status UPDATE is blocked. Use agentdesk.kanban.setStatus(cardId, newStatus) instead.");
+                    }
+                    if (/review_status\s*=/i.test(sql)) {
+                        throw new Error("Direct kanban_cards review_status UPDATE is blocked. Use agentdesk.kanban.setReviewStatus(cardId, status, opts) instead.");
+                    }
+                    if (/latest_dispatch_id\s*=/i.test(sql)) {
+                        throw new Error("Direct kanban_cards latest_dispatch_id UPDATE is blocked. Use the dispatch API instead.");
+                    }
                 }
                 // Block direct INSERT/UPDATE on task_dispatches — use agentdesk.dispatch.create() instead.
-                // Direct writes bypass send_dispatch_to_discord(), unified thread routing,
-                // dispatch_notified guard, and channel_thread_map updates.
                 if (/(?:INSERT\s+INTO|UPDATE)\s+task_dispatches\b/i.test(sql)) {
                     throw new Error("Direct task_dispatches mutation is blocked. Use agentdesk.dispatch.create() instead.");
+                }
+                // Block direct INSERT/UPDATE/DELETE on card_review_state — use agentdesk.reviewState.sync() instead (#158).
+                if (/(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|UPDATE|DELETE\s+FROM)\s+card_review_state\b/i.test(sql)) {
+                    throw new Error("Direct card_review_state mutation is blocked. Use agentdesk.reviewState.sync(cardId, state, opts) instead.");
                 }
                 // Direct write — db.execute remains synchronous by design.
                 // dispatch.create and kanban.setStatus use intent/transition model;
@@ -264,6 +274,13 @@ fn register_log_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
         })?,
     )?;
 
+    log_obj.set(
+        "debug",
+        Function::new(ctx.clone(), |msg: String| {
+            tracing::debug!(target: "policy", "{}", msg);
+        })?,
+    )?;
+
     ad.set("log", log_obj)?;
     Ok(())
 }
@@ -380,7 +397,7 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     let dispatch_obj = Object::new(ctx.clone())?;
 
     // __dispatch_create_raw(card_id, agent_id, dispatch_type, title) → json_string
-    let db_d = db;
+    let db_d = db.clone();
     dispatch_obj.set(
         "__create_raw",
         Function::new(
@@ -394,6 +411,71 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     dispatch_create_raw(&db_d, &card_id, &agent_id, &dispatch_type, &title)
                 },
             ),
+        )?,
+    )?;
+
+    // __mark_failed_raw(dispatch_id, reason) → json_string
+    // Marks a dispatch as failed. Used by timeout handlers.
+    let db_mf = db.clone();
+    dispatch_obj.set(
+        "__mark_failed_raw",
+        Function::new(ctx.clone(), move |dispatch_id: String, reason: String| -> String {
+            let conn = match db_mf.separate_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+            };
+            match conn.execute(
+                "UPDATE task_dispatches SET status = 'failed', result = ?1, updated_at = datetime('now') \
+                 WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+                rusqlite::params![reason, dispatch_id],
+            ) {
+                Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
+            }
+        })?,
+    )?;
+
+    // __mark_completed_raw(dispatch_id, result_json) → json_string
+    // Marks a dispatch as completed. Used by orphan recovery.
+    let db_mc = db.clone();
+    dispatch_obj.set(
+        "__mark_completed_raw",
+        Function::new(ctx.clone(), move |dispatch_id: String, result_json: String| -> String {
+            let conn = match db_mc.separate_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+            };
+            match conn.execute(
+                "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+                 WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+                rusqlite::params![result_json, dispatch_id],
+            ) {
+                Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
+            }
+        })?,
+    )?;
+
+    // __set_retry_count_raw(dispatch_id, count) → json_string
+    // Updates retry_count for auto-retry tracking.
+    let db_rc = db;
+    dispatch_obj.set(
+        "__set_retry_count_raw",
+        Function::new(
+            ctx.clone(),
+            move |dispatch_id: String, count: i32| -> String {
+                let conn = match db_rc.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+                };
+                match conn.execute(
+                    "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
+                    rusqlite::params![count, dispatch_id],
+                ) {
+                    Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
+                }
+            },
         )?,
     )?;
 
@@ -411,6 +493,8 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 // If validation fails, it returns an error that we throw immediately.
                 var result = JSON.parse(raw(cardId, agentId, dt, t));
                 if (result.error) throw new Error(result.error);
+                // #173: If dedup'd, return existing ID without pushing intent
+                if (result.reused) return result.dispatch_id;
                 // #121: Push CreateDispatch intent — execution deferred to Rust
                 var dispatchId = result.dispatch_id;
                 agentdesk.__pendingIntents.push({
@@ -422,6 +506,33 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     title: t
                 });
                 return dispatchId;
+            };
+            var rawFail = agentdesk.dispatch.__mark_failed_raw;
+            agentdesk.dispatch.markFailed = function(dispatchId, reason) {
+                var result = JSON.parse(rawFail(dispatchId, reason || ""));
+                if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.markFailed] no rows affected for " + dispatchId + " — already terminal or missing");
+                }
+                return result;
+            };
+            var rawComplete = agentdesk.dispatch.__mark_completed_raw;
+            agentdesk.dispatch.markCompleted = function(dispatchId, resultJson) {
+                var result = JSON.parse(rawComplete(dispatchId, resultJson || "{}"));
+                if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.markCompleted] no rows affected for " + dispatchId + " — already terminal or missing");
+                }
+                return result;
+            };
+            var rawRetry = agentdesk.dispatch.__set_retry_count_raw;
+            agentdesk.dispatch.setRetryCount = function(dispatchId, count) {
+                var result = JSON.parse(rawRetry(dispatchId, count));
+                if (result.error) throw new Error(result.error);
+                if (result.rows_affected === 0) {
+                    agentdesk.log.warn("[dispatch.setRetryCount] no rows affected for " + dispatchId + " — missing");
+                }
+                return result;
             };
         })();
     "#,
@@ -471,6 +582,29 @@ fn dispatch_create_raw(
         .is_ok();
     if !agent_exists {
         return format!(r#"{{"error":"agent not found: {agent_id}"}}"#);
+    }
+    // #173: Dedup — if same card + same type already has pending/dispatched, return existing.
+    if dispatch_type != "review-decision" {
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM task_dispatches \
+                 WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
+                 AND status IN ('pending', 'dispatched') LIMIT 1",
+                rusqlite::params![card_id, dispatch_type],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(eid) = existing_id {
+            tracing::info!(
+                "DEDUP: reusing existing dispatch {} for card {} type {}",
+                eid,
+                card_id,
+                dispatch_type
+            );
+            return format!(
+                r#"{{"dispatch_id":"{eid}","card_id":"{card_id}","agent_id":"{agent_id}","reused":true}}"#
+            );
+        }
     }
     // Generate pre-assigned dispatch ID (actual DB write deferred to intent executor)
     let dispatch_id = uuid::Uuid::new_v4().to_string();
@@ -665,6 +799,189 @@ mod tests {
             "started_at should be set after transitioning to in_progress"
         );
     }
+
+    /// Seed a minimal kanban_cards row for FK satisfaction in review state tests.
+    fn seed_card_for_review(conn: &rusqlite::Connection, card_id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('agent-t', 'Test', '0', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES (?1, 'T', 'review', 'agent-t', datetime('now'), datetime('now'))",
+            [card_id],
+        )
+        .unwrap();
+    }
+
+    // #158: review_state_sync_on_conn — idle state sets state and clears pending_dispatch_id
+    #[test]
+    fn test_review_state_sync_idle() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-1");
+        // Seed existing review state with pending_dispatch_id
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
+             VALUES ('rs-1', 'suggestion_pending', 'disp-1', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-1", "state": "idle"}).to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, pd): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "idle");
+        assert!(pd.is_none(), "idle should clear pending_dispatch_id");
+    }
+
+    // #158: leaving suggestion_pending must clear stale pending_dispatch_id
+    #[test]
+    fn test_review_state_sync_non_suggestion_pending_clears_pending_dispatch_id() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-1b");
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
+             VALUES ('rs-1b', 'suggestion_pending', 'disp-2', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({
+                "card_id": "rs-1b",
+                "state": "rework_pending",
+                "last_decision": "pm_rework"
+            })
+            .to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, pd): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1b'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "rework_pending");
+        assert!(
+            pd.is_none(),
+            "non-suggestion_pending states must clear stale pending_dispatch_id"
+        );
+    }
+
+    // #158: review_state_sync_on_conn — reviewing state auto-sets review_entered_at
+    #[test]
+    fn test_review_state_sync_reviewing() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-2");
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-2", "state": "reviewing", "review_round": 1})
+                .to_string(),
+        );
+        assert!(result.contains("\"ok\":true"));
+
+        let (state, rr, entered): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT state, review_round, review_entered_at FROM card_review_state WHERE card_id = 'rs-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "reviewing");
+        assert_eq!(rr, Some(1));
+        assert!(
+            entered.is_some(),
+            "reviewing should auto-set review_entered_at"
+        );
+    }
+
+    // #158: review_state_sync_on_conn — clear_verdict only NULLs last_verdict
+    #[test]
+    fn test_review_state_sync_clear_verdict() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "rs-3");
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) \
+             VALUES ('rs-3', 'reviewing', 'improve', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let result = review_state_sync_on_conn(
+            &conn,
+            &serde_json::json!({"card_id": "rs-3", "state": "clear_verdict"}).to_string(),
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let (state, verdict): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_verdict FROM card_review_state WHERE card_id = 'rs-3'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "reviewing", "clear_verdict should not change state");
+        assert!(verdict.is_none(), "clear_verdict should NULL last_verdict");
+    }
+
+    // #158: review_state_sync (JSON wrapper) — round-trip test
+    #[test]
+    fn test_review_state_sync_json_wrapper() {
+        let db = test_db();
+        {
+            let conn = db.separate_conn().unwrap();
+            seed_card_for_review(&conn, "rs-4");
+        }
+        let result = review_state_sync(
+            &db,
+            r#"{"card_id":"rs-4","state":"suggestion_pending","last_verdict":"improve","pending_dispatch_id":"d-99"}"#,
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync should succeed: {result}"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        let (state, verdict, pd): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, last_verdict, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-4'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "suggestion_pending");
+        assert_eq!(verdict.as_deref(), Some("improve"));
+        assert_eq!(pd.as_deref(), Some("d-99"));
+    }
 }
 
 // ── Message queue ops ─────────────────────────────────────────────
@@ -811,21 +1128,13 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 ).ok();
             }
 
-            // #117: Sync canonical review state on status transitions (pipeline-driven)
+            // #117/#158: Sync canonical review state via unified entrypoint
             let has_hooks = pipeline.hooks_for_state(&new_status).map_or(false, |h| !h.on_enter.is_empty() || !h.on_exit.is_empty());
             let is_review_enter = pipeline.hooks_for_state(&new_status).map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"));
             if pipeline.is_terminal(&new_status) || !has_hooks {
-                conn.execute(
-                    "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?1, 'idle', datetime('now')) \
-                     ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
-                    [&card_id],
-                ).ok();
+                review_state_sync_on_conn(&conn, &serde_json::json!({"card_id": card_id, "state": "idle"}).to_string());
             } else if is_review_enter {
-                conn.execute(
-                    "INSERT INTO card_review_state (card_id, state, review_entered_at, updated_at) VALUES (?1, 'reviewing', datetime('now'), datetime('now')) \
-                     ON CONFLICT(card_id) DO UPDATE SET state = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now')",
-                    [&card_id],
-                ).ok();
+                review_state_sync_on_conn(&conn, &serde_json::json!({"card_id": card_id, "state": "reviewing"}).to_string());
             }
 
             format!(
@@ -864,6 +1173,115 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
         })?,
     )?;
 
+    // #155: setReviewStatus — controlled path for review_status + clock updates.
+    // Replaces direct SQL UPDATEs so the ExecuteSQL guard can block bare review_status writes.
+    let db_review = db.clone();
+    kanban_obj.set(
+        "__setReviewStatusRaw",
+        Function::new(
+            ctx.clone(),
+            move |card_id: String, opts_json: String| -> String {
+                let opts: serde_json::Value = match serde_json::from_str(&opts_json) {
+                    Ok(v) => v,
+                    Err(e) => return format!(r#"{{"error":"bad opts: {}"}}"#, e),
+                };
+                let conn = match db_review.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+                };
+
+                // Build dynamic SET clause
+                let mut sets = vec!["updated_at = datetime('now')".to_string()];
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+
+                if let Some(rs) = opts.get("review_status") {
+                    if rs.is_null() {
+                        sets.push("review_status = NULL".to_string());
+                    } else if let Some(s) = rs.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        sets.push(format!("review_status = ?{}", params.len()));
+                    }
+                }
+                if let Some(v) = opts.get("suggestion_pending_at") {
+                    if v.is_null() {
+                        sets.push("suggestion_pending_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("suggestion_pending_at = datetime('now')".to_string());
+                    }
+                }
+                if let Some(v) = opts.get("review_entered_at") {
+                    if v.is_null() {
+                        sets.push("review_entered_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("review_entered_at = datetime('now')".to_string());
+                    }
+                }
+                if let Some(v) = opts.get("awaiting_dod_at") {
+                    if v.is_null() {
+                        sets.push("awaiting_dod_at = NULL".to_string());
+                    } else if v.as_str() == Some("now") {
+                        sets.push("awaiting_dod_at = datetime('now')".to_string());
+                    }
+                }
+                if let Some(v) = opts.get("blocked_reason") {
+                    if v.is_null() {
+                        sets.push("blocked_reason = NULL".to_string());
+                    } else if let Some(s) = v.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        sets.push(format!("blocked_reason = ?{}", params.len()));
+                    }
+                }
+
+                // Optional terminal guard: only update if status != terminal
+                let where_clause = if let Some(excl) = opts.get("exclude_status") {
+                    if let Some(s) = excl.as_str() {
+                        params.push(Box::new(s.to_string()));
+                        params.push(Box::new(card_id.clone()));
+                        format!(
+                            "WHERE id = ?{} AND status != ?{}",
+                            params.len(),
+                            params.len() - 1
+                        )
+                    } else {
+                        params.push(Box::new(card_id.clone()));
+                        format!("WHERE id = ?{}", params.len())
+                    }
+                } else {
+                    params.push(Box::new(card_id.clone()));
+                    format!("WHERE id = ?{}", params.len())
+                };
+
+                let sql = format!(
+                    "UPDATE kanban_cards SET {} {}",
+                    sets.join(", "),
+                    where_clause
+                );
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                if let Err(e) = conn.execute(&sql, param_refs.as_slice()) {
+                    return format!(r#"{{"error":"UPDATE: {}"}}"#, e);
+                }
+
+                // #117/#158: Sync card_review_state via unified entrypoint
+                if let Some(rs) = opts.get("review_status") {
+                    let review_state = if rs.is_null() {
+                        Some("idle")
+                    } else {
+                        rs.as_str()
+                    };
+                    if let Some(s) = review_state {
+                        review_state_sync_on_conn(
+                            &conn,
+                            &serde_json::json!({"card_id": card_id, "state": s}).to_string(),
+                        );
+                    }
+                }
+
+                r#"{"ok":true}"#.to_string()
+            },
+        )?,
+    )?;
+
     ad.set("kanban", kanban_obj)?;
 
     // JS wrapper that parses JSON and accumulates transitions for post-hook processing.
@@ -895,6 +1313,14 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             agentdesk.kanban.getCard = function(cardId) {
                 var result = JSON.parse(getRaw(cardId));
                 if (result.error) return null;
+                return result;
+            };
+            var reviewRaw = agentdesk.kanban.__setReviewStatusRaw;
+            agentdesk.kanban.setReviewStatus = function(cardId, reviewStatus, opts) {
+                var o = opts || {};
+                o.review_status = reviewStatus;
+                var result = JSON.parse(reviewRaw(cardId, JSON.stringify(o)));
+                if (result.error) throw new Error(result.error);
                 return result;
             };
         })();
@@ -968,7 +1394,7 @@ fn register_kv_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     )?;
 
     // kv.delete(key)
-    let db_del = db;
+    let db_del = db.clone();
     kv_obj.set(
         "delete",
         Function::new(ctx.clone(), move |key: String| -> String {
@@ -1001,7 +1427,127 @@ fn register_kv_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     "#,
     )?;
 
+    // ── agentdesk.reviewState — typed bridge for card_review_state mutations (#158) ──
+    // Replaces direct SQL INSERT/UPDATE on card_review_state from JS policies.
+    // All review-state mutations go through this single entrypoint.
+    {
+        let db_rs = db.clone();
+        let sync_raw = Function::new(ctx.clone(), move |json_str: String| -> String {
+            review_state_sync(&db_rs, &json_str)
+        })?;
+
+        let _: rquickjs::Value = ctx.eval(
+            r#"
+            (function() {
+                agentdesk.reviewState = {
+                    __syncRaw: null,
+                    sync: function(cardId, state, opts) {
+                        opts = opts || {};
+                        var payload = JSON.stringify({
+                            card_id: cardId,
+                            state: state,
+                            review_round: opts.review_round || null,
+                            last_verdict: opts.last_verdict || null,
+                            last_decision: opts.last_decision || null,
+                            pending_dispatch_id: opts.pending_dispatch_id || null,
+                            approach_change_round: opts.approach_change_round || null,
+                            review_entered_at: opts.review_entered_at || null
+                        });
+                        var result = JSON.parse(agentdesk.reviewState.__syncRaw(payload));
+                        if (result.error) throw new Error(result.error);
+                        return result;
+                    }
+                };
+            })();
+        "#,
+        )?;
+
+        let rs_obj: rquickjs::Value = ctx.eval("agentdesk.reviewState")?;
+        let rs_obj: Object = rs_obj.into_object().unwrap();
+        rs_obj.set("__syncRaw", sync_raw)?;
+    }
+
     Ok(())
+}
+
+/// Rust implementation of card_review_state sync (#158).
+/// Single entrypoint for all review-state mutations.
+/// Used by both the JS bridge and Rust route handlers.
+pub fn review_state_sync(db: &Db, json_str: &str) -> String {
+    let conn = match db.separate_conn() {
+        Ok(c) => c,
+        Err(e) => return format!(r#"{{"error":"db error: {}"}}"#, e),
+    };
+    review_state_sync_on_conn(&conn, json_str)
+}
+
+/// Same as `review_state_sync` but operates on an already-acquired connection.
+/// Use this inside transactions or when a lock is already held (#158).
+pub fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &str) -> String {
+    let params: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return format!(r#"{{"error":"invalid JSON: {}"}}"#, e),
+    };
+
+    let card_id = params["card_id"].as_str().unwrap_or("");
+    let state = params["state"].as_str().unwrap_or("");
+    if card_id.is_empty() || state.is_empty() {
+        return r#"{"error":"card_id and state are required"}"#.to_string();
+    }
+
+    // Special case: clear_verdict only NULLs last_verdict without changing state
+    if state == "clear_verdict" {
+        let result = conn.execute(
+            "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
+            rusqlite::params![card_id],
+        );
+        return match result {
+            Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+            Err(e) => format!(r#"{{"error":"sql error: {}"}}"#, e),
+        };
+    }
+
+    // Build dynamic SET clause based on provided fields
+    let review_round = params["review_round"].as_i64();
+    let last_verdict = params["last_verdict"].as_str();
+    let last_decision = params["last_decision"].as_str();
+    let pending_dispatch_id = params["pending_dispatch_id"].as_str();
+    let approach_change_round = params["approach_change_round"].as_i64();
+    let review_entered_at = params["review_entered_at"].as_str();
+
+    // UPSERT: INSERT OR REPLACE with all fields
+    let result = conn.execute(
+        "INSERT INTO card_review_state (card_id, state, review_round, last_verdict, last_decision, pending_dispatch_id, approach_change_round, review_entered_at, updated_at) \
+         VALUES (?1, ?2, COALESCE(?3, 0), ?4, ?5, ?6, ?7, COALESCE(?8, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE NULL END), datetime('now')) \
+         ON CONFLICT(card_id) DO UPDATE SET \
+         state = ?2, \
+         review_round = COALESCE(?3, review_round), \
+         last_verdict = COALESCE(?4, last_verdict), \
+         last_decision = COALESCE(?5, last_decision), \
+         pending_dispatch_id = CASE \
+             WHEN ?6 IS NOT NULL THEN ?6 \
+             WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id \
+             ELSE NULL \
+         END, \
+         approach_change_round = COALESCE(?7, approach_change_round), \
+         review_entered_at = COALESCE(?8, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
+         updated_at = datetime('now')",
+        rusqlite::params![
+            card_id,
+            state,
+            review_round,
+            last_verdict,
+            last_decision,
+            pending_dispatch_id,
+            approach_change_round,
+            review_entered_at,
+        ],
+    );
+
+    match result {
+        Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+        Err(e) => format!(r#"{{"error":"sql error: {}"}}"#, e),
+    }
 }
 
 // ── Exec ops ──────────────────────────────────────────────────────
@@ -1055,7 +1601,7 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
             let mut results = Vec::new();
             if let Some(root) = crate::cli::agentdesk_runtime_root() {
                 let inflight_dir = root.join("runtime/discord_inflight");
-                for provider in &["claude", "codex"] {
+                for provider in &["claude", "codex", "gemini"] {
                     let dir = inflight_dir.join(provider);
                     if let Ok(entries) = std::fs::read_dir(&dir) {
                         for entry in entries.flatten() {
@@ -1071,6 +1617,7 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                                         // channel_name → for agent identification
                                         // tmux_session_name → for diagnostics
                                         // session_id → Claude session ID
+                                        // session_key, dispatch_id → for long-turn detection (#130)
                                         let channel_name = data.get("channel_name").and_then(|v| v.as_str()).unwrap_or("");
                                         let tmux_name = data.get("tmux_session_name").and_then(|v| v.as_str()).unwrap_or("");
                                         results.push(serde_json::json!({
@@ -1080,6 +1627,8 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                                             "channel_name": channel_name,
                                             "tmux_session_name": tmux_name,
                                             "session_id": data.get("session_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "session_key": data.get("session_key").and_then(|v| v.as_str()).unwrap_or(""),
+                                            "dispatch_id": data.get("dispatch_id").and_then(|v| v.as_str()).unwrap_or(""),
                                         }));
                                     }
                                 }
@@ -1135,10 +1684,12 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
         rquickjs::Function::new(
             ctx.clone(),
             |session_key: String, command: String| -> String {
-                let result = std::process::Command::new("tmux")
-                    .args(["send-keys", "-t", &session_key, &command, "Enter"])
-                    .output();
-                match result {
+                // session_key may be "hostname:tmux_name"
+                let tmux_name = session_key
+                    .split_once(':')
+                    .map(|(_, name)| name)
+                    .unwrap_or(&session_key);
+                match crate::services::platform::tmux::send_keys(tmux_name, &[&command, "Enter"]) {
                     Ok(out) if out.status.success() => {
                         format!(
                             r#"{{"ok":true,"session":"{}","command":"{}"}}"#,
@@ -1167,10 +1718,7 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                 .split_once(':')
                 .map(|(_, name)| name)
                 .unwrap_or(&session_key);
-            let result = std::process::Command::new("tmux")
-                .args(["kill-session", "-t", tmux_name])
-                .output();
-            match result {
+            match crate::services::platform::tmux::kill_session_output(tmux_name) {
                 Ok(out) if out.status.success() => {
                     format!(r#"{{"ok":true,"session":"{}"}}"#, session_key)
                 }

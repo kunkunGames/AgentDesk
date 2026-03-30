@@ -39,7 +39,7 @@ use crate::services::claude::{
 use crate::services::codex;
 use crate::services::gemini;
 use crate::services::provider::ProviderKind;
-use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
+use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
 
 use adk_session::{
     build_adk_session_key, derive_adk_session_info, parse_dispatch_id, post_adk_session_status,
@@ -146,7 +146,6 @@ pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
         map.remove(&channel_id);
     }
 }
-
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
@@ -388,6 +387,14 @@ pub(super) struct SharedData {
     pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
     /// HTTP API port for self-referencing requests (from config server.port).
     pub(super) api_port: u16,
+    /// Shared DB handle for direct dispatch finalization (avoids HTTP round-trip).
+    pub(super) db: Option<crate::db::Db>,
+    /// Shared policy engine for direct dispatch finalization.
+    pub(super) engine: Option<crate::engine::PolicyEngine>,
+    /// Set of registered slash command names (populated at framework setup).
+    /// Used by the router to distinguish known slash commands from arbitrary
+    /// `/`-prefixed user text that should fall through to the AI provider.
+    pub(super) known_slash_commands: tokio::sync::OnceCell<std::collections::HashSet<String>>,
 }
 
 /// Poise user data type
@@ -889,6 +896,154 @@ async fn execute_handoff_turns(
     }
 }
 
+/// #164: Re-deliver orphan pending dispatches after dcserver restart.
+///
+/// After a restart, dispatches in `pending` status may have been Discord-notified
+/// but the in-memory intervention_queue was lost. Or the notification was interrupted
+/// mid-flight. This function identifies truly orphan dispatches and re-delivers them.
+///
+/// **Safety**:
+/// - Process-global once guard via `std::sync::Once` — safe across multiple provider instances
+/// - Startup boot timestamp from dcserver.pid mtime — not wall clock
+/// - Newer-dispatch check uses rowid (monotonic) instead of created_at (second-granularity)
+/// - Five AND conditions must ALL be met before re-delivery (see issue #164)
+async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
+    // Process-global once guard: prevents duplicate execution when multiple
+    // provider instances (Claude + Codex) call this from their own setup paths.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let mut should_run = false;
+    ONCE.call_once(|| should_run = true);
+    if !should_run {
+        return;
+    }
+
+    let db = match shared.db.as_ref() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Boot timestamp from dcserver.pid mtime — represents actual process start,
+    // not a wall-clock offset that could mis-classify old pending dispatches.
+    let boot_time: String = {
+        let pid_path =
+            crate::cli::agentdesk_runtime_root().map(|r| r.join("runtime").join("dcserver.pid"));
+        let mtime = pid_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+        match mtime {
+            Some(t) => {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+            }
+            None => {
+                // No pid file — cannot determine boot time safely, skip recovery
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ #164: No dcserver.pid — skipping orphan dispatch recovery");
+                return;
+            }
+        }
+    };
+
+    // Query orphan pending dispatches with all 5 safety conditions:
+    // 1. status = 'pending'
+    // 2. card is assigned to the dispatch target agent
+    // 3. agent has NO working session (idle)
+    // 4. created_at < boot_time (pre-restart, using pid mtime)
+    // 5. no newer dispatch for the same card (using rowid for monotonic ordering,
+    //    avoids same-second ambiguity with created_at)
+    let orphans: Vec<(String, String, String, String, String)> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT d.id, d.to_agent_id, d.kanban_card_id, d.title, d.dispatch_type
+             FROM task_dispatches d
+             JOIN kanban_cards kc ON kc.id = d.kanban_card_id
+             WHERE d.status = 'pending'
+               AND d.created_at < ?1
+               AND kc.assigned_agent_id = d.to_agent_id
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions s
+                 WHERE s.agent_id = d.to_agent_id
+                   AND s.status = 'working'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_dispatches d2
+                 WHERE d2.kanban_card_id = d.kanban_card_id
+                   AND d2.rowid > d.rowid
+                   AND d2.status NOT IN ('cancelled', 'failed')
+               )",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map([&boot_time], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    if orphans.is_empty() {
+        return;
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts}] 🔄 #164: Found {} orphan pending dispatch(es) to re-deliver",
+        orphans.len()
+    );
+
+    for (dispatch_id, agent_id, card_id, title, dtype) in &orphans {
+        // Remove the dispatch_notified guard so send_dispatch_to_discord can proceed.
+        // This is safe because the Once guard ensures only one caller reaches here,
+        // and the 5-condition query already validated this dispatch is truly orphan.
+        {
+            let conn = match db.lock() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            conn.execute(
+                "DELETE FROM kv_meta WHERE key = ?1",
+                [&format!("dispatch_notified:{dispatch_id}")],
+            )
+            .ok();
+        }
+
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}]   ↻ Re-delivering {dtype} dispatch {id} → {agent} (card {card})",
+            id = &dispatch_id[..8],
+            agent = agent_id,
+            card = &card_id[..8.min(card_id.len())],
+        );
+
+        crate::server::routes::dispatches::send_dispatch_to_discord(
+            db,
+            agent_id,
+            title,
+            card_id,
+            dispatch_id,
+        )
+        .await;
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{ts}] ✓ #164: Re-delivered {} orphan dispatch(es)",
+        orphans.len()
+    );
+}
+
 /// Kick off turns for channels that have queued interventions but no active
 /// turn running. This bridges the gap where restored pending queues or
 /// handoff injections sit idle because no turn-completion event triggers
@@ -1296,6 +1451,8 @@ pub async fn run_bot(
     shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
     health_registry: Arc<health::HealthRegistry>,
     api_port: u16,
+    db: Option<crate::db::Db>,
+    engine: Option<crate::engine::PolicyEngine>,
 ) {
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
@@ -1355,6 +1512,9 @@ pub async fn run_bot(
         cached_serenity_ctx: tokio::sync::OnceCell::new(),
         cached_bot_token: tokio::sync::OnceCell::new(),
         api_port,
+        db,
+        engine,
+        known_slash_commands: tokio::sync::OnceCell::new(),
     });
 
     {
@@ -1394,6 +1554,7 @@ pub async fn run_bot(
                 commands::cmd_debug(),
                 commands::cmd_adduser(),
                 commands::cmd_removeuser(),
+                commands::cmd_receipt(),
                 commands::cmd_help(),
                 commands::cmd_meeting(),
             ],
@@ -1401,7 +1562,6 @@ pub async fn run_bot(
             ..Default::default()
         })
         .setup(move |ctx, _ready, framework| {
-            let ctx_clone = ctx.clone();
             let shared_for_migrate = shared_clone.clone();
             let health_registry_for_setup = health_registry.clone();
             let provider_for_setup = provider.clone();
@@ -1410,6 +1570,12 @@ pub async fn run_bot(
                 // Register in each guild for instant slash command propagation
                 // (register_globally can take up to 1 hour)
                 let commands = &framework.options().commands;
+                // Populate known slash command names for router fallback logic
+                let cmd_names: std::collections::HashSet<String> = commands
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let _ = shared_for_migrate.known_slash_commands.set(cmd_names);
                 for guild in &_ready.guilds {
                     if let Err(e) =
                         poise::builtins::register_in_guild(ctx, commands, guild.id).await
@@ -1432,11 +1598,7 @@ pub async fn run_bot(
                 // Enrich role_map.json with channelId for reliable name→ID resolution
                 enrich_role_map_with_channel_ids();
 
-                // Background: resolve category names for all known channels
                 let shared_for_tmux = shared_for_migrate.clone();
-                tokio::spawn(async move {
-                    migrate_session_categories(&ctx_clone, &shared_for_migrate).await;
-                });
 
                 // Background: poll for deferred restart marker when idle
                 let shared_for_deferred = shared_for_tmux.clone();
@@ -1530,6 +1692,7 @@ pub async fn run_bot(
                 let shared_for_restart_reports = shared_for_tmux.clone();
                 let provider_for_restore = provider.clone();
                 tokio::spawn(async move {
+                    gc_stale_fixed_working_sessions(&shared_for_tmux2).await;
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
@@ -1576,6 +1739,9 @@ pub async fn run_bot(
                         &provider_for_restore,
                     )
                     .await;
+
+                    // #164: Re-deliver orphan pending dispatches from before restart
+                    recover_orphan_pending_dispatches(&shared_for_restart_reports).await;
 
                     // Kick off turns for channels that have queued messages but no
                     // active turn. Without this, restored pending queues and handoff
@@ -1650,10 +1816,12 @@ pub async fn run_bot(
                 // (idle/disconnected thread sessions older than 1 hour)
                 {
                     let api_port = shared_clone.api_port;
+                    let shared_for_session_gc = shared_clone.clone();
                     tokio::spawn(async move {
                         // Run every 10 minutes, initial delay 2 minutes
                         tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
                         loop {
+                            gc_stale_fixed_working_sessions(&shared_for_session_gc).await;
                             gc_stale_thread_sessions_via_api(api_port).await;
                             tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
                         }
@@ -2155,9 +2323,9 @@ fn record_and_clear_family_profile_probe_answer(
 }
 
 async fn try_handle_family_profile_probe_reply(
-    ctx: &serenity::Context,
+    _ctx: &serenity::Context,
     msg: &serenity::Message,
-    shared: &Arc<SharedData>,
+    _shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) -> Result<bool, Error> {
     if *provider != ProviderKind::Claude || msg.author.bot || msg.guild_id.is_some() {
@@ -2174,16 +2342,46 @@ async fn try_handle_family_profile_probe_reply(
         return Ok(false);
     };
 
+    // Always clear the pending probe state first, regardless of whether the
+    // record succeeds.  If we only clear on success, the pending entry survives
+    // and the *next* unrelated DM will be re-matched as a probe answer.
+    let target_for_clear = target.clone();
+    let clear_result =
+        tokio::task::spawn_blocking(move || clear_family_profile_probe_pending(&target_for_clear))
+            .await;
+    match clear_result {
+        Ok(Err(err)) => {
+            eprintln!(
+                "  [profile-probe] failed to clear pending state for user={} topic={} error={}",
+                msg.author.id.get(),
+                topic_key,
+                err
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "  [profile-probe] clear pending task panicked for user={} topic={} error={}",
+                msg.author.id.get(),
+                topic_key,
+                err
+            );
+        }
+        _ => {}
+    }
+
+    // Record the answer (best-effort). Return Ok(false) so the message
+    // continues to the normal DM handling path, where the agent responds
+    // directly in the DM channel with contextual follow-up.
     let topic_key_owned = topic_key.clone();
     let target_owned = target.clone();
     let answer_owned = answer.to_string();
     let recorded = tokio::task::spawn_blocking(move || {
-        record_and_clear_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
+        record_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
     })
     .await
     .map_err(|err| format!("profile_probe_join_failed:{err}"))?;
 
-    let response = match recorded {
+    match &recorded {
         Ok(true) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
@@ -2191,7 +2389,6 @@ async fn try_handle_family_profile_probe_reply(
                 msg.author.id.get(),
                 topic_key
             );
-            "답변 고마워요. 프로필에 반영해둘게요."
         }
         Ok(false) => {
             eprintln!(
@@ -2199,7 +2396,6 @@ async fn try_handle_family_profile_probe_reply(
                 msg.author.id.get(),
                 topic_key
             );
-            "답변은 받았는데 저장 대상에 바로 반영하지 못했어요. 제가 다시 확인할게요."
         }
         Err(err) => {
             eprintln!(
@@ -2208,13 +2404,12 @@ async fn try_handle_family_profile_probe_reply(
                 topic_key,
                 err
             );
-            "답변은 받았는데 저장 중 오류가 있었어요. 다시 확인해서 반영할게요."
         }
-    };
+    }
 
-    rate_limit_wait(shared, msg.channel_id).await;
-    let _ = msg.channel_id.say(&ctx.http, response).await;
-    Ok(true)
+    // Let the message fall through to normal DM handling so the agent
+    // responds directly in the DM conversation.
+    Ok(false)
 }
 
 /// Rate limit helper — ensures minimum 1s gap between API calls per channel
@@ -2288,6 +2483,31 @@ async fn gc_stale_thread_sessions_via_api(api_port: u16) {
     }
 }
 
+/// Periodic GC: disconnect stale fixed-channel working sessions from the DB so
+/// restart recovery cannot restore dead provider session IDs.
+async fn gc_stale_fixed_working_sessions(shared: &Arc<SharedData>) {
+    let Some(db) = &shared.db else {
+        return;
+    };
+
+    let cleared = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!("  [{ts}] ⚠ Fixed-session GC lock error: {e}");
+                return;
+            }
+        };
+        crate::server::routes::dispatched_sessions::gc_stale_fixed_working_sessions_db(&conn)
+    };
+
+    if cleared > 0 {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 🧹 GC: disconnected {cleared} stale fixed-channel working session(s)");
+    }
+}
+
 /// Periodically clean up idle sessions and their associated data.
 /// Called from handle_event; uses a static Mutex to track the last cleanup time.
 async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
@@ -2344,8 +2564,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
 // Command functions removed — see commands/ submodule.
 // Remaining in mod.rs: detect_worktree_conflict, create_git_worktree, cleanup_git_worktree,
 // send_file_to_channel, send_message_to_channel, send_message_to_user, auto_restore_session,
-// bootstrap_thread_session, load_existing_session, cleanup_session_files, resolve_channel_category,
-// and other non-command functions.
+// bootstrap_thread_session, resolve_channel_category, and other non-command functions.
 
 // ─── Text message → Claude AI ───────────────────────────────────────────────
 
@@ -2581,18 +2800,41 @@ pub(super) async fn auto_restore_session(
     let (ch_name, cat_name) = resolve_channel_category(serenity_ctx, channel_id).await;
 
     // Read settings first to get last_sessions/last_remotes info
+    // DB cwd takes priority over yaml last_sessions (preserves worktree paths)
     let (last_path, is_remote, saved_remote, provider) = {
         let settings = shared.settings.read().await;
         let channel_key = channel_id.get().to_string();
-        let last_path = settings.last_sessions.get(&channel_key).cloned();
+        let yaml_path = settings.last_sessions.get(&channel_key).cloned();
         let is_remote = settings.last_remotes.contains_key(&channel_key);
         let saved_remote = settings.last_remotes.get(&channel_key).cloned();
-        (
-            last_path,
-            is_remote,
-            saved_remote,
-            settings.provider.clone(),
-        )
+        let provider = settings.provider.clone();
+
+        // Try DB cwd first — preserves worktree paths from previous session
+        let ch_name = {
+            let data = shared.core.lock().await;
+            data.sessions
+                .get(&channel_id)
+                .and_then(|s| s.channel_name.clone())
+        };
+        let db_cwd: Option<String> = ch_name.as_ref().and_then(|ch| {
+            let tmux_name = provider.build_tmux_session_name(ch);
+            let hostname = crate::services::platform::hostname_short();
+            let session_key = format!("{}:{}", hostname, tmux_name);
+            shared.db.as_ref().and_then(|db| {
+                db.lock().ok().and_then(|conn| {
+                    conn.query_row(
+                        "SELECT cwd FROM sessions WHERE session_key = ?1",
+                        [&session_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .filter(|p| !p.is_empty() && std::path::Path::new(p).is_dir())
+                })
+            })
+        });
+        let last_path = db_cwd.or(yaml_path);
+
+        (last_path, is_remote, saved_remote, provider)
     };
 
     let mut data = shared.core.lock().await;
@@ -2602,7 +2844,8 @@ pub(super) async fn auto_restore_session(
 
     if let Some(last_path) = last_path {
         if is_remote || Path::new(&last_path).is_dir() {
-            let existing = load_existing_session(&last_path, Some(channel_id.get()));
+            // Session ID is restored from DB (sessions.claude_session_id column)
+            // which is already loaded into DiscordSession.session_id at startup.
             let session = data
                 .sessions
                 .entry(channel_id)
@@ -2625,49 +2868,7 @@ pub(super) async fn auto_restore_session(
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
             session.current_path = Some(last_path.clone());
-            let current_gen = runtime_store::load_generation();
-            let mut need_db_restore = false;
-            let restore_ch_name = session.channel_name.clone();
-            if let Some((session_data, _)) = existing {
-                if session_data.born_generation < current_gen && current_gen > 0 {
-                    // Old generation session — quarantine: start fresh without
-                    // reusing session_id/history from the previous generation.
-                    // However, for thread sessions we can restore the provider
-                    // session_id from DB so resume can continue the conversation.
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] 🔒 QUARANTINE: auto-restore skipping old session_id/history for {last_path} (saved_gen={}, current_gen={current_gen})",
-                        session_data.born_generation
-                    );
-                    need_db_restore = true;
-                } else {
-                    session.session_id = Some(session_data.session_id.clone());
-                    session.history = session_data.history.clone();
-                }
-            }
             drop(data);
-
-            // Restore provider session_id from DB for quarantined sessions.
-            // This runs outside the core lock to avoid deadlocks on the async API call.
-            if need_db_restore {
-                if let Some(ref ch_name) = restore_ch_name {
-                    let tmux_name = provider.build_tmux_session_name(ch_name);
-                    let hostname = crate::services::platform::hostname_short();
-                    let session_key = format!("{}:{}", hostname, tmux_name);
-                    if let Some(restored_sid) =
-                        adk_session::fetch_provider_session_id(&session_key, shared.api_port).await
-                    {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] ↻ QUARANTINE: restored provider session_id from DB for {last_path}"
-                        );
-                        let mut data = shared.core.lock().await;
-                        if let Some(session) = data.sessions.get_mut(&channel_id) {
-                            session.session_id = Some(restored_sid);
-                        }
-                    }
-                }
-            }
             // Rescan skills with project path
             let new_skills = scan_skills(&provider, Some(&last_path));
             *shared.skills_cache.write().await = new_skills;
@@ -2700,13 +2901,12 @@ async fn bootstrap_thread_session(
         // Not a thread (shouldn't happen here) — fall back to resolved name
         _thread_title
     };
-    let existing = load_existing_session(parent_path, Some(thread_channel_id.get()));
-
     let mut data = shared.core.lock().await;
     if data.sessions.contains_key(&thread_channel_id) {
         return;
     }
 
+    // Session ID comes from DB (sessions.claude_session_id), not from file.
     let session = data
         .sessions
         .entry(thread_channel_id)
@@ -2725,105 +2925,8 @@ async fn bootstrap_thread_session(
             born_generation: runtime_store::load_generation(),
         });
     session.current_path = Some(parent_path.to_string());
-    if let Some((session_data, _)) = existing {
-        session.session_id = Some(session_data.session_id.clone());
-        session.history = session_data.history.clone();
-    }
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ↻ Bootstrapped thread session from parent path: {parent_path}");
-}
-
-/// Load existing session from ai_sessions directory.
-/// Prefers sessions with a non-empty session_id. Among those, picks the most recently modified.
-pub(super) fn load_existing_session(
-    current_path: &str,
-    channel_id: Option<u64>,
-) -> Option<(SessionData, std::time::SystemTime)> {
-    let sessions_dir = ai_screen::ai_sessions_dir()?;
-
-    if !sessions_dir.exists() {
-        return None;
-    }
-
-    let mut best_with_id: Option<(SessionData, std::time::SystemTime)> = None;
-    let mut best_without_id: Option<(SessionData, std::time::SystemTime)> = None;
-
-    if let Ok(entries) = fs::read_dir(&sessions_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
-                        if session_data.current_path == current_path {
-                            // Strict channel-aware restore when channel_id is provided.
-                            if let Some(cid) = channel_id {
-                                if session_data.discord_channel_id != Some(cid) {
-                                    continue;
-                                }
-                            }
-
-                            if let Ok(metadata) = path.metadata() {
-                                if let Ok(modified) = metadata.modified() {
-                                    let has_id = !session_data.session_id.is_empty();
-                                    let target = if has_id {
-                                        &mut best_with_id
-                                    } else {
-                                        &mut best_without_id
-                                    };
-                                    match target {
-                                        None => *target = Some((session_data, modified)),
-                                        Some((_, latest_time)) if modified > *latest_time => {
-                                            *target = Some((session_data, modified));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Prefer sessions with a valid session_id
-    best_with_id.or(best_without_id)
-}
-
-/// Clean up stale session files for a given path, keeping only the one matching current_session_id.
-pub(super) fn cleanup_session_files(current_path: &str, current_session_id: Option<&str>) {
-    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
-        return;
-    };
-    if !sessions_dir.exists() {
-        return;
-    }
-
-    let Ok(entries) = fs::read_dir(&sessions_dir) else {
-        return;
-    };
-
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "json").unwrap_or(false) {
-            continue;
-        }
-        // Don't delete the current session file
-        if let Some(sid) = current_session_id {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if stem == sid {
-                    continue;
-                }
-            }
-        }
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(old) = serde_json::from_str::<SessionData>(&content) {
-                if old.current_path == current_path {
-                    let _ = fs::remove_file(&path);
-                }
-            }
-        }
-    }
 }
 
 /// Resolve the channel name and parent category name for a Discord channel.
@@ -3014,179 +3117,6 @@ fn enrich_role_map_with_channel_ids() {
         if let Ok(pretty) = serde_json::to_string_pretty(&json) {
             let _ = runtime_store::atomic_write(&path, &pretty);
         }
-    }
-}
-
-/// On startup, resolve category names for all known channels and update session files.
-async fn migrate_session_categories(ctx: &serenity::prelude::Context, shared: &Arc<SharedData>) {
-    let sessions_dir = match ai_screen::ai_sessions_dir() {
-        Some(d) if d.exists() => d,
-        _ => return,
-    };
-
-    // Collect channel IDs from bot_settings.last_sessions
-    let channel_keys: Vec<(String, String)> = {
-        let settings = shared.settings.read().await;
-        settings
-            .last_sessions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
-
-    let mut updated = 0usize;
-    for (channel_key, session_path) in &channel_keys {
-        let Ok(cid) = channel_key.parse::<u64>() else {
-            continue;
-        };
-        let channel_id = serenity::model::id::ChannelId::new(cid);
-        let (ch_name, cat_name) = resolve_channel_category(ctx, channel_id).await;
-        if ch_name.is_none() && cat_name.is_none() {
-            continue;
-        }
-
-        // Find the session file for this channel's path
-        let existing = load_existing_session(session_path, Some(cid));
-        if let Some((session_data, _)) = existing {
-            let file_path = sessions_dir.join(format!("{}.json", session_data.session_id));
-            if file_path.exists() {
-                // Read, update category fields, write back
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(obj) = val.as_object_mut() {
-                            obj.insert(
-                                "discord_channel_id".to_string(),
-                                serde_json::Value::Number(serde_json::Number::from(cid)),
-                            );
-                            if let Some(ref name) = ch_name {
-                                obj.insert(
-                                    "discord_channel_name".to_string(),
-                                    serde_json::Value::String(name.clone()),
-                                );
-                            }
-                            if let Some(ref cat) = cat_name {
-                                obj.insert(
-                                    "discord_category_name".to_string(),
-                                    serde_json::Value::String(cat.clone()),
-                                );
-                            }
-                            if let Ok(json) = serde_json::to_string_pretty(&val) {
-                                let _ = fs::write(&file_path, json);
-                                updated += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if updated > 0 {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] ✓ Updated {updated} session(s) with channel/category info");
-    }
-}
-
-/// Save session to file in the ai_sessions directory
-fn save_session_to_file(session: &DiscordSession, current_path: &str) {
-    let Some(ref session_id) = session.session_id else {
-        return;
-    };
-
-    if session.history.is_empty() {
-        return;
-    }
-
-    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
-        return;
-    };
-
-    if fs::create_dir_all(&sessions_dir).is_err() {
-        return;
-    }
-
-    let saveable_history: Vec<HistoryItem> = session
-        .history
-        .iter()
-        .filter(|item| !matches!(item.item_type, HistoryType::System))
-        .cloned()
-        .collect();
-
-    if saveable_history.is_empty() {
-        return;
-    }
-
-    let file_path = sessions_dir.join(format!("{}.json", session_id));
-
-    if let Some(parent) = file_path.parent() {
-        if parent != sessions_dir {
-            return;
-        }
-    }
-
-    // Preserve existing category/channel names from the file when in-memory values are None
-    let (effective_channel_name, effective_category_name) =
-        if session.channel_name.is_none() || session.category_name.is_none() {
-            if let Ok(content) = fs::read_to_string(&file_path) {
-                if let Ok(existing) = serde_json::from_str::<SessionData>(&content) {
-                    (
-                        session
-                            .channel_name
-                            .clone()
-                            .or(existing.discord_channel_name),
-                        session
-                            .category_name
-                            .clone()
-                            .or(existing.discord_category_name),
-                    )
-                } else {
-                    (session.channel_name.clone(), session.category_name.clone())
-                }
-            } else {
-                (session.channel_name.clone(), session.category_name.clone())
-            }
-        } else {
-            (session.channel_name.clone(), session.category_name.clone())
-        };
-
-    // Clean up old session files for the same Discord channel (different session_id)
-    if let Ok(entries) = fs::read_dir(&sessions_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if fname == session_id {
-                    continue;
-                } // keep current
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(old) = serde_json::from_str::<SessionData>(&content) {
-                        let same_channel = match (session.channel_id, old.discord_channel_id) {
-                            (Some(cid), Some(old_cid)) => cid == old_cid,
-                            _ => old.discord_channel_name == effective_channel_name,
-                        };
-                        if same_channel {
-                            let _ = fs::remove_file(&path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let session_data = SessionData {
-        session_id: session_id.clone(),
-        history: saveable_history,
-        current_path: current_path.to_string(),
-        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        discord_channel_id: session.channel_id,
-        discord_channel_name: effective_channel_name,
-        discord_category_name: effective_category_name,
-        remote_profile_name: session.remote_profile_name.clone(),
-        born_generation: session.born_generation,
-    };
-
-    if let Ok(json) = serde_json::to_string_pretty(&session_data) {
-        let _ = fs::write(file_path, json);
     }
 }
 

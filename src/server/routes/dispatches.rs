@@ -150,16 +150,24 @@ pub async fn create_dispatch(
         &context,
     ) {
         Ok(d) => {
-            // Send dispatch message to the target agent's Discord channel
-            let to_agent_id = body.to_agent_id.clone();
-            let title = body.title.clone();
-            let card_id = body.kanban_card_id.clone();
             let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
-            let db = state.db.clone();
-            tokio::spawn(async move {
-                send_dispatch_to_discord(&db, &to_agent_id, &title, &card_id, &dispatch_id).await;
-            });
-            (StatusCode::CREATED, Json(json!({"dispatch": d})))
+            let was_reused = d.get("__reused").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Only send Discord notification for genuinely new dispatches (#173)
+            if !was_reused {
+                queue_dispatch_notify(
+                    &state.db,
+                    &dispatch_id,
+                    &body.to_agent_id,
+                    &body.kanban_card_id,
+                    &body.title,
+                );
+            }
+            let status_code = if was_reused {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (status_code, Json(json!({"dispatch": d})))
         }
         Err(e) => {
             let msg = format!("{e}");
@@ -181,16 +189,12 @@ pub async fn update_dispatch(
     Path(id): Path<String>,
     Json(body): Json<UpdateDispatchBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // If status is "completed", use the dispatch engine's complete_dispatch
+    // #143: Route all API-driven completions through finalize_dispatch
     if body.status.as_deref() == Some("completed") {
-        let result = body.result.unwrap_or(json!({}));
-        match dispatch::complete_dispatch(&state.db, &state.engine, &id, &result) {
+        let context = body.result.as_ref();
+        match dispatch::finalize_dispatch(&state.db, &state.engine, &id, "api", context) {
             Ok(d) => {
-                let db_clone = state.db.clone();
-                let dispatch_id = id.clone();
-                tokio::spawn(async move {
-                    handle_completed_dispatch_followups(&db_clone, &dispatch_id).await;
-                });
+                queue_dispatch_followup(&state.db, &id);
                 return (StatusCode::OK, Json(json!({"dispatch": d})));
             }
             Err(e) => {
@@ -405,13 +409,23 @@ fn get_thread_for_channel(
         }
     }
 
-    // Fallback: legacy active_thread_id (no channel distinction)
-    conn.query_row(
-        "SELECT active_thread_id FROM kanban_cards WHERE id = ?1 AND active_thread_id IS NOT NULL",
-        [card_id],
-        |row| row.get(0),
-    )
-    .ok()
+    // Fallback: legacy active_thread_id — only if channel_thread_map is empty/absent.
+    // When the map exists but doesn't contain this channel, the thread belongs to a
+    // different channel (e.g. CDX review thread) and must NOT be reused for the
+    // primary channel's review-decision message.
+    if map_json
+        .as_deref()
+        .map_or(true, |s| s.is_empty() || s == "{}")
+    {
+        return conn
+            .query_row(
+                "SELECT active_thread_id FROM kanban_cards WHERE id = ?1 AND active_thread_id IS NOT NULL",
+                [card_id],
+                |row| row.get(0),
+            )
+            .ok();
+    }
+    None
 }
 
 /// Set the thread_id for a specific channel in channel_thread_map.
@@ -491,6 +505,128 @@ pub(super) fn clear_all_threads(conn: &rusqlite::Connection, card_id: &str) {
     .ok();
 }
 
+// ── Outbox worker trait ───────────────────────────────────────
+
+/// Trait for outbox side-effects (Discord notifications, followups).
+/// Extracted from `dispatch_outbox_loop` to allow mock injection in tests.
+pub(crate) trait OutboxNotifier: Send + Sync {
+    fn notify_dispatch(
+        &self,
+        db: crate::db::Db,
+        agent_id: String,
+        title: String,
+        card_id: String,
+        dispatch_id: String,
+    ) -> impl std::future::Future<Output = ()> + Send;
+
+    fn handle_followup(
+        &self,
+        db: crate::db::Db,
+        dispatch_id: String,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// Production notifier that calls the real Discord functions.
+pub(crate) struct RealOutboxNotifier;
+
+impl OutboxNotifier for RealOutboxNotifier {
+    async fn notify_dispatch(
+        &self,
+        db: crate::db::Db,
+        agent_id: String,
+        title: String,
+        card_id: String,
+        dispatch_id: String,
+    ) {
+        send_dispatch_to_discord(&db, &agent_id, &title, &card_id, &dispatch_id).await;
+    }
+
+    async fn handle_followup(&self, db: crate::db::Db, dispatch_id: String) {
+        handle_completed_dispatch_followups(&db, &dispatch_id).await;
+    }
+}
+
+/// Process one batch of pending outbox entries.
+/// Returns the number of entries processed (0 if queue was empty).
+pub(crate) async fn process_outbox_batch<N: OutboxNotifier>(
+    db: &crate::db::Db,
+    notifier: &N,
+) -> usize {
+    let pending: Vec<(
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = {
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT id, dispatch_id, action, agent_id, card_id, title \
+             FROM dispatch_outbox WHERE status = 'pending' ORDER BY id ASC LIMIT 5",
+        ) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    let count = pending.len();
+    for (id, dispatch_id, action, agent_id, card_id, title) in pending {
+        // Mark as processing
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE dispatch_outbox SET status = 'processing' WHERE id = ?1",
+                [id],
+            )
+            .ok();
+        }
+
+        match action.as_str() {
+            "notify" => {
+                if let (Some(aid), Some(cid), Some(t)) = (agent_id, card_id, title) {
+                    notifier
+                        .notify_dispatch(db.clone(), aid, t, cid, dispatch_id.clone())
+                        .await;
+                }
+            }
+            "followup" => {
+                notifier
+                    .handle_followup(db.clone(), dispatch_id.clone())
+                    .await;
+            }
+            other => {
+                tracing::warn!("[dispatch-outbox] Unknown action: {other}");
+            }
+        }
+
+        // Mark done
+        if let Ok(conn) = db.lock() {
+            conn.execute(
+                "UPDATE dispatch_outbox SET status = 'done', processed_at = datetime('now') WHERE id = ?1",
+                [id],
+            )
+            .ok();
+        }
+    }
+    count
+}
+
 /// Send a dispatch notification to the target agent's Discord channel.
 /// Message format: `DISPATCH:<dispatch_id> - <title>\n<issue_url>`
 /// The `DISPATCH:<uuid>` prefix is required for the dcserver to link the
@@ -538,7 +674,7 @@ pub(crate) async fn send_dispatch_to_discord(
     // For review dispatches, use the alternate channel (counter-model)
     let mut use_alt = use_counter_model_channel(dispatch_type.as_deref());
 
-    // #137: Check if this card is in a unified thread auto-queue run
+    // #145: Check if this dispatch is in a unified thread auto-queue run (dispatch_id path)
     let is_unified_run: bool = db
         .lock()
         .ok()
@@ -546,8 +682,8 @@ pub(crate) async fn send_dispatch_to_discord(
             conn.query_row(
                 "SELECT COUNT(*) > 0 FROM auto_queue_runs r \
                  JOIN auto_queue_entries e ON e.run_id = r.id \
-                 WHERE e.kanban_card_id = ?1 AND r.unified_thread = 1 AND r.status = 'active'",
-                [card_id],
+                 WHERE e.dispatch_id = ?1 AND r.unified_thread = 1 AND r.status = 'active'",
+                [dispatch_id],
                 |row| row.get(0),
             )
             .ok()
@@ -615,8 +751,12 @@ pub(crate) async fn send_dispatch_to_discord(
         .unwrap_or_default()
     };
 
-    // For review dispatches, look up reviewed commit SHA and target provider from context
-    let (reviewed_commit, target_provider): (Option<String>, Option<String>) = if use_alt {
+    // For review dispatches, look up reviewed commit SHA, branch, and target provider from context
+    let (reviewed_commit, target_provider, review_branch): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = if use_alt {
         let conn = match db.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -642,9 +782,13 @@ pub(crate) async fn send_dispatch_to_discord(
                 .get("target_provider")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            ctx_val
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let message = format_dispatch_message(
@@ -655,6 +799,7 @@ pub(crate) async fn send_dispatch_to_discord(
         use_alt,
         reviewed_commit.as_deref(),
         target_provider.as_deref(),
+        review_branch.as_deref(),
     );
 
     // Send via Discord HTTP API using the announce bot
@@ -671,34 +816,44 @@ pub(crate) async fn send_dispatch_to_discord(
     // ── Thread reuse: check if card already has an active thread ──
     let client = reqwest::Client::new();
     let dispatch_type_label = dispatch_type.as_deref().unwrap_or("implementation");
+    let message = prefix_dispatch_message(dispatch_type_label, &message);
 
-    // #137: Check if this dispatch belongs to a unified-thread auto-queue run
-    // #137: Look up per-channel unified thread from JSON map
+    // #145/#140: Look up per-channel unified thread via dispatch_id path
+    // #140: For parallel runs (thread_group_count > 1), threads are grouped:
+    //   unified_thread_id = {"0": {"channel_id": "thread_id"}, "1": {"channel_id": "thread_id"}}
+    // For non-parallel (thread_group_count == 1), flat format is preserved:
+    //   unified_thread_id = {"channel_id": "thread_id"}
     let mut unified_thread_id: Option<String> = db.lock().ok().and_then(|conn| {
-        let map_json: Option<String> = conn
+        // Get both the map JSON and the entry's thread_group + run's group count
+        let row: Option<(String, i64, i64)> = conn
             .query_row(
-                "SELECT r.unified_thread_id FROM auto_queue_runs r \
-                     JOIN auto_queue_entries e ON e.run_id = r.id \
-                     WHERE e.kanban_card_id = ?1 AND r.unified_thread = 1 AND r.status = 'active' \
-                     AND r.unified_thread_id IS NOT NULL",
-                [card_id],
-                |row| row.get::<_, String>(0),
+                "SELECT r.unified_thread_id, COALESCE(e.thread_group, 0), COALESCE(r.thread_group_count, 1) \
+                 FROM auto_queue_runs r \
+                 JOIN auto_queue_entries e ON e.run_id = r.id \
+                 WHERE e.dispatch_id = ?1 AND r.unified_thread = 1 AND r.status = 'active' \
+                 AND r.unified_thread_id IS NOT NULL",
+                [dispatch_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
             )
             .ok();
-        map_json.and_then(|json_str| {
-            // Try parsing as JSON map {"channel_id": "thread_id", ...}
+        row.and_then(|(json_str, thread_group, group_count)| {
             if let Ok(map) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                if map.is_object() {
-                    map.get(&channel_id_num.to_string())
+                if !map.is_object() {
+                    return None;
+                }
+                if group_count > 1 {
+                    // Parallel: nested format {"group_num": {"channel_id": "thread_id"}}
+                    map.get(&thread_group.to_string())
+                        .and_then(|group_map| group_map.get(&channel_id_num.to_string()))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                 } else {
-                    // Legacy: parsed as number/string, not a JSON object — skip
-                    // A new JSON map will be created when a thread is made for this channel
-                    None
+                    // Non-parallel: flat format {"channel_id": "thread_id"}
+                    map.get(&channel_id_num.to_string())
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 }
             } else {
-                // Unparseable — skip, will be overwritten with proper JSON map
                 None
             }
         })
@@ -736,15 +891,15 @@ pub(crate) async fn send_dispatch_to_discord(
         }
     }
 
-    // #137: If unified thread reuse failed, remove this channel from JSON map
+    // #145: If unified thread reuse failed, remove this channel from JSON map (dispatch_id path)
     if unified_thread_id.is_some() {
         if let Ok(conn) = db.lock() {
             let existing: String = conn
                 .query_row(
                     "SELECT COALESCE(unified_thread_id, '{}') FROM auto_queue_runs \
-                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1) \
+                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE dispatch_id = ?1) \
                      AND status IN ('active', 'paused')",
-                    [card_id],
+                    [dispatch_id],
                     |row| row.get(0),
                 )
                 .unwrap_or_else(|_| "{}".to_string());
@@ -754,9 +909,9 @@ pub(crate) async fn send_dispatch_to_discord(
                 }
                 conn.execute(
                     "UPDATE auto_queue_runs SET unified_thread_id = ?1 \
-                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?2) \
+                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE dispatch_id = ?2) \
                      AND status IN ('active', 'paused')",
-                    rusqlite::params![map.to_string(), card_id],
+                    rusqlite::params![map.to_string(), dispatch_id],
                 )
                 .ok();
             }
@@ -765,45 +920,41 @@ pub(crate) async fn send_dispatch_to_discord(
     }
 
     // No existing thread or reuse failed — create a new thread
-    // #137: For unified thread, build name from all queued issue numbers
+    // #137/#140: For unified thread, build name from queued issue numbers
+    // #140: For parallel runs, only show issues in the same thread_group
     let thread_name = if unified_thread_id.is_none() {
         // First dispatch in unified run — check if we should use a combined name
         let unified_issues: Option<String> = db
             .lock()
             .ok()
             .and_then(|conn| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT kc.github_issue_number FROM auto_queue_entries e \
+                // Check if this card is in a unified run and get thread_group info
+                let entry_info: Option<(String, i64, i64)> = conn
+                    .query_row(
+                        "SELECT e.run_id, COALESCE(e.thread_group, 0), COALESCE(r.thread_group_count, 1) \
+                         FROM auto_queue_entries e \
                          JOIN auto_queue_runs r ON e.run_id = r.id \
-                         JOIN kanban_cards kc ON e.kanban_card_id = kc.id \
-                         WHERE r.unified_thread = 1 \
-                         AND e.kanban_card_id = ?1 AND kc.github_issue_number IS NOT NULL \
-                         LIMIT 1",
+                         WHERE r.unified_thread = 1 AND e.dispatch_id = ?1",
+                        [dispatch_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
                     )
-                    .ok()?;
-                // If this card is in a unified run, gather all issue numbers
-                let is_unified: bool = stmt
-                    .query_map([card_id], |row| row.get::<_, i64>(0))
-                    .ok()
-                    .map(|rows| rows.count() > 0)
-                    .unwrap_or(false);
-                if !is_unified {
-                    return None;
-                }
-                drop(stmt);
-                let mut stmt2 = conn
-                    .prepare(
-                        "SELECT kc.github_issue_number FROM auto_queue_entries e \
-                         JOIN auto_queue_runs r ON e.run_id = r.id \
-                         JOIN kanban_cards kc ON e.kanban_card_id = kc.id \
-                         WHERE r.unified_thread = 1 \
-                         AND e.run_id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1) \
-                         AND kc.github_issue_number IS NOT NULL \
-                         ORDER BY e.priority_rank ASC",
-                    )
-                    .ok()?;
-                // Get current card's issue number for highlighting
+                    .ok();
+                let (run_id, thread_group, group_count) = entry_info?;
+
+                // Build issue list — for parallel runs, only show group's issues
+                let group_filter = if group_count > 1 {
+                    format!(" AND COALESCE(e.thread_group, 0) = {}", thread_group)
+                } else {
+                    String::new()
+                };
+                let sql = format!(
+                    "SELECT kc.github_issue_number FROM auto_queue_entries e \
+                     JOIN kanban_cards kc ON e.kanban_card_id = kc.id \
+                     WHERE e.run_id = ?1{} AND kc.github_issue_number IS NOT NULL \
+                     ORDER BY e.priority_rank ASC",
+                    group_filter
+                );
+                let mut stmt = conn.prepare(&sql).ok()?;
                 let current_issue: Option<i64> = conn
                     .query_row(
                         "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
@@ -811,8 +962,8 @@ pub(crate) async fn send_dispatch_to_discord(
                         |row| row.get(0),
                     )
                     .ok();
-                let nums: Vec<String> = stmt2
-                    .query_map([card_id], |row| row.get::<_, i64>(0))
+                let nums: Vec<String> = stmt
+                    .query_map([&run_id], |row| row.get::<_, i64>(0))
                     .ok()?
                     .filter_map(|r| r.ok())
                     .map(|n| {
@@ -826,7 +977,12 @@ pub(crate) async fn send_dispatch_to_discord(
                 if nums.is_empty() {
                     None
                 } else {
-                    Some(nums.join(" "))
+                    // For parallel runs, prefix with group number
+                    if group_count > 1 {
+                        Some(format!("G{} {}", thread_group, nums.join(" ")))
+                    } else {
+                        Some(nums.join(" "))
+                    }
                 }
             });
 
@@ -891,64 +1047,58 @@ pub(crate) async fn send_dispatch_to_discord(
                             )
                             .ok();
                             set_thread_for_channel(&conn, card_id, channel_id_num, thread_id);
-                            // #141: Store unified thread per channel in JSON map
+                            // #141/#140: Store unified thread per channel in JSON map
                             // Save when: no existing thread for this channel (unified_thread_id is None)
                             // AND this card belongs to a unified run
                             if unified_thread_id.is_none() && is_unified_run {
-                                // Read existing map, add this channel's thread
+                                // #140: Get thread_group and group_count for this entry
+                                let (entry_group, group_count): (i64, i64) = conn
+                                    .query_row(
+                                        "SELECT COALESCE(e.thread_group, 0), COALESCE(r.thread_group_count, 1) \
+                                         FROM auto_queue_entries e \
+                                         JOIN auto_queue_runs r ON e.run_id = r.id \
+                                         WHERE e.dispatch_id = ?1",
+                                        [dispatch_id],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap_or((0, 1));
+
+                                // Read existing map
                                 let existing: String = conn
                                     .query_row(
                                         "SELECT COALESCE(unified_thread_id, '{}') FROM auto_queue_runs \
-                                         WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?1) \
+                                         WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE dispatch_id = ?1) \
                                          AND status IN ('active', 'paused')",
-                                        [card_id],
+                                        [dispatch_id],
                                         |row| row.get(0),
                                     )
                                     .unwrap_or_else(|_| "{}".to_string());
-                                // #141: Ensure we have a proper JSON object — legacy plain
-                                // string/number values get upgraded to a map, preserving
-                                // the legacy thread_id under the primary channel key
-                                let mut map: serde_json::Value = serde_json::from_str::<
-                                    serde_json::Value,
-                                >(
-                                    &existing
-                                )
-                                .ok()
-                                .filter(|v: &serde_json::Value| v.is_object())
-                                .unwrap_or_else(|| {
-                                    // Legacy: plain thread_id — promote to JSON map
-                                    // Preserve it under primary channel key if available
-                                    let legacy_tid = existing.trim().to_string();
-                                    if legacy_tid.is_empty() || legacy_tid == "{}" {
-                                        return serde_json::json!({});
+
+                                let mut map: serde_json::Value =
+                                    serde_json::from_str::<serde_json::Value>(&existing)
+                                        .ok()
+                                        .filter(|v: &serde_json::Value| v.is_object())
+                                        .unwrap_or_else(|| serde_json::json!({}));
+
+                                if group_count > 1 {
+                                    // #140: Parallel — nested format {"group_num": {"channel_id": "thread_id"}}
+                                    let group_key = entry_group.to_string();
+                                    if !map.get(&group_key).map(|v| v.is_object()).unwrap_or(false)
+                                    {
+                                        map[group_key.clone()] = serde_json::json!({});
                                     }
-                                    let primary_ch: Option<String> = conn
-                                        .query_row(
-                                            "SELECT discord_channel_id FROM agents WHERE id = ?1",
-                                            [agent_id],
-                                            |row| row.get(0),
-                                        )
-                                        .ok();
-                                    let primary_num: Option<u64> = primary_ch.and_then(|ch| {
-                                        ch.parse().ok().or_else(|| resolve_channel_alias(&ch))
-                                    });
-                                    if let Some(pch) = primary_num {
-                                        // Backfill channel_thread_map with the legacy primary mapping
-                                        // so get_thread_for_channel() resolves correctly for primary channel
-                                        set_thread_for_channel(&conn, card_id, pch, &legacy_tid);
-                                        serde_json::json!({ pch.to_string(): legacy_tid })
-                                    } else {
-                                        serde_json::json!({})
-                                    }
-                                });
-                                map[channel_id_num.to_string()] = serde_json::json!(thread_id);
-                                // #145: Only update active/paused runs to prevent stale-run
-                                // collision when the same card is re-queued into a new run
+                                    map[group_key][channel_id_num.to_string()] =
+                                        serde_json::json!(thread_id);
+                                } else {
+                                    // Non-parallel: flat format {"channel_id": "thread_id"}
+                                    map[channel_id_num.to_string()] = serde_json::json!(thread_id);
+                                }
+
                                 conn.execute(
                                     "UPDATE auto_queue_runs SET unified_thread_id = ?1, unified_thread_channel_id = ?2 \
-                                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE kanban_card_id = ?3) \
+                                     WHERE id IN (SELECT run_id FROM auto_queue_entries WHERE dispatch_id = ?3) \
                                      AND status IN ('active', 'paused')",
-                                    rusqlite::params![map.to_string(), thread_id, card_id],
+                                    rusqlite::params![map.to_string(), thread_id, dispatch_id],
                                 )
                                 .ok();
                             }
@@ -1187,20 +1337,10 @@ async fn try_reuse_thread(
         }
     }
 
-    // 2b. Send separator message to visually distinguish dispatch phases
-    let separator = format!("── {} dispatch ──", dispatch_type);
     let msg_url = format!(
         "https://discord.com/api/v10/channels/{}/messages",
         thread_id
     );
-    let _ = client
-        .post(&msg_url)
-        .header("Authorization", format!("Bot {}", token))
-        .json(&serde_json::json!({"content": separator}))
-        .send()
-        .await;
-
-    // 3. Send the dispatch message
     let msg_ok = client
         .post(&msg_url)
         .header("Authorization", format!("Bot {}", token))
@@ -1383,6 +1523,7 @@ pub(super) async fn send_review_result_to_primary(
              카운터모델이 verdict를 제출하지 않고 세션이 종료됐습니다.\n\
              GitHub 이슈 코멘트를 확인하고 리뷰 내용이 있으면 반영해주세요.{url_line}"
         );
+        let message = prefix_dispatch_message("review-decision", &message);
 
         let url = format!(
             "https://discord.com/api/v10/channels/{}/messages",
@@ -1432,16 +1573,19 @@ pub(super) async fn send_review_result_to_primary(
         &format!("[리뷰 검토] {title}"),
         &serde_json::json!({"verdict": verdict}),
     ) {
-        Ok((id, _old_status)) => {
-            // #117: Update canonical card_review_state with pending_dispatch_id
+        Ok((id, _old_status, _reused)) => {
+            // #117/#158: Update canonical card_review_state via unified entrypoint
             if let Ok(conn) = db.lock() {
-                conn.execute(
-                    "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, last_verdict, updated_at) \
-                     VALUES (?1, 'suggestion_pending', ?2, ?3, datetime('now')) \
-                     ON CONFLICT(card_id) DO UPDATE SET \
-                       pending_dispatch_id = ?2, last_verdict = ?3, updated_at = datetime('now')",
-                    rusqlite::params![card_id, id, verdict],
-                ).ok();
+                crate::engine::ops::review_state_sync_on_conn(
+                    &conn,
+                    &serde_json::json!({
+                        "card_id": card_id,
+                        "state": "suggestion_pending",
+                        "pending_dispatch_id": id,
+                        "last_verdict": verdict,
+                    })
+                    .to_string(),
+                );
             }
             id
         }
@@ -1462,21 +1606,14 @@ pub(super) async fn send_review_result_to_primary(
          • 반론 → GitHub 코멘트로 이의 제기 후 review-decision API에 dispute 호출\n\
          • 불수용 → review-decision API에 dismiss 호출{url_line}"
     );
+    let message = prefix_dispatch_message("review-decision", &message);
 
-    // Send separator + dispatch to existing thread, or just to channel
+    // Send a single review-decision message to existing thread, or just to channel
     if sending_to_thread {
         let msg_url = format!(
             "https://discord.com/api/v10/channels/{}/messages",
             target_channel
         );
-        // Separator
-        let _ = client
-            .post(&msg_url)
-            .header("Authorization", format!("Bot {}", token))
-            .json(&serde_json::json!({"content": "── review-decision dispatch ──"}))
-            .send()
-            .await;
-        // Dispatch message
         let ok = client
             .post(&msg_url)
             .header("Authorization", format!("Bot {}", token))
@@ -1559,7 +1696,9 @@ fn extract_review_verdict(result_json: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub(super) async fn handle_completed_dispatch_followups(db: &crate::db::Db, dispatch_id: &str) {
+/// Send Discord notifications for a completed dispatch (review verdicts, etc.).
+/// Callers of `finalize_dispatch` should spawn this after the sync call returns.
+pub(crate) async fn handle_completed_dispatch_followups(db: &crate::db::Db, dispatch_id: &str) {
     let info: Option<(String, String, String, String, String, Option<String>)> = {
         let conn = match db.lock() {
             Ok(c) => c,
@@ -1678,10 +1817,10 @@ pub fn resolve_channel_alias_pub(alias: &str) -> Option<u64> {
 }
 
 fn use_counter_model_channel(dispatch_type: Option<&str>) -> bool {
-    // Only "review" goes to the counter-model channel.
+    // "review" and "e2e-test" (#197) go to the counter-model channel.
     // "review-decision" is sent to the original agent's primary channel
     // so it reuses the implementation thread.
-    matches!(dispatch_type, Some("review"))
+    matches!(dispatch_type, Some("review") | Some("e2e-test"))
 }
 
 fn format_dispatch_message(
@@ -1692,6 +1831,7 @@ fn format_dispatch_message(
     use_alt: bool,
     reviewed_commit: Option<&str>,
     target_provider: Option<&str>,
+    review_branch: Option<&str>,
 ) -> String {
     // Format issue link as markdown hyperlink with angle brackets to suppress embed
     let issue_link = match (issue_url, issue_number) {
@@ -1709,6 +1849,14 @@ fn format_dispatch_message(
         if !issue_link.is_empty() {
             message.push('\n');
             message.push_str(&issue_link);
+        }
+        // #193: Include branch info so reviewer inspects the correct code
+        if let Some(branch) = review_branch {
+            let short_commit = reviewed_commit.map(|c| &c[..8.min(c.len())]).unwrap_or("?");
+            message.push_str(&format!(
+                "\n\n리뷰 대상 브랜치: `{branch}` (commit: `{short_commit}`)\n\
+                 반드시 해당 브랜치를 checkout하여 리뷰하세요. main 브랜치가 아닙니다."
+            ));
         }
         // Append verdict API call instructions for the counter-model reviewer
         let commit_arg = reviewed_commit
@@ -1733,6 +1881,10 @@ fn format_dispatch_message(
     } else {
         format!("DISPATCH:{dispatch_id} - {title}")
     }
+}
+
+fn prefix_dispatch_message(dispatch_type: &str, message: &str) -> String {
+    format!("── {} dispatch ──\n{}", dispatch_type, message)
 }
 
 fn resolve_channel_alias(alias: &str) -> Option<u64> {
@@ -1933,11 +2085,75 @@ pub async fn get_card_thread(
     }
 }
 
+// ── #144: Dispatch Notification Outbox ───────────────────────
+
+/// Queue a dispatch notification for async delivery via the outbox worker.
+///
+/// Replaces `tokio::spawn(send_dispatch_to_discord(...))` with a durable
+/// outbox insert. The worker loop drains these entries and calls
+/// `send_dispatch_to_discord` / `handle_completed_dispatch_followups`.
+pub(crate) fn queue_dispatch_notify(
+    db: &crate::db::Db,
+    dispatch_id: &str,
+    agent_id: &str,
+    card_id: &str,
+    title: &str,
+) {
+    if let Ok(conn) = db.separate_conn() {
+        conn.execute(
+            "INSERT INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title) \
+             VALUES (?1, 'notify', ?2, ?3, ?4)",
+            rusqlite::params![dispatch_id, agent_id, card_id, title],
+        )
+        .ok();
+    }
+}
+
+/// Queue a dispatch completion followup for async processing.
+///
+/// Replaces `tokio::spawn(handle_completed_dispatch_followups(...))`.
+pub(crate) fn queue_dispatch_followup(db: &crate::db::Db, dispatch_id: &str) {
+    if let Ok(conn) = db.separate_conn() {
+        conn.execute(
+            "INSERT INTO dispatch_outbox (dispatch_id, action) VALUES (?1, 'followup')",
+            [dispatch_id],
+        )
+        .ok();
+    }
+}
+
+/// Worker loop that drains dispatch_outbox and executes Discord side-effects.
+///
+/// This is the SINGLE place where dispatch-related Discord HTTP calls originate.
+/// All other code paths insert into the outbox table and return immediately.
+pub(crate) async fn dispatch_outbox_loop(db: crate::db::Db) {
+    use std::time::Duration;
+
+    // Wait for server to be ready
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    tracing::info!("[dispatch-outbox] Worker started (adaptive backoff 500ms-5s)");
+
+    let notifier = RealOutboxNotifier;
+    let mut poll_interval = Duration::from_millis(500);
+    let max_interval = Duration::from_secs(5);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let processed = process_outbox_batch(&db, &notifier).await;
+        if processed == 0 {
+            poll_interval = (poll_interval.mul_f64(1.5)).min(max_interval);
+        } else {
+            poll_interval = Duration::from_millis(500);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         extract_review_verdict, format_dispatch_message, handle_completed_dispatch_followups,
-        use_counter_model_channel,
+        prefix_dispatch_message, use_counter_model_channel,
     };
     use crate::db::Db;
     use std::sync::{Arc, Mutex};
@@ -1970,6 +2186,7 @@ mod tests {
             true,
             Some("abc123"),
             Some("codex"),
+            None,
         );
 
         assert!(message.starts_with("DISPATCH:dispatch-1 - [Review R1] card-1"));
@@ -1988,6 +2205,24 @@ mod tests {
     }
 
     #[test]
+    fn review_dispatch_message_with_branch() {
+        let message = format_dispatch_message(
+            "dispatch-br",
+            "[Review R1] card-1",
+            Some("https://github.com/itismyfield/AgentDesk/issues/19"),
+            Some(19),
+            true,
+            Some("abc12345deadbeef"),
+            Some("codex"),
+            Some("wt/feature-branch"),
+        );
+
+        assert!(message.contains("리뷰 대상 브랜치: `wt/feature-branch`"));
+        assert!(message.contains("commit: `abc12345`"));
+        assert!(message.contains("main 브랜치가 아닙니다"));
+    }
+
+    #[test]
     fn review_dispatch_message_without_commit() {
         let message = format_dispatch_message(
             "dispatch-no-commit",
@@ -1995,6 +2230,7 @@ mod tests {
             None,
             None,
             true,
+            None,
             None,
             None,
         );
@@ -2015,6 +2251,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         assert!(message.contains(
@@ -2023,6 +2260,15 @@ mod tests {
         assert!(!message.contains("검토 전용"));
         // Implementation dispatches should NOT include verdict instructions
         assert!(!message.contains("review-verdict"));
+    }
+
+    #[test]
+    fn prefix_dispatch_message_merges_separator_and_body() {
+        let message = prefix_dispatch_message("review-decision", "DISPATCH:d-1 - Example");
+        assert_eq!(
+            message,
+            "── review-decision dispatch ──\nDISPATCH:d-1 - Example"
+        );
     }
 
     #[test]

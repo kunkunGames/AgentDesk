@@ -10,7 +10,7 @@ use crate::services::tmux_common::tmux_exact_target;
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::settings::cleanup_channel_uploads;
 use super::super::turn_bridge::cancel_active_token;
-use super::super::{Context, Error, check_auth, cleanup_session_files};
+use super::super::{Context, Error, check_auth};
 
 /// /stop — Cancel in-progress AI request
 #[poise::command(slash_command, rename = "stop")]
@@ -83,10 +83,6 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
     {
         let mut data = ctx.data().shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
-            // Clean up ALL session files on disk (including current) when clearing
-            if let Some(ref path) = session.current_path {
-                cleanup_session_files(path, None);
-            }
             cleanup_channel_uploads(channel_id);
             session.session_id = None;
             session.history.clear();
@@ -119,11 +115,9 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
     #[cfg(unix)]
     if *provider == crate::services::provider::ProviderKind::Claude {
         if let Some(ref name) = tmux_name {
-            let exact_target = tmux_exact_target(name);
+            let name = name.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("tmux")
-                    .args(["send-keys", "-t", &exact_target, "/clear", "Enter"])
-                    .output()
+                crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
             })
             .await;
         }

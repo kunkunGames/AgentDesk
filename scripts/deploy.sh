@@ -155,11 +155,11 @@ fi
 # ── Step 2: Copy binary ──────────────────────────────────────────────────────
 info "Installing binary..."
 mkdir -p "$BIN_DIR"
-mkdir -p "$LIBEXEC_DIR"
 if [ "$OS" = "darwin" ]; then
-  chflags nouchg "$WRAPPER_BIN" 2>/dev/null || true
-  chflags nouchg "$REAL_BIN" 2>/dev/null || true
+  # Previous installs may have been immutable; unlock before backup/replace.
+  chflags nouchg "$WRAPPER_BIN" "$REAL_BIN" 2>/dev/null || true
 fi
+mkdir -p "$LIBEXEC_DIR"
 if [ -e "$WRAPPER_BIN" ]; then
   BACKUP_WRAPPER="$(mktemp "$BIN_DIR/agentdesk.wrapper.backup.XXXXXX")"
   cp "$WRAPPER_BIN" "$BACKUP_WRAPPER"
@@ -178,10 +178,6 @@ if [ "$OS" = "darwin" ]; then
   fi
 fi
 write_wrapper_script
-if [ "$OS" = "darwin" ]; then
-  chflags uchg "$WRAPPER_BIN" 2>/dev/null || true
-  chflags uchg "$REAL_BIN" 2>/dev/null || true
-fi
 ok "Binary wrapper: $WRAPPER_BIN -> $REAL_BIN"
 run_installed_binary_self_check
 rm -f "$BIN_DIR/agentdesk-real"

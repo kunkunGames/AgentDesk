@@ -4,26 +4,26 @@ pub fn print_help() {
     println!("AgentDesk {} - AI agent orchestration platform", VERSION);
     println!();
     println!("USAGE:");
-    println!("    agentdesk [OPTIONS]");
+    println!("    agentdesk <COMMAND>");
     println!();
-    println!("OPTIONS:");
+    println!("COMMANDS:");
     println!("    -h, --help              Print help information");
     println!("    -v, --version           Print version information");
     println!(
-        "    --dcserver [TOKEN]      Start Discord bot server(s); without TOKEN uses bot_settings.json"
+        "    dcserver [TOKEN]        Start Discord bot server(s); without TOKEN uses bot_settings.json"
     );
     println!(
-        "    --restart-dcserver [--report-channel-id <ID> --report-provider <claude|codex|gemini> [--report-message-id <ID>]]"
+        "    restart-dcserver [--report-channel-id <ID> --report-provider <claude|codex|gemini> [--report-message-id <ID>]]"
     );
-    println!("    --discord-sendfile <PATH> --channel <ID> --key <HASH>");
-    println!("    --discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]");
-    println!("    --discord-senddm --user <ID> --message <TEXT> [--key <HASH>]");
-    println!("    --reset-tmux             Kill all AgentDesk-* tmux sessions");
+    println!("    discord-sendfile <PATH> --channel <ID> --key <HASH>");
+    println!("    discord-sendmessage --channel <ID> --message <TEXT> [--key <HASH>]");
+    println!("    discord-senddm --user <ID> --message <TEXT> [--key <HASH>]");
+    println!("    reset-tmux              Kill all AgentDesk-* tmux sessions");
     println!(
-        "    --ismcptool <TOOL>...    Check if MCP tool(s) are registered in .claude/settings.json (CWD)"
+        "    ismcptool <TOOL>...     Check if MCP tool(s) are registered in .claude/settings.json (CWD)"
     );
     println!(
-        "    --addmcptool <TOOL>...   Add MCP tool permission(s) to .claude/settings.json (CWD)"
+        "    addmcptool <TOOL>...    Add MCP tool permission(s) to .claude/settings.json (CWD)"
     );
     println!();
 }
@@ -214,37 +214,22 @@ pub fn handle_reset_tmux() {
     println!("Done.");
 }
 
-#[cfg(unix)]
 fn kill_agentdesk_tmux_sessions_local() -> usize {
-    let output = match std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return 0,
+    let names = match crate::services::platform::tmux::list_session_names() {
+        Ok(n) => n,
+        Err(_) => return 0,
     };
 
     let mut count = 0;
-    for line in output.lines() {
-        let name = line.trim();
+    for name in &names {
         if name.starts_with("AgentDesk-") {
-            if std::process::Command::new("tmux")
-                .args(["kill-session", "-t", name])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
+            if crate::services::platform::tmux::kill_session(name) {
                 println!("   killed: {}", name);
                 count += 1;
             }
         }
     }
     count
-}
-
-#[cfg(not(unix))]
-fn kill_agentdesk_tmux_sessions_local() -> usize {
-    0
 }
 
 fn clean_agentdesk_tmp_files() -> usize {

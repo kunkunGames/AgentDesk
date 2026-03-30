@@ -93,6 +93,8 @@ mod tests {
         let state = AppState {
             db: db.clone(),
             engine: test_engine(&db),
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
             health_registry: None,
         };
 
@@ -407,7 +409,7 @@ mod tests {
         seed_card(&db, "card-s6", "in_progress");
 
         // Step 1: Create implementation dispatch via canonical path
-        let (dispatch_id, _) = dispatch::create_dispatch_core(
+        let (dispatch_id, _, _) = dispatch::create_dispatch_core(
             &db,
             "card-s6",
             "agent-1",
@@ -551,14 +553,20 @@ mod tests {
 
         // Default pipeline kickoff is "requested", but simple pipeline kickoff is "in_progress"
         let default_kickoff = crate::pipeline::get()
-            .transitions.iter()
+            .transitions
+            .iter()
             .find(|t| {
                 t.transition_type == crate::pipeline::TransitionType::Gated
-                    && crate::pipeline::get().dispatchable_states().contains(&t.from.as_str())
+                    && crate::pipeline::get()
+                        .dispatchable_states()
+                        .contains(&t.from.as_str())
             })
             .map(|t| t.to.as_str())
             .unwrap();
-        assert_eq!(default_kickoff, "requested", "default pipeline kickoff must be 'requested'");
+        assert_eq!(
+            default_kickoff, "requested",
+            "default pipeline kickoff must be 'requested'"
+        );
 
         // Create dispatch via create_dispatch_core_with_id — should use card's effective pipeline
         let result = dispatch::create_dispatch_core_with_id(
@@ -570,7 +578,11 @@ mod tests {
             "[S7 test]",
             &serde_json::json!({}),
         );
-        assert!(result.is_ok(), "dispatch creation should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "dispatch creation should succeed: {:?}",
+            result.err()
+        );
 
         // Card status must be "in_progress" (override kickoff), NOT "requested" (default kickoff)
         let status = get_card_status(&db, "card-s7");
@@ -601,7 +613,11 @@ mod tests {
             "[S7b test]",
             &serde_json::json!({}),
         );
-        assert!(result2.is_ok(), "create_dispatch_core should succeed: {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "create_dispatch_core should succeed: {:?}",
+            result2.err()
+        );
         assert_eq!(
             get_card_status(&db, "card-s7b"),
             "in_progress",
@@ -664,22 +680,41 @@ mod tests {
         drop(conn);
 
         // Validate the effective pipeline
-        assert!(effective.validate().is_ok(), "simple pipeline override must be valid");
+        assert!(
+            effective.validate().is_ok(),
+            "simple pipeline override must be valid"
+        );
 
         // Verify states: no "review" or "requested" state
         let state_ids: Vec<&str> = effective.states.iter().map(|s| s.id.as_str()).collect();
-        assert!(!state_ids.contains(&"review"), "simple pipeline has no review state");
-        assert!(!state_ids.contains(&"requested"), "simple pipeline has no requested state");
-        assert!(state_ids.contains(&"in_progress"), "simple pipeline has in_progress");
+        assert!(
+            !state_ids.contains(&"review"),
+            "simple pipeline has no review state"
+        );
+        assert!(
+            !state_ids.contains(&"requested"),
+            "simple pipeline has no requested state"
+        );
+        assert!(
+            state_ids.contains(&"in_progress"),
+            "simple pipeline has in_progress"
+        );
         assert!(state_ids.contains(&"done"), "simple pipeline has done");
 
         // Verify terminal state
         assert!(effective.is_terminal("done"), "done is terminal");
-        assert!(!effective.is_terminal("in_progress"), "in_progress is not terminal");
+        assert!(
+            !effective.is_terminal("in_progress"),
+            "in_progress is not terminal"
+        );
 
         // Verify dispatchable state
         let dispatchable = effective.dispatchable_states();
-        assert_eq!(dispatchable, vec!["ready"], "ready is the only dispatchable state");
+        assert_eq!(
+            dispatchable,
+            vec!["ready"],
+            "ready is the only dispatchable state"
+        );
 
         // Verify transitions work: card can go ready → in_progress (gated)
         assert!(
@@ -766,9 +801,15 @@ mod tests {
 
         // Key assertion: review → qa_test transition exists (not review → done)
         let review_pass = effective.find_transition("review", "qa_test");
-        assert!(review_pass.is_some(), "review → qa_test must exist in QA pipeline");
+        assert!(
+            review_pass.is_some(),
+            "review → qa_test must exist in QA pipeline"
+        );
         let review_done = effective.find_transition("review", "done");
-        assert!(review_done.is_none(), "review → done must NOT exist in QA pipeline");
+        assert!(
+            review_done.is_none(),
+            "review → done must NOT exist in QA pipeline"
+        );
 
         // qa_test → done transition
         let qa_done = effective.find_transition("qa_test", "done");
@@ -776,13 +817,19 @@ mod tests {
 
         // qa_test → in_progress force transition
         let qa_rework = effective.find_transition("qa_test", "in_progress");
-        assert!(qa_rework.is_some(), "qa_test → in_progress (force) must exist");
+        assert!(
+            qa_rework.is_some(),
+            "qa_test → in_progress (force) must exist"
+        );
 
         // Verify custom state has hooks
         let qa_hooks = effective.hooks_for_state("qa_test");
         assert!(qa_hooks.is_some(), "qa_test must have hook bindings");
         assert!(
-            qa_hooks.unwrap().on_enter.contains(&"OnCardTransition".to_string()),
+            qa_hooks
+                .unwrap()
+                .on_enter
+                .contains(&"OnCardTransition".to_string()),
             "qa_test on_enter must include OnCardTransition"
         );
 
@@ -810,9 +857,17 @@ mod tests {
 
         // Force transition qa_test → in_progress (simulating QA failure)
         let result = kanban::transition_status_with_opts(
-            &db, &engine, "card-qa", "in_progress", "qa-fail", true,
+            &db,
+            &engine,
+            "card-qa",
+            "in_progress",
+            "qa-fail",
+            true,
         );
-        assert!(result.is_ok(), "qa_test → in_progress force transition must work");
+        assert!(
+            result.is_ok(),
+            "qa_test → in_progress force transition must work"
+        );
         assert_eq!(get_card_status(&db, "card-qa"), "in_progress");
     }
 
@@ -881,11 +936,22 @@ mod tests {
         }
 
         let result_a = dispatch::create_dispatch_core_with_id(
-            &db, "d-multi-a", "card-multi-a", "agent-1", "implementation", "[Multi A]", &serde_json::json!({}),
+            &db,
+            "d-multi-a",
+            "card-multi-a",
+            "agent-1",
+            "implementation",
+            "[Multi A]",
+            &serde_json::json!({}),
         );
-        assert!(result_a.is_ok(), "dispatch for card-multi-a should succeed: {:?}", result_a.err());
+        assert!(
+            result_a.is_ok(),
+            "dispatch for card-multi-a should succeed: {:?}",
+            result_a.err()
+        );
         assert_eq!(
-            get_card_status(&db, "card-multi-a"), "in_progress",
+            get_card_status(&db, "card-multi-a"),
+            "in_progress",
             "card in 'ready' must kick off to 'in_progress', not 'qa_test'"
         );
 
@@ -905,12 +971,823 @@ mod tests {
         }
 
         let result_b = dispatch::create_dispatch_core_with_id(
-            &db, "d-multi-b", "card-multi-b", "agent-1", "implementation", "[Multi B]", &serde_json::json!({}),
+            &db,
+            "d-multi-b",
+            "card-multi-b",
+            "agent-1",
+            "implementation",
+            "[Multi B]",
+            &serde_json::json!({}),
         );
-        assert!(result_b.is_ok(), "dispatch for card-multi-b should succeed: {:?}", result_b.err());
+        assert!(
+            result_b.is_ok(),
+            "dispatch for card-multi-b should succeed: {:?}",
+            result_b.err()
+        );
         assert_eq!(
-            get_card_status(&db, "card-multi-b"), "qa_test",
+            get_card_status(&db, "card-multi-b"),
+            "qa_test",
             "card in 'qa_ready' must kick off to 'qa_test', not 'in_progress'"
+        );
+    }
+
+    // ── #158: card_review_state write centralisation tests ──────────
+
+    /// Helper: query card_review_state for a card.
+    fn get_review_state(
+        db: &db::Db,
+        card_id: &str,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT state, last_verdict, last_decision FROM card_review_state WHERE card_id = ?1",
+            [card_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()
+    }
+
+    /// #158: Typed bridge (review_state_sync) writes card_review_state correctly.
+    /// Tests the Rust entrypoint that backs the JS agentdesk.reviewState.sync bridge.
+    #[test]
+    fn scenario_158a_typed_bridge_writes_review_state() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-158a", "review");
+
+        // Step 1: Set reviewing state with round via JSON wrapper (same path as JS bridge)
+        let result = crate::engine::ops::review_state_sync(
+            &db,
+            r#"{"card_id":"card-158a","state":"reviewing","review_round":1}"#,
+        );
+        assert!(
+            result.contains("\"ok\":true"),
+            "sync to reviewing must succeed: {result}"
+        );
+
+        let (state, _, _) =
+            get_review_state(&db, "card-158a").expect("card_review_state row must exist");
+        assert_eq!(state, "reviewing", "bridge must create reviewing state");
+
+        // Step 2: Update with verdict
+        let result2 = crate::engine::ops::review_state_sync(
+            &db,
+            r#"{"card_id":"card-158a","state":"suggestion_pending","last_verdict":"improve"}"#,
+        );
+        assert!(
+            result2.contains("\"ok\":true"),
+            "sync to suggestion_pending must succeed: {result2}"
+        );
+
+        let (state2, verdict, _) = get_review_state(&db, "card-158a").unwrap();
+        assert_eq!(state2, "suggestion_pending");
+        assert_eq!(verdict.as_deref(), Some("improve"));
+
+        // Step 3: Set to idle — must clear pending_dispatch_id
+        let result3 =
+            crate::engine::ops::review_state_sync(&db, r#"{"card_id":"card-158a","state":"idle"}"#);
+        assert!(
+            result3.contains("\"ok\":true"),
+            "sync to idle must succeed: {result3}"
+        );
+
+        let (state3, _, _) = get_review_state(&db, "card-158a").unwrap();
+        assert_eq!(state3, "idle", "bridge must allow idle transition");
+
+        // Step 4: Verify JS bridge is registered and callable (smoke test)
+        let engine = test_engine(&db);
+        let js_check: String = engine
+            .eval_js(r#"typeof agentdesk.reviewState.sync === "function" ? "ok" : "missing""#)
+            .unwrap();
+        assert_eq!(
+            js_check, "ok",
+            "agentdesk.reviewState.sync must be registered as a function"
+        );
+    }
+
+    /// #158: ExecuteSQL intent rejects direct card_review_state mutations.
+    #[test]
+    fn scenario_158b_execute_sql_intent_rejects_review_state_write() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-158b", "review");
+
+        // Attempt INSERT via ExecuteSQL intent — must fail
+        let insert_intent = crate::engine::intent::Intent::ExecuteSQL {
+            sql: "INSERT INTO card_review_state (card_id, state, updated_at) VALUES ('card-158b', 'idle', datetime('now'))".to_string(),
+            params: vec![],
+        };
+        let result = crate::engine::intent::execute_intents(&db, vec![insert_intent]);
+        assert_eq!(
+            result.errors, 1,
+            "INSERT into card_review_state via ExecuteSQL must be rejected"
+        );
+
+        // Attempt INSERT OR REPLACE via ExecuteSQL intent — must also fail
+        let replace_intent = crate::engine::intent::Intent::ExecuteSQL {
+            sql: "INSERT OR REPLACE INTO card_review_state (card_id, state, updated_at) VALUES ('card-158b', 'idle', datetime('now'))".to_string(),
+            params: vec![],
+        };
+        let result_replace = crate::engine::intent::execute_intents(&db, vec![replace_intent]);
+        assert_eq!(
+            result_replace.errors, 1,
+            "INSERT OR REPLACE into card_review_state via ExecuteSQL must be rejected"
+        );
+
+        // Attempt UPDATE via ExecuteSQL intent — must also fail
+        let update_intent = crate::engine::intent::Intent::ExecuteSQL {
+            sql: "UPDATE card_review_state SET state = 'idle' WHERE card_id = 'card-158b'"
+                .to_string(),
+            params: vec![],
+        };
+        let result2 = crate::engine::intent::execute_intents(&db, vec![update_intent]);
+        assert_eq!(
+            result2.errors, 1,
+            "UPDATE card_review_state via ExecuteSQL must be rejected"
+        );
+
+        // Attempt DELETE via ExecuteSQL intent — must also fail
+        let delete_intent = crate::engine::intent::Intent::ExecuteSQL {
+            sql: "DELETE FROM card_review_state WHERE card_id = 'card-158b'".to_string(),
+            params: vec![],
+        };
+        let result3 = crate::engine::intent::execute_intents(&db, vec![delete_intent]);
+        assert_eq!(
+            result3.errors, 1,
+            "DELETE from card_review_state via ExecuteSQL must be rejected"
+        );
+
+        // Verify no row was created
+        assert!(
+            get_review_state(&db, "card-158b").is_none(),
+            "no card_review_state row should exist after blocked intents"
+        );
+    }
+
+    /// #158: JS db.execute() blocks direct card_review_state SQL writes.
+    #[test]
+    fn scenario_158c_js_db_execute_blocks_review_state_direct_sql() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-158c", "review");
+
+        // Try INSERT via agentdesk.db.execute — must throw
+        let insert_result: String = engine
+            .eval_js(r#"
+                try {
+                    agentdesk.db.execute(
+                        "INSERT INTO card_review_state (card_id, state, updated_at) VALUES ('card-158c', 'idle', datetime('now'))"
+                    );
+                    "unexpected_success"
+                } catch(e) {
+                    e.message.indexOf("card_review_state") >= 0 ? "blocked" : "wrong_error: " + e.message
+                }
+            "#)
+            .unwrap();
+        assert_eq!(
+            insert_result, "blocked",
+            "JS db.execute INSERT into card_review_state must be blocked"
+        );
+
+        // Try INSERT OR REPLACE via agentdesk.db.execute — must throw
+        let replace_result: String = engine
+            .eval_js(r#"
+                try {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO card_review_state (card_id, state, updated_at) VALUES ('card-158c', 'idle', datetime('now'))"
+                    );
+                    "unexpected_success"
+                } catch(e) {
+                    e.message.indexOf("card_review_state") >= 0 ? "blocked" : "wrong_error: " + e.message
+                }
+            "#)
+            .unwrap();
+        assert_eq!(
+            replace_result, "blocked",
+            "JS db.execute INSERT OR REPLACE into card_review_state must be blocked"
+        );
+
+        // Try UPDATE via agentdesk.db.execute — must throw
+        let update_result: String = engine
+            .eval_js(r#"
+                try {
+                    agentdesk.db.execute(
+                        "UPDATE card_review_state SET state = 'idle' WHERE card_id = 'card-158c'"
+                    );
+                    "unexpected_success"
+                } catch(e) {
+                    e.message.indexOf("card_review_state") >= 0 ? "blocked" : "wrong_error: " + e.message
+                }
+            "#)
+            .unwrap();
+        assert_eq!(
+            update_result, "blocked",
+            "JS db.execute UPDATE on card_review_state must be blocked"
+        );
+
+        // Try DELETE via agentdesk.db.execute — must throw
+        let delete_result: String = engine
+            .eval_js(r#"
+                try {
+                    agentdesk.db.execute(
+                        "DELETE FROM card_review_state WHERE card_id = 'card-158c'"
+                    );
+                    "unexpected_success"
+                } catch(e) {
+                    e.message.indexOf("card_review_state") >= 0 ? "blocked" : "wrong_error: " + e.message
+                }
+            "#)
+            .unwrap();
+        assert_eq!(
+            delete_result, "blocked",
+            "JS db.execute DELETE on card_review_state must be blocked"
+        );
+
+        // Verify no row was created by blocked operations
+        assert!(
+            get_review_state(&db, "card-158c").is_none(),
+            "no card_review_state row should exist after blocked JS db.execute"
+        );
+    }
+
+    /// #158: Full review cycle — card transitions sync card_review_state via single entrypoint.
+    #[test]
+    fn scenario_158d_review_cycle_syncs_canonical_state() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-158d", "in_progress");
+
+        // Create implementation dispatch and complete it to trigger review transition
+        seed_dispatch(&db, "d-158d", "card-158d", "implementation", "pending");
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "d-158d",
+            &serde_json::json!({"completion_source": "test_harness"}),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        // Card should be in review
+        assert_eq!(get_card_status(&db, "card-158d"), "review");
+
+        // card_review_state must be "reviewing" (synced via single entrypoint during transition)
+        let (state, _, _) = get_review_state(&db, "card-158d")
+            .expect("card_review_state must exist after review transition");
+        assert_eq!(
+            state, "reviewing",
+            "canonical review state must be 'reviewing' after entering review"
+        );
+
+        // Force card to done — review state must reset to idle
+        assert!(
+            kanban::transition_status_with_opts(&db, &engine, "card-158d", "done", "test", true)
+                .is_ok()
+        );
+        assert_eq!(get_card_status(&db, "card-158d"), "done");
+
+        let (state2, _, _) = get_review_state(&db, "card-158d").unwrap();
+        assert_eq!(
+            state2, "idle",
+            "canonical review state must be 'idle' after terminal transition"
+        );
+    }
+
+    /// #158: review-automation.js OnReviewEnter hook uses reviewState.sync bridge.
+    #[test]
+    fn scenario_158e_on_review_enter_js_hook_syncs_canonical_state() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-158e", "review");
+
+        kanban::fire_enter_hooks(&db, &engine, "card-158e", "review");
+
+        let (state, _, _) = get_review_state(&db, "card-158e")
+            .expect("card_review_state must exist after OnReviewEnter hook");
+        assert_eq!(
+            state, "reviewing",
+            "OnReviewEnter policy hook must sync canonical review state via bridge"
+        );
+
+        let conn = db.lock().unwrap();
+        let review_round: i64 = conn
+            .query_row(
+                "SELECT review_round FROM kanban_cards WHERE id = 'card-158e'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_round, 1, "OnReviewEnter must increment review_round");
+
+        let review_dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-158e' AND dispatch_type = 'review' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_dispatch_count, 1,
+            "OnReviewEnter must create exactly one pending review dispatch"
+        );
+    }
+
+    // ── #160: Process-level restart/delivery boundary tests ────
+    //
+    // Infrastructure: MockNotifier + process_outbox_batch + DB fallback helpers.
+    // Tests exercise actual outbox worker code paths, not raw SQL.
+
+    use crate::server::routes::dispatches::{OutboxNotifier, process_outbox_batch};
+
+    /// Mock Discord transport that records calls and optionally fails.
+    struct MockNotifier {
+        calls: std::sync::Mutex<Vec<MockCall>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum MockCall {
+        Notify {
+            agent_id: String,
+            dispatch_id: String,
+        },
+        Followup {
+            dispatch_id: String,
+        },
+    }
+
+    impl MockNotifier {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_log(&self) -> Vec<MockCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn notify_count(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| matches!(c, MockCall::Notify { .. }))
+                .count()
+        }
+    }
+
+    impl OutboxNotifier for MockNotifier {
+        async fn notify_dispatch(
+            &self,
+            _db: crate::db::Db,
+            agent_id: String,
+            _title: String,
+            _card_id: String,
+            dispatch_id: String,
+        ) {
+            self.calls.lock().unwrap().push(MockCall::Notify {
+                agent_id,
+                dispatch_id,
+            });
+        }
+
+        async fn handle_followup(&self, _db: crate::db::Db, dispatch_id: String) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockCall::Followup { dispatch_id });
+        }
+    }
+
+    fn seed_outbox(db: &db::Db, dispatch_id: &str, action: &str) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title, status) \
+             VALUES (?1, ?2, 'agent-1', 'card-160', 'Test', 'pending')",
+            rusqlite::params![dispatch_id, action],
+        )
+        .unwrap();
+    }
+
+    fn outbox_status(db: &db::Db, dispatch_id: &str) -> Vec<String> {
+        let conn = db.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT status FROM dispatch_outbox WHERE dispatch_id = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map([dispatch_id], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn has_reconcile_marker(db: &db::Db, dispatch_id: &str) -> bool {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM kv_meta WHERE key = ?1",
+            [&format!("reconcile_dispatch:{dispatch_id}")],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+    }
+
+    fn get_dispatch_result_json(db: &db::Db, dispatch_id: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT result FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Scenario 160-1: DB commit → outbox worker delivers exactly 1 notification.
+    ///
+    /// Exercises `process_outbox_batch` with MockNotifier to verify:
+    /// - Outbox entry transitions pending → processing → done
+    /// - Mock Discord transport receives exactly 1 notify call
+    #[tokio::test]
+    async fn scenario_160_1_outbox_batch_delivers_exactly_once() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-160", "ready");
+        seed_dispatch(&db, "d-160-1", "card-160", "implementation", "pending");
+        seed_outbox(&db, "d-160-1", "notify");
+
+        let mock = MockNotifier::new();
+
+        // Run one batch — this exercises the real process_outbox_batch code path
+        let processed = process_outbox_batch(&db, &mock).await;
+
+        assert_eq!(processed, 1, "Batch should process exactly 1 entry");
+        assert_eq!(
+            mock.notify_count(),
+            1,
+            "Mock should receive exactly 1 notify call"
+        );
+        assert_eq!(
+            mock.call_log(),
+            vec![MockCall::Notify {
+                agent_id: "agent-1".into(),
+                dispatch_id: "d-160-1".into(),
+            }]
+        );
+
+        // Verify outbox entry transitioned to done
+        assert_eq!(outbox_status(&db, "d-160-1"), vec!["done"]);
+
+        // Second batch should find nothing pending
+        let processed2 = process_outbox_batch(&db, &mock).await;
+        assert_eq!(processed2, 0, "No pending entries after first drain");
+        assert_eq!(mock.notify_count(), 1, "No additional calls on empty queue");
+    }
+
+    /// Scenario 160-2: Recovery API failure → DB fallback completes dispatch
+    /// and sets reconciliation marker for onTick hook chain.
+    ///
+    /// Simulates the turn_bridge fallback path: when finalize_dispatch fails,
+    /// the system falls back to direct DB UPDATE + reconcile marker.
+    #[tokio::test]
+    async fn scenario_160_2_recovery_fallback_completes_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-160r", "in_progress");
+        seed_dispatch(&db, "d-160r", "card-160r", "implementation", "pending");
+
+        // Step 1: Verify finalize_dispatch works on the happy path
+        let result = dispatch::finalize_dispatch(
+            &db,
+            &engine,
+            "d-160r",
+            "recovery_completed_during_downtime",
+            Some(&serde_json::json!({"summary": "completed during downtime"})),
+        );
+        assert!(
+            result.is_ok(),
+            "finalize_dispatch happy path should succeed"
+        );
+        assert_eq!(get_dispatch_status(&db, "d-160r"), "completed");
+
+        // Step 2: Simulate the fallback path — when finalize_dispatch fails,
+        // turn_bridge does a direct DB UPDATE + reconciliation marker.
+        // This is the exact SQL from turn_bridge.rs:605-617.
+        seed_card(&db, "card-160r2", "in_progress");
+        seed_dispatch(&db, "d-160r2", "card-160r2", "implementation", "pending");
+
+        // Execute the fallback SQL (mirrors turn_bridge.rs separate_conn path)
+        {
+            let fallback_conn = db.separate_conn().unwrap();
+            let changed = fallback_conn
+                .execute(
+                    "UPDATE task_dispatches SET status = 'completed', \
+                     result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', \
+                     updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
+                    ["d-160r2"],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "Fallback UPDATE should affect 1 row");
+
+            fallback_conn
+                .execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params!["reconcile_dispatch:d-160r2", "d-160r2"],
+                )
+                .unwrap();
+        }
+
+        // Verify fallback outcome
+        assert_eq!(get_dispatch_status(&db, "d-160r2"), "completed");
+        assert!(
+            has_reconcile_marker(&db, "d-160r2"),
+            "Reconciliation marker must exist for onTick hook chain"
+        );
+        let result_json = get_dispatch_result_json(&db, "d-160r2").unwrap();
+        assert!(
+            result_json.contains("turn_bridge_db_fallback"),
+            "Result should record fallback completion source"
+        );
+        assert!(
+            result_json.contains("needs_reconcile"),
+            "Result should flag reconciliation needed"
+        );
+    }
+
+    /// Scenario 160-3: Multiple outbox entries processed in FIFO order via
+    /// actual process_outbox_batch — mock records call sequence.
+    ///
+    /// Verifies: persisted queue order → catch-up order → no order reversal.
+    #[tokio::test]
+    async fn scenario_160_3_outbox_fifo_ordering_through_worker() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-160o", "ready");
+        seed_dispatch(&db, "d-160o-a", "card-160o", "implementation", "pending");
+        seed_dispatch(&db, "d-160o-b", "card-160o", "implementation", "pending");
+        seed_dispatch(&db, "d-160o-c", "card-160o", "implementation", "pending");
+
+        seed_outbox(&db, "d-160o-a", "notify");
+        seed_outbox(&db, "d-160o-b", "notify");
+        seed_outbox(&db, "d-160o-c", "notify");
+
+        let mock = MockNotifier::new();
+        let processed = process_outbox_batch(&db, &mock).await;
+
+        assert_eq!(processed, 3);
+
+        // Verify FIFO order via mock call log
+        let ids: Vec<String> = mock
+            .call_log()
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::Notify { dispatch_id, .. } => Some(dispatch_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["d-160o-a", "d-160o-b", "d-160o-c"],
+            "Order reversal detected — outbox must process in id ASC (FIFO)"
+        );
+
+        // All entries should be done
+        assert_eq!(outbox_status(&db, "d-160o-a"), vec!["done"]);
+        assert_eq!(outbox_status(&db, "d-160o-b"), vec!["done"]);
+        assert_eq!(outbox_status(&db, "d-160o-c"), vec!["done"]);
+    }
+
+    /// Scenario 160-4: Duplicate outbox entries for the same dispatch → mock
+    /// receives calls for both (dedup is in send_dispatch_to_discord, not the loop).
+    /// But the outbox correctly processes all pending entries and transitions them.
+    #[tokio::test]
+    async fn scenario_160_4_outbox_processes_all_entries_including_duplicates() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-160d", "ready");
+        seed_dispatch(&db, "d-160d", "card-160d", "implementation", "pending");
+
+        // Insert duplicate outbox entries for the same dispatch
+        seed_outbox(&db, "d-160d", "notify");
+        seed_outbox(&db, "d-160d", "notify");
+
+        let mock = MockNotifier::new();
+        let processed = process_outbox_batch(&db, &mock).await;
+
+        // Worker processes all pending entries — dedup is the notifier's job
+        assert_eq!(processed, 2, "Worker should process both pending entries");
+        assert_eq!(
+            mock.notify_count(),
+            2,
+            "Mock receives both calls (real send_dispatch_to_discord would dedup via marker)"
+        );
+
+        // Both entries should transition to done
+        assert_eq!(outbox_status(&db, "d-160d"), vec!["done", "done"]);
+    }
+
+    /// Scenario 160-5: Mixed actions (notify + followup) are dispatched to the
+    /// correct notifier methods through process_outbox_batch.
+    #[tokio::test]
+    async fn scenario_160_5_mixed_actions_route_correctly() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-160m", "ready");
+        seed_dispatch(&db, "d-160m-n", "card-160m", "implementation", "pending");
+        seed_dispatch(&db, "d-160m-f", "card-160m", "implementation", "pending");
+
+        seed_outbox(&db, "d-160m-n", "notify");
+        // Insert followup entry manually (seed_outbox hardcodes card_id)
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO dispatch_outbox (dispatch_id, action, status) \
+                 VALUES ('d-160m-f', 'followup', 'pending')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mock = MockNotifier::new();
+        let processed = process_outbox_batch(&db, &mock).await;
+
+        assert_eq!(processed, 2);
+        assert_eq!(
+            mock.call_log(),
+            vec![
+                MockCall::Notify {
+                    agent_id: "agent-1".into(),
+                    dispatch_id: "d-160m-n".into(),
+                },
+                MockCall::Followup {
+                    dispatch_id: "d-160m-f".into(),
+                },
+            ]
+        );
+    }
+
+    // ── #195: review-decision accept creates rework dispatch ──────────
+    //
+    // Verifies that when an agent accepts review feedback via POST /api/review-decision,
+    // a rework dispatch is automatically created and the card transitions to the
+    // rework target state (in_progress), NOT directly to review.
+    // This prevents the pipeline from getting stuck when the accept decision
+    // was the only active dispatch for the card.
+
+    #[tokio::test]
+    async fn scenario_195_accept_creates_rework_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-195", "review");
+
+        // Set up a pending review-decision dispatch (simulates the state after
+        // counter-model review found suggestions and agent received decision prompt)
+        seed_dispatch(&db, "rd-195", "card-195", "review-decision", "pending");
+
+        // Set up card_review_state with pending_dispatch_id pointing to the review-decision
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
+                 VALUES ('card-195', 'suggestion_pending', 'rd-195')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+
+        // Call the review-decision handler with accept
+        let (status, json) = crate::server::routes::review_verdict::submit_review_decision(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::ReviewDecisionBody {
+                card_id: "card-195".to_string(),
+                decision: "accept".to_string(),
+                comment: None,
+                dispatch_id: Some("rd-195".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "accept should succeed: {json:?}"
+        );
+        assert_eq!(
+            json.0["rework_dispatch_created"], true,
+            "rework_dispatch_created must be true in response"
+        );
+
+        // Review-decision dispatch must be completed
+        assert_eq!(
+            get_dispatch_status(&db, "rd-195"),
+            "completed",
+            "review-decision dispatch must be completed after accept"
+        );
+
+        // Card must be in rework target state (in_progress), NOT review
+        let card_status = get_card_status(&db, "card-195");
+        assert_eq!(
+            card_status, "in_progress",
+            "#195: accept must transition card to rework target (in_progress), not review"
+        );
+
+        // A rework dispatch must exist for this card
+        let conn = db.lock().unwrap();
+        let rework_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-195' AND dispatch_type = 'rework' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rework_count, 1,
+            "#195: accept must create exactly 1 rework dispatch"
+        );
+
+        // Verify canonical review state is rework_pending
+        let review_state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM card_review_state WHERE card_id = 'card-195'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        assert_eq!(
+            review_state.as_deref(),
+            Some("rework_pending"),
+            "#195: canonical review state must be 'rework_pending' after accept"
+        );
+    }
+
+    // ── #195: rework dispatch completion triggers re-review cycle ──────
+    //
+    // Verifies the full accept → rework → re-review cycle:
+    // After rework dispatch completes, OnDispatchCompleted (kanban-rules.js)
+    // transitions the card to review, and OnReviewEnter creates a new review dispatch.
+
+    #[test]
+    fn scenario_195_rework_completion_triggers_review() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-195b", "in_progress");
+
+        // Create and complete a rework dispatch — simulates the rework turn finishing
+        seed_dispatch(&db, "rw-195b", "card-195b", "rework", "pending");
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "rw-195b",
+            &serde_json::json!({"completion_source": "test_harness"}),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        // Rework completion → card must transition to review (via kanban-rules.js)
+        let status = get_card_status(&db, "card-195b");
+        assert_eq!(
+            status, "review",
+            "#195: rework completion must transition card to review"
+        );
+
+        // OnReviewEnter must create a review dispatch for re-review
+        let conn = db.lock().unwrap();
+        let review_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-195b' AND dispatch_type = 'review' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_count, 1,
+            "#195: rework completion must trigger OnReviewEnter → review dispatch"
         );
     }
 }

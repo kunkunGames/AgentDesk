@@ -10,6 +10,8 @@ use super::AppState;
 use super::session_activity::SessionActivityResolver;
 use crate::services::provider::parse_provider_and_channel_from_tmux_name;
 
+const STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL: &str = "-6 hours";
+
 /// Extract parent channel name from a thread channel name.
 /// Thread names follow the convention `{parent}-t{thread_id}` where thread_id
 /// is a numeric Discord channel ID (15+ digits).
@@ -99,6 +101,7 @@ pub struct HookSessionBody {
 #[derive(Debug, Deserialize)]
 pub struct DeleteSessionQuery {
     pub session_key: String,
+    pub provider: Option<String>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────
@@ -220,7 +223,7 @@ pub async fn list_dispatched_sessions(
                     return None;
                 }
                 Some(json!({
-                    "id": row.id,
+                    "id": row.id.to_string(),
                     "session_key": row.session_key,
                     "agent_id": row.agent_id,
                     "provider": row.provider,
@@ -299,6 +302,9 @@ pub async fn hook_session(
     let status = body.status.as_deref().unwrap_or("working");
     let provider = body.provider.as_deref().unwrap_or("claude");
     let tokens = body.tokens.unwrap_or(0) as i64;
+    // #107: Normalize empty claude_session_id to None (SQL NULL) so stale empty
+    // strings are never persisted — prevents invalid --resume attempts after restart.
+    let claude_session_id = body.claude_session_id.as_deref().filter(|s| !s.is_empty());
     let idle_auto_complete_dispatch = if status == "idle" {
         body.dispatch_id.as_ref().and_then(|did| {
             conn.query_row(
@@ -321,7 +327,17 @@ pub async fn hook_session(
     let persisted_session_id = body
         .session_id
         .as_deref()
-        .or(body.claude_session_id.as_deref());
+        .filter(|s| !s.is_empty())
+        .or(claude_session_id);
+
+    // Check if session exists before upsert to determine new vs update for WS event
+    let is_new_session: bool = conn
+        .query_row(
+            "SELECT COUNT(*) = 0 FROM sessions WHERE session_key = ?1",
+            [&body.session_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(true);
 
     let result = conn.execute(
         "INSERT INTO sessions (session_key, agent_id, provider, status, session_info, model, tokens, cwd, active_dispatch_id, thread_channel_id, claude_session_id, last_heartbeat)
@@ -363,13 +379,13 @@ pub async fn hook_session(
             drop(conn);
 
             if let Some(ref did) = idle_auto_complete_dispatch {
-                let auto_result = json!({
-                    "auto_completed": true,
-                    "completion_source": "session_idle",
-                });
-                if let Err(e) =
-                    crate::dispatch::complete_dispatch(&state.db, &state.engine, did, &auto_result)
-                {
+                if let Err(e) = crate::dispatch::finalize_dispatch(
+                    &state.db,
+                    &state.engine,
+                    did,
+                    "session_idle",
+                    Some(&json!({ "auto_completed": true })),
+                ) {
                     tracing::warn!(
                         "[session] Failed to auto-complete dispatch {} on idle: {}",
                         did,
@@ -382,14 +398,7 @@ pub async fn hook_session(
                     );
                     // Send any follow-up dispatch (e.g. review dispatch) that was
                     // created by hooks during complete_dispatch to Discord.
-                    let db_clone = state.db.clone();
-                    let did_owned = did.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::handle_completed_dispatch_followups(
-                            &db_clone, &did_owned,
-                        )
-                        .await;
-                    });
+                    super::dispatches::queue_dispatch_followup(&state.db, did);
                 }
             }
 
@@ -469,6 +478,130 @@ pub async fn hook_session(
             // is spawned from the auto-complete path above (line ~252). Re-firing here caused
             // double hook execution → duplicate review-decision dispatches.
 
+            // #179: When session transitions to idle, trigger auto-queue to dispatch next entry.
+            // This closes the chain gap where onCardTerminal hasn't fired yet (card still in review)
+            // but the agent is already idle and could start the next queued item.
+            if status == "idle" {
+                if let Some(ref aid) = agent_id {
+                    let aid_clone = aid.clone();
+                    let port = crate::config::load_graceful().server.port;
+                    tokio::spawn(async move {
+                        // Small delay to let any in-flight card transitions settle
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let url = crate::config::local_api_url(port, "/api/auto-queue/activate");
+                        let _ = reqwest::Client::new()
+                            .post(&url)
+                            .json(&serde_json::json!({
+                                "agent_id": aid_clone,
+                                "active_only": true,
+                            }))
+                            .send()
+                            .await;
+                    });
+                }
+            }
+
+            // Emit session event for real-time dashboard update (#156)
+            // Read the full session row (joined with agent data) from sessions table
+            // to ensure fresh status/session_info rather than stale agents table data.
+            if let Ok(conn) = state.db.lock() {
+                let session_event: Option<(i64, serde_json::Value, bool)> = conn.query_row(
+                    "SELECT s.id, s.session_key, s.agent_id, s.provider, s.status, \
+                     s.active_dispatch_id, s.model, s.tokens, s.cwd, s.last_heartbeat, \
+                     s.session_info, a.department, a.sprite_number, a.avatar_emoji, \
+                     COALESCE(a.xp, 0), s.thread_channel_id, \
+                     d.name, d.name_ko, d.color \
+                     FROM sessions s \
+                     LEFT JOIN agents a ON s.agent_id = a.id \
+                     LEFT JOIN departments d ON a.department = d.id \
+                     WHERE s.session_key = ?1",
+                    [&body.session_key],
+                    |row| {
+                        let sid: i64 = row.get(0)?;
+                        let skey: Option<String> = row.get(1)?;
+                        Ok((sid, json!({
+                            "id": sid.to_string(),
+                            "session_key": skey,
+                            "name": skey,
+                            "linked_agent_id": row.get::<_, Option<String>>(2)?,
+                            "provider": row.get::<_, Option<String>>(3)?,
+                            "status": row.get::<_, Option<String>>(4)?,
+                            "active_dispatch_id": row.get::<_, Option<String>>(5)?,
+                            "model": row.get::<_, Option<String>>(6)?,
+                            "tokens": row.get::<_, i64>(7)?,
+                            "cwd": row.get::<_, Option<String>>(8)?,
+                            "last_seen_at": row.get::<_, Option<String>>(9)?,
+                            "session_info": row.get::<_, Option<String>>(10)?,
+                            "department_id": row.get::<_, Option<String>>(11)?,
+                            "sprite_number": row.get::<_, Option<i64>>(12)?,
+                            "avatar_emoji": row.get::<_, Option<String>>(13).ok().flatten().unwrap_or_else(|| "\u{1F916}".to_string()),
+                            "stats_xp": row.get::<_, i64>(14).unwrap_or(0),
+                            "thread_channel_id": row.get::<_, Option<String>>(15).ok().flatten(),
+                            "department_name": row.get::<_, Option<String>>(16)?,
+                            "department_name_ko": row.get::<_, Option<String>>(17)?,
+                            "department_color": row.get::<_, Option<String>>(18)?,
+                            "connected_at": null,
+                        }), false))
+                    },
+                ).ok();
+
+                if let Some((_sid, payload, _)) = session_event {
+                    if is_new_session {
+                        // New sessions must be emitted immediately — batching
+                        // can suppress the insert if an update arrives within
+                        // the same flush window (dashboard needs the "new" first).
+                        crate::server::ws::emit_event(
+                            &state.broadcast_tx,
+                            "dispatched_session_new",
+                            payload,
+                        );
+                    } else {
+                        crate::server::ws::emit_batched_event(
+                            &state.batch_buffer,
+                            "dispatched_session_update",
+                            &body.session_key,
+                            payload,
+                        );
+                    }
+                }
+            }
+
+            // Also emit agent_status for agent-level dashboard (batched)
+            if let Some(ref aid) = agent_id {
+                if let Ok(conn) = state.db.lock() {
+                    if let Ok(agent) = conn.query_row(
+                        "SELECT a.id, a.name, a.name_ko, s.status, s.session_info, \
+                         a.cli_provider, a.avatar_emoji, a.department, \
+                         a.discord_channel_id, a.discord_channel_alt \
+                         FROM agents a LEFT JOIN sessions s ON s.agent_id = a.id \
+                         AND s.session_key = ?2 \
+                         WHERE a.id = ?1",
+                        rusqlite::params![aid, body.session_key],
+                        |row| {
+                            Ok(json!({
+                                "id": row.get::<_, String>(0)?,
+                                "name": row.get::<_, String>(1)?,
+                                "name_ko": row.get::<_, Option<String>>(2)?,
+                                "status": row.get::<_, Option<String>>(3)?,
+                                "session_info": row.get::<_, Option<String>>(4)?,
+                                "cli_provider": row.get::<_, Option<String>>(5)?,
+                                "avatar_emoji": row.get::<_, Option<String>>(6)?,
+                                "department": row.get::<_, Option<String>>(7)?,
+                                "discord_channel_id": row.get::<_, Option<String>>(8)?,
+                                "discord_channel_alt": row.get::<_, Option<String>>(9)?,
+                            }))
+                        },
+                    ) {
+                        crate::server::ws::emit_batched_event(
+                            &state.batch_buffer,
+                            "agent_status",
+                            aid,
+                            agent,
+                        );
+                    }
+                }
+            }
+
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => (
@@ -537,10 +670,29 @@ pub async fn delete_session(
         }
     };
 
+    // Read session id before delete for WS event
+    let session_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM sessions WHERE session_key = ?1",
+            [&params.session_key],
+            |row| row.get(0),
+        )
+        .ok();
+
     match conn.execute(
         "DELETE FROM sessions WHERE session_key = ?1",
         [&params.session_key],
     ) {
+        Ok(n) if n > 0 => {
+            if let Some(sid) = session_id {
+                crate::server::ws::emit_event(
+                    &state.broadcast_tx,
+                    "dispatched_session_disconnect",
+                    json!({"id": sid.to_string()}),
+                );
+            }
+            (StatusCode::OK, Json(json!({"ok": true, "deleted": n})))
+        }
         Ok(n) => (StatusCode::OK, Json(json!({"ok": true, "deleted": n}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -565,11 +717,27 @@ pub async fn get_claude_session_id(
         }
     };
 
-    match conn.query_row(
-        "SELECT claude_session_id FROM sessions WHERE session_key = ?1",
-        [&params.session_key],
-        |row| row.get::<_, Option<String>>(0),
-    ) {
+    // Fixed-channel rows can survive a dcserver crash with status=working even
+    // when the underlying tmux/provider session is long dead. Clear those stale
+    // rows before attempting to restore a provider session_id.
+    let _ = disconnect_stale_fixed_session_by_key_db(&conn, &params.session_key);
+
+    let provider = params.provider.as_deref().filter(|s| !s.is_empty());
+    let result = if let Some(provider) = provider {
+        conn.query_row(
+            "SELECT claude_session_id FROM sessions WHERE session_key = ?1 AND provider = ?2",
+            rusqlite::params![&params.session_key, provider],
+            |row| row.get::<_, Option<String>>(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT claude_session_id FROM sessions WHERE session_key = ?1",
+            [&params.session_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+    };
+
+    match result {
         Ok(claude_session_id) => (
             StatusCode::OK,
             Json(json!({"claude_session_id": claude_session_id, "session_id": claude_session_id})),
@@ -663,6 +831,40 @@ pub fn gc_stale_thread_sessions_db(conn: &rusqlite::Connection) -> usize {
     .unwrap_or(0)
 }
 
+/// Mark stale fixed-channel working sessions as disconnected so they cannot
+/// keep restoring dead provider session IDs after restart.
+pub fn gc_stale_fixed_working_sessions_db(conn: &rusqlite::Connection) -> usize {
+    conn.execute(
+        "UPDATE sessions
+         SET status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL
+         WHERE thread_channel_id IS NULL
+           AND status = 'working'
+           AND COALESCE(last_heartbeat, created_at) < datetime('now', ?1)",
+        [STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
+    )
+    .unwrap_or(0)
+}
+
+fn disconnect_stale_fixed_session_by_key_db(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+) -> usize {
+    conn.execute(
+        "UPDATE sessions
+         SET status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL
+         WHERE session_key = ?1
+           AND thread_channel_id IS NULL
+           AND status = 'working'
+           AND COALESCE(last_heartbeat, created_at) < datetime('now', ?2)",
+        rusqlite::params![session_key, STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
+    )
+    .unwrap_or(0)
+}
+
 /// PATCH /api/dispatched-sessions/:id
 pub async fn update_dispatched_session(
     State(state): State<AppState>,
@@ -734,7 +936,34 @@ pub async fn update_dispatched_session(
             StatusCode::NOT_FOUND,
             Json(json!({"error": "session not found"})),
         ),
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
+        Ok(_) => {
+            // Read back session and emit update event (batched: 150ms dedup)
+            if let Ok(session) = conn.query_row(
+                "SELECT id, session_key, agent_id, status, provider, session_info, model, tokens, cwd, active_dispatch_id, last_heartbeat \
+                 FROM sessions WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(json!({
+                        "id": row.get::<_, i64>(0)?.to_string(),
+                        "session_key": row.get::<_, String>(1)?,
+                        "agent_id": row.get::<_, Option<String>>(2)?,
+                        "status": row.get::<_, Option<String>>(3)?,
+                        "provider": row.get::<_, Option<String>>(4)?,
+                        "session_info": row.get::<_, Option<String>>(5)?,
+                        "model": row.get::<_, Option<String>>(6)?,
+                        "tokens": row.get::<_, i64>(7)?,
+                        "cwd": row.get::<_, Option<String>>(8)?,
+                        "active_dispatch_id": row.get::<_, Option<String>>(9)?,
+                        "last_heartbeat": row.get::<_, Option<String>>(10)?,
+                    }))
+                },
+            ) {
+                crate::server::ws::emit_batched_event(
+                    &state.batch_buffer, "dispatched_session_update", &id.to_string(), session,
+                );
+            }
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("{e}")})),
@@ -816,17 +1045,15 @@ pub async fn force_kill_session(
     // 1. Kill tmux session
     let tmux_killed = {
         let sess = tmux_name.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             crate::services::tmux_diagnostics::record_tmux_exit_reason(
                 &sess,
                 "force-kill API invoked",
             );
-            std::process::Command::new("tmux")
-                .args(["kill-session", "-t", &sess])
-                .output()
+            crate::services::platform::tmux::kill_session(&sess)
         })
-        .await;
-        matches!(result, Ok(Ok(o)) if o.status.success())
+        .await
+        .unwrap_or(false)
     };
 
     // 2. Clear inflight state by scanning provider directory for matching tmux_session_name
@@ -929,16 +1156,9 @@ pub async fn force_kill_session(
                 retry_dispatch_id = Some(new_id.clone());
 
                 // Send to Discord (hooks already fired by create_dispatch)
-                let db2 = state.db.clone();
-                let agent_s = agent.to_string();
-                let title_s = dtitle.to_string();
-                let card_s = card_id.clone();
-                tokio::spawn(async move {
-                    crate::server::routes::dispatches::send_dispatch_to_discord(
-                        &db2, &agent_s, &title_s, &card_s, &new_id,
-                    )
-                    .await;
-                });
+                crate::server::routes::dispatches::queue_dispatch_notify(
+                    &state.db, &new_id, agent, dtitle, &card_id,
+                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -972,24 +1192,9 @@ fn clear_inflight_by_tmux_name(
     provider: &crate::services::provider::ProviderKind,
     tmux_name: &str,
 ) -> bool {
-    let inflight_root = {
-        let root = if let Ok(override_root) = std::env::var("AGENTDESK_ROOT_DIR") {
-            let trimmed = override_root.trim();
-            if !trimmed.is_empty() {
-                std::path::PathBuf::from(trimmed)
-            } else {
-                match dirs::home_dir() {
-                    Some(h) => h.join(".adk").join("release"),
-                    None => return false,
-                }
-            }
-        } else {
-            match dirs::home_dir() {
-                Some(h) => h.join(".adk").join("release"),
-                None => return false,
-            }
-        };
-        root.join("runtime").join("discord_inflight")
+    let inflight_root = match crate::config::runtime_root() {
+        Some(root) => root.join("runtime").join("discord_inflight"),
+        None => return false,
     };
 
     let provider_dir = inflight_root.join(provider.as_str());
@@ -1037,11 +1242,7 @@ mod tests {
     async fn idle_hook_does_not_auto_complete_implementation_dispatch() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let card_id = "card-1";
         let dispatch_id = "dispatch-1";
@@ -1133,11 +1334,7 @@ mod tests {
     async fn idle_hook_does_not_auto_complete_rework_dispatch() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let card_id = "card-rework";
         let dispatch_id = "dispatch-rework";
@@ -1226,11 +1423,7 @@ mod tests {
     async fn idle_hook_auto_completes_pending_review_dispatch() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let card_id = "card-review";
         let dispatch_id = "dispatch-review";
@@ -1325,11 +1518,7 @@ mod tests {
     async fn idle_hook_does_not_auto_complete_review_decision_dispatch() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let card_id = "card-review-decision";
         let dispatch_id = "dispatch-review-decision";
@@ -1429,11 +1618,7 @@ mod tests {
     async fn thread_session_resolves_agent_from_parent_channel() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         {
             let conn = db.lock().unwrap();
@@ -1481,11 +1666,7 @@ mod tests {
     async fn thread_session_resolves_alt_channel_agent_from_session_key_fallback() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         {
             let conn = db.lock().unwrap();
@@ -1533,11 +1714,7 @@ mod tests {
     async fn direct_channel_session_keeps_agent_mapping_without_thread_id() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         {
             let conn = db.lock().unwrap();
@@ -1586,11 +1763,7 @@ mod tests {
     async fn stale_local_tmux_session_is_filtered_from_active_dispatch_list() {
         let db = test_db();
         let engine = test_engine(&db);
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let hostname = crate::services::platform::hostname_short();
         let session_key = format!("{hostname}:AgentDesk-stale-test-{}", std::process::id());

@@ -20,3 +20,4 @@ _read_default() {
 ADK_DEFAULT_PORT=$(_read_default port 8791)
 ADK_DEFAULT_HOST=$(_read_default host "0.0.0.0")
 ADK_DEFAULT_LOOPBACK=$(_read_default loopback "127.0.0.1")
+export ADK_DEFAULT_PORT ADK_DEFAULT_HOST ADK_DEFAULT_LOOPBACK

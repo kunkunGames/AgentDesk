@@ -9,6 +9,7 @@ mod error;
 mod github;
 pub(crate) mod kanban;
 pub(crate) mod pipeline;
+pub(crate) mod receipt;
 pub(crate) mod runtime;
 mod server;
 mod services;
@@ -132,6 +133,9 @@ enum Commands {
         /// Optional codex model override
         #[arg(long)]
         codex_model: Option<String>,
+        /// Optional reasoning effort (low, normal, high, xhigh)
+        #[arg(long)]
+        reasoning_effort: Option<String>,
         /// Working directory (defaults to ".")
         #[arg(long, default_value = ".")]
         cwd: String,
@@ -332,6 +336,7 @@ fn main() -> Result<()> {
                 prompt_file,
                 codex_bin,
                 codex_model,
+                reasoning_effort,
                 cwd,
                 input_mode,
             }) => {
@@ -346,6 +351,7 @@ fn main() -> Result<()> {
                     &cwd,
                     &codex_bin,
                     codex_model.as_deref(),
+                    reasoning_effort.as_deref(),
                     mode,
                 );
                 return Ok(());

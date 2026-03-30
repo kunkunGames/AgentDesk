@@ -113,11 +113,12 @@ fn record_tuning_outcome(
 }
 
 /// #117: Update the canonical card_review_state record after a review-decision action.
+/// #158: Routes through the unified review_state_sync entrypoint.
 fn update_card_review_state(
     db: &crate::db::Db,
     card_id: &str,
     decision: &str,
-    dispatch_id: Option<&str>,
+    _dispatch_id: Option<&str>,
 ) {
     let state = match decision {
         "accept" => "rework_pending",
@@ -125,21 +126,12 @@ fn update_card_review_state(
         "dismiss" => "idle",
         _ => return,
     };
-    if let Ok(conn) = db.lock() {
-        conn.execute(
-            "INSERT INTO card_review_state (card_id, state, last_decision, decided_at, pending_dispatch_id, updated_at)
-             VALUES (?1, ?2, ?3, datetime('now'), NULL, datetime('now'))
-             ON CONFLICT(card_id) DO UPDATE SET
-               state = ?2,
-               last_decision = ?3,
-               decided_by = NULL,
-               decided_at = datetime('now'),
-               pending_dispatch_id = NULL,
-               approach_change_round = NULL,
-               updated_at = datetime('now')",
-            rusqlite::params![card_id, state, decision],
-        ).ok();
-    }
+    let payload = serde_json::json!({
+        "card_id": card_id,
+        "state": state,
+        "last_decision": decision,
+    });
+    crate::engine::ops::review_state_sync(db, &payload.to_string());
 }
 
 /// Write a review-passed marker file for the reviewed commit.
@@ -151,22 +143,11 @@ fn update_card_review_state(
 /// misconfiguration).  Git or filesystem failures are logged but not fatal
 /// — the marker is best-effort when commit is not explicitly provided.
 fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), String> {
-    let resolve_home = || -> Result<std::path::PathBuf, String> {
-        dirs::home_dir().ok_or_else(|| {
-            "HOME directory not found; set AGENTDESK_REPO_DIR and AGENTDESK_ROOT_DIR".to_string()
-        })
-    };
-
     let commit = if let Some(c) = reviewed_commit {
         c.to_string()
     } else {
-        let repo_dir = match std::env::var("AGENTDESK_REPO_DIR") {
-            Ok(d) => d,
-            Err(_) => resolve_home()?
-                .join("AgentDesk")
-                .to_string_lossy()
-                .into_owned(),
-        };
+        let repo_dir = crate::services::platform::resolve_repo_dir()
+            .ok_or_else(|| "Cannot resolve repo dir; set AGENTDESK_REPO_DIR".to_string())?;
         match crate::services::platform::git_head_commit(&repo_dir) {
             Some(c) => c,
             None => {
@@ -175,18 +156,14 @@ fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), Strin
             }
         }
     };
-    let root = match std::env::var("AGENTDESK_ROOT_DIR") {
-        Ok(d) => d,
-        Err(_) => resolve_home()?
-            .join(".adk/release")
-            .to_string_lossy()
-            .into_owned(),
-    };
-    let dir = format!("{}/runtime/review_passed", root);
+    let root = crate::config::runtime_root().ok_or_else(|| {
+        "runtime root not found; set AGENTDESK_ROOT_DIR or ensure HOME exists".to_string()
+    })?;
+    let dir = root.join("runtime").join("review_passed");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("stamp_review_passed_marker: failed to create dir: {e}");
     }
-    if let Err(e) = std::fs::write(format!("{}/{}", dir, commit), "") {
+    if let Err(e) = std::fs::write(dir.join(&commit), "") {
         eprintln!("stamp_review_passed_marker: failed to write marker: {e}");
     }
     Ok(())
@@ -243,7 +220,7 @@ pub async fn submit_verdict(
     };
 
     // A: Validate dispatch_type — only 'review' dispatches should go through the verdict API.
-    //    implementation/rework dispatches have their own completion path (session idle auto-complete),
+    //    implementation/rework dispatches have their own completion path (turn_bridge explicit completion),
     //    review-decision dispatches should use /api/review-decision (accept/dispute/dismiss).
     let dispatch_type: Option<String> = conn
         .query_row(
@@ -398,25 +375,34 @@ pub async fn submit_verdict(
     });
     let result_str = result_json.to_string();
 
-    // Update dispatch with verdict result — only if still pending/dispatched.
-    // Cancelled dispatches (e.g. after dismiss) must NOT be promoted to completed,
-    // as that would re-trigger OnDispatchCompleted hooks and cause review loops (#80).
-    let updated = match conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?2, updated_at = datetime('now') \
-         WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-        rusqlite::params![body.dispatch_id, result_str],
+    // #143: Mark dispatch completed via shared helper (DB-only, no OnDispatchCompleted).
+    // Review verdict fires OnReviewVerdict — specialized hook, not the generic completion hook.
+    // Cancelled dispatches must NOT be promoted to completed (review loop guard #80).
+    drop(conn);
+    let updated = match crate::dispatch::mark_dispatch_completed(
+        &state.db,
+        &body.dispatch_id,
+        &result_json,
     ) {
         Ok(n) => n,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("update dispatch: {e}")})),
-            )
+            );
         }
     };
 
     if updated == 0 {
-        // Check if dispatch exists but was cancelled/completed
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("database lock poisoned: {e}")})),
+                );
+            }
+        };
         let current_status: Option<String> = conn
             .query_row(
                 "SELECT status FROM task_dispatches WHERE id = ?1",
@@ -433,16 +419,15 @@ pub async fn submit_verdict(
     }
 
     // Find associated card
-    let card_id: Option<String> = conn
-        .query_row(
+    let card_id: Option<String> = state.db.separate_conn().ok().and_then(|conn| {
+        conn.query_row(
             "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
             [&body.dispatch_id],
             |row| row.get(0),
         )
         .ok()
-        .flatten();
-
-    drop(conn);
+        .flatten()
+    });
 
     // #100: stamp release marker AFTER dispatch update confirmed, BEFORE hooks.
     // This ensures: (1) stale/duplicate submissions don't write markers (updated==0 already returned),
@@ -501,11 +486,7 @@ pub async fn submit_verdict(
             }
         }
 
-        let db_clone = state.db.clone();
-        let dispatch_id = body.dispatch_id.clone();
-        tokio::spawn(async move {
-            super::dispatches::handle_completed_dispatch_followups(&db_clone, &dispatch_id).await;
-        });
+        super::dispatches::queue_dispatch_followup(&state.db, &body.dispatch_id);
     }
 
     // #119: TN is recorded when a pass-reviewed card reaches done (see kanban.rs
@@ -513,6 +494,17 @@ pub async fn submit_verdict(
     // requires an external bug-report signal that does not yet exist in the system.
 
     // #100: release marker was already stamped before dispatch completion (above).
+
+    // Emit kanban_card_updated for real-time dashboard
+    if let Ok(conn) = state.db.lock() {
+        if let Ok(card) = conn.query_row(
+            &format!("{} WHERE kc.id = ?1", super::kanban::CARD_SELECT),
+            [&card_id],
+            |row| super::kanban::card_row_to_json(row),
+        ) {
+            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
+        }
+    }
 
     (
         StatusCode::OK,
@@ -532,6 +524,11 @@ pub struct ReviewDecisionBody {
     pub card_id: String,
     pub decision: String, // "accept", "dispute", "dismiss"
     pub comment: Option<String>,
+    /// #109: dispatch-scoped targeting — when provided, the server validates
+    /// that this dispatch_id matches the pending review-decision dispatch for
+    /// the card. Prevents replayed/stale decisions from consuming the wrong
+    /// dispatch.
+    pub dispatch_id: Option<String>,
 }
 
 /// POST /api/review-decision
@@ -614,188 +611,228 @@ pub async fn submit_review_decision(
         );
     }
 
+    // #109: When dispatch_id is provided, validate it matches the pending
+    // review-decision dispatch. This prevents replayed or stale decisions from
+    // consuming a different dispatch than the one they were issued for.
+    if let Some(ref submitted_did) = body.dispatch_id {
+        if pending_rd_id.as_deref() != Some(submitted_did.as_str()) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!(
+                        "dispatch_id mismatch: submitted {} but pending is {}",
+                        submitted_did,
+                        pending_rd_id.as_deref().unwrap_or("(none)")
+                    ),
+                    "card_id": body.card_id,
+                })),
+            );
+        }
+    }
+
     match body.decision.as_str() {
         "accept" => {
-            // Agent accepts review feedback → dispatch-first rework creation
-            let (agent_id, title): (String, String) = conn
-                .query_row(
-                    "SELECT COALESCE(assigned_agent_id, ''), title FROM kanban_cards WHERE id = ?1",
-                    [&body.card_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap_or_default();
-
+            // #195: Agent accepts review feedback — create a rework dispatch so the
+            // agent can address the findings. When the rework dispatch completes,
+            // OnDispatchCompleted (kanban-rules.js) transitions to review for re-review.
             drop(conn);
 
-            if agent_id.is_empty() {
+            let (card_status_now, card_repo_id, card_agent_id, card_title): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT status, repo_id, assigned_agent_id, title FROM kanban_cards WHERE id = ?1",
+                        [&body.card_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            crate::pipeline::ensure_loaded();
+            let effective_pipeline = {
+                let conn = match state.db.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("database lock poisoned: {e}")})),
+                        );
+                    }
+                };
+                crate::pipeline::resolve_for_card(
+                    &conn,
+                    card_repo_id.as_deref(),
+                    card_agent_id.as_deref(),
+                )
+            };
+
+            // Guard: terminal card
+            if effective_pipeline.is_terminal(&card_status_now) {
                 return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "no assigned agent for card", "card_id": body.card_id})),
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "card is terminal, cannot accept review feedback",
+                        "card_id": body.card_id,
+                    })),
                 );
             }
 
-            // Complete the consumed review-decision dispatch BEFORE creating
-            // the rework dispatch.  The pending-dispatch guard in
-            // create_dispatch_core refuses to insert when a pending dispatch
-            // already exists for the card, so we must clear it first.
-            if let (Some(rd_id), Ok(conn)) = (&pending_rd_id, state.db.lock()) {
-                conn.execute(
-                    "UPDATE task_dispatches SET status = 'completed', \
-                     result = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![
-                        json!({"decision": "accept", "completion_source": "review_decision_api"})
-                            .to_string(),
-                        rd_id,
-                    ],
+            // Find rework target via review_rework gate (same logic as timeouts.js section E)
+            let rework_target = effective_pipeline
+                .transitions
+                .iter()
+                .find(|t| {
+                    t.from == card_status_now
+                        && t.transition_type == crate::pipeline::TransitionType::Gated
+                        && t.gates.iter().any(|g| g == "review_rework")
+                })
+                .map(|t| t.to.clone())
+                .unwrap_or_else(|| {
+                    effective_pipeline
+                        .dispatchable_states()
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| effective_pipeline.initial_state().to_string())
+                });
+
+            // Consume review-decision dispatch FIRST — frees the duplicate dispatch guard
+            // so the rework dispatch can be created (create_dispatch_core rejects when
+            // any pending/dispatched dispatch already exists for the card).
+            if let Some(ref rd_id) = pending_rd_id {
+                crate::dispatch::mark_dispatch_completed(
+                    &state.db,
+                    rd_id,
+                    &json!({"decision": "accept", "completion_source": "review_decision_api"}),
                 )
                 .ok();
             }
 
-            // Dispatch-first: create rework dispatch BEFORE transitioning card status.
-            // If dispatch creation fails (e.g. done terminal guard), card stays in
-            // current status instead of being stranded in in_progress with no dispatch.
-            let rework_title = format!("[Rework] {title}");
-            let rework_result = crate::dispatch::create_dispatch(
+            // Create rework dispatch for the assigned agent
+            let rework_dispatch_created = if let Some(ref agent_id) = card_agent_id {
+                let rework_title = format!(
+                    "[Rework] {}",
+                    card_title.as_deref().unwrap_or(&body.card_id)
+                );
+                match crate::dispatch::create_dispatch_core(
+                    &state.db,
+                    &body.card_id,
+                    agent_id,
+                    "rework",
+                    &rework_title,
+                    &json!({}),
+                ) {
+                    Ok((dispatch_id, _, _reused)) => {
+                        tracing::info!(
+                            "[review-decision] #195 Rework dispatch created: card={} dispatch={}",
+                            body.card_id,
+                            dispatch_id
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        // Duplicate guard or other failure — log but continue with transition
+                        tracing::warn!(
+                            "[review-decision] #195 Rework dispatch creation failed for card {}: {e}",
+                            body.card_id
+                        );
+                        false
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[review-decision] #195 No agent assigned to card {} — cannot create rework dispatch",
+                    body.card_id
+                );
+                false
+            };
+
+            // Transition card to rework target (e.g., in_progress)
+            if let Err(e) = crate::kanban::transition_status(
                 &state.db,
                 &state.engine,
                 &body.card_id,
-                &agent_id,
-                "rework",
-                &rework_title,
-                &json!({"review_decision": "accept", "comment": body.comment}),
-            );
-
-            match rework_result {
-                Ok(ref d) => {
-                    // #119: Record tuning outcome BEFORE transition (which clears last_verdict)
-                    record_decision_tuning(
-                        &state.db,
-                        &body.card_id,
-                        "accept",
-                        pending_rd_id.as_deref(),
-                    );
-                    spawn_aggregate_if_needed(&state.db);
-
-                    // Pipeline-driven: find rework target using card's effective pipeline
-                    let (card_status_now, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = state
-                        .db
-                        .lock()
-                        .ok()
-                        .and_then(|c| {
-                            c.query_row(
-                                "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
-                                [&body.card_id],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_default();
-                    crate::pipeline::ensure_loaded();
-                    let effective_pipeline = crate::pipeline::resolve_for_card(
-                        &state.db.lock().unwrap(),
-                        card_repo_id.as_deref(),
-                        card_agent_id.as_deref(),
-                    );
-                    let rework_target = effective_pipeline
-                        .transitions
-                        .iter()
-                        .find(|t| {
-                            t.from == card_status_now
-                                && t.transition_type
-                                    == crate::pipeline::TransitionType::Gated
-                                && t.gates.iter().any(|g| g == "review_rework")
-                        })
-                        .map(|t| t.to.clone())
-                        .unwrap_or_else(|| {
-                            // Fallback: kickoff from card's current state
-                            effective_pipeline
-                                .kickoff_for(&card_status_now)
-                                .unwrap_or_else(|| effective_pipeline.initial_state().to_string())
-                        });
-                    let _ = crate::kanban::transition_status(
-                        &state.db,
-                        &state.engine,
-                        &body.card_id,
-                        &rework_target,
-                    );
-                    if let Ok(conn) = state.db.lock() {
-                        conn.execute(
-                            "UPDATE kanban_cards SET review_status = 'rework_pending' WHERE id = ?1",
-                            [&body.card_id],
-                        )
-                        .ok();
-                    }
-
-                    // Async Discord notification
-                    let dispatch_id = d["id"].as_str().unwrap_or("").to_string();
-                    let db_clone = state.db.clone();
-                    let card_id = body.card_id.clone();
-                    let agent_id_c = agent_id.clone();
-                    let title_c = rework_title.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::send_dispatch_to_discord(
-                            &db_clone,
-                            &agent_id_c,
-                            &title_c,
-                            &card_id,
-                            &dispatch_id,
-                        )
-                        .await;
-                    });
-
-                    // #117: Update canonical review state before returning
-                    update_card_review_state(
-                        &state.db,
-                        &body.card_id,
-                        "accept",
-                        pending_rd_id.as_deref(),
-                    );
-
-                    return (
-                        StatusCode::OK,
-                        Json(json!({
-                            "ok": true,
-                            "card_id": body.card_id,
-                            "decision": "accept",
-                            "message": "Rework dispatch created",
-                        })),
-                    );
-                }
-                Err(e) => {
-                    // Dispatch failed → fail closed, do NOT move card to in_progress
-                    tracing::warn!(
-                        "[review-decision] accept dispatch creation failed for card {}: {e}",
-                        body.card_id
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!("rework dispatch creation failed: {e}"),
-                            "card_id": body.card_id,
-                            "fallback": "card stays in current status",
-                        })),
-                    );
-                }
+                &rework_target,
+            ) {
+                tracing::warn!(
+                    "[review-decision] #195 Transition to rework target failed for card {}: {e}",
+                    body.card_id
+                );
             }
-        }
-        "dispute" => {
-            // Agent disputes → complete the review-decision dispatch, then create new review
-            if let Some(ref rd_id) = pending_rd_id {
-                conn.execute(
-                    "UPDATE task_dispatches SET status = 'completed', \
-                     result = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![
-                        json!({"decision": "dispute", "completion_source": "review_decision_api"})
-                            .to_string(),
-                        rd_id,
-                    ],
+
+            // Clear suggestion_pending_at (same as timeouts.js auto-accept)
+            if let Ok(c) = state.db.lock() {
+                c.execute(
+                    "UPDATE kanban_cards SET suggestion_pending_at = NULL WHERE id = ?1",
+                    [&body.card_id],
                 )
                 .ok();
             }
+
+            // #119: Record tuning outcome
+            record_decision_tuning(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
+            spawn_aggregate_if_needed(&state.db);
+
+            // #117: Update canonical review state → rework_pending
+            update_card_review_state(&state.db, &body.card_id, "accept", pending_rd_id.as_deref());
+
+            // Emit kanban_card_updated for real-time dashboard
+            if let Ok(conn) = state.db.lock() {
+                if let Ok(card) = conn.query_row(
+                    &format!("{} WHERE kc.id = ?1", super::kanban::CARD_SELECT),
+                    [&body.card_id],
+                    |row| super::kanban::card_row_to_json(row),
+                ) {
+                    crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
+                }
+            }
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "card_id": body.card_id,
+                    "decision": "accept",
+                    "rework_dispatch_created": rework_dispatch_created,
+                    "message": "Review-decision accepted, rework dispatch created",
+                })),
+            );
+        }
+        "dispute" => {
+            // #143: Agent disputes → complete review-decision dispatch via shared helper
+            if let Some(ref rd_id) = pending_rd_id {
+                crate::dispatch::mark_dispatch_completed(
+                    &state.db,
+                    rd_id,
+                    &json!({"decision": "dispute", "completion_source": "review_decision_api"}),
+                )
+                .ok();
+            }
+            // #155: Use intents for review_status mutation (executor boundary)
+            use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
+            let dispute_intents = vec![
+                TransitionIntent::SetReviewStatus {
+                    card_id: body.card_id.clone(),
+                    review_status: Some("reviewing".to_string()),
+                },
+                TransitionIntent::SyncReviewState {
+                    card_id: body.card_id.clone(),
+                    state: "reviewing".to_string(),
+                },
+            ];
+            for intent in &dispute_intents {
+                execute_intent_on_conn(&conn, intent).ok();
+            }
             conn.execute(
-                "UPDATE kanban_cards SET review_status = 'reviewing', review_entered_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE kanban_cards SET review_entered_at = datetime('now') WHERE id = ?1",
                 [&body.card_id],
-            ).ok();
+            )
+            .ok();
             drop(conn);
 
             // #119: Record tuning outcome BEFORE OnReviewEnter (which increments review_round)
@@ -828,22 +865,12 @@ pub async fn submit_review_decision(
                 &dispute_status,
             );
 
-            // Drain: onReviewEnter may call setStatus (e.g. pending_decision on max rounds)
-            loop {
-                let transitions = state.engine.drain_pending_transitions();
-                if transitions.is_empty() {
-                    break;
-                }
-                for (t_card_id, old_s, new_s) in &transitions {
-                    crate::kanban::fire_transition_hooks(
-                        &state.db,
-                        &state.engine,
-                        &t_card_id,
-                        &old_s,
-                        &new_s,
-                    );
-                }
-            }
+            // #108: Drain all pending intents and transitions from OnReviewEnter hooks.
+            // drain_hook_side_effects handles both transition processing (e.g. setStatus
+            // for pending_decision on max rounds) and Discord notifications for any
+            // dispatches created by the hooks, eliminating the previous manual drain loop
+            // that only handled transitions and missed dispatch notifications.
+            crate::kanban::drain_hook_side_effects(&state.db, &state.engine);
 
             // #117: Update canonical review state before returning
             update_card_review_state(
@@ -853,31 +880,16 @@ pub async fn submit_review_decision(
                 pending_rd_id.as_deref(),
             );
 
-            // Send newly created review dispatch to Discord (created by OnReviewEnter hook)
+            // Emit kanban_card_updated for real-time dashboard
             if let Ok(conn) = state.db.lock() {
-                let new_review: Option<(String, String, String)> = conn
-                    .query_row(
-                        "SELECT td.id, COALESCE(td.to_agent_id, ''), COALESCE(td.title, '') \
-                         FROM task_dispatches td \
-                         WHERE td.kanban_card_id = ?1 AND td.dispatch_type = 'review' AND td.status = 'pending' \
-                         ORDER BY td.rowid DESC LIMIT 1",
-                        [&body.card_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .ok();
-                drop(conn);
-                if let Some((did, aid, title)) = new_review {
-                    let db_clone = state.db.clone();
-                    let card_id = body.card_id.clone();
-                    tokio::spawn(async move {
-                        super::dispatches::send_dispatch_to_discord(
-                            &db_clone, &aid, &title, &card_id, &did,
-                        )
-                        .await;
-                    });
+                if let Ok(card) = conn.query_row(
+                    &format!("{} WHERE kc.id = ?1", super::kanban::CARD_SELECT),
+                    [&body.card_id],
+                    |row| super::kanban::card_row_to_json(row),
+                ) {
+                    crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
                 }
             }
-
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -895,7 +907,15 @@ pub async fn submit_review_decision(
             drop(conn);
             crate::pipeline::ensure_loaded();
             let terminal_state = {
-                let conn_lock = state.db.lock().unwrap();
+                let conn_lock = match state.db.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("database lock poisoned: {e}")})),
+                        );
+                    }
+                };
                 let (repo_id, agent_id): (Option<String>, Option<String>) = conn_lock
                     .query_row(
                         "SELECT repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
@@ -903,31 +923,78 @@ pub async fn submit_review_decision(
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .unwrap_or((None, None));
-                let eff = crate::pipeline::resolve_for_card(&conn_lock, repo_id.as_deref(), agent_id.as_deref());
-                eff.states.iter().find(|s| s.terminal).map(|s| s.id.clone()).unwrap_or_else(|| "done".to_string())
+                let eff = crate::pipeline::resolve_for_card(
+                    &conn_lock,
+                    repo_id.as_deref(),
+                    agent_id.as_deref(),
+                );
+                eff.states
+                    .iter()
+                    .find(|s| s.terminal)
+                    .map(|s| s.id.clone())
+                    .unwrap_or_else(|| "done".to_string())
             };
-            let _ =
-                crate::kanban::transition_status(&state.db, &state.engine, &body.card_id, &terminal_state);
+            let _ = crate::kanban::transition_status(
+                &state.db,
+                &state.engine,
+                &body.card_id,
+                &terminal_state,
+            );
 
             // Post-transition cleanup: cancel remaining pending review dispatches to prevent
             // stale dispatches from re-triggering review loops after dismiss.
             if let Ok(conn) = state.db.lock() {
-                conn.execute(
-                    "UPDATE task_dispatches SET status = 'cancelled', updated_at = datetime('now') \
-                     WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched') \
-                     AND dispatch_type IN ('review', 'review-decision')",
-                    [&body.card_id],
-                )
-                .ok();
-                // Belt-and-suspenders: ensure review_status is cleared even if transition_status
-                // failed silently (the `let _ =` above discards errors).
-                conn.execute(
-                    "UPDATE kanban_cards SET review_status = NULL WHERE id = ?1",
-                    [&body.card_id],
-                )
-                .ok();
+                let dispatch_ids: Vec<String> = conn
+                    .prepare(
+                        "SELECT id FROM task_dispatches \
+                         WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched') \
+                         AND dispatch_type IN ('review', 'review-decision')",
+                    )
+                    .ok()
+                    .and_then(|mut stmt| {
+                        stmt.query_map([&body.card_id], |row| row.get::<_, String>(0))
+                            .ok()
+                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    })
+                    .unwrap_or_default();
+                conn.execute_batch("BEGIN").ok();
+                for dispatch_id in &dispatch_ids {
+                    if let Err(e) = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+                        &conn,
+                        dispatch_id,
+                        None,
+                    ) {
+                        conn.execute_batch("ROLLBACK").ok();
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("{e}")})),
+                        );
+                    }
+                }
+                // #155: Belt-and-suspenders via intent (executor boundary)
+                use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
+                if let Err(e) = execute_intent_on_conn(
+                    &conn,
+                    &TransitionIntent::SetReviewStatus {
+                        card_id: body.card_id.clone(),
+                        review_status: None,
+                    },
+                ) {
+                    conn.execute_batch("ROLLBACK").ok();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
                 // Clear thread mappings so dismissed review threads are not reused.
                 super::dispatches::clear_all_threads(&conn, &body.card_id);
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    conn.execute_batch("ROLLBACK").ok();
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
             }
         }
         _ => {}
@@ -940,7 +1007,6 @@ pub async fn submit_review_decision(
         &body.decision,
         pending_rd_id.as_deref(),
     );
-
     // #119: Record tuning outcome (dismiss falls through here; accept/dispute call helper before returning)
     record_decision_tuning(
         &state.db,
@@ -949,6 +1015,17 @@ pub async fn submit_review_decision(
         pending_rd_id.as_deref(),
     );
     spawn_aggregate_if_needed(&state.db);
+
+    // Emit kanban_card_updated for real-time dashboard
+    if let Ok(conn) = state.db.lock() {
+        if let Ok(card) = conn.query_row(
+            &format!("{} WHERE kc.id = ?1", super::kanban::CARD_SELECT),
+            [&body.card_id],
+            |row| super::kanban::card_row_to_json(row),
+        ) {
+            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
+        }
+    }
 
     (
         StatusCode::OK,
@@ -970,17 +1047,31 @@ const MIN_OUTCOMES_FOR_GUIDANCE: i64 = 5;
 const MIN_CATEGORY_OUTCOMES: i64 = 3;
 
 /// Spawn a background task to re-aggregate review tuning data.
-/// Uses a lightweight debounce: skips if the last aggregate was < 60s ago.
+/// Debounce: skips if the max outcome rowid hasn't changed since the last aggregation.
+/// This avoids the old mtime-based debounce that could miss outcomes inserted
+/// shortly after the previous aggregate (e.g. a 5th sample crossing the threshold
+/// 10s after a 4-sample aggregate).
 pub fn spawn_aggregate_if_needed(db: &crate::db::Db) {
     let db = db.clone();
     tokio::spawn(async move {
-        // Debounce: check if guidance file was written recently
-        let path = review_tuning_guidance_path();
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(modified) = meta.modified() {
-                if modified.elapsed().map_or(false, |d| d.as_secs() < 60) {
-                    return; // aggregated < 60s ago, skip
-                }
+        // Debounce: compare latest outcome rowid against last aggregated rowid
+        if let Ok(conn) = db.lock() {
+            let max_rowid: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM review_tuning_outcomes",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let last_aggregated_rowid: i64 = conn
+                .query_row(
+                    "SELECT CAST(COALESCE(value, '0') AS INTEGER) FROM kv_meta WHERE key = 'review_tuning_last_aggregated_rowid'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if max_rowid <= last_aggregated_rowid {
+                return; // no new outcomes since last aggregation, skip
             }
         }
         aggregate_review_tuning_core(&db);
@@ -993,6 +1084,16 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64,
         Ok(c) => c,
         Err(_) => return (0, 0, 0, 0, 0, 0),
     };
+
+    // Snapshot the current max rowid BEFORE reading outcomes.
+    // This is stored in kv_meta after aggregation for rowid-based debounce.
+    let snapshot_max_rowid: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM review_tuning_outcomes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     let mut total_tp = 0i64;
     let mut total_fp = 0i64;
@@ -1131,6 +1232,15 @@ fn aggregate_review_tuning_core(db: &crate::db::Db) -> (i64, i64, i64, i64, i64,
     }
     let _ = std::fs::write(&guidance_path, &guidance);
 
+    // #119: Store the snapshot rowid so the debounce check in spawn_aggregate_if_needed
+    // can skip re-aggregation until new outcomes arrive.
+    conn.execute(
+        "INSERT INTO kv_meta (key, value) VALUES ('review_tuning_last_aggregated_rowid', ?1) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [&snapshot_max_rowid.to_string()],
+    )
+    .ok();
+
     let lines = guidance_lines.len();
     tracing::info!(
         "[review-tuning] #119 aggregation: tp={total_tp} fp={total_fp} tn={total_tn} fn={total_fn} disputed={total_disputed}, {lines} guidance lines → {}",
@@ -1173,14 +1283,8 @@ pub async fn aggregate_review_tuning(
 }
 
 /// Well-known path for review tuning guidance file.
-/// Uses ~/.adk/release/runtime/ (same logic as agentdesk_runtime_root).
 pub fn review_tuning_guidance_path() -> std::path::PathBuf {
-    let root = std::env::var("AGENTDESK_ROOT_DIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".adk").join("release")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let root = crate::config::runtime_root().unwrap_or_else(|| std::path::PathBuf::from("."));
     root.join("runtime").join("review-tuning-guidance.txt")
 }
 
@@ -1232,11 +1336,7 @@ mod tests {
     async fn submit_verdict_pass_marks_done_and_clears_review_status() {
         let db = test_db();
         seed_review_card(&db, "dispatch-pass");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, _) = submit_verdict(
             State(state),
@@ -1281,11 +1381,7 @@ mod tests {
     async fn submit_verdict_improve_creates_review_decision_dispatch() {
         let db = test_db();
         seed_review_card(&db, "dispatch-improve");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, _) = submit_verdict(
             State(state),
@@ -1335,11 +1431,7 @@ mod tests {
     async fn review_verdict_allows_same_agent_submission() {
         let db = test_db();
         seed_review_card(&db, "dispatch-counter");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1380,11 +1472,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1424,11 +1512,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1474,11 +1558,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_review_decision(
             State(state),
@@ -1486,6 +1566,7 @@ mod tests {
                 card_id: "card-d".to_string(),
                 decision: "dismiss".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -1541,11 +1622,7 @@ mod tests {
         ).unwrap();
         drop(conn);
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1615,11 +1692,7 @@ mod tests {
     async fn cross_provider_verdict_allowed() {
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-cross", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         // CDX (codex) submitting verdict for a review where from=claude, target=codex → allowed
         let (status, body) = submit_verdict(
@@ -1644,11 +1717,7 @@ mod tests {
     async fn same_provider_verdict_rejected() {
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-self-prov", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         // CC (claude) submitting verdict for own work → self-review rejection
         let (status, body) = submit_verdict(
@@ -1673,11 +1742,7 @@ mod tests {
     async fn verdict_without_provider_rejected_for_counter_model_dispatch() {
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-no-prov", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         // No provider specified on counter-model dispatch → rejected to prevent bypass
         let (status, body) = submit_verdict(
@@ -1707,11 +1772,7 @@ mod tests {
     async fn reverse_cross_provider_verdict_allowed() {
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-rev-cross", "codex", "claude");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         // CC (claude) submitting verdict where from=codex, target=claude → allowed
         let (status, body) = submit_verdict(
@@ -1737,11 +1798,7 @@ mod tests {
         // "Claude" (capitalized) submitting for from=claude → should normalize and reject
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-case-self", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1766,11 +1823,7 @@ mod tests {
         // "Codex" (capitalized) submitting for from=claude, target=codex → normalize and allow
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-case-cross", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1794,11 +1847,7 @@ mod tests {
     async fn gemini_cross_provider_allowed() {
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-gemini-cross", "claude", "gemini");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1823,11 +1872,7 @@ mod tests {
         // Unknown provider string → reject
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-unknown-prov", "claude", "codex");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1857,11 +1902,7 @@ mod tests {
         // from=codex, target=claude, submitter=codex → self-review blocked (submitter == from)
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-mismatch", "codex", "claude");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1887,11 +1928,7 @@ mod tests {
         // This exercises line 341-351 (mismatch branch), not 329-339 (self-review branch)
         let db = test_db();
         seed_counter_model_review(&db, "dispatch-mismatch2", "claude", "claude");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1908,7 +1945,12 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body.0["error"].as_str().unwrap().contains("provider mismatch"));
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider mismatch")
+        );
     }
 
     #[tokio::test]
@@ -1917,11 +1959,7 @@ mod tests {
         // should still allow verdicts without provider field
         let db = test_db();
         seed_review_card(&db, "dispatch-legacy");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -1963,11 +2001,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let (status, _body) = submit_review_decision(
             State(state),
@@ -1975,12 +2009,13 @@ mod tests {
                 card_id: "card-done".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
 
-        // Dispatch creation should fail (done terminal guard) → 500
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // #195: Terminal card guard returns 409 CONFLICT (was 500 before #195 refactor)
+        assert_eq!(status, StatusCode::CONFLICT);
 
         // Card must NOT have moved to in_progress — it should stay done
         let conn = db.lock().unwrap();
@@ -1994,6 +2029,19 @@ mod tests {
         assert_eq!(
             card_status, "done",
             "card must stay done, not stranded in in_progress"
+        );
+
+        // #155: Review-decision dispatch must still be pending (not consumed)
+        let dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'dispatch-orig'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_status, "pending",
+            "review-decision dispatch must stay pending when accept fails on terminal card"
         );
     }
 
@@ -2020,11 +2068,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         let (status, _) = submit_review_decision(
             State(state),
@@ -2032,6 +2076,7 @@ mod tests {
                 card_id: "card-dismissed".to_string(),
                 decision: "accept".to_string(),
                 comment: Some("late accept after dismiss".to_string()),
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2075,11 +2120,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         // First accept should succeed
         let (status1, _) = submit_review_decision(
@@ -2088,6 +2129,7 @@ mod tests {
                 card_id: "card-dup".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2100,6 +2142,7 @@ mod tests {
                 card_id: "card-dup".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2128,11 +2171,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), engine);
 
         // Accept consumes the dispatch
         let (status1, _) = submit_review_decision(
@@ -2141,6 +2180,7 @@ mod tests {
                 card_id: "card-ad".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2153,6 +2193,7 @@ mod tests {
                 card_id: "card-ad".to_string(),
                 decision: "dispute".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;
@@ -2198,11 +2239,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, _) = submit_verdict(
             State(state),
@@ -2264,11 +2301,7 @@ mod tests {
     async fn accept_verdict_is_rejected_by_submit_verdict() {
         let db = test_db();
         seed_review_card(&db, "dispatch-accept-v");
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, body) = submit_verdict(
             State(state),
@@ -2390,11 +2423,7 @@ mod tests {
             ).unwrap();
         }
 
-        let state = AppState {
-            db: db.clone(),
-            engine: test_engine(&db),
-            health_registry: None,
-        };
+        let state = AppState::test_state(db.clone(), test_engine(&db));
 
         let (status, _) = submit_review_decision(
             State(state),
@@ -2402,6 +2431,7 @@ mod tests {
                 card_id: "card-rs".to_string(),
                 decision: "accept".to_string(),
                 comment: None,
+                dispatch_id: None,
             }),
         )
         .await;

@@ -13,7 +13,8 @@ use crate::services::provider::ProviderKind;
 use crate::services::remote::RemoteProfile;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
+    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
+    tmux_session_exists, tmux_session_has_live_pane,
 };
 use crate::utils::format::safe_prefix;
 
@@ -219,6 +220,29 @@ pub enum ReadOutputResult {
     Cancelled { offset: u64 },
 }
 
+/// Result from sending a follow-up message to an existing tmux session.
+///
+/// When `RecreateSession` is returned, the caller should kill the current
+/// tmux session and fall through to the full session-creation path, replaying
+/// the same prompt in a fresh session.
+///
+/// **Partial-output note:** If the session dies *after* some streaming output
+/// has already been forwarded to Discord, the recreated session will produce
+/// the full response again, which may appear as duplicate text to the user.
+/// This is an acceptable trade-off: the alternative (leaving the task
+/// unfinished) is worse, and Claude/Codex prompts are generally idempotent
+/// for read/analysis tasks.  For prompts that trigger side-effects (file
+/// writes, git operations), the agent CLI itself is responsible for
+/// idempotency — the same prompt re-sent to a fresh session will not blindly
+/// re-apply already-committed changes.
+#[derive(Debug)]
+pub enum FollowupResult {
+    /// Message delivered and output successfully read to completion.
+    Delivered,
+    /// Session needs to be killed and recreated (FIFO broken or session died).
+    RecreateSession { error: String },
+}
+
 #[cfg(unix)]
 fn tmux_session_alive(tmux_session_name: &str) -> bool {
     tmux_session_has_live_pane(tmux_session_name)
@@ -240,16 +264,8 @@ fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
 
 #[cfg(unix)]
 pub(crate) fn tmux_session_ready_for_input(tmux_session_name: &str) -> bool {
-    let exact_target = tmux_exact_target(tmux_session_name);
-    Command::new("tmux")
-        .args(["capture-pane", "-p", "-t", &exact_target, "-S", "-80"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            tmux_capture_indicates_ready_for_input(&stdout)
-        })
+    crate::services::platform::tmux::capture_pane(tmux_session_name, -80)
+        .map(|stdout| tmux_capture_indicates_ready_for_input(&stdout))
         .unwrap_or(false)
 }
 
@@ -295,10 +311,7 @@ impl CancelToken {
             #[cfg(unix)]
             {
                 record_tmux_exit_reason(&name, "explicit cleanup via cancel_with_tmux_cleanup");
-                let exact_target = tmux_exact_target(&name);
-                let _ = Command::new("tmux")
-                    .args(["kill-session", "-t", &exact_target])
-                    .output();
+                crate::services::platform::tmux::kill_session(&name);
             }
             #[cfg(not(unix))]
             {
@@ -1265,6 +1278,30 @@ pub(crate) fn process_stream_line(
 
     // Extract statusline info from result events
     if msg_type == "result" {
+        // Prefer result event's own usage field over accumulated message values.
+        // The result event usage reflects the LAST API call's context window,
+        // while accumulated values overcount for multi-call turns (tool use loops).
+        if let Some(usage) = json.get("usage") {
+            let inp = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_read = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let cache_creation = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let out = usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            state.accum_input_tokens = inp + cache_read + cache_creation;
+            state.accum_output_tokens = out;
+        }
+
         let cost_usd = json.get("cost_usd").and_then(|v| v.as_f64());
         let total_cost_usd = json.get("total_cost_usd").and_then(|v| v.as_f64());
         let duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
@@ -1581,11 +1618,7 @@ fn parse_assistant_extra_tool_uses(json: &Value) -> Vec<StreamMessage> {
 /// Check if tmux is available on the system
 #[cfg(unix)]
 pub fn is_tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::services::platform::tmux::is_available()
 }
 
 /// Execute Claude inside a local tmux session with bidirectional input.
@@ -1627,26 +1660,32 @@ fn execute_streaming_local_tmux(
 
     if session_usable {
         debug_log("Existing tmux session found — sending follow-up message");
-        return send_followup_to_tmux(
+        match send_followup_to_tmux(
             prompt,
             &output_path,
             &input_fifo_path,
-            sender,
-            cancel_token,
+            sender.clone(),
+            cancel_token.clone(),
             tmux_session_name,
-        );
-    }
-
-    if session_exists {
+        )? {
+            FollowupResult::Delivered => return Ok(()),
+            FollowupResult::RecreateSession { error } => {
+                debug_log(&format!("Follow-up failed, recreating session: {}", error));
+                record_tmux_exit_reason(
+                    tmux_session_name,
+                    &format!("followup failed, recreating: {}", error),
+                );
+                crate::services::platform::tmux::kill_session(tmux_session_name);
+                // Fall through to new session creation below
+            }
+        }
+    } else if session_exists {
         debug_log("Stale tmux session found — recreating");
         record_tmux_exit_reason(
             tmux_session_name,
             "stale local session cleanup before recreate",
         );
-        let exact_target = tmux_exact_target(tmux_session_name);
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &exact_target])
-            .status();
+        crate::services::platform::tmux::kill_session(tmux_session_name);
     }
 
     // === Create new tmux session ===
@@ -1747,19 +1786,11 @@ fn execute_streaming_local_tmux(
     ));
 
     // Launch tmux session with script file (avoids command length limits)
-    let tmux_result = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            tmux_session_name,
-            "-c",
-            working_dir,
-            &format!("bash {}", shell_escape(&script_path)),
-        ])
-        .env_remove("CLAUDECODE")
-        .output()
-        .map_err(|e| format!("Failed to create tmux session: {}", e))?;
+    let tmux_result = crate::services::platform::tmux::create_session(
+        tmux_session_name,
+        Some(working_dir),
+        &format!("bash {}", shell_escape(&script_path)),
+    )?;
 
     if !tmux_result.status.success() {
         let stderr = String::from_utf8_lossy(&tmux_result.stderr);
@@ -1772,10 +1803,7 @@ fn execute_streaming_local_tmux(
     }
 
     // Keep tmux session alive after process exits for post-mortem analysis
-    let exact_target = tmux_exact_target(tmux_session_name);
-    let _ = Command::new("tmux")
-        .args(["set-option", "-t", &exact_target, "remain-on-exit", "on"])
-        .output();
+    crate::services::platform::tmux::set_option(tmux_session_name, "remain-on-exit", "on");
 
     // Stamp generation marker so post-restart watcher restore can detect old sessions
     let gen_marker_path =
@@ -1839,10 +1867,7 @@ fn execute_streaming_local_tmux(
                     tmux_session_name,
                     "stream retry after repeated tmux session death",
                 );
-                let exact_target = tmux_exact_target(tmux_session_name);
-                let _ = Command::new("tmux")
-                    .args(["kill-session", "-t", &exact_target])
-                    .output();
+                crate::services::platform::tmux::kill_session(tmux_session_name);
 
                 // Clean up and recreate temp files
                 let _ = std::fs::remove_file(&output_path);
@@ -1867,19 +1892,12 @@ fn execute_streaming_local_tmux(
                     .map_err(|e| format!("Failed to rewrite prompt file: {}", e))?;
 
                 // Re-launch tmux session using existing script file
-                let tmux_retry = Command::new("tmux")
-                    .args([
-                        "new-session",
-                        "-d",
-                        "-s",
-                        tmux_session_name,
-                        "-c",
-                        working_dir,
-                        &format!("bash {}", shell_escape(&script_path)),
-                    ])
-                    .env_remove("CLAUDECODE")
-                    .output()
-                    .map_err(|e| format!("Failed to recreate tmux session: {}", e))?;
+                let tmux_retry = crate::services::platform::tmux::create_session(
+                    tmux_session_name,
+                    Some(working_dir),
+                    &format!("bash {}", shell_escape(&script_path)),
+                )
+                .map_err(|e| format!("Failed to recreate tmux session: {}", e))?;
 
                 if !tmux_retry.status.success() {
                     let stderr = String::from_utf8_lossy(&tmux_retry.stderr);
@@ -1903,6 +1921,10 @@ fn execute_streaming_local_tmux(
 }
 
 /// Send a follow-up message to an existing tmux Claude session.
+///
+/// Returns [`FollowupResult::RecreateSession`] when the FIFO is broken or the
+/// session dies mid-output, signalling the caller to kill the session and
+/// replay the prompt in a freshly created one.
 #[cfg(unix)]
 fn send_followup_to_tmux(
     prompt: &str,
@@ -1911,7 +1933,7 @@ fn send_followup_to_tmux(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
-) -> Result<(), String> {
+) -> Result<FollowupResult, String> {
     use std::io::Write;
 
     debug_log(&format!(
@@ -1933,16 +1955,26 @@ fn send_followup_to_tmux(
         }
     });
 
-    // Write to input FIFO (blocks briefly until wrapper's reader is ready)
-    let mut fifo = std::fs::OpenOptions::new()
+    // Write to input FIFO — if the pipe is broken or missing, request recreation
+    let write_result = std::fs::OpenOptions::new()
         .write(true)
         .open(input_fifo_path)
-        .map_err(|e| format!("Failed to open input FIFO: {}", e))?;
+        .map_err(|e| format!("Failed to open input FIFO: {}", e))
+        .and_then(|mut fifo| {
+            writeln!(fifo, "{}", msg)
+                .map_err(|e| format!("Failed to write to input FIFO: {}", e))?;
+            fifo.flush()
+                .map_err(|e| format!("Failed to flush input FIFO: {}", e))?;
+            Ok(())
+        });
 
-    writeln!(fifo, "{}", msg).map_err(|e| format!("Failed to write to input FIFO: {}", e))?;
-    fifo.flush()
-        .map_err(|e| format!("Failed to flush input FIFO: {}", e))?;
-    drop(fifo);
+    if let Err(e) = write_result {
+        if should_recreate_session_after_followup_fifo_error(&e) {
+            debug_log(&format!("FIFO error triggers session recreation: {}", e));
+            return Ok(FollowupResult::RecreateSession { error: e });
+        }
+        return Err(e);
+    }
 
     debug_log("Follow-up message sent to input FIFO");
 
@@ -1969,18 +2001,15 @@ fn send_followup_to_tmux(
                 tmux_session_name: tmux_session_name.to_string(),
                 last_offset: offset,
             });
+            Ok(FollowupResult::Delivered)
         }
         ReadOutputResult::SessionDied { .. } => {
-            debug_log("tmux session died during follow-up");
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            debug_log("tmux session died during follow-up — requesting recreation");
+            Ok(FollowupResult::RecreateSession {
+                error: "session died during follow-up output reading".to_string(),
+            })
         }
     }
-
-    Ok(())
 }
 
 /// Callbacks for session status checks during output file polling.
@@ -2273,13 +2302,36 @@ pub(crate) fn execute_streaming_local_process(
             if backend.is_alive(handle) {
                 debug_log("Existing process session found — sending follow-up");
                 drop(handles);
-                return send_followup_to_process(
+                match send_followup_to_process(
                     prompt,
                     &output_path,
                     session_name,
-                    sender,
-                    cancel_token,
-                );
+                    sender.clone(),
+                    cancel_token.clone(),
+                )? {
+                    FollowupResult::Delivered => return Ok(()),
+                    FollowupResult::RecreateSession { error } => {
+                        debug_log(&format!(
+                            "Process follow-up failed, recreating session: {}",
+                            error
+                        ));
+                        // Kill existing process and clean up handle
+                        if let Some(handle) = PROCESS_HANDLES.lock().unwrap().remove(session_name) {
+                            if let crate::services::session_backend::SessionHandle::Process {
+                                child,
+                                ..
+                            } = handle
+                            {
+                                let mut child_guard = child.lock().unwrap();
+                                if let Some(ref mut c) = *child_guard {
+                                    let _ = c.kill();
+                                    let _ = c.wait();
+                                }
+                            }
+                        }
+                        // Fall through to new session creation below
+                    }
+                }
             }
         }
     }
@@ -2366,8 +2418,9 @@ fn send_followup_to_process(
     session_name: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
-) -> Result<(), String> {
+) -> Result<FollowupResult, String> {
     use crate::services::session_backend::{ProcessBackend, SessionBackend};
+    use crate::services::tmux_diagnostics::should_recreate_session_after_stdin_error;
 
     debug_log(&format!(
         "=== send_followup_to_process: {} ===",
@@ -2388,7 +2441,17 @@ fn send_followup_to_process(
     let handles = PROCESS_HANDLES.lock().unwrap();
     if let Some(handle) = handles.get(session_name) {
         let backend = ProcessBackend::new();
-        backend.send_input(handle, &msg.to_string())?;
+        if let Err(e) = backend.send_input(handle, &msg.to_string()) {
+            drop(handles);
+            if should_recreate_session_after_stdin_error(&e) {
+                debug_log(&format!(
+                    "stdin pipe error triggers session recreation: {}",
+                    e
+                ));
+                return Ok(FollowupResult::RecreateSession { error: e });
+            }
+            return Err(e);
+        }
     } else {
         return Err("No process handle found for session".to_string());
     }
@@ -2419,18 +2482,16 @@ fn send_followup_to_process(
                 session_name: session_name.to_string(),
                 last_offset: offset,
             });
+            Ok(FollowupResult::Delivered)
         }
         ReadOutputResult::SessionDied { .. } => {
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            debug_log("process session died during follow-up — requesting recreation");
             PROCESS_HANDLES.lock().unwrap().remove(session_name);
+            Ok(FollowupResult::RecreateSession {
+                error: "process died during follow-up output reading".to_string(),
+            })
         }
     }
-
-    Ok(())
 }
 
 /// Global storage for ProcessBackend session handles.
@@ -2842,5 +2903,72 @@ mod tests {
             serde_json::from_str(r#"{"type":"result","subtype":"success","result":"ok"}"#).unwrap();
         let extras = parse_assistant_extra_tool_uses(&json);
         assert!(extras.is_empty());
+    }
+
+    // ========== FollowupResult tests ==========
+
+    #[test]
+    fn test_followup_result_maps_completed_to_delivered() {
+        let read_result = ReadOutputResult::Completed { offset: 100 };
+        let followup = match read_result {
+            ReadOutputResult::Completed { .. } | ReadOutputResult::Cancelled { .. } => {
+                FollowupResult::Delivered
+            }
+            ReadOutputResult::SessionDied { .. } => FollowupResult::RecreateSession {
+                error: "died".to_string(),
+            },
+        };
+        assert!(matches!(followup, FollowupResult::Delivered));
+    }
+
+    #[test]
+    fn test_followup_result_maps_session_died_to_recreate() {
+        let read_result = ReadOutputResult::SessionDied { offset: 42 };
+        let followup = match read_result {
+            ReadOutputResult::Completed { .. } | ReadOutputResult::Cancelled { .. } => {
+                FollowupResult::Delivered
+            }
+            ReadOutputResult::SessionDied { .. } => FollowupResult::RecreateSession {
+                error: "session died during follow-up output reading".to_string(),
+            },
+        };
+        match followup {
+            FollowupResult::RecreateSession { error } => {
+                assert!(error.contains("session died"));
+            }
+            _ => panic!("Expected RecreateSession"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_followup_fifo_not_found_returns_recreate() {
+        use std::sync::mpsc;
+
+        let (sender, _receiver) = mpsc::channel();
+        let dir = std::env::temp_dir();
+        let output_path = dir.join(format!(
+            "agentdesk-test-followup-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&output_path, "");
+
+        let result = send_followup_to_tmux(
+            "test prompt",
+            output_path.to_str().unwrap(),
+            "/tmp/agentdesk-test-nonexistent-fifo-path",
+            sender,
+            None,
+            "test-session-followup",
+        );
+
+        let _ = std::fs::remove_file(&output_path);
+
+        match result {
+            Ok(FollowupResult::RecreateSession { error }) => {
+                assert!(error.contains("Failed to open input FIFO"));
+            }
+            other => panic!("Expected Ok(RecreateSession), got {:?}", other),
+        }
     }
 }

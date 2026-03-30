@@ -214,7 +214,6 @@ pub fn parse_provider_and_channel_from_tmux_name(
 ) -> Option<(ProviderKind, String)> {
     let prefix = format!("{}-", TMUX_SESSION_PREFIX);
     let stripped = session_name.strip_prefix(&prefix)?;
-    // Strip env suffix (e.g. "-dev") from the end before parsing
     let suffix = tmux_env_suffix();
     let without_suffix = if !suffix.is_empty() {
         stripped.strip_suffix(suffix).unwrap_or(stripped)
@@ -236,6 +235,7 @@ pub fn parse_provider_and_channel_from_tmux_name(
 #[cfg(test)]
 mod tests {
     use super::{ProviderKind, parse_provider_and_channel_from_tmux_name};
+    use crate::dispatch::extract_thread_channel_id;
 
     #[test]
     fn test_provider_channel_support() {
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(p.display_name(), "gpt");
         assert!(!p.is_channel_supported(Some("test-cc"), false));
         assert!(!p.is_channel_supported(Some("test"), false));
-        assert!(!p.is_channel_supported(None, true)); // unsupported even in DM
+        assert!(!p.is_channel_supported(None, true));
     }
 
     #[test]
@@ -296,8 +296,6 @@ mod tests {
             Some((ProviderKind::Claude, "mac-mini".to_string()))
         );
     }
-
-    // ── P0 tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_provider_from_str_claude() {
@@ -346,7 +344,6 @@ mod tests {
 
     #[test]
     fn test_parse_provider_and_channel_from_tmux_name() {
-        // Roundtrip: build then parse
         let channel = "my-test-channel";
         let session = ProviderKind::Claude.build_tmux_session_name(channel);
         let (provider, parsed_channel) =
@@ -369,31 +366,19 @@ mod tests {
 
     #[test]
     fn test_is_channel_supported_cc_suffix() {
-        // "-cc" channel → Claude only
         assert!(ProviderKind::Claude.is_channel_supported(Some("dev-cc"), false));
         assert!(!ProviderKind::Codex.is_channel_supported(Some("dev-cc"), false));
     }
 
     #[test]
     fn test_is_channel_supported_cdx_suffix() {
-        // "-cdx" channel → Codex only
         assert!(ProviderKind::Codex.is_channel_supported(Some("dev-cdx"), false));
         assert!(!ProviderKind::Claude.is_channel_supported(Some("dev-cdx"), false));
     }
 
     // ── #157 suffix preservation tests ─────────────────────────────────
-
-    /// Helper: extract thread channel ID from a channel name the same way
-    /// `is_unified_thread_channel_name_active` does (without DB access).
-    fn extract_thread_id_from_channel_name(channel_name: &str) -> Option<u64> {
-        let pos = channel_name.rfind("-t")?;
-        let suffix = &channel_name[pos + 2..];
-        if suffix.len() >= 15 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            suffix.parse().ok()
-        } else {
-            None
-        }
-    }
+    // All tests use `crate::dispatch::extract_thread_channel_id` — the same
+    // pure parsing function that production `is_unified_thread_channel_name_active` calls.
 
     #[test]
     fn test_suffix_preserved_long_ascii_parent() {
@@ -408,7 +393,7 @@ mod tests {
         assert_eq!(provider, ProviderKind::Claude);
 
         // Suffix must be extractable
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(
             extracted,
             Some(1487044675541012490u64),
@@ -427,7 +412,7 @@ mod tests {
         let session = ProviderKind::Claude.build_tmux_session_name(&channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
 
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(
             extracted,
             Some(1234567890123456789u64),
@@ -447,16 +432,25 @@ mod tests {
         let session = ProviderKind::Claude.build_tmux_session_name(&channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
 
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(
             extracted,
             Some(1487044675541012490u64),
             "thread ID must survive CJK parent truncation, got channel_name='{}'",
             parsed
         );
-        // Verify no mid-char truncation: all chars in parsed prefix must be valid UTF-8
-        // (this is implicitly verified by Rust's String type, but let's be explicit)
-        assert!(parsed.is_char_boundary(0));
+        // Verify truncation happened at a CJK char boundary (not mid-byte).
+        // The suffix starts at "-t"; everything before it is the truncated prefix.
+        // Each CJK char is 3 bytes, so prefix byte length must be divisible by 3
+        // (all chars in the prefix are CJK after sanitization).
+        let suffix_pos = parsed.rfind("-t").unwrap();
+        let prefix = &parsed[..suffix_pos];
+        assert!(
+            prefix.len() % 3 == 0 && prefix.chars().all(|c| c.len_utf8() == 3),
+            "CJK prefix must be cut at char boundary, got prefix='{}' ({}B)",
+            prefix,
+            prefix.len()
+        );
     }
 
     #[test]
@@ -472,19 +466,28 @@ mod tests {
         let session = ProviderKind::Claude.build_tmux_session_name(&channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
 
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(extracted, Some(1487044675541012490u64));
         // Trimmed total should be <= 44
-        assert!(parsed.len() <= 44, "trimmed channel must be <= 44 bytes, got {}", parsed.len());
+        assert!(
+            parsed.len() <= 44,
+            "trimmed channel must be <= 44 bytes, got {}",
+            parsed.len()
+        );
     }
 
     #[test]
     fn test_no_thread_suffix_still_truncates_normally() {
         // Non-thread channel names should still be truncated to 44 chars
-        let long_channel = "a]very]long]channel]name]that]exceeds]the]maximum]allowed]length]for]tmux";
+        let long_channel =
+            "a]very]long]channel]name]that]exceeds]the]maximum]allowed]length]for]tmux";
         let session = ProviderKind::Claude.build_tmux_session_name(long_channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
-        assert!(parsed.len() <= 44, "non-thread channel must be <= 44 bytes, got {}", parsed.len());
+        assert!(
+            parsed.len() <= 44,
+            "non-thread channel must be <= 44 bytes, got {}",
+            parsed.len()
+        );
     }
 
     #[test]
@@ -494,7 +497,7 @@ mod tests {
         let session = ProviderKind::Claude.build_tmux_session_name(channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
         assert_eq!(parsed, channel);
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(extracted, Some(1487044675541012490u64));
     }
 
@@ -509,7 +512,7 @@ mod tests {
             let (parsed_provider, parsed_channel) =
                 parse_provider_and_channel_from_tmux_name(&session).unwrap();
             assert_eq!(parsed_provider, provider);
-            let extracted = extract_thread_id_from_channel_name(&parsed_channel);
+            let extracted = extract_thread_channel_id(&parsed_channel);
             assert_eq!(
                 extracted,
                 Some(1487044675541012490u64),
@@ -521,30 +524,33 @@ mod tests {
     }
 
     #[test]
-    fn test_suffix_preserved_prefix_budget_zero() {
-        // Synthetic: suffix alone >= 44 chars → prefix_budget saturates to 0.
-        // Real Discord IDs (max 20 digits) never hit this, but the code must not panic.
-        let digits = "1".repeat(43); // 43 digits → suffix "-t" + 43 = 45 > 44
+    fn test_suffix_preserved_prefix_budget_zero_no_panic() {
+        // prefix_budget=0 is unreachable with valid Discord IDs (max 20 digits →
+        // suffix max 22 chars → budget min 22). This test proves the code handles
+        // the theoretical boundary safely (no panic, suffix marker preserved).
+        let digits = "1".repeat(43); // 43 digits → suffix = 45 chars > 44
         let channel = format!("parent-t{}", digits);
 
         // Must not panic
         let session = ProviderKind::Claude.build_tmux_session_name(&channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
 
-        // Suffix is preserved (starts with "-t" and has all digits), but
-        // 43-digit number overflows u64 so extract_thread_id_from_channel_name
-        // returns None — this is expected and acceptable for synthetic inputs.
+        // u64 overflow means extract_thread_channel_id returns None — expected.
+        // The invariant we prove: code survives gracefully, suffix marker preserved.
         assert!(
             parsed.contains("-t"),
-            "suffix marker must survive, got channel_name='{}'",
+            "suffix marker must survive at budget=0, got channel_name='{}'",
             parsed
         );
+        // extract_thread_channel_id returns None due to u64 overflow
+        assert_eq!(extract_thread_channel_id(&parsed), None);
     }
 
     #[test]
-    fn test_suffix_preserved_max_realistic_id() {
-        // Max realistic case: 20-digit Discord ID (u64 max) + long parent
-        // suffix = "-t" + 20 = 22 chars → prefix_budget = 44 - 22 = 22
+    fn test_suffix_preserved_min_realistic_budget() {
+        // Minimum realistic prefix_budget: u64::MAX (20 digits) → suffix 22 chars
+        // → prefix_budget = 44 - 22 = 22. Even with max-length ID + long parent,
+        // the production parsing function must extract the correct thread ID.
         let parent = "abcdefghijklmnopqrstuvwxyz-very-long-name-x"; // 43 chars
         let thread_id = "18446744073709551615"; // u64::MAX, 20 digits
         let channel = format!("{}-t{}", parent, thread_id);
@@ -553,11 +559,12 @@ mod tests {
         let session = ProviderKind::Claude.build_tmux_session_name(&channel);
         let (_, parsed) = parse_provider_and_channel_from_tmux_name(&session).unwrap();
 
-        let extracted = extract_thread_id_from_channel_name(&parsed);
+        // DoD 2: even at minimum realistic budget, production parser succeeds
+        let extracted = extract_thread_channel_id(&parsed);
         assert_eq!(
             extracted,
             Some(u64::MAX),
-            "max u64 thread ID must survive, got channel_name='{}'",
+            "max u64 thread ID must be parseable at min budget, got channel_name='{}'",
             parsed
         );
         assert!(parsed.len() <= 44);

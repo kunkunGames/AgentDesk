@@ -1,18 +1,93 @@
+use super::handoff::{HandoffRecord, save_handoff};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
-#[cfg(unix)]
 use crate::services::tmux_common::tmux_exact_target;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
+use crate::utils::format::tail_with_ellipsis;
 
 #[cfg(not(unix))]
 fn tmux_session_has_live_pane(_name: &str) -> bool {
     false
 }
 
+/// Retry-aware tmux session check for recovery after dcserver restart.
+/// The first check can false-negative if tmux CLI hasn't fully initialized yet.
+fn tmux_session_alive_with_retry(name: &str) -> bool {
+    if tmux_session_has_live_pane(name) {
+        return true;
+    }
+    // Retry up to 2 more times with 1-second gaps
+    for attempt in 1..=2 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if tmux_session_has_live_pane(name) {
+            println!(
+                "  [recovery] tmux pane alive on retry {} for {}",
+                attempt, name
+            );
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) const RESTART_SESSION_DIED_HANDOFF_SENTINEL: &str = "__restart_session_died_handoff__";
+
+/// Retry-aware tmux has_session check.
+fn tmux_has_session_with_retry(name: &str) -> bool {
+    if crate::services::platform::tmux::has_session(name) {
+        return true;
+    }
+    for attempt in 1..=2 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if crate::services::platform::tmux::has_session(name) {
+            println!(
+                "  [recovery] tmux session found on retry {} for {}",
+                attempt, name
+            );
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(not(unix))]
 fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Option<String> {
     None
+}
+
+fn save_missing_session_handoff(
+    provider: &ProviderKind,
+    state: &inflight::InflightTurnState,
+    best_response: &str,
+) {
+    let partial = best_response.trim();
+    let partial_context = if partial.is_empty() {
+        "(재시작 전까지 전달된 partial 응답 없음)".to_string()
+    } else {
+        tail_with_ellipsis(partial, 1200)
+    };
+    let context = format!(
+        "재시작 중 기존 tmux 세션이 사라져 동일 turn에 재연결하지 못했습니다.\n\n원래 사용자 요청:\n{}\n\n재시작 전 partial 응답:\n{}",
+        state.user_text.trim(),
+        partial_context,
+    );
+    let handoff = HandoffRecord::new(
+        provider,
+        state.channel_id,
+        state.channel_name.clone(),
+        "재시작 중 중단된 응답을 이어서 마무리",
+        context,
+        None,
+        Some(state.user_msg_id),
+    );
+    if let Err(e) = save_handoff(&handoff) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!(
+            "  [{ts}] ⚠ failed to save recovery handoff for channel {}: {e}",
+            state.channel_id
+        );
+    }
 }
 
 /// Check whether a **successful** result record exists after the given offset.
@@ -143,6 +218,18 @@ fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
         .unwrap_or(false)
 }
 
+fn recovery_watcher_start_offset(output_path: &str, saved_last_offset: u64) -> (u64, u64, bool) {
+    let current_len = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    if current_len >= saved_last_offset {
+        (saved_last_offset, current_len, false)
+    } else {
+        // The output file was recreated or truncated while dcserver was down.
+        // Resume from the beginning of the new file so we do not skip the
+        // entire restarted session output.
+        (0, current_len, true)
+    }
+}
+
 pub(super) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -158,33 +245,7 @@ pub(super) async fn restore_inflight_turns(
     let current_gen = shared.current_generation;
 
     for state in states {
-        // Generation gate: skip recovery for turns born in a previous generation.
-        // These old sessions should not be followed up — the new dcserver should
-        // start fresh sessions instead.
-        if state.born_generation < current_gen {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⏭ skipping inflight recovery for channel {}: old generation (born={}, current={})",
-                state.channel_id, state.born_generation, current_gen
-            );
-            // Update the Discord message so "Processing..." doesn't stay forever
-            if state.current_msg_id != 0 {
-                let channel_id = ChannelId::new(state.channel_id);
-                let current_msg_id = MessageId::new(state.current_msg_id);
-                let stale_text = super::turn_bridge::stale_inflight_message(&state.full_response);
-                let _ = super::formatting::replace_long_message_raw(
-                    http,
-                    channel_id,
-                    current_msg_id,
-                    &stale_text,
-                    shared,
-                )
-                .await;
-            }
-            clear_inflight_state(provider, state.channel_id);
-            continue;
-        }
-
+        // No generation gate — adopt mode allows old-gen session recovery.
         // If a restart report exists for this channel, check whether the agent
         // has already finished before deciding to skip recovery.  When the output
         // file contains a completed result we deliver it directly and clear both
@@ -244,86 +305,130 @@ pub(super) async fn restore_inflight_turns(
                 // #142: Check dispatch type — implementation/rework need explicit completion,
                 // review can use idle auto-complete.
                 let recovered_dispatch_id = parse_dispatch_id(&state.user_text);
+                let mut dispatch_completed = recovered_dispatch_id.is_none();
                 if let Some(ref did) = recovered_dispatch_id {
-                    // #142: For implementation/rework, idle won't auto-complete (#115).
-                    // Use PATCH /api/dispatches/:id to complete directly.
-                    // For review, idle auto-complete works fine.
-                    let complete_url = crate::config::local_api_url(
-                        shared.api_port,
-                        &format!("/api/dispatches/{}", did),
-                    );
-                    let client = reqwest::Client::new();
-                    let patch_result = client
-                        .patch(&complete_url)
-                        .json(&serde_json::json!({
+                    // #143: Use finalize_dispatch directly with retry.
+                    if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                        for attempt in 1..=3u8 {
+                            match crate::dispatch::finalize_dispatch(
+                                db,
+                                engine,
+                                did,
+                                "recovery_completed_during_downtime",
+                                None,
+                            ) {
+                                Ok(_) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!(
+                                        "  [{ts}] ✓ recovery: completed dispatch {did} via finalize_dispatch"
+                                    );
+                                    crate::server::routes::dispatches::queue_dispatch_followup(
+                                        db, &did,
+                                    );
+                                    dispatch_completed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    eprintln!(
+                                        "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
+                                    );
+                                    if attempt < 3 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                        }
+                        // All retries exhausted — DB fallback via pool, then runtime-root
+                        if !dispatch_completed {
+                            let pool_ok = db.separate_conn().ok().map_or(false, |conn| {
+                                let changed = conn.execute(
+                                    "UPDATE task_dispatches SET status = 'completed', \
+                                     result = '{\"completion_source\":\"recovery_db_fallback\",\"needs_reconcile\":true}', \
+                                     updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
+                                    [did.as_str()],
+                                ).unwrap_or(0);
+                                if changed > 0 {
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                                        rusqlite::params![format!("reconcile_dispatch:{did}"), did.as_str()],
+                                    ).ok();
+                                }
+                                changed > 0
+                            });
+                            if pool_ok {
+                                dispatch_completed = true;
+                            } else {
+                                dispatch_completed =
+                                    super::turn_bridge::runtime_db_fallback_complete(
+                                        did,
+                                        "recovery_db_fallback",
+                                    );
+                            }
+                        }
+                    } else {
+                        // Db/Engine not available — fall back to API PATCH with retry
+                        let complete_url = crate::config::local_api_url(
+                            shared.api_port,
+                            &format!("/api/dispatches/{}", did),
+                        );
+                        let payload = serde_json::json!({
                             "status": "completed",
                             "result": {"completion_source": "recovery_completed_during_downtime"},
-                        }))
-                        .send()
-                        .await;
-                    match patch_result {
-                        Ok(resp) if resp.status().is_success() => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!(
-                                "  [{ts}] ✓ recovery: completed dispatch {did} via API (completed-during-downtime)"
-                            );
+                        });
+                        for attempt in 1..=3u8 {
+                            match reqwest::Client::new()
+                                .patch(&complete_url)
+                                .json(&payload)
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!(
+                                        "  [{ts}] ✓ recovery: completed dispatch {did} via API"
+                                    );
+                                    dispatch_completed = true;
+                                    break;
+                                }
+                                Ok(resp) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    eprintln!(
+                                        "  [{ts}] ⚠ recovery: dispatch {did} API completion failed (attempt {attempt}/3): {}",
+                                        resp.status()
+                                    );
+                                }
+                                Err(e) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    eprintln!(
+                                        "  [{ts}] ⚠ recovery: dispatch {did} API call failed (attempt {attempt}/3): {e}"
+                                    );
+                                }
+                            }
+                            if attempt < 3 {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
                         }
-                        Ok(resp) => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            let status = resp.status();
-                            println!(
-                                "  [{ts}] ⚠ recovery: dispatch {did} API completion failed ({status}), falling back to idle"
+                        // API retries exhausted — runtime-root DB fallback
+                        if !dispatch_completed {
+                            dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
+                                did,
+                                "recovery_db_fallback",
                             );
-                            // Fallback: post idle (works for review type)
-                            let adk_session_key = build_adk_session_key(
-                                shared,
-                                ChannelId::new(state.channel_id),
-                                provider,
-                            )
-                            .await;
-                            post_adk_session_status(
-                                adk_session_key.as_deref(),
-                                state.channel_name.as_deref(),
-                                Some(provider.as_str()),
-                                "idle",
-                                provider,
-                                None,
-                                None,
-                                None,
-                                Some(did),
-                                shared.api_port,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!(
-                                "  [{ts}] ⚠ recovery: dispatch {did} API call failed ({e}), falling back to idle"
-                            );
-                            let adk_session_key = build_adk_session_key(
-                                shared,
-                                ChannelId::new(state.channel_id),
-                                provider,
-                            )
-                            .await;
-                            post_adk_session_status(
-                                adk_session_key.as_deref(),
-                                state.channel_name.as_deref(),
-                                Some(provider.as_str()),
-                                "idle",
-                                provider,
-                                None,
-                                None,
-                                None,
-                                Some(did),
-                                shared.api_port,
-                            )
-                            .await;
                         }
                     }
                 }
-                super::restart_report::clear_restart_report(provider, state.channel_id);
-                clear_inflight_state(provider, state.channel_id);
+                // Only clear recovery bookkeeping if dispatch was completed (or no dispatch).
+                // Preserving state on failure allows the next recovery pass to retry.
+                if dispatch_completed {
+                    super::restart_report::clear_restart_report(provider, state.channel_id);
+                    clear_inflight_state(provider, state.channel_id);
+                } else if let Some(ref did) = recovered_dispatch_id {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ❌ recovery: dispatch {did} completion failed — preserving state for next recovery pass"
+                    );
+                }
                 continue;
             }
 
@@ -347,41 +452,127 @@ pub(super) async fn restore_inflight_turns(
                 });
             let session_alive = tmux_name
                 .as_deref()
-                .map_or(false, tmux_session_has_live_pane);
+                .map_or(false, tmux_session_alive_with_retry);
 
             if session_alive {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
-                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, proceeding with watcher recovery",
+                    "  [{ts}] ↻ restart report exists but tmux session alive for channel {}: clearing report, spawning watcher immediately",
                     state.channel_id
                 );
                 super::restart_report::clear_restart_report(provider, state.channel_id);
-                // Add 👀 reaction to bot placeholder to indicate watcher re-attached
-                super::formatting::add_reaction_raw(
-                    http,
-                    ChannelId::new(state.channel_id),
-                    MessageId::new(state.current_msg_id),
-                    '👀',
-                )
-                .await;
-                // Fall through to normal recovery path below (watcher re-attach)
+                // Register session in-memory so handlers can find it.
+                // Derive channel_name from tmux session name if not in inflight state.
+                let effective_channel_name = state.channel_name.clone().or_else(|| {
+                    tmux_name.as_deref().and_then(|name| {
+                        crate::services::provider::parse_provider_and_channel_from_tmux_name(name)
+                            .map(|(_, ch)| ch)
+                    })
+                });
+                let channel_id = ChannelId::new(state.channel_id);
+                {
+                    let mut data = shared.core.lock().await;
+                    let session =
+                        data.sessions
+                            .entry(channel_id)
+                            .or_insert_with(|| DiscordSession {
+                                session_id: state.session_id.clone(),
+                                current_path: None,
+                                history: Vec::new(),
+                                pending_uploads: Vec::new(),
+                                cleared: false,
+                                remote_profile_name: None,
+                                channel_id: Some(state.channel_id),
+                                channel_name: effective_channel_name.clone(),
+                                category_name: None,
+                                last_active: tokio::time::Instant::now(),
+                                worktree: None,
+                                born_generation: super::runtime_store::load_generation(),
+                            });
+                    session.channel_id = Some(state.channel_id);
+                    session.last_active = tokio::time::Instant::now();
+                    if session.channel_name.is_none() {
+                        session.channel_name = effective_channel_name;
+                    }
+                }
+
+                // Immediately spawn a tmux watcher instead of deferring to
+                // restore_tmux_watchers().  The previous "watcher will adopt"
+                // approach had a race condition: the tmux session could die
+                // between recovery (now) and restore_tmux_watchers (~50s later),
+                // losing the in-progress response entirely.
+                if let Some(ref tmux_session_name) = tmux_name {
+                    let output_path =
+                        crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
+                    if std::fs::metadata(&output_path).is_ok()
+                        && !shared.tmux_watchers.contains_key(&channel_id)
+                    {
+                        let (initial_offset, current_len, truncated) =
+                            recovery_watcher_start_offset(&output_path, state.last_offset);
+                        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+                        let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let turn_delivered =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        shared.tmux_watchers.insert(
+                            channel_id,
+                            TmuxWatcherHandle {
+                                paused: paused.clone(),
+                                resume_offset: resume_offset.clone(),
+                                cancel: cancel.clone(),
+                                pause_epoch: pause_epoch.clone(),
+                                turn_delivered: turn_delivered.clone(),
+                            },
+                        );
+                        let ts2 = chrono::Local::now().format("%H:%M:%S");
+                        if truncated {
+                            println!(
+                                "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                                tmux_session_name, state.last_offset, current_len
+                            );
+                        }
+                        println!(
+                            "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                            tmux_session_name, initial_offset
+                        );
+                        tokio::spawn(super::tmux::tmux_output_watcher(
+                            channel_id,
+                            http.clone(),
+                            shared.clone(),
+                            output_path,
+                            tmux_session_name.clone(),
+                            initial_offset,
+                            cancel,
+                            paused,
+                            resume_offset,
+                            pause_epoch,
+                            turn_delivered,
+                        ));
+                    }
+                }
+
+                // Keep the inflight state until the watcher either relays the
+                // final response or triggers watcher-death handoff. Clearing it
+                // here breaks the handoff path if the recovered tmux session
+                // dies before producing a result.
+                continue;
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 if let Some(diag) = tmux_name.as_deref().and_then(|name| {
                     build_tmux_death_diagnostic(name, output_path_for_check.as_deref())
                 }) {
                     println!(
-                        "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop ({diag})",
+                        "  [{ts}] ↻ restart report exists but tmux session is dead for channel {}: clearing report, continuing with direct fallback recovery ({diag})",
                         state.channel_id
                     );
                 } else {
                     println!(
-                        "  [{ts}] ⏭ skipping inflight recovery for channel {}: restart report exists, session dead, delegating to flush loop",
+                        "  [{ts}] ↻ restart report exists but tmux session is dead for channel {}: clearing report, continuing with direct fallback recovery",
                         state.channel_id
                     );
                 }
-                clear_inflight_state(provider, state.channel_id);
-                continue;
+                super::restart_report::clear_restart_report(provider, state.channel_id);
             }
         }
 
@@ -472,7 +663,10 @@ pub(super) async fn restore_inflight_turns(
                 shared,
             )
             .await;
-            clear_inflight_state(provider, state.channel_id);
+            // Keep the inflight state until the watcher either relays the
+            // final response or triggers watcher-death handoff. Clearing it
+            // here breaks the handoff path if the recovered tmux session dies
+            // before producing a result.
             continue;
         }
 
@@ -503,16 +697,9 @@ pub(super) async fn restore_inflight_turns(
             continue;
         }
 
-        let can_recover = tmux_session_name.as_deref().map_or(false, |name| {
-            let exact_target = tmux_exact_target(name);
-            std::process::Command::new("tmux")
-                .args(["has-session", "-t", &exact_target])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        });
+        let can_recover = tmux_session_name
+            .as_deref()
+            .map_or(false, |name| tmux_has_session_with_retry(name));
 
         if !can_recover {
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -553,6 +740,7 @@ pub(super) async fn restore_inflight_turns(
                 shared,
             )
             .await;
+            save_missing_session_handoff(provider, &state, &best_response);
             clear_inflight_state(provider, state.channel_id);
             continue;
         }
@@ -584,6 +772,108 @@ pub(super) async fn restore_inflight_turns(
             clear_inflight_state(provider, state.channel_id);
             continue;
         };
+
+        // If tmux pane is alive, skip recovery reader entirely.
+        // The session is idle (waiting for input) — spawn a watcher immediately
+        // instead of deferring to restore_tmux_watchers() to avoid a race
+        // condition where the session could die in the gap between recovery and
+        // restore_tmux_watchers (~50s), losing the response.
+        let pane_alive = tmux_session_alive_with_retry(&tmux_session_name);
+        if pane_alive {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ↻ inflight recovery: pane alive for channel {}, spawning watcher immediately",
+                state.channel_id
+            );
+            // Register session in-memory so handlers can find it.
+            let effective_channel_name = channel_name.clone().or_else(|| {
+                crate::services::provider::parse_provider_and_channel_from_tmux_name(
+                    &tmux_session_name,
+                )
+                .map(|(_, ch)| ch)
+            });
+            {
+                let channel_key = channel_id.get().to_string();
+                let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
+                let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
+                let mut data = shared.core.lock().await;
+                let session = data
+                    .sessions
+                    .entry(channel_id)
+                    .or_insert_with(|| DiscordSession {
+                        session_id: state.session_id.clone(),
+                        current_path: None,
+                        history: Vec::new(),
+                        pending_uploads: Vec::new(),
+                        cleared: false,
+                        remote_profile_name: saved_remote,
+                        channel_id: Some(channel_id.get()),
+                        channel_name: effective_channel_name.clone(),
+                        category_name: None,
+                        last_active: tokio::time::Instant::now(),
+                        worktree: None,
+                        born_generation: super::runtime_store::load_generation(),
+                    });
+                session.channel_id = Some(channel_id.get());
+                session.last_active = tokio::time::Instant::now();
+                if session.current_path.is_none() {
+                    session.current_path = last_path;
+                }
+                if session.channel_name.is_none() {
+                    session.channel_name = effective_channel_name;
+                }
+            }
+
+            // Immediately spawn watcher to avoid race condition.
+            if std::fs::metadata(&output_path).is_ok()
+                && !shared.tmux_watchers.contains_key(&channel_id)
+            {
+                let (initial_offset, current_len, truncated) =
+                    recovery_watcher_start_offset(&output_path, state.last_offset);
+                let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
+                let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let turn_delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                shared.tmux_watchers.insert(
+                    channel_id,
+                    TmuxWatcherHandle {
+                        paused: paused.clone(),
+                        resume_offset: resume_offset.clone(),
+                        cancel: cancel.clone(),
+                        pause_epoch: pause_epoch.clone(),
+                        turn_delivered: turn_delivered.clone(),
+                    },
+                );
+                let ts2 = chrono::Local::now().format("%H:%M:%S");
+                if truncated {
+                    println!(
+                        "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                        tmux_session_name, state.last_offset, current_len
+                    );
+                }
+                println!(
+                    "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                    tmux_session_name, initial_offset
+                );
+                tokio::spawn(super::tmux::tmux_output_watcher(
+                    channel_id,
+                    http.clone(),
+                    shared.clone(),
+                    output_path.clone(),
+                    tmux_session_name.clone(),
+                    initial_offset,
+                    cancel,
+                    paused,
+                    resume_offset,
+                    pause_epoch,
+                    turn_delivered,
+                ));
+            }
+
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
 
         shared
             .recovering_channels
@@ -668,6 +958,7 @@ pub(super) async fn restore_inflight_turns(
         let tmux_for_reader = tmux_session_name.clone();
         let start_offset = state.last_offset;
         let recovery_session_id = state.session_id.clone();
+        let retry_channel_id = channel_id.get();
         std::thread::spawn(move || {
             match claude::read_output_file_until_result(
                 &output_for_reader,
@@ -685,12 +976,37 @@ pub(super) async fn restore_inflight_turns(
                         last_offset: offset,
                     });
                 }
-                Ok(ReadOutputResult::SessionDied { .. }) => {
-                    let _ = tx.send(StreamMessage::Done {
-                        result: "⚠️ AgentDesk 재시작 중 진행되던 세션을 복구하지 못했습니다."
-                            .to_string(),
-                        session_id: recovery_session_id,
-                    });
+                Ok(ReadOutputResult::SessionDied { offset }) => {
+                    // Check if tmux pane is actually alive — dcserver restart
+                    // may cause SessionDied because no new output arrived, but
+                    // the Claude CLI process could still be idle (waiting for input).
+                    let pane_alive = tmux_session_alive_with_retry(&tmux_for_reader);
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    if pane_alive {
+                        // Session is alive but idle — hand off to watcher instead of retrying
+                        eprintln!(
+                            "  [{ts}] ↻ Recovery: session idle but pane alive — handing off to watcher (channel {})",
+                            retry_channel_id
+                        );
+                        let _ = tx.send(StreamMessage::TmuxReady {
+                            output_path: output_for_reader,
+                            input_fifo_path: input_for_reader,
+                            tmux_session_name: tmux_for_reader,
+                            last_offset: offset,
+                        });
+                    } else {
+                        // Session truly dead during restart recovery — hand off
+                        // to the internal post-restart follow-up path instead
+                        // of exposing Discord auto-retry history to the user.
+                        eprintln!(
+                            "  [{ts}] ↻ Recovery: session died, signaling internal handoff (channel {})",
+                            retry_channel_id
+                        );
+                        let _ = tx.send(StreamMessage::Done {
+                            result: RESTART_SESSION_DIED_HANDOFF_SENTINEL.to_string(),
+                            session_id: recovery_session_id,
+                        });
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(StreamMessage::Error {
@@ -702,6 +1018,12 @@ pub(super) async fn restore_inflight_turns(
                 }
             }
         });
+
+        let recovery_dispatch_id = parse_dispatch_id(&state.user_text);
+        // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
+        let mut state = state;
+        state.session_key = state.session_key.or_else(|| adk_session_key.clone());
+        state.dispatch_id = state.dispatch_id.or_else(|| recovery_dispatch_id.clone());
 
         spawn_turn_bridge(
             http.clone(),
@@ -722,7 +1044,7 @@ pub(super) async fn restore_inflight_turns(
                 adk_session_name,
                 adk_session_info: Some(adk_session_info),
                 adk_cwd: last_path.clone(),
-                dispatch_id: parse_dispatch_id(&state.user_text),
+                dispatch_id: recovery_dispatch_id,
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),
@@ -739,6 +1061,7 @@ pub(super) async fn restore_inflight_turns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::provider::ProviderKind;
     use std::io::Write;
 
     #[test]
@@ -932,5 +1255,98 @@ mod tests {
             file.path().to_str().unwrap(),
             0
         ));
+    }
+
+    #[test]
+    fn missing_session_recovery_saves_handoff_for_followup_turn() {
+        let _lock = super::super::runtime_store::test_env_lock().lock().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("agentdesk-root");
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+
+        struct EnvReset;
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+            }
+        }
+
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
+        let _reset = EnvReset;
+
+        let state = crate::services::discord::inflight::InflightTurnState {
+            version: 1,
+            provider: "codex".to_string(),
+            channel_id: 1486333430516945008,
+            channel_name: Some("adk-cdx-t1486333430516945008".to_string()),
+            request_owner_user_id: 343742347365974026,
+            user_msg_id: 1487795113240559788,
+            current_msg_id: 1487799916758827138,
+            current_msg_len: 0,
+            user_text: "릴리즈하다가 응답이 끊겼어. 이어서 설명해줘.".to_string(),
+            session_id: Some("session-1".to_string()),
+            tmux_session_name: Some("AgentDesk-codex-adk-cdx-t1486333430516945008".to_string()),
+            output_path: Some("/tmp/agentdesk-test.jsonl".to_string()),
+            input_fifo_path: Some("/tmp/agentdesk-test.input".to_string()),
+            last_offset: 123,
+            full_response: "중간까지 정리했습니다.".to_string(),
+            response_sent_offset: 0,
+            current_tool_line: None,
+            started_at: "2026-03-29 22:00:34".to_string(),
+            updated_at: "2026-03-29 22:03:53".to_string(),
+            born_generation: 7,
+            any_tool_used: true,
+            has_post_tool_text: false,
+            session_key: None,
+            dispatch_id: None,
+        };
+
+        save_missing_session_handoff(
+            &ProviderKind::Codex,
+            &state,
+            "이미 확인한 내용은 여기까지입니다. 이어서 원인과 대응을 설명하겠습니다.",
+        );
+
+        let handoffs = crate::services::discord::handoff::load_handoffs(&ProviderKind::Codex);
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(handoffs[0].channel_id, state.channel_id);
+        assert_eq!(handoffs[0].user_msg_id, Some(state.user_msg_id));
+        assert!(handoffs[0].intent.contains("중단된 응답"));
+        assert!(handoffs[0].context.contains("원래 사용자 요청"));
+        assert!(handoffs[0].context.contains("partial 응답"));
+        assert!(
+            handoffs[0]
+                .context
+                .contains("이어서 원인과 대응을 설명하겠습니다")
+        );
+    }
+
+    #[test]
+    fn recovery_watcher_resume_uses_saved_offset_when_file_grew() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "before").unwrap();
+        let saved_offset = file.as_file().metadata().unwrap().len();
+        writeln!(file, "after").unwrap();
+        file.flush().unwrap();
+
+        let (offset, current_len, truncated) =
+            recovery_watcher_start_offset(file.path().to_str().unwrap(), saved_offset);
+        assert_eq!(offset, saved_offset);
+        assert!(current_len >= saved_offset);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn recovery_watcher_resume_rewinds_when_file_was_truncated() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "new session output").unwrap();
+        file.flush().unwrap();
+
+        let saved_offset = file.as_file().metadata().unwrap().len() + 100;
+        let (offset, current_len, truncated) =
+            recovery_watcher_start_offset(file.path().to_str().unwrap(), saved_offset);
+        assert_eq!(offset, 0);
+        assert!(current_len < saved_offset);
+        assert!(truncated);
     }
 }

@@ -20,6 +20,7 @@ pub mod offices;
 pub mod onboarding;
 pub mod pipeline;
 mod queue_api;
+pub mod receipt;
 pub mod review_verdict;
 pub mod reviews;
 mod session_activity;
@@ -47,17 +48,38 @@ use crate::services::discord::health::HealthRegistry;
 pub struct AppState {
     pub db: Db,
     pub engine: PolicyEngine,
+    pub broadcast_tx: crate::server::ws::BroadcastTx,
+    pub batch_buffer: crate::server::ws::BatchBuffer,
     pub health_registry: Option<Arc<HealthRegistry>>,
+}
+
+#[cfg(test)]
+impl AppState {
+    pub fn test_state(db: Db, engine: PolicyEngine) -> Self {
+        let tx = crate::server::ws::new_broadcast();
+        let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
+        Self {
+            db,
+            engine,
+            broadcast_tx: tx,
+            batch_buffer: buf,
+            health_registry: None,
+        }
+    }
 }
 
 pub fn api_router(
     db: Db,
     engine: PolicyEngine,
+    broadcast_tx: crate::server::ws::BroadcastTx,
+    batch_buffer: crate::server::ws::BatchBuffer,
     health_registry: Option<Arc<HealthRegistry>>,
 ) -> Router {
     let state = AppState {
         db,
         engine,
+        broadcast_tx,
+        batch_buffer,
         health_registry,
     };
 
@@ -387,6 +409,7 @@ pub fn api_router(
         .route("/audit-logs", get(analytics::audit_logs))
         .route("/machine-status", get(analytics::machine_status))
         .route("/rate-limits", get(analytics::rate_limits))
+        .route("/receipt", get(receipt::get_receipt))
         .route("/skills-trend", get(analytics::skills_trend))
         // Docs
         .route("/docs", get(docs::api_docs))

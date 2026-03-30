@@ -8,6 +8,229 @@ use crate::services::tmux_common::tmux_exact_target;
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 use crate::utils::format::{safe_suffix, tail_with_ellipsis};
 
+/// Auto-retry a failed resume by fetching recent Discord history,
+/// storing it in kv_meta for the router to inject into the LLM prompt,
+/// and re-sending the original message via announce bot.
+/// Discord only sees a short notice — the full history is LLM-only.
+async fn auto_retry_with_history(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    user_text: &str,
+    api_port: u16,
+) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+
+    // Dedup guard: use a static set to prevent turn_bridge + watcher from
+    // both firing auto-retry for the same channel simultaneously.
+    use std::sync::LazyLock;
+    static RETRY_PENDING: LazyLock<dashmap::DashSet<u64>> =
+        LazyLock::new(|| dashmap::DashSet::new());
+    if !RETRY_PENDING.insert(channel_id.get()) {
+        eprintln!("  [{ts}] ⏭ auto-retry: skipped (dedup) for channel {channel_id}");
+        return;
+    }
+    // Clean up guard after 30 seconds (allow future retries)
+    let ch_id = channel_id.get();
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        RETRY_PENDING.remove(&ch_id);
+    });
+
+    eprintln!("  [{ts}] ↻ auto-retry: fetching last 10 messages for channel {channel_id}");
+
+    // Fetch last 10 messages from Discord
+    let history = match channel_id
+        .messages(http, serenity::builder::GetMessages::new().limit(10))
+        .await
+    {
+        Ok(msgs) => {
+            let mut lines = Vec::new();
+            for msg in msgs.iter().rev() {
+                let author = &msg.author.name;
+                let content = msg.content.chars().take(300).collect::<String>();
+                if !content.trim().is_empty() {
+                    lines.push(format!("{}: {}", author, content));
+                }
+            }
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        Err(e) => {
+            eprintln!("  [{ts}] ⚠ auto-retry: failed to fetch history: {e}");
+            None
+        }
+    };
+
+    // Store history in kv_meta for the router to inject into LLM prompt.
+    // Key: session_retry_context:{channel_id} — consumed on next turn start.
+    if let Some(ref hist) = history {
+        let _ = reqwest::Client::new()
+            .post(local_api_url(api_port, "/api/kv"))
+            .json(&serde_json::json!({
+                "key": format!("session_retry_context:{}", channel_id),
+                "value": hist,
+            }))
+            .send()
+            .await;
+    }
+
+    // Discord message: short notice only — history stays LLM-side
+    let retry_content = format!(
+        "[이전 대화 복원 — 세션이 만료되어 최근 대화를 컨텍스트로 제공합니다]\n\n{}",
+        user_text
+    );
+    let retry_ch = channel_id.get().to_string();
+
+    let _ = reqwest::Client::new()
+        .post(local_api_url(api_port, "/api/send"))
+        .json(&serde_json::json!({
+            "target": format!("channel:{retry_ch}"),
+            "content": retry_content,
+            "source": "pipeline",
+            "bot": "announce",
+        }))
+        .send()
+        .await;
+}
+
+fn clear_local_session_state(
+    new_session_id: &mut Option<String>,
+    inflight_state: &mut InflightTurnState,
+) {
+    *new_session_id = None;
+    inflight_state.session_id = None;
+}
+
+async fn reset_session_for_auto_retry(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    cancel_token: &Arc<CancelToken>,
+    adk_session_key: Option<&str>,
+    new_session_id: &mut Option<String>,
+    inflight_state: &mut InflightTurnState,
+    reason: &str,
+) {
+    clear_local_session_state(new_session_id, inflight_state);
+    let _ = save_inflight_state(inflight_state);
+
+    let stale_sid = {
+        let mut data = shared.core.lock().await;
+        let old = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|s| s.session_id.clone());
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            session.session_id = None;
+        }
+        old
+    };
+
+    if let Some(key) = adk_session_key {
+        super::adk_session::clear_claude_session_id(key, shared.api_port).await;
+    }
+
+    if let Some(ref sid) = stale_sid {
+        let port = shared.api_port;
+        let sid_c = sid.clone();
+        let _ = reqwest::Client::new()
+            .post(crate::config::local_api_url(
+                port,
+                "/api/dispatched-sessions/clear-stale-session-id",
+            ))
+            .json(&serde_json::json!({"claude_session_id": sid_c}))
+            .send()
+            .await;
+    }
+
+    #[cfg(unix)]
+    if let Some(name) = cancel_token
+        .tmux_session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        eprintln!("  [{ts}] ♻ auto-retry: killing tmux session {name} before retry ({reason})");
+        record_tmux_exit_reason(
+            &name,
+            &format!("forcing fresh session before auto-retry: {reason}"),
+        );
+        crate::services::platform::tmux::kill_session(&name);
+    }
+}
+
+pub(super) fn contains_stale_resume_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no conversation found") || lower.contains("error: no conversation")
+}
+
+pub(super) fn result_event_has_stale_resume_error(value: &serde_json::Value) -> bool {
+    if value.get("type").and_then(|v| v.as_str()) != Some("result") {
+        return false;
+    }
+
+    let subtype = value.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    let is_error = value
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || subtype.starts_with("error");
+    if !is_error {
+        return false;
+    }
+
+    if value
+        .get("result")
+        .and_then(|v| v.as_str())
+        .map(contains_stale_resume_error_text)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    value
+        .get("errors")
+        .and_then(|v| v.as_array())
+        .map(|errors| {
+            errors.iter().any(|err| {
+                err.as_str()
+                    .map(contains_stale_resume_error_text)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn output_file_has_stale_resume_error_after_offset(output_path: &str, start_offset: u64) -> bool {
+    let Ok(bytes) = std::fs::read(output_path) else {
+        return false;
+    };
+    let start = usize::try_from(start_offset)
+        .ok()
+        .map(|offset| offset.min(bytes.len()))
+        .unwrap_or(bytes.len());
+
+    String::from_utf8_lossy(&bytes[start..])
+        .lines()
+        .any(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .map(|value| result_event_has_stale_resume_error(&value))
+                .unwrap_or(false)
+        })
+}
+
+fn stream_error_has_stale_resume_error(message: &str, stderr: &str) -> bool {
+    contains_stale_resume_error_text(message) || contains_stale_resume_error_text(stderr)
+}
+
 /// Decide the final response text when a Done event arrives.
 ///
 /// Returns the text that should be used as `full_response`.
@@ -52,18 +275,15 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
                 #[cfg(unix)]
                 {
                     // #145: skip kill for unified-thread sessions with active runs
-                    let is_unified = crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
-                        .map(|(_, ch)| crate::dispatch::is_unified_thread_channel_name_active(&ch))
-                        .unwrap_or(false);
+                    let is_unified =
+                        crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
+                            .map(|(_, ch)| {
+                                crate::dispatch::is_unified_thread_channel_name_active(&ch)
+                            })
+                            .unwrap_or(false);
                     if !is_unified {
-                        record_tmux_exit_reason(
-                            &name,
-                            &format!("explicit cleanup via {reason}"),
-                        );
-                        let exact_target = tmux_exact_target(&name);
-                        let _ = std::process::Command::new("tmux")
-                            .args(["kill-session", "-t", &exact_target])
-                            .output();
+                        record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
+                        crate::services::platform::tmux::kill_session(&name);
                     }
                 }
                 #[cfg(not(unix))]
@@ -214,15 +434,19 @@ fn extract_review_decision(full_response: &str) -> Option<&'static str> {
 async fn submit_review_decision_fallback(
     api_port: u16,
     card_id: &str,
+    dispatch_id: &str,
     decision: &str,
     full_response: &str,
 ) -> Result<(), String> {
     let comment = truncate_str(full_response.trim(), 4000).to_string();
     let url = local_api_url(api_port, "/api/review-decision");
+    // #109: Include dispatch_id so the server can atomically consume the
+    // specific review-decision dispatch, preventing replay attacks.
     let resp = reqwest::Client::new()
         .post(url)
         .json(&serde_json::json!({
             "card_id": card_id,
+            "dispatch_id": dispatch_id,
             "decision": decision,
             "comment": comment,
         }))
@@ -340,6 +564,7 @@ async fn guard_review_dispatch_completion(
                     match submit_review_decision_fallback(
                         api_port,
                         card_id,
+                        dispatch_id,
                         decision,
                         full_response,
                     )
@@ -364,6 +589,37 @@ async fn guard_review_dispatch_completion(
 }
 
 /// Explicitly complete implementation/rework dispatches at turn end.
+/// Last-resort dispatch completion via runtime-root SQLite file.
+///
+/// Opens a fresh connection to the on-disk DB (bypassing the Db pool) and writes
+/// a status + reconciliation marker so onTick can run the hook chain later.
+/// Returns `true` if the UPDATE affected at least one row.
+pub(super) fn runtime_db_fallback_complete(dispatch_id: &str, source: &str) -> bool {
+    let Some(root) = crate::cli::agentdesk_runtime_root() else {
+        return false;
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+        return false;
+    };
+    let result_json = format!("{{\"completion_source\":\"{source}\",\"needs_reconcile\":true}}");
+    let changed = conn
+        .execute(
+            "UPDATE task_dispatches SET status = 'completed', result = ?1, \
+             updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+            rusqlite::params![result_json, dispatch_id],
+        )
+        .unwrap_or(0);
+    if changed > 0 {
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
+        )
+        .ok();
+    }
+    changed > 0
+}
+
 /// Unlike review dispatches (which auto-complete on session idle), these types
 /// require an explicit PATCH so the pipeline can advance deterministically.
 /// Fail a dispatch with retry on PATCH failure.
@@ -418,14 +674,21 @@ async fn fail_dispatch_with_retry(api_port: u16, dispatch_id: Option<&str>, erro
     }
 }
 
-async fn complete_work_dispatch_on_turn_end(api_port: u16, dispatch_id: Option<&str>) {
+/// Complete an implementation/rework dispatch via finalize_dispatch (#143).
+///
+/// Retries finalize_dispatch 3× with 1-second backoff. On exhaustion, falls back
+/// to direct DB UPDATE + reconciliation marker for onTick hook chain.
+/// When Db/Engine are unavailable, retries API PATCH 3× then DB fallback.
+async fn complete_work_dispatch_on_turn_end(
+    shared: &Arc<super::SharedData>,
+    dispatch_id: Option<&str>,
+) {
     let Some(dispatch_id) = dispatch_id else {
         return;
     };
-    let Some(snapshot) = fetch_dispatch_snapshot(api_port, dispatch_id).await else {
-        // Snapshot fetch failed — fail the dispatch with retry to prevent orphan
+    let Some(snapshot) = fetch_dispatch_snapshot(shared.api_port, dispatch_id).await else {
         fail_dispatch_with_retry(
-            api_port,
+            shared.api_port,
             Some(dispatch_id),
             "dispatch snapshot fetch failed",
         )
@@ -440,62 +703,106 @@ async fn complete_work_dispatch_on_turn_end(api_port: u16, dispatch_id: Option<&
         _ => return,
     }
 
-    let url = local_api_url(api_port, &format!("/api/dispatches/{dispatch_id}"));
-    let payload = serde_json::json!({
-        "status": "completed",
-        "result": {
-            "completion_source": "turn_bridge_explicit",
-        },
-    });
-    for attempt in 1..=3 {
-        match reqwest::Client::new()
-            .patch(&url)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
-                    dtype = snapshot.dispatch_type,
-                );
-                return;
-            }
-            Ok(resp) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
-                    "  [{ts}] ⚠ Explicit dispatch completion failed (attempt {attempt}/3): HTTP {}",
-                    resp.status()
-                );
-            }
-            Err(e) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
-                    "  [{ts}] ⚠ Explicit dispatch completion error (attempt {attempt}/3): {e}"
-                );
+    // Direct finalize_dispatch with retry — single completion authority (#143)
+    if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+        for attempt in 1..=3u8 {
+            match crate::dispatch::finalize_dispatch(
+                db,
+                engine,
+                dispatch_id,
+                "turn_bridge_explicit",
+                None,
+            ) {
+                Ok(_) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id}",
+                        dtype = snapshot.dispatch_type,
+                    );
+                    crate::server::routes::dispatches::queue_dispatch_followup(db, dispatch_id);
+                    return;
+                }
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⚠ finalize_dispatch failed for {dispatch_id} (attempt {attempt}/3): {e}"
+                    );
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
             }
         }
-        if attempt < 3 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-    }
-    // Fallback: direct DB update + reconciliation marker for onTick hook chain.
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    eprintln!(
-        "  [{ts}] ❌ Explicit completion failed after 3 retries, falling back to direct DB for {dispatch_id}"
-    );
-    if let Some(root) = crate::cli::agentdesk_runtime_root() {
-        let db_path = root.join("data/agentdesk.sqlite");
-        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let _ = conn.execute(
-                "UPDATE task_dispatches SET status = 'completed', result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', updated_at = datetime('now') WHERE id = ?1 AND status = 'pending'",
+        // All retries exhausted — DB fallback via pool, then runtime-root file
+        let fallback_ok = db.separate_conn().ok().map_or(false, |conn| {
+            let changed = conn.execute(
+                "UPDATE task_dispatches SET status = 'completed', \
+                 result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', \
+                 updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
                 [dispatch_id],
-            );
-            // Leave reconciliation marker for onTick to run hook chain
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
+            ).unwrap_or(0);
+            if changed > 0 {
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
+                ).ok();
+            }
+            changed > 0
+        });
+        if !fallback_ok {
+            let ok = runtime_db_fallback_complete(dispatch_id, "turn_bridge_db_fallback");
+            if !ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] 🔴 CRITICAL: all completion paths exhausted for dispatch {dispatch_id} — dispatch stranded"
+                );
+            }
+        }
+    } else {
+        // Db/Engine not available — fall back to API PATCH with retry
+        let url = local_api_url(shared.api_port, &format!("/api/dispatches/{dispatch_id}"));
+        let payload = serde_json::json!({
+            "status": "completed",
+            "result": { "completion_source": "turn_bridge_explicit" },
+        });
+        for attempt in 1..=3u8 {
+            match reqwest::Client::new()
+                .patch(&url)
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ✅ Explicitly completed {dtype} dispatch {dispatch_id} (via API)",
+                        dtype = snapshot.dispatch_type,
+                    );
+                    return;
+                }
+                Ok(resp) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⚠ Explicit dispatch completion failed (attempt {attempt}/3): HTTP {}",
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⚠ Explicit dispatch completion error (attempt {attempt}/3): {e}"
+                    );
+                }
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        // API retries exhausted — runtime-root DB fallback
+        if !runtime_db_fallback_complete(dispatch_id, "turn_bridge_db_fallback") {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] 🔴 CRITICAL: all completion paths exhausted for dispatch {dispatch_id} — dispatch stranded"
             );
         }
     }
@@ -566,6 +873,9 @@ pub(super) fn spawn_turn_bridge(
         let mut has_post_tool_text = bridge.inflight_state.has_post_tool_text;
         let mut tmux_handed_off = false;
         let mut transport_error = false;
+        let mut resume_failure_detected = false;
+        let mut restart_recovery_handoff = false;
+        let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
         let current_msg_id = bridge.current_msg_id;
         let response_sent_offset = bridge.response_sent_offset;
@@ -750,6 +1060,16 @@ pub(super) fn spawn_turn_bridge(
                             result,
                             session_id: sid,
                         } => {
+                            if result == super::recovery::RESTART_SESSION_DIED_HANDOFF_SENTINEL {
+                                restart_recovery_handoff = true;
+                            } else if result == "__session_died_retry__" {
+                                // Legacy fallback: older recovery reporters used
+                                // auto-retry instead of the internal handoff
+                                // sentinel. Keep this branch for mixed-runtime
+                                // rollouts until every caller emits the new
+                                // sentinel consistently.
+                                recovery_retry = true;
+                            }
                             if let Some(resolved) = resolve_done_response(
                                 &full_response,
                                 &result,
@@ -769,6 +1089,8 @@ pub(super) fn spawn_turn_bridge(
                         StreamMessage::Error {
                             message, stderr, ..
                         } => {
+                            let is_stale_resume =
+                                stream_error_has_stale_resume_error(&message, &stderr);
                             transport_error = true;
                             let combined = format!("{} {}", message, stderr).to_lowercase();
                             if combined.contains("prompt is too long")
@@ -782,6 +1104,20 @@ pub(super) fn spawn_turn_bridge(
                                 // with a shorter message or /compact. Don't mark as transport error.
                                 transport_error = false;
                                 full_response = "⚠️ __prompt too long__".to_string();
+                            } else if is_stale_resume {
+                                // Recoverable stale resume: auto-retry with a fresh provider
+                                // session instead of failing the current dispatch/turn.
+                                transport_error = false;
+                                resume_failure_detected = true;
+                                if !stderr.is_empty() {
+                                    full_response = format!(
+                                        "Error: {}\nstderr: {}",
+                                        message,
+                                        truncate_str(&stderr, 500)
+                                    );
+                                } else {
+                                    full_response = format!("Error: {}", message);
+                                }
                             } else if !stderr.is_empty() {
                                 full_response = format!(
                                     "Error: {}\nstderr: {}",
@@ -979,7 +1315,7 @@ pub(super) fn spawn_turn_bridge(
         // Skip if: cancelled, prompt too long, or transport error.
         // transport_error is set by StreamMessage::Error — not substring matching.
         if !cancelled && !is_prompt_too_long && !transport_error {
-            complete_work_dispatch_on_turn_end(shared_owned.api_port, dispatch_id.as_deref()).await;
+            complete_work_dispatch_on_turn_end(&shared_owned, dispatch_id.as_deref()).await;
         } else if transport_error && !cancelled {
             // Transport error — fail the dispatch instead of completing
             fail_dispatch_with_retry(
@@ -1010,8 +1346,7 @@ pub(super) fn spawn_turn_bridge(
         if dispatch_id.is_none() && !is_prompt_too_long {
             let total_tokens =
                 total_context_tokens(accumulated_input_tokens, accumulated_output_tokens);
-            let ctx_cfg =
-                super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
+            let ctx_cfg = super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
             let pct = (total_tokens * 100) / ctx_cfg.context_window.max(1);
             if pct >= ctx_cfg.compact_pct {
                 if let Some(ref tmux_name) = inflight_state.tmux_session_name {
@@ -1019,11 +1354,9 @@ pub(super) fn spawn_turn_bridge(
                     println!(
                         "  [{ts}] ⚡ Auto-compact: {tmux_name} at {pct}% ({total_tokens} tokens)"
                     );
-                    let exact_target = tmux_exact_target(tmux_name);
+                    let name = tmux_name.to_string();
                     let _ = tokio::task::spawn_blocking(move || {
-                        std::process::Command::new("tmux")
-                            .args(["send-keys", "-t", &exact_target, "/compact", "Enter"])
-                            .output()
+                        crate::services::platform::tmux::send_keys(&name, &["/compact", "Enter"])
                     })
                     .await;
                 }
@@ -1084,7 +1417,98 @@ pub(super) fn spawn_turn_bridge(
             remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
         }
 
-        if cancelled {
+        // Recovery auto-retry: session died during restart recovery
+        if recovery_retry {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ↻ Recovery session died — triggering auto-retry with history (channel {})",
+                channel_id
+            );
+            reset_session_for_auto_retry(
+                &shared_owned,
+                channel_id,
+                &cancel_token,
+                adk_session_key.as_deref(),
+                &mut new_session_id,
+                &mut inflight_state,
+                "recovery session died",
+            )
+            .await;
+            // Auto-retry with Discord history
+            let http_c = http.clone();
+            let retry_text = user_text_owned.clone();
+            let retry_port = shared_owned.api_port;
+            tokio::spawn(async move {
+                auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+            });
+            // Replace placeholder with recovery notice (don't delete — avoids visual gap)
+            let _ = channel_id
+                .edit_message(
+                    &http,
+                    current_msg_id,
+                    serenity::EditMessage::new()
+                        .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                )
+                .await;
+            full_response = String::new();
+        }
+
+        if restart_recovery_handoff {
+            let best_response =
+                if full_response == super::recovery::RESTART_SESSION_DIED_HANDOFF_SENTINEL {
+                    String::new()
+                } else {
+                    full_response.clone()
+                };
+            let handed_off = super::tmux::start_restart_handoff_from_state(
+                channel_id,
+                &http,
+                &shared_owned,
+                &provider,
+                inflight_state.clone(),
+                &best_response,
+            )
+            .await;
+            if handed_off {
+                full_response = String::new();
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ↻ Recovery session died — queued internal handoff instead of Discord auto-retry (channel {})",
+                    channel_id
+                );
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Recovery session died — internal handoff failed, falling back to auto-retry (channel {})",
+                    channel_id
+                );
+                reset_session_for_auto_retry(
+                    &shared_owned,
+                    channel_id,
+                    &cancel_token,
+                    adk_session_key.as_deref(),
+                    &mut new_session_id,
+                    &mut inflight_state,
+                    "restart recovery handoff failed",
+                )
+                .await;
+                let http_c = http.clone();
+                let retry_text = user_text_owned.clone();
+                let retry_port = shared_owned.api_port;
+                tokio::spawn(async move {
+                    auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                });
+                let _ = channel_id
+                    .edit_message(
+                        &http,
+                        current_msg_id,
+                        serenity::EditMessage::new()
+                            .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                    )
+                    .await;
+                full_response = String::new();
+            }
+        } else if cancelled {
             if let Ok(guard) = cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
                     claude::kill_pid_tree(pid);
@@ -1153,7 +1577,33 @@ pub(super) fn spawn_turn_bridge(
                 channel_id
             );
         } else {
-            if full_response.is_empty() {
+            // Check for stale resume failure BEFORE any other response handling.
+            // This path is driven by explicit error/result events, not assistant text.
+            if resume_failure_detected {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Resume failed (error in response), clearing session_id (channel {})",
+                    channel_id
+                );
+                reset_session_for_auto_retry(
+                    &shared_owned,
+                    channel_id,
+                    &cancel_token,
+                    adk_session_key.as_deref(),
+                    &mut new_session_id,
+                    &mut inflight_state,
+                    "resume failed in response output",
+                )
+                .await;
+                // Auto-retry with Discord history context
+                let http_c = http.clone();
+                let retry_text = user_text_owned.clone();
+                let retry_port = shared_owned.api_port;
+                tokio::spawn(async move {
+                    auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                });
+                full_response = String::new(); // Suppress error message to user
+            } else if full_response.is_empty() {
                 // Fallback: try to extract response from tmux output file
                 if let Some(ref path) = inflight_state.output_path {
                     let recovered = super::recovery::extract_response_from_output_pub(
@@ -1171,129 +1621,85 @@ pub(super) fn spawn_turn_bridge(
                     }
                 }
 
-                // Check for resume failure BEFORE other response handling.
-                // Covers both empty response AND error text in response.
-                let resume_error_in_response = full_response.contains("No conversation found")
-                    || full_response.contains("Error: No conversation");
-                if resume_error_in_response {
+                // Check for stale resume failure in recovered output
+                let stale_resume_in_output = inflight_state
+                    .output_path
+                    .as_deref()
+                    .map(|path| {
+                        output_file_has_stale_resume_error_after_offset(
+                            path,
+                            inflight_state.last_offset,
+                        )
+                    })
+                    .unwrap_or(false);
+                if stale_resume_in_output {
+                    resume_failure_detected = true;
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     eprintln!(
-                        "  [{ts}] ⚠ Resume failed (error in response), clearing session_id (channel {})",
+                        "  [{ts}] ⚠ Resume failed (stale session_id in recovered output), auto-retrying (channel {})",
                         channel_id
                     );
-                    // Clear all 3 locations
-                    let stale_sid = {
-                        let mut data = shared_owned.core.lock().await;
-                        let old = data
-                            .sessions
-                            .get(&channel_id)
-                            .and_then(|s| s.session_id.clone());
-                        if let Some(session) = data.sessions.get_mut(&channel_id) {
-                            session.session_id = None;
-                        }
-                        old
-                    };
-                    if let Some(ref key) = adk_session_key {
-                        super::adk_session::save_claude_session_id(key, "", shared_owned.api_port)
-                            .await;
-                    }
-                    if let Some(ref sid) = stale_sid {
-                        if let Some(root) = crate::cli::agentdesk_runtime_root() {
-                            let f = root.join("ai_sessions").join(format!("{sid}.json"));
-                            let _ = std::fs::remove_file(&f);
-                        }
-                        let port = shared_owned.api_port;
-                        let sid_c = sid.clone();
-                        tokio::spawn(async move {
-                            let _ = reqwest::Client::new()
-                                .post(crate::config::local_api_url(
-                                    port,
-                                    "/api/dispatched-sessions/clear-stale-session-id",
-                                ))
-                                .json(&serde_json::json!({"claude_session_id": sid_c}))
-                                .send()
-                                .await;
-                        });
-                    }
-                    full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
-                } else if full_response.is_empty() {
+                    reset_session_for_auto_retry(
+                        &shared_owned,
+                        channel_id,
+                        &cancel_token,
+                        adk_session_key.as_deref(),
+                        &mut new_session_id,
+                        &mut inflight_state,
+                        "stale session_id in recovered output",
+                    )
+                    .await;
+                    let http_c = http.clone();
+                    let retry_text = user_text_owned.clone();
+                    let retry_port = shared_owned.api_port;
+                    tokio::spawn(async move {
+                        auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                    });
+                    full_response = String::new();
+                } else {
                     // Check for resume failure via other methods
                     let mut resume_failed = false;
                     let quick_exit = turn_start.elapsed().as_secs() < 10;
-                    let _had_session_id =
-                        new_session_id.is_none() && bridge.new_session_id.is_none();
                     // Method 1: check tmux output file
                     if let Some(ref path) = inflight_state.output_path {
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            if content.contains("No conversation found")
-                                || content.contains("Error: No conversation")
-                            {
-                                resume_failed = true;
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!(
-                                    "  [{ts}] ⚠ Resume failed (stale session_id), clearing for fresh start (channel {})",
-                                    channel_id
-                                );
-                                // Clear stale session_id from ALL 3 storage locations:
-                                // 1. In-memory
-                                let stale_sid = {
-                                    let mut data = shared_owned.core.lock().await;
-                                    let old_sid = data
-                                        .sessions
-                                        .get(&channel_id)
-                                        .and_then(|s| s.session_id.clone());
-                                    if let Some(session) = data.sessions.get_mut(&channel_id) {
-                                        session.session_id = None;
-                                    }
-                                    old_sid
-                                };
-                                // 2. DB
-                                if let Some(ref key) = adk_session_key {
-                                    super::adk_session::save_provider_session_id(
-                                        key,
-                                        "",
-                                        shared_owned.api_port,
-                                    )
-                                    .await;
-                                }
-                                // 3. Session file on disk (ai_sessions/{id}.json)
-                                if let Some(ref sid) = stale_sid {
-                                    if let Some(root) = crate::cli::agentdesk_runtime_root() {
-                                        let session_file =
-                                            root.join("ai_sessions").join(format!("{sid}.json"));
-                                        if session_file.exists() {
-                                            let _ = std::fs::remove_file(&session_file);
-                                            eprintln!(
-                                                "  [{ts}] 🗑 Removed stale session file: {}",
-                                                session_file.display()
-                                            );
-                                        }
-                                    }
-                                }
-                                // Also clear any other sessions in DB with same stale ID via API
-                                if let Some(ref sid) = stale_sid {
-                                    let port = shared_owned.api_port;
-                                    let sid_clone = sid.clone();
-                                    tokio::spawn(async move {
-                                        let url = local_api_url(
-                                            port,
-                                            "/api/dispatched-sessions/clear-stale-session-id",
-                                        );
-                                        let _ = reqwest::Client::new()
-                                            .post(&url)
-                                            .json(&serde_json::json!({"session_id": sid_clone, "claude_session_id": sid_clone}))
-                                            .send()
-                                            .await;
-                                    });
-                                }
-                                full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
-                            }
+                        if output_file_has_stale_resume_error_after_offset(
+                            path,
+                            inflight_state.last_offset,
+                        ) {
+                            resume_failed = true;
+                            resume_failure_detected = true;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ⚠ Resume failed (stale session_id in output file), auto-retrying (channel {})",
+                                channel_id
+                            );
+                            reset_session_for_auto_retry(
+                                &shared_owned,
+                                channel_id,
+                                &cancel_token,
+                                adk_session_key.as_deref(),
+                                &mut new_session_id,
+                                &mut inflight_state,
+                                "stale session_id in output file",
+                            )
+                            .await;
+                            let http_c = http.clone();
+                            let retry_text = user_text_owned.clone();
+                            let retry_port = shared_owned.api_port;
+                            tokio::spawn(async move {
+                                auto_retry_with_history(
+                                    &http_c,
+                                    channel_id,
+                                    &retry_text,
+                                    retry_port,
+                                )
+                                .await;
+                            });
+                            full_response = String::new();
                         }
                     }
                     // Method 2: quick exit (<10s) + empty response + had a session_id to resume
-                    // = Claude exited immediately due to stale session
                     if !resume_failed && quick_exit && rx_disconnected {
-                        // Check if we attempted a resume (session_id was set at turn start)
                         let attempted_resume = {
                             let data = shared_owned.core.lock().await;
                             data.sessions
@@ -1303,50 +1709,35 @@ pub(super) fn spawn_turn_bridge(
                         };
                         if attempted_resume {
                             resume_failed = true;
+                            resume_failure_detected = true;
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             eprintln!(
-                                "  [{ts}] ⚠ Quick exit with empty response — likely stale session_id (channel {})",
+                                "  [{ts}] ⚠ Quick exit with empty response — auto-retrying with fresh session (channel {})",
                                 channel_id
                             );
-                            // Clear all 3 locations
-                            let stale_sid = {
-                                let mut data = shared_owned.core.lock().await;
-                                let old = data
-                                    .sessions
-                                    .get(&channel_id)
-                                    .and_then(|s| s.session_id.clone());
-                                if let Some(session) = data.sessions.get_mut(&channel_id) {
-                                    session.session_id = None;
-                                }
-                                old
-                            };
-                            if let Some(ref key) = adk_session_key {
-                                super::adk_session::save_claude_session_id(
-                                    key,
-                                    "",
-                                    shared_owned.api_port,
+                            reset_session_for_auto_retry(
+                                &shared_owned,
+                                channel_id,
+                                &cancel_token,
+                                adk_session_key.as_deref(),
+                                &mut new_session_id,
+                                &mut inflight_state,
+                                "quick exit with empty response",
+                            )
+                            .await;
+                            let http_c = http.clone();
+                            let retry_text = user_text_owned.clone();
+                            let retry_port = shared_owned.api_port;
+                            tokio::spawn(async move {
+                                auto_retry_with_history(
+                                    &http_c,
+                                    channel_id,
+                                    &retry_text,
+                                    retry_port,
                                 )
                                 .await;
-                            }
-                            if let Some(ref sid) = stale_sid {
-                                if let Some(root) = crate::cli::agentdesk_runtime_root() {
-                                    let f = root.join("ai_sessions").join(format!("{sid}.json"));
-                                    let _ = std::fs::remove_file(&f);
-                                }
-                                let port = shared_owned.api_port;
-                                let sid_c = sid.clone();
-                                tokio::spawn(async move {
-                                    let _ = reqwest::Client::new()
-                                        .post(crate::config::local_api_url(
-                                            port,
-                                            "/api/dispatched-sessions/clear-stale-session-id",
-                                        ))
-                                        .json(&serde_json::json!({"claude_session_id": sid_c}))
-                                        .send()
-                                        .await;
-                                });
-                            }
-                            full_response = "⚠️ 이전 대화 세션이 만료되어 새 세션으로 시작합니다. 메시지를 다시 보내주세요.".to_string();
+                            });
+                            full_response = String::new();
                         }
                     }
                     if !resume_failed {
@@ -1371,15 +1762,28 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            full_response = format_for_discord(&full_response);
-            let _ = super::formatting::replace_long_message_raw(
-                &http,
-                channel_id,
-                current_msg_id,
-                &full_response,
-                &shared_owned,
-            )
-            .await;
+            // If response is empty (e.g. auto-retry on stale session), show
+            // recovery notice instead of deleting — avoids visual gap.
+            if full_response.trim().is_empty() {
+                let _ = channel_id
+                    .edit_message(
+                        &http,
+                        current_msg_id,
+                        serenity::EditMessage::new()
+                            .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                    )
+                    .await;
+            } else {
+                full_response = format_for_discord(&full_response);
+                let _ = super::formatting::replace_long_message_raw(
+                    &http,
+                    channel_id,
+                    current_msg_id,
+                    &full_response,
+                    &shared_owned,
+                )
+                .await;
+            }
 
             // Signal the watcher that this turn's response was already delivered.
             // Prevents the watcher from relaying the same response when it resumes.
@@ -1387,7 +1791,9 @@ pub(super) fn spawn_turn_bridge(
                 watcher.turn_delivered.store(true, Ordering::Relaxed);
             }
 
-            add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
+            if !full_response.trim().is_empty() {
+                add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
+            }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Response sent");
@@ -1464,13 +1870,14 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        // Update in-memory session under lock, then do file I/O outside the
-        // lock to avoid blocking other tasks (including health checks).
-        let (file_save_info, session_id_to_persist) = {
+        // Update in-memory session under lock.
+        let session_id_to_persist = {
             let mut data = shared_owned.core.lock().await;
             if let Some(session) = data.sessions.get_mut(&channel_id) {
                 if !session.cleared && !is_prompt_too_long {
-                    if let Some(sid) = new_session_id {
+                    if resume_failure_detected {
+                        session.session_id = None;
+                    } else if let Some(sid) = new_session_id {
                         session.session_id = Some(sid);
                     }
                     session.history.push(HistoryItem {
@@ -1481,36 +1888,28 @@ pub(super) fn spawn_turn_bridge(
                         item_type: HistoryType::Assistant,
                         content: full_response.clone(),
                     });
-                    let current_path = session.current_path.clone();
-                    let channel_name = session.channel_name.clone();
-                    let persisted_sid = session.session_id.clone();
-                    let info = current_path.map(|path| {
-                        let snapshot = session.clone();
-                        (path, channel_name, snapshot)
-                    });
-                    (info, persisted_sid)
+                    session.session_id.clone()
                 } else {
-                    (None, None)
+                    None
                 }
             } else {
-                (None, None)
+                None
             }
         };
-        // File I/O runs without holding core lock
-        if let Some((path, _channel_name, session_snapshot)) = file_save_info {
-            save_session_to_file(&session_snapshot, &path);
-        }
 
         // Persist provider session_id to DB so it survives dcserver restarts.
-        if let (Some(ref session_key), Some(ref persisted_sid)) =
-            (adk_session_key, session_id_to_persist)
-        {
-            super::adk_session::save_provider_session_id(
-                session_key,
-                persisted_sid,
-                shared_owned.api_port,
-            )
-            .await;
+        if !resume_failure_detected {
+            if let (Some(ref session_key), Some(ref persisted_sid)) =
+                (adk_session_key, session_id_to_persist)
+            {
+                super::adk_session::save_provider_session_id(
+                    session_key,
+                    persisted_sid,
+                    &provider,
+                    shared_owned.api_port,
+                )
+                .await;
+            }
         }
 
         // Clear restart report BEFORE clearing inflight state (which removes
@@ -1554,11 +1953,9 @@ pub(super) fn spawn_turn_bridge(
                         name,
                         "dispatch turn completed — killing thread session",
                     );
-                    let exact_target = tmux_exact_target(&name);
+                    let name_c = name.to_string();
                     let kill_result = tokio::task::spawn_blocking(move || {
-                        std::process::Command::new("tmux")
-                            .args(["kill-session", "-t", &exact_target])
-                            .output()
+                        crate::services::platform::tmux::kill_session_output(&name_c)
                     })
                     .await;
                     let kill_ok = matches!(&kill_result, Ok(Ok(o)) if o.status.success());
@@ -1740,10 +2137,15 @@ pub(super) fn spawn_turn_bridge(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_verdict_payload, extract_explicit_review_verdict, extract_review_decision,
-        persisted_context_tokens, resolve_done_response, should_resume_watcher_after_turn,
-        total_context_tokens,
+        build_verdict_payload, clear_local_session_state, contains_stale_resume_error_text,
+        extract_explicit_review_verdict, extract_review_decision,
+        output_file_has_stale_resume_error_after_offset, persisted_context_tokens,
+        resolve_done_response, result_event_has_stale_resume_error,
+        should_resume_watcher_after_turn, total_context_tokens,
     };
+    use crate::services::discord::InflightTurnState;
+    use crate::services::provider::ProviderKind;
+    use std::io::Write;
 
     #[test]
     fn chained_batch_mid_turn_keeps_watcher_paused() {
@@ -1769,6 +2171,142 @@ mod tests {
     #[test]
     fn total_context_tokens_saturates_on_overflow() {
         assert_eq!(total_context_tokens(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn clear_local_session_state_drops_stale_resume_id_everywhere() {
+        let mut new_session_id = Some("stale-session".to_string());
+        let mut inflight_state = InflightTurnState::new(
+            ProviderKind::Claude,
+            1479671298497183835,
+            Some("adk-cc".to_string()),
+            343742347365974026,
+            1,
+            2,
+            "resume me".to_string(),
+            Some("stale-session".to_string()),
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+
+        clear_local_session_state(&mut new_session_id, &mut inflight_state);
+
+        assert_eq!(new_session_id, None);
+        assert_eq!(inflight_state.session_id, None);
+    }
+
+    #[test]
+    fn stale_resume_text_helper_matches_known_error_shapes() {
+        assert!(contains_stale_resume_error_text("Error: No conversation"));
+        assert!(contains_stale_resume_error_text(
+            "No conversation found for session"
+        ));
+        assert!(!contains_stale_resume_error_text(
+            "The assistant explained why a conversation was missing context."
+        ));
+    }
+
+    #[test]
+    fn stale_resume_result_helper_requires_error_result_record() {
+        let assistant_text = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": "The log said No conversation found"
+                }]
+            }
+        });
+        let success_result = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "No conversation found while inspecting logs",
+        });
+        let error_result = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["No conversation found"],
+        });
+
+        assert!(!result_event_has_stale_resume_error(&assistant_text));
+        assert!(!result_event_has_stale_resume_error(&success_result));
+        assert!(result_event_has_stale_resume_error(&error_result));
+    }
+
+    #[test]
+    fn stale_resume_output_scan_ignores_assistant_mentions() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "text",
+                        "text": "I saw `No conversation found` in the logs."
+                    }]
+                }
+            })
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "result": "analysis complete"
+            })
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        assert!(!output_file_has_stale_resume_error_after_offset(
+            file.path().to_str().unwrap(),
+            0,
+        ));
+    }
+
+    #[test]
+    fn stale_resume_output_scan_detects_error_result_after_offset() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "text",
+                        "text": "before"
+                    }]
+                }
+            })
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let offset = std::fs::metadata(file.path()).unwrap().len();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "errors": ["No conversation found"]
+            })
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        assert!(output_file_has_stale_resume_error_after_offset(
+            file.path().to_str().unwrap(),
+            offset,
+        ));
     }
 
     #[test]

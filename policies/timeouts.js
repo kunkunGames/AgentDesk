@@ -4,8 +4,8 @@
  *
  * Hook: onTick (1분 간격 — Rust 서버에서 주기적으로 fire)
  *
- * [A] Requested 타임아웃 (45분) → retry_count < 10이면 재시도 대기, ≥ 10이면 pending_decision
- * [B] In-Progress 스테일 (2시간) → blocked
+ * [A] Requested 타임아웃 (requested_timeout_min, 기본 45분) → retry_count < 10이면 재시도 대기, ≥ 10이면 pending_decision
+ * [B] In-Progress 스테일 (in_progress_stale_min, 기본 120분) → blocked
  * [C] 스테일 리뷰 (dispatch 완료인데 verdict 없음) → pending_decision
  * [D] DoD 대기 타임아웃 (15분) → pending_decision
  * [E] 자동-수용 결정 타임아웃 → auto-accept + rework
@@ -16,6 +16,7 @@
  * [J] Failed 디스패치 자동 재시도 (30초 쿨다운, ~60초 cadence, 최대 10회 + 즉시 Discord 알림)
  * [I] 턴 데드락 감지 + 자동 복구 (15분 주기, 최대 3회 연장 후 강제 중단 + 재디스패치)
  * [K] 고아 디스패치 복구 (5분) — in_progress 카드 + pending 디스패치 + 활성 세션 없음 → review 전이
+ * [M] Workspace branch 보호 (5분) — 메인 repo가 wt/* 브랜치로 이탈하면 자동 복구 (#181)
  */
 
 // Send notification via notify bot (system alerts, not agent communication)
@@ -48,6 +49,13 @@ function sendDeadlockAlert(message) {
 
 // Shared constant used by sections [A] and [J]
 var MAX_DISPATCH_RETRIES = 10;
+
+// Helper: read timeout config as SQL interval string
+function getTimeoutInterval(key, fallbackMinutes) {
+  var val = parseInt(agentdesk.config.get(key), 10);
+  if (!val || val <= 0) val = fallbackMinutes;
+  return "-" + val + " minutes";
+}
 
 var timeouts = {
   name: "timeouts",
@@ -156,30 +164,16 @@ var timeouts = {
           var dodOnly = reasons.length === 1 && reasons[0].indexOf("DoD 미완료") === 0;
           if (dodOnly) {
             agentdesk.kanban.setStatus(card.id, rReview);
-            agentdesk.db.execute(
-              "UPDATE kanban_cards SET review_status = 'awaiting_dod', awaiting_dod_at = datetime('now') WHERE id = ?",
-              [card.id]
-            );
+            agentdesk.kanban.setReviewStatus(card.id, "awaiting_dod", {awaiting_dod_at: "now"});
             // #117: sync canonical review state
-            agentdesk.db.execute(
-              "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'awaiting_dod', datetime('now')) " +
-              "ON CONFLICT(card_id) DO UPDATE SET state = 'awaiting_dod', updated_at = datetime('now')",
-              [card.id]
-            );
+            agentdesk.reviewState.sync(card.id, "awaiting_dod");
             agentdesk.log.warn("[reconcile] Card " + card.id + " → " + rReview + "(awaiting_dod): " + reasons[0]);
             continue;
           }
           agentdesk.kanban.setStatus(card.id, rPending);
-          agentdesk.db.execute(
-            "UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?",
-            [card.id]
-          );
+          agentdesk.kanban.setReviewStatus(card.id, null, {suggestion_pending_at: null});
           // #117: sync canonical review state
-          agentdesk.db.execute(
-            "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'idle', datetime('now')) " +
-            "ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
-            [card.id]
-          );
+          agentdesk.reviewState.sync(card.id, "idle");
           agentdesk.log.warn("[reconcile] Card " + card.id + " → " + rPending + ": " + reasons.join("; "));
           // PMD notification via async outbox (#120)
           var pmdCh = agentdesk.config.get("kanban_manager_channel_id");
@@ -198,29 +192,31 @@ var timeouts = {
   },
 
   _section_A: function() {
-    // ─── [A] Requested 타임아웃 (45분) ─────────────────────
+    // ─── [A] Requested 타임아웃 ─────────────────────
     // retry_count < 10이면 pending_decision 대신 failed만 마크 → [J]가 30초 후 재시도
     var aCfg = agentdesk.pipeline.getConfig();
     var aInitial = agentdesk.pipeline.kickoffState(aCfg);
     var aInProgress = agentdesk.pipeline.nextGatedTarget(aInitial, aCfg);
     var aForce = agentdesk.pipeline.forceOnlyTargets(aInitial, aCfg);
     var aPending = aForce[0];
+    var requestedInterval = getTimeoutInterval("requested_timeout_min", 45);
     var staleRequested = agentdesk.db.query(
       "SELECT kc.id, kc.assigned_agent_id, kc.latest_dispatch_id, " +
       "COALESCE(td.retry_count, 0) as retry_count " +
       "FROM kanban_cards kc " +
       "LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id " +
-      "WHERE kc.status = ? AND kc.requested_at IS NOT NULL AND kc.requested_at < datetime('now', '-45 minutes')",
+      "WHERE kc.status = ? AND kc.requested_at IS NOT NULL AND kc.requested_at < datetime('now', '" + requestedInterval + "')",
       [aInitial]
     );
     for (var i = 0; i < staleRequested.length; i++) {
       var rc = staleRequested[i];
-      // Dispatch를 failed로
+      // Dispatch를 failed로 — skip state changes if dispatch was already terminal
       if (rc.latest_dispatch_id) {
-        agentdesk.db.execute(
-          "UPDATE task_dispatches SET status = 'failed', result ='Timed out waiting for agent', updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
-          [rc.latest_dispatch_id]
-        );
+        var failResult = agentdesk.dispatch.markFailed(rc.latest_dispatch_id, "Timed out waiting for agent");
+        if (failResult.rows_affected === 0) {
+          agentdesk.log.info("[timeout] Card " + rc.id + " dispatch already terminal, skipping");
+          continue;
+        }
       }
 
       if (rc.retry_count < MAX_DISPATCH_RETRIES) {
@@ -262,20 +258,22 @@ var timeouts = {
   },
 
   _section_B: function() {
-    // ─── [B] In-Progress 스테일 (2시간) ────────────────────
+    // ─── [B] In-Progress 스테일 ────────────────────
     var bCfg = agentdesk.pipeline.getConfig();
     var bInitial = agentdesk.pipeline.kickoffState(bCfg);
     var bInProgress = agentdesk.pipeline.nextGatedTarget(bInitial, bCfg);
     var bForce = agentdesk.pipeline.forceOnlyTargets(bInProgress, bCfg);
     var bBlocked = bForce.length > 1 ? bForce[1] : bForce[0];
+    var inProgressInterval = getTimeoutInterval("in_progress_stale_min", 120);
     var staleInProgress = agentdesk.db.query(
-      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '-2 hours')",
+      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '" + inProgressInterval + "')",
       [bInProgress]
     );
     for (var j = 0; j < staleInProgress.length; j++) {
       agentdesk.kanban.setStatus(staleInProgress[j].id, bBlocked);
+      var staleMin = parseInt(agentdesk.config.get("in_progress_stale_min"), 10) || 120;
       agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'Stalled: no activity for 2+ hours' WHERE id = ?",
+        "UPDATE kanban_cards SET blocked_reason = 'Stalled: no activity for " + staleMin + "+ min' WHERE id = ?",
         [staleInProgress[j].id]
       );
       agentdesk.log.warn("[timeout] Card " + staleInProgress[j].id + " " + bInProgress + " stale → " + bBlocked);
@@ -291,7 +289,7 @@ var timeouts = {
       if (kmChannel2) {
         agentdesk.message.queue(
           kmChannel2,
-          "[Stalled] " + stalledTitle + " (담당: " + stalledAssignee + ")" + stalledUrl + "\n2시간+ 활동 없음 → blocked",
+          "[Stalled] " + stalledTitle + " (담당: " + stalledAssignee + ")" + stalledUrl + "\n" + staleMin + "분+ 활동 없음 → blocked",
           "announce",
           "system"
         );
@@ -313,18 +311,16 @@ var timeouts = {
       "JOIN task_dispatches td ON td.kanban_card_id = kc.id " +
       "WHERE kc.status = ? AND kc.review_status = 'reviewing' " +
       "AND td.dispatch_type = 'review' AND td.status IN ('completed', 'failed') " +
-      "AND kc.review_entered_at IS NOT NULL AND kc.review_entered_at < datetime('now', '-30 minutes')",
+      "AND kc.review_entered_at IS NOT NULL AND kc.review_entered_at < datetime('now', '-30 minutes') " +
+      "AND NOT EXISTS (SELECT 1 FROM task_dispatches td2 WHERE td2.kanban_card_id = kc.id " +
+      "AND td2.dispatch_type IN ('review', 'review-decision') AND td2.status = 'pending')",
       [cReview]
     );
     for (var k = 0; k < staleReviews.length; k++) {
       agentdesk.kanban.setStatus(staleReviews[k].card_id, cPending);
-      agentdesk.db.execute("UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?", [staleReviews[k].card_id]);
+      agentdesk.kanban.setReviewStatus(staleReviews[k].card_id, null, {suggestion_pending_at: null});
       // #117: sync canonical review state
-      agentdesk.db.execute(
-        "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'idle', datetime('now')) " +
-        "ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
-        [staleReviews[k].card_id]
-      );
+      agentdesk.reviewState.sync(staleReviews[k].card_id, "idle");
       agentdesk.log.warn("[timeout] Stale review → pending_decision: card " + staleReviews[k].card_id);
     }
   },
@@ -345,13 +341,9 @@ var timeouts = {
     );
     for (var d = 0; d < stuckDod.length; d++) {
       agentdesk.kanban.setStatus(stuckDod[d].id, dPending);
-      agentdesk.db.execute("UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?", [stuckDod[d].id]);
+      agentdesk.kanban.setReviewStatus(stuckDod[d].id, null, {suggestion_pending_at: null});
       // #117: sync canonical review state
-      agentdesk.db.execute(
-        "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'idle', datetime('now')) " +
-        "ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
-        [stuckDod[d].id]
-      );
+      agentdesk.reviewState.sync(stuckDod[d].id, "idle");
       agentdesk.log.warn("[timeout] DoD await timeout → pending_decision: card " + stuckDod[d].id);
     }
   },
@@ -385,10 +377,7 @@ var timeouts = {
           );
           // Dispatch succeeded — now transition to rework target + rework_pending
           agentdesk.kanban.setStatus(sc.id, eReworkTarget);
-          agentdesk.db.execute(
-            "UPDATE kanban_cards SET review_status = 'rework_pending', suggestion_pending_at = NULL, updated_at = datetime('now') WHERE id = ?",
-            [sc.id]
-          );
+          agentdesk.kanban.setReviewStatus(sc.id, "rework_pending", {suggestion_pending_at: null});
           // #119: Record tuning outcome (auto-accept = true_positive) BEFORE transition clears last_verdict
           var reviewState = agentdesk.db.query(
             "SELECT review_round, last_verdict FROM card_review_state WHERE card_id = ?",
@@ -416,13 +405,19 @@ var timeouts = {
               [sc.id, rs.review_round || null, rs.last_verdict || "unknown", findingCats]
             );
             agentdesk.log.info("[review-tuning] #119 recorded true_positive (auto-accept): card=" + sc.id);
+            // #119: Trigger re-aggregation — other outcome paths (Rust) call
+            // spawn_aggregate_if_needed directly; from JS we hit the HTTP API.
+            try {
+              var aggPort = agentdesk.config.get("server_port");
+              if (aggPort) {
+                agentdesk.http.post("http://127.0.0.1:" + aggPort + "/api/review-tuning/aggregate", {});
+              }
+            } catch (aggErr) {
+              agentdesk.log.warn("[review-tuning] aggregate trigger failed (non-fatal): " + aggErr);
+            }
           }
           // #117: sync canonical review state
-          agentdesk.db.execute(
-            "INSERT INTO card_review_state (card_id, state, last_decision, updated_at) VALUES (?, 'rework_pending', 'auto_accept', datetime('now')) " +
-            "ON CONFLICT(card_id) DO UPDATE SET state = 'rework_pending', last_decision = 'auto_accept', updated_at = datetime('now')",
-            [sc.id]
-          );
+          agentdesk.reviewState.sync(sc.id, "rework_pending", { last_decision: "auto_accept" });
           agentdesk.log.warn("[timeout] Auto-accepted suggestions for card " + sc.id + " — rework dispatch created");
         } catch (e) {
           // Dispatch failed — route to pending state instead
@@ -457,10 +452,11 @@ var timeouts = {
       "SELECT id, kanban_card_id FROM task_dispatches WHERE status IN ('pending','dispatched') AND created_at < datetime('now', '-24 hours')"
     );
     for (var sd = 0; sd < staleDispatches.length; sd++) {
-      agentdesk.db.execute(
-        "UPDATE task_dispatches SET status = 'failed', result ='Stale dispatch auto-failed after 24h', updated_at = datetime('now') WHERE id = ?",
-        [staleDispatches[sd].id]
-      );
+      var sfResult = agentdesk.dispatch.markFailed(staleDispatches[sd].id, "Stale dispatch auto-failed after 24h");
+      if (sfResult.rows_affected === 0) {
+        agentdesk.log.info("[timeout] Dispatch " + staleDispatches[sd].id + " already terminal, skipping");
+        continue;
+      }
       if (staleDispatches[sd].kanban_card_id) {
         var card = agentdesk.kanban.getCard(staleDispatches[sd].kanban_card_id);
         if (card && !agentdesk.pipeline.isTerminal(card.status, gCfg)) {
@@ -570,10 +566,7 @@ var timeouts = {
           fd.title
         );
         // 새 디스패치에 retry_count 기록
-        agentdesk.db.execute(
-          "UPDATE task_dispatches SET retry_count = ? WHERE id = ?",
-          [newRetryCount, newDispatchId]
-        );
+        agentdesk.dispatch.setRetryCount(newDispatchId, newRetryCount);
         agentdesk.log.info("[retry] Auto-retry dispatch for card " + fd.kanban_card_id +
           " — attempt " + newRetryCount + "/" + MAX_DISPATCH_RETRIES +
           " (old: " + fd.id + " → new: " + newDispatchId + ")");
@@ -605,12 +598,8 @@ var timeouts = {
       } catch (e) {
         agentdesk.log.error("[retry] Failed to create retry dispatch for card " +
           fd.kanban_card_id + ": " + e);
-        // 재시도 디스패치 생성 실패 → pending state로 이관
-        agentdesk.kanban.setStatus(fd.kanban_card_id, jBlocked);
-        agentdesk.db.execute(
-          "UPDATE kanban_cards SET blocked_reason = 'Auto-retry dispatch creation failed: " + e + "' WHERE id = ?",
-          [fd.kanban_card_id]
-        );
+        // Don't block the card on transient retry failure — leave status as-is
+        // so the next tick can retry. Only log the error.
       }
     }
   },
@@ -742,12 +731,11 @@ var timeouts = {
 
           if (dispInfo.length > 0 && (dispInfo[0].status === "pending" || dispInfo[0].status === "dispatched")) {
             var di = dispInfo[0];
-            agentdesk.db.execute(
-              "UPDATE task_dispatches SET status = 'failed', " +
-              "result = 'Deadlock auto-recovery: " + totalMin + "min timeout', " +
-              "updated_at = datetime('now') WHERE id = ? AND status IN ('pending','dispatched')",
-              [sess.active_dispatch_id]
-            );
+            var dlResult = agentdesk.dispatch.markFailed(sess.active_dispatch_id, "Deadlock auto-recovery: " + totalMin + "min timeout");
+            if (dlResult.rows_affected === 0) {
+              agentdesk.log.info("[deadlock] Dispatch " + sess.active_dispatch_id + " already terminal, skipping");
+              continue;
+            }
 
             try {
               agentdesk.dispatch.create(
@@ -875,12 +863,7 @@ var timeouts = {
     for (var op = 0; op < orphanedDispatches.length; op++) {
       var od = orphanedDispatches[op];
       // 1) Dispatch를 completed로 마크
-      agentdesk.db.execute(
-        "UPDATE task_dispatches SET status = 'completed', " +
-        "result = '{\"auto_completed\":true,\"completion_source\":\"orphan_recovery\"}', " +
-        "updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
-        [od.dispatch_id]
-      );
+      agentdesk.dispatch.markCompleted(od.dispatch_id, '{"auto_completed":true,"completion_source":"orphan_recovery"}');
       // 2) Card를 review로 전이 → OnReviewEnter 훅이 review dispatch를 생성
       agentdesk.kanban.setStatus(od.kanban_card_id, kReview);
       agentdesk.log.warn("[orphan-recovery] Completed orphaned dispatch " + od.dispatch_id +
@@ -924,6 +907,8 @@ var timeouts = {
         if (currentTier <= lastAlertedTier) continue; // already alerted at this tier or higher
         sendDeadlockAlert(
           "⚠️ [장시간 턴] " + (inf.channel_name || inf.channel_id) + "\n" +
+          "session_key: " + (inf.session_key || "?") + "\n" +
+          "dispatch_id: " + (inf.dispatch_id || "?") + "\n" +
           "tmux: " + (inf.tmux_session_name || "?") + "\n" +
           "경과: " + Math.round(elapsedMin) + "분 (" + ALERT_THRESHOLDS[currentTier] + "분 단계)\n" +
           "provider: " + (inf.provider || "?")
@@ -957,6 +942,123 @@ var timeouts = {
       }
     } catch(de) {
       agentdesk.log.warn("[long-turn] inflight scan error: " + de);
+    }
+  },
+
+  // ─── [M] Workspace branch 보호 (#181) ────────────────────
+  // 메인 workspace repo가 wt/* 브랜치로 checkout되면 자동으로 main 복구.
+  // 원인: Claude Code 에이전트가 메인 repo에서 worktree 브랜치를 checkout → policy
+  // merge cleaner가 worktree 삭제 → 경로 깨짐 → 전체 세션 장애.
+  _section_M: function() {
+    // Get unique workspace paths from sessions table
+    var workspaces = agentdesk.db.query(
+      "SELECT DISTINCT json_extract(metadata, '$.workspace') as ws FROM sessions " +
+      "WHERE json_extract(metadata, '$.workspace') IS NOT NULL"
+    );
+    // Also check known workspaces from agents table
+    var agentWorkspaces = agentdesk.db.query(
+      "SELECT DISTINCT workspace FROM agents WHERE workspace IS NOT NULL AND workspace != ''"
+    );
+    // Deduplicate
+    var seen = {};
+    var paths = [];
+    for (var w = 0; w < workspaces.length; w++) {
+      if (workspaces[w].ws && !seen[workspaces[w].ws]) {
+        seen[workspaces[w].ws] = true;
+        paths.push(workspaces[w].ws);
+      }
+    }
+    for (var aw = 0; aw < agentWorkspaces.length; aw++) {
+      if (agentWorkspaces[aw].workspace && !seen[agentWorkspaces[aw].workspace]) {
+        seen[agentWorkspaces[aw].workspace] = true;
+        paths.push(agentWorkspaces[aw].workspace);
+      }
+    }
+    // If no workspaces found from DB, check the server's own workspace
+    if (paths.length === 0) {
+      var serverWs = agentdesk.config.get("workspace");
+      if (serverWs) paths.push(serverWs);
+    }
+
+    for (var p = 0; p < paths.length; p++) {
+      var ws = paths[p];
+      try {
+        var branch = agentdesk.exec("git", JSON.stringify(["-C", ws, "branch", "--show-current"]));
+        if (!branch) continue;
+        branch = branch.replace(/\s+/g, "");
+        if (branch.indexOf("wt/") === 0) {
+          agentdesk.log.warn("[branch-guard] Workspace " + ws + " on worktree branch '" + branch + "' — recovering to main");
+          // Stash any changes before switching
+          agentdesk.exec("git", JSON.stringify(["-C", ws, "stash", "--include-untracked", "-m", "auto-stash before branch-guard recovery"]));
+          var checkoutResult = agentdesk.exec("git", JSON.stringify(["-C", ws, "checkout", "main"]));
+          agentdesk.exec("git", JSON.stringify(["-C", ws, "pull", "--ff-only"]));
+          agentdesk.exec("git", JSON.stringify(["-C", ws, "worktree", "prune"]));
+          agentdesk.log.warn("[branch-guard] Recovered " + ws + " to main (was: " + branch + ")");
+          sendDeadlockAlert(
+            "🔧 [branch-guard] Workspace 브랜치 자동 복구\n" +
+            "경로: `" + ws + "`\n" +
+            "이탈 브랜치: `" + branch + "` → `main`\n" +
+            "원인: 에이전트가 worktree 브랜치를 메인 repo에서 checkout (#181)"
+          );
+        }
+      } catch(e) {
+        agentdesk.log.warn("[branch-guard] Error checking " + ws + ": " + e);
+      }
+    }
+  },
+
+  // ─── [N] Orphan review — review 상태인데 dispatch가 없는 카드 자동 복구 ──
+  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched review dispatch 0건
+  // 원인: force-transition 후 dispatch 누락, dispatch 생성 중 에러, race condition 등
+  // 복구: in_progress → review 재진입으로 OnReviewEnter 훅이 dispatch를 생성하도록 유도
+  _section_N: function() {
+    var nCfg = agentdesk.pipeline.getConfig();
+    var nInitial = agentdesk.pipeline.kickoffState(nCfg);
+    var nInProgress = agentdesk.pipeline.nextGatedTarget(nInitial, nCfg);
+    var nReview = agentdesk.pipeline.nextGatedTarget(nInProgress, nCfg);
+    if (!nReview) return;
+
+    var orphanReviews = agentdesk.db.query(
+      "SELECT kc.id, kc.title, kc.github_issue_number, kc.assigned_agent_id " +
+      "FROM kanban_cards kc " +
+      "WHERE kc.status = ? " +
+      "AND kc.review_entered_at IS NOT NULL " +
+      "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
+      "AND NOT EXISTS (" +
+      "  SELECT 1 FROM task_dispatches td " +
+      "  WHERE td.kanban_card_id = kc.id " +
+      "  AND td.dispatch_type IN ('review', 'review-decision') " +
+      "  AND td.status IN ('pending', 'dispatched')" +
+      ")",
+      [nReview]
+    );
+
+    // Orphan review = review state with no active dispatch after 5 min.
+    // Instead of reimplementing OnReviewEnter safeguards, escalate to
+    // pending_decision so PMD can decide the correct action.
+    // This avoids partial policy reimplementation (R1/R2 review feedback).
+    var nForce = agentdesk.pipeline.forceOnlyTargets(nInProgress, nCfg);
+    var nPending = nForce[0];
+
+    for (var n = 0; n < orphanReviews.length; n++) {
+      var oc = orphanReviews[n];
+      agentdesk.log.warn("[timeout] Orphan review detected: card " + oc.id +
+        " (#" + (oc.github_issue_number || "?") + ") in review with no active dispatch → pending_decision");
+
+      agentdesk.kanban.setStatus(oc.id, nPending);
+      agentdesk.kanban.setReviewStatus(oc.id, null, {suggestion_pending_at: null});
+      agentdesk.reviewState.sync(oc.id, "idle");
+
+      var kmChannel = getPMDChannel();
+      if (kmChannel) {
+        agentdesk.message.queue(
+          kmChannel,
+          "⚠️ [orphan-review] #" + (oc.github_issue_number || "?") + " " +
+          (oc.title || oc.id) + "\nreview 상태인데 dispatch 없음 → pending_decision 전환 (PMD 결정 필요)",
+          "notify",
+          "system"
+        );
+      }
     }
   },
 
@@ -1051,43 +1153,70 @@ var timeouts = {
 // Sections are grouped by criticality and cadence.
 // onTick (legacy, 5min) is kept as no-op for backward compat.
 
-// 30s tier: [J] retry, [I-0] unsent notification recovery
+// 30s tier: [J] retry, [I-0] unsent notification recovery, [I] deadlock, [K] orphan
+// Critical-path sections [I] and [K] run here to avoid non-critical section delays (#127)
 timeouts.onTick30s = function(ev) {
   var start = Date.now();
-  try { timeouts._section_I0(); } catch(e) { agentdesk.log.warn("[tick30s] I-0 error: " + e); }
-  try { timeouts._section_J(); } catch(e) { agentdesk.log.warn("[tick30s] J error: " + e); }
-  agentdesk.log.debug("[tick30s] took " + (Date.now() - start) + "ms");
+  var t;
+  t = Date.now(); try { timeouts._section_I0(); } catch(e) { agentdesk.log.warn("[tick30s] I-0 error: " + e); }
+  agentdesk.log.debug("[tick30s][I-0] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_J(); } catch(e) { agentdesk.log.warn("[tick30s] J error: " + e); }
+  agentdesk.log.debug("[tick30s][J] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_I(); } catch(e) { agentdesk.log.warn("[tick30s] I error: " + e); }
+  agentdesk.log.debug("[tick30s][I] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_K(); } catch(e) { agentdesk.log.warn("[tick30s] K error: " + e); }
+  agentdesk.log.debug("[tick30s][K] " + (Date.now() - t) + "ms");
+  agentdesk.log.debug("[tick30s] total " + (Date.now() - start) + "ms");
 };
 
-// 1min tier: [A] [C] [D] [E] [K] [L]
+// 1min tier: [A] [C] [D] [E] [L] (non-critical timeouts)
+// [K] moved to 30s tier for critical-path isolation (#127)
 timeouts.onTick1min = function(ev) {
   var start = Date.now();
-  try { timeouts._section_A(); } catch(e) { agentdesk.log.warn("[tick1min] A error: " + e); }
-  try { timeouts._section_C(); } catch(e) { agentdesk.log.warn("[tick1min] C error: " + e); }
-  try { timeouts._section_D(); } catch(e) { agentdesk.log.warn("[tick1min] D error: " + e); }
-  try { timeouts._section_E(); } catch(e) { agentdesk.log.warn("[tick1min] E error: " + e); }
-  try { timeouts._section_K(); } catch(e) { agentdesk.log.warn("[tick1min] K error: " + e); }
-  try { timeouts._section_L(); } catch(e) { agentdesk.log.warn("[tick1min] L error: " + e); }
-  agentdesk.log.debug("[tick1min] took " + (Date.now() - start) + "ms");
+  var t;
+  t = Date.now(); try { timeouts._section_A(); } catch(e) { agentdesk.log.warn("[tick1min] A error: " + e); }
+  agentdesk.log.debug("[tick1min][A] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_C(); } catch(e) { agentdesk.log.warn("[tick1min] C error: " + e); }
+  agentdesk.log.debug("[tick1min][C] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_D(); } catch(e) { agentdesk.log.warn("[tick1min] D error: " + e); }
+  agentdesk.log.debug("[tick1min][D] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_E(); } catch(e) { agentdesk.log.warn("[tick1min] E error: " + e); }
+  agentdesk.log.debug("[tick1min][E] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_L(); } catch(e) { agentdesk.log.warn("[tick1min] L error: " + e); }
+  agentdesk.log.debug("[tick1min][L] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_N(); } catch(e) { agentdesk.log.warn("[tick1min] N error: " + e); }
+  agentdesk.log.debug("[tick1min][N] " + (Date.now() - t) + "ms");
+  agentdesk.log.debug("[tick1min] total " + (Date.now() - start) + "ms");
 };
 
-// 5min tier: [R] [B] [F] [G] [H] [I] [ctx] + TTL cleanup
+// 5min tier: [R] [B] [F] [G] [H] [ctx] + TTL cleanup (non-critical reconciliation)
+// [I] moved to 30s tier for critical-path isolation (#127)
 timeouts.onTick5min = function(ev) {
   var start = Date.now();
+  var t;
   // #126: Purge expired kv_meta keys
+  t = Date.now();
   try {
     agentdesk.db.execute("DELETE FROM kv_meta WHERE expires_at IS NOT NULL AND expires_at < datetime('now')");
   } catch(e) { agentdesk.log.warn("[tick5min] kv_ttl error: " + e); }
-  try { timeouts._section_R(); } catch(e) { agentdesk.log.warn("[tick5min] R error: " + e); }
-  try { timeouts._section_B(); } catch(e) { agentdesk.log.warn("[tick5min] B error: " + e); }
-  try { timeouts._section_F(); } catch(e) { agentdesk.log.warn("[tick5min] F error: " + e); }
-  try { timeouts._section_G(); } catch(e) { agentdesk.log.warn("[tick5min] G error: " + e); }
-  try { timeouts._section_H(); } catch(e) { agentdesk.log.warn("[tick5min] H error: " + e); }
-  try { timeouts._section_I(); } catch(e) { agentdesk.log.warn("[tick5min] I error: " + e); }
+  agentdesk.log.debug("[tick5min][kv_ttl] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_R(); } catch(e) { agentdesk.log.warn("[tick5min] R error: " + e); }
+  agentdesk.log.debug("[tick5min][R] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_B(); } catch(e) { agentdesk.log.warn("[tick5min] B error: " + e); }
+  agentdesk.log.debug("[tick5min][B] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_F(); } catch(e) { agentdesk.log.warn("[tick5min] F error: " + e); }
+  agentdesk.log.debug("[tick5min][F] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_G(); } catch(e) { agentdesk.log.warn("[tick5min] G error: " + e); }
+  agentdesk.log.debug("[tick5min][G] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_H(); } catch(e) { agentdesk.log.warn("[tick5min] H error: " + e); }
+  agentdesk.log.debug("[tick5min][H] " + (Date.now() - t) + "ms");
+  t = Date.now(); try { timeouts._section_M(); } catch(e) { agentdesk.log.warn("[tick5min] M error: " + e); }
+  agentdesk.log.debug("[tick5min][M] " + (Date.now() - t) + "ms");
   if (timeouts.onContextCheck) {
-    try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
+    t = Date.now(); try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
+    agentdesk.log.debug("[tick5min][ctx] " + (Date.now() - t) + "ms");
   }
-  agentdesk.log.debug("[tick5min] took " + (Date.now() - start) + "ms");
+  agentdesk.log.debug("[tick5min] total " + (Date.now() - start) + "ms");
 };
 
 // Legacy onTick: no-op (tiered hooks handle everything)

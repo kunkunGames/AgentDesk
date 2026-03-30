@@ -15,8 +15,6 @@ pub struct Config {
     pub policies: PoliciesConfig,
     #[serde(default)]
     pub data: DataConfig,
-    #[serde(default)]
-    pub kanban: KanbanConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,18 +83,6 @@ pub struct DataConfig {
     pub db_name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct KanbanConfig {
-    #[serde(default = "default_45")]
-    pub timeout_requested_minutes: u64,
-    #[serde(default = "default_100")]
-    pub timeout_in_progress_minutes: u64,
-    #[serde(default = "default_3")]
-    pub max_review_rounds: u32,
-    #[serde(default = "default_5")]
-    pub max_chain_depth: u32,
-}
-
 /// Compile-time defaults loaded from the project-root `defaults.json`.
 /// This is the single source of truth for port/host values shared across
 /// Rust, Vite, and shell scripts.
@@ -143,18 +129,6 @@ fn default_data_dir() -> PathBuf {
 fn default_db_name() -> String {
     "agentdesk.sqlite".into()
 }
-fn default_45() -> u64 {
-    45
-}
-fn default_100() -> u64 {
-    100
-}
-fn default_3() -> u32 {
-    3
-}
-fn default_5() -> u32 {
-    5
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -190,6 +164,19 @@ pub fn loopback() -> String {
     ServerConfig::loopback()
 }
 
+/// Canonical runtime root: $AGENTDESK_ROOT_DIR → ~/.adk/release
+/// All code that needs the AgentDesk root directory MUST call this function
+/// instead of reimplementing the resolution logic.
+pub fn runtime_root() -> Option<std::path::PathBuf> {
+    if let Ok(override_root) = std::env::var("AGENTDESK_ROOT_DIR") {
+        let trimmed = override_root.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".adk").join("release"))
+}
+
 impl Default for PoliciesConfig {
     fn default() -> Self {
         Self {
@@ -208,17 +195,6 @@ impl Default for DataConfig {
     }
 }
 
-impl Default for KanbanConfig {
-    fn default() -> Self {
-        Self {
-            timeout_requested_minutes: 45,
-            timeout_in_progress_minutes: 100,
-            max_review_rounds: 3,
-            max_chain_depth: 5,
-        }
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -228,7 +204,6 @@ impl Default for Config {
             github: GitHubConfig::default(),
             policies: PoliciesConfig::default(),
             data: DataConfig::default(),
-            kanban: KanbanConfig::default(),
         }
     }
 }
@@ -316,8 +291,34 @@ pub fn load_graceful() -> Config {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_graceful_config_path;
+    use super::{resolve_graceful_config_path, runtime_root};
     use std::path::PathBuf;
+
+    #[test]
+    fn runtime_root_returns_valid_path() {
+        // runtime_root() should always return Some on systems with a home directory
+        let root = runtime_root();
+        assert!(root.is_some(), "runtime_root() returned None");
+        let path = root.unwrap();
+        // Path should end with .adk/release (unless overridden by env)
+        if std::env::var("AGENTDESK_ROOT_DIR").is_err() {
+            assert!(
+                path.ends_with(".adk/release"),
+                "expected path ending with .adk/release, got {:?}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_root_respects_env_override() {
+        let override_path = std::env::temp_dir().join("adk-test-root");
+        // Safety: test isolation — this test is the only one touching this env var
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &override_path) };
+        let root = runtime_root();
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+        assert_eq!(root, Some(override_path));
+    }
 
     fn make_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -395,12 +396,6 @@ impl Settings {
     }
 
     pub fn config_dir() -> Option<std::path::PathBuf> {
-        if let Ok(root) = std::env::var("AGENTDESK_ROOT_DIR") {
-            let trimmed = root.trim();
-            if !trimmed.is_empty() {
-                return Some(std::path::PathBuf::from(trimmed));
-            }
-        }
-        dirs::home_dir().map(|h| h.join(".adk").join("release"))
+        runtime_root()
     }
 }

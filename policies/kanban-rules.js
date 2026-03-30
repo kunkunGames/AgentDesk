@@ -162,10 +162,11 @@ var rules = {
         }
 
         // 디스패치 completed 처리
-        agentdesk.db.execute(
-          "UPDATE task_dispatches SET status = 'completed', result = ?, updated_at = datetime('now') WHERE id = ?",
-          [JSON.stringify({ verdict: verdict, auto_completed: true, source: "github_comment" }), payload.dispatch_id]
-        );
+        var mcResult = agentdesk.dispatch.markCompleted(payload.dispatch_id, JSON.stringify({ verdict: verdict, auto_completed: true, source: "github_comment" }));
+        if (mcResult.rows_affected === 0) {
+          agentdesk.log.info("[kanban] dispatch " + payload.dispatch_id + " already terminal, skipping auto-complete");
+          return;
+        }
         agentdesk.log.info("[kanban] review dispatch " + payload.dispatch_id + " auto-completed with verdict: " + verdict);
       }
     }
@@ -198,6 +199,9 @@ var rules = {
 
     // Review/decision dispatches — handled by review-automation policy
     if (dispatch.dispatch_type === "review" || dispatch.dispatch_type === "review-decision") return;
+
+    // #197: e2e-test dispatches — handled by deploy-pipeline policy
+    if (dispatch.dispatch_type === "e2e-test") return;
 
     // Rework dispatches — skip gate, go directly to review
     if (dispatch.dispatch_type === "rework") {
@@ -270,31 +274,17 @@ var rules = {
         if (dodOnly) {
           // DoD 미완료만 → awaiting_dod (15분 유예, timeouts.js [D]가 만료 시 pendingState)
           agentdesk.kanban.setStatus(card.id, reviewState);
-          agentdesk.db.execute(
-            "UPDATE kanban_cards SET review_status = 'awaiting_dod', awaiting_dod_at = datetime('now') WHERE id = ?",
-            [card.id]
-          );
+          agentdesk.kanban.setReviewStatus(card.id, "awaiting_dod", {awaiting_dod_at: "now"});
           // #117: sync canonical review state
-          agentdesk.db.execute(
-            "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'awaiting_dod', datetime('now')) " +
-            "ON CONFLICT(card_id) DO UPDATE SET state = 'awaiting_dod', updated_at = datetime('now')",
-            [card.id]
-          );
+          agentdesk.reviewState.sync(card.id, "awaiting_dod");
           agentdesk.log.warn("[pm-gate] Card " + card.id + " → review(awaiting_dod): " + reasons[0]);
           return;
         }
         // Other gate failures → pendingState
         agentdesk.kanban.setStatus(card.id, pendingState);
-        agentdesk.db.execute(
-          "UPDATE kanban_cards SET review_status = NULL, suggestion_pending_at = NULL WHERE id = ?",
-          [card.id]
-        );
+        agentdesk.kanban.setReviewStatus(card.id, null, {suggestion_pending_at: null});
         // #117: sync canonical review state
-        agentdesk.db.execute(
-          "INSERT INTO card_review_state (card_id, state, updated_at) VALUES (?, 'idle', datetime('now')) " +
-          "ON CONFLICT(card_id) DO UPDATE SET state = 'idle', pending_dispatch_id = NULL, updated_at = datetime('now')",
-          [card.id]
-        );
+        agentdesk.reviewState.sync(card.id, "idle");
         agentdesk.log.warn("[pm-gate] Card " + card.id + " → " + pendingState + ": " + reasons.join("; "));
         notifyPMD(card.id, reasons.join("; "));
         return;
