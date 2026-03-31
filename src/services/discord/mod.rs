@@ -59,8 +59,9 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    RoleBinding, channel_supports_provider, channel_upload_dir, cleanup_old_uploads,
-    load_bot_settings, resolve_role_binding, save_bot_settings,
+    RoleBinding, bot_settings_allow_agent, bot_settings_allow_channel, channel_supports_provider,
+    channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
+    save_bot_settings,
 };
 use shared_memory::load_shared_knowledge;
 #[cfg(unix)]
@@ -251,8 +252,13 @@ pub(super) struct Intervention {
 /// Bot-level settings persisted to disk
 #[derive(Clone)]
 pub(super) struct DiscordBotSettings {
+    /// Optional agent identity (e.g. "codex", "spark") for same-provider isolation.
+    pub(super) agent: Option<String>,
     pub(super) provider: ProviderKind,
     pub(super) allowed_tools: Vec<String>,
+    /// Explicit Discord channel allowlist for this bot token.
+    /// Empty means "no channel restriction".
+    pub(super) allowed_channel_ids: Vec<u64>,
     /// channel_id (string) → last working directory path
     pub(super) last_sessions: std::collections::HashMap<String, String>,
     /// channel_id (string) → last remote profile name
@@ -268,11 +274,13 @@ pub(super) struct DiscordBotSettings {
 impl Default for DiscordBotSettings {
     fn default() -> Self {
         Self {
+            agent: None,
             provider: ProviderKind::Claude,
             allowed_tools: DEFAULT_ALLOWED_TOOLS
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            allowed_channel_ids: Vec::new(),
             last_sessions: std::collections::HashMap::new(),
             last_remotes: std::collections::HashMap::new(),
             owner_user_id: None,

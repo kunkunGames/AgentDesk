@@ -86,6 +86,41 @@ pub(super) fn channel_supports_provider(
     provider.is_channel_supported(channel_name, is_dm)
 }
 
+pub(super) fn bot_settings_allow_channel(
+    settings: &DiscordBotSettings,
+    channel_id: ChannelId,
+    is_dm: bool,
+) -> bool {
+    if is_dm
+        || settings.allowed_channel_ids.is_empty()
+        || settings.allowed_channel_ids.contains(&channel_id.get())
+    {
+        return true;
+    }
+    false
+}
+
+pub(super) fn bot_settings_allow_agent(
+    settings: &DiscordBotSettings,
+    role_binding: Option<&RoleBinding>,
+    is_dm: bool,
+) -> bool {
+    if is_dm {
+        return true;
+    }
+
+    let Some(expected_agent) = settings
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+
+    role_binding.is_some_and(|binding| binding.role_id.eq_ignore_ascii_case(expected_agent))
+}
+
 /// Look up the provider for a channel name using the global suffix_map
 /// from org.yaml or bot_settings.json.
 fn lookup_suffix_provider(channel_name: &str) -> Option<ProviderKind> {
@@ -396,6 +431,12 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
     let Some(entry) = json.get(&key) else {
         return DiscordBotSettings::default();
     };
+    let agent = entry
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let owner_user_id = entry.get("owner_user_id").and_then(json_u64);
     let provider = entry
         .get("provider")
@@ -420,6 +461,11 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
                 .collect()
         })
         .unwrap_or_default();
+    let allowed_channel_ids = entry
+        .get("allowed_channel_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
+        .unwrap_or_default();
     let allowed_user_ids = entry
         .get("allowed_user_ids")
         .and_then(|v| v.as_array())
@@ -438,7 +484,9 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         Some(value) => {
             let Some(tools_arr) = value.as_array() else {
                 return DiscordBotSettings {
+                    agent,
                     provider,
+                    allowed_channel_ids,
                     owner_user_id,
                     last_sessions,
                     last_remotes,
@@ -451,8 +499,10 @@ pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         }
     };
     DiscordBotSettings {
+        agent,
         provider,
         allowed_tools,
+        allowed_channel_ids,
         last_sessions,
         last_remotes,
         owner_user_id,
@@ -478,8 +528,10 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
     let normalized_tools = normalize_allowed_tools(&settings.allowed_tools);
     let mut entry = serde_json::json!({
         "token": token,
+        "agent": settings.agent,
         "provider": settings.provider.as_str(),
         "allowed_tools": normalized_tools,
+        "allowed_channel_ids": settings.allowed_channel_ids,
         "last_sessions": settings.last_sessions,
         "last_remotes": settings.last_remotes,
         "allowed_user_ids": settings.allowed_user_ids,
@@ -554,9 +606,9 @@ mod tests {
     use crate::services::provider::ProviderKind;
 
     use super::{
-        channel_supports_provider, discord_token_hash, load_bot_settings,
-        load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
-        resolve_role_binding,
+        bot_settings_allow_agent, bot_settings_allow_channel, channel_supports_provider,
+        discord_token_hash, load_bot_settings, load_discord_bot_launch_configs, load_peer_agents,
+        render_peer_agent_guidance, resolve_role_binding, save_bot_settings,
     };
 
     fn with_temp_home<F>(f: F)
@@ -685,6 +737,54 @@ mod tests {
     }
 
     #[test]
+    fn test_load_bot_settings_reads_allowed_channel_ids() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "allowed_channel_ids": ["123", 456]
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert_eq!(settings.allowed_channel_ids, vec![123, 456]);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_settings_reads_agent_identity() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "test-token";
+            let key = discord_token_hash(token);
+            let json = serde_json::json!({
+                key: {
+                    "token": token,
+                    "agent": "spark"
+                }
+            });
+            fs::write(
+                settings_dir.join("bot_settings.json"),
+                serde_json::to_string_pretty(&json).unwrap(),
+            )
+            .unwrap();
+
+            let settings = load_bot_settings(token);
+            assert_eq!(settings.agent.as_deref(), Some("spark"));
+        });
+    }
+
+    #[test]
     fn test_resolve_role_binding_reads_optional_provider() {
         with_temp_home(|temp_home: &TempDir| {
             let settings_dir = temp_home.path().join(".adk").join("config");
@@ -791,6 +891,34 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_save_bot_settings_persists_allowed_channel_ids() {
+        with_temp_home(|_temp_home: &TempDir| {
+            let token = "test-token";
+            let mut settings = super::super::DiscordBotSettings::default();
+            settings.allowed_channel_ids = vec![123, 456];
+
+            save_bot_settings(token, &settings);
+
+            let loaded = load_bot_settings(token);
+            assert_eq!(loaded.allowed_channel_ids, vec![123, 456]);
+        });
+    }
+
+    #[test]
+    fn test_save_bot_settings_persists_agent_identity() {
+        with_temp_home(|_temp_home: &TempDir| {
+            let token = "test-token";
+            let mut settings = super::super::DiscordBotSettings::default();
+            settings.agent = Some("codex".to_string());
+
+            save_bot_settings(token, &settings);
+
+            let loaded = load_bot_settings(token);
+            assert_eq!(loaded.agent.as_deref(), Some("codex"));
+        });
+    }
+
     // ── P0 tests ─────────────────────────────────────────────────────────
 
     #[test]
@@ -833,6 +961,62 @@ mod tests {
             true,
             None,
         ));
+    }
+
+    #[test]
+    fn test_bot_settings_allow_channel_honors_allowlist() {
+        let mut settings = super::super::DiscordBotSettings::default();
+        settings.allowed_channel_ids = vec![1488022491992424448];
+
+        assert!(bot_settings_allow_channel(
+            &settings,
+            ChannelId::new(1488022491992424448),
+            false
+        ));
+        assert!(!bot_settings_allow_channel(
+            &settings,
+            ChannelId::new(1486017489027469493),
+            false
+        ));
+        assert!(bot_settings_allow_channel(
+            &settings,
+            ChannelId::new(999),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_bot_settings_allow_agent_requires_matching_role_binding() {
+        let mut settings = super::super::DiscordBotSettings::default();
+        settings.agent = Some("codex".to_string());
+
+        let codex_binding = super::RoleBinding {
+            role_id: "codex".to_string(),
+            prompt_file: "/tmp/codex.md".to_string(),
+            provider: Some(ProviderKind::Codex),
+            model: None,
+            reasoning_effort: None,
+        };
+        let spark_binding = super::RoleBinding {
+            role_id: "spark".to_string(),
+            prompt_file: "/tmp/spark.md".to_string(),
+            provider: Some(ProviderKind::Codex),
+            model: None,
+            reasoning_effort: None,
+        };
+
+        assert!(bot_settings_allow_agent(
+            &settings,
+            Some(&codex_binding),
+            false
+        ));
+        assert!(!bot_settings_allow_agent(
+            &settings,
+            Some(&spark_binding),
+            false
+        ));
+        assert!(!bot_settings_allow_agent(&settings, None, false));
+        assert!(bot_settings_allow_agent(&settings, None, true));
     }
 
     #[test]

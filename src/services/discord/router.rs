@@ -169,6 +169,13 @@ pub(super) async fn handle_event(
             };
             let role_binding =
                 resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
+            let settings_snapshot = { data.shared.settings.read().await.clone() };
+            if !bot_settings_allow_channel(&settings_snapshot, effective_channel_id, is_dm) {
+                return Ok(());
+            }
+            if !bot_settings_allow_agent(&settings_snapshot, role_binding.as_ref(), is_dm) {
+                return Ok(());
+            }
             if !channel_supports_provider(
                 &data.provider,
                 effective_channel_name.as_deref(),

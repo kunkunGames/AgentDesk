@@ -14,7 +14,10 @@ use crate::services::tmux_diagnostics::{
 use super::formatting::{
     format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw,
 };
-use super::settings::{channel_supports_provider, resolve_role_binding};
+use super::settings::{
+    bot_settings_allow_agent, bot_settings_allow_channel, channel_supports_provider,
+    resolve_role_binding,
+};
 use super::{DISCORD_MSG_LIMIT, SharedData, TmuxWatcherHandle, rate_limit_wait};
 
 use crate::utils::format::tail_with_ellipsis;
@@ -1150,7 +1153,8 @@ pub(super) fn process_watcher_lines(
 /// On startup, scan for surviving tmux sessions (AgentDesk-*) and restore watchers.
 /// This handles the case where AgentDesk was restarted but tmux sessions are still alive.
 pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &Arc<SharedData>) {
-    let provider = shared.settings.read().await.provider.clone();
+    let settings_snapshot = { shared.settings.read().await.clone() };
+    let provider = settings_snapshot.provider.clone();
 
     // List tmux sessions matching our naming convention
     let output = match tokio::time::timeout(
@@ -1278,6 +1282,31 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         // #148: Do NOT register in owned_sessions yet — QUARANTINE check below may
         // skip this session. Registering early blocks new session creation for the channel.
+        let role_binding = resolve_role_binding(*channel_id, Some(channel_name));
+        if !bot_settings_allow_channel(&settings_snapshot, *channel_id, false) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — channel {} not allowed for bot settings",
+                session_name, channel_id
+            );
+            continue;
+        }
+        if !bot_settings_allow_agent(&settings_snapshot, role_binding.as_ref(), false) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — agent mismatch for channel {}",
+                session_name, channel_id
+            );
+            continue;
+        }
+        if !channel_supports_provider(&provider, Some(channel_name), false, role_binding.as_ref()) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — provider mismatch for channel {}",
+                session_name, channel_id
+            );
+            continue;
+        }
 
         if let Some(started) = shared.recovering_channels.get(channel_id) {
             if started.elapsed() < std::time::Duration::from_secs(60) {
