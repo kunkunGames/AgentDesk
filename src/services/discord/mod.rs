@@ -2876,13 +2876,6 @@ pub(super) async fn auto_restore_session(
     channel_id: ChannelId,
     serenity_ctx: &serenity::prelude::Context,
 ) {
-    {
-        let data = shared.core.lock().await;
-        if data.sessions.contains_key(&channel_id) {
-            return;
-        }
-    }
-
     // Resolve channel/category before taking the lock for mutation
     let (ch_name, cat_name) = resolve_channel_category(serenity_ctx, channel_id).await;
 
@@ -2896,13 +2889,8 @@ pub(super) async fn auto_restore_session(
         let saved_remote = settings.last_remotes.get(&channel_key).cloned();
         let provider = settings.provider.clone();
 
-        // Try DB cwd first — preserves worktree paths from previous session
-        let ch_name = {
-            let data = shared.core.lock().await;
-            data.sessions
-                .get(&channel_id)
-                .and_then(|s| s.channel_name.clone())
-        };
+        // Use the live Discord channel name here so restart recovery cannot
+        // keep querying a stale same-provider session key from another agent.
         let db_cwd: Option<String> = ch_name.as_ref().and_then(|ch| {
             let tmux_name = provider.build_tmux_session_name(ch);
             let hostname = crate::services::platform::hostname_short();
@@ -2925,8 +2913,17 @@ pub(super) async fn auto_restore_session(
     };
 
     let mut data = shared.core.lock().await;
-    if data.sessions.contains_key(&channel_id) {
-        return; // Double-check after re-acquiring lock
+    if let Some(session) = data.sessions.get_mut(&channel_id) {
+        session.channel_id = Some(channel_id.get());
+        session.last_active = tokio::time::Instant::now();
+        session.channel_name = ch_name.clone();
+        session.category_name = cat_name.clone();
+        if session.remote_profile_name.is_none() {
+            session.remote_profile_name = saved_remote.clone();
+        }
+        if session.current_path.is_some() || last_path.is_none() {
+            return;
+        }
     }
 
     if let Some(last_path) = last_path {
@@ -2943,8 +2940,8 @@ pub(super) async fn auto_restore_session(
                     pending_uploads: Vec::new(),
                     cleared: false,
                     channel_id: Some(channel_id.get()),
-                    channel_name: ch_name,
-                    category_name: cat_name,
+                    channel_name: ch_name.clone(),
+                    category_name: cat_name.clone(),
                     remote_profile_name: saved_remote.clone(),
 
                     last_active: tokio::time::Instant::now(),
@@ -2954,6 +2951,11 @@ pub(super) async fn auto_restore_session(
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
+            session.channel_name = ch_name.clone();
+            session.category_name = cat_name.clone();
+            if session.remote_profile_name.is_none() {
+                session.remote_profile_name = saved_remote.clone();
+            }
             session.current_path = Some(last_path.clone());
             drop(data);
 
