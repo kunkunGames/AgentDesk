@@ -1,4 +1,5 @@
 use super::handoff::{HandoffRecord, save_handoff};
+use super::settings::{resolve_role_binding, validate_bot_channel_routing};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
 use crate::services::tmux_common::tmux_exact_target;
@@ -245,6 +246,12 @@ pub(super) async fn restore_inflight_turns(
     let current_gen = shared.current_generation;
 
     for state in states {
+        let channel_id = ChannelId::new(state.channel_id);
+        let is_dm = matches!(
+            channel_id.to_channel(http).await,
+            Ok(serenity::model::channel::Channel::Private(_))
+        );
+
         // No generation gate — adopt mode allows old-gen session recovery.
         // If a restart report exists for this channel, check whether the agent
         // has already finished before deciding to skip recovery.  When the output
@@ -469,7 +476,29 @@ pub(super) async fn restore_inflight_turns(
                             .map(|(_, ch)| ch)
                     })
                 });
-                let channel_id = ChannelId::new(state.channel_id);
+                // Resolve thread parent so validation uses the same semantics
+                // as normal message routing (router.rs).
+                let (eff_id, eff_name) = if let Some((pid, pname)) =
+                    super::resolve_thread_parent(http, channel_id).await
+                {
+                    (pid, pname.or(effective_channel_name.clone()))
+                } else {
+                    (channel_id, effective_channel_name.clone())
+                };
+                if let Err(reason) = validate_bot_channel_routing(
+                    &settings_snapshot,
+                    provider,
+                    eff_id,
+                    eff_name.as_deref(),
+                    is_dm,
+                ) {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
+                        state.channel_id,
+                    );
+                    continue;
+                }
                 {
                     let mut data = shared.core.lock().await;
                     let session =
@@ -579,7 +608,6 @@ pub(super) async fn restore_inflight_turns(
             }
         }
 
-        let channel_id = ChannelId::new(state.channel_id);
         let current_msg_id = MessageId::new(state.current_msg_id);
         let user_msg_id = MessageId::new(state.user_msg_id);
         let channel_name = state.channel_name.clone();
@@ -588,6 +616,34 @@ pub(super) async fn restore_inflight_turns(
                 .as_ref()
                 .map(|name| provider.build_tmux_session_name(name))
         });
+        let channel_name = channel_name.or_else(|| {
+            tmux_session_name.as_deref().and_then(|name| {
+                crate::services::provider::parse_provider_and_channel_from_tmux_name(name)
+                    .map(|(_, ch)| ch)
+            })
+        });
+        // Resolve thread parent so validation uses the same semantics
+        // as normal message routing (router.rs).
+        let (eff_id, eff_name) =
+            if let Some((pid, pname)) = super::resolve_thread_parent(http, channel_id).await {
+                (pid, pname.or(channel_name.clone()))
+            } else {
+                (channel_id, channel_name.clone())
+            };
+        if let Err(reason) = validate_bot_channel_routing(
+            &settings_snapshot,
+            provider,
+            eff_id,
+            eff_name.as_deref(),
+            is_dm,
+        ) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
+                state.channel_id,
+            );
+            continue;
+        }
         let (fallback_output, fallback_input) = tmux_session_name
             .as_deref()
             .map(tmux_runtime_paths)
@@ -935,7 +991,6 @@ pub(super) async fn restore_inflight_turns(
                 .insert(channel_id, UserId::new(state.request_owner_user_id));
         }
 
-        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
         let adk_session_key = build_adk_session_key(shared, channel_id, provider).await;
         let adk_session_name = channel_name.clone();
         let adk_session_info = derive_adk_session_info(
@@ -1030,6 +1085,7 @@ pub(super) async fn restore_inflight_turns(
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());
         state.dispatch_id = state.dispatch_id.or_else(|| recovery_dispatch_id.clone());
+        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
 
         spawn_turn_bridge(
             http.clone(),
