@@ -1100,6 +1100,7 @@ async fn send_dispatch_to_discord_inner(
             .ok()
             .and_then(|conn| {
                 // Check if this card is in a unified run and get thread_group info
+                // #218: Try dispatch_id first, then card_id for review/rework
                 let entry_info: Option<(String, i64, i64)> = conn
                     .query_row(
                         "SELECT e.run_id, COALESCE(e.thread_group, 0), COALESCE(r.thread_group_count, 1) \
@@ -1109,7 +1110,18 @@ async fn send_dispatch_to_discord_inner(
                         [dispatch_id],
                         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
                     )
-                    .ok();
+                    .ok()
+                    .or_else(|| {
+                        conn.query_row(
+                            "SELECT e.run_id, COALESCE(e.thread_group, 0), COALESCE(r.thread_group_count, 1) \
+                             FROM auto_queue_entries e \
+                             JOIN auto_queue_runs r ON e.run_id = r.id \
+                             WHERE r.unified_thread = 1 AND e.kanban_card_id = ?1 AND r.status = 'active'",
+                            [card_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                        )
+                        .ok()
+                    });
                 let (run_id, thread_group, group_count) = entry_info?;
 
                 // Build issue list — for parallel runs, only show group's issues
