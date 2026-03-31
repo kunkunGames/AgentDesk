@@ -1,4 +1,8 @@
 use super::handoff::{HandoffRecord, save_handoff};
+use super::settings::{
+    bot_settings_allow_agent, bot_settings_allow_channel, channel_supports_provider,
+    resolve_role_binding,
+};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
 use crate::services::tmux_common::tmux_exact_target;
@@ -470,6 +474,37 @@ pub(super) async fn restore_inflight_turns(
                     })
                 });
                 let channel_id = ChannelId::new(state.channel_id);
+                let role_binding =
+                    resolve_role_binding(channel_id, effective_channel_name.as_deref());
+                if !bot_settings_allow_channel(&settings_snapshot, channel_id, false) {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ inflight recovery skip for channel {} — not allowed for bot settings",
+                        state.channel_id
+                    );
+                    continue;
+                }
+                if !bot_settings_allow_agent(&settings_snapshot, role_binding.as_ref(), false) {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ inflight recovery skip for channel {} — agent mismatch",
+                        state.channel_id
+                    );
+                    continue;
+                }
+                if !channel_supports_provider(
+                    provider,
+                    effective_channel_name.as_deref(),
+                    false,
+                    role_binding.as_ref(),
+                ) {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!(
+                        "  [{ts}] ⏭ inflight recovery skip for channel {} — provider mismatch",
+                        state.channel_id
+                    );
+                    continue;
+                }
                 {
                     let mut data = shared.core.lock().await;
                     let session =
@@ -588,6 +623,42 @@ pub(super) async fn restore_inflight_turns(
                 .as_ref()
                 .map(|name| provider.build_tmux_session_name(name))
         });
+        let channel_name = channel_name.or_else(|| {
+            tmux_session_name.as_deref().and_then(|name| {
+                crate::services::provider::parse_provider_and_channel_from_tmux_name(name)
+                    .map(|(_, ch)| ch)
+            })
+        });
+        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
+        if !bot_settings_allow_channel(&settings_snapshot, channel_id, false) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ inflight recovery skip for channel {} — not allowed for bot settings",
+                state.channel_id
+            );
+            continue;
+        }
+        if !bot_settings_allow_agent(&settings_snapshot, role_binding.as_ref(), false) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ inflight recovery skip for channel {} — agent mismatch",
+                state.channel_id
+            );
+            continue;
+        }
+        if !channel_supports_provider(
+            provider,
+            channel_name.as_deref(),
+            false,
+            role_binding.as_ref(),
+        ) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ inflight recovery skip for channel {} — provider mismatch",
+                state.channel_id
+            );
+            continue;
+        }
         let (fallback_output, fallback_input) = tmux_session_name
             .as_deref()
             .map(tmux_runtime_paths)
@@ -935,7 +1006,6 @@ pub(super) async fn restore_inflight_turns(
                 .insert(channel_id, UserId::new(state.request_owner_user_id));
         }
 
-        let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
         let adk_session_key = build_adk_session_key(shared, channel_id, provider).await;
         let adk_session_name = channel_name.clone();
         let adk_session_info = derive_adk_session_info(

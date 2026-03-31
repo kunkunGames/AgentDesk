@@ -213,18 +213,16 @@ pub(super) async fn handle_event(
             } else {
                 (channel_id, channel_name.clone())
             };
-            let role_binding =
-                resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
             let settings_snapshot = { data.shared.settings.read().await.clone() };
-            if !bot_settings_allow_channel(&settings_snapshot, effective_channel_id, is_dm) {
-                return Ok(());
-            }
-            if !channel_supports_provider(
+            if validate_bot_channel_routing(
+                &settings_snapshot,
                 &data.provider,
+                effective_channel_id,
                 effective_channel_name.as_deref(),
                 is_dm,
-                role_binding.as_ref(),
-            ) {
+            )
+            .is_err()
+            {
                 return Ok(());
             }
 
