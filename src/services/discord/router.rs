@@ -1097,18 +1097,9 @@ pub(super) async fn handle_text_message(
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
-    // Only inject shared knowledge on the first turn (no existing session).
-    // Subsequent turns already have it in the system prompt context.
-    // ReviewLite dispatches skip shared knowledge to save tokens.
-    let is_review_lite = matches!(
-        dispatch_type_str.as_deref(),
-        Some("review") | Some("review-decision")
-    );
-    if session_id.is_none() && !is_review_lite {
-        if let Some(knowledge) = load_shared_knowledge() {
-            context_chunks.push(knowledge);
-        }
-    }
+    // SAK (Shared Agent Knowledge) is now injected into the system prompt
+    // (see below, after build_system_prompt) for prompt caching benefits.
+    // ReviewLite dispatches still skip it to save tokens.
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }
@@ -1212,7 +1203,7 @@ pub(super) async fn handle_text_message(
             .and_then(|_| dispatch_type_str.as_deref()),
     );
 
-    let system_prompt_owned = build_system_prompt(
+    let mut system_prompt_owned = build_system_prompt(
         &discord_context,
         &current_path,
         channel_id,
@@ -1224,6 +1215,24 @@ pub(super) async fn handle_text_message(
         dispatch_profile,
         dispatch_type_str.as_deref(),
     );
+
+    // Inject SAK (Shared Agent Knowledge) into system prompt for prompt caching.
+    // SAK changes infrequently (daily memory-merge at most), so placing it in the
+    // system prompt prefix enables Anthropic's automatic prefix caching — cached
+    // tokens are free on Pro/Max subscriptions.
+    // ReviewLite dispatches skip SAK to save tokens (reviewer doesn't need it).
+    if dispatch_profile != DispatchProfile::ReviewLite {
+        if let Some(knowledge) = load_shared_knowledge() {
+            let sak_len = knowledge.len();
+            system_prompt_owned.push_str("\n\n");
+            system_prompt_owned.push_str(&knowledge);
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 📦 SAK injected into system prompt ({sak_len} chars) for channel {}",
+                channel_id.get()
+            );
+        }
+    }
 
     // Create cancel token — with second check to close the TOCTOU race window.
     // Multiple messages can pass the initial cancel_tokens check (line 169) concurrently
