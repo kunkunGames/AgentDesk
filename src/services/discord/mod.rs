@@ -61,8 +61,8 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings,
-    resolve_role_binding, save_bot_settings, validate_bot_channel_routing,
+    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
+    save_bot_settings, validate_bot_channel_routing,
 };
 use shared_memory::load_shared_knowledge;
 #[cfg(unix)]
@@ -3087,15 +3087,14 @@ pub(super) async fn provider_handles_channel(
         } else {
             (channel_id, channel_name)
         };
-    let role_binding =
-        resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
-
-    channel_supports_provider(
+    validate_bot_channel_routing(
+        settings,
         provider,
+        effective_channel_id,
         effective_channel_name.as_deref(),
         is_dm,
-        role_binding.as_ref(),
-    ) && bot_settings_allow_channel(settings, effective_channel_id, is_dm)
+    )
+    .is_ok()
 }
 
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.

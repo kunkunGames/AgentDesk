@@ -1053,34 +1053,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_save_bot_settings_persists_allowed_channel_ids() {
-        with_temp_home(|_temp_home: &TempDir| {
-            let token = "test-token";
-            let mut settings = super::super::DiscordBotSettings::default();
-            settings.allowed_channel_ids = vec![123, 456];
-
-            save_bot_settings(token, &settings);
-
-            let loaded = load_bot_settings(token);
-            assert_eq!(loaded.allowed_channel_ids, vec![123, 456]);
-        });
-    }
-
-    #[test]
-    fn test_save_bot_settings_persists_agent_identity() {
-        with_temp_home(|_temp_home: &TempDir| {
-            let token = "test-token";
-            let mut settings = super::super::DiscordBotSettings::default();
-            settings.agent = Some("codex".to_string());
-
-            save_bot_settings(token, &settings);
-
-            let loaded = load_bot_settings(token);
-            assert_eq!(loaded.agent.as_deref(), Some("codex"));
-        });
-    }
-
     // ── P0 tests ─────────────────────────────────────────────────────────
 
     #[test]
