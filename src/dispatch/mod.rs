@@ -722,21 +722,29 @@ fn complete_dispatch_inner(
     // These are dispatches created outside any card transition context.
     notify_hook_created_dispatches(db, pre_hook_max_rowid);
 
-    // #139: Safety net — if card transitioned to review but OnReviewEnter failed
-    // to create a review dispatch (engine lock contention, JS error, etc.),
-    // re-fire OnReviewEnter to guarantee review dispatch creation.
+    // #139/#220: Safety net — if card transitioned to review but OnReviewEnter
+    // failed to create a review dispatch (engine lock contention causing
+    // try_lock WouldBlock → hook deferred, JS error, etc.), create the review
+    // dispatch directly in Rust instead of re-firing the JS hook. This bypasses
+    // all engine lock contention and JS failure modes.
     {
-        let needs_review_dispatch = db
+        let review_info: Option<(String, String)> = db
             .lock()
             .ok()
-            .map(|conn| {
-                let (card_status, repo_id, agent_id): (Option<String>, Option<String>, Option<String>) = conn
+            .and_then(|conn| {
+                let (card_status, repo_id, agent_id, review_round): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<i64>,
+                ) = conn
                     .query_row(
-                        "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+                        "SELECT status, repo_id, assigned_agent_id, review_round \
+                         FROM kanban_cards WHERE id = ?1",
                         [&kanban_card_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
-                    .unwrap_or((None, None, None));
+                    .unwrap_or((None, None, None, None));
                 let has_review_dispatch: bool = conn
                     .query_row(
                         "SELECT COUNT(*) > 0 FROM task_dispatches \
@@ -746,25 +754,54 @@ fn complete_dispatch_inner(
                         |row| row.get(0),
                     )
                     .unwrap_or(false);
-                // Pipeline-driven: check if current state has OnReviewEnter hook (card's effective pipeline)
                 let is_review_state = card_status.as_deref().map_or(false, |s| {
-                    let eff = crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
+                    let eff = crate::pipeline::resolve_for_card(
+                        &conn,
+                        repo_id.as_deref(),
+                        agent_id.as_deref(),
+                    );
                     eff.hooks_for_state(s)
                         .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
                 });
-                is_review_state && !has_review_dispatch
-            })
-            .unwrap_or(false);
+                if is_review_state && !has_review_dispatch {
+                    agent_id.map(|aid| {
+                        let round = review_round.unwrap_or(1);
+                        (aid, format!("[Review R{}]", round))
+                    })
+                } else {
+                    None
+                }
+            });
 
-        if needs_review_dispatch {
+        if let Some((agent_id, title_prefix)) = review_info {
             let cid = kanban_card_id.as_deref().unwrap_or("unknown");
             tracing::warn!(
-                "[dispatch] Card {} in review-like state but no review dispatch — re-firing OnReviewEnter (#139)",
-                cid
+                "[dispatch] Card {cid} in review state but no review dispatch — creating directly (#220)"
             );
-            let _ = engine.try_fire_hook_by_name("OnReviewEnter", json!({ "card_id": cid }));
-            crate::kanban::drain_hook_side_effects(db, engine);
-            notify_hook_created_dispatches(db, pre_hook_max_rowid);
+            match create_dispatch_core_with_id(
+                db,
+                &uuid::Uuid::new_v4().to_string(),
+                cid,
+                &agent_id,
+                "review",
+                &format!("{} {}", title_prefix, cid),
+                &json!({}),
+            ) {
+                Ok((did, _, reused)) => {
+                    if !reused {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] ✅ Safety net created review dispatch {did} for card {cid}"
+                        );
+                    }
+                    notify_hook_created_dispatches(db, pre_hook_max_rowid);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[dispatch] Safety net failed to create review dispatch for {cid}: {e}"
+                    );
+                }
+            }
         }
     }
 
