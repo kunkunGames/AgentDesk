@@ -304,7 +304,11 @@ pub(super) async fn restore_inflight_turns(
                 // completion path was lost when dcserver restarted.
                 // #142: Check dispatch type — implementation/rework need explicit completion,
                 // review can use idle auto-complete.
-                let recovered_dispatch_id = parse_dispatch_id(&state.user_text);
+                // #222: DB lookup first, text parsing as fallback for unified threads.
+                let recovered_dispatch_id =
+                    lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id)
+                        .await
+                        .or_else(|| parse_dispatch_id(&state.user_text));
                 let mut dispatch_completed = recovered_dispatch_id.is_none();
                 if let Some(ref did) = recovered_dispatch_id {
                     // #143: Use finalize_dispatch directly with retry.
@@ -952,7 +956,11 @@ pub(super) async fn restore_inflight_turns(
             Some(&adk_session_info),
             None,
             last_path.as_deref(),
-            parse_dispatch_id(&state.user_text).as_deref(),
+            // #222: DB lookup first for unified thread recovery
+            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
+                .await
+                .or_else(|| parse_dispatch_id(&state.user_text))
+                .as_deref(),
             shared.api_port,
         )
         .await;
@@ -1025,7 +1033,11 @@ pub(super) async fn restore_inflight_turns(
             }
         });
 
-        let recovery_dispatch_id = parse_dispatch_id(&state.user_text);
+        // #222: DB lookup first for unified thread recovery
+        let recovery_dispatch_id =
+            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
+                .await
+                .or_else(|| parse_dispatch_id(&state.user_text));
         // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());
