@@ -248,6 +248,12 @@ pub(super) async fn restore_inflight_turns(
     let current_gen = shared.current_generation;
 
     for state in states {
+        let channel_id = ChannelId::new(state.channel_id);
+        let is_dm = matches!(
+            channel_id.to_channel(http).await,
+            Ok(serenity::model::channel::Channel::Private(_))
+        );
+
         // No generation gate — adopt mode allows old-gen session recovery.
         // If a restart report exists for this channel, check whether the agent
         // has already finished before deciding to skip recovery.  When the output
@@ -472,13 +478,12 @@ pub(super) async fn restore_inflight_turns(
                             .map(|(_, ch)| ch)
                     })
                 });
-                let channel_id = ChannelId::new(state.channel_id);
                 if let Err(reason) = validate_bot_channel_routing(
                     &settings_snapshot,
                     provider,
                     channel_id,
                     effective_channel_name.as_deref(),
-                    false,
+                    is_dm,
                 ) {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     match reason {
@@ -609,7 +614,6 @@ pub(super) async fn restore_inflight_turns(
             }
         }
 
-        let channel_id = ChannelId::new(state.channel_id);
         let current_msg_id = MessageId::new(state.current_msg_id);
         let user_msg_id = MessageId::new(state.user_msg_id);
         let channel_name = state.channel_name.clone();
@@ -629,7 +633,7 @@ pub(super) async fn restore_inflight_turns(
             provider,
             channel_id,
             channel_name.as_deref(),
-            false,
+            is_dm,
         ) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             match reason {
