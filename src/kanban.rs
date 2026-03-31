@@ -107,6 +107,27 @@ pub fn transition_status_with_opts(
         )
         .unwrap_or(false);
 
+    // Review verdict gate: check the LATEST completed review dispatch for this card.
+    // Only dispatches completed AFTER the most recent review entry count.
+    let latest_review_verdict: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(result, '$.verdict') FROM task_dispatches \
+             WHERE kanban_card_id = ?1 AND dispatch_type = 'review' AND status = 'completed' \
+             ORDER BY updated_at DESC LIMIT 1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    let review_verdict_pass = matches!(
+        latest_review_verdict.as_deref(),
+        Some("pass") | Some("approved")
+    );
+    let review_verdict_rework = matches!(
+        latest_review_verdict.as_deref(),
+        Some("rework") | Some("improve") | Some("reject")
+    );
+
     let ctx = TransitionContext {
         card: CardState {
             id: card_id.to_string(),
@@ -117,6 +138,8 @@ pub fn transition_status_with_opts(
         pipeline: effective.clone(),
         gates: GateSnapshot {
             has_active_dispatch,
+            review_verdict_pass,
+            review_verdict_rework,
         },
     };
 
@@ -264,6 +287,8 @@ pub fn transition_status_no_hooks(
         pipeline: effective,
         gates: GateSnapshot {
             has_active_dispatch,
+            review_verdict_pass: false,
+            review_verdict_rework: false,
         },
     };
 

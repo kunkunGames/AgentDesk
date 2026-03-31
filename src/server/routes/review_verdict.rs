@@ -754,11 +754,14 @@ pub async fn submit_review_decision(
             };
 
             // Transition card to rework target (e.g., in_progress)
-            if let Err(e) = crate::kanban::transition_status(
+            // Force=true — accept decision already validated the review verdict
+            if let Err(e) = crate::kanban::transition_status_with_opts(
                 &state.db,
                 &state.engine,
                 &body.card_id,
                 &rework_target,
+                "review_decision_accept",
+                true,
             ) {
                 tracing::warn!(
                     "[review-decision] #195 Transition to rework target failed for card {}: {e}",
@@ -934,11 +937,13 @@ pub async fn submit_review_decision(
                     .map(|s| s.id.clone())
                     .unwrap_or_else(|| "done".to_string())
             };
-            let _ = crate::kanban::transition_status(
+            let _ = crate::kanban::transition_status_with_opts(
                 &state.db,
                 &state.engine,
                 &body.card_id,
                 &terminal_state,
+                "dismiss",
+                true, // force — dismiss bypasses review_passed gate
             );
 
             // Post-transition cleanup: cancel remaining pending review dispatches to prevent

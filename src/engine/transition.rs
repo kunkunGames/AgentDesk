@@ -27,6 +27,10 @@ pub struct CardState {
 pub struct GateSnapshot {
     /// Whether the card has at least one pending/dispatched dispatch.
     pub has_active_dispatch: bool,
+    /// Whether the latest completed review dispatch has verdict=pass/approved.
+    pub review_verdict_pass: bool,
+    /// Whether the latest completed review dispatch has verdict=rework/improve.
+    pub review_verdict_rework: bool,
 }
 
 /// Everything the pure reducer needs — no DB handle.
@@ -253,22 +257,34 @@ fn decide_pipeline_transition(
                 for gate_name in &t.gates {
                     if let Some(gate) = pipeline.gates.get(gate_name.as_str()) {
                         if gate.gate_type == "builtin" {
-                            if let Some("has_active_dispatch") = gate.check.as_deref() {
-                                if !ctx.gates.has_active_dispatch {
-                                    return TransitionDecision {
-                                        outcome: TransitionOutcome::Blocked(format!(
-                                            "Status transition {} → {} requires an active dispatch (gate: {})",
-                                            card.status, target, gate_name
-                                        )),
-                                        intents: vec![TransitionIntent::AuditLog {
-                                            card_id: card.id.clone(),
-                                            from: card.status.clone(),
-                                            to: target.to_string(),
-                                            source: source.to_string(),
-                                            message: "BLOCKED: no active dispatch".to_string(),
-                                        }],
-                                    };
+                            let blocked_msg = match gate.check.as_deref() {
+                                Some("has_active_dispatch") if !ctx.gates.has_active_dispatch => {
+                                    Some("BLOCKED: no active dispatch")
                                 }
+                                Some("review_verdict_pass") if !ctx.gates.review_verdict_pass => {
+                                    Some("BLOCKED: no review pass verdict for current round")
+                                }
+                                Some("review_verdict_rework")
+                                    if !ctx.gates.review_verdict_rework =>
+                                {
+                                    Some("BLOCKED: no review rework verdict for current round")
+                                }
+                                _ => None,
+                            };
+                            if let Some(msg) = blocked_msg {
+                                return TransitionDecision {
+                                    outcome: TransitionOutcome::Blocked(format!(
+                                        "Status transition {} → {} failed gate '{}': {}",
+                                        card.status, target, gate_name, msg
+                                    )),
+                                    intents: vec![TransitionIntent::AuditLog {
+                                        card_id: card.id.clone(),
+                                        from: card.status.clone(),
+                                        to: target.to_string(),
+                                        source: source.to_string(),
+                                        message: msg.to_string(),
+                                    }],
+                                };
                             }
                         }
                     }
@@ -894,6 +910,8 @@ mod tests {
             pipeline: test_pipeline(),
             gates: GateSnapshot {
                 has_active_dispatch: has_dispatch,
+                review_verdict_pass: false,
+                review_verdict_rework: false,
             },
         }
     }
