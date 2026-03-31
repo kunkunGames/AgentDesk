@@ -347,6 +347,11 @@ pub fn api_router(
         )
         // Discord bindings
         .route("/discord-bindings", get(discord::list_bindings))
+        .route(
+            "/discord/channels/{id}/messages",
+            get(discord::channel_messages),
+        )
+        .route("/discord/channels/{id}", get(discord::channel_info))
         // Round-table meetings
         .route("/round-table-meetings", get(meetings::list_meetings))
         .route("/round-table-meetings/start", post(meetings::start_meeting))
