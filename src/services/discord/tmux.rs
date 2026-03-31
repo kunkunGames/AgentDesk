@@ -14,7 +14,9 @@ use crate::services::tmux_diagnostics::{
 use super::formatting::{
     format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw,
 };
-use super::settings::{channel_supports_provider, resolve_role_binding};
+use super::settings::{
+    channel_supports_provider, resolve_role_binding, validate_bot_channel_routing,
+};
 use super::{DISCORD_MSG_LIMIT, SharedData, TmuxWatcherHandle, rate_limit_wait};
 
 use crate::utils::format::tail_with_ellipsis;
@@ -1172,7 +1174,8 @@ pub(super) fn process_watcher_lines(
 /// On startup, scan for surviving tmux sessions (AgentDesk-*) and restore watchers.
 /// This handles the case where AgentDesk was restarted but tmux sessions are still alive.
 pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &Arc<SharedData>) {
-    let provider = shared.settings.read().await.provider.clone();
+    let settings_snapshot = { shared.settings.read().await.clone() };
+    let provider = settings_snapshot.provider.clone();
 
     // List tmux sessions matching our naming convention
     let output = match tokio::time::timeout(
@@ -1300,6 +1303,32 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         // #148: Do NOT register in owned_sessions yet — QUARANTINE check below may
         // skip this session. Registering early blocks new session creation for the channel.
+        let is_dm = matches!(
+            channel_id.to_channel(http.as_ref()).await,
+            Ok(serenity::model::channel::Channel::Private(_))
+        );
+        // Resolve thread parent so validation uses the same semantics
+        // as normal message routing (router.rs).
+        let (eff_id, eff_name) =
+            if let Some((pid, pname)) = super::resolve_thread_parent(http, *channel_id).await {
+                (pid, pname.unwrap_or_else(|| channel_name.clone()))
+            } else {
+                (*channel_id, channel_name.clone())
+            };
+        if let Err(reason) = validate_bot_channel_routing(
+            &settings_snapshot,
+            &provider,
+            eff_id,
+            Some(&eff_name),
+            is_dm,
+        ) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — {reason} for channel {}",
+                session_name, channel_id
+            );
+            continue;
+        }
 
         if let Some(started) = shared.recovering_channels.get(channel_id) {
             if started.elapsed() < std::time::Duration::from_secs(60) {

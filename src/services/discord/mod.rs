@@ -61,8 +61,8 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    RoleBinding, bot_settings_allow_channel, channel_supports_provider, channel_upload_dir,
-    cleanup_old_uploads, load_bot_settings, resolve_role_binding, save_bot_settings,
+    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
+    save_bot_settings, validate_bot_channel_routing,
 };
 use shared_memory::load_shared_knowledge;
 #[cfg(unix)]
@@ -250,6 +250,8 @@ pub(super) struct Intervention {
 /// Bot-level settings persisted to disk
 #[derive(Clone)]
 pub(super) struct DiscordBotSettings {
+    /// Optional agent identity (e.g. "codex", "spark") for same-provider isolation.
+    pub(super) agent: Option<String>,
     pub(super) provider: ProviderKind,
     pub(super) allowed_tools: Vec<String>,
     /// Explicit Discord channel allowlist for this bot token.
@@ -272,6 +274,7 @@ pub(super) struct DiscordBotSettings {
 impl Default for DiscordBotSettings {
     fn default() -> Self {
         Self {
+            agent: None,
             provider: ProviderKind::Claude,
             allowed_tools: DEFAULT_ALLOWED_TOOLS
                 .iter()
@@ -2981,7 +2984,7 @@ async fn bootstrap_thread_session(
 ) {
     let (_thread_title, cat_name) = resolve_channel_category(serenity_ctx, thread_channel_id).await;
     // Build a short, stable channel_name: "{parent_channel}-t{thread_id}"
-    let parent_info = resolve_thread_parent(serenity_ctx, thread_channel_id).await;
+    let parent_info = resolve_thread_parent(&serenity_ctx.http, thread_channel_id).await;
     let ch_name = if let Some((_parent_id, parent_name)) = parent_info {
         let parent = parent_name.unwrap_or_else(|| format!("{}", _parent_id));
         Some(format!("{}-t{}", parent, thread_channel_id.get()))
@@ -3078,30 +3081,30 @@ pub(super) async fn provider_handles_channel(
         Ok(serenity::model::channel::Channel::Private(_))
     );
     let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
-    let (effective_channel_id, effective_channel_name) =
-        if let Some((parent_id, parent_name)) = resolve_thread_parent(ctx, channel_id).await {
-            (parent_id, parent_name.or(channel_name))
-        } else {
-            (channel_id, channel_name)
-        };
-    let role_binding =
-        resolve_role_binding(effective_channel_id, effective_channel_name.as_deref());
-
-    channel_supports_provider(
+    let (effective_channel_id, effective_channel_name) = if let Some((parent_id, parent_name)) =
+        resolve_thread_parent(&ctx.http, channel_id).await
+    {
+        (parent_id, parent_name.or(channel_name))
+    } else {
+        (channel_id, channel_name)
+    };
+    validate_bot_channel_routing(
+        settings,
         provider,
+        effective_channel_id,
         effective_channel_name.as_deref(),
         is_dm,
-        role_binding.as_ref(),
-    ) && bot_settings_allow_channel(settings, effective_channel_id, is_dm)
+    )
+    .is_ok()
 }
 
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.
 /// For non-thread channels, returns `None`.
-async fn resolve_thread_parent(
-    ctx: &serenity::prelude::Context,
+pub(super) async fn resolve_thread_parent(
+    http: &Arc<serenity::Http>,
     channel_id: serenity::model::id::ChannelId,
 ) -> Option<(serenity::model::id::ChannelId, Option<String>)> {
-    let channel = channel_id.to_channel(&ctx.http).await.ok()?;
+    let channel = channel_id.to_channel(http).await.ok()?;
     let serenity::model::channel::Channel::Guild(gc) = channel else {
         return None;
     };
@@ -3109,7 +3112,7 @@ async fn resolve_thread_parent(
     match gc.kind {
         ChannelType::PublicThread | ChannelType::PrivateThread => {
             let parent_id = gc.parent_id?;
-            let parent_name = if let Ok(parent_ch) = parent_id.to_channel(&ctx.http).await {
+            let parent_name = if let Ok(parent_ch) = parent_id.to_channel(http).await {
                 match parent_ch {
                     serenity::model::channel::Channel::Guild(pg) => Some(pg.name.clone()),
                     _ => None,
