@@ -20,8 +20,8 @@ const GEMINI_RESUME_LATEST: &str = "latest";
 const GEMINI_SESSION_DEAD_MESSAGE: &str = "Gemini stream ended without a terminal result";
 const GEMINI_INVALID_RESUME_SELECTOR_MESSAGE: &str =
     "InvalidArgument: Gemini resume selector must be `latest` or a numeric session index";
-const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-const GEMINI_STREAM_IDLE_TICKS_BEFORE_RETRY: u32 = 2;
+const GEMINI_STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const GEMINI_STREAM_IDLE_WATCHDOG: Duration = Duration::from_secs(120);
 const GEMINI_MAX_SESSION_RETRIES: usize = 1;
 
 #[derive(Debug)]
@@ -229,7 +229,8 @@ fn execute_gemini_streaming_attempt(
         &stdout_events,
         cancel_token.as_deref(),
         &mut state,
-        GEMINI_STREAM_IDLE_TIMEOUT,
+        GEMINI_STREAM_POLL_TIMEOUT,
+        GEMINI_STREAM_IDLE_WATCHDOG,
     ) {
         GeminiStreamLoopResult::Cancelled => {
             claude::kill_child_tree(&mut child);
@@ -294,18 +295,19 @@ fn collect_gemini_stream_events(
     stdout_events: &mpsc::Receiver<GeminiStreamEvent>,
     cancel_token: Option<&CancelToken>,
     state: &mut GeminiAttemptState,
-    idle_timeout: Duration,
+    poll_timeout: Duration,
+    idle_watchdog: Duration,
 ) -> GeminiStreamLoopResult {
-    let mut idle_ticks = 0;
+    let mut silent_for = Duration::ZERO;
 
     loop {
         if is_cancelled(cancel_token) {
             return GeminiStreamLoopResult::Cancelled;
         }
 
-        match stdout_events.recv_timeout(idle_timeout) {
+        match stdout_events.recv_timeout(poll_timeout) {
             Ok(GeminiStreamEvent::Line(line)) => {
-                idle_ticks = 0;
+                silent_for = Duration::ZERO;
                 process_gemini_stream_line(&line, state);
             }
             Ok(GeminiStreamEvent::ReadError(message)) => {
@@ -321,12 +323,15 @@ fn collect_gemini_stream_events(
                 if state.terminal_result_seen {
                     return GeminiStreamLoopResult::Eof;
                 }
-                idle_ticks += 1;
-                if idle_ticks >= GEMINI_STREAM_IDLE_TICKS_BEFORE_RETRY {
+                if state.raw_stdout.is_empty() {
+                    continue;
+                }
+                silent_for += poll_timeout;
+                if silent_for >= idle_watchdog {
                     return GeminiStreamLoopResult::RetrySession {
                         message: format!(
                             "Gemini stream produced no output for {} seconds",
-                            idle_timeout.as_secs() * GEMINI_STREAM_IDLE_TICKS_BEFORE_RETRY as u64
+                            idle_watchdog.as_secs()
                         ),
                     };
                 }
@@ -605,11 +610,15 @@ fn observed_session_to_resume_selector(session_id: &str) -> Option<String> {
         return None;
     }
 
-    if session_id.eq_ignore_ascii_case(GEMINI_RESUME_LATEST)
-        || session_id.chars().all(|ch| ch.is_ascii_digit())
-        || looks_like_uuid(session_id)
-        || is_common_session_metadata(session_id)
-    {
+    if session_id.eq_ignore_ascii_case(GEMINI_RESUME_LATEST) {
+        return Some(GEMINI_RESUME_LATEST.to_string());
+    }
+
+    if session_id.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(session_id.to_string());
+    }
+
+    if looks_like_uuid(session_id) || is_common_session_metadata(session_id) {
         return Some(GEMINI_RESUME_LATEST.to_string());
     }
 
@@ -816,6 +825,14 @@ mod tests {
         assert_eq!(
             observed_session_to_resume_selector(observed).as_deref(),
             Some("latest")
+        );
+    }
+
+    #[test]
+    fn observed_session_to_resume_selector_preserves_numeric_selector() {
+        assert_eq!(
+            observed_session_to_resume_selector("12").as_deref(),
+            Some("12")
         );
     }
 
@@ -1178,9 +1195,59 @@ mod tests {
             Some(token.as_ref()),
             &mut state,
             Duration::from_millis(5),
+            Duration::from_millis(10),
         );
 
         assert_eq!(result, GeminiStreamLoopResult::Cancelled);
+        assert_eq!(state.final_text, "partial");
+    }
+
+    #[test]
+    fn idle_watchdog_does_not_retry_before_first_stream_progress() {
+        let token = Arc::new(CancelToken::new());
+        let (_tx, rx) = mpsc::channel();
+        let mut state = GeminiAttemptState::new(None);
+        let token_for_thread = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(4));
+            token_for_thread.cancelled.store(true, Ordering::Relaxed);
+        });
+
+        let result = collect_gemini_stream_events(
+            &rx,
+            Some(token.as_ref()),
+            &mut state,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+
+        assert_eq!(result, GeminiStreamLoopResult::Cancelled);
+        assert!(state.raw_stdout.is_empty());
+    }
+
+    #[test]
+    fn idle_watchdog_retries_after_extended_silence_following_progress() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = GeminiAttemptState::new(None);
+        tx.send(GeminiStreamEvent::Line(
+            r#"{"type":"message","role":"assistant","content":"partial"}"#.to_string(),
+        ))
+        .unwrap();
+
+        let result = collect_gemini_stream_events(
+            &rx,
+            None,
+            &mut state,
+            Duration::from_millis(1),
+            Duration::from_millis(3),
+        );
+
+        match result {
+            GeminiStreamLoopResult::RetrySession { message } => {
+                assert!(message.contains("Gemini stream produced no output"));
+            }
+            other => panic!("expected RetrySession, got {:?}", other),
+        }
         assert_eq!(state.final_text, "partial");
     }
 
