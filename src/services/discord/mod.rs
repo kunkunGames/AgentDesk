@@ -44,7 +44,8 @@ use crate::services::provider::ProviderKind;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
 
 use adk_session::{
-    build_adk_session_key, derive_adk_session_info, parse_dispatch_id, post_adk_session_status,
+    build_adk_session_key, derive_adk_session_info, lookup_pending_dispatch_for_thread,
+    parse_dispatch_id, post_adk_session_status,
 };
 use formatting::{
     BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
