@@ -565,7 +565,7 @@ pub async fn api_docs() -> (StatusCode, Json<Value>) {
         // Cancel dispatch + kill session
         ep(
             "POST",
-            "/api/dispatches/{id}/cancel",
+            "/api/dispatch-cancel/{id}",
             "dispatches",
             "Cancel dispatch and kill associated agent session",
         ),
