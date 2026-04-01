@@ -986,8 +986,28 @@ pub(super) async fn tmux_output_watcher(
 
             let ctx_cfg = super::adk_session::fetch_context_thresholds(shared.api_port).await;
             let pct = (tokens * 100) / ctx_cfg.context_window.max(1);
-            // #227: Re-enabled — token counting fixed (input-only, /clear resets).
-            if pct >= ctx_cfg.compact_pct && !is_prompt_too_long {
+            // #227: Re-enabled with 5-min cooldown (matches turn_bridge path).
+            // Without cooldown, the compact turn's own result could re-trigger compact.
+            let compact_cooldown_ok = shared.db.as_ref().map_or(true, |db| {
+                db.lock().ok().map_or(true, |conn| {
+                    let cooldown_key = format!("auto_compact_cooldown:{}", channel_id.get());
+                    let last: Option<String> = conn
+                        .query_row(
+                            "SELECT value FROM kv_meta WHERE key = ?1",
+                            [&cooldown_key],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    last.and_then(|v| v.parse::<i64>().ok()).map_or(true, |ts| {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        now - ts > 300 // 5 min cooldown
+                    })
+                })
+            });
+            if pct >= ctx_cfg.compact_pct && !is_prompt_too_long && compact_cooldown_ok {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 eprintln!(
                     "  [{ts}] ⚡ [watcher] Auto-compact: {} at {pct}% ({tokens} tokens)",
@@ -998,6 +1018,21 @@ pub(super) async fn tmux_output_watcher(
                     crate::services::platform::tmux::send_keys(&name, &["/compact", "Enter"])
                 })
                 .await;
+                // Set cooldown timestamp
+                if let Some(ref db) = shared.db {
+                    if let Ok(conn) = db.lock() {
+                        let cooldown_key = format!("auto_compact_cooldown:{}", channel_id.get());
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        conn.execute(
+                            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                            rusqlite::params![cooldown_key, now.to_string()],
+                        )
+                        .ok();
+                    }
+                }
                 // Notify agent channel via notify bot
                 {
                     let api_port = shared.api_port;
