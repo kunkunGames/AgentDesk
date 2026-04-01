@@ -103,9 +103,31 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
     // doesn't try to --resume a dead session.
     let shared = &ctx.data().shared;
     let provider = &ctx.data().provider;
-    if let Some(ref key) =
-        super::super::adk_session::build_adk_session_key(shared, channel_id, provider).await
-    {
+    // #227: Derive session key with fallback for post-restart state where
+    // in-memory sessions may be empty but DB still has stale token values.
+    let session_key = {
+        let key =
+            super::super::adk_session::build_adk_session_key(shared, channel_id, provider).await;
+        if key.is_some() {
+            key
+        } else {
+            // Fallback: resolve channel name from Discord API
+            let ch_name = channel_id
+                .to_channel(ctx.http())
+                .await
+                .ok()
+                .and_then(|ch| match ch {
+                    poise::serenity_prelude::Channel::Guild(gc) => Some(gc.name.clone()),
+                    _ => None,
+                });
+            ch_name.map(|name| {
+                let tmux_name = provider.build_tmux_session_name(&name);
+                let hostname = crate::services::platform::hostname_short();
+                format!("{}:{}", hostname, tmux_name)
+            })
+        }
+    };
+    if let Some(ref key) = session_key {
         super::super::adk_session::clear_claude_session_id(key, shared.api_port).await;
         // #227: Reset tokens to 0 so stale context values don't persist after /clear.
         super::super::adk_session::post_adk_session_status(
