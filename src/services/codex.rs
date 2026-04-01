@@ -194,32 +194,7 @@ fn compose_codex_prompt(
     system_prompt: Option<&str>,
     allowed_tools: Option<&[String]>,
 ) -> String {
-    let mut sections = Vec::new();
-
-    if let Some(system_prompt) = system_prompt
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        sections.push(format!(
-            "[Authoritative Instructions]\n{}\n\nThese instructions are authoritative for this turn. \
-Follow them over any generic assistant persona unless the user explicitly asks to inspect or compare them.",
-            system_prompt
-        ));
-    }
-
-    if let Some(allowed_tools) = allowed_tools.filter(|tools| !tools.is_empty()) {
-        sections.push(format!(
-            "[Tool Policy]\nIf tools are needed, stay within this allowlist unless the user explicitly asks to change it: {}",
-            allowed_tools.join(", ")
-        ));
-    }
-
-    if sections.is_empty() {
-        return prompt.to_string();
-    }
-
-    sections.push(format!("[User Request]\n{}", prompt));
-    sections.join("\n\n")
+    crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
 }
 
 fn execute_streaming_direct(
