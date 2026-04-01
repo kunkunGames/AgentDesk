@@ -322,14 +322,14 @@ impl CancelToken {
 }
 
 /// Cached regex pattern for session ID validation
-fn session_id_regex() -> &'static Regex {
+pub(crate) fn session_id_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").expect("Invalid session ID regex pattern"))
 }
 
 /// Validate session ID format (alphanumeric, dashes, underscores only)
 /// Max length reduced to 64 characters for security
-fn is_valid_session_id(session_id: &str) -> bool {
+pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty() && session_id.len() <= 64 && session_id_regex().is_match(session_id)
 }
 

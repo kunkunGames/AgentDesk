@@ -15,6 +15,8 @@ static GEMINI_PATH: OnceLock<Option<String>> = OnceLock::new();
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 const GEMINI_RESUME_LATEST: &str = "latest";
 const GEMINI_SESSION_DEAD_MESSAGE: &str = "Gemini stream ended without a terminal result";
+const GEMINI_INVALID_RESUME_SELECTOR_MESSAGE: &str =
+    "InvalidArgument: Gemini resume selector must be `latest` or a numeric session index";
 const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const GEMINI_STREAM_IDLE_TICKS_BEFORE_RETRY: u32 = 2;
 const GEMINI_MAX_SESSION_RETRIES: usize = 1;
@@ -162,20 +164,36 @@ pub fn execute_command_streaming(
         return Err(remote_profile_not_supported_message());
     }
 
+    let resume_selector = normalize_resume_selector(session_id)?;
+    if is_cancelled(cancel_token.as_deref()) {
+        return Ok(());
+    }
+
     let gemini_bin = get_gemini_path().ok_or_else(|| "Gemini CLI not found".to_string())?;
     let prompt = compose_gemini_prompt(prompt, system_prompt, allowed_tools);
-    let mut resume_selector = normalize_resume_selector(session_id)?;
-
-    for attempt in 0..=GEMINI_MAX_SESSION_RETRIES {
-        match execute_gemini_streaming_attempt(
+    run_gemini_streaming_attempts(&sender, resume_selector, |resume_selector| {
+        execute_gemini_streaming_attempt(
             gemini_bin,
             &prompt,
             model,
-            resume_selector.clone(),
+            resume_selector,
             working_dir,
             sender.clone(),
             cancel_token.clone(),
-        )? {
+        )
+    })
+}
+
+fn run_gemini_streaming_attempts<F>(
+    sender: &Sender<StreamMessage>,
+    mut resume_selector: Option<String>,
+    mut execute_attempt: F,
+) -> Result<(), String>
+where
+    F: FnMut(Option<String>) -> Result<GeminiAttemptResult, String>,
+{
+    for attempt in 0..=GEMINI_MAX_SESSION_RETRIES {
+        match execute_attempt(resume_selector.clone())? {
             GeminiAttemptResult::Completed | GeminiAttemptResult::Cancelled => return Ok(()),
             GeminiAttemptResult::RetrySession {
                 message,
@@ -628,14 +646,35 @@ fn normalize_resume_selector(session_id: Option<&str>) -> Result<Option<String>,
         return Ok(Some(GEMINI_RESUME_LATEST.to_string()));
     }
 
-    Err(
-        "InvalidArgument: Gemini resume selector must be `latest` or a numeric session index"
-            .to_string(),
-    )
+    if is_common_session_metadata(session_id) {
+        return Err(GEMINI_INVALID_RESUME_SELECTOR_MESSAGE.to_string());
+    }
+
+    Err(GEMINI_INVALID_RESUME_SELECTOR_MESSAGE.to_string())
 }
 
-fn observed_session_to_resume_selector(_session_id: &str) -> Option<String> {
-    Some(GEMINI_RESUME_LATEST.to_string())
+fn observed_session_to_resume_selector(session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+
+    if session_id.eq_ignore_ascii_case(GEMINI_RESUME_LATEST)
+        || session_id.chars().all(|ch| ch.is_ascii_digit())
+        || looks_like_uuid(session_id)
+        || is_common_session_metadata(session_id)
+    {
+        return Some(GEMINI_RESUME_LATEST.to_string());
+    }
+
+    None
+}
+
+fn is_common_session_metadata(session_id: &str) -> bool {
+    let session_id = session_id.trim();
+    !session_id.is_empty()
+        && claude::session_id_regex().is_match(session_id)
+        && claude::is_valid_session_id(session_id)
 }
 
 fn looks_like_uuid(value: &str) -> bool {
@@ -762,16 +801,19 @@ fn render_gemini_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState, GeminiFinalState, build_exec_args,
-        build_gemini_tool_result_message, build_gemini_tool_use_message, execute_command_streaming,
-        extract_gemini_error_message, extract_text_from_stream_output, finalize_gemini_attempt,
-        flush_buffered_stream_messages, looks_like_uuid, normalize_resume_selector,
-        observed_session_to_resume_selector, process_gemini_stream_line,
-        remote_profile_not_supported_message,
+        GEMINI_INVALID_RESUME_SELECTOR_MESSAGE, GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptResult,
+        GeminiAttemptState, GeminiFinalState, build_exec_args, build_gemini_tool_result_message,
+        build_gemini_tool_use_message, execute_command_streaming, extract_gemini_error_message,
+        extract_text_from_stream_output, finalize_gemini_attempt, flush_buffered_stream_messages,
+        looks_like_uuid, normalize_resume_selector, observed_session_to_resume_selector,
+        process_gemini_stream_line, remote_profile_not_supported_message,
+        run_gemini_streaming_attempts,
     };
-    use crate::services::claude::StreamMessage;
+    use crate::services::claude::{CancelToken, StreamMessage};
     use crate::services::remote::{RemoteAuth, RemoteProfile};
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
 
     #[test]
@@ -833,6 +875,14 @@ mod tests {
     }
 
     #[test]
+    fn observed_session_to_resume_selector_maps_common_metadata_to_latest() {
+        assert_eq!(
+            observed_session_to_resume_selector("session-alpha").as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
     fn extract_text_from_stream_output_ignores_plaintext_retry_logs() {
         let output = concat!(
             "Attempt 1 failed with status 429. Retrying with backoff...\n",
@@ -877,6 +927,38 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn tool_use_then_tool_result_preserves_order() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = GeminiAttemptState::new(None);
+        process_gemini_stream_line(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","parameters":{"command":"pwd"}}"#,
+            &mut state,
+        );
+        process_gemini_stream_line(
+            r#"{"type":"tool_result","status":"success","output":"/tmp/example"}"#,
+            &mut state,
+        );
+
+        flush_buffered_stream_messages(&tx, &mut state);
+
+        match rx.recv().unwrap() {
+            StreamMessage::ToolUse { name, input } => {
+                assert_eq!(name, "Bash");
+                assert!(input.contains("\"command\":\"pwd\""));
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::ToolResult { content, is_error } => {
+                assert_eq!(content, "/tmp/example");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -945,6 +1027,84 @@ mod tests {
     }
 
     #[test]
+    fn execute_complete_flushes_buffered_messages_before_done() {
+        let (tx, rx) = mpsc::channel();
+        let mut state = GeminiAttemptState::new(None);
+        process_gemini_stream_line(
+            r#"{"type":"init","session_id":"session-alpha","model":"gemini-2.5-flash"}"#,
+            &mut state,
+        );
+        process_gemini_stream_line(
+            r#"{"type":"message","role":"assistant","content":"hello"}"#,
+            &mut state,
+        );
+        process_gemini_stream_line(
+            r#"{"type":"tool_use","tool_name":"run_shell_command","parameters":{"command":"pwd"}}"#,
+            &mut state,
+        );
+        process_gemini_stream_line(
+            r#"{"type":"tool_result","status":"success","output":"/tmp/example"}"#,
+            &mut state,
+        );
+        process_gemini_stream_line(
+            r#"{"type":"result","result":"hello","stats":{"input_tokens":10,"output_tokens":4,"duration_ms":20}}"#,
+            &mut state,
+        );
+
+        let final_state = finalize_gemini_attempt(&mut state, String::new(), Some(0));
+        flush_buffered_stream_messages(&tx, &mut state);
+        match final_state {
+            GeminiFinalState::Done { result, session_id } => {
+                let _ = tx.send(StreamMessage::Done { result, session_id });
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+
+        match rx.recv().unwrap() {
+            StreamMessage::Init { session_id } => assert_eq!(session_id, "latest"),
+            other => panic!("expected Init, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::Text { content } => assert_eq!(content, "hello"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::ToolUse { name, .. } => assert_eq!(name, "Bash"),
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::ToolResult { content, is_error } => {
+                assert_eq!(content, "/tmp/example");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::StatusUpdate {
+                model,
+                input_tokens,
+                output_tokens,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("gemini-2.5-flash"));
+                assert_eq!(input_tokens, Some(10));
+                assert_eq!(output_tokens, Some(4));
+                assert_eq!(duration_ms, Some(20));
+            }
+            other => panic!("expected StatusUpdate, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::Done { result, session_id } => {
+                assert_eq!(result, "hello");
+                assert_eq!(session_id.as_deref(), Some("latest"));
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn terminal_result_is_authoritative_even_if_error_seen() {
         let mut state = GeminiAttemptState::new(Some("latest".to_string()));
         state.last_error_message = Some("quota exceeded".to_string());
@@ -1002,6 +1162,89 @@ mod tests {
         let message = remote_profile_not_supported_message();
         assert!(message.contains("NotSupported"));
         assert!(message.contains("remote_profile"));
+    }
+
+    #[test]
+    fn execute_command_streaming_rejects_invalid_resume_selector_before_binary_lookup() {
+        let (tx, _rx) = mpsc::channel();
+        let error = execute_command_streaming(
+            "hello",
+            Some("session-alpha"),
+            ".",
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, GEMINI_INVALID_RESUME_SELECTOR_MESSAGE);
+    }
+
+    #[test]
+    fn execute_command_streaming_returns_ok_when_cancelled_before_spawn() {
+        let (tx, rx) = mpsc::channel();
+        let token = Arc::new(CancelToken::new());
+        token.cancelled.store(true, Ordering::Relaxed);
+
+        let result = execute_command_streaming(
+            "hello",
+            None,
+            ".",
+            tx,
+            None,
+            None,
+            Some(token.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_ok());
+        assert!(rx.try_recv().is_err());
+        assert!(token.child_pid.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn session_died_retry_once_then_error() {
+        let (tx, rx) = mpsc::channel();
+        let mut attempt_calls = Vec::new();
+
+        let result = run_gemini_streaming_attempts(&tx, Some("latest".to_string()), |selector| {
+            attempt_calls.push(selector);
+            Ok(GeminiAttemptResult::RetrySession {
+                message: GEMINI_SESSION_DEAD_MESSAGE.to_string(),
+                stdout: "partial".to_string(),
+                stderr: String::new(),
+                exit_code: None,
+            })
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempt_calls, vec![Some("latest".to_string()), None]);
+        match rx.recv().unwrap() {
+            StreamMessage::Error {
+                message,
+                stdout,
+                stderr,
+                exit_code,
+            } => {
+                assert!(message.contains("could not be recovered after retry"));
+                assert!(message.contains(GEMINI_SESSION_DEAD_MESSAGE));
+                assert_eq!(stdout, "partial");
+                assert!(stderr.is_empty());
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
