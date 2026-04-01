@@ -887,8 +887,8 @@ pub(super) async fn tmux_output_watcher(
 
             let ctx_cfg = super::adk_session::fetch_context_thresholds(shared.api_port).await;
             let pct = (tokens * 100) / ctx_cfg.context_window.max(1);
-            // DISABLED — token counting unreliable. Re-enable after fix.
-            if false && pct >= ctx_cfg.compact_pct && !is_prompt_too_long {
+            // #227: Re-enabled — token counting fixed (input-only, /clear resets).
+            if pct >= ctx_cfg.compact_pct && !is_prompt_too_long {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 eprintln!(
                     "  [{ts}] ⚡ [watcher] Auto-compact: {} at {pct}% ({tokens} tokens)",
@@ -1184,7 +1184,9 @@ pub(super) fn process_watcher_lines(
                             full_response.push_str(result_str);
                         }
                     }
-                    // Extract token usage from result event for context tracking
+                    // Extract token usage from result event for context tracking.
+                    // #227: Use input tokens only — output tokens are NOT part of the
+                    // context window and inflated the percentage (197% on 1M window).
                     if let Some(usage) = val.get("usage") {
                         let input = usage
                             .get("input_tokens")
@@ -1198,11 +1200,7 @@ pub(super) fn process_watcher_lines(
                             .get("cache_creation_input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        let output = usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        result_tokens = Some(input + cache_read + cache_creation + output);
+                        result_tokens = Some(input + cache_read + cache_creation);
                     }
 
                     state.final_result = Some(String::new());

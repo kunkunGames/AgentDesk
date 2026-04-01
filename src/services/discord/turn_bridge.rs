@@ -1363,11 +1363,10 @@ pub(super) fn spawn_turn_bridge(
         )
         .await;
 
-        // ─── Auto-compact: DISABLED — token counting is unreliable (input+output
-        // double-count, stale DB values after /clear). Re-enable after accurate
-        // context window measurement is implemented.
+        // ─── Auto-compact (#227): triggers /compact when context exceeds threshold.
+        // Token measurement: input_tokens only (output excluded, /clear resets to 0).
         #[cfg(unix)]
-        if false && dispatch_id.is_none() && !is_prompt_too_long {
+        if dispatch_id.is_none() && !is_prompt_too_long {
             let total_tokens =
                 total_context_tokens(accumulated_input_tokens, accumulated_output_tokens);
             let ctx_cfg = super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
