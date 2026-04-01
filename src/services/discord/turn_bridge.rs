@@ -241,6 +241,13 @@ fn stream_error_has_stale_resume_error(message: &str, stderr: &str) -> bool {
     contains_stale_resume_error_text(message) || contains_stale_resume_error_text(stderr)
 }
 
+fn stream_error_requires_terminal_session_reset(message: &str, stderr: &str) -> bool {
+    let lower = format!("{} {}", message, stderr).to_ascii_lowercase();
+    lower.contains("gemini session could not be recovered after retry")
+        || lower.contains("gemini stream ended without a terminal result")
+        || lower.contains("invalidargument: gemini resume selector must be")
+}
+
 /// Decide the final response text when a Done event arrives.
 ///
 /// Returns the text that should be used as `full_response`.
@@ -895,6 +902,7 @@ pub(super) fn spawn_turn_bridge(
         let mut tmux_handed_off = false;
         let mut transport_error = false;
         let mut resume_failure_detected = false;
+        let mut terminal_session_reset_required = false;
         let mut restart_recovery_handoff = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
@@ -1112,6 +1120,8 @@ pub(super) fn spawn_turn_bridge(
                         } => {
                             let is_stale_resume =
                                 stream_error_has_stale_resume_error(&message, &stderr);
+                            let session_reset_required =
+                                stream_error_requires_terminal_session_reset(&message, &stderr);
                             transport_error = true;
                             let combined = format!("{} {}", message, stderr).to_lowercase();
                             if combined.contains("prompt is too long")
@@ -1147,6 +1157,15 @@ pub(super) fn spawn_turn_bridge(
                                 );
                             } else {
                                 full_response = format!("Error: {}", message);
+                            }
+                            if session_reset_required {
+                                terminal_session_reset_required = true;
+                                clear_local_session_state(&mut new_session_id, &mut inflight_state);
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                eprintln!(
+                                    "  [{ts}] ⚠ Clearing stored provider session after terminal Gemini session failure (channel {})",
+                                    channel_id
+                                );
                             }
                             inflight_state.full_response = full_response.clone();
                             state_dirty = true;
@@ -1959,7 +1978,7 @@ pub(super) fn spawn_turn_bridge(
             let mut data = shared_owned.core.lock().await;
             if let Some(session) = data.sessions.get_mut(&channel_id) {
                 if !session.cleared && !is_prompt_too_long {
-                    if resume_failure_detected {
+                    if resume_failure_detected || terminal_session_reset_required {
                         session.session_id = None;
                     } else if let Some(sid) = new_session_id {
                         session.session_id = Some(sid);
@@ -1982,7 +2001,7 @@ pub(super) fn spawn_turn_bridge(
         };
 
         // Persist provider session_id to DB so it survives dcserver restarts.
-        if !resume_failure_detected {
+        if !resume_failure_detected && !terminal_session_reset_required {
             if let (Some(ref session_key), Some(ref persisted_sid)) =
                 (adk_session_key, session_id_to_persist)
             {
@@ -1993,6 +2012,11 @@ pub(super) fn spawn_turn_bridge(
                     shared_owned.api_port,
                 )
                 .await;
+            }
+        } else if terminal_session_reset_required {
+            if let Some(ref session_key) = adk_session_key {
+                super::adk_session::clear_claude_session_id(session_key, shared_owned.api_port)
+                    .await;
             }
         }
 
@@ -2225,7 +2249,8 @@ mod tests {
         extract_explicit_review_verdict, extract_review_decision,
         output_file_has_stale_resume_error_after_offset, persisted_context_tokens,
         resolve_done_response, result_event_has_stale_resume_error,
-        should_resume_watcher_after_turn, total_context_tokens,
+        should_resume_watcher_after_turn, stream_error_requires_terminal_session_reset,
+        total_context_tokens,
     };
     use crate::services::discord::InflightTurnState;
     use crate::services::provider::ProviderKind;
@@ -2290,6 +2315,22 @@ mod tests {
         ));
         assert!(!contains_stale_resume_error_text(
             "The assistant explained why a conversation was missing context."
+        ));
+    }
+
+    #[test]
+    fn terminal_session_reset_helper_matches_gemini_recovery_failure() {
+        assert!(stream_error_requires_terminal_session_reset(
+            "Gemini session could not be recovered after retry: Gemini stream ended without a terminal result",
+            "",
+        ));
+        assert!(stream_error_requires_terminal_session_reset(
+            "InvalidArgument: Gemini resume selector must be `latest` or a numeric session index",
+            "",
+        ));
+        assert!(!stream_error_requires_terminal_session_reset(
+            "Gemini CLI not found",
+            "",
         ));
     }
 
