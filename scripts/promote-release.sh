@@ -23,9 +23,37 @@ PROMOTE_DETACHED_CHILD="${AGENTDESK_PROMOTE_DETACHED_CHILD:-0}"
 PROMOTE_LOG_PATH="${AGENTDESK_PROMOTE_LOG_PATH:-}"
 PROMOTE_TEST_MODE="${AGENTDESK_PROMOTE_TEST_MODE:-0}"
 PROMOTE_DELAY_SECS="${AGENTDESK_PROMOTE_DELAY_SECS:-2}"
+CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
 DASHBOARD_SOURCE=""
 
 echo "═══ ADK Promote Dev → Release ═══"
+
+sign_binary_with_fallback() {
+    local target="$1"
+    local identity="${CODESIGN_IDENTITY:--}"
+
+    if [ -n "$identity" ] && [ "$identity" != "-" ] && command -v security >/dev/null 2>&1; then
+        if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
+            echo "⚠ Signing identity not found locally; falling back to ad-hoc signature"
+            identity="-"
+        fi
+    fi
+
+    if [ -z "$identity" ]; then
+        identity="-"
+    fi
+
+    if [ "$identity" = "-" ]; then
+        codesign -f -s "$identity" --identifier "com.itismyfield.agentdesk" "$target"
+    else
+        codesign -f -s "$identity" --options runtime --identifier "com.itismyfield.agentdesk" "$target"
+    fi
+
+    if ! codesign -v "$target" 2>/dev/null; then
+        echo "✗ Codesign verification failed — aborting"
+        exit 1
+    fi
+}
 
 _notify_channel() {
     local content="$1"
@@ -207,12 +235,7 @@ chflags nouchg "$ADK_REL/bin/agentdesk" 2>/dev/null || true
 cp "$ADK_DEV/bin/agentdesk" "$ADK_REL/bin/agentdesk"
 chmod +x "$ADK_REL/bin/agentdesk"
 xattr -d com.apple.provenance "$ADK_REL/bin/agentdesk" 2>/dev/null || true
-codesign -f -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" "$ADK_REL/bin/agentdesk"
-# Verify signature
-if ! codesign -v "$ADK_REL/bin/agentdesk" 2>/dev/null; then
-    echo "✗ Codesign verification failed — aborting"
-    exit 1
-fi
+sign_binary_with_fallback "$ADK_REL/bin/agentdesk"
 # Lock binary to prevent unsigned overwrites
 chflags uchg "$ADK_REL/bin/agentdesk"
 
