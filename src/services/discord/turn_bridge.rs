@@ -141,6 +141,47 @@ fn reset_gemini_retry_attempt_state(
     inflight_state.response_sent_offset = 0;
 }
 
+fn handle_gemini_retry_boundary(
+    full_response: &mut String,
+    current_tool_line: &mut Option<String>,
+    last_tool_name: &mut Option<String>,
+    last_tool_summary: &mut Option<String>,
+    any_tool_used: &mut bool,
+    has_post_tool_text: &mut bool,
+    response_sent_offset: &mut usize,
+    last_edit_text: &mut String,
+    new_session_id: &mut Option<String>,
+    inflight_state: &mut InflightTurnState,
+) -> bool {
+    let had_local_session = new_session_id.is_some() || inflight_state.session_id.is_some();
+    let should_reset = should_reset_gemini_retry_attempt_state(
+        full_response,
+        current_tool_line.as_deref(),
+        *any_tool_used,
+        *has_post_tool_text,
+    );
+
+    if had_local_session {
+        clear_local_session_state(new_session_id, inflight_state);
+    }
+
+    if should_reset {
+        reset_gemini_retry_attempt_state(
+            full_response,
+            current_tool_line,
+            last_tool_name,
+            last_tool_summary,
+            any_tool_used,
+            has_post_tool_text,
+            response_sent_offset,
+            inflight_state,
+        );
+        last_edit_text.clear();
+    }
+
+    had_local_session || should_reset
+}
+
 async fn reset_session_for_auto_retry(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -1007,16 +1048,9 @@ pub(super) fn spawn_turn_bridge(
             loop {
                 match rx.try_recv() {
                     Ok(msg) => match msg {
-                        StreamMessage::Init { session_id: sid } => {
+                        StreamMessage::RetryBoundary => {
                             if provider == ProviderKind::Gemini
-                                && should_reset_gemini_retry_attempt_state(
-                                    &full_response,
-                                    current_tool_line.as_deref(),
-                                    any_tool_used,
-                                    has_post_tool_text,
-                                )
-                            {
-                                reset_gemini_retry_attempt_state(
+                                && handle_gemini_retry_boundary(
                                     &mut full_response,
                                     &mut current_tool_line,
                                     &mut last_tool_name,
@@ -1024,10 +1058,15 @@ pub(super) fn spawn_turn_bridge(
                                     &mut any_tool_used,
                                     &mut has_post_tool_text,
                                     &mut response_sent_offset,
+                                    &mut last_edit_text,
+                                    &mut new_session_id,
                                     &mut inflight_state,
-                                );
-                                last_edit_text.clear();
+                                )
+                            {
+                                state_dirty = true;
                             }
+                        }
+                        StreamMessage::Init { session_id: sid } => {
                             new_session_id = Some(sid.clone());
                             inflight_state.session_id = Some(sid);
                             state_dirty = true;
@@ -2317,7 +2356,7 @@ pub(super) fn spawn_turn_bridge(
 mod tests {
     use super::{
         build_verdict_payload, clear_local_session_state, contains_stale_resume_error_text,
-        extract_explicit_review_verdict, extract_review_decision,
+        extract_explicit_review_verdict, extract_review_decision, handle_gemini_retry_boundary,
         output_file_has_stale_resume_error_after_offset, persisted_context_tokens,
         reset_gemini_retry_attempt_state, resolve_done_response,
         result_event_has_stale_resume_error, should_reset_gemini_retry_attempt_state,
@@ -2481,6 +2520,68 @@ mod tests {
         assert!(!any_tool_used);
         assert!(!has_post_tool_text);
         assert_eq!(response_sent_offset, 0);
+        assert!(inflight_state.full_response.is_empty());
+        assert_eq!(inflight_state.current_tool_line, None);
+        assert!(!inflight_state.any_tool_used);
+        assert!(!inflight_state.has_post_tool_text);
+        assert_eq!(inflight_state.response_sent_offset, 0);
+    }
+
+    #[test]
+    fn handle_gemini_retry_boundary_clears_partial_output_and_local_session_state() {
+        let mut full_response = "partial answer".to_string();
+        let mut current_tool_line = Some("⚙ Bash: pwd".to_string());
+        let mut last_tool_name = Some("Bash".to_string());
+        let mut last_tool_summary = Some("pwd".to_string());
+        let mut any_tool_used = true;
+        let mut has_post_tool_text = true;
+        let mut response_sent_offset = 42usize;
+        let mut last_edit_text = "partial answer".to_string();
+        let mut new_session_id = Some("stale".to_string());
+        let mut inflight_state = InflightTurnState::new(
+            ProviderKind::Gemini,
+            1479671298497183835,
+            Some("adk-gm".to_string()),
+            343742347365974026,
+            1,
+            2,
+            "resume me".to_string(),
+            Some("stale".to_string()),
+            Some("AgentDesk-gemini-adk-gm".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        inflight_state.full_response = full_response.clone();
+        inflight_state.current_tool_line = current_tool_line.clone();
+        inflight_state.any_tool_used = true;
+        inflight_state.has_post_tool_text = true;
+        inflight_state.response_sent_offset = response_sent_offset;
+
+        let changed = handle_gemini_retry_boundary(
+            &mut full_response,
+            &mut current_tool_line,
+            &mut last_tool_name,
+            &mut last_tool_summary,
+            &mut any_tool_used,
+            &mut has_post_tool_text,
+            &mut response_sent_offset,
+            &mut last_edit_text,
+            &mut new_session_id,
+            &mut inflight_state,
+        );
+
+        assert!(changed);
+        assert!(full_response.is_empty());
+        assert_eq!(current_tool_line, None);
+        assert_eq!(last_tool_name, None);
+        assert_eq!(last_tool_summary, None);
+        assert!(!any_tool_used);
+        assert!(!has_post_tool_text);
+        assert_eq!(response_sent_offset, 0);
+        assert!(last_edit_text.is_empty());
+        assert_eq!(new_session_id, None);
+        assert_eq!(inflight_state.session_id, None);
         assert!(inflight_state.full_response.is_empty());
         assert_eq!(inflight_state.current_tool_line, None);
         assert!(!inflight_state.any_tool_used);

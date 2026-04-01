@@ -166,16 +166,23 @@ pub fn execute_command_streaming(
 fn run_gemini_streaming_attempts<F>(
     sender: &Sender<StreamMessage>,
     resume_selector: Option<String>,
-    execute_attempt: F,
+    mut execute_attempt: F,
 ) -> Result<(), String>
 where
     F: FnMut(Option<String>) -> Result<StreamAttemptResult, String>,
 {
+    let mut attempt_index = 0usize;
     run_retrying_stream_attempts(
         "Gemini",
         resume_selector,
         GEMINI_MAX_SESSION_RETRIES,
-        execute_attempt,
+        |resume_selector| {
+            if attempt_index > 0 {
+                let _ = sender.send(StreamMessage::RetryBoundary);
+            }
+            attempt_index += 1;
+            execute_attempt(resume_selector)
+        },
         |failure| send_gemini_stream_failure(sender, failure),
     )
 }
@@ -500,27 +507,6 @@ fn finalize_gemini_attempt(
     let terminal_result_seen = state.terminal_result_seen;
     let terminal_result_text = state.terminal_result_text.take();
 
-    if terminal_result_seen {
-        let result = final_text.trim().to_string();
-        let result = if result.is_empty() {
-            terminal_result_text.unwrap_or_default()
-        } else {
-            result
-        };
-        if result.is_empty() {
-            return StreamFinalState::Error(StreamAttemptFailure {
-                message: "Gemini emitted a terminal result without any response text".to_string(),
-                stdout: raw_stdout,
-                stderr,
-                exit_code,
-            });
-        }
-        return StreamFinalState::Done {
-            result,
-            session_id: last_resume_selector,
-        };
-    }
-
     if let Some(message) = last_error_message {
         return StreamFinalState::Error(StreamAttemptFailure {
             message,
@@ -546,6 +532,29 @@ fn finalize_gemini_attempt(
             stderr,
             exit_code,
         });
+    }
+
+    if terminal_result_seen {
+        let result = final_text.trim().to_string();
+        let result = if result.is_empty() {
+            terminal_result_text.unwrap_or_default()
+        } else {
+            result
+        };
+        if result.is_empty() {
+            return StreamFinalState::Error(StreamAttemptFailure {
+                message: "Gemini emitted a terminal result without any response text".to_string(),
+                stdout: raw_stdout,
+                stderr,
+                exit_code,
+            });
+        }
+        return StreamFinalState::Done {
+            result,
+            session_id: Some(
+                last_resume_selector.unwrap_or_else(|| GEMINI_RESUME_LATEST.to_string()),
+            ),
+        };
     }
 
     StreamFinalState::RetrySession(StreamAttemptFailure {
@@ -1093,18 +1102,20 @@ mod tests {
     }
 
     #[test]
-    fn terminal_result_is_authoritative_even_if_error_seen() {
+    fn terminal_result_with_structured_error_is_terminal_error() {
         let mut state = GeminiAttemptState::new(Some("latest".to_string()));
         state.last_error_message = Some("quota exceeded".to_string());
         state.final_text = "done".to_string();
         state.terminal_result_seen = true;
 
         match finalize_gemini_attempt(&mut state, String::new(), Some(0)) {
-            StreamFinalState::Done { result, session_id } => {
-                assert_eq!(result, "done");
-                assert_eq!(session_id.as_deref(), Some("latest"));
+            StreamFinalState::Error(failure) => {
+                assert_eq!(failure.message, "quota exceeded");
+                assert!(failure.stdout.is_empty());
+                assert!(failure.stderr.is_empty());
+                assert_eq!(failure.exit_code, Some(0));
             }
-            other => panic!("expected Done, got {:?}", other),
+            other => panic!("expected Error, got {:?}", other),
         }
     }
 
@@ -1137,6 +1148,39 @@ mod tests {
                 assert_eq!(failure.exit_code, Some(2));
             }
             other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn terminal_result_with_non_zero_exit_is_terminal_error() {
+        let mut state = GeminiAttemptState::new(Some("latest".to_string()));
+        state.final_text = "done".to_string();
+        state.terminal_result_seen = true;
+        state.raw_stdout = "plain stdout".to_string();
+
+        match finalize_gemini_attempt(&mut state, "plain stderr".to_string(), Some(2)) {
+            StreamFinalState::Error(failure) => {
+                assert!(failure.message.contains("plain stderr"));
+                assert_eq!(failure.stdout, "plain stdout");
+                assert_eq!(failure.stderr, "plain stderr");
+                assert_eq!(failure.exit_code, Some(2));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn terminal_result_without_init_falls_back_to_latest_selector() {
+        let mut state = GeminiAttemptState::new(None);
+        state.final_text = "done".to_string();
+        state.terminal_result_seen = true;
+
+        match finalize_gemini_attempt(&mut state, String::new(), Some(0)) {
+            StreamFinalState::Done { result, session_id } => {
+                assert_eq!(result, "done");
+                assert_eq!(session_id.as_deref(), Some("latest"));
+            }
+            other => panic!("expected Done, got {:?}", other),
         }
     }
 
@@ -1350,6 +1394,10 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(attempt_calls, vec![Some("latest".to_string()), None]);
         match rx.recv().unwrap() {
+            StreamMessage::RetryBoundary => {}
+            other => panic!("expected RetryBoundary, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
             StreamMessage::Error {
                 message,
                 stdout,
@@ -1363,6 +1411,50 @@ mod tests {
                 assert_eq!(exit_code, None);
             }
             other => panic!("expected Error, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn retry_success_without_init_emits_boundary_and_latest_selector() {
+        let (tx, rx) = mpsc::channel();
+        let mut attempt_calls = Vec::new();
+
+        let result = run_gemini_streaming_attempts(&tx, Some("latest".to_string()), |selector| {
+            attempt_calls.push(selector.clone());
+            if attempt_calls.len() == 1 {
+                return Ok(StreamAttemptResult::RetrySession(StreamAttemptFailure {
+                    message: GEMINI_SESSION_DEAD_MESSAGE.to_string(),
+                    stdout: "partial".to_string(),
+                    stderr: String::new(),
+                    exit_code: None,
+                }));
+            }
+
+            let mut state = GeminiAttemptState::new(selector);
+            state.final_text = "fresh result".to_string();
+            state.terminal_result_seen = true;
+            match finalize_gemini_attempt(&mut state, String::new(), Some(0)) {
+                StreamFinalState::Done { result, session_id } => {
+                    let _ = tx.send(StreamMessage::Done { result, session_id });
+                    Ok(StreamAttemptResult::Completed)
+                }
+                other => panic!("expected Done, got {:?}", other),
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(attempt_calls, vec![Some("latest".to_string()), None]);
+        match rx.recv().unwrap() {
+            StreamMessage::RetryBoundary => {}
+            other => panic!("expected RetryBoundary, got {:?}", other),
+        }
+        match rx.recv().unwrap() {
+            StreamMessage::Done { result, session_id } => {
+                assert_eq!(result, "fresh result");
+                assert_eq!(session_id.as_deref(), Some("latest"));
+            }
+            other => panic!("expected Done, got {:?}", other),
         }
         assert!(rx.try_recv().is_err());
     }

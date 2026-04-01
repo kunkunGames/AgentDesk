@@ -27,6 +27,8 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
 pub enum StreamMessage {
     /// Initialization - contains session_id
     Init { session_id: String },
+    /// Provider started a fresh retry attempt after discarding stale session state
+    RetryBoundary,
     /// Text response chunk
     Text { content: String },
     /// Tool use started
