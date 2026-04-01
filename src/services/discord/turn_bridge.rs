@@ -154,6 +154,16 @@ async fn reset_session_for_auto_retry(
     {
         let ts = chrono::Local::now().format("%H:%M:%S");
         eprintln!("  [{ts}] ♻ auto-retry: killing tmux session {name} before retry ({reason})");
+        crate::services::termination_audit::record_termination_for_tmux(
+            &name,
+            None,
+            "turn_bridge",
+            "auto_retry_fresh_session",
+            Some(&format!(
+                "forcing fresh session before auto-retry: {reason}"
+            )),
+            None,
+        );
         record_tmux_exit_reason(
             &name,
             &format!("forcing fresh session before auto-retry: {reason}"),
@@ -236,6 +246,8 @@ fn stream_error_requires_terminal_session_reset(message: &str, stderr: &str) -> 
     lower.contains("gemini session could not be recovered after retry")
         || lower.contains("gemini stream ended without a terminal result")
         || lower.contains("invalidargument: gemini resume selector must be")
+        || lower.contains("qwen session could not be recovered after retry")
+        || lower.contains("qwen stream ended without a terminal result")
 }
 
 /// Decide the final response text when a Done event arrives.
@@ -289,6 +301,14 @@ pub(super) fn cancel_active_token(token: &Arc<CancelToken>, cleanup_tmux: bool, 
                             })
                             .unwrap_or(false);
                     if !is_unified {
+                        crate::services::termination_audit::record_termination_for_tmux(
+                            &name,
+                            None,
+                            "turn_bridge",
+                            "explicit_cancel",
+                            Some(&format!("explicit cleanup via {reason}")),
+                            None,
+                        );
                         record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
                         crate::services::platform::tmux::kill_session(&name);
                     }
@@ -1182,23 +1202,25 @@ pub(super) fn spawn_turn_bridge(
                             inflight_state.input_fifo_path = Some(input_fifo_path);
                             inflight_state.last_offset = last_offset;
 
-                            let already_watching =
-                                shared_owned.tmux_watchers.contains_key(&channel_id);
-                            if !already_watching {
-                                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                                let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
-                                let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
-                                let turn_delivered =
-                                    Arc::new(std::sync::atomic::AtomicBool::new(false));
-                                let handle = TmuxWatcherHandle {
-                                    paused: paused.clone(),
-                                    resume_offset: resume_offset.clone(),
-                                    cancel: cancel.clone(),
-                                    pause_epoch: pause_epoch.clone(),
-                                    turn_delivered: turn_delivered.clone(),
-                                };
-                                shared_owned.tmux_watchers.insert(channel_id, handle);
+                            // #226: Atomic claim via try_claim_watcher
+                            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                            let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
+                            let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+                            let turn_delivered =
+                                Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let handle = TmuxWatcherHandle {
+                                paused: paused.clone(),
+                                resume_offset: resume_offset.clone(),
+                                cancel: cancel.clone(),
+                                pause_epoch: pause_epoch.clone(),
+                                turn_delivered: turn_delivered.clone(),
+                            };
+                            if super::tmux::try_claim_watcher(
+                                &shared_owned.tmux_watchers,
+                                channel_id,
+                                handle,
+                            ) {
                                 #[cfg(unix)]
                                 {
                                     let http_bg = http.clone();
@@ -1363,10 +1385,10 @@ pub(super) fn spawn_turn_bridge(
         )
         .await;
 
-        // ─── Auto-compact: send /compact if context window usage exceeds threshold ───
-        // Only for non-dispatch (main channel) sessions with a live tmux session.
+        // ─── Auto-compact: DISABLED — token counting still unreliable (224% after restart).
+        // #227 re-enabled but measurement is still wrong. Keep disabled until root cause fixed.
         #[cfg(unix)]
-        if dispatch_id.is_none() && !is_prompt_too_long {
+        if false && dispatch_id.is_none() && !is_prompt_too_long {
             let total_tokens =
                 total_context_tokens(accumulated_input_tokens, accumulated_output_tokens);
             let ctx_cfg = super::adk_session::fetch_context_thresholds(shared_owned.api_port).await;
@@ -2253,7 +2275,8 @@ mod tests {
     }
 
     #[test]
-    fn persisted_context_tokens_uses_input_tokens_only() {
+    fn persisted_context_tokens_uses_input_only() {
+        // input_tokens represents full context window occupancy; output is excluded
         assert_eq!(persisted_context_tokens(610_000, 90_000), Some(610_000));
         assert_eq!(persisted_context_tokens(0, 0), None);
     }
@@ -2299,13 +2322,21 @@ mod tests {
     }
 
     #[test]
-    fn terminal_session_reset_helper_matches_gemini_recovery_failure() {
+    fn terminal_session_reset_helper_matches_terminal_recovery_failures() {
         assert!(stream_error_requires_terminal_session_reset(
             "Gemini session could not be recovered after retry: Gemini stream ended without a terminal result",
             "",
         ));
         assert!(stream_error_requires_terminal_session_reset(
             "InvalidArgument: Gemini resume selector must be `latest` or a numeric session index",
+            "",
+        ));
+        assert!(stream_error_requires_terminal_session_reset(
+            "Qwen session could not be recovered after retry: Qwen stream ended without a terminal result",
+            "",
+        ));
+        assert!(stream_error_requires_terminal_session_reset(
+            "Qwen stream ended without a terminal result",
             "",
         ));
         assert!(!stream_error_requires_terminal_session_reset(

@@ -567,6 +567,21 @@ var timeouts = {
     }
   },
 
+  // #219: Check if a tmux session has at least one live (non-dead) pane.
+  // Mirrors Rust's has_live_pane() — uses #{pane_dead} format instead of
+  // has-session (which returns true for zombie sessions with dead panes).
+  _tmuxHasLivePane: function(tmuxName) {
+    try {
+      // "=" prefix prevents tmux prefix-matching (exact_target convention)
+      var out = agentdesk.exec("tmux", ["list-panes", "-t", "=" + tmuxName, "-F", "#{pane_dead}"]);
+      // Success: lines of "0" (alive) or "1" (dead). Any "0" = live pane exists.
+      // Failure: "ERROR: ..." (session gone)
+      return typeof out === "string" && out.indexOf("ERROR") === -1 && out.indexOf("0") !== -1;
+    } catch(e) {
+      return false;
+    }
+  },
+
   _section_I: function() {
     // ─── [I] 턴 데드락 감지 + 자동 복구 (15분 주기) ─────────
     // 판별: sessions.last_heartbeat 기반 (연속 스톨만 카운트)
@@ -601,30 +616,33 @@ var timeouts = {
     for (var sw = 0; sw < staleWorkingSessions.length; sw++) {
       var swKey = staleWorkingSessions[sw].session_key;
       var tmuxName = (swKey || "").split(":").pop();
-      // Check if tmux session is still alive and has a running process
-      var tmuxAlive = false;
-      try {
-        var checkOut = agentdesk.exec("tmux", JSON.stringify(["list-panes", "-t", tmuxName, "-F", "#{pane_current_command}"]));
-        tmuxAlive = checkOut && checkOut.indexOf("agentdesk") !== -1;
-      } catch(e) { tmuxAlive = false; }
-      // #219: Also check tmux output file activity — if output was modified recently,
-      // the session is alive even without heartbeat updates
+      // #219: Check if tmux session has a live pane (not just session existence).
+      // has-session returns true for zombie sessions with dead panes;
+      // list-panes #{pane_dead} distinguishes live vs dead workers.
+      var tmuxAlive = timeouts._tmuxHasLivePane(tmuxName);
       if (!tmuxAlive) {
+        // #219: Fail any pending dispatch before transitioning to idle.
+        // Without this, the dispatch stays "pending" as an orphan and gets
+        // re-delivered or auto-completed, causing the failure loop.
         try {
-          var outputPath = "/tmp/adk-output-" + tmuxName + ".txt";
-          var stat = agentdesk.exec("stat", JSON.stringify(["-f", "%m", outputPath]));
-          if (stat) {
-            var mtime = parseInt(stat.trim(), 10);
-            var now = Math.floor(Date.now() / 1000);
-            if (now - mtime < 300) { // output modified within 5 minutes
-              tmuxAlive = true;
+          var swSessInfo = agentdesk.db.query(
+            "SELECT active_dispatch_id FROM sessions WHERE session_key = ?", [swKey]
+          );
+          if (swSessInfo.length > 0 && swSessInfo[0].active_dispatch_id) {
+            var swDispId = swSessInfo[0].active_dispatch_id;
+            var swDispStatus = agentdesk.db.query(
+              "SELECT status FROM task_dispatches WHERE id = ?", [swDispId]
+            );
+            if (swDispStatus.length > 0 && (swDispStatus[0].status === "pending" || swDispStatus[0].status === "dispatched")) {
+              agentdesk.dispatch.markFailed(swDispId, "Stale working session recovery — no active tmux session after 10min");
+              agentdesk.log.warn("[deadlock] Failed stale dispatch " + swDispId + " for session " + swKey);
             }
           }
-        } catch(e2) { /* stat failed — file may not exist */ }
-      }
-      if (!tmuxAlive) {
+        } catch(dispErr) {
+          agentdesk.log.warn("[deadlock] Failed to mark dispatch for " + swKey + ": " + dispErr);
+        }
         agentdesk.db.execute(
-          "UPDATE sessions SET status = 'idle' WHERE session_key = ? AND status = 'working'",
+          "UPDATE sessions SET status = 'idle', active_dispatch_id = NULL WHERE session_key = ? AND status = 'working'",
           [swKey]
         );
         agentdesk.log.info("[deadlock] Fixed stale working session → idle: " + swKey);
@@ -640,6 +658,15 @@ var timeouts = {
     for (var dl = 0; dl < staleSessions.length; dl++) {
       var sess = staleSessions[dl];
       var deadlockKey = "deadlock_check:" + sess.session_key;
+
+      // #219: If tmux session has a live pane, the agent is actively working
+      // despite stale heartbeat (long tool calls, subagents). Reset counter
+      // and skip — heartbeat staleness alone is not sufficient for deadlock.
+      var dlTmuxName = (sess.session_key || "").split(":").pop();
+      if (timeouts._tmuxHasLivePane(dlTmuxName)) {
+        agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [deadlockKey]);
+        continue;
+      }
 
       // Check extension count + last check timestamp
       var extRecord = agentdesk.db.query(
@@ -752,7 +779,18 @@ var timeouts = {
           totalMin + "분 무응답 → 강제 중단" +
           (redispatched ? " + 재디스패치 완료" : ""));
 
-        // 5) 이력 기록
+        // 5) Termination audit
+        try {
+          var probeInfo = "agent=" + sess.agent_id + " extensions=" + extensions + "/" + MAX_EXTENSIONS +
+            " last_heartbeat=" + sess.last_heartbeat + " kill_ok=" + (killResult.ok || false);
+          agentdesk.db.execute(
+            "INSERT INTO session_termination_events (session_key, dispatch_id, killer_component, reason_code, reason_text, probe_snapshot, tmux_alive) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [sess.session_key, sess.active_dispatch_id || null, "deadlock_policy", "deadlock_timeout",
+             totalMin + "min timeout — " + (redispatched ? "redispatched" : "cancelled"), probeInfo, 0]
+          );
+        } catch (e) { /* fire-and-forget */ }
+
+        // 6) 이력 기록 (legacy)
         agentdesk.db.execute(
           "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
           ["deadlock_history:" + sess.session_key + ":" + Date.now(),
@@ -1196,10 +1234,11 @@ timeouts.onTick5min = function(ev) {
   agentdesk.log.debug("[tick5min][H] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_M(); } catch(e) { agentdesk.log.warn("[tick5min] M error: " + e); }
   agentdesk.log.debug("[tick5min][M] " + (Date.now() - t) + "ms");
-  if (timeouts.onContextCheck) {
-    t = Date.now(); try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
-    agentdesk.log.debug("[tick5min][ctx] " + (Date.now() - t) + "ms");
-  }
+  // DISABLED — token counting unreliable (double-count, stale after /clear). Re-enable after fix.
+  // if (timeouts.onContextCheck) {
+  //   t = Date.now(); try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
+  //   agentdesk.log.debug("[tick5min][ctx] " + (Date.now() - t) + "ms");
+  // }
   agentdesk.log.debug("[tick5min] total " + (Date.now() - start) + "ms");
 };
 

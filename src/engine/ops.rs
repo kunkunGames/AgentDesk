@@ -1097,6 +1097,45 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 );
             }
 
+            // #228: Enforce review_verdict_pass gate on transitions to terminal states.
+            // Only this specific gate is checked — other gates (has_active_dispatch,
+            // review_rework) and force_only transitions are used legitimately by
+            // policies and must not be blocked here. PMD bypasses via force-transition API.
+            if pipeline.is_terminal(&new_status) {
+                if let Some(t) = pipeline.find_transition(&old_status, &new_status) {
+                    let needs_review_pass = t.gates.iter().any(|g| {
+                        pipeline.gates.get(g.as_str())
+                            .map_or(false, |gc| gc.check.as_deref() == Some("review_verdict_pass"))
+                    });
+                    if needs_review_pass {
+                        // Mirror kanban.rs:112-125 — check the LATEST completed review
+                        // dispatch only, not any historical pass. A card with pass R1
+                        // then rework R2 must not skip the current review round.
+                        let latest_verdict: Option<String> = conn
+                            .query_row(
+                                "SELECT json_extract(result, '$.verdict') FROM task_dispatches \
+                                 WHERE kanban_card_id = ?1 AND dispatch_type = 'review' \
+                                 AND status = 'completed' \
+                                 ORDER BY updated_at DESC LIMIT 1",
+                                [&card_id],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                            .flatten();
+                        let has_pass = matches!(
+                            latest_verdict.as_deref(),
+                            Some("pass") | Some("approved")
+                        );
+                        if !has_pass {
+                            return format!(
+                                r#"{{"error":"gate blocked: review_verdict_pass — no review pass verdict","from":"{}","to":"{}"}}"#,
+                                old_status, new_status
+                            );
+                        }
+                    }
+                }
+            }
+
             // Clock fields from pipeline config
             let clock_extra = match pipeline.clock_for_state(&new_status) {
                 Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
@@ -1718,6 +1757,14 @@ fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                 .split_once(':')
                 .map(|(_, name)| name)
                 .unwrap_or(&session_key);
+            crate::services::termination_audit::record_termination_for_tmux(
+                tmux_name,
+                None,
+                "policy_engine",
+                "session_kill_api",
+                Some("force-kill via agentdesk.session.kill()"),
+                None,
+            );
             match crate::services::platform::tmux::kill_session_output(tmux_name) {
                 Ok(out) if out.status.success() => {
                     format!(r#"{{"ok":true,"session":"{}"}}"#, session_key)

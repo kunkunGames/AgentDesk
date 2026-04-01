@@ -130,6 +130,111 @@ pub async fn get_dispatch(
     }
 }
 
+/// POST /api/dispatches/:id/cancel
+///
+/// Cancel a dispatch AND kill the associated agent session/turn.
+/// Ensures the agent stops working on the cancelled dispatch.
+pub async fn cancel_dispatch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 1. Get dispatch info before cancelling
+    let dispatch_info: Option<(String, String, Option<String>)> =
+        state.db.lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT to_agent_id, status, thread_id FROM task_dispatches WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok()
+        });
+
+    let (agent_id, status, thread_id) = match dispatch_info {
+        Some(info) => info,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "dispatch not found"})),
+            );
+        }
+    };
+
+    if status == "completed" || status == "cancelled" {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("dispatch already {status}"), "status": status})),
+        );
+    }
+
+    // 2. Cancel the dispatch in DB
+    {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        if let Err(e) = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            &id,
+            Some("api_cancel"),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    }
+
+    // 3. Kill the agent's tmux session for this thread (if any)
+    let mut session_killed = false;
+    if let Some(ref tid) = thread_id {
+        // Find tmux session name from thread_id
+        let session_name: Option<String> = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT session_key FROM sessions WHERE session_key LIKE ?1 AND status IN ('working', 'idle')",
+                    [format!("%t{tid}%")],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            });
+
+        if let Some(ref key) = session_name {
+            let tmux_name = key.split(':').last().unwrap_or(key);
+            // Kill tmux session
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", tmux_name])
+                .output();
+            // Mark session as idle
+            if let Ok(conn) = state.db.lock() {
+                conn.execute(
+                    "UPDATE sessions SET status = 'idle', active_dispatch_id = NULL WHERE session_key = ?1",
+                    [key.as_str()],
+                )
+                .ok();
+            }
+            session_killed = true;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "dispatch_id": id,
+            "agent_id": agent_id,
+            "session_killed": session_killed,
+        })),
+    )
+}
+
 /// POST /api/dispatches
 pub async fn create_dispatch(
     State(state): State<AppState>,
@@ -2455,6 +2560,78 @@ pub(crate) async fn dispatch_outbox_loop(db: crate::db::Db) {
         } else {
             poll_interval = Duration::from_millis(500);
         }
+    }
+}
+
+/// GET /api/internal/pending-dispatch-for-thread?thread_id=xxx
+///
+/// #222: Look up a pending implementation/rework dispatch whose kanban card
+/// is linked to the given thread channel. Used by turn_bridge as fallback
+/// when parse_dispatch_id(user_text) fails in unified threads.
+pub async fn get_pending_dispatch_for_thread(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let thread_id = match params.get("thread_id") {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "thread_id required"})),
+            );
+        }
+    };
+
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    // Find a pending dispatch whose card is linked to this thread via
+    // channel_thread_map (JSON contains the thread_id) or active_thread_id.
+    let dispatch_id: Option<String> = conn
+        .query_row(
+            "SELECT td.id FROM task_dispatches td \
+             JOIN kanban_cards kc ON kc.id = td.kanban_card_id \
+             WHERE td.status IN ('pending', 'dispatched') \
+             AND td.dispatch_type IN ('implementation', 'rework') \
+             AND (kc.active_thread_id = ?1 \
+                  OR INSTR(COALESCE(kc.channel_thread_map, ''), ?1) > 0) \
+             ORDER BY td.created_at DESC LIMIT 1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Fallback: check unified_thread_id / unified_thread_channel_id in auto_queue_runs
+    let dispatch_id = dispatch_id.or_else(|| {
+        conn.query_row(
+            "SELECT td.id FROM task_dispatches td \
+             JOIN auto_queue_entries e ON e.kanban_card_id = td.kanban_card_id \
+             JOIN auto_queue_runs r ON r.id = e.run_id \
+             WHERE td.status IN ('pending', 'dispatched') \
+             AND td.dispatch_type IN ('implementation', 'rework') \
+             AND r.unified_thread = 1 AND r.status = 'active' \
+             AND (r.unified_thread_channel_id = ?1 \
+                  OR INSTR(COALESCE(r.unified_thread_id, ''), ?1) > 0) \
+             ORDER BY td.created_at DESC LIMIT 1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .ok()
+    });
+
+    match dispatch_id {
+        Some(id) => (StatusCode::OK, Json(json!({"dispatch_id": id}))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no pending dispatch for thread"})),
+        ),
     }
 }
 

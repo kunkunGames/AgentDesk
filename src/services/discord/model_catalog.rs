@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 use regex::Regex;
 use serde::Deserialize;
@@ -192,6 +193,8 @@ const GEMINI_MODEL_CATALOG: &[ModelCatalogEntry] = &[
 
 static CODEX_MODEL_CATALOG_DYNAMIC: OnceLock<Vec<ModelCatalogEntry>> = OnceLock::new();
 static GEMINI_MODEL_CATALOG_DYNAMIC: OnceLock<Vec<ModelCatalogEntry>> = OnceLock::new();
+static QWEN_MODEL_CATALOG_CACHE: OnceLock<Mutex<HashMap<String, QwenResolvedCatalog>>> =
+    OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct CodexModelsCache {
@@ -552,6 +555,28 @@ fn load_qwen_settings_file(path: &PathBuf) -> Option<QwenSettingsFile> {
     serde_json::from_str(&raw).ok()
 }
 
+fn qwen_catalog_cache_key(layers: &[Option<PathBuf>]) -> String {
+    layers
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let Some(path) = path else {
+                return format!("{index}:<none>");
+            };
+            let metadata = fs::metadata(path).ok();
+            let len = metadata.as_ref().map(|meta| meta.len()).unwrap_or(0);
+            let modified = metadata
+                .as_ref()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|time| format!("{}.{:09}", time.as_secs(), time.subsec_nanos()))
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{index}:{}|{len}|{modified}", path.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn truncate_catalog_text(raw: &str, fallback: &str, max_chars: usize) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -576,6 +601,15 @@ fn resolve_qwen_model_catalog(working_dir: Option<&str>) -> QwenResolvedCatalog 
         qwen_project_settings_path(working_dir),
         qwen_system_settings_path(),
     ];
+    let cache_key = qwen_catalog_cache_key(&layers);
+    if let Some(cached) = QWEN_MODEL_CATALOG_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return cached;
+    }
 
     let mut merged_entries: HashMap<String, (usize, ModelCatalogEntry)> = HashMap::new();
     let mut next_order = 0usize;
@@ -653,10 +687,19 @@ fn resolve_qwen_model_catalog(working_dir: Option<&str>) -> QwenResolvedCatalog 
         }
     }
 
-    QwenResolvedCatalog {
+    let resolved = QwenResolvedCatalog {
         entries,
         default_model,
+    };
+
+    if let Ok(mut cache) = QWEN_MODEL_CATALOG_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(cache_key, resolved.clone());
     }
+
+    resolved
 }
 
 pub(crate) fn resolved_default_model(
@@ -966,6 +1009,43 @@ export const VALID_GEMINI_MODELS = new Set([
             assert!(catalog.iter().any(|entry| entry.value == "project-model"
                 && entry.label == "Project Model"
                 && entry.picker_description() == "Project scoped model | Qwen settings (openai)"));
+        });
+    }
+
+    #[test]
+    fn qwen_resolved_models_reuse_cached_static_strings() {
+        with_temp_qwen_env(|temp_home, temp_project| {
+            let user_qwen_dir = temp_home.path().join(".qwen");
+            fs::create_dir_all(&user_qwen_dir).unwrap();
+
+            fs::write(
+                user_qwen_dir.join("settings.json"),
+                r#"{
+                  "modelProviders": {
+                    "openai": [
+                      {
+                        "id": "cached-model",
+                        "name": "Cached Model",
+                        "description": "Cached model description"
+                      }
+                    ]
+                  },
+                  "model": { "name": "cached-model" }
+                }"#,
+            )
+            .unwrap();
+
+            let working_dir = temp_project.path().to_str().unwrap();
+            let first = super::resolve_qwen_model_catalog(Some(working_dir));
+            let second = super::resolve_qwen_model_catalog(Some(working_dir));
+            assert_eq!(first.entries.len(), 1);
+            assert_eq!(second.entries.len(), 1);
+            assert!(std::ptr::eq(first.entries[0].value, second.entries[0].value));
+            assert!(std::ptr::eq(first.entries[0].label, second.entries[0].label));
+            assert!(std::ptr::eq(
+                first.default_model.unwrap(),
+                second.default_model.unwrap()
+            ));
         });
     }
 }

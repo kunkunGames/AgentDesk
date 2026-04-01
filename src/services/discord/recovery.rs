@@ -311,7 +311,11 @@ pub(super) async fn restore_inflight_turns(
                 // completion path was lost when dcserver restarted.
                 // #142: Check dispatch type — implementation/rework need explicit completion,
                 // review can use idle auto-complete.
-                let recovered_dispatch_id = parse_dispatch_id(&state.user_text);
+                // #222: DB lookup first, text parsing as fallback for unified threads.
+                let recovered_dispatch_id =
+                    lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id)
+                        .await
+                        .or_else(|| parse_dispatch_id(&state.user_text));
                 let mut dispatch_completed = recovered_dispatch_id.is_none();
                 if let Some(ref did) = recovered_dispatch_id {
                     // #143: Use finalize_dispatch directly with retry.
@@ -533,9 +537,7 @@ pub(super) async fn restore_inflight_turns(
                 if let Some(ref tmux_session_name) = tmux_name {
                     let output_path =
                         crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
-                    if std::fs::metadata(&output_path).is_ok()
-                        && !shared.tmux_watchers.contains_key(&channel_id)
-                    {
+                    if std::fs::metadata(&output_path).is_ok() {
                         let (initial_offset, current_len, truncated) =
                             recovery_watcher_start_offset(&output_path, state.last_offset);
                         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -544,42 +546,43 @@ pub(super) async fn restore_inflight_turns(
                         let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                         let turn_delivered =
                             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        shared.tmux_watchers.insert(
-                            channel_id,
-                            TmuxWatcherHandle {
-                                paused: paused.clone(),
-                                resume_offset: resume_offset.clone(),
-                                cancel: cancel.clone(),
-                                pause_epoch: pause_epoch.clone(),
-                                turn_delivered: turn_delivered.clone(),
-                            },
-                        );
-                        let ts2 = chrono::Local::now().format("%H:%M:%S");
-                        if truncated {
-                            println!(
-                                "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
-                                tmux_session_name, state.last_offset, current_len
-                            );
-                        }
-                        println!(
-                            "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
-                            tmux_session_name, initial_offset
-                        );
-                        #[cfg(unix)]
+                        // #226: Atomic claim via try_claim_watcher
+                        let handle = TmuxWatcherHandle {
+                            paused: paused.clone(),
+                            resume_offset: resume_offset.clone(),
+                            cancel: cancel.clone(),
+                            pause_epoch: pause_epoch.clone(),
+                            turn_delivered: turn_delivered.clone(),
+                        };
+                        if super::tmux::try_claim_watcher(&shared.tmux_watchers, channel_id, handle)
                         {
-                            tokio::spawn(super::tmux::tmux_output_watcher(
-                                channel_id,
-                                http.clone(),
-                                shared.clone(),
-                                output_path,
-                                tmux_session_name.clone(),
-                                initial_offset,
-                                cancel,
-                                paused,
-                                resume_offset,
-                                pause_epoch,
-                                turn_delivered,
-                            ));
+                            let ts2 = chrono::Local::now().format("%H:%M:%S");
+                            if truncated {
+                                println!(
+                                    "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                                    tmux_session_name, state.last_offset, current_len
+                                );
+                            }
+                            println!(
+                                "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                                tmux_session_name, initial_offset
+                            );
+                            #[cfg(unix)]
+                            {
+                                tokio::spawn(super::tmux::tmux_output_watcher(
+                                    channel_id,
+                                    http.clone(),
+                                    shared.clone(),
+                                    output_path,
+                                    tmux_session_name.clone(),
+                                    initial_offset,
+                                    cancel,
+                                    paused,
+                                    resume_offset,
+                                    pause_epoch,
+                                    turn_delivered,
+                                ));
+                            }
                         }
                     }
                 }
@@ -714,18 +717,122 @@ pub(super) async fn restore_inflight_turns(
             } else {
                 super::formatting::format_for_discord(&extracted)
             };
-            let _ = super::formatting::replace_long_message_raw(
+            // #225 P1-1: Track relay success — only clear inflight if Discord delivery succeeds
+            let relay_ok = super::formatting::replace_long_message_raw(
                 http,
                 channel_id,
                 current_msg_id,
                 &final_text,
                 shared,
             )
-            .await;
-            // Keep the inflight state until the watcher either relays the
-            // final response or triggers watcher-death handoff. Clearing it
-            // here breaks the handoff path if the recovered tmux session dies
-            // before producing a result.
+            .await
+            .is_ok();
+
+            // Mark user message as completed: ⏳ → ✅
+            let user_msg_id = MessageId::new(state.user_msg_id);
+            super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
+            super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
+
+            // Complete the dispatch if this was an implementation/rework turn.
+            // Review dispatches require the verdict flow (review_verdict.rs)
+            // and must not be generically finalized here.
+            // #225 P1-3: Use DB lookup for dispatch ID (text parsing fails in unified threads)
+            let recovered_dispatch_id = parse_dispatch_id(&state.user_text)
+                .or(lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id).await);
+            let mut dispatch_completed = recovered_dispatch_id.is_none();
+            if let Some(ref did) = recovered_dispatch_id {
+                let dispatch_type = shared.db.as_ref().and_then(|db| {
+                    db.separate_conn().ok().and_then(|conn| {
+                        conn.query_row(
+                            "SELECT dispatch_type FROM task_dispatches WHERE id = ?1",
+                            [did.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                    })
+                });
+
+                match dispatch_type.as_deref() {
+                    Some("implementation") | Some("rework") => {
+                        if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                            for attempt in 1..=3u8 {
+                                match crate::dispatch::finalize_dispatch(
+                                    db,
+                                    engine,
+                                    did,
+                                    "recovery_output_completed",
+                                    None,
+                                ) {
+                                    Ok(_) => {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        println!(
+                                            "  [{ts}] ✓ recovery: completed dispatch {did} via finalize_dispatch"
+                                        );
+                                        crate::server::routes::dispatches::queue_dispatch_followup(
+                                            db, did,
+                                        );
+                                        dispatch_completed = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        eprintln!(
+                                            "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
+                                        );
+                                        if attempt < 3 {
+                                            tokio::time::sleep(std::time::Duration::from_secs(1))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            if !dispatch_completed {
+                                dispatch_completed =
+                                    super::turn_bridge::runtime_db_fallback_complete(
+                                        did,
+                                        "recovery_output_db_fallback",
+                                    );
+                            }
+                        } else {
+                            dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
+                                did,
+                                "recovery_output_db_fallback",
+                            );
+                        }
+                        if !dispatch_completed {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ❌ recovery: dispatch {did} completion failed — preserving state for retry"
+                            );
+                        }
+                    }
+                    Some(_) => {
+                        // Non-work dispatches (review, review-decision) need their
+                        // own completion flow — clear inflight but leave dispatch
+                        // status for the appropriate handler (see follow-up #xxx).
+                        dispatch_completed = true;
+                    }
+                    None => {
+                        // DB unavailable — cannot determine dispatch type.
+                        // Preserve inflight state so the next recovery pass can retry.
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!(
+                            "  [{ts}] ⚠ recovery: cannot determine dispatch type for {did} — preserving state"
+                        );
+                    }
+                }
+            }
+
+            // #225 P1-1: Only clear inflight if both dispatch completed AND relay succeeded.
+            // If relay failed, preserve inflight for retry on next startup.
+            if dispatch_completed && relay_ok {
+                clear_inflight_state(provider, state.channel_id);
+            } else if dispatch_completed && !relay_ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ recovery: dispatch completed but Discord relay failed — preserving inflight for retry"
+                );
+            }
             continue;
         }
 
@@ -775,10 +882,10 @@ pub(super) async fn restore_inflight_turns(
                 state.full_response.clone()
             };
             let stale_text = stale_inflight_message(&best_response);
-            if let Some(diag) = tmux_session_name
+            let death_diag = tmux_session_name
                 .as_deref()
-                .and_then(|name| build_tmux_death_diagnostic(name, output_path.as_deref()))
-            {
+                .and_then(|name| build_tmux_death_diagnostic(name, output_path.as_deref()));
+            if let Some(ref diag) = death_diag {
                 println!(
                     "  [{ts}] ⚠ cannot recover inflight turn for channel {}: tmux session missing (response len: {}, {diag})",
                     state.channel_id,
@@ -799,6 +906,18 @@ pub(super) async fn restore_inflight_turns(
                 shared,
             )
             .await;
+            if let Some(ref sk) = state.session_key {
+                crate::services::termination_audit::record_termination(
+                    sk,
+                    state.dispatch_id.as_deref(),
+                    "recovery",
+                    "restart_session_missing",
+                    Some("tmux session missing after restart"),
+                    death_diag.as_deref(),
+                    Some(state.last_offset),
+                    Some(false),
+                );
+            }
             save_missing_session_handoff(provider, &state, &best_response);
             clear_inflight_state(provider, state.channel_id);
             continue;
@@ -884,9 +1003,7 @@ pub(super) async fn restore_inflight_turns(
             }
 
             // Immediately spawn watcher to avoid race condition.
-            if std::fs::metadata(&output_path).is_ok()
-                && !shared.tmux_watchers.contains_key(&channel_id)
-            {
+            if std::fs::metadata(&output_path).is_ok() {
                 let (initial_offset, current_len, truncated) =
                     recovery_watcher_start_offset(&output_path, state.last_offset);
                 let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -894,46 +1011,49 @@ pub(super) async fn restore_inflight_turns(
                 let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
                 let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let turn_delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                shared.tmux_watchers.insert(
-                    channel_id,
-                    TmuxWatcherHandle {
-                        paused: paused.clone(),
-                        resume_offset: resume_offset.clone(),
-                        cancel: cancel.clone(),
-                        pause_epoch: pause_epoch.clone(),
-                        turn_delivered: turn_delivered.clone(),
-                    },
-                );
-                let ts2 = chrono::Local::now().format("%H:%M:%S");
-                if truncated {
+                // #226: Atomic claim via try_claim_watcher
+                let handle = TmuxWatcherHandle {
+                    paused: paused.clone(),
+                    resume_offset: resume_offset.clone(),
+                    cancel: cancel.clone(),
+                    pause_epoch: pause_epoch.clone(),
+                    turn_delivered: turn_delivered.clone(),
+                };
+                if super::tmux::try_claim_watcher(&shared.tmux_watchers, channel_id, handle) {
+                    let ts2 = chrono::Local::now().format("%H:%M:%S");
+                    if truncated {
+                        println!(
+                            "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
+                            tmux_session_name, state.last_offset, current_len
+                        );
+                    }
                     println!(
-                        "  [{ts2}] ↻ recovery: output truncated for #{} (saved offset {}, file len {}), restarting watcher from 0",
-                        tmux_session_name, state.last_offset, current_len
+                        "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
+                        tmux_session_name, initial_offset
                     );
-                }
-                println!(
-                    "  [{ts2}] 👁 recovery: spawned watcher for #{} at offset {}",
-                    tmux_session_name, initial_offset
-                );
-                #[cfg(unix)]
-                {
-                    tokio::spawn(super::tmux::tmux_output_watcher(
-                        channel_id,
-                        http.clone(),
-                        shared.clone(),
-                        output_path.clone(),
-                        tmux_session_name.clone(),
-                        initial_offset,
-                        cancel,
-                        paused,
-                        resume_offset,
-                        pause_epoch,
-                        turn_delivered,
-                    ));
+                    #[cfg(unix)]
+                    {
+                        tokio::spawn(super::tmux::tmux_output_watcher(
+                            channel_id,
+                            http.clone(),
+                            shared.clone(),
+                            output_path.clone(),
+                            tmux_session_name.clone(),
+                            initial_offset,
+                            cancel,
+                            paused,
+                            resume_offset,
+                            pause_epoch,
+                            turn_delivered,
+                        ));
+                    }
                 }
             }
 
-            clear_inflight_state(provider, state.channel_id);
+            // Keep the inflight state until the watcher either relays the
+            // final response or triggers watcher-death handoff. Clearing it
+            // here breaks the handoff path if the recovered tmux session
+            // dies before producing a result.
             continue;
         }
 
@@ -1007,7 +1127,11 @@ pub(super) async fn restore_inflight_turns(
             Some(&adk_session_info),
             None,
             last_path.as_deref(),
-            parse_dispatch_id(&state.user_text).as_deref(),
+            // #222: DB lookup first for unified thread recovery
+            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
+                .await
+                .or_else(|| parse_dispatch_id(&state.user_text))
+                .as_deref(),
             shared.api_port,
         )
         .await;
@@ -1080,7 +1204,11 @@ pub(super) async fn restore_inflight_turns(
             }
         });
 
-        let recovery_dispatch_id = parse_dispatch_id(&state.user_text);
+        // #222: DB lookup first for unified thread recovery
+        let recovery_dispatch_id =
+            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
+                .await
+                .or_else(|| parse_dispatch_id(&state.user_text));
         // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());

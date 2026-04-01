@@ -13,6 +13,7 @@ pub mod qwen;
 pub mod qwen_tmux_wrapper;
 pub mod remote_stub;
 pub mod session_backend;
+pub mod termination_audit;
 pub mod tmux_common;
 pub mod tmux_diagnostics;
 #[cfg(unix)]
