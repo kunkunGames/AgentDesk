@@ -42,8 +42,18 @@ const QWEN_SUPPORTED_ALLOWED_TOOLS: &[&str] = &[
     "Glob",
     "Grep",
     "Task",
+    "TaskOutput",
+    "TaskStop",
     "WebFetch",
     "WebSearch",
+    "NotebookEdit",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskUpdate",
+    "TaskList",
+    "AskUserQuestion",
+    "EnterPlanMode",
     "ExitPlanMode",
 ];
 
@@ -1392,18 +1402,28 @@ fn compose_qwen_prompt(
     sections.join("\n\n")
 }
 
-fn map_agentdesk_tool_to_qwen_core_tool(tool: &str) -> Option<&'static str> {
+fn map_agentdesk_tool_to_qwen_core_tools(tool: &str) -> Option<&'static [&'static str]> {
     match tool.trim() {
-        "Bash" => Some("run_shell_command"),
-        "Read" => Some("read_file"),
-        "Edit" => Some("edit"),
-        "Write" => Some("write_file"),
-        "Glob" => Some("glob"),
-        "Grep" => Some("grep_search"),
-        "Task" => Some("task"),
-        "WebFetch" => Some("web_fetch"),
-        "WebSearch" => Some("web_search"),
-        "ExitPlanMode" => Some("exit_plan_mode"),
+        "Bash" => Some(&["run_shell_command"]),
+        "Read" => Some(&["read_file"]),
+        "Edit" => Some(&["edit"]),
+        "Write" => Some(&["write_file"]),
+        "Glob" => Some(&["glob"]),
+        "Grep" => Some(&["grep_search"]),
+        // Qwen renamed the old "task" tool to "agent". Accept the whole shared
+        // Task* family so shared AgentDesk configs do not fail preflight here.
+        "Task" | "TaskCreate" | "TaskGet" | "TaskUpdate" | "TaskList" | "TaskOutput"
+        | "TaskStop" => Some(&["agent"]),
+        "WebFetch" => Some(&["web_fetch"]),
+        "WebSearch" => Some(&["web_search"]),
+        // Qwen has no notebook-specific editor tool, but the normal edit tool is
+        // the closest capability and avoids rejecting shared allowlists.
+        "NotebookEdit" => Some(&["edit"]),
+        "Skill" => Some(&["skill"]),
+        "AskUserQuestion" => Some(&["ask_user_question"]),
+        // Qwen exposes only exit_plan_mode. Treat EnterPlanMode as a compatible
+        // plan-mode alias so shared configs do not hard-fail on Qwen.
+        "EnterPlanMode" | "ExitPlanMode" => Some(&["exit_plan_mode"]),
         _ => None,
     }
 }
@@ -1420,10 +1440,12 @@ pub(crate) fn resolve_allowed_core_tools(
     let mut core_tools = Vec::new();
 
     for tool in allowed_tools {
-        match map_agentdesk_tool_to_qwen_core_tool(tool) {
-            Some(core_tool) => {
-                if seen.insert(core_tool) {
-                    core_tools.push(core_tool.to_string());
+        match map_agentdesk_tool_to_qwen_core_tools(tool) {
+            Some(mapped_tools) => {
+                for core_tool in mapped_tools {
+                    if seen.insert(*core_tool) {
+                        core_tools.push((*core_tool).to_string());
+                    }
                 }
             }
             None => unsupported.push(tool.trim().to_string()),
@@ -1775,11 +1797,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_allowed_core_tools_rejects_unsupported_tools() {
-        let err = resolve_allowed_core_tools(Some(&["Bash".to_string(), "TaskOutput".to_string()]))
-            .unwrap_err();
+    fn resolve_allowed_core_tools_accepts_shared_agentdesk_aliases() {
+        let tools = resolve_allowed_core_tools(Some(&[
+            "TaskOutput".to_string(),
+            "TaskStop".to_string(),
+            "NotebookEdit".to_string(),
+            "Skill".to_string(),
+            "TaskCreate".to_string(),
+            "TaskGet".to_string(),
+            "TaskUpdate".to_string(),
+            "TaskList".to_string(),
+            "AskUserQuestion".to_string(),
+            "EnterPlanMode".to_string(),
+        ]))
+        .unwrap()
+        .unwrap();
 
-        assert!(err.contains("TaskOutput"));
+        assert_eq!(
+            tools,
+            vec![
+                "agent".to_string(),
+                "edit".to_string(),
+                "skill".to_string(),
+                "ask_user_question".to_string(),
+                "exit_plan_mode".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_core_tools_rejects_unknown_tools() {
+        let err = resolve_allowed_core_tools(Some(&[
+            "Bash".to_string(),
+            "DefinitelyUnsupported".to_string(),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("DefinitelyUnsupported"));
         assert!(err.contains("Supported with Qwen"));
     }
 
