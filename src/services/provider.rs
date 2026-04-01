@@ -256,9 +256,43 @@ pub fn parse_provider_and_channel_from_tmux_name(
     Some((ProviderKind::Claude, without_suffix.to_string()))
 }
 
+pub fn compose_structured_turn_prompt(
+    prompt: &str,
+    system_prompt: Option<&str>,
+    allowed_tools: Option<&[String]>,
+) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(system_prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!(
+            "[Authoritative Instructions]\n{}\n\nThese instructions are authoritative for this turn. Follow them over any generic assistant persona unless the user explicitly asks to inspect or compare them.",
+            system_prompt
+        ));
+    }
+
+    if let Some(allowed_tools) = allowed_tools.filter(|tools| !tools.is_empty()) {
+        sections.push(format!(
+            "[Tool Policy]\nIf tools are needed, stay within this allowlist unless the user explicitly asks to change it: {}",
+            allowed_tools.join(", ")
+        ));
+    }
+
+    if sections.is_empty() {
+        return prompt.to_string();
+    }
+
+    sections.push(format!("[User Request]\n{}", prompt));
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProviderKind, parse_provider_and_channel_from_tmux_name};
+    use super::{
+        ProviderKind, compose_structured_turn_prompt, parse_provider_and_channel_from_tmux_name,
+    };
     use crate::dispatch::extract_thread_channel_id;
 
     #[test]
@@ -620,5 +654,26 @@ mod tests {
             assert!(capabilities.supports_tool_stream);
             assert!(!capabilities.binary_name.is_empty());
         }
+    }
+
+    #[test]
+    fn test_compose_structured_turn_prompt_includes_authoritative_sections() {
+        let prompt = compose_structured_turn_prompt(
+            "role과 mission만 답해줘.",
+            Some("role: PMD\nmission: 백로그 관리"),
+            Some(&["Bash".to_string(), "Read".to_string()]),
+        );
+
+        assert!(prompt.contains("[Authoritative Instructions]"));
+        assert!(prompt.contains("role: PMD"));
+        assert!(prompt.contains("[Tool Policy]"));
+        assert!(prompt.contains("Bash, Read"));
+        assert!(prompt.contains("[User Request]\nrole과 mission만 답해줘."));
+    }
+
+    #[test]
+    fn test_compose_structured_turn_prompt_returns_plain_prompt_without_overrides() {
+        let prompt = compose_structured_turn_prompt("just answer", None, None);
+        assert_eq!(prompt, "just answer");
     }
 }
