@@ -1817,10 +1817,48 @@ pub async fn run_bot(
                         &provider_for_restore,
                     ).await;
 
+                    // #226: Collect channels that recovery already handled (spawned + ended watchers).
+                    // restore_tmux_watchers must skip these to prevent duplicate watcher creation.
+                    // The issue: recovery watcher starts → session ends quickly → watcher removes
+                    // itself from DashMap → restore_tmux_watchers sees empty slot → creates second watcher.
                     #[cfg(unix)]
                     {
+                        // Mark all channels that recovery touched as "recently handled"
+                        // by inserting a recovery_handled marker in kv_meta.
+                        // restore_tmux_watchers checks this and skips those channels.
+                        if let Some(ref db) = shared_for_tmux2.db {
+                            if let Ok(conn) = db.lock() {
+                                let recovery_channels: Vec<u64> = shared_for_tmux2
+                                    .recovering_channels
+                                    .iter()
+                                    .map(|entry| entry.key().get())
+                                    .collect();
+                                for ch in &recovery_channels {
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                                        rusqlite::params![
+                                            format!("recovery_handled_channel:{ch}"),
+                                            chrono::Utc::now().timestamp().to_string(),
+                                        ],
+                                    )
+                                    .ok();
+                                }
+                            }
+                        }
+
                         restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                         cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
+
+                        // Clean up recovery markers
+                        if let Some(ref db) = shared_for_tmux2.db {
+                            if let Ok(conn) = db.lock() {
+                                conn.execute(
+                                    "DELETE FROM kv_meta WHERE key LIKE 'recovery_handled_channel:%'",
+                                    [],
+                                )
+                                .ok();
+                            }
+                        }
                     }
 
                     // Execute durable handoffs (post-restart follow-up work)

@@ -1680,6 +1680,32 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
     // was built during the scan phase, which includes async Discord API calls.
     // A normal turn may have created a watcher in the meantime.
     for pw in pending {
+        // #226: Skip channels that recovery already handled — their watchers may have
+        // ended quickly (session died), removing themselves from the DashMap, but we
+        // should not create a second watcher because recovery already processed the turn.
+        let recovery_handled = shared
+            .db
+            .as_ref()
+            .and_then(|db| {
+                db.lock().ok().and_then(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) > 0 FROM kv_meta WHERE key = ?1",
+                        [format!("recovery_handled_channel:{}", pw.channel_id.get())],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .ok()
+                })
+            })
+            .unwrap_or(false);
+        if recovery_handled {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⏭ watcher skip for {} — recovery already handled this channel",
+                pw.session_name
+            );
+            continue;
+        }
+
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
