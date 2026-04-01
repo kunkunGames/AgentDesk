@@ -232,6 +232,12 @@ fn execute_gemini_streaming_attempt(
         &mut state,
         GEMINI_STREAM_POLL_TIMEOUT,
         GEMINI_STREAM_IDLE_WATCHDOG,
+        || {
+            child
+                .try_wait()
+                .map(|status| status.is_some())
+                .unwrap_or(true)
+        },
     ) {
         GeminiStreamLoopResult::Cancelled => {
             claude::kill_child_tree(&mut child);
@@ -290,14 +296,18 @@ fn send_gemini_stream_failure(sender: &Sender<StreamMessage>, failure: StreamAtt
     });
 }
 
-fn collect_gemini_stream_events(
+fn collect_gemini_stream_events<F>(
     stdout_events: &mpsc::Receiver<GeminiStreamEvent>,
     sender: &Sender<StreamMessage>,
     cancel_token: Option<&CancelToken>,
     state: &mut GeminiAttemptState,
     poll_timeout: Duration,
     idle_watchdog: Duration,
-) -> GeminiStreamLoopResult {
+    mut definitive_failure_observed: F,
+) -> GeminiStreamLoopResult
+where
+    F: FnMut() -> bool,
+{
     let mut silent_for = Duration::ZERO;
 
     loop {
@@ -328,6 +338,9 @@ fn collect_gemini_stream_events(
                 }
                 silent_for += poll_timeout;
                 if silent_for >= idle_watchdog {
+                    if !definitive_failure_observed() {
+                        continue;
+                    }
                     return GeminiStreamLoopResult::RetrySession {
                         message: format!(
                             "Gemini stream produced no output for {} seconds",
@@ -1206,6 +1219,7 @@ mod tests {
             &mut state,
             Duration::from_millis(5),
             Duration::from_millis(10),
+            || false,
         );
 
         assert_eq!(result, GeminiStreamLoopResult::Cancelled);
@@ -1235,6 +1249,7 @@ mod tests {
             &mut state,
             Duration::from_millis(1),
             Duration::from_millis(2),
+            || false,
         );
 
         assert_eq!(result, GeminiStreamLoopResult::Cancelled);
@@ -1248,7 +1263,43 @@ mod tests {
     }
 
     #[test]
-    fn idle_watchdog_retries_after_extended_silence_following_progress() {
+    fn idle_watchdog_waits_if_process_is_still_alive_during_extended_silence() {
+        let (tx, rx) = mpsc::channel();
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let mut state = GeminiAttemptState::new(None);
+        tx.send(GeminiStreamEvent::Line(
+            r#"{"type":"message","role":"assistant","content":"partial"}"#.to_string(),
+        ))
+        .unwrap();
+        let token = Arc::new(CancelToken::new());
+        let token_for_thread = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            token_for_thread.cancelled.store(true, Ordering::Relaxed);
+        });
+
+        let result = collect_gemini_stream_events(
+            &rx,
+            &stream_tx,
+            Some(token.as_ref()),
+            &mut state,
+            Duration::from_millis(1),
+            Duration::from_millis(3),
+            || false,
+        );
+
+        assert_eq!(result, GeminiStreamLoopResult::Cancelled);
+        assert_eq!(state.final_text, "partial");
+        assert!(state.meaningful_progress_seen);
+        match stream_rx.recv().unwrap() {
+            StreamMessage::Text { content } => assert_eq!(content, "partial"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+        assert!(stream_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn idle_watchdog_retries_after_extended_silence_once_process_exit_is_observed() {
         let (tx, rx) = mpsc::channel();
         let (stream_tx, stream_rx) = mpsc::channel();
         let mut state = GeminiAttemptState::new(None);
@@ -1264,6 +1315,7 @@ mod tests {
             &mut state,
             Duration::from_millis(1),
             Duration::from_millis(3),
+            || true,
         );
 
         match result {
