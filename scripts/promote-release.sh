@@ -24,6 +24,7 @@ PROMOTE_LOG_PATH="${AGENTDESK_PROMOTE_LOG_PATH:-}"
 PROMOTE_TEST_MODE="${AGENTDESK_PROMOTE_TEST_MODE:-0}"
 PROMOTE_DELAY_SECS="${AGENTDESK_PROMOTE_DELAY_SECS:-2}"
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
+ALLOW_ADHOC_RELEASE_SIGN="${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-0}"
 DASHBOARD_SOURCE=""
 
 echo "═══ ADK Promote Dev → Release ═══"
@@ -32,15 +33,35 @@ sign_binary_with_fallback() {
     local target="$1"
     local identity="${CODESIGN_IDENTITY:--}"
 
-    if [ -n "$identity" ] && [ "$identity" != "-" ] && command -v security >/dev/null 2>&1; then
-        if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
-            echo "⚠ Signing identity not found locally; falling back to ad-hoc signature"
+    if [ -z "$identity" ]; then
+        if [ "$ALLOW_ADHOC_RELEASE_SIGN" = "1" ]; then
+            echo "⚠ No signing identity configured; using explicit ad-hoc release signature override"
             identity="-"
+        else
+            echo "✗ No release signing identity configured"
+            echo "  Set AGENTDESK_CODESIGN_IDENTITY to a valid Developer ID Application certificate"
+            echo "  or set AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=1 for an explicit local override"
+            exit 1
         fi
     fi
 
-    if [ -z "$identity" ]; then
-        identity="-"
+    if [ "$identity" = "-" ] && [ "$ALLOW_ADHOC_RELEASE_SIGN" != "1" ]; then
+        echo "✗ Refusing ad-hoc release signing without AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=1"
+        exit 1
+    fi
+
+    if [ -n "$identity" ] && [ "$identity" != "-" ] && command -v security >/dev/null 2>&1; then
+        if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
+            if [ "$ALLOW_ADHOC_RELEASE_SIGN" = "1" ]; then
+                echo "⚠ Signing identity not found locally; using explicit ad-hoc release signature override"
+                identity="-"
+            else
+                echo "✗ Signing identity not found locally: $identity"
+                echo "  Refusing release promotion without a valid Developer ID Application certificate"
+                echo "  Set AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=1 only for an explicit local override"
+                exit 1
+            fi
+        fi
     fi
 
     if [ "$identity" = "-" ]; then
