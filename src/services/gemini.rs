@@ -525,15 +525,6 @@ fn finalize_gemini_attempt(
         });
     }
 
-    if !stderr.trim().is_empty() {
-        return StreamFinalState::Error(StreamAttemptFailure {
-            message: derive_error_message(&raw_stdout, &stderr, exit_code, "Gemini"),
-            stdout: raw_stdout,
-            stderr,
-            exit_code,
-        });
-    }
-
     if terminal_result_seen {
         let result = final_text.trim().to_string();
         let result = if result.is_empty() {
@@ -1176,6 +1167,22 @@ mod tests {
         state.terminal_result_seen = true;
 
         match finalize_gemini_attempt(&mut state, String::new(), Some(0)) {
+            StreamFinalState::Done { result, session_id } => {
+                assert_eq!(result, "done");
+                assert_eq!(session_id.as_deref(), Some("latest"));
+            }
+            other => panic!("expected Done, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn terminal_result_with_zero_exit_ignores_stderr_noise() {
+        let mut state = GeminiAttemptState::new(Some("latest".to_string()));
+        state.final_text = "done".to_string();
+        state.terminal_result_seen = true;
+        state.raw_stdout = "plain stdout".to_string();
+
+        match finalize_gemini_attempt(&mut state, "warning: progress".to_string(), Some(0)) {
             StreamFinalState::Done { result, session_id } => {
                 assert_eq!(result, "done");
                 assert_eq!(session_id.as_deref(), Some("latest"));
