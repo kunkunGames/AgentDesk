@@ -99,8 +99,8 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
         data.intervention_queue.remove(&channel_id);
     }
 
-    // Clear the stored claude_session_id from DB so the next turn
-    // doesn't try to --resume a dead session.
+    // Clear the stored provider session_id from DB so the next turn
+    // doesn't try to resume a dead session.
     let shared = &ctx.data().shared;
     let provider = &ctx.data().provider;
     // #227: Derive session key with fallback for post-restart state where
@@ -128,7 +128,7 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
         }
     };
     if let Some(ref key) = session_key {
-        super::super::adk_session::clear_claude_session_id(key, shared.api_port).await;
+        super::super::adk_session::clear_provider_session_id(key, shared.api_port).await;
         // #227: Reset tokens to 0 so stale context values don't persist after /clear.
         super::super::adk_session::post_adk_session_status(
             Some(key.as_str()),
