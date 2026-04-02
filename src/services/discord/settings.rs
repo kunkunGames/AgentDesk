@@ -671,7 +671,7 @@ mod tests {
     use poise::serenity_prelude::ChannelId;
     use tempfile::TempDir;
 
-    use crate::services::claude::DEFAULT_ALLOWED_TOOLS;
+    use crate::services::agent_protocol::DEFAULT_ALLOWED_TOOLS;
     use crate::services::provider::ProviderKind;
 
     use super::{
