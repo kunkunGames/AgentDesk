@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
@@ -24,6 +24,13 @@ struct TurnNormalizationState {
     last_session_id: Option<String>,
     init_emitted_for_session: Option<String>,
     partial_blocks: HashMap<usize, PartialBlockState>,
+}
+
+#[derive(Debug)]
+enum TurnStreamEvent {
+    Line(String),
+    ReadError(String),
+    Eof,
 }
 
 pub fn run(
@@ -259,24 +266,36 @@ fn run_turn(
         buf
     });
 
+    let stdout_events = spawn_turn_stream_reader(stdout);
     let mut state = TurnNormalizationState {
         last_session_id: session_id.clone(),
         init_emitted_for_session: session_id.clone(),
         ..TurnNormalizationState::default()
     };
     let mut saw_result = false;
+    let mut pending_error: Option<String> = None;
 
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read Qwen output: {}", e))?;
-        for normalized in normalize_qwen_line(&line, &mut state) {
-            if let Some(id) = extract_init_session_id(&normalized) {
-                *session_id = Some(id);
+    loop {
+        match stdout_events.recv() {
+            Ok(TurnStreamEvent::Line(line)) => {
+                for normalized in normalize_qwen_line(&line, &mut state) {
+                    if let Some(id) = extract_init_session_id(&normalized) {
+                        *session_id = Some(id);
+                    }
+                    if is_result_line(&normalized) {
+                        saw_result = true;
+                    }
+                    emit_json_line(output, normalized)?;
+                }
+                if saw_result {
+                    break;
+                }
             }
-            if is_result_line(&normalized) {
-                saw_result = true;
+            Ok(TurnStreamEvent::ReadError(message)) => {
+                pending_error = Some(message);
+                break;
             }
-            emit_json_line(output, normalized)?;
+            Ok(TurnStreamEvent::Eof) | Err(_) => break,
         }
     }
 
@@ -287,6 +306,11 @@ fn run_turn(
         .wait_with_output()
         .map_err(|e| format!("Failed to wait for Qwen: {}", e))?;
     let stderr = stderr_handle.join().unwrap_or_default();
+
+    if let Some(message) = pending_error {
+        emit_result_error(output, &message);
+        return Err(message);
+    }
 
     if !wait.status.success() && !saw_result {
         let message = derive_wrapper_error_message(&stderr, wait.status.code());
@@ -305,6 +329,34 @@ fn run_turn(
     }
 
     Ok(())
+}
+
+fn spawn_turn_stream_reader<R>(stdout: R) -> mpsc::Receiver<TurnStreamEvent>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(TurnStreamEvent::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(TurnStreamEvent::ReadError(format!(
+                        "Failed to read Qwen output: {}",
+                        err
+                    )));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(TurnStreamEvent::Eof);
+    });
+    rx
 }
 
 fn build_turn_args(prompt: &str, model: Option<&str>, session_id: Option<&str>) -> Vec<String> {
@@ -768,7 +820,12 @@ fn emit_json_line(output: &mut std::fs::File, value: Value) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::{build_turn_args, decode_external_prompt, normalize_qwen_line};
+    use super::{
+        TurnStreamEvent, build_turn_args, decode_external_prompt, normalize_qwen_line,
+        spawn_turn_stream_reader,
+    };
+    use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn test_decode_external_prompt_keeps_plain_line() {
@@ -813,5 +870,21 @@ mod tests {
                 .any(|pair| pair == ["--resume", "session-123"])
         );
         assert!(!args.iter().any(|arg| arg == "--continue"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn turn_stream_reader_emits_line_without_waiting_for_eof() {
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let events = spawn_turn_stream_reader(reader);
+
+        writeln!(writer, r#"{{"type":"result","subtype":"success"}}"#).unwrap();
+
+        match events.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TurnStreamEvent::Line(line) => {
+                assert_eq!(line, r#"{"type":"result","subtype":"success"}"#)
+            }
+            other => panic!("expected line event, got {:?}", other),
+        }
     }
 }
