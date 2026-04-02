@@ -358,7 +358,10 @@ pub fn api_router(
         )
         .route("/discord/channels/{id}", get(discord::channel_info))
         // Round-table meetings
-        .route("/round-table-meetings", get(meetings::list_meetings))
+        .route(
+            "/round-table-meetings",
+            get(meetings::list_meetings).post(meetings::upsert_meeting),
+        )
         .route("/round-table-meetings/start", post(meetings::start_meeting))
         .route(
             "/round-table-meetings/{id}",
