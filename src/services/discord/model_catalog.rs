@@ -244,7 +244,7 @@ fn intern_owned(value: String) -> &'static str {
 }
 
 fn codex_model_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".codex").join("models_cache.json"))
+    model_catalog_home_dir().map(|home| home.join(".codex").join("models_cache.json"))
 }
 
 fn gemini_models_js_path() -> Option<PathBuf> {
@@ -531,9 +531,21 @@ fn qwen_system_defaults_path() -> Option<PathBuf> {
 }
 
 fn qwen_user_settings_path() -> Option<PathBuf> {
-    dirs::home_dir()
+    model_catalog_home_dir()
         .map(|home| home.join(".qwen").join("settings.json"))
         .filter(|path| path.is_file())
+}
+
+fn model_catalog_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("AGENTDESK_TEST_HOME") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+
+    dirs::home_dir()
 }
 
 fn qwen_project_settings_path(working_dir: Option<&str>) -> Option<PathBuf> {
@@ -863,12 +875,14 @@ mod tests {
 
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
+        let prev_test_home = std::env::var_os("AGENTDESK_TEST_HOME");
         let prev_system_defaults = std::env::var_os("QWEN_CODE_SYSTEM_DEFAULTS_PATH");
         let prev_system_settings = std::env::var_os("QWEN_CODE_SYSTEM_SETTINGS_PATH");
 
         unsafe {
             std::env::set_var("HOME", temp_home.path());
             std::env::set_var("USERPROFILE", temp_home.path());
+            std::env::set_var("AGENTDESK_TEST_HOME", temp_home.path());
             std::env::remove_var("QWEN_CODE_SYSTEM_DEFAULTS_PATH");
             std::env::remove_var("QWEN_CODE_SYSTEM_SETTINGS_PATH");
         }
@@ -882,6 +896,10 @@ mod tests {
         match prev_userprofile {
             Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
             None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match prev_test_home {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_TEST_HOME", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_TEST_HOME") },
         }
         match prev_system_defaults {
             Some(value) => unsafe { std::env::set_var("QWEN_CODE_SYSTEM_DEFAULTS_PATH", value) },
