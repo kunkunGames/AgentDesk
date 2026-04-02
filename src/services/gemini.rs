@@ -414,7 +414,20 @@ fn process_gemini_json_event(
     match json.get("type").and_then(|v| v.as_str()) {
         Some("init") => {
             if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
-                state.last_resume_selector = observed_session_to_resume_selector(session_id);
+                // P1: Preserve existing numeric/latest resume selector — only update
+                // if the observed value is itself resumable, or we have no selector yet.
+                let observed = observed_session_to_resume_selector(session_id);
+                let existing_is_resumable =
+                    state.last_resume_selector.as_ref().map_or(false, |s| {
+                        s == GEMINI_RESUME_LATEST || s.chars().all(|c| c.is_ascii_digit())
+                    });
+                if !existing_is_resumable
+                    || observed
+                        .as_ref()
+                        .map_or(false, |o| o != GEMINI_RESUME_LATEST)
+                {
+                    state.last_resume_selector = observed;
+                }
                 let _ = sender.send(StreamMessage::Init {
                     session_id: state
                         .last_resume_selector
