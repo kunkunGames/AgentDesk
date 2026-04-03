@@ -57,8 +57,14 @@ function getTimeoutInterval(key, fallbackMinutes) {
   return "-" + val + " minutes";
 }
 
-// #231: PM Decision notification dedup — collect reasons per card within a tick,
-// then flush a single combined notification per card at tick end.
+// #231: PM Decision notification dedup.
+// Reasons are collected across all tier handlers in a scheduler pass
+// (Rust fires 30s→1min→5min→onTick back-to-back when cadences align).
+// _flushPMDecisions runs in onTick (legacy, 5min) AFTER all tiered handlers,
+// combining every reason into one notification per card.
+// For non-aligned ticks (only 30s or 30s+1min fire), buffered reasons
+// are deferred until the next onTick (~5 min max delay — acceptable for
+// PM decisions which are human-reviewed asynchronously).
 var _pendingPMDecisions = {};  // { cardId: { title: string, reasons: string[] } }
 var PM_DECISION_COOLDOWN_SEC = 300;  // 5-min cross-tick cooldown
 
@@ -66,7 +72,10 @@ function _queuePMDecision(cardId, title, reason) {
   if (!_pendingPMDecisions[cardId]) {
     _pendingPMDecisions[cardId] = { title: title, reasons: [] };
   }
-  _pendingPMDecisions[cardId].reasons.push(reason);
+  // Deduplicate identical reasons within the same buffer
+  if (_pendingPMDecisions[cardId].reasons.indexOf(reason) === -1) {
+    _pendingPMDecisions[cardId].reasons.push(reason);
+  }
 }
 
 function _flushPMDecisions() {
@@ -85,12 +94,12 @@ function _flushPMDecisions() {
       var sentAt = parseInt(existing[0].value, 10) || 0;
       var now = Math.floor(Date.now() / 1000);
       if (now - sentAt < PM_DECISION_COOLDOWN_SEC) {
-        agentdesk.log.info("[PM dedup] Skipped duplicate for card " + cardId +
-          " (cooldown " + (now - sentAt) + "s/" + PM_DECISION_COOLDOWN_SEC + "s)");
+        agentdesk.log.info("[PM dedup] Skipped notification for card " + cardId +
+          " (" + entry.reasons.length + " reasons, cooldown " + (now - sentAt) + "s/" + PM_DECISION_COOLDOWN_SEC + "s)");
         continue;
       }
     }
-    // Send combined notification
+    // Send combined notification with all accumulated reasons
     var msg = "[PM Decision] " + entry.title + "\n사유: " + entry.reasons.join("; ");
     agentdesk.message.queue(pmdCh, msg, "announce", "system");
     // Set cooldown with TTL
@@ -106,8 +115,12 @@ var timeouts = {
   name: "timeouts",
   priority: 100,
 
-  // Legacy onTick: no-op, replaced by tiered tick handlers (#127)
-  onTick: function() {},
+  // Legacy onTick: fires after all tiered handlers when cadences align
+  // (Rust scheduler: 30s→1min→5min→onTick). Used as the single flush
+  // point for #231 PM decision dedup so cross-tier reasons are combined.
+  onTick: function() {
+    _flushPMDecisions();
+  },
 
   // ── Section methods (extracted from onTick for tiered execution) ──
 
@@ -1203,7 +1216,6 @@ timeouts.onTick30s = function(ev) {
   agentdesk.log.debug("[tick30s][I] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_K(); } catch(e) { agentdesk.log.warn("[tick30s] K error: " + e); }
   agentdesk.log.debug("[tick30s][K] " + (Date.now() - t) + "ms");
-  _flushPMDecisions();  // #231: flush deduped PM notifications
   agentdesk.log.debug("[tick30s] total " + (Date.now() - start) + "ms");
 };
 
@@ -1224,7 +1236,6 @@ timeouts.onTick1min = function(ev) {
   agentdesk.log.debug("[tick1min][L] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_N(); } catch(e) { agentdesk.log.warn("[tick1min] N error: " + e); }
   agentdesk.log.debug("[tick1min][N] " + (Date.now() - t) + "ms");
-  _flushPMDecisions();  // #231: flush deduped PM notifications
   agentdesk.log.debug("[tick1min] total " + (Date.now() - start) + "ms");
 };
 
@@ -1251,7 +1262,6 @@ timeouts.onTick5min = function(ev) {
   agentdesk.log.debug("[tick5min][H] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_M(); } catch(e) { agentdesk.log.warn("[tick5min] M error: " + e); }
   agentdesk.log.debug("[tick5min][M] " + (Date.now() - t) + "ms");
-  _flushPMDecisions();  // #231: flush deduped PM notifications
   // DISABLED — token counting unreliable (double-count, stale after /clear). Re-enable after fix.
   // if (timeouts.onContextCheck) {
   //   t = Date.now(); try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
