@@ -165,16 +165,20 @@ rm -f "$ADK_DEV/runtime/dcserver.lock"
 
 # 3. Copy binary
 echo "▸ Copying binary..."
-# Remove immutable flag if set (only deploy scripts should touch the binary)
+# Atomic binary swap: sign in tmp, then mv to replace inode.
+# Prevents OS signing cache corruption on codesign failure.
 chflags nouchg "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
-cp "$REPO/target/release/agentdesk" "$ADK_DEV/bin/agentdesk"
-chmod +x "$ADK_DEV/bin/agentdesk"
-codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$ADK_DEV/bin/agentdesk"
-# Verify signature
-if ! codesign -v "$ADK_DEV/bin/agentdesk" 2>/dev/null; then
+cp "$REPO/target/release/agentdesk" "$ADK_DEV/bin/agentdesk.new"
+chmod +x "$ADK_DEV/bin/agentdesk.new"
+xattr -d com.apple.provenance "$ADK_DEV/bin/agentdesk.new" 2>/dev/null || true
+codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$ADK_DEV/bin/agentdesk.new"
+# Verify signature before swap
+if ! codesign -v "$ADK_DEV/bin/agentdesk.new" 2>/dev/null; then
     echo "✗ Codesign verification failed — aborting"
+    rm -f "$ADK_DEV/bin/agentdesk.new"
     exit 1
 fi
+mv -f "$ADK_DEV/bin/agentdesk.new" "$ADK_DEV/bin/agentdesk"
 # Lock binary to prevent unsigned overwrites
 chflags uchg "$ADK_DEV/bin/agentdesk"
 

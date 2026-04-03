@@ -24,7 +24,6 @@ mod turn_bridge;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -35,12 +34,11 @@ use tokio::sync::Mutex;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
-use crate::services::claude::{
-    self, CancelToken, DEFAULT_ALLOWED_TOOLS, ReadOutputResult, StreamMessage,
-};
+use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
+use crate::services::claude;
 use crate::services::codex;
 use crate::services::gemini;
-use crate::services::provider::ProviderKind;
+use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::qwen;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
 
@@ -310,25 +308,6 @@ pub(super) struct TmuxWatcherHandle {
     pub(super) turn_delivered: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Atomically claim a channel for watcher creation using DashMap::entry().
-/// Returns true if the claim succeeded (caller should spawn the watcher).
-/// Returns false if a watcher already exists (caller should skip).
-pub(super) fn try_claim_watcher(
-    watchers: &dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
-    channel_id: ChannelId,
-    handle: TmuxWatcherHandle,
-) -> bool {
-    use dashmap::mapref::entry::Entry;
-
-    match watchers.entry(channel_id) {
-        Entry::Occupied(_) => false,
-        Entry::Vacant(entry) => {
-            entry.insert(handle);
-            true
-        }
-    }
-}
-
 fn synthetic_thread_channel_name(parent_name: &str, channel_id: ChannelId) -> String {
     format!("{parent_name}-t{}", channel_id.get())
 }
@@ -358,7 +337,6 @@ fn choose_restore_channel_name(
         .or(existing_channel_name)
         .map(ToOwned::to_owned)
 }
-
 #[derive(Clone)]
 pub(super) struct ModelPickerPendingState {
     pub(super) owner_user_id: UserId,
@@ -2345,323 +2323,257 @@ pub(super) async fn check_owner(user_id: UserId, shared: &Arc<SharedData>) -> bo
     settings.owner_user_id == Some(user_id.get())
 }
 
-fn family_profile_probe_script_path() -> Option<std::path::PathBuf> {
-    // Try org.yaml skills_root first, fallback to $AGENTDESK_ROOT_DIR/skills/
-    let skills_root = org_schema::load_skills_root()
-        .map(std::path::PathBuf::from)
-        .or_else(|| runtime_store::agentdesk_root().map(|r| r.join("skills")));
-    skills_root.map(|root| {
-        root.join("family-profile-probe")
-            .join("scripts")
-            .join("select_profile_probe.py")
+/// Check for pending DM replies and consume them. The answer text is stored
+/// in the consumed row's context (as `_answer`), and a notification is sent
+/// to the source agent's Discord channel so its session can process the reply.
+pub(super) async fn try_handle_pending_dm_reply(
+    db: &crate::db::Db,
+    msg: &serenity::Message,
+) -> bool {
+    if msg.author.bot || msg.guild_id.is_some() {
+        return false;
+    }
+    let answer = msg.content.trim();
+    if answer.is_empty() {
+        return false;
+    }
+    let user_id_str = msg.author.id.get().to_string();
+    let username = msg.author.name.clone();
+    let db = db.clone();
+    let answer_owned = answer.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        consume_pending_dm_reply(&db, &user_id_str, &answer_owned)
+    })
+    .await;
+    match result {
+        Ok(Some(info)) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ✉️ DM reply consumed: user={} agent={} id={}",
+                msg.author.id.get(),
+                info.source_agent,
+                info.id
+            );
+
+            // Notify the source agent's Discord channel (inline, not fire-and-forget)
+            if let Err(e) = notify_source_agent(
+                &info.db,
+                &info.source_agent,
+                info.id,
+                info.channel_id.as_deref(),
+                &username,
+                &info.answer,
+            )
+            .await
+            {
+                eprintln!("  [dm-reply] notify source agent failed: {e}");
+                // Record failure in context so readConsumed can detect it
+                let db3 = info.db.clone();
+                let reply_id = info.id;
+                let err_msg = format!("{e}");
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = db3.separate_conn() {
+                        let _ = conn.execute(
+                            "UPDATE pending_dm_replies SET context = \
+                             json_set(context, '$._notify_failed', json('true'), '$._notify_error', ?1) \
+                             WHERE id = ?2",
+                            rusqlite::params![err_msg, reply_id],
+                        );
+                    }
+                })
+                .await;
+            }
+
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            eprintln!("  [dm-reply] consume task error: {e}");
+            false
+        }
+    }
+}
+
+/// Send a notification to the source agent's Discord channel about the DM reply.
+/// Prefers the stored `channel_id` from the pending row (alt/thread channels);
+/// falls back to `agents.discord_channel_id` only if none was stored.
+async fn notify_source_agent(
+    db: &crate::db::Db,
+    source_agent: &str,
+    reply_id: i64,
+    stored_channel_id: Option<&str>,
+    username: &str,
+    answer: &str,
+) -> Result<(), String> {
+    let token =
+        crate::credential::read_bot_token("announce").ok_or("no announce bot token configured")?;
+
+    // Prefer the stored channel_id from the pending row (supports alt/thread channels)
+    let channel_id: u64 = if let Some(ch) = stored_channel_id {
+        resolve_channel_to_u64(ch)?
+    } else {
+        // Fall back to the agent's primary discord_channel_id
+        let db = db.clone();
+        let agent_name = source_agent.to_string();
+        let ch_opt: Option<String> = tokio::task::spawn_blocking(move || {
+            let conn = db.separate_conn().map_err(|e| format!("{e}"))?;
+            conn.query_row(
+                "SELECT discord_channel_id FROM agents WHERE id = ?1",
+                rusqlite::params![agent_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| format!("{e}"))
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))??;
+        let raw = ch_opt.ok_or("agent has no discord_channel_id")?;
+        resolve_channel_to_u64(&raw)?
+    };
+
+    let message = format!("DM_REPLY:{reply_id} from {username}: {answer}");
+    send_message_to_channel(&token, channel_id, &message)
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+/// Parse a channel identifier — numeric ID or name alias (e.g. "윤호네비서") → u64.
+fn resolve_channel_to_u64(raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>().or_else(|_| {
+        crate::server::routes::dispatches::resolve_channel_alias_pub(raw)
+            .ok_or_else(|| format!("cannot resolve channel '{raw}'"))
     })
 }
 
-fn family_profile_probe_state_paths() -> Vec<std::path::PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    vec![
-        home.join(".local")
-            .join("state")
-            .join("family-profile-probe")
-            .join("profile_probe_state.json"),
-        home.join(".openclaw")
-            .join("workspace")
-            .join("state")
-            .join("profile_probe_state.json"),
-    ]
-}
-
-fn profile_probe_target_user_id(target: &str) -> Option<u64> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    for prefix in ["user:", "dm:"] {
-        if let Some(raw) = trimmed.strip_prefix(prefix) {
-            return raw.trim().parse::<u64>().ok();
-        }
-    }
-
-    trimmed.parse::<u64>().ok()
-}
-
-fn profile_probe_target_key_for_user(user_id: u64) -> Option<&'static str> {
-    match user_id {
-        343742347365974026 => Some("obujang"),
-        429955158974136340 => Some("yohoejang"),
-        _ => None,
-    }
-}
-
-fn profile_probe_target_for_key(target_key: &str) -> Option<String> {
-    match target_key {
-        "obujang" => Some("user:343742347365974026".to_string()),
-        "yohoejang" => Some("user:429955158974136340".to_string()),
-        _ => None,
-    }
-}
-
-fn pending_family_profile_probe_from_state_value(
-    json: &serde_json::Value,
-    user_id: u64,
-) -> Option<(String, String)> {
-    if let Some(pending) = json.get("pending").and_then(|v| v.as_object()) {
-        for (target, entry) in pending {
-            if profile_probe_target_user_id(target) != Some(user_id) {
-                continue;
-            }
-            let Some(topic_key) = entry.get("topicKey").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            return Some((topic_key.to_string(), target.to_string()));
-        }
-    }
-
-    let target_key = profile_probe_target_key_for_user(user_id)?;
-    let topic_key = json
-        .get("perTarget")
-        .and_then(|v| v.as_object())
-        .and_then(|per| per.get(target_key))
-        .and_then(|v| v.as_object())
-        .and_then(|bucket| bucket.get("pendingProbe"))
-        .and_then(|v| v.as_object())
-        .and_then(|pending| pending.get("topicKey"))
-        .and_then(|v| v.as_str())?;
-    let target = profile_probe_target_for_key(target_key)?;
-    Some((topic_key.to_string(), target))
-}
-
-fn pending_family_profile_probe_for_user(user_id: u64) -> Option<(String, String)> {
-    for path in family_profile_probe_state_paths() {
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        if let Some(pending) = pending_family_profile_probe_from_state_value(&json, user_id) {
-            return Some(pending);
-        }
-    }
-
-    None
-}
-
-fn clear_family_profile_probe_pending_from_state_value(
-    json: &mut serde_json::Value,
-    target: &str,
-) -> bool {
-    let Some(root) = json.as_object_mut() else {
-        return false;
-    };
-
-    let mut changed = false;
-    let target_user_id = profile_probe_target_user_id(target);
-
-    if let Some(pending) = root.get_mut("pending").and_then(|v| v.as_object_mut()) {
-        let remove_targets: Vec<String> = pending
-            .keys()
-            .filter(|entry_target| {
-                if entry_target.as_str() == target {
-                    return true;
-                }
-                target_user_id
-                    .map(|uid| profile_probe_target_user_id(entry_target) == Some(uid))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        for entry_target in remove_targets {
-            if pending.remove(&entry_target).is_some() {
-                changed = true;
-            }
-        }
-    }
-
-    if let Some(target_key) = target_user_id.and_then(profile_probe_target_key_for_user) {
-        if let Some(bucket) = root
-            .get_mut("perTarget")
-            .and_then(|v| v.as_object_mut())
-            .and_then(|per| per.get_mut(target_key))
-            .and_then(|v| v.as_object_mut())
+/// Retry DM reply notifications that previously failed (`_notify_failed` in context).
+/// Called from the 5-min tick loop.
+pub async fn retry_failed_dm_notifications(db: &crate::db::Db) {
+    let db2 = db.clone();
+    let entries: Vec<(i64, String, String, Option<String>)> =
+        match tokio::task::spawn_blocking(move || {
+            let conn = db2.separate_conn().map_err(|e| format!("{e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, source_agent, context, channel_id FROM pending_dm_replies \
+                     WHERE status = 'consumed' AND json_extract(context, '$._notify_failed') IS NOT NULL \
+                     LIMIT 10",
+                )
+                .map_err(|e| format!("{e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(|e| format!("{e}"))?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            Ok::<_, String>(rows)
+        })
+        .await
         {
-            if bucket.remove("pendingProbe").is_some() {
-                changed = true;
-            }
-        }
+            Ok(Ok(v)) => v,
+            _ => return,
+        };
+
+    if entries.is_empty() {
+        return;
     }
 
-    changed
-}
-
-fn clear_family_profile_probe_pending(target: &str) -> Result<bool, String> {
-    let mut changed_any = false;
-    for path in family_profile_probe_state_paths() {
-        if !path.exists() {
+    for (id, source_agent, context_str, channel_id) in entries {
+        let ctx: serde_json::Value =
+            serde_json::from_str(&context_str).unwrap_or(serde_json::json!({}));
+        let answer = ctx
+            .get("_answer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if answer.is_empty() {
             continue;
         }
 
-        let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-        let mut json = serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|err| format!("clear_pending_parse_failed:{err}: {}", path.display()))?;
-
-        if clear_family_profile_probe_pending_from_state_value(&mut json, target) {
-            let pretty = serde_json::to_string_pretty(&json)
-                .map_err(|err| format!("clear_pending_serialize_failed:{err}"))?;
-            fs::write(&path, pretty + "\n").map_err(|err| err.to_string())?;
-            changed_any = true;
+        match notify_source_agent(
+            db,
+            &source_agent,
+            id,
+            channel_id.as_deref(),
+            "(retry)",
+            &answer,
+        )
+        .await
+        {
+            Ok(()) => {
+                // Clear _notify_failed on success
+                let db3 = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = db3.separate_conn() {
+                        let _ = conn.execute(
+                            "UPDATE pending_dm_replies SET context = \
+                             json_remove(context, '$._notify_failed', '$._notify_error') \
+                             WHERE id = ?1",
+                            rusqlite::params![id],
+                        );
+                    }
+                })
+                .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ✉️ DM reply retry OK: id={id} agent={source_agent}");
+            }
+            Err(e) => {
+                eprintln!("  [dm-reply] retry still failing id={id}: {e}");
+            }
         }
     }
-
-    Ok(changed_any)
 }
 
-fn record_family_profile_probe_answer(
-    topic_key: &str,
-    target: &str,
+struct ConsumedDmReply {
+    id: i64,
+    source_agent: String,
+    answer: String,
+    channel_id: Option<String>,
+    db: crate::db::Db,
+}
+
+fn consume_pending_dm_reply(
+    db: &crate::db::Db,
+    user_id: &str,
     answer: &str,
-) -> Result<bool, String> {
-    let Some(script_path) = family_profile_probe_script_path() else {
-        return Err("family_profile_probe_script_missing".to_string());
-    };
-    if !script_path.exists() {
-        return Err(format!(
-            "family_profile_probe_script_not_found:{}",
-            script_path.display()
-        ));
-    }
+) -> Option<ConsumedDmReply> {
+    let conn = db.separate_conn().ok()?;
+    // FIFO: consume oldest non-expired pending entry
+    let row: Result<(i64, String, String, Option<String>), _> = conn.query_row(
+        "SELECT id, source_agent, context, channel_id FROM pending_dm_replies \
+         WHERE user_id = ?1 AND status = 'pending' \
+         AND (expires_at IS NULL OR expires_at > datetime('now')) \
+         ORDER BY created_at ASC LIMIT 1",
+        rusqlite::params![user_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
+    let (id, source_agent, context_str, channel_id) = row.ok()?;
 
-    let output = Command::new("/usr/bin/python3")
-        .arg(script_path)
-        .arg("--record-answer")
-        .arg("--topic-key")
-        .arg(topic_key)
-        .arg("--target")
-        .arg(target)
-        .arg("--answer")
-        .arg(answer)
-        .output()
-        .map_err(|err| err.to_string())?;
+    // Merge the answer into the context JSON
+    let mut context: serde_json::Value =
+        serde_json::from_str(&context_str).unwrap_or(serde_json::json!({}));
+    context["_answer"] = serde_json::Value::String(answer.to_string());
+    let updated_context = serde_json::to_string(&context).unwrap_or_default();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Err(if stderr.is_empty() { stdout } else { stderr });
-    }
-
-    let payload = serde_json::from_str::<serde_json::Value>(&stdout)
-        .map_err(|err| format!("record_answer_parse_failed:{err}: {stdout}"))?;
-    Ok(payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
-}
-
-fn record_and_clear_family_profile_probe_answer(
-    topic_key: &str,
-    target: &str,
-    answer: &str,
-) -> Result<bool, String> {
-    let recorded = record_family_profile_probe_answer(topic_key, target, answer)?;
-    if recorded {
-        if let Err(err) = clear_family_profile_probe_pending(target) {
-            eprintln!(
-                "  [profile-probe] recorded answer but failed to clear pending target={} topic={} error={}",
-                target, topic_key, err
-            );
-        }
-    }
-    Ok(recorded)
-}
-
-async fn try_handle_family_profile_probe_reply(
-    _ctx: &serenity::Context,
-    msg: &serenity::Message,
-    _shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-) -> Result<bool, Error> {
-    if *provider != ProviderKind::Claude || msg.author.bot || msg.guild_id.is_some() {
-        return Ok(false);
-    }
-
-    let answer = msg.content.trim();
-    if answer.is_empty() {
-        return Ok(false);
-    }
-
-    let Some((topic_key, target)) = pending_family_profile_probe_for_user(msg.author.id.get())
-    else {
-        return Ok(false);
-    };
-
-    // Always clear the pending probe state first, regardless of whether the
-    // record succeeds.  If we only clear on success, the pending entry survives
-    // and the *next* unrelated DM will be re-matched as a probe answer.
-    let target_for_clear = target.clone();
-    let clear_result =
-        tokio::task::spawn_blocking(move || clear_family_profile_probe_pending(&target_for_clear))
-            .await;
-    match clear_result {
-        Ok(Err(err)) => {
-            eprintln!(
-                "  [profile-probe] failed to clear pending state for user={} topic={} error={}",
-                msg.author.id.get(),
-                topic_key,
-                err
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "  [profile-probe] clear pending task panicked for user={} topic={} error={}",
-                msg.author.id.get(),
-                topic_key,
-                err
-            );
-        }
+    // CAS: only mark consumed if still pending (guards against race)
+    let updated = conn.execute(
+        "UPDATE pending_dm_replies SET status = 'consumed', consumed_at = datetime('now'), \
+         context = ?1 WHERE id = ?2 AND status = 'pending'",
+        rusqlite::params![updated_context, id],
+    );
+    match updated {
+        Ok(0) => return None, // already consumed by another path
+        Err(_) => return None,
         _ => {}
     }
 
-    // Record the answer (best-effort). Return Ok(false) so the message
-    // continues to the normal DM handling path, where the agent responds
-    // directly in the DM channel with contextual follow-up.
-    let topic_key_owned = topic_key.clone();
-    let target_owned = target.clone();
-    let answer_owned = answer.to_string();
-    let recorded = tokio::task::spawn_blocking(move || {
-        record_family_profile_probe_answer(&topic_key_owned, &target_owned, &answer_owned)
+    Some(ConsumedDmReply {
+        id,
+        source_agent,
+        answer: answer.to_string(),
+        channel_id,
+        db: db.clone(),
     })
-    .await
-    .map_err(|err| format!("profile_probe_join_failed:{err}"))?;
-
-    match &recorded {
-        Ok(true) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ✓ Recorded family profile probe answer: user={} topic={}",
-                msg.author.id.get(),
-                topic_key
-            );
-        }
-        Ok(false) => {
-            eprintln!(
-                "  [profile-probe] record_answer returned false for user={} topic={}",
-                msg.author.id.get(),
-                topic_key
-            );
-        }
-        Err(err) => {
-            eprintln!(
-                "  [profile-probe] failed to record answer for user={} topic={} error={}",
-                msg.author.id.get(),
-                topic_key,
-                err
-            );
-        }
-    }
-
-    // Let the message fall through to normal DM handling so the agent
-    // responds directly in the DM conversation.
-    Ok(false)
 }
 
 /// Rate limit helper — ensures minimum 1s gap between API calls per channel
@@ -3450,94 +3362,9 @@ fn enrich_role_map_with_channel_ids() {
 mod tests {
     use super::ChannelId;
     use super::{
-        choose_restore_channel_name, clear_family_profile_probe_pending_from_state_value,
-        is_synthetic_thread_channel_name, pending_family_profile_probe_from_state_value,
+        choose_restore_channel_name, is_synthetic_thread_channel_name,
         synthetic_thread_channel_name,
     };
-
-    #[test]
-    fn legacy_pending_probe_is_detected() {
-        let json = serde_json::json!({
-            "pending": {
-                "user:343742347365974026": {
-                    "topicKey": "nar.vaccination_history"
-                }
-            }
-        });
-
-        let pending = pending_family_profile_probe_from_state_value(&json, 343742347365974026);
-        assert_eq!(
-            pending,
-            Some((
-                "nar.vaccination_history".to_string(),
-                "user:343742347365974026".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn per_target_pending_probe_is_detected() {
-        let json = serde_json::json!({
-            "perTarget": {
-                "yohoejang": {
-                    "pendingProbe": {
-                        "topicKey": "yunho.newborn_screening",
-                        "question": "질문",
-                        "sentAt": "2026-03-26T18:45:42.764539+09:00"
-                    }
-                }
-            }
-        });
-
-        let pending = pending_family_profile_probe_from_state_value(&json, 429955158974136340);
-        assert_eq!(
-            pending,
-            Some((
-                "yunho.newborn_screening".to_string(),
-                "user:429955158974136340".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn clear_pending_probe_removes_legacy_and_per_target_entries() {
-        let mut json = serde_json::json!({
-            "pending": {
-                "user:343742347365974026": {
-                    "topicKey": "nar.vaccination_history"
-                }
-            },
-            "perTarget": {
-                "obujang": {
-                    "pendingProbe": {
-                        "topicKey": "nar.vaccination_history",
-                        "question": "질문",
-                        "sentAt": "2026-03-26T19:00:41.734890+09:00"
-                    }
-                }
-            }
-        });
-
-        let changed = clear_family_profile_probe_pending_from_state_value(
-            &mut json,
-            "user:343742347365974026",
-        );
-
-        assert!(changed);
-        assert!(
-            json.get("pending")
-                .and_then(|v| v.as_object())
-                .map(|pending| pending.is_empty())
-                .unwrap_or(true)
-        );
-        assert!(
-            json.get("perTarget")
-                .and_then(|v| v.get("obujang"))
-                .and_then(|v| v.as_object())
-                .and_then(|bucket| bucket.get("pendingProbe"))
-                .is_none()
-        );
-    }
 
     #[test]
     fn synthetic_thread_channel_name_round_trips() {

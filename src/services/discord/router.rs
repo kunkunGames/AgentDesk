@@ -250,17 +250,14 @@ pub(super) async fn handle_event(
                 return Ok(());
             }
 
+            // #189: Generic DM reply tracking — consume pending entry if present.
+            // The message always falls through to normal handling so the agent
+            // can respond contextually in the DM conversation.
             let text = new_message.content.trim();
-            if !text.is_empty()
-                && try_handle_family_profile_probe_reply(
-                    ctx,
-                    new_message,
-                    &data.shared,
-                    &data.provider,
-                )
-                .await?
-            {
-                return Ok(());
+            if !text.is_empty() {
+                if let Some(ref db) = data.shared.db {
+                    try_handle_pending_dm_reply(db, new_message).await;
+                }
             }
 
             // Auth check (allowed bots bypass auth)
