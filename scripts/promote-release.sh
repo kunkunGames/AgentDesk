@@ -249,14 +249,16 @@ echo "▸ Stopping release..."
 launchctl bootout "gui/$(id -u)/$PLIST_REL" 2>/dev/null || true
 sleep 2
 
-# Copy binary from dev
+# Copy binary from dev — atomic: sign in tmp, then mv to replace inode.
+# In-place codesign can corrupt the OS signing cache if it fails mid-write,
+# causing SIGKILL on subsequent launches even though the binary is valid.
 echo "▸ Copying binary from dev..."
-# Remove immutable flag if set (only deploy scripts should touch the binary)
 chflags nouchg "$ADK_REL/bin/agentdesk" 2>/dev/null || true
-cp "$ADK_DEV/bin/agentdesk" "$ADK_REL/bin/agentdesk"
-chmod +x "$ADK_REL/bin/agentdesk"
-xattr -d com.apple.provenance "$ADK_REL/bin/agentdesk" 2>/dev/null || true
-sign_binary_with_fallback "$ADK_REL/bin/agentdesk"
+cp "$ADK_DEV/bin/agentdesk" "$ADK_REL/bin/agentdesk.new"
+chmod +x "$ADK_REL/bin/agentdesk.new"
+xattr -d com.apple.provenance "$ADK_REL/bin/agentdesk.new" 2>/dev/null || true
+sign_binary_with_fallback "$ADK_REL/bin/agentdesk.new"
+mv -f "$ADK_REL/bin/agentdesk.new" "$ADK_REL/bin/agentdesk"
 # Lock binary to prevent unsigned overwrites
 chflags uchg "$ADK_REL/bin/agentdesk"
 
