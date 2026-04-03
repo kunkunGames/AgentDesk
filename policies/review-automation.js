@@ -164,6 +164,8 @@ var reviewAutomation = {
     var counterChannelId = agentRow[0].discord_channel_alt;
 
     // Create review dispatch (targets same agent — counter channel picks it up)
+    // #245: Log agent_id for diagnostics — "project-agentdesk-cdx" phantom agent was traced here
+    agentdesk.log.info("[review] Creating review dispatch: card=" + card.id + " agent=" + card.assigned_agent_id + " round=" + newRound);
     try {
       var reviewDispatchId = agentdesk.dispatch.create(
         card.id,
@@ -171,7 +173,7 @@ var reviewAutomation = {
         "review",
         "[Review R" + newRound + "] " + card.id
       );
-      agentdesk.log.info("[review] Counter-model review dispatched: " + reviewDispatchId);
+      agentdesk.log.info("[review] Counter-model review dispatched: " + reviewDispatchId + " to " + card.assigned_agent_id);
       // Discord notification is handled by the Rust handler (async send_dispatch_to_discord)
       // to avoid ureq deadlock on tokio runtime.
     } catch (e) {
