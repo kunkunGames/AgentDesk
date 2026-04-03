@@ -21,7 +21,7 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
     globals.set("agentdesk", ad)?;
 
     // ── agentdesk.__pendingIntents — intent accumulator for deferred mutations (#121)
-    ctx.eval::<(), _>(r#"agentdesk.__pendingIntents = [];"#)?;
+    ctx.eval::<(), _>(r#"agentdesk.__pendingIntents = []; agentdesk.__createdDispatches = [];"#)?;
 
     // ── agentdesk.__generateId — UUID v4 generation from Rust
     let gen_id = Function::new(ctx.clone(), || -> String {
@@ -400,10 +400,11 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let dispatch_obj = Object::new(ctx.clone())?;
 
-    // __dispatch_create_raw(card_id, agent_id, dispatch_type, title) → json_string
+    // #248: __dispatch_create_sync(card_id, agent_id, dispatch_type, title) → json_string
+    // Synchronous DB INSERT — no deferred intent.
     let db_d = db.clone();
     dispatch_obj.set(
-        "__create_raw",
+        "__create_sync",
         Function::new(
             ctx.clone(),
             rquickjs::function::MutFn::from(
@@ -412,7 +413,7 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                       dispatch_type: String,
                       title: String|
                       -> String {
-                    dispatch_create_raw(&db_d, &card_id, &agent_id, &dispatch_type, &title)
+                    dispatch_create_sync(&db_d, &card_id, &agent_id, &dispatch_type, &title)
                 },
             ),
         )?,
@@ -489,26 +490,20 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     let _: rquickjs::Value = ctx.eval(
         r#"
         (function() {
-            var raw = agentdesk.dispatch.__create_raw;
+            var sync = agentdesk.dispatch.__create_sync;
             agentdesk.dispatch.create = function(cardId, agentId, dispatchType, title) {
                 var dt = dispatchType || "implementation";
                 var t = title || "Dispatch";
-                // Eager validation: call the raw bridge to check terminal guard etc.
-                // If validation fails, it returns an error that we throw immediately.
-                var result = JSON.parse(raw(cardId, agentId, dt, t));
+                // #248: Synchronous DB INSERT — no deferred intent.
+                // Validation + INSERT happen atomically in Rust.
+                var result = JSON.parse(sync(cardId, agentId, dt, t));
                 if (result.error) throw new Error(result.error);
-                // #173: If dedup'd, return existing ID without pushing intent
-                if (result.reused) return result.dispatch_id;
-                // #121: Push CreateDispatch intent — execution deferred to Rust
                 var dispatchId = result.dispatch_id;
-                agentdesk.__pendingIntents.push({
-                    type: "create_dispatch",
-                    dispatch_id: dispatchId,
-                    card_id: cardId,
-                    agent_id: agentId,
-                    dispatch_type: dt,
-                    title: t
-                });
+                // #248: Push to outbox for post-hook notification dispatch
+                if (result.outbox && !result.reused) {
+                    agentdesk.__createdDispatches = agentdesk.__createdDispatches || [];
+                    agentdesk.__createdDispatches.push(result.outbox);
+                }
                 return dispatchId;
             };
             var rawFail = agentdesk.dispatch.__mark_failed_raw;
@@ -545,74 +540,70 @@ fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     Ok(())
 }
 
-/// #121: Validation-only dispatch check. Returns a pre-assigned ID if valid,
-/// or an error string. Does NOT write to DB — actual creation is deferred
-/// to intent execution via `intent::execute_create_dispatch`.
-fn dispatch_create_raw(
+/// #248: Synchronous dispatch creation — validates, inserts into DB immediately,
+/// and returns the dispatch ID. Side effects (kickoff hooks, notifications) are
+/// deferred to the `__createdDispatches` outbox, drained after hook execution.
+fn dispatch_create_sync(
     db: &Db,
     card_id: &str,
     agent_id: &str,
     dispatch_type: &str,
-    _title: &str,
+    title: &str,
 ) -> String {
-    // Validate: card exists and is not in a terminal state
-    let conn = match db.separate_conn() {
-        Ok(c) => c,
-        Err(e) => return format!(r#"{{"error":"DB: {e}"}}"#),
-    };
-    let card_status: Option<String> = conn
-        .query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
-            [card_id],
-            |row| row.get(0),
-        )
-        .ok();
-    match card_status {
-        None => return r#"{"error":"card not found"}"#.to_string(),
-        Some(ref s) => {
-            crate::pipeline::ensure_loaded();
-            if let Some(pipeline) = crate::pipeline::try_get() {
-                if pipeline.is_terminal(s) && dispatch_type != "review-decision" {
-                    return format!(
-                        r#"{{"error":"cannot dispatch to terminal card (status={s})"}}"#
-                    );
-                }
+    let context = serde_json::json!({});
+    match crate::dispatch::create_dispatch_core(
+        db,
+        card_id,
+        agent_id,
+        dispatch_type,
+        title,
+        &context,
+    ) {
+        Ok((dispatch_id, _old_status, reused)) => {
+            if reused {
+                return format!(
+                    r#"{{"dispatch_id":"{dispatch_id}","card_id":"{card_id}","agent_id":"{agent_id}","reused":true}}"#
+                );
             }
-        }
-    }
-    // Validate: agent exists
-    let agent_exists: bool = conn
-        .query_row("SELECT 1 FROM agents WHERE id = ?1", [agent_id], |_| Ok(()))
-        .is_ok();
-    if !agent_exists {
-        return format!(r#"{{"error":"agent not found: {agent_id}"}}"#);
-    }
-    // #173: Dedup — if same card + same type already has pending/dispatched, return existing.
-    if dispatch_type != "review-decision" {
-        let existing_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM task_dispatches \
-                 WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
-                 AND status IN ('pending', 'dispatched') LIMIT 1",
-                rusqlite::params![card_id, dispatch_type],
-                |row| row.get(0),
+            // #117/#158: Update card_review_state for review-decision dispatches
+            if dispatch_type == "review-decision" {
+                review_state_sync(
+                    db,
+                    &serde_json::json!({
+                        "card_id": card_id,
+                        "state": "suggestion_pending",
+                        "pending_dispatch_id": dispatch_id,
+                    })
+                    .to_string(),
+                );
+            }
+            // Get issue URL for Discord notification (used by drain outbox)
+            let issue_url: Option<String> = db.separate_conn().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+                    [card_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten()
+            });
+            // Serialize created dispatch info for outbox collection
+            let outbox_json = serde_json::json!({
+                "dispatch_id": dispatch_id,
+                "card_id": card_id,
+                "agent_id": agent_id,
+                "dispatch_type": dispatch_type,
+                "issue_url": issue_url,
+            });
+            format!(
+                r#"{{"dispatch_id":"{dispatch_id}","card_id":"{card_id}","agent_id":"{agent_id}","outbox":{}}}"#,
+                outbox_json
             )
-            .ok();
-        if let Some(eid) = existing_id {
-            tracing::info!(
-                "DEDUP: reusing existing dispatch {} for card {} type {}",
-                eid,
-                card_id,
-                dispatch_type
-            );
-            return format!(
-                r#"{{"dispatch_id":"{eid}","card_id":"{card_id}","agent_id":"{agent_id}","reused":true}}"#
-            );
+        }
+        Err(e) => {
+            format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'"))
         }
     }
-    // Generate pre-assigned dispatch ID (actual DB write deferred to intent executor)
-    let dispatch_id = uuid::Uuid::new_v4().to_string();
-    format!(r#"{{"dispatch_id":"{dispatch_id}","card_id":"{card_id}","agent_id":"{agent_id}"}}"#)
 }
 
 #[cfg(test)]
