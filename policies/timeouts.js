@@ -107,7 +107,7 @@ function _flushPMDecisions() {
     }
     // Send combined notification with all accumulated reasons
     if (!pmdCh) continue;
-    var msg = "[PM Decision] " + entry.title + "\n사유: " + entry.reasons.join("; ");
+    var msg = "⚠️ [PM 결정 요청] " + entry.title + "\n카드가 pending_decision 상태입니다. PMD가 다음 조치를 결정해주세요.\n사유: " + entry.reasons.join("; ");
     agentdesk.message.queue(pmdCh, msg, "announce", "system");
     // Set cooldown with TTL
     agentdesk.db.execute(
