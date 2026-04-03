@@ -2157,6 +2157,13 @@ fn build_bot_settings_entry_plans(
         } else {
             None
         };
+        if accumulator.role_ids.len() > 1 && allowed_channel_ids.is_none() {
+            warnings.push(format!(
+                "Skipping bot_settings import for Discord account '{}': multiple imported agents share the same token, but no live channel allowlist could be written to keep routing scoped.",
+                account_id
+            ));
+            continue;
+        }
         entries.push(BotSettingsEntryPlan {
             account_id,
             provider,
@@ -2255,10 +2262,10 @@ fn render_bot_settings_json(
     _overwrite: bool,
 ) -> Result<String, String> {
     let mut root = if path.exists() {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .unwrap_or_else(|| serde_json::json!({}))
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|e| format!("Failed to parse '{}': {e}", path.display()))?
     } else {
         serde_json::json!({})
     };

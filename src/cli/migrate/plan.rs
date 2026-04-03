@@ -1074,18 +1074,24 @@ fn resolve_workspace_value_with_rewrites(
     workspace_rewrite_rules: &[WorkspaceRewriteRule],
     warnings: &mut Vec<String>,
 ) -> PathBuf {
-    let path = PathBuf::from(raw_workspace);
-    if !path.is_absolute() {
-        return source_root.join(path);
-    }
-
-    let normalized = raw_workspace.trim().trim_end_matches('/');
+    let trimmed_workspace = raw_workspace.trim();
+    let path = PathBuf::from(trimmed_workspace);
+    let normalized = trimmed_workspace.trim_end_matches(|ch| ch == '/' || ch == '\\');
     for rule in workspace_rewrite_rules {
-        if normalized == rule.from || normalized.starts_with(&format!("{}/", rule.from)) {
+        let from = rule
+            .from
+            .trim()
+            .trim_end_matches(|ch| ch == '/' || ch == '\\');
+        let matches_rule = normalized == from
+            || normalized
+                .strip_prefix(from)
+                .map(|suffix| suffix.starts_with('/') || suffix.starts_with('\\'))
+                .unwrap_or(false);
+        if matches_rule {
             let suffix = normalized
-                .strip_prefix(&rule.from)
+                .strip_prefix(from)
                 .unwrap_or_default()
-                .trim_start_matches('/');
+                .trim_start_matches(|ch| ch == '/' || ch == '\\');
             let target_root = if rule.to.is_absolute() {
                 rule.to.clone()
             } else {
@@ -1104,6 +1110,13 @@ fn resolve_workspace_value_with_rewrites(
             ));
             return rewritten;
         }
+    }
+
+    let looks_absolute = path.is_absolute()
+        || trimmed_workspace.starts_with('/')
+        || trimmed_workspace.starts_with('\\');
+    if !looks_absolute {
+        return source_root.join(path);
     }
 
     if !path.exists() {

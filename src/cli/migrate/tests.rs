@@ -921,6 +921,62 @@ fn live_write_bot_settings_resolves_env_placeholder_without_provider() {
 }
 
 #[test]
+fn live_write_bot_settings_skips_shared_account_without_live_channel_scope() {
+    let temp = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let alpha_workspace = temp.path().join("workspace-alpha");
+    let beta_workspace = temp.path().join("workspace-beta");
+    fs::create_dir_all(&alpha_workspace).unwrap();
+    fs::create_dir_all(&beta_workspace).unwrap();
+    fs::write(alpha_workspace.join("IDENTITY.md"), "# Alpha\n").unwrap();
+    fs::write(alpha_workspace.join("MEMORY.md"), "# Memory\n").unwrap();
+    fs::write(beta_workspace.join("IDENTITY.md"), "# Beta\n").unwrap();
+    fs::write(beta_workspace.join("MEMORY.md"), "# Memory\n").unwrap();
+
+    write_openclaw_config(
+        temp.path(),
+        r#"{
+            "agents":{
+                "list":[
+                    {"id":"alpha","model":"openai/gpt-5","workspace":"workspace-alpha"},
+                    {"id":"beta","model":"openai/gpt-5","workspace":"workspace-beta"}
+                ]
+            },
+            "bindings":[
+                {"agentId":"alpha","match":{"channel":"discord"}},
+                {"agentId":"beta","match":{"channel":"discord"}}
+            ],
+            "channels":{
+                "discord":{
+                    "token":"discord-token-shared",
+                    "guilds":{"g1":{"channels":{"1234567890":{"allow":true}}}}
+                }
+            }
+        }"#,
+    );
+
+    let source = resolve_source(&temp);
+    let mut args = base_args();
+    args.all_agents = true;
+    args.dry_run = false;
+    args.write_bot_settings = true;
+    args.discord_token_mode = "plaintext-only".to_string();
+
+    let plan = build_import_plan(&source, &args, Some(runtime.path())).unwrap();
+    apply::apply_import_plan(&plan, &source, &args, runtime.path()).unwrap();
+
+    assert!(
+        !runtime
+            .path()
+            .join("config")
+            .join("bot_settings.json")
+            .exists()
+    );
+    let warnings = fs::read_to_string(audit_root(&plan).join("warnings.txt")).unwrap();
+    assert!(warnings.contains("multiple imported agents share the same token"));
+}
+
+#[test]
 fn session_import_writes_ai_sessions_session_map_and_db_rows() {
     let temp = TempDir::new().unwrap();
     let runtime = TempDir::new().unwrap();
@@ -932,22 +988,20 @@ fn session_import_writes_ai_sessions_session_map_and_db_rows() {
     fs::write(workspace.join("MEMORY.md"), "# Memory\n").unwrap();
     fs::write(
         sessions_dir.join("sessions.json"),
-        format!(
-            r#"{{
-                "session-key-1": {{
-                    "sessionId": "session-1",
-                    "sessionFile": "session-1.jsonl",
-                    "updatedAt": 1710000000000,
-                    "model": "openai/gpt-5",
-                    "modelProvider": "codex",
-                    "cwd": "{}",
-                    "lastChannel": "1234567890",
-                    "lastThreadId": "777",
-                    "status": "done"
-                }}
-            }}"#,
-            workspace.display()
-        ),
+        serde_json::json!({
+            "session-key-1": {
+                "sessionId": "session-1",
+                "sessionFile": "session-1.jsonl",
+                "updatedAt": 1710000000000i64,
+                "model": "openai/gpt-5",
+                "modelProvider": "codex",
+                "cwd": workspace.display().to_string(),
+                "lastChannel": "1234567890",
+                "lastThreadId": "777",
+                "status": "done"
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     fs::write(
@@ -1010,7 +1064,13 @@ fn session_import_writes_ai_sessions_session_map_and_db_rows() {
     assert_eq!(agent_id, "alpha");
     assert_eq!(provider, "codex");
     assert_eq!(model, "openai/gpt-5");
-    assert!(cwd.ends_with("/openclaw/workspaces/alpha"));
+    assert!(
+        std::path::Path::new(&cwd).ends_with(
+            std::path::Path::new("openclaw")
+                .join("workspaces")
+                .join("alpha")
+        )
+    );
     assert!(session_info.contains("\"source_session_id\":\"session-1\""));
 }
 
@@ -1376,6 +1436,47 @@ fn apply_fails_when_existing_agentdesk_yaml_is_invalid() {
     let err = apply::apply_import_plan(&plan, &source, &args, runtime.path()).unwrap_err();
     assert!(err.contains("Failed to load"));
     assert!(err.contains("agentdesk.yaml"));
+}
+
+#[test]
+fn apply_fails_when_existing_bot_settings_json_is_invalid() {
+    let temp = TempDir::new().unwrap();
+    let runtime = TempDir::new().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(runtime.path().join("config")).unwrap();
+    fs::write(workspace.join("IDENTITY.md"), "# Alpha\n").unwrap();
+    fs::write(workspace.join("MEMORY.md"), "# Memory\n").unwrap();
+    fs::write(
+        runtime.path().join("config").join("bot_settings.json"),
+        "{not valid json",
+    )
+    .unwrap();
+
+    write_openclaw_config(
+        temp.path(),
+        r#"{
+            "agents":{"list":[{"id":"alpha","default":true,"model":"openai/gpt-5","workspace":"workspace"}]},
+            "bindings":[{"agentId":"alpha","match":{"channel":"discord"}}],
+            "channels":{
+                "discord":{
+                    "token":"discord-token-plaintext",
+                    "guilds":{"g1":{"channels":{"1234567890":{"allow":true}}}}
+                }
+            }
+        }"#,
+    );
+
+    let source = resolve_source(&temp);
+    let mut args = base_args();
+    args.dry_run = false;
+    args.write_bot_settings = true;
+    args.discord_token_mode = "plaintext-only".to_string();
+
+    let plan = build_import_plan(&source, &args, Some(runtime.path())).unwrap();
+    let err = apply::apply_import_plan(&plan, &source, &args, runtime.path()).unwrap_err();
+    assert!(err.contains("bot_settings.json"));
+    assert!(err.contains("Failed to parse"));
 }
 
 #[test]
