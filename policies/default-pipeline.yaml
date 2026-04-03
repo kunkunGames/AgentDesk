@@ -78,6 +78,11 @@ transitions:
     to: pending_decision
     type: force_only
 
+  # Revert to backlog (force-only, for cancellation/requeue)
+  - from: requested
+    to: backlog
+    type: force_only
+
   - from: in_progress
     to: blocked
     type: force_only

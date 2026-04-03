@@ -190,6 +190,22 @@ pub fn create_dispatch_core(
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
+    // #245: Guard — reject dispatches to non-existent agents.
+    // Catches phantom agent IDs (e.g. "project-agentdesk-cdx") before DB INSERT.
+    let agent_exists: bool = conn
+        .query_row("SELECT 1 FROM agents WHERE id = ?1", [to_agent_id], |_| {
+            Ok(())
+        })
+        .is_ok();
+    if !agent_exists {
+        return Err(anyhow::anyhow!(
+            "Cannot create {} dispatch: agent '{}' not found (card {})",
+            dispatch_type,
+            to_agent_id,
+            kanban_card_id
+        ));
+    }
+
     // Guard: prevent ALL dispatches for terminal cards (pipeline-driven).
     crate::pipeline::ensure_loaded();
     let effective =
@@ -303,6 +319,21 @@ pub fn create_dispatch_core_with_id(
     let conn = db
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+
+    // #245: Guard — reject dispatches to non-existent agents.
+    let agent_exists: bool = conn
+        .query_row("SELECT 1 FROM agents WHERE id = ?1", [to_agent_id], |_| {
+            Ok(())
+        })
+        .is_ok();
+    if !agent_exists {
+        return Err(anyhow::anyhow!(
+            "Cannot create {} dispatch: agent '{}' not found (card {})",
+            dispatch_type,
+            to_agent_id,
+            kanban_card_id
+        ));
+    }
 
     let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
         .query_row(
@@ -1006,7 +1037,16 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
-        crate::db::wrap_conn(conn)
+        let db = crate::db::wrap_conn(conn);
+        // #245: Seed common test agents so agent-exists guard passes
+        {
+            let c = db.separate_conn().unwrap();
+            c.execute_batch(
+                "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', 'ch-1');
+                 INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-2', 'Agent 2', 'ch-2');"
+            ).unwrap();
+        }
+        db
     }
 
     fn test_engine(db: &Db) -> PolicyEngine {
@@ -1019,6 +1059,16 @@ mod tests {
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, created_at, updated_at) VALUES (?1, 'Test Card', ?2, datetime('now'), datetime('now'))",
             rusqlite::params![card_id, status],
+        )
+        .unwrap();
+    }
+
+    /// Seed a test agent in the DB so dispatch creation agent-exists guard passes.
+    fn seed_agent(db: &Db, agent_id: &str) {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES (?1, ?1, ?1)",
+            [agent_id],
         )
         .unwrap();
     }
@@ -1153,7 +1203,7 @@ mod tests {
         let db = test_db();
         let conn = db.separate_conn().unwrap();
         conn.execute(
-            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+            "INSERT OR REPLACE INTO agents (id, name, discord_channel_id, discord_channel_alt) \
              VALUES ('agent-1', 'Agent 1', '123', '456')",
             [],
         )

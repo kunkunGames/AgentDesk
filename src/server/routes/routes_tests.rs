@@ -11,6 +11,16 @@ fn test_db() -> Db {
     crate::db::wrap_conn(conn)
 }
 
+/// Seed test agents for dispatch-related tests (#245 agent-exists guard).
+fn seed_test_agents(db: &Db) {
+    let c = db.separate_conn().unwrap();
+    c.execute_batch(
+        "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('ch-td', 'TD', 'ch-td');
+         INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('ag1', 'Agent1', 'ag1');
+         INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', 'ch-1');"
+    ).unwrap();
+}
+
 fn test_engine(db: &Db) -> PolicyEngine {
     let config = crate::config::Config::default();
     PolicyEngine::new(&config, db.clone()).unwrap()
@@ -713,6 +723,7 @@ async fn dispatch_list_empty() {
 #[tokio::test]
 async fn dispatch_create_and_get() {
     let db = test_db();
+    seed_test_agents(&db);
     let engine = test_engine(&db);
 
     {
@@ -803,6 +814,7 @@ async fn dispatch_create_card_not_found() {
 #[tokio::test]
 async fn dispatch_complete() {
     let db = test_db();
+    seed_test_agents(&db);
     let engine = test_engine(&db);
 
     {
