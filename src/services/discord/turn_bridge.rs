@@ -1734,7 +1734,12 @@ pub(super) fn spawn_turn_bridge(
             full_response = if full_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let formatted = format_for_discord(&full_response);
+                let filtered = if matches!(provider, ProviderKind::Codex) {
+                    super::formatting::filter_codex_tool_logs(&full_response)
+                } else {
+                    full_response.clone()
+                };
+                let formatted = format_for_discord(&filtered);
                 format!("{}\n\n[Stopped]", formatted)
             };
 
@@ -1990,6 +1995,9 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
             } else {
+                if matches!(provider, ProviderKind::Codex) {
+                    full_response = super::formatting::filter_codex_tool_logs(&full_response);
+                }
                 full_response = format_for_discord(&full_response);
                 let _ = super::formatting::replace_long_message_raw(
                     &http,
