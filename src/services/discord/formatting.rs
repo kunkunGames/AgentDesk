@@ -189,7 +189,10 @@ pub(super) fn extract_skill_description(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_tool_name, convert_markdown_tables, normalize_allowed_tools};
+    use super::{
+        canonical_tool_name, convert_markdown_tables, filter_codex_tool_logs,
+        normalize_allowed_tools,
+    };
 
     #[test]
     fn test_canonical_tool_name_is_case_insensitive() {
@@ -326,6 +329,59 @@ mod tests {
         for chunk in &chunks {
             assert!(chunk.len() <= DISCORD_MSG_LIMIT + 50);
         }
+    }
+
+    // ── filter_codex_tool_logs tests ─────────────────────────────────────
+
+    #[test]
+    fn test_filter_codex_tool_logs_basic() {
+        let input = "[Bash] /bin/zsh -lc \"ls -la\"\nHere is the result.\n[Read] /path/to/file\nThe file contains...";
+        let output = filter_codex_tool_logs(input);
+        assert!(output.contains("⚙\u{fe0f} Bash"));
+        assert!(output.contains("Here is the result."));
+        assert!(output.contains("⚙\u{fe0f} Read"));
+        assert!(output.contains("The file contains..."));
+        assert!(!output.contains("/bin/zsh"));
+        assert!(!output.contains("/path/to/file"));
+    }
+
+    #[test]
+    fn test_filter_codex_tool_logs_preserves_code_blocks() {
+        let input = "```\n[Bash] should not be filtered\n```\n[Bash] should be filtered";
+        let output = filter_codex_tool_logs(input);
+        assert!(output.contains("[Bash] should not be filtered"));
+        assert!(output.contains("⚙\u{fe0f} Bash"));
+    }
+
+    #[test]
+    fn test_filter_codex_tool_logs_no_tool_lines() {
+        let input = "Hello world\nNo tools here";
+        let output = filter_codex_tool_logs(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_filter_codex_tool_logs_consecutive_same_tool() {
+        let input = "[Bash] ls\n[Bash] pwd\n[Bash] cat foo\nDone";
+        let output = filter_codex_tool_logs(input);
+        assert_eq!(output.matches("⚙\u{fe0f} Bash").count(), 3);
+        assert!(output.contains("Done"));
+    }
+
+    #[test]
+    fn test_filter_codex_tool_logs_tool_name_only() {
+        let input = "[Glob]\nResults here";
+        let output = filter_codex_tool_logs(input);
+        assert!(output.contains("⚙\u{fe0f} Glob"));
+        assert!(output.contains("Results here"));
+    }
+
+    #[test]
+    fn test_filter_codex_tool_logs_leading_whitespace() {
+        let input = "  [Edit] some/file.rs\nDone";
+        let output = filter_codex_tool_logs(input);
+        assert!(output.contains("⚙\u{fe0f} Edit"));
+        assert!(output.contains("Done"));
     }
 }
 
@@ -644,6 +700,42 @@ fn parse_table_cells(line: &str) -> Vec<String> {
         .split('|')
         .map(|cell| cell.trim().to_string())
         .collect()
+}
+
+/// Filter Codex CLI tool-call log lines from response text.
+/// Replaces `[Bash] command...` -> `⚙️ Bash`, etc.
+/// Only the tool-log lines are replaced; all other text is preserved verbatim.
+/// Lines inside code blocks (``` ... ```) are NOT filtered.
+pub(super) fn filter_codex_tool_logs(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static TOOL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*\[([A-Z][a-zA-Z0-9]*)\](\s.*)?$").unwrap());
+
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+
+    for line in s.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push(line.to_string());
+            continue;
+        }
+        if in_code_block {
+            result.push(line.to_string());
+            continue;
+        }
+
+        if let Some(caps) = TOOL_RE.captures(line) {
+            let tool_name = &caps[1];
+            result.push(format!("⚙\u{fe0f} {tool_name}"));
+        } else {
+            result.push(line.to_string());
+        }
+    }
+
+    result.join("\n")
 }
 
 /// Mechanical formatting for Discord readability.
