@@ -2374,24 +2374,34 @@ pub(super) async fn try_handle_pending_dm_reply(
                 info.id
             );
 
-            // Notify the source agent's Discord channel
-            let db2 = info.db.clone();
-            let source_agent = info.source_agent.clone();
-            let reply_id = info.id;
-            let answer_for_notify = info.answer.clone();
-            tokio::spawn(async move {
-                if let Err(e) = notify_source_agent(
-                    &db2,
-                    &source_agent,
-                    reply_id,
-                    &username,
-                    &answer_for_notify,
-                )
-                .await
-                {
-                    eprintln!("  [dm-reply] notify source agent failed: {e}");
-                }
-            });
+            // Notify the source agent's Discord channel (inline, not fire-and-forget)
+            if let Err(e) = notify_source_agent(
+                &info.db,
+                &info.source_agent,
+                info.id,
+                info.channel_id.as_deref(),
+                &username,
+                &info.answer,
+            )
+            .await
+            {
+                eprintln!("  [dm-reply] notify source agent failed: {e}");
+                // Record failure in context so readConsumed can detect it
+                let db3 = info.db.clone();
+                let reply_id = info.id;
+                let err_msg = format!("{e}");
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = db3.separate_conn() {
+                        let _ = conn.execute(
+                            "UPDATE pending_dm_replies SET context = \
+                             json_set(context, '$._notify_failed', json('true'), '$._notify_error', ?1) \
+                             WHERE id = ?2",
+                            rusqlite::params![err_msg, reply_id],
+                        );
+                    }
+                })
+                .await;
+            }
 
             true
         }
@@ -2404,37 +2414,48 @@ pub(super) async fn try_handle_pending_dm_reply(
 }
 
 /// Send a notification to the source agent's Discord channel about the DM reply.
+/// Prefers the stored `channel_id` from the pending row (alt/thread channels);
+/// falls back to `agents.discord_channel_id` only if none was stored.
 async fn notify_source_agent(
     db: &crate::db::Db,
     source_agent: &str,
     reply_id: i64,
+    stored_channel_id: Option<&str>,
     username: &str,
     answer: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), String> {
     let token =
         crate::credential::read_bot_token("announce").ok_or("no announce bot token configured")?;
 
-    // Look up the source agent's discord_channel_id
-    let db = db.clone();
-    let agent_name = source_agent.to_string();
-    let channel_id: u64 = tokio::task::spawn_blocking(move || {
-        let conn = db.separate_conn()?;
-        conn.query_row(
-            "SELECT discord_channel_id FROM agents WHERE id = ?1",
-            rusqlite::params![agent_name],
-            |row| {
-                let ch: Option<String> = row.get(0)?;
-                Ok(ch)
-            },
-        )
-    })
-    .await??
-    .ok_or("agent has no discord_channel_id")?
-    .parse::<u64>()
-    .map_err(|e| format!("invalid channel id: {e}"))?;
+    // Prefer the stored channel_id from the pending row (supports alt/thread channels)
+    let channel_id: u64 = if let Some(ch) = stored_channel_id {
+        ch.parse::<u64>()
+            .map_err(|e| format!("invalid stored channel_id: {e}"))?
+    } else {
+        // Fall back to the agent's primary discord_channel_id
+        let db = db.clone();
+        let agent_name = source_agent.to_string();
+        let ch_opt: Option<String> = tokio::task::spawn_blocking(move || {
+            let conn = db.separate_conn().map_err(|e| format!("{e}"))?;
+            conn.query_row(
+                "SELECT discord_channel_id FROM agents WHERE id = ?1",
+                rusqlite::params![agent_name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| format!("{e}"))
+        })
+        .await
+        .map_err(|e| format!("join: {e}"))??;
+        ch_opt
+            .ok_or("agent has no discord_channel_id")?
+            .parse::<u64>()
+            .map_err(|e| format!("invalid channel id: {e}"))?
+    };
 
     let message = format!("DM_REPLY:{reply_id} from {username}: {answer}");
-    send_message_to_channel(&token, channel_id, &message).await?;
+    send_message_to_channel(&token, channel_id, &message)
+        .await
+        .map_err(|e| format!("{e}"))?;
     Ok(())
 }
 
@@ -2442,6 +2463,7 @@ struct ConsumedDmReply {
     id: i64,
     source_agent: String,
     answer: String,
+    channel_id: Option<String>,
     db: crate::db::Db,
 }
 
@@ -2452,15 +2474,15 @@ fn consume_pending_dm_reply(
 ) -> Option<ConsumedDmReply> {
     let conn = db.separate_conn().ok()?;
     // FIFO: consume oldest non-expired pending entry
-    let row: Result<(i64, String, String), _> = conn.query_row(
-        "SELECT id, source_agent, context FROM pending_dm_replies \
+    let row: Result<(i64, String, String, Option<String>), _> = conn.query_row(
+        "SELECT id, source_agent, context, channel_id FROM pending_dm_replies \
          WHERE user_id = ?1 AND status = 'pending' \
          AND (expires_at IS NULL OR expires_at > datetime('now')) \
          ORDER BY created_at ASC LIMIT 1",
         rusqlite::params![user_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     );
-    let (id, source_agent, context_str) = row.ok()?;
+    let (id, source_agent, context_str, channel_id) = row.ok()?;
 
     // Merge the answer into the context JSON
     let mut context: serde_json::Value =
@@ -2484,6 +2506,7 @@ fn consume_pending_dm_reply(
         id,
         source_agent,
         answer: answer.to_string(),
+        channel_id,
         db: db.clone(),
     })
 }
