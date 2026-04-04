@@ -2137,6 +2137,29 @@ pub async fn rereview_card(
                 );
             }
         }
+
+        // ── Stale cleanup: reset review-related fields so OnReviewEnter starts clean ──
+        conn.execute(
+            "UPDATE kanban_cards
+             SET review_status = NULL,
+                 suggestion_pending_at = NULL,
+                 review_entered_at = NULL,
+                 awaiting_dod_at = NULL,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            [&id],
+        )
+        .ok();
+
+        let sync_payload = json!({
+            "card_id": id,
+            "state": "idle",
+        })
+        .to_string();
+        let sync_result = crate::engine::ops::review_state_sync_on_conn(&conn, &sync_payload);
+        if sync_result.contains("\"error\"") {
+            tracing::warn!("[kanban] rereview review_state_sync cleanup failed: {sync_result}");
+        }
     }
 
     if current_status != "review" {
@@ -2275,6 +2298,134 @@ pub async fn rereview_card(
             "reason": reason,
         })),
     )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchRereviewBody {
+    pub issues: Vec<i64>,
+    pub reason: Option<String>,
+}
+
+/// POST /api/re-review
+///
+/// PMD-only batch endpoint. Accepts a list of GitHub issue numbers,
+/// looks up each card, and calls the rereview logic for each.
+/// Per-item error handling: one failure does not stop others.
+pub async fn batch_rereview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchRereviewBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // ── Auth: same two-factor check as single rereview ──
+    let config = crate::config::load_graceful();
+    if let Some(expected_token) = config.server.auth_token.as_deref() {
+        if !expected_token.is_empty() {
+            let provided = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            if provided != Some(expected_token) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "batch rereview requires explicit Bearer token"})),
+                );
+            }
+        }
+    }
+
+    let caller_channel = headers
+        .get("x-channel-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let pmd_channel: String = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        conn.query_row(
+            "SELECT value FROM kv_meta WHERE key = 'kanban_manager_channel_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+    };
+
+    if pmd_channel.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "kanban_manager_channel_id not configured"})),
+        );
+    }
+
+    if caller_channel != pmd_channel {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error": "batch rereview requires X-Channel-Id matching kanban_manager_channel_id"}),
+            ),
+        );
+    }
+
+    let reason = body.reason.clone();
+    let mut results = Vec::new();
+
+    for issue_number in &body.issues {
+        let card_id: Option<String> = state.db.lock().ok().and_then(|conn| {
+            conn.query_row(
+                "SELECT id FROM kanban_cards WHERE github_issue_number = ?1",
+                [issue_number],
+                |row| row.get(0),
+            )
+            .ok()
+        });
+
+        let card_id = match card_id {
+            Some(id) => id,
+            None => {
+                results.push(json!({
+                    "issue": issue_number,
+                    "ok": false,
+                    "error": format!("card not found for issue #{issue_number}"),
+                }));
+                continue;
+            }
+        };
+
+        let rereview_body = RereviewBody {
+            reason: reason.clone(),
+        };
+
+        let (status, Json(response)) = rereview_card(
+            State(state.clone()),
+            Path(card_id),
+            headers.clone(),
+            Json(rereview_body),
+        )
+        .await;
+
+        if status == StatusCode::OK {
+            results.push(json!({
+                "issue": issue_number,
+                "ok": true,
+                "dispatch_id": response.get("review_dispatch_id"),
+            }));
+        } else {
+            results.push(json!({
+                "issue": issue_number,
+                "ok": false,
+                "error": response.get("error"),
+            }));
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "results": results })))
 }
 
 #[derive(Debug, Deserialize)]
