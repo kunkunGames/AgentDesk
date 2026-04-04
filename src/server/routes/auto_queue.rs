@@ -180,17 +180,13 @@ fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<Str
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let initial_state = pipeline.initial_state().to_string();
-    if !states.iter().any(|s| s == &initial_state) {
-        states.push(initial_state);
-    }
     // Requested is a pre-execution staging state in the default pipeline. Allow
-    // enqueueing it directly so callers do not need force-transition -> ready.
+    // enqueueing it directly so callers can queue already-requested work.
     if pipeline.is_valid_state("requested") && !states.iter().any(|s| s == "requested") {
         states.push("requested".to_string());
     }
-    // #255: ready is a free-transition predecessor to the dispatchable state.
-    // Allow enqueueing cards in ready — activate will walk them to the dispatchable state.
+    // Ready is an explicit preparation state. Backlog is intentionally excluded:
+    // auto-queue should only accept work that has already been prepared.
     if pipeline.is_valid_state("ready") && !states.iter().any(|s| s == "ready") {
         states.push("ready".to_string());
     }
@@ -356,7 +352,7 @@ pub async fn generate(
     };
     ensure_tables(&conn);
 
-    // Build filter — pipeline-driven enqueueable states (dispatchable + free predecessors)
+    // Build filter — pipeline-driven enqueueable states (dispatchable + prepared staging states)
     crate::pipeline::ensure_loaded();
     let enqueueable = crate::pipeline::try_get()
         .map(|p| {
@@ -366,7 +362,7 @@ pub async fn generate(
                 .collect::<Vec<_>>()
                 .join(",")
         })
-        .unwrap_or_else(|| "'ready','backlog','requested'".to_string());
+        .unwrap_or_else(|| "'ready','requested'".to_string());
     let mut conditions = vec![format!("kc.status IN ({})", enqueueable)];
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if let Some(ref repo) = body.repo {
@@ -1960,8 +1956,8 @@ pub async fn enqueue(
         );
     }
 
-    // Accept the queue's initial staging states directly so PMD does not need
-    // force-transition -> ready (which would fire kanban hooks and side-dispatches).
+    // Accept only prepared staging states directly so PMD does not need
+    // redundant state nudges before enqueueing work.
     crate::pipeline::ensure_loaded();
     let effective_pipeline = crate::pipeline::resolve_for_card(
         &conn,
@@ -1973,7 +1969,7 @@ pub async fn enqueue(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": format!("card status is '{}', only initial/dispatchable/requested states can be enqueued", card_status),
+                "error": format!("card status is '{}', only ready/requested/dispatchable states can be enqueued", card_status),
                 "card_id": card_id,
                 "status": card_status,
                 "allowed_states": enqueueable_states,
