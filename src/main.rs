@@ -142,6 +142,9 @@ enum Commands {
         /// Input mode: fifo (default) or pipe
         #[arg(long, value_enum, default_value_t = InputModeArg::Fifo)]
         input_mode: InputModeArg,
+        /// Auto-compact token limit (absolute token count)
+        #[arg(long)]
+        compact_token_limit: Option<u64>,
     },
     /// tmux + Qwen CLI integration wrapper (Unix only)
     #[cfg(unix)]
@@ -415,6 +418,7 @@ fn main() -> Result<()> {
                 reasoning_effort,
                 cwd,
                 input_mode,
+                compact_token_limit,
             }) => {
                 let mode = match input_mode {
                     InputModeArg::Pipe => services::tmux_wrapper::InputMode::Pipe,
@@ -429,6 +433,7 @@ fn main() -> Result<()> {
                     codex_model.as_deref(),
                     reasoning_effort.as_deref(),
                     mode,
+                    compact_token_limit,
                 );
                 return Ok(());
             }

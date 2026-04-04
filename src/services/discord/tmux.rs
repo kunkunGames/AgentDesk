@@ -11,9 +11,7 @@ use crate::services::tmux_diagnostics::{
     tmux_session_exists, tmux_session_has_live_pane,
 };
 
-use super::formatting::{
-    format_for_discord, format_tool_input, normalize_empty_lines, send_long_message_raw,
-};
+use super::formatting::{format_tool_input, normalize_empty_lines, send_long_message_raw};
 use super::settings::{
     channel_supports_provider, resolve_role_binding, validate_bot_channel_routing,
 };
@@ -30,6 +28,39 @@ pub(super) fn try_claim_watcher(
     use dashmap::mapref::entry::Entry;
     match watchers.entry(channel_id) {
         Entry::Occupied(_) => false,
+        Entry::Vacant(entry) => {
+            entry.insert(handle);
+            true
+        }
+    }
+}
+
+/// #243: Claim a channel for watcher creation, cancelling any existing watcher.
+/// Unlike try_claim_watcher (which skips if occupied), this always succeeds:
+/// if a watcher already exists, it is cancelled and replaced.
+/// Returns true if a fresh slot was created, false if an existing watcher was replaced.
+pub(super) fn claim_or_replace_watcher(
+    watchers: &dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
+    channel_id: ChannelId,
+    handle: TmuxWatcherHandle,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+    match watchers.entry(channel_id) {
+        Entry::Occupied(mut entry) => {
+            // Cancel the existing watcher — it will exit on its next loop iteration
+            // and skip DashMap removal (since cancel is set).
+            entry
+                .get()
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ♻ watcher replaced for channel {} — cancelled stale watcher",
+                channel_id
+            );
+            entry.insert(handle);
+            false
+        }
         Entry::Vacant(entry) => {
             entry.insert(handle);
             true
@@ -802,7 +833,13 @@ pub(super) async fn tmux_output_watcher(
         // #225 P1-2: Track relay success across branches
         let mut relay_ok = false;
         if !full_response.trim().is_empty() {
-            let formatted = format_for_discord(&full_response);
+            let watcher_provider = parse_provider_and_channel_from_tmux_name(&tmux_session_name)
+                .map(|(p, _)| p)
+                .unwrap_or(crate::services::provider::ProviderKind::Claude);
+            let formatted = super::formatting::format_for_discord_with_provider(
+                &full_response,
+                &watcher_provider,
+            );
             let prefixed = formatted.to_string();
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
@@ -1062,8 +1099,12 @@ pub(super) async fn tmux_output_watcher(
         }
     }
 
-    // Cleanup
-    shared.tmux_watchers.remove(&channel_id);
+    // Cleanup: only remove from DashMap if we weren't cancelled/replaced.
+    // #243: When a watcher is cancelled (replaced by a new watcher or shutdown),
+    // the replacement already occupies the slot — removing would delete the new entry.
+    if !cancel.load(Ordering::Relaxed) {
+        shared.tmux_watchers.remove(&channel_id);
+    }
 
     // Kill dead tmux session to prevent accumulation (especially for thread sessions
     // which are created per-dispatch and would otherwise linger for 24h).

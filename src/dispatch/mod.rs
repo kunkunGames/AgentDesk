@@ -54,38 +54,17 @@ fn build_review_context(
                     &wt.commit[..8.min(wt.commit.len())]
                 );
             } else {
-                // Fall back: check previous review dispatch for persisted branch info
-                let prev_branch: Option<(String, String)> =
-                    db.separate_conn().ok().and_then(|conn| {
-                        let ctx_str: Option<String> = conn
-                            .query_row(
-                                "SELECT context FROM task_dispatches \
-                             WHERE kanban_card_id = ?1 AND dispatch_type = 'review' \
-                             AND status IN ('completed', 'failed', 'cancelled') \
-                             ORDER BY created_at DESC LIMIT 1",
-                                [kanban_card_id],
-                                |row| row.get(0),
-                            )
-                            .ok()
-                            .flatten();
-                        ctx_str.and_then(|s| {
-                            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-                            let b = v.get("branch")?.as_str()?.to_string();
-                            let c = v.get("reviewed_commit")?.as_str()?.to_string();
-                            Some((b, c))
-                        })
-                    });
-
-                if let Some((branch, commit)) = prev_branch {
+                // #229: No worktree found — use main HEAD directly.
+                // Previous dispatch context is NOT reused because it may reference
+                // commits from a different issue (e.g., after worktree cleanup the
+                // latest completed review dispatch may belong to a prior issue).
+                if let Some(commit) = crate::services::platform::git_head_commit(&repo_dir) {
                     obj.insert("reviewed_commit".to_string(), json!(commit));
-                    obj.insert("branch".to_string(), json!(branch));
                     tracing::info!(
-                        "[dispatch] Review dispatch for card {}: reusing previous branch '{}'",
+                        "[dispatch] Review dispatch for card {}: no worktree, using main HEAD ({})",
                         kanban_card_id,
-                        branch
+                        &commit[..8.min(commit.len())]
                     );
-                } else if let Some(commit) = crate::services::platform::git_head_commit(&repo_dir) {
-                    obj.insert("reviewed_commit".to_string(), json!(commit));
                 }
             }
         }
@@ -169,27 +148,138 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
     Ok(cancelled)
 }
 
-/// Core dispatch creation: DB operations only, no hooks fired.
-///
-/// - Inserts a record into `task_dispatches`
-/// - Updates `kanban_cards.latest_dispatch_id` and sets status to "requested" (non-review)
-/// - Returns `(dispatch_id, old_card_status)`
-///
-/// Caller is responsible for firing hooks after this returns.
-///
-/// Returns `(dispatch_id, old_card_status, reused)`.
-/// When `reused` is true the returned ID belongs to an existing pending/dispatched
-/// dispatch of the same type — no new row was inserted (#173 dedup).
-pub fn create_dispatch_core(
+fn dispatch_uses_alt_channel(dispatch_type: &str) -> bool {
+    matches!(dispatch_type, "review" | "e2e-test")
+}
+
+fn resolve_dispatch_channel_id(channel: &str) -> Option<u64> {
+    channel
+        .parse::<u64>()
+        .ok()
+        .or_else(|| crate::server::routes::dispatches::resolve_channel_alias_pub(channel))
+}
+
+fn load_existing_thread_for_channel(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    channel_id: u64,
+) -> Result<Option<String>> {
+    let map_json: Option<String> = conn
+        .query_row(
+            "SELECT channel_thread_map FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    if let Some(json_str) = map_json.as_deref() {
+        if !json_str.is_empty() && json_str != "{}" {
+            let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json_str)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Cannot create dispatch for card {}: invalid channel_thread_map JSON: {}",
+                        card_id,
+                        e
+                    )
+                })?;
+
+            if let Some(value) = map.get(&channel_id.to_string()) {
+                let thread_id = value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot create dispatch for card {}: non-string thread mapping for channel {}",
+                        card_id,
+                        channel_id
+                    )
+                })?;
+                return Ok(Some(thread_id.to_string()));
+            }
+            return Ok(None);
+        }
+    }
+
+    Ok(conn
+        .query_row(
+            "SELECT active_thread_id FROM kanban_cards WHERE id = ?1 AND active_thread_id IS NOT NULL",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok())
+}
+
+fn validate_dispatch_target_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    to_agent_id: &str,
+    dispatch_type: &str,
+) -> Result<()> {
+    let channel_column = if dispatch_uses_alt_channel(dispatch_type) {
+        "discord_channel_alt"
+    } else {
+        "discord_channel_id"
+    };
+    let channel_role = if dispatch_uses_alt_channel(dispatch_type) {
+        "alternate"
+    } else {
+        "primary"
+    };
+
+    let channel_value: Option<String> = conn
+        .query_row(
+            &format!("SELECT {channel_column} FROM agents WHERE id = ?1"),
+            [to_agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let channel_value = channel_value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot create {} dispatch: agent '{}' has no {} discord channel (card {})",
+            dispatch_type,
+            to_agent_id,
+            channel_role,
+            card_id
+        )
+    })?;
+
+    let channel_id = resolve_dispatch_channel_id(&channel_value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot create {} dispatch: agent '{}' has invalid {} discord channel '{}' (card {})",
+            dispatch_type,
+            to_agent_id,
+            channel_role,
+            channel_value,
+            card_id
+        )
+    })?;
+
+    if let Some(thread_id) = load_existing_thread_for_channel(conn, card_id, channel_id)? {
+        if thread_id.parse::<u64>().is_err() {
+            return Err(anyhow::anyhow!(
+                "Cannot create {} dispatch: card '{}' has invalid thread '{}' for channel {}",
+                dispatch_type,
+                card_id,
+                thread_id,
+                channel_id
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn create_dispatch_core_internal(
     db: &Db,
+    dispatch_id: &str,
     kanban_card_id: &str,
     to_agent_id: &str,
     dispatch_type: &str,
     title: &str,
     context: &serde_json::Value,
 ) -> Result<(String, String, bool)> {
-    let dispatch_id = uuid::Uuid::new_v4().to_string();
-
     let context_str = if dispatch_type == "review" {
         build_review_context(db, kanban_card_id, to_agent_id, context)?
     } else {
@@ -211,6 +301,23 @@ pub fn create_dispatch_core(
         )
         .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
 
+    // Guard: reject dispatches to non-existent agents or invalid Discord routing
+    // before any row is created.
+    let agent_exists: bool = conn
+        .query_row("SELECT 1 FROM agents WHERE id = ?1", [to_agent_id], |_| {
+            Ok(())
+        })
+        .is_ok();
+    if !agent_exists {
+        return Err(anyhow::anyhow!(
+            "Cannot create {} dispatch: agent '{}' not found (card {})",
+            dispatch_type,
+            to_agent_id,
+            kanban_card_id
+        ));
+    }
+    validate_dispatch_target_on_conn(&conn, kanban_card_id, to_agent_id, dispatch_type)?;
+
     // Guard: prevent ALL dispatches for terminal cards (pipeline-driven).
     crate::pipeline::ensure_loaded();
     let effective =
@@ -225,9 +332,8 @@ pub fn create_dispatch_core(
         ));
     }
 
-    // #173: Dedup — if same card already has a pending/dispatched dispatch of the SAME type,
-    // return the existing dispatch_id idempotently instead of creating a duplicate.
-    // review-decision handles its own dedup below (#116: cancel previous then insert).
+    // Dedup on the canonical path after validation so malformed targets do not
+    // silently reuse an existing dispatch.
     if dispatch_type != "review-decision" {
         let existing_id: Option<String> = conn
             .query_row(
@@ -253,8 +359,6 @@ pub fn create_dispatch_core(
         || dispatch_type == "review-decision"
         || dispatch_type == "rework";
 
-    // #116: Cancel any existing pending review-decision for this card before creating a new one.
-    // Enforces the invariant: at most 1 pending/dispatched review-decision per card.
     if dispatch_type == "review-decision" {
         let mut stmt = conn.prepare(
             "SELECT id FROM task_dispatches \
@@ -283,14 +387,11 @@ pub fn create_dispatch_core(
         }
     }
 
-    // #155: Dispatch INSERT + card-state intents in a single transaction.
-    // The dispatch row and card-state update must be atomic — if intents fail,
-    // the dispatch row must also be rolled back to prevent orphaned dispatches.
     apply_dispatch_attached_intents(
         &conn,
         kanban_card_id,
         to_agent_id,
-        &dispatch_id,
+        dispatch_id,
         dispatch_type,
         is_review_type,
         &old_status,
@@ -299,7 +400,38 @@ pub fn create_dispatch_core(
         &context_str,
     )?;
 
-    Ok((dispatch_id, old_status, false))
+    Ok((dispatch_id.to_string(), old_status, false))
+}
+
+/// Core dispatch creation: DB operations only, no hooks fired.
+///
+/// - Inserts a record into `task_dispatches`
+/// - Updates `kanban_cards.latest_dispatch_id` and sets status to "requested" (non-review)
+/// - Returns `(dispatch_id, old_card_status)`
+///
+/// Caller is responsible for firing hooks after this returns.
+///
+/// Returns `(dispatch_id, old_card_status, reused)`.
+/// When `reused` is true the returned ID belongs to an existing pending/dispatched
+/// dispatch of the same type — no new row was inserted (#173 dedup).
+pub fn create_dispatch_core(
+    db: &Db,
+    kanban_card_id: &str,
+    to_agent_id: &str,
+    dispatch_type: &str,
+    title: &str,
+    context: &serde_json::Value,
+) -> Result<(String, String, bool)> {
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    create_dispatch_core_internal(
+        db,
+        &dispatch_id,
+        kanban_card_id,
+        to_agent_id,
+        dispatch_type,
+        title,
+        context,
+    )
 }
 
 /// Like `create_dispatch_core` but uses a pre-assigned dispatch ID (#121 intent model).
@@ -315,106 +447,15 @@ pub fn create_dispatch_core_with_id(
     title: &str,
     context: &serde_json::Value,
 ) -> Result<(String, String, bool)> {
-    let context_str = if dispatch_type == "review" {
-        build_review_context(db, kanban_card_id, to_agent_id, context)?
-    } else {
-        serde_json::to_string(context)?
-    };
-
-    let conn = db
-        .separate_conn()
-        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
-
-    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
-            [kanban_card_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| anyhow::anyhow!("Card not found: {e}"))?;
-
-    crate::pipeline::ensure_loaded();
-    let effective =
-        crate::pipeline::resolve_for_card(&conn, card_repo_id.as_deref(), card_agent_id.as_deref());
-    let is_terminal = effective.is_terminal(&old_status);
-    if is_terminal {
-        return Err(anyhow::anyhow!(
-            "Cannot create {} dispatch for terminal card {} (status: {}) — cannot revert terminal card",
-            dispatch_type,
-            kanban_card_id,
-            old_status
-        ));
-    }
-
-    // #173: Dedup guard (same logic as create_dispatch_core).
-    if dispatch_type != "review-decision" {
-        let existing_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM task_dispatches \
-                 WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
-                 AND status IN ('pending', 'dispatched') LIMIT 1",
-                rusqlite::params![kanban_card_id, dispatch_type],
-                |row| row.get(0),
-            )
-            .ok();
-        if let Some(eid) = existing_id {
-            tracing::info!(
-                "DEDUP: reusing existing dispatch {} for card {} type {}",
-                eid,
-                kanban_card_id,
-                dispatch_type
-            );
-            return Ok((eid, old_status, true));
-        }
-    }
-
-    let is_review_type = dispatch_type == "review"
-        || dispatch_type == "review-decision"
-        || dispatch_type == "rework";
-
-    if dispatch_type == "review-decision" {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM task_dispatches \
-             WHERE kanban_card_id = ?1 AND dispatch_type = 'review-decision' \
-             AND status IN ('pending', 'dispatched')",
-        )?;
-        let stale_ids: Vec<String> = stmt
-            .query_map([kanban_card_id], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-        let mut cancelled = 0;
-        for stale_id in &stale_ids {
-            cancelled += cancel_dispatch_and_reset_auto_queue_on_conn(
-                &conn,
-                stale_id,
-                Some("superseded_by_new_review_decision"),
-            )?;
-        }
-        if cancelled > 0 {
-            tracing::info!(
-                "[dispatch] Cancelled {} stale review-decision(s) for card {} before creating new one",
-                cancelled,
-                kanban_card_id
-            );
-        }
-    }
-
-    // #155: Dispatch INSERT + card-state intents in a single transaction
-    apply_dispatch_attached_intents(
-        &conn,
+    create_dispatch_core_internal(
+        db,
+        dispatch_id,
         kanban_card_id,
         to_agent_id,
-        dispatch_id,
         dispatch_type,
-        is_review_type,
-        &old_status,
-        &effective,
         title,
-        &context_str,
-    )?;
-
-    Ok((dispatch_id.to_string(), old_status, false))
+        context,
+    )
 }
 
 /// Create a new dispatch for a kanban card.
@@ -477,10 +518,39 @@ pub fn create_dispatch(
     Ok(dispatch)
 }
 
+/// Ensure a durable notify outbox row exists for a dispatch.
+///
+/// Used both by the authoritative dispatch creation transaction and by
+/// fallback/backfill paths that must avoid duplicate notify entries.
+pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+    agent_id: &str,
+    card_id: &str,
+    title: &str,
+) -> rusqlite::Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'notify'",
+        [dispatch_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+
+    conn.execute(
+        "INSERT INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title) \
+         VALUES (?1, 'notify', ?2, ?3, ?4)",
+        rusqlite::params![dispatch_id, agent_id, card_id, title],
+    )?;
+    Ok(true)
+}
+
 /// #155: Insert dispatch row + apply DispatchAttached transition intents atomically.
 ///
 /// Both the `task_dispatches` INSERT and the card-state intents execute inside
 /// a single transaction so that reducer failure rolls back the dispatch row too.
+/// #249 also inserts the notify outbox row inside the same transaction.
 fn apply_dispatch_attached_intents(
     conn: &rusqlite::Connection,
     card_id: &str,
@@ -548,6 +618,7 @@ fn apply_dispatch_attached_intents(
             }
             return Err(e.into());
         }
+        ensure_dispatch_notify_outbox_on_conn(conn, dispatch_id, to_agent_id, card_id, title)?;
         for intent in &decision.intents {
             transition::execute_intent_on_conn(conn, intent)?;
         }
@@ -688,15 +759,6 @@ fn complete_dispatch_inner(
         })
         .unwrap_or_default();
 
-    // Capture max rowid before hooks fire — any dispatches created by hooks
-    // (JS agentdesk.dispatch.create()) will have a higher rowid.
-    let pre_hook_max_rowid: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(rowid), 0) FROM task_dispatches",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
     drop(conn);
 
     // Fire event hooks for dispatch completion (#134 — pipeline-defined events)
@@ -715,12 +777,6 @@ fn complete_dispatch_inner(
     // After OnDispatchCompleted, policies may have queued follow-up transitions
     // and dispatch intents (OnReviewEnter, retry dispatches, etc.).
     crate::kanban::drain_hook_side_effects(db, engine);
-
-    // After all hooks and transitions drained, check for dispatches created by
-    // OnDispatchCompleted hooks (e.g. pipeline.js, review-automation.js, timeouts.js)
-    // that were NOT covered by fire_transition_hooks' notify_new_dispatches_after_hooks.
-    // These are dispatches created outside any card transition context.
-    notify_hook_created_dispatches(db, pre_hook_max_rowid);
 
     // #139/#220: Safety net — if card transitioned to review but OnReviewEnter
     // failed to create a review dispatch (engine lock contention causing
@@ -767,57 +823,10 @@ fn complete_dispatch_inner(
             );
             let _ = engine.fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": cid }));
             crate::kanban::drain_hook_side_effects(db, engine);
-            notify_hook_created_dispatches(db, pre_hook_max_rowid);
         }
     }
 
     Ok(dispatch)
-}
-
-/// Send Discord notifications for any pending dispatches created after `pre_hook_max_rowid`.
-/// Uses the `dispatch_notified` dedup guard in `send_dispatch_to_discord` to avoid
-/// double-notifying dispatches already handled by `notify_new_dispatches_after_hooks`.
-pub(crate) fn notify_hook_created_dispatches(db: &Db, pre_hook_max_rowid: i64) {
-    let dispatches: Vec<(String, String, String, String)> = db
-        .separate_conn()
-        .ok()
-        .map(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT td.id, td.to_agent_id, td.kanban_card_id, kc.title \
-                     FROM task_dispatches td \
-                     JOIN kanban_cards kc ON td.kanban_card_id = kc.id \
-                     WHERE td.status = 'pending' \
-                       AND td.rowid > ?1 \
-                       AND NOT EXISTS (SELECT 1 FROM kv_meta WHERE key = 'dispatch_notified:' || td.id)",
-                )
-                .ok();
-            stmt.as_mut()
-                .and_then(|s| {
-                    s.query_map(rusqlite::params![pre_hook_max_rowid], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })
-                    .ok()
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-
-    if dispatches.is_empty() {
-        return;
-    }
-
-    // #144: Queue via dispatch outbox instead of tokio::spawn.
-    for (dispatch_id, agent_id, card_id, title) in dispatches {
-        crate::server::routes::dispatches::queue_dispatch_notify(
-            db,
-            &dispatch_id,
-            &agent_id,
-            &card_id,
-            &title,
-        );
-    }
 }
 
 /// Read a single dispatch row as JSON.
@@ -1021,13 +1030,22 @@ fn provider_from_channel_suffix(channel: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
-        crate::db::wrap_conn(conn)
+        let db = crate::db::wrap_conn(conn);
+        // Seed common test agents with valid primary/alternate channels so the
+        // canonical dispatch target validation can run in unit tests.
+        {
+            let c = db.separate_conn().unwrap();
+            c.execute_batch(
+                "INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES ('agent-1', 'Agent 1', '111', '222');
+                 INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES ('agent-2', 'Agent 2', '333', '444');"
+            ).unwrap();
+        }
+        db
     }
 
     fn test_engine(db: &Db) -> PolicyEngine {
@@ -1042,6 +1060,15 @@ mod tests {
             rusqlite::params![card_id, status],
         )
         .unwrap();
+    }
+
+    fn count_notify_outbox(conn: &rusqlite::Connection, dispatch_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'notify'",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1174,7 +1201,7 @@ mod tests {
         let db = test_db();
         let conn = db.separate_conn().unwrap();
         conn.execute(
-            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+            "INSERT OR REPLACE INTO agents (id, name, discord_channel_id, discord_channel_alt) \
              VALUES ('agent-1', 'Agent 1', '123', '456')",
             [],
         )
@@ -1328,6 +1355,11 @@ mod tests {
         let dispatch = query_dispatch_row(&conn, &dispatch_id).unwrap();
         assert_eq!(dispatch["status"], "pending");
         assert_eq!(dispatch["kanban_card_id"], "card-core");
+        assert_eq!(
+            count_notify_outbox(&conn, &dispatch_id),
+            1,
+            "core creation must atomically enqueue exactly one notify outbox row"
+        );
         drop(conn);
 
         // create_dispatch delegates to core — verify same invariants
@@ -1346,6 +1378,34 @@ mod tests {
     }
 
     #[test]
+    fn create_dispatch_core_with_id_atomically_inserts_notify_outbox() {
+        let db = test_db();
+        seed_card(&db, "card-core-id", "ready");
+
+        let (dispatch_id, old_status, reused) = create_dispatch_core_with_id(
+            &db,
+            "dispatch-core-id",
+            "card-core-id",
+            "agent-1",
+            "implementation",
+            "Core with id",
+            &json!({}),
+        )
+        .unwrap();
+
+        assert_eq!(dispatch_id, "dispatch-core-id");
+        assert_eq!(old_status, "ready");
+        assert!(!reused);
+
+        let conn = db.separate_conn().unwrap();
+        assert_eq!(
+            count_notify_outbox(&conn, "dispatch-core-id"),
+            1,
+            "pre-assigned dispatch creation must also enqueue notify outbox inside the transaction"
+        );
+    }
+
+    #[test]
     fn create_dispatch_core_rejects_done_card() {
         let db = test_db();
         seed_card(&db, "card-done-core", "done");
@@ -1359,6 +1419,112 @@ mod tests {
             &json!({}),
         );
         assert!(result.is_err(), "core should reject done card dispatch");
+    }
+
+    #[test]
+    fn create_dispatch_core_rejects_missing_primary_channel_before_insert() {
+        let db = test_db();
+        seed_card(&db, "card-no-channel", "ready");
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "UPDATE agents SET discord_channel_id = NULL WHERE id = 'agent-1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = create_dispatch_core(
+            &db,
+            "card-no-channel",
+            "agent-1",
+            "implementation",
+            "Should fail",
+            &json!({}),
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("no primary discord channel"));
+
+        let conn = db.separate_conn().unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-no-channel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 0, "failed validation must not persist rows");
+    }
+
+    #[test]
+    fn create_dispatch_core_with_id_rejects_invalid_channel_alias_before_insert() {
+        let db = test_db();
+        seed_card(&db, "card-bad-channel", "ready");
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "UPDATE agents SET discord_channel_id = 'not-a-channel' WHERE id = 'agent-1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = create_dispatch_core_with_id(
+            &db,
+            "dispatch-bad-channel",
+            "card-bad-channel",
+            "agent-1",
+            "implementation",
+            "Should fail",
+            &json!({}),
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("invalid primary discord channel"));
+
+        let conn = db.separate_conn().unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE id = 'dispatch-bad-channel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dispatch_count, 0,
+            "invalid channels must fail before INSERT"
+        );
+    }
+
+    #[test]
+    fn create_dispatch_core_rejects_invalid_existing_thread_before_insert() {
+        let db = test_db();
+        seed_card(&db, "card-bad-thread", "ready");
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET active_thread_id = 'thread-not-numeric' WHERE id = 'card-bad-thread'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = create_dispatch_core(
+            &db,
+            "card-bad-thread",
+            "agent-1",
+            "implementation",
+            "Should fail",
+            &json!({}),
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("invalid thread"));
+
+        let conn = db.separate_conn().unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-bad-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 0, "invalid thread must fail before INSERT");
     }
 
     #[test]
@@ -1634,5 +1800,12 @@ mod tests {
         .unwrap();
         assert!(reused2, "duplicate must be flagged as reused");
         assert_eq!(id1, id2);
+
+        let conn = db.separate_conn().unwrap();
+        assert_eq!(
+            count_notify_outbox(&conn, &id1),
+            1,
+            "reused dispatch must not create a second notify outbox row"
+        );
     }
 }

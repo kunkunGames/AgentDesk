@@ -561,6 +561,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_ste_dispatch_id ON session_termination_events(dispatch_id);
         CREATE INDEX IF NOT EXISTS idx_ste_created_at ON session_termination_events(created_at);",
     )?;
+
+    // #189: Generic DM reply tracking — replaces family profile probe hardcode.
+    // Agents register pending DM replies; router matches incoming DMs to pending entries.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_dm_replies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_agent TEXT NOT NULL,
+            user_id      TEXT NOT NULL,
+            channel_id   TEXT,
+            context      TEXT NOT NULL DEFAULT '{}',
+            status       TEXT NOT NULL DEFAULT 'pending',
+            created_at   DATETIME DEFAULT (datetime('now')),
+            consumed_at  DATETIME,
+            expires_at   DATETIME
+        );
+        CREATE INDEX IF NOT EXISTS idx_pdr_user_status ON pending_dm_replies(user_id, status);",
+    )?;
+
     seed_builtin_pipeline_stages(conn)?;
 
     Ok(())

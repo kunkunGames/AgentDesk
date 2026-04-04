@@ -288,10 +288,13 @@ pub(super) async fn restore_inflight_turns(
                     if state.full_response.trim().is_empty() {
                         "(복구됨 — 응답 텍스트 없음)".to_string()
                     } else {
-                        super::formatting::format_for_discord(&state.full_response)
+                        super::formatting::format_for_discord_with_provider(
+                            &state.full_response,
+                            provider,
+                        )
                     }
                 } else {
-                    super::formatting::format_for_discord(&extracted)
+                    super::formatting::format_for_discord_with_provider(&extracted, provider)
                 };
                 let channel_id = ChannelId::new(state.channel_id);
                 let current_msg_id = MessageId::new(state.current_msg_id);
@@ -726,10 +729,13 @@ pub(super) async fn restore_inflight_turns(
                 if state.full_response.trim().is_empty() {
                     "(복구됨 — 응답 텍스트 없음)".to_string()
                 } else {
-                    super::formatting::format_for_discord(&state.full_response)
+                    super::formatting::format_for_discord_with_provider(
+                        &state.full_response,
+                        provider,
+                    )
                 }
             } else {
-                super::formatting::format_for_discord(&extracted)
+                super::formatting::format_for_discord_with_provider(&extracted, provider)
             };
             // #225 P1-1: Track relay success — only clear inflight if Discord delivery succeeds
             let relay_ok = super::formatting::replace_long_message_raw(
@@ -851,7 +857,7 @@ pub(super) async fn restore_inflight_turns(
         }
 
         let tmux_ready_without_new_output = tmux_session_name.as_deref().map_or(false, |name| {
-            !output_has_new_bytes && claude::tmux_session_ready_for_input(name)
+            !output_has_new_bytes && crate::services::provider::tmux_session_ready_for_input(name)
         });
 
         if tmux_ready_without_new_output {
@@ -863,7 +869,7 @@ pub(super) async fn restore_inflight_turns(
             let final_text = if state.full_response.trim().is_empty() {
                 stale_inflight_message("")
             } else {
-                super::formatting::format_for_discord(&state.full_response)
+                super::formatting::format_for_discord_with_provider(&state.full_response, provider)
             };
             let _ = super::formatting::replace_long_message_raw(
                 http,
@@ -1175,7 +1181,7 @@ pub(super) async fn restore_inflight_turns(
                 start_offset,
                 tx.clone(),
                 Some(cancel_for_reader),
-                claude::SessionProbe::tmux(tmux_for_reader.clone()),
+                crate::services::provider::SessionProbe::tmux(tmux_for_reader.clone()),
             ) {
                 Ok(ReadOutputResult::Completed { offset })
                 | Ok(ReadOutputResult::Cancelled { offset }) => {

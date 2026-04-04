@@ -564,6 +564,7 @@ impl PolicyEngine {
     /// Drain pending intents accumulated by bridge functions during hook execution.
     /// Calls `intent::execute_intents` to apply them and returns the result.
     /// Transitions in the result should be fed into `fire_transition_hooks`.
+    ///
     pub fn drain_pending_intents(&self) -> intent::IntentExecutionResult {
         let inner = match self.inner.lock() {
             Ok(g) => g,
@@ -598,14 +599,17 @@ impl PolicyEngine {
         drop(inner);
 
         let intents: Vec<intent::Intent> = serde_json::from_str(&json_str).unwrap_or_default();
-        if intents.is_empty() {
-            return intent::IntentExecutionResult {
+        let result = if intents.is_empty() {
+            intent::IntentExecutionResult {
                 transitions: Vec::new(),
                 created_dispatches: Vec::new(),
                 errors: 0,
-            };
-        }
-        intent::execute_intents(&self.db, intents)
+            }
+        } else {
+            intent::execute_intents(&self.db, intents)
+        };
+
+        result
     }
 
     /// List loaded policies (for API endpoint).
