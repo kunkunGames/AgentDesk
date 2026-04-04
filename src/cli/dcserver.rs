@@ -1239,13 +1239,42 @@ pub fn handle_dcserver(token: Option<String>) {
             None => {
                 let configs = services::discord::load_discord_bot_launch_configs();
                 if should_run_http_only_onboarding(token.as_deref(), configs.len()) {
-                    println!(
-                        "  ⚠ No bot tokens found in {} — continuing in onboarding mode (HTTP only)",
-                        settings_path
-                            .as_deref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "bot_settings.json".to_string())
+                    let settings_display = settings_path
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "bot_settings.json".to_string());
+                    eprintln!(
+                        "  ⚠ No bot tokens found in {} — waiting for HTTP server...",
+                        settings_display
                     );
+                    // Gate onboarding-ready signal on actual /api/health success.
+                    // The HTTP server is spawned async above; probe until it
+                    // responds or give up so the watchdog can trigger rollback.
+                    let health_url =
+                        config::local_api_url(api_port, "/api/health");
+                    let mut http_ok = false;
+                    for _ in 0..15 {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        if let Ok(resp) = reqwest::get(&health_url).await {
+                            if resp.status().is_success() {
+                                http_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                    if http_ok {
+                        // Emit to stdout — verify_dcserver_ready_since() reads
+                        // dcserver.stdout.log for this substring.
+                        println!(
+                            "  ⚠ continuing in onboarding mode (HTTP only) — {}",
+                            settings_display
+                        );
+                    } else {
+                        eprintln!(
+                            "  ✗ HTTP server not reachable at {} — onboarding mode unavailable",
+                            health_url
+                        );
+                    }
                     std::future::pending::<()>().await;
                     return;
                 }
