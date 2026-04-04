@@ -75,6 +75,9 @@ mod tests {
                 unified_thread  INTEGER DEFAULT 0,
                 unified_thread_id TEXT,
                 unified_thread_channel_id TEXT,
+                max_concurrent_threads INTEGER DEFAULT 1,
+                max_concurrent_per_agent INTEGER DEFAULT 1,
+                thread_group_count INTEGER DEFAULT 1,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 completed_at DATETIME
             );
@@ -87,6 +90,7 @@ mod tests {
                 reason          TEXT,
                 status          TEXT DEFAULT 'pending',
                 dispatch_id     TEXT,
+                thread_group    INTEGER DEFAULT 0,
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 dispatched_at   DATETIME,
                 completed_at    DATETIME
@@ -423,6 +427,73 @@ mod tests {
         assert_eq!(
             status, "pending_decision",
             "stale requested card with exhausted retries → pending_decision"
+        );
+    }
+
+    #[test]
+    fn auto_queue_on_tick_dispatches_ready_card_via_requested_preflight() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+                 VALUES ('card-aq-ready', 'AQ Ready', 'ready', 'agent-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-aq-ready', 'repo-1', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, created_at) \
+                 VALUES ('entry-aq-ready', 'run-aq-ready', 'card-aq-ready', 'agent-1', 'pending', 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let _ = engine.try_fire_hook_by_name("OnTick1min", serde_json::json!({}));
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-aq-ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "dispatched",
+            "ready card must be dispatched by auto-queue tick"
+        );
+
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-aq-ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 1, "exactly one dispatch must be created");
+
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-aq-ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            card_status, "in_progress",
+            "ready card must advance through requested preflight to in_progress"
         );
     }
 
