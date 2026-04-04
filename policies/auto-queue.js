@@ -344,6 +344,70 @@ var autoQueue = {
   }
 };
 
+function _isDispatchableState(state, cfg) {
+  if (!cfg || !cfg.transitions) return false;
+  var hasGatedOut = false;
+  var hasGatedIn = false;
+  for (var i = 0; i < cfg.transitions.length; i++) {
+    var t = cfg.transitions[i];
+    if (t.from === state && t.type === "gated") hasGatedOut = true;
+    if (t.to === state && t.type === "gated") hasGatedIn = true;
+  }
+  return hasGatedOut && !hasGatedIn;
+}
+
+function _dispatchableTargets(cfg) {
+  if (!cfg || !cfg.states) return [];
+  var targets = [];
+
+  // #255: requested is the canonical preflight anchor when present.
+  if (agentdesk.pipeline.hasState("requested", cfg)) {
+    targets.push("requested");
+  }
+
+  for (var i = 0; i < cfg.states.length; i++) {
+    var s = cfg.states[i];
+    if (s.terminal) continue;
+    if (!_isDispatchableState(s.id, cfg)) continue;
+    if (targets.indexOf(s.id) === -1) targets.push(s.id);
+  }
+  return targets;
+}
+
+function _freePathToDispatchable(from, cfg) {
+  var targets = _dispatchableTargets(cfg);
+  if (targets.length === 0) return null;
+  if (targets.indexOf(from) >= 0) return [];
+  if (!cfg || !cfg.transitions) return null;
+
+  var queue = [from];
+  var visited = {};
+  var parent = {};
+  visited[from] = true;
+
+  while (queue.length > 0) {
+    var cur = queue.shift();
+    for (var i = 0; i < cfg.transitions.length; i++) {
+      var t = cfg.transitions[i];
+      if (t.from !== cur || t.type !== "free" || visited[t.to]) continue;
+      parent[t.to] = cur;
+      if (targets.indexOf(t.to) >= 0) {
+        var path = [t.to];
+        var p = cur;
+        while (p && p !== from) {
+          path.unshift(p);
+          p = parent[p];
+        }
+        return path;
+      }
+      visited[t.to] = true;
+      queue.push(t.to);
+    }
+  }
+
+  return null;
+}
+
 // ── Shared dispatch helper (group-aware) (#140) ─────────────────
 function dispatchNextEntryInGroup(agentId, runId, threadGroup) {
   // #179/#140: Guard — skip if this group already has a dispatched entry.
@@ -384,46 +448,45 @@ function dispatchNextEntryInGroup(agentId, runId, threadGroup) {
   var entry = nextEntry[0];
   agentdesk.log.info("[auto-queue] Dispatching group " + threadGroup + " entry for " + agentId + ": " + entry.kanban_card_id);
 
-  // #255: Walk the card through free transitions to the preflight state (requested)
-  // before creating dispatch. requested is dispatch-free; creating a dispatch triggers
-  // DispatchAttached which advances the card from requested → in_progress.
+  // #255/#261: Walk the card to the dispatchable preflight anchor before creating
+  // the implementation dispatch. In the default pipeline this is "requested";
+  // dispatch.create() then advances requested → in_progress.
   var pCfg = agentdesk.pipeline.resolveForCard(entry.kanban_card_id) || agentdesk.pipeline.getConfig();
-  var pKickoff = agentdesk.pipeline.kickoffState(pCfg);
   var cardStatus = agentdesk.db.query(
     "SELECT status FROM kanban_cards WHERE id = ?",
     [entry.kanban_card_id]
   );
-  if (cardStatus.length > 0 && cardStatus[0].status !== pKickoff) {
-    // Walk free transitions from current state toward the preflight state.
-    // e.g. backlog → ready → requested (each step is a free transition)
+  if (cardStatus.length > 0) {
     var cur = cardStatus[0].status;
     var walked = false;
-    for (var step = 0; step < 10 && cur !== pKickoff; step++) {
-      var nextFree = null;
-      for (var ti = 0; ti < pCfg.transitions.length; ti++) {
-        var tr = pCfg.transitions[ti];
-        if (tr.from === cur && tr.type === "free") {
-          // Pick the transition that leads toward pKickoff (BFS-lite: prefer direct match)
-          if (tr.to === pKickoff) { nextFree = tr.to; break; }
-          if (!nextFree) nextFree = tr.to;
-        }
-      }
-      if (!nextFree) break;
-      try {
-        agentdesk.kanban.setStatus(entry.kanban_card_id, nextFree);
-        cur = nextFree;
-        walked = true;
-      } catch (e) {
-        agentdesk.log.warn("[auto-queue] Free-walk failed at " + cur + " → " + nextFree + " for " + entry.kanban_card_id + ": " + e);
-        break;
-      }
-    }
-    if (cur !== pKickoff) {
-      agentdesk.log.warn("[auto-queue] Card " + entry.kanban_card_id + " stuck at " + cur + ", cannot reach " + pKickoff + " — skipping dispatch");
+    var walkPath = _freePathToDispatchable(cur, pCfg);
+
+    if (walkPath === null && !_isDispatchableState(cur, pCfg)) {
+      agentdesk.log.warn("[auto-queue] Card " + entry.kanban_card_id + " stuck at " + cur + ", cannot reach a dispatchable preflight state — skipping dispatch");
       return;
     }
+
+    if (walkPath && walkPath.length > 0) {
+      for (var step = 0; step < walkPath.length; step++) {
+        var nextFree = walkPath[step];
+        try {
+          agentdesk.kanban.setStatus(entry.kanban_card_id, nextFree);
+          cur = nextFree;
+          walked = true;
+        } catch (e) {
+          agentdesk.log.warn("[auto-queue] Free-walk failed at " + cur + " → " + nextFree + " for " + entry.kanban_card_id + ": " + e);
+          return;
+        }
+      }
+    }
+
+    if (!_isDispatchableState(cur, pCfg)) {
+      agentdesk.log.warn("[auto-queue] Card " + entry.kanban_card_id + " is at " + cur + " after walk but still not dispatchable — skipping dispatch");
+      return;
+    }
+
     if (walked) {
-      agentdesk.log.info("[auto-queue] Card " + entry.kanban_card_id + " walked to " + pKickoff + " (preflight)");
+      agentdesk.log.info("[auto-queue] Card " + entry.kanban_card_id + " walked to " + cur + " (dispatchable preflight)");
     }
   }
 
