@@ -385,8 +385,8 @@ function dispatchNextEntryInGroup(agentId, runId, threadGroup) {
   var entry = nextEntry[0];
   agentdesk.log.info("[auto-queue] Dispatching group " + threadGroup + " entry for " + agentId + ": " + entry.kanban_card_id);
 
-  // #255: Ensure card is in the preflight state (requested) before creating dispatch.
-  // requested is now a dispatch-free preflight state; creating a dispatch triggers
+  // #255: Walk the card through free transitions to the preflight state (requested)
+  // before creating dispatch. requested is dispatch-free; creating a dispatch triggers
   // DispatchAttached which advances the card from requested → in_progress.
   var pCfg = agentdesk.pipeline.getConfig();
   var pKickoff = agentdesk.pipeline.kickoffState(pCfg);
@@ -395,11 +395,36 @@ function dispatchNextEntryInGroup(agentId, runId, threadGroup) {
     [entry.kanban_card_id]
   );
   if (cardStatus.length > 0 && cardStatus[0].status !== pKickoff) {
-    try {
-      agentdesk.kanban.setStatus(entry.kanban_card_id, pKickoff);
-      agentdesk.log.info("[auto-queue] Card " + entry.kanban_card_id + " → " + pKickoff + " (preflight)");
-    } catch (e) {
-      agentdesk.log.warn("[auto-queue] Failed to move card " + entry.kanban_card_id + " to " + pKickoff + ": " + e);
+    // Walk free transitions from current state toward the preflight state.
+    // e.g. backlog → ready → requested (each step is a free transition)
+    var cur = cardStatus[0].status;
+    var walked = false;
+    for (var step = 0; step < 10 && cur !== pKickoff; step++) {
+      var nextFree = null;
+      for (var ti = 0; ti < pCfg.transitions.length; ti++) {
+        var tr = pCfg.transitions[ti];
+        if (tr.from === cur && tr.type === "free") {
+          // Pick the transition that leads toward pKickoff (BFS-lite: prefer direct match)
+          if (tr.to === pKickoff) { nextFree = tr.to; break; }
+          if (!nextFree) nextFree = tr.to;
+        }
+      }
+      if (!nextFree) break;
+      try {
+        agentdesk.kanban.setStatus(entry.kanban_card_id, nextFree);
+        cur = nextFree;
+        walked = true;
+      } catch (e) {
+        agentdesk.log.warn("[auto-queue] Free-walk failed at " + cur + " → " + nextFree + " for " + entry.kanban_card_id + ": " + e);
+        break;
+      }
+    }
+    if (cur !== pKickoff) {
+      agentdesk.log.warn("[auto-queue] Card " + entry.kanban_card_id + " stuck at " + cur + ", cannot reach " + pKickoff + " — skipping dispatch");
+      return;
+    }
+    if (walked) {
+      agentdesk.log.info("[auto-queue] Card " + entry.kanban_card_id + " walked to " + pKickoff + " (preflight)");
     }
   }
 
