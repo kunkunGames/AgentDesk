@@ -304,6 +304,32 @@ pub async fn update_dispatch(
         }
     }
 
+    // #265: Validate status before applying generic update.
+    // Only whitelisted values are accepted. `completed` is included for documentation
+    // but is already routed through finalize_dispatch() above and won't reach here.
+    //
+    // NOTE: `pending`, `dispatched`, `cancelled`, `failed` are set as raw DB updates
+    // in this generic path — they do NOT fire lifecycle hooks (e.g. OnDispatchCompleted).
+    // If hook-driven side effects are needed for these statuses in the future, they
+    // must be routed explicitly like `completed` is above.
+    const VALID_DISPATCH_STATUSES: &[&str] =
+        &["pending", "dispatched", "completed", "cancelled", "failed"];
+
+    if let Some(ref status) = body.status {
+        if !VALID_DISPATCH_STATUSES.contains(&status.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "invalid dispatch status '{}' — allowed values: {}",
+                        status,
+                        VALID_DISPATCH_STATUSES.join(", ")
+                    )
+                })),
+            );
+        }
+    }
+
     // Generic status update
     let conn = match state.db.lock() {
         Ok(c) => c,

@@ -3160,3 +3160,132 @@ fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries() {
         "valid entry dispatch_id must be preserved"
     );
 }
+
+// ── #265: Dispatch status validation ──────────────────────────
+
+/// #265: PATCH /dispatches/:id with an invalid status like "done" must return
+/// 400 and must NOT modify the dispatch or its associated card state.
+#[tokio::test]
+async fn patch_dispatch_rejects_invalid_status() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_test_agents(&db);
+
+    // Seed a card in in_progress + a rework dispatch
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, created_at, updated_at)
+             VALUES ('card-265', 'Stuck Card', 'in_progress', 'ch-td', 'dispatch-265', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
+             VALUES ('dispatch-265', 'card-265', 'ch-td', 'rework', 'dispatched', 'Rework task', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dispatches/dispatch-265")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"done"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "invalid status 'done' must be rejected with 400"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid dispatch status"),
+        "error message must mention invalid status"
+    );
+
+    // Verify dispatch status is unchanged (pipeline invariant)
+    let conn = db.lock().unwrap();
+    let dispatch_status: String = conn
+        .query_row(
+            "SELECT status FROM task_dispatches WHERE id = 'dispatch-265'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        dispatch_status, "dispatched",
+        "dispatch status must be unchanged after rejected update"
+    );
+
+    // Verify card state is also unchanged (pipeline invariant)
+    let card_status: String = conn
+        .query_row(
+            "SELECT status FROM kanban_cards WHERE id = 'card-265'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        card_status, "in_progress",
+        "card status must be unchanged after rejected dispatch update"
+    );
+}
+
+/// #265: Valid statuses like "cancelled" must still work through the generic path.
+#[tokio::test]
+async fn patch_dispatch_accepts_valid_status_cancelled() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_test_agents(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, created_at, updated_at)
+             VALUES ('card-265v', 'Valid Card', 'in_progress', 'ch-td', 'dispatch-265v', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
+             VALUES ('dispatch-265v', 'card-265v', 'ch-td', 'rework', 'dispatched', 'Rework task', datetime('now'), datetime('now'))",
+            [],
+        ).unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/dispatches/dispatch-265v")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"cancelled"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "valid status 'cancelled' must be accepted"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["dispatch"]["status"], "cancelled");
+}
