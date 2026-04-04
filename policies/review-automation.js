@@ -190,6 +190,18 @@ var reviewAutomation = {
     if (dispatches.length === 0) return;
     var dispatch = dispatches[0];
 
+    // #198: create-pr dispatch completed — transition card to terminal
+    if (dispatch.dispatch_type === "create-pr") {
+      var cfg2 = agentdesk.pipeline.resolveForCard(dispatch.kanban_card_id);
+      var init2 = agentdesk.pipeline.kickoffState(cfg2);
+      var ip2 = agentdesk.pipeline.nextGatedTarget(init2, cfg2);
+      var rev2 = agentdesk.pipeline.nextGatedTarget(ip2, cfg2);
+      var term2 = agentdesk.pipeline.nextGatedTargetWithGate(rev2, "review_passed", cfg2) || agentdesk.pipeline.terminalState(cfg2);
+      agentdesk.kanban.setStatus(dispatch.kanban_card_id, term2);
+      agentdesk.log.info("[review] Create-PR completed for card " + dispatch.kanban_card_id + " → " + term2);
+      return;
+    }
+
     // Only handle review-type dispatches
     if (dispatch.dispatch_type !== "review" && dispatch.dispatch_type !== "review-decision") return;
     if (!dispatch.kanban_card_id) return;
@@ -477,8 +489,39 @@ function processVerdict(cardId, verdict, result) {
         );
         agentdesk.log.info("[review] Card " + cardId + " completed all pipeline stages");
       }
-      agentdesk.kanban.setStatus(cardId, reviewPassTarget);
-      agentdesk.log.info("[review] Card " + cardId + " passed review → " + reviewPassTarget);
+
+      // #198: If the card has worktree sessions, create a "create-pr" dispatch
+      // so the agent pushes the branch and opens a PR before going terminal.
+      var prDispatched = false;
+      var prCardInfo = agentdesk.db.query(
+        "SELECT assigned_agent_id, title, github_issue_number FROM kanban_cards WHERE id = ?",
+        [cardId]
+      );
+      if (prCardInfo.length > 0 && prCardInfo[0].assigned_agent_id) {
+        var agentId = prCardInfo[0].assigned_agent_id;
+        var wtSessions = agentdesk.db.query(
+          "SELECT cwd FROM sessions WHERE agent_id = ? AND cwd LIKE '%worktrees/%' ORDER BY last_heartbeat DESC LIMIT 1",
+          [agentId]
+        );
+        if (wtSessions.length > 0) {
+          var issueNum = prCardInfo[0].github_issue_number || "?";
+          try {
+            agentdesk.dispatch.create(
+              cardId, agentId, "create-pr",
+              "[PR 생성] #" + issueNum + " " + prCardInfo[0].title
+            );
+            prDispatched = true;
+            agentdesk.log.info("[review] Create-PR dispatch created for worktree card " + cardId);
+          } catch (e) {
+            agentdesk.log.warn("[review] Create-PR dispatch failed: " + e + " — falling through to terminal");
+          }
+        }
+      }
+
+      if (!prDispatched) {
+        agentdesk.kanban.setStatus(cardId, reviewPassTarget);
+        agentdesk.log.info("[review] Card " + cardId + " passed review → " + reviewPassTarget);
+      }
     }
 
   } else if (verdict === "improve" || verdict === "reject" || verdict === "rework") {
