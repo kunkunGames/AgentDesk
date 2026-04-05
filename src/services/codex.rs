@@ -977,13 +977,13 @@ mod tests {
     use super::{
         TMUX_PROMPT_B64_PREFIX, base_exec_args, compose_codex_prompt, handle_codex_json_line,
     };
+    use crate::services::claude::StreamMessage;
     #[cfg(unix)]
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
     };
     #[cfg(unix)]
     use crate::services::provider::ProviderKind;
-    use crate::services::claude::StreamMessage;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
     #[cfg(unix)]

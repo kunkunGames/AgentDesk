@@ -367,7 +367,11 @@ fn standard_fallback_dirs() -> Vec<PathBuf> {
             push_unique_path(root.join("Volta/bin"), &mut dirs, &mut seen);
             push_unique_path(root.join("Programs"), &mut dirs, &mut seen);
             for provider_dir in ["claude", "codex", "gemini", "qwen"] {
-                push_unique_path(root.join("Programs").join(provider_dir), &mut dirs, &mut seen);
+                push_unique_path(
+                    root.join("Programs").join(provider_dir),
+                    &mut dirs,
+                    &mut seen,
+                );
             }
         }
         if let Some(user_profile) = std::env::var_os("USERPROFILE") {
