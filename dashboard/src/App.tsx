@@ -14,6 +14,7 @@ import type {
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import * as api from "./api/client";
+import { onApiError } from "./api/client";
 import { KanbanProvider, useKanban } from "./contexts/KanbanContext";
 import { OfficeProvider, useOffice } from "./contexts/OfficeContext";
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
@@ -31,13 +32,15 @@ const OfficeManagerModal = lazy(() => import("./components/OfficeManagerModal"))
 const AgentInfoCard = lazy(() => import("./components/agent-manager/AgentInfoCard"));
 import { useSpriteMap } from "./components/AgentAvatar";
 import { useI18n } from "./i18n";
-import NotificationCenter, { type Notification, useNotifications } from "./components/NotificationCenter";
+import NotificationCenter, { type Notification, useNotifications, ToastOverlay } from "./components/NotificationCenter";
 import { useDashboardSocket } from "./app/useDashboardSocket";
 import {
   Building2,
   LayoutDashboard,
   Users,
   FileText,
+  MessageSquare,
+  Puzzle,
   Wifi,
   WifiOff,
   Settings,
@@ -46,7 +49,7 @@ import {
 const ChatView = lazy(() => import("./components/ChatView"));
 const CommandPalette = lazy(() => import("./components/CommandPalette"));
 
-type ViewMode = "office" | "dashboard" | "agents" | "meetings" | "chat" | "skills" | "kanban" | "settings";
+import { VIEW_REGISTRY, NAV_ROUTES, type ViewMode } from "./app/routes";
 
 function hasUnresolvedMeetingIssues(meeting: RoundTableMeeting): boolean {
   const totalIssues = meeting.proposed_issues?.length ?? 0;
@@ -87,10 +90,25 @@ interface BootstrapData {
 
 export default function App() {
   const [data, setData] = useState<BootstrapData | null>(null);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const { notifications, pushNotification, dismissNotification } = useNotifications();
+
+  // Wire up API error → toast notifications (throttled: max 1 per 3s per endpoint)
+  useEffect(() => {
+    const lastFired = new Map<string, number>();
+    onApiError((url, error) => {
+      const now = Date.now();
+      const last = lastFired.get(url) ?? 0;
+      if (now - last < 3000) return;
+      lastFired.set(url, now);
+      pushNotification(`API error: ${error.message}`, "error");
+    });
+    return () => onApiError(null);
+  }, [pushNotification]);
 
   useEffect(() => {
     (async () => {
+      const partial: string[] = [];
       try {
         await api.getSession();
         const off = await api.getOffices();
@@ -103,11 +121,14 @@ export default function App() {
           api.getDispatchedSessions(true),
           api.getStats(defaultOfficeId),
           api.getSettings(),
-          api.getRoundTableMeetings().catch(() => [] as RoundTableMeeting[]),
-          api.getAuditLogs(12).catch(() => [] as AuditLogEntry[]),
-          api.getKanbanCards().catch(() => [] as KanbanCard[]),
-          api.getTaskDispatches({ limit: 200 }).catch(() => [] as TaskDispatch[]),
+          api.getRoundTableMeetings().catch(() => { partial.push("meetings"); return [] as RoundTableMeeting[]; }),
+          api.getAuditLogs(12).catch(() => { partial.push("audit logs"); return [] as AuditLogEntry[]; }),
+          api.getKanbanCards().catch(() => { partial.push("kanban"); return [] as KanbanCard[]; }),
+          api.getTaskDispatches({ limit: 200 }).catch(() => { partial.push("dispatches"); return [] as TaskDispatch[]; }),
         ]);
+        if (partial.length > 0) {
+          pushNotification(`Failed to load: ${partial.join(", ")}`, "warning");
+        }
         const resolvedSettings = set.companyName
           ? ({ ...DEFAULT_SETTINGS, ...set } as CompanySettings)
           : DEFAULT_SETTINGS;
@@ -127,26 +148,13 @@ export default function App() {
           selectedOfficeId: defaultOfficeId ?? null,
         });
       } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
         console.error("Bootstrap failed:", e);
-        // Allow rendering even on failure so user sees something
-        setData({
-          offices: [],
-          agents: [],
-          allAgents: [],
-          departments: [],
-          allDepartments: [],
-          sessions: [],
-          stats: null,
-          settings: DEFAULT_SETTINGS,
-          roundTableMeetings: [],
-          auditLogs: [],
-          kanbanCards: [],
-          taskDispatches: [],
-          selectedOfficeId: null,
-        });
+        setBootstrapError(msg);
+        // Do NOT call setData — keep data null so the error UI renders
       }
     })();
-  }, []);
+  }, [pushNotification]);
 
   // WS connection — kept at root so wsRef is available early
   // The handler is a no-op pass-through: each context listens via the
@@ -176,10 +184,21 @@ export default function App() {
 
   if (!data) {
     return (
-      <div className="flex items-center justify-center h-screen bg-gray-900 text-gray-400">
+      <div className="flex items-center justify-center h-screen bg-th-bg-primary text-th-text-muted">
         <div className="text-center">
           <div className="text-4xl mb-4">🐾</div>
-          <div>{t({ ko: "AgentDesk 대시보드 로딩 중...", en: "Loading AgentDesk Dashboard..." })}</div>
+          <div>{bootstrapError
+            ? t({ ko: `로딩 실패: ${bootstrapError}`, en: `Load failed: ${bootstrapError}` })
+            : t({ ko: "AgentDesk 대시보드 로딩 중...", en: "Loading AgentDesk Dashboard..." })
+          }</div>
+          {bootstrapError && (
+            <button
+              className="mt-4 px-4 py-2 rounded-lg bg-surface-medium text-th-text-primary text-sm"
+              onClick={() => window.location.reload()}
+            >
+              {t({ ko: "새로고침", en: "Reload" })}
+            </button>
+          )}
         </div>
       </div>
     );
@@ -229,7 +248,7 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
   const [officeInfoAgent, setOfficeInfoAgent] = useState<Agent | null>(null);
   const [showCmdPalette, setShowCmdPalette] = useState(false);
 
-  const { settings, setSettings, stats, refreshStats, isKo, locale, tr } = useSettings();
+  const { settings, setSettings, stats, refreshStats, refreshingStats, isKo, locale, tr } = useSettings();
   const {
     offices,
     selectedOfficeId,
@@ -252,6 +271,8 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
     refreshDepartments,
     refreshAllDepartments,
     refreshAuditLogs,
+    refreshing,
+    datasetStates,
   } = useOffice();
   const { kanbanCards, taskDispatches, upsertKanbanCard, setKanbanCards } = useKanban();
 
@@ -279,30 +300,34 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
   }, [refreshOffices, refreshAgents, refreshAllAgents, refreshDepartments, refreshAllDepartments, refreshAuditLogs]);
 
   const newMeetingsCount = roundTableMeetings.filter(hasUnresolvedMeetingIssues).length;
-  const viewFallbackLabel = useMemo(() => ({
-    office: isKo ? "오피스 로딩 중..." : "Loading Office...",
-    dashboard: isKo ? "대시보드 로딩 중..." : "Loading Dashboard...",
-    agents: isKo ? "직원 로딩 중..." : "Loading Agents...",
-    kanban: isKo ? "칸반 로딩 중..." : "Loading Kanban...",
-    meetings: isKo ? "회의 로딩 중..." : "Loading Meetings...",
-    chat: isKo ? "채팅 로딩 중..." : "Loading Chat...",
-    skills: isKo ? "스킬 로딩 중..." : "Loading Skills...",
-    settings: isKo ? "설정 로딩 중..." : "Loading Settings...",
-  } satisfies Record<ViewMode, string>), [isKo]);
+  const viewFallbackLabel = useMemo(() =>
+    Object.fromEntries(VIEW_REGISTRY.map((r) => [r.id, isKo ? r.loadingKo : r.loadingEn])) as Record<ViewMode, string>,
+  [isKo]);
 
-  const navItems: Array<{ id: ViewMode; icon: React.ReactNode; label: string; badge?: number; badgeColor?: string }> = [
-    { id: "office", icon: <Building2 size={20} />, label: isKo ? "오피스" : "Office" },
-    { id: "dashboard", icon: <LayoutDashboard size={20} />, label: isKo ? "대시보드" : "Dashboard" },
-    { id: "kanban", icon: <KanbanSquare size={20} />, label: isKo ? "칸반" : "Kanban" },
-    { id: "agents", icon: <Users size={20} />, label: isKo ? "직원" : "Staff" },
-    { id: "meetings", icon: <FileText size={20} />, label: isKo ? "회의" : "Meetings", badge: newMeetingsCount || undefined, badgeColor: "bg-amber-500" },
-    { id: "settings", icon: <Settings size={20} />, label: isKo ? "설정" : "Settings" },
-  ];
+  const navIconMap: Record<string, React.ReactNode> = {
+    office: <Building2 size={20} />,
+    dashboard: <LayoutDashboard size={20} />,
+    kanban: <KanbanSquare size={20} />,
+    agents: <Users size={20} />,
+    meetings: <FileText size={20} />,
+    chat: <MessageSquare size={20} />,
+    skills: <Puzzle size={20} />,
+    settings: <Settings size={20} />,
+  };
+  const navBadges: Record<string, { badge?: number; badgeColor?: string }> = {
+    meetings: { badge: newMeetingsCount || undefined, badgeColor: "bg-amber-500" },
+  };
+  const navItems = NAV_ROUTES.map((r) => ({
+    id: r.id,
+    icon: navIconMap[r.id] ?? <span>{r.icon}</span>,
+    label: isKo ? r.labelKo : r.labelEn,
+    ...navBadges[r.id],
+  }));
 
   return (
-    <div className="flex fixed inset-0 bg-gray-900">
+    <div className="flex sm:fixed sm:inset-0 min-h-dvh bg-th-bg-primary">
       {/* Sidebar (hidden on mobile) */}
-      <nav className="hidden sm:flex w-[4.5rem] bg-gray-950 border-r border-gray-800 flex-col items-center py-4 gap-1">
+      <nav className="hidden sm:flex w-[4.5rem] bg-th-nav-bg border-r border-th-card-border flex-col items-center py-4 gap-1">
         <div className="text-2xl mb-4">🐾</div>
         {navItems.map((item) => (
           <NavBtn
@@ -321,9 +346,11 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
           className="w-10 h-10 flex items-center justify-center rounded-lg"
           title={wsConnected ? (isKo ? "서버 연결됨" : "Server connected") : (isKo ? "서버 연결 끊김" : "Server disconnected")}
         >
-          {wsConnected
-            ? <Wifi size={16} className="text-emerald-500" />
-            : <WifiOff size={16} className="text-red-400 animate-pulse" />}
+          {(refreshing || refreshingStats)
+            ? <div className="w-4 h-4 rounded-full border-2 border-th-text-muted border-t-indigo-400 animate-spin" title={isKo ? "데이터 갱신 중..." : "Refreshing..."} />
+            : wsConnected
+              ? <Wifi size={16} className="text-emerald-500" />
+              : <WifiOff size={16} className="text-red-400 animate-pulse" />}
         </div>
       </nav>
 
@@ -338,6 +365,25 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
             onManageOffices={() => setShowOfficeManager(true)}
             isKo={isKo}
           />
+        )}
+
+        {/* Dataset status banners — loading and error per dataset */}
+        {Object.entries(datasetStates).some(([, s]) => s.loading) && (
+          <div className="px-3 py-1 text-xs bg-indigo-500/10 text-indigo-400 border-b border-indigo-500/20 flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full border-2 border-indigo-400/40 border-t-indigo-400 animate-spin shrink-0" />
+            <span>{isKo ? "갱신 중:" : "Refreshing:"}</span>
+            {Object.entries(datasetStates)
+              .filter(([, s]) => s.loading)
+              .map(([key]) => <span key={key} className="px-1.5 py-0.5 rounded bg-indigo-500/20">{key}</span>)}
+          </div>
+        )}
+        {Object.entries(datasetStates).some(([, s]) => s.error) && (
+          <div className="px-3 py-1 text-xs bg-red-500/10 text-red-400 border-b border-red-500/20 flex items-center gap-2">
+            <span>{isKo ? "로드 실패:" : "Failed:"}</span>
+            {Object.entries(datasetStates)
+              .filter(([, s]) => s.error)
+              .map(([key, s]) => <span key={key} className="px-1.5 py-0.5 rounded bg-red-500/20" title={s.error ?? undefined}>{key}</span>)}
+          </div>
         )}
 
         <main className="flex-1 min-h-0 flex flex-col overflow-hidden mb-14 sm:mb-0">
@@ -453,19 +499,24 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
       </div>
 
       {/* G1: Mobile bottom tab bar */}
-      <nav className="sm:hidden fixed bottom-0 left-0 right-0 bg-gray-950 border-t border-gray-800 flex justify-around items-center h-14 z-50">
+      <nav className="sm:hidden fixed bottom-0 left-0 right-0 bg-th-nav-bg border-t border-th-card-border flex justify-around items-center h-14 z-50">
+        {(refreshing || refreshingStats) && (
+          <div className="absolute top-0 left-0 right-0 h-0.5 overflow-hidden">
+            <div className="h-full bg-indigo-400 animate-[loading-bar_1.5s_ease-in-out_infinite]" />
+          </div>
+        )}
         {navItems.map((item) => (
           <button
             key={item.id}
             onClick={() => { setView(item.id); if (item.id === "dashboard") refreshStats(); }}
-            className={`relative flex flex-col items-center justify-center flex-1 h-full text-[10px] ${
-              view === item.id ? "text-indigo-400" : "text-gray-500"
+            className={`relative flex flex-col items-center justify-center flex-1 h-full text-xs ${
+              view === item.id ? "text-indigo-400" : "text-th-text-muted"
             }`}
           >
             {item.icon}
             <span className="mt-0.5">{item.label}</span>
             {item.badge !== undefined && item.badge > 0 && (
-              <span className={`absolute top-1 right-1/4 ${item.badgeColor || "bg-emerald-500"} text-white text-[8px] w-3.5 h-3.5 rounded-full flex items-center justify-center`}>
+              <span className={`absolute top-1 right-1/4 ${item.badgeColor || "bg-emerald-500"} text-white text-xs w-3.5 h-3.5 rounded-full flex items-center justify-center`}>
                 {item.badge}
               </span>
             )}
@@ -515,6 +566,9 @@ function AppShell({ wsConnected, wsRef, notifications, pushNotification, dismiss
           />
         )}
       </Suspense>
+
+      {/* Toast overlay for API errors and warnings */}
+      <ToastOverlay notifications={notifications} onDismiss={dismissNotification} />
     </div>
   );
 }
@@ -543,13 +597,13 @@ function NavBtn({
       className={`relative w-14 rounded-lg flex flex-col items-center justify-center gap-0.5 py-1.5 transition-colors ${
         active
           ? "bg-indigo-600 text-white"
-          : "text-gray-500 hover:text-gray-300 hover:bg-gray-800"
+          : "text-th-text-muted hover:text-th-text-primary hover:bg-surface-hover"
       }`}
     >
       {icon}
-      <span className="text-[10px] leading-tight">{label}</span>
+      <span className="text-xs leading-tight">{label}</span>
       {badge !== undefined && badge > 0 && (
-        <span className={`absolute -top-1 -right-0.5 ${badgeColor || "bg-emerald-500"} text-white text-[10px] w-4 h-4 rounded-full flex items-center justify-center`}>
+        <span className={`absolute -top-1 -right-0.5 ${badgeColor || "bg-emerald-500"} text-white text-xs w-4 h-4 rounded-full flex items-center justify-center`}>
           {badge}
         </span>
       )}
