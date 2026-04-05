@@ -33,6 +33,36 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
         .filter(|s| !s.is_empty())
 }
 
+fn is_card_scoped_worktree_path(path: &str, branch: Option<&str>) -> bool {
+    let resolved_branch = branch
+        .map(str::to_string)
+        .or_else(|| crate::services::platform::shell::git_branch_name(path));
+    let repo_root = crate::services::platform::resolve_repo_dir();
+    let is_repo_root = repo_root.as_deref() == Some(path);
+    let is_non_main_branch = resolved_branch
+        .as_deref()
+        .map(|value| value != "main" && value != "master")
+        .unwrap_or(false);
+    !is_repo_root || is_non_main_branch
+}
+
+fn refresh_worktree_execution_target(
+    target: &DispatchExecutionTarget,
+) -> Option<DispatchExecutionTarget> {
+    let path = target.worktree_path.as_deref()?;
+    if !is_card_scoped_worktree_path(path, target.branch.as_deref()) {
+        return None;
+    }
+    let mut refreshed = execution_target_from_dir(path)?;
+    if refreshed.branch.is_none() {
+        refreshed.branch = target.branch.clone();
+    }
+    if refreshed.worktree_path.is_none() {
+        refreshed.worktree_path = target.worktree_path.clone();
+    }
+    Some(refreshed)
+}
+
 /// Check whether a commit message references the given card's GitHub issue number.
 ///
 /// Used to cross-validate dispatch-history commits so a poisoned `reviewed_commit`
@@ -175,18 +205,8 @@ fn latest_completed_work_dispatch_target(
         });
     }
 
-    let trusted_path = path.filter(|candidate| {
-        let resolved_branch = branch
-            .clone()
-            .or_else(|| crate::services::platform::shell::git_branch_name(candidate));
-        let repo_root = crate::services::platform::resolve_repo_dir();
-        let is_repo_root = repo_root.as_deref() == Some(*candidate);
-        let is_non_main_branch = resolved_branch
-            .as_deref()
-            .map(|value| value != "main" && value != "master")
-            .unwrap_or(false);
-        !is_repo_root || is_non_main_branch
-    });
+    let trusted_path =
+        path.filter(|candidate| is_card_scoped_worktree_path(candidate, branch.as_deref()));
 
     trusted_path.and_then(execution_target_from_dir)
 }
@@ -281,23 +301,35 @@ fn build_review_context(
             // #269: Cross-validate the commit against the card's issue number.
             // A poisoned reviewed_commit (from an unrelated issue) can propagate
             // through review→rework cycles if we blindly trust dispatch history.
-            let validated_work_target =
-                latest_completed_work_dispatch_target(db, kanban_card_id).filter(|t| {
-                    let valid =
-                        commit_belongs_to_card_issue(db, kanban_card_id, &t.reviewed_commit);
-                    if !valid {
-                        tracing::warn!(
-                            "[dispatch] Review dispatch for card {}: work target commit {} doesn't match card issue — skipping to next fallback",
-                            kanban_card_id,
-                            &t.reviewed_commit[..8.min(t.reviewed_commit.len())]
-                        );
-                    }
-                    valid
-                });
+            let latest_work_target = latest_completed_work_dispatch_target(db, kanban_card_id);
+            let validated_work_target = latest_work_target.as_ref().filter(|t| {
+                let valid =
+                    commit_belongs_to_card_issue(db, kanban_card_id, &t.reviewed_commit);
+                if !valid {
+                    tracing::warn!(
+                        "[dispatch] Review dispatch for card {}: work target commit {} doesn't match card issue — skipping to next fallback",
+                        kanban_card_id,
+                        &t.reviewed_commit[..8.min(t.reviewed_commit.len())]
+                    );
+                }
+                valid
+            });
             if let Some(target) = validated_work_target {
                 apply_review_target_context(&target, obj);
                 tracing::info!(
                     "[dispatch] Review dispatch for card {}: reusing latest work target (commit {}, branch: {:?}, path: {:?})",
+                    kanban_card_id,
+                    &target.reviewed_commit[..8.min(target.reviewed_commit.len())],
+                    target.branch.as_deref(),
+                    target.worktree_path.as_deref()
+                );
+            } else if let Some(target) = latest_work_target
+                .as_ref()
+                .and_then(refresh_worktree_execution_target)
+            {
+                apply_review_target_context(&target, obj);
+                tracing::info!(
+                    "[dispatch] Review dispatch for card {}: latest work commit didn't validate, but keeping non-main worktree target (commit {}, branch: {:?}, path: {:?})",
                     kanban_card_id,
                     &target.reviewed_commit[..8.min(target.reviewed_commit.len())],
                     target.branch.as_deref(),
@@ -2410,5 +2442,65 @@ mod tests {
         assert_ne!(parsed["reviewed_commit"], poisoned_commit);
         assert_eq!(parsed["worktree_path"], repo_dir);
         assert_eq!(parsed["branch"], "main");
+    }
+
+    #[test]
+    fn review_context_keeps_non_main_worktree_when_latest_commit_does_not_match_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-worktree-fallback", "review");
+        set_card_issue_number(&db, "card-review-worktree-fallback", 320);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let wt_dir = repo.path().join("wt-320");
+        let wt_path = wt_dir.to_str().unwrap();
+
+        run_git(
+            repo_dir,
+            &["worktree", "add", wt_path, "-b", "wt/320-phase6"],
+        );
+        std::fs::write(
+            wt_dir.join("phase6.txt"),
+            "local-only dashboard v2 changes\n",
+        )
+        .unwrap();
+
+        let worktree_head = crate::services::platform::git_head_commit(wt_path).unwrap();
+        let main_head = git_commit(repo_dir, "chore: unrelated main advance (#999)");
+        assert_ne!(
+            worktree_head, main_head,
+            "main must move past worktree HEAD"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-worktree-fallback', 'card-review-worktree-fallback', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": wt_path,
+                    "completed_branch": "wt/320-phase6",
+                    "completed_commit": worktree_head.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-worktree-fallback", "agent-1", &json!({}))
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["worktree_path"], wt_path);
+        assert_eq!(parsed["branch"], "wt/320-phase6");
+        assert_eq!(parsed["reviewed_commit"], worktree_head);
+        assert_ne!(parsed["reviewed_commit"], main_head);
     }
 }
