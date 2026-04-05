@@ -971,18 +971,22 @@ mod tests {
     use std::sync::mpsc;
 
     #[cfg(unix)]
+    use super::build_tmux_launch_env_lines;
+    #[cfg(unix)]
     use super::send_followup_to_tmux;
     use super::{
-        TMUX_PROMPT_B64_PREFIX, base_exec_args, build_tmux_launch_env_lines, compose_codex_prompt,
-        handle_codex_json_line,
+        TMUX_PROMPT_B64_PREFIX, base_exec_args, compose_codex_prompt, handle_codex_json_line,
     };
-    use crate::services::claude::StreamMessage;
+    #[cfg(unix)]
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
     };
+    #[cfg(unix)]
     use crate::services::provider::ProviderKind;
+    use crate::services::claude::StreamMessage;
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
+    #[cfg(unix)]
     #[test]
     fn test_tmux_launch_env_lines_include_exec_path_and_report_envs() {
         let env_lines = build_tmux_launch_env_lines(

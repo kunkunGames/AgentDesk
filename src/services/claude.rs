@@ -2568,12 +2568,14 @@ fn execute_streaming_remote_tmux(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
     };
 
     // ========== is_valid_session_id tests ==========
 
+    #[cfg(unix)]
     #[test]
     fn test_tmux_launch_env_lines_include_exec_path_and_report_envs() {
         let env_lines = build_tmux_launch_env_lines(

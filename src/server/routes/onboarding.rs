@@ -889,17 +889,20 @@ pub async fn check_provider(
     }
 
     // Check login (heuristic: config directory exists with content)
-    let home = std::env::var("HOME").unwrap_or_default();
-    let config_dir = if cmd == "claude" {
-        format!("{home}/.claude")
-    } else if cmd == "codex" {
-        format!("{home}/.codex")
-    } else if cmd == "qwen" {
-        format!("{home}/.qwen")
-    } else {
-        format!("{home}/.gemini")
-    };
-    let logged_in = std::path::Path::new(&config_dir).is_dir();
+    let logged_in = dirs::home_dir()
+        .map(|home| {
+            let config_dir = if cmd == "claude" {
+                home.join(".claude")
+            } else if cmd == "codex" {
+                home.join(".codex")
+            } else if cmd == "qwen" {
+                home.join(".qwen")
+            } else {
+                home.join(".gemini")
+            };
+            config_dir.is_dir()
+        })
+        .unwrap_or(false);
 
     (
         StatusCode::OK,
