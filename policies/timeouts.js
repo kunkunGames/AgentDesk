@@ -58,6 +58,10 @@ function getTimeoutInterval(key, fallbackMinutes) {
   return "-" + val + " minutes";
 }
 
+function latestCardActivityExpr(cardAlias, dispatchAlias) {
+  return "MAX(COALESCE(" + dispatchAlias + ".created_at, ''), COALESCE(" + cardAlias + ".updated_at, ''), COALESCE(" + cardAlias + ".started_at, ''))";
+}
+
 // #231: PM Decision notification dedup — durable kv_meta buffer.
 // Reasons are persisted to kv_meta (survives restart) and flushed
 // in onTick (legacy, 5min) AFTER all tiered handlers to combine
@@ -315,7 +319,9 @@ var timeouts = {
     var bBlocked = bForce.length > 1 ? bForce[1] : bForce[0];
     var inProgressInterval = getTimeoutInterval("in_progress_stale_min", 120);
     var staleInProgress = agentdesk.db.query(
-      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '" + inProgressInterval + "')",
+      "SELECT kc.id FROM kanban_cards kc " +
+      "LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id " +
+      "WHERE kc.status = ? AND " + latestCardActivityExpr("kc", "td") + " < datetime('now', '" + inProgressInterval + "')",
       [bInProgress]
     );
     for (var j = 0; j < staleInProgress.length; j++) {
