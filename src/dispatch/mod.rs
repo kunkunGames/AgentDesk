@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::db::Db;
+use crate::db::agents::{load_agent_channel_bindings, resolve_agent_dispatch_channel_on_conn};
 use crate::engine::PolicyEngine;
+use crate::services::provider::ProviderKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DispatchExecutionTarget {
@@ -29,6 +31,89 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
         .get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+fn is_card_scoped_worktree_path(path: &str, branch: Option<&str>) -> bool {
+    let resolved_branch = branch
+        .map(str::to_string)
+        .or_else(|| crate::services::platform::shell::git_branch_name(path));
+    let repo_root = crate::services::platform::resolve_repo_dir();
+    let is_repo_root = repo_root.as_deref() == Some(path);
+    let is_non_main_branch = resolved_branch
+        .as_deref()
+        .map(|value| value != "main" && value != "master")
+        .unwrap_or(false);
+    !is_repo_root || is_non_main_branch
+}
+
+fn refresh_worktree_execution_target(
+    target: &DispatchExecutionTarget,
+) -> Option<DispatchExecutionTarget> {
+    let path = target.worktree_path.as_deref()?;
+    if !is_card_scoped_worktree_path(path, target.branch.as_deref()) {
+        return None;
+    }
+    let mut refreshed = execution_target_from_dir(path)?;
+    if refreshed.branch.is_none() {
+        refreshed.branch = target.branch.clone();
+    }
+    if refreshed.worktree_path.is_none() {
+        refreshed.worktree_path = target.worktree_path.clone();
+    }
+    Some(refreshed)
+}
+
+/// Check whether a commit message references the given card's GitHub issue number.
+///
+/// Used to cross-validate dispatch-history commits so a poisoned `reviewed_commit`
+/// from an unrelated issue cannot propagate through review→rework cycles (#269).
+///
+/// Returns `false` (reject → fallback) when verification is impossible (repo dir
+/// missing, git unreachable, commit not locally available). This fail-closed
+/// design ensures the fallback chain always reaches `resolve_card_worktree()` or
+/// `resolve_card_issue_commit_target()` when the dispatch-history commit can't
+/// be confirmed as belonging to this issue.
+fn commit_belongs_to_card_issue(db: &Db, card_id: &str, commit_sha: &str) -> bool {
+    let issue_number: Option<i64> = db.separate_conn().ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
+    });
+    let Some(issue_number) = issue_number else {
+        // No issue number on card — can't validate, assume OK
+        return true;
+    };
+    let Some(repo_dir) = crate::services::platform::resolve_repo_dir() else {
+        tracing::warn!(
+            "[dispatch] commit_belongs_to_card_issue: repo dir unavailable — rejecting to fallback"
+        );
+        return false;
+    };
+    // Check commit subject for (#<issue_number>)
+    let Ok(output) = std::process::Command::new("git")
+        .args(["log", "--format=%s", "-n", "1", commit_sha])
+        .current_dir(&repo_dir)
+        .output()
+    else {
+        tracing::warn!(
+            "[dispatch] commit_belongs_to_card_issue: git log failed — rejecting to fallback"
+        );
+        return false;
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            "[dispatch] commit_belongs_to_card_issue: commit {} not reachable — rejecting to fallback",
+            &commit_sha[..8.min(commit_sha.len())]
+        );
+        return false;
+    }
+    let subject = String::from_utf8_lossy(&output.stdout);
+    let pattern = format!("(#{})", issue_number);
+    subject.contains(&pattern)
 }
 
 fn latest_completed_work_dispatch_target(
@@ -120,18 +205,8 @@ fn latest_completed_work_dispatch_target(
         });
     }
 
-    let trusted_path = path.filter(|candidate| {
-        let resolved_branch = branch
-            .clone()
-            .or_else(|| crate::services::platform::shell::git_branch_name(candidate));
-        let repo_root = crate::services::platform::resolve_repo_dir();
-        let is_repo_root = repo_root.as_deref() == Some(*candidate);
-        let is_non_main_branch = resolved_branch
-            .as_deref()
-            .map(|value| value != "main" && value != "master")
-            .unwrap_or(false);
-        !is_repo_root || is_non_main_branch
-    });
+    let trusted_path =
+        path.filter(|candidate| is_card_scoped_worktree_path(candidate, branch.as_deref()));
 
     trusted_path.and_then(execution_target_from_dir)
 }
@@ -222,10 +297,39 @@ fn build_review_context(
             // Prefer the actual target used by the latest completed work dispatch
             // for this card. This keeps review aligned even when the card had no
             // dedicated worktree and the agent worked directly in the repo root.
-            if let Some(target) = latest_completed_work_dispatch_target(db, kanban_card_id) {
+            //
+            // #269: Cross-validate the commit against the card's issue number.
+            // A poisoned reviewed_commit (from an unrelated issue) can propagate
+            // through review→rework cycles if we blindly trust dispatch history.
+            let latest_work_target = latest_completed_work_dispatch_target(db, kanban_card_id);
+            let validated_work_target = latest_work_target.as_ref().filter(|t| {
+                let valid =
+                    commit_belongs_to_card_issue(db, kanban_card_id, &t.reviewed_commit);
+                if !valid {
+                    tracing::warn!(
+                        "[dispatch] Review dispatch for card {}: work target commit {} doesn't match card issue — skipping to next fallback",
+                        kanban_card_id,
+                        &t.reviewed_commit[..8.min(t.reviewed_commit.len())]
+                    );
+                }
+                valid
+            });
+            if let Some(target) = validated_work_target {
                 apply_review_target_context(&target, obj);
                 tracing::info!(
                     "[dispatch] Review dispatch for card {}: reusing latest work target (commit {}, branch: {:?}, path: {:?})",
+                    kanban_card_id,
+                    &target.reviewed_commit[..8.min(target.reviewed_commit.len())],
+                    target.branch.as_deref(),
+                    target.worktree_path.as_deref()
+                );
+            } else if let Some(target) = latest_work_target
+                .as_ref()
+                .and_then(refresh_worktree_execution_target)
+            {
+                apply_review_target_context(&target, obj);
+                tracing::info!(
+                    "[dispatch] Review dispatch for card {}: latest work commit didn't validate, but keeping non-main worktree target (commit {}, branch: {:?}, path: {:?})",
                     kanban_card_id,
                     &target.reviewed_commit[..8.min(target.reviewed_commit.len())],
                     target.branch.as_deref(),
@@ -275,23 +379,30 @@ fn build_review_context(
         // Inject from_provider/target_provider for cross-provider review validation
         if !obj.contains_key("from_provider") || !obj.contains_key("target_provider") {
             if let Ok(conn) = db.separate_conn() {
-                if let Ok((ch, alt)) = conn.query_row(
-                    "SELECT discord_channel_id, discord_channel_alt FROM agents WHERE id = ?1",
-                    [to_agent_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
-                ) {
+                if let Ok(Some(bindings)) = load_agent_channel_bindings(&conn, to_agent_id) {
+                    let primary_provider = bindings
+                        .provider
+                        .as_deref()
+                        .and_then(ProviderKind::from_str);
                     if !obj.contains_key("from_provider") {
-                        if let Some(fp) = ch.as_deref().and_then(provider_from_channel_suffix) {
+                        if let Some(fp) = primary_provider.as_ref().map(ProviderKind::as_str) {
+                            obj.insert("from_provider".to_string(), json!(fp));
+                        } else if let Some(fp) = bindings
+                            .primary_channel()
+                            .as_deref()
+                            .and_then(provider_from_channel_suffix)
+                        {
                             obj.insert("from_provider".to_string(), json!(fp));
                         }
                     }
                     if !obj.contains_key("target_provider") {
-                        if let Some(tp) = alt.as_deref().and_then(provider_from_channel_suffix) {
+                        if let Some(tp) = primary_provider.as_ref().map(|p| p.counterpart()) {
+                            obj.insert("target_provider".to_string(), json!(tp.as_str()));
+                        } else if let Some(tp) = bindings
+                            .counter_model_channel()
+                            .as_deref()
+                            .and_then(provider_from_channel_suffix)
+                        {
                             obj.insert("target_provider".to_string(), json!(tp));
                         }
                     }
@@ -416,27 +527,18 @@ fn validate_dispatch_target_on_conn(
     to_agent_id: &str,
     dispatch_type: &str,
 ) -> Result<()> {
-    let channel_column = if dispatch_uses_alt_channel(dispatch_type) {
-        "discord_channel_alt"
-    } else {
-        "discord_channel_id"
-    };
     let channel_role = if dispatch_uses_alt_channel(dispatch_type) {
-        "alternate"
+        "counter-model"
     } else {
         "primary"
     };
 
-    let channel_value: Option<String> = conn
-        .query_row(
-            &format!("SELECT {channel_column} FROM agents WHERE id = ?1"),
-            [to_agent_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let channel_value: Option<String> =
+        resolve_agent_dispatch_channel_on_conn(conn, to_agent_id, Some(dispatch_type))
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
     let channel_value = channel_value.ok_or_else(|| {
         anyhow::anyhow!(
@@ -905,7 +1007,11 @@ pub fn mark_dispatch_completed(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
     let changed = conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+        "UPDATE task_dispatches
+         SET status = 'completed',
+             result = ?1,
+             updated_at = datetime('now'),
+             completed_at = COALESCE(completed_at, datetime('now')) \
          WHERE id = ?2 AND status IN ('pending', 'dispatched')",
         rusqlite::params![result_str, dispatch_id],
     )?;
@@ -936,7 +1042,11 @@ fn complete_dispatch_inner(
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
 
     let changed = conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+        "UPDATE task_dispatches
+         SET status = 'completed',
+             result = ?1,
+             updated_at = datetime('now'),
+             completed_at = COALESCE(completed_at, datetime('now')) \
          WHERE id = ?2 AND status IN ('pending', 'dispatched')",
         rusqlite::params![result_str, dispatch_id],
     )?;
@@ -1061,25 +1171,31 @@ pub fn query_dispatch_row(
     dispatch_id: &str,
 ) -> Result<serde_json::Value> {
     conn.query_row(
-        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at, COALESCE(retry_count, 0)
+        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at, completed_at, COALESCE(retry_count, 0)
          FROM task_dispatches WHERE id = ?1",
         [dispatch_id],
         |row| {
+            let status: String = row.get(5)?;
+            let updated_at: String = row.get(12)?;
+            let completed_at: Option<String> = row
+                .get::<_, Option<String>>(13)?
+                .or_else(|| (status == "completed").then(|| updated_at.clone()));
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "kanban_card_id": row.get::<_, Option<String>>(1)?,
                 "from_agent_id": row.get::<_, Option<String>>(2)?,
                 "to_agent_id": row.get::<_, Option<String>>(3)?,
                 "dispatch_type": row.get::<_, Option<String>>(4)?,
-                "status": row.get::<_, String>(5)?,
+                "status": status,
                 "title": row.get::<_, Option<String>>(6)?,
                 "context": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "result": row.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "parent_dispatch_id": row.get::<_, Option<String>>(9)?,
                 "chain_depth": row.get::<_, i64>(10)?,
                 "created_at": row.get::<_, String>(11)?,
-                "updated_at": row.get::<_, String>(12)?,
-                "retry_count": row.get::<_, i64>(13)?,
+                "updated_at": updated_at,
+                "completed_at": completed_at,
+                "retry_count": row.get::<_, i64>(14)?,
             }))
         },
     )
@@ -1256,6 +1372,40 @@ fn provider_from_channel_suffix(channel: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn repo_dir_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct RepoDirOverride {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl RepoDirOverride {
+        fn new(path: &str) -> Self {
+            let lock = repo_dir_env_lock().lock().unwrap();
+            let previous = std::env::var("AGENTDESK_REPO_DIR").ok();
+            unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RepoDirOverride {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_deref() {
+                unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) };
+            } else {
+                unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
+            }
+        }
+    }
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1279,11 +1429,53 @@ mod tests {
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
 
+    fn run_git(repo_dir: &str, args: &[&str]) -> std::process::Output {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap();
+
+        run_git(repo_dir, &["init", "-b", "main"]);
+        run_git(repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(repo_dir, &["config", "user.name", "Test"]);
+        run_git(repo_dir, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let override_guard = RepoDirOverride::new(repo_dir);
+        (repo, override_guard)
+    }
+
+    fn git_commit(repo_dir: &str, message: &str) -> String {
+        run_git(repo_dir, &["commit", "--allow-empty", "-m", message]);
+        crate::services::platform::git_head_commit(repo_dir).unwrap()
+    }
+
     fn seed_card(db: &Db, card_id: &str, status: &str) {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, created_at, updated_at) VALUES (?1, 'Test Card', ?2, datetime('now'), datetime('now'))",
             rusqlite::params![card_id, status],
+        )
+        .unwrap();
+    }
+
+    fn set_card_issue_number(db: &Db, card_id: &str, issue_number: i64) {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET github_issue_number = ?1 WHERE id = ?2",
+            rusqlite::params![issue_number, card_id],
         )
         .unwrap();
     }
@@ -1373,6 +1565,46 @@ mod tests {
             complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
 
         assert_eq!(completed["status"], "completed");
+    }
+
+    #[test]
+    fn complete_dispatch_records_completed_at() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-2-ts", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-2-ts",
+            "agent-1",
+            "implementation",
+            "title",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        let completed =
+            complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
+
+        assert!(
+            completed["completed_at"].as_str().is_some(),
+            "completion result must expose completed_at"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        let stored_completed_at: Option<String> = conn
+            .query_row(
+                "SELECT completed_at FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored_completed_at.is_some(),
+            "task_dispatches.completed_at must be stored for completed rows"
+        );
     }
 
     #[test]
@@ -2087,9 +2319,16 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-review-target", "review");
 
-        let repo_dir = "/tmp/test-review-target".to_string();
-        let completed_commit = "deadbeefcafebabe1234567890abcdef12345678".to_string();
-        let completed_branch = Some("wt/review-target".to_string());
+        let repo_dir = crate::services::platform::resolve_repo_dir()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap();
+        let completed_commit = crate::services::platform::git_head_commit(&repo_dir)
+            .unwrap_or_else(|| "ci-detached-head".to_string());
+        let completed_branch = crate::services::platform::shell::git_branch_name(&repo_dir);
 
         let conn = db.separate_conn().unwrap();
         conn.execute(
@@ -2121,5 +2360,147 @@ mod tests {
         if let Some(branch) = completed_branch {
             assert_eq!(parsed["branch"], branch);
         }
+    }
+
+    #[test]
+    fn review_context_accepts_latest_work_dispatch_commit_for_same_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-match", "review");
+        set_card_issue_number(&db, "card-review-match", 305);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let matching_commit = git_commit(repo_dir, "fix: target commit (#305)");
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-match', 'card-review-match', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": "main",
+                    "completed_commit": matching_commit.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-match", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["reviewed_commit"], matching_commit);
+        assert_eq!(parsed["worktree_path"], repo_dir);
+        assert_eq!(parsed["branch"], "main");
+    }
+
+    #[test]
+    fn review_context_rejects_latest_work_dispatch_commit_from_other_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-mismatch", "review");
+        set_card_issue_number(&db, "card-review-mismatch", 305);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let expected_commit = git_commit(repo_dir, "fix: target commit (#305)");
+        let poisoned_commit = git_commit(repo_dir, "chore: unrelated (#999)");
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-mismatch', 'card-review-mismatch', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": "main",
+                    "completed_commit": poisoned_commit.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-mismatch", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["reviewed_commit"], expected_commit);
+        assert_ne!(parsed["reviewed_commit"], poisoned_commit);
+        assert_eq!(parsed["worktree_path"], repo_dir);
+        assert_eq!(parsed["branch"], "main");
+    }
+
+    #[test]
+    fn review_context_keeps_non_main_worktree_when_latest_commit_does_not_match_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-worktree-fallback", "review");
+        set_card_issue_number(&db, "card-review-worktree-fallback", 320);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let wt_dir = repo.path().join("wt-320");
+        let wt_path = wt_dir.to_str().unwrap();
+
+        run_git(
+            repo_dir,
+            &["worktree", "add", wt_path, "-b", "wt/320-phase6"],
+        );
+        std::fs::write(
+            wt_dir.join("phase6.txt"),
+            "local-only dashboard v2 changes\n",
+        )
+        .unwrap();
+
+        let worktree_head = crate::services::platform::git_head_commit(wt_path).unwrap();
+        let main_head = git_commit(repo_dir, "chore: unrelated main advance (#999)");
+        assert_ne!(
+            worktree_head, main_head,
+            "main must move past worktree HEAD"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-worktree-fallback', 'card-review-worktree-fallback', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": wt_path,
+                    "completed_branch": "wt/320-phase6",
+                    "completed_commit": worktree_head.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-worktree-fallback", "agent-1", &json!({}))
+                .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["worktree_path"], wt_path);
+        assert_eq!(parsed["branch"], "wt/320-phase6");
+        assert_eq!(parsed["reviewed_commit"], worktree_head);
+        assert_ne!(parsed["reviewed_commit"], main_head);
     }
 }

@@ -56,6 +56,7 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
     // ── agentdesk.message ────────────────────────────────────────
     let db_for_pipeline = db.clone();
     let db_for_dm_reply = db.clone();
+    let db_for_agents = db.clone();
     register_message_ops(ctx, db)?;
 
     // ── agentdesk.exec ──────────────────────────────────────────
@@ -66,6 +67,9 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
 
     // ── agentdesk.dmReply ────────────────────────────────────
     register_dm_reply_ops(ctx, db_for_dm_reply)?;
+
+    // ── agentdesk.agents ─────────────────────────────────────────
+    register_agent_ops(ctx, db_for_agents)?;
 
     Ok(())
 }
@@ -1128,10 +1132,7 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
 
             // Also update auto_queue_entries if terminal
             if pipeline.is_terminal(&new_status) {
-                conn.execute(
-                    "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') WHERE kanban_card_id = ?1 AND status = 'dispatched'",
-                    [&card_id],
-                ).ok();
+                sync_auto_queue_terminal_on_conn(&conn, &card_id);
             }
 
             // #117/#158: Sync canonical review state via unified entrypoint
@@ -1485,6 +1486,27 @@ pub fn review_state_sync(db: &Db, json_str: &str) -> String {
         Err(e) => return format!(r#"{{"error":"db error: {}"}}"#, e),
     };
     review_state_sync_on_conn(&conn, json_str)
+}
+
+/// Best-effort auto-queue cleanup for terminal cards.
+///
+/// When a card finishes, its active dispatch entry should become `done` and any
+/// stale pending copies in active or paused runs should be skipped so they do
+/// not block other runs.
+pub(crate) fn sync_auto_queue_terminal_on_conn(conn: &rusqlite::Connection, card_id: &str) {
+    conn.execute(
+        "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
+         WHERE kanban_card_id = ?1 AND status = 'dispatched'",
+        [card_id],
+    )
+    .ok();
+    conn.execute(
+        "UPDATE auto_queue_entries SET status = 'skipped', completed_at = datetime('now') \
+         WHERE kanban_card_id = ?1 AND status = 'pending' \
+         AND run_id IN (SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused'))",
+        [card_id],
+    )
+    .ok();
 }
 
 /// Same as `review_state_sync` but operates on an already-acquired connection.
@@ -2208,4 +2230,103 @@ fn dm_reply_read_consumed_raw(db: &Db, user_id: &str) -> String {
         Err(rusqlite::Error::QueryReturnedNoRows) => r#"{"ok":false}"#.to_string(),
         Err(e) => format!(r#"{{"error":"query failed: {e}"}}"#),
     }
+}
+
+// ── Agent channel resolution ops (#304) ─────────────────────────
+//
+// Exposes Rust channel resolution logic to JS policies so they don't
+// query legacy columns directly.
+
+fn register_agent_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
+    let ad: Object<'js> = ctx.globals().get("agentdesk")?;
+    let agents_obj = Object::new(ctx.clone())?;
+
+    // __resolvePrimaryChannel(agentId) -> channelId | ""
+    let db_primary = db.clone();
+    agents_obj.set(
+        "__resolvePrimaryChannel",
+        Function::new(ctx.clone(), move |agent_id: String| -> String {
+            match db_primary.separate_conn() {
+                Ok(conn) => {
+                    match crate::db::agents::resolve_agent_primary_channel_on_conn(&conn, &agent_id)
+                    {
+                        Ok(Some(ch)) => ch,
+                        _ => String::new(),
+                    }
+                }
+                Err(_) => String::new(),
+            }
+        })?,
+    )?;
+
+    // __resolveCounterModelChannel(agentId) -> channelId | ""
+    let db_counter = db.clone();
+    agents_obj.set(
+        "__resolveCounterModelChannel",
+        Function::new(ctx.clone(), move |agent_id: String| -> String {
+            match db_counter.separate_conn() {
+                Ok(conn) => {
+                    match crate::db::agents::resolve_agent_counter_model_channel_on_conn(
+                        &conn, &agent_id,
+                    ) {
+                        Ok(Some(ch)) => ch,
+                        _ => String::new(),
+                    }
+                }
+                Err(_) => String::new(),
+            }
+        })?,
+    )?;
+
+    // __resolveDispatchChannel(agentId, dispatchType) -> channelId | ""
+    let db_dispatch = db;
+    agents_obj.set(
+        "__resolveDispatchChannel",
+        Function::new(
+            ctx.clone(),
+            move |agent_id: String, dispatch_type: String| -> String {
+                match db_dispatch.separate_conn() {
+                    Ok(conn) => {
+                        let dtype = if dispatch_type.is_empty() {
+                            None
+                        } else {
+                            Some(dispatch_type.as_str())
+                        };
+                        match crate::db::agents::resolve_agent_dispatch_channel_on_conn(
+                            &conn, &agent_id, dtype,
+                        ) {
+                            Ok(Some(ch)) => ch,
+                            _ => String::new(),
+                        }
+                    }
+                    Err(_) => String::new(),
+                }
+            },
+        )?,
+    )?;
+
+    ad.set("agents", agents_obj)?;
+
+    // JS convenience wrappers
+    ctx.eval::<(), _>(
+        r#"
+(function() {
+    var a = agentdesk.agents;
+    a.resolvePrimaryChannel = function(agentId) {
+        var ch = a.__resolvePrimaryChannel(agentId);
+        return ch || null;
+    };
+    a.resolveCounterModelChannel = function(agentId) {
+        var ch = a.__resolveCounterModelChannel(agentId);
+        return ch || null;
+    };
+    a.resolveDispatchChannel = function(agentId, dispatchType) {
+        var ch = a.__resolveDispatchChannel(agentId, dispatchType || "");
+        return ch || null;
+    };
+})();
+"#,
+    )?;
+
+    Ok(())
 }

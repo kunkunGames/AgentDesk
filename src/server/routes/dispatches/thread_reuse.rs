@@ -6,6 +6,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::db::agents::{
+    resolve_agent_counter_model_channel_on_conn, resolve_agent_primary_channel_on_conn,
+};
 use crate::server::routes::AppState;
 
 use super::parse_channel_id;
@@ -421,14 +424,12 @@ pub async fn get_card_thread(
         String,
         Option<String>,
         Option<String>,
-        Option<String>,
-        Option<String>,
+        String,
         Option<String>,
     )> = conn
         .query_row(
             "SELECT kc.id, kc.active_thread_id, td.dispatch_type, \
-                    (SELECT a.discord_channel_alt FROM agents a WHERE a.id = td.to_agent_id), \
-                    (SELECT a.discord_channel_id FROM agents a WHERE a.id = td.to_agent_id), \
+                    td.to_agent_id, \
                     td.context \
              FROM task_dispatches td \
              JOIN kanban_cards kc ON kc.id = td.kanban_card_id \
@@ -441,25 +442,24 @@ pub async fn get_card_thread(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .ok();
 
     match result {
-        Some((
-            card_id,
-            _legacy_thread_id,
-            dispatch_type,
-            alt_channel,
-            primary_channel,
-            dispatch_context,
-        )) => {
+        Some((card_id, _legacy_thread_id, dispatch_type, to_agent_id, dispatch_context)) => {
+            let primary_channel = resolve_agent_primary_channel_on_conn(&conn, &to_agent_id)
+                .ok()
+                .flatten();
+            let counter_model_channel =
+                resolve_agent_counter_model_channel_on_conn(&conn, &to_agent_id)
+                    .ok()
+                    .flatten();
             // Determine target channel for this dispatch type
-            let use_alt = matches!(dispatch_type.as_deref(), Some("review"));
+            let use_alt = super::use_counter_model_channel(dispatch_type.as_deref());
             let target_channel = if use_alt {
-                alt_channel.as_deref()
+                counter_model_channel.as_deref()
             } else {
                 primary_channel.as_deref()
             };
@@ -474,7 +474,9 @@ pub async fn get_card_thread(
                     "card_id": card_id,
                     "active_thread_id": thread_id,
                     "dispatch_type": dispatch_type,
-                    "discord_channel_alt": alt_channel,
+                    "discord_channel_id": primary_channel,
+                    "discord_channel_alt": counter_model_channel,
+                    "discord_channel_target": target_channel,
                     "dispatch_context": dispatch_context,
                 })),
             )
@@ -488,9 +490,10 @@ pub async fn get_card_thread(
 
 /// GET /api/internal/pending-dispatch-for-thread?thread_id=xxx
 ///
-/// #222: Look up a pending implementation/rework dispatch whose kanban card
-/// is linked to the given thread channel. Used by turn_bridge as fallback
-/// when parse_dispatch_id(user_text) fails in unified threads.
+/// #222: Look up the latest pending/dispatched dispatch whose kanban card is
+/// linked to the given thread channel. Used by turn_bridge as fallback when
+/// parse_dispatch_id(user_text) fails in unified/reused threads, including
+/// review and review-decision flows.
 pub async fn get_pending_dispatch_for_thread(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -515,14 +518,15 @@ pub async fn get_pending_dispatch_for_thread(
         }
     };
 
-    // Find a pending dispatch whose card is linked to this thread via
-    // channel_thread_map (JSON contains the thread_id) or active_thread_id.
+    // Find the latest pending/dispatched dispatch whose card is linked to this
+    // thread via channel_thread_map (JSON contains the thread_id) or
+    // active_thread_id. This must cover review/review-decision as well as work
+    // dispatches because reused threads often omit a fresh DISPATCH: prefix.
     let dispatch_id: Option<String> = conn
         .query_row(
             "SELECT td.id FROM task_dispatches td \
              JOIN kanban_cards kc ON kc.id = td.kanban_card_id \
              WHERE td.status IN ('pending', 'dispatched') \
-             AND td.dispatch_type IN ('implementation', 'rework') \
              AND (kc.active_thread_id = ?1 \
                   OR INSTR(COALESCE(kc.channel_thread_map, ''), ?1) > 0) \
              ORDER BY td.created_at DESC LIMIT 1",
@@ -531,7 +535,9 @@ pub async fn get_pending_dispatch_for_thread(
         )
         .ok();
 
-    // Fallback: check unified_thread_id / unified_thread_channel_id in auto_queue_runs
+    // Fallback: check unified_thread_id / unified_thread_channel_id in
+    // auto_queue_runs. These runs only own work dispatches, so keep the
+    // explicit implementation/rework filter here.
     let dispatch_id = dispatch_id.or_else(|| {
         conn.query_row(
             "SELECT td.id FROM task_dispatches td \

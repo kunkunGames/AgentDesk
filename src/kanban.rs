@@ -198,6 +198,9 @@ pub fn transition_status_with_opts(
     drop(conn);
 
     // ── 5. Post-transition side-effects (hooks, GitHub sync) ──
+    if effective.is_terminal(new_status) {
+        sync_terminal_card_state(db, card_id);
+    }
     github_sync_on_transition(db, &effective, card_id, new_status);
     fire_dynamic_hooks(engine, &effective, card_id, &old_status, new_status);
 
@@ -367,6 +370,53 @@ fn fire_dynamic_hooks(
     // No fallback — YAML is the sole source of truth for hook bindings.
 }
 
+const TERMINAL_DISPATCH_CLEANUP_REASON: &str = "auto_cancelled_on_terminal_card";
+
+fn sync_terminal_card_state(db: &Db, card_id: &str) {
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+
+    conn.execute(
+        "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
+         WHERE kanban_card_id = ?1 AND status = 'dispatched'",
+        [card_id],
+    )
+    .ok();
+
+    let pending_followups: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM task_dispatches \
+             WHERE kanban_card_id = ?1 AND dispatch_type IN ('review-decision', 'rework') \
+             AND status IN ('pending', 'dispatched')",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([card_id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut cancelled = 0usize;
+    for dispatch_id in pending_followups {
+        cancelled += crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            &dispatch_id,
+            Some(TERMINAL_DISPATCH_CLEANUP_REASON),
+        )
+        .unwrap_or(0);
+    }
+
+    if cancelled > 0 {
+        tracing::info!(
+            "[kanban] Cancelled {} pending terminal follow-up dispatch(es) for card {}",
+            cancelled,
+            card_id
+        );
+    }
+}
+
 /// Drain deferred side-effects produced while hooks were executing.
 ///
 /// Hooks cannot re-enter the engine, so transition requests and dispatch
@@ -526,14 +576,7 @@ pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from
     if let Some(ref pipeline) = effective {
         // Sync auto_queue_entries + GitHub on terminal status
         if pipeline.is_terminal(to) {
-            if let Ok(conn) = db.lock() {
-                conn.execute(
-                    "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
-                     WHERE kanban_card_id = ?1 AND status = 'dispatched'",
-                    [card_id],
-                )
-                .ok();
-            }
+            sync_terminal_card_state(db, card_id);
         }
 
         github_sync_on_transition(db, pipeline, card_id, to);
@@ -609,7 +652,11 @@ fn github_sync_on_transition(
     }
 }
 
+/// Cooldown period for violation alerts (30 minutes).
+const VIOLATION_COOLDOWN_SECS: i64 = 1800;
+
 /// Send a violation alert to the PMD/kanban-manager channel via announce bot.
+/// Applies dedup cooldown (30 min per card+from+to) and suppresses API-source alerts.
 fn notify_pmd_violation(
     conn: &rusqlite::Connection,
     card_id: &str,
@@ -618,6 +665,37 @@ fn notify_pmd_violation(
     source: &str,
     reason: &str,
 ) {
+    // #200: API callers already receive error responses — no need to alert PMD.
+    if source == "api" {
+        tracing::debug!(
+            "[kanban] Suppressing violation alert for api source: {from} → {to} card {card_id}"
+        );
+        return;
+    }
+
+    // #200: Dedup cooldown — skip if same card+from+to was alerted within 30 min.
+    let cooldown_key = format!("violation_sent:{card_id}:{from}:{to}");
+    let recently_sent: bool = conn
+        .query_row(
+            "SELECT 1 FROM kv_meta WHERE key = ?1 \
+             AND (expires_at IS NULL OR expires_at > datetime('now'))",
+            [&cooldown_key],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if recently_sent {
+        tracing::debug!(
+            "[kanban] Violation alert cooldown active for {from} → {to} card {card_id}"
+        );
+        return;
+    }
+    // Record cooldown with TTL
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO kv_meta (key, value, expires_at) \
+         VALUES (?1, ?2, datetime('now', '+' || ?3 || ' seconds'))",
+        rusqlite::params![cooldown_key, "1", VIOLATION_COOLDOWN_SECS.to_string()],
+    );
+
     // Look up card title for the notification
     let title: String = conn
         .query_row(
@@ -909,8 +987,10 @@ pub fn correct_tn_to_fn_on_reopen(db: &Db, card_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_db() -> Db {
@@ -934,6 +1014,38 @@ mod tests {
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, contents).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
     fn seed_card(db: &Db, card_id: &str, status: &str) {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -954,6 +1066,22 @@ mod tests {
              VALUES (?1, ?2, 'agent-1', 'implementation', ?3, 'Test Dispatch', datetime('now'), datetime('now'))",
             rusqlite::params![format!("dispatch-{}-{}", card_id, dispatch_status), card_id, dispatch_status],
         ).unwrap();
+    }
+
+    fn seed_dispatch_with_type(
+        db: &Db,
+        dispatch_id: &str,
+        card_id: &str,
+        dispatch_type: &str,
+        dispatch_status: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
+             VALUES (?1, ?2, 'agent-1', ?3, ?4, 'Typed Dispatch', datetime('now'), datetime('now'))",
+            rusqlite::params![dispatch_id, card_id, dispatch_type, dispatch_status],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1082,9 +1210,91 @@ mod tests {
         assert_eq!(count, 1, "tick hook dispatch intent should be persisted");
     }
 
-    /// #202: Verify that try_fire_hook alone (without explicit drain_hook_side_effects)
-    /// persists dispatch intents created by tick hooks. This catches the scenario where
-    /// dispatch.create() defers an INSERT intent but the intent drain is skipped.
+    /// Regression test for #274: transition_status() fires custom state hooks
+    /// through try_fire_hook_by_name(), and dispatch.create() in that path must
+    /// return with the dispatch row + notify outbox already materialized.
+    #[test]
+    fn transition_status_custom_on_enter_hook_materializes_dispatch_outbox() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ready-enter-hook.js"),
+            r#"
+            var policy = {
+                name: "ready-enter-hook",
+                priority: 1,
+                onCustomReadyEnter: function(payload) {
+                    agentdesk.dispatch.create(
+                        payload.card_id,
+                        "agent-1",
+                        "implementation",
+                        "Ready Hook Dispatch"
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, dir.path());
+        seed_card(&db, "card-ready-hook", "backlog");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET pipeline_config = ?1 WHERE id = 'agent-1'",
+                [json!({
+                    "hooks": {
+                        "ready": {
+                            "on_enter": ["onCustomReadyEnter"],
+                            "on_exit": []
+                        }
+                    }
+                })
+                .to_string()],
+            )
+            .unwrap();
+        }
+
+        transition_status(&db, &engine, "card-ready-hook", "ready").unwrap();
+
+        let conn = db.lock().unwrap();
+        let (dispatch_id, title): (String, String) = conn
+            .query_row(
+                "SELECT id, title FROM task_dispatches WHERE kanban_card_id = 'card-ready-hook'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("custom ready on_enter hook should create a dispatch");
+        assert_eq!(title, "Ready Hook Dispatch");
+
+        let notify_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'notify'",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .expect("dispatch outbox query should succeed");
+        assert_eq!(
+            notify_count, 1,
+            "custom transition hook dispatch must enqueue exactly one notify outbox row"
+        );
+
+        let (card_status, latest_dispatch_id): (String, String) = conn
+            .query_row(
+                "SELECT status, latest_dispatch_id FROM kanban_cards WHERE id = 'card-ready-hook'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("card should be updated by dispatch.create()");
+        assert_eq!(card_status, "in_progress");
+        assert_eq!(latest_dispatch_id, dispatch_id);
+    }
+
+    /// Regression guard for the known-hook path: try_fire_hook_by_name() must
+    /// return with dispatch.create() side-effects already visible, even without
+    /// an extra drain_hook_side_effects() call at the caller.
     #[test]
     fn try_fire_hook_drains_dispatch_intents_without_explicit_drain() {
         let dir = TempDir::new().unwrap();
@@ -1129,6 +1339,68 @@ mod tests {
         assert_eq!(
             count, 1,
             "#202: tick hook dispatch intent must be persisted by try_fire_hook's internal drain"
+        );
+    }
+
+    #[test]
+    fn fire_transition_hooks_terminal_cleanup_cancels_review_followups_with_reason() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-terminal-cleanup", "review");
+        seed_dispatch_with_type(
+            &db,
+            "dispatch-rd-cleanup",
+            "card-terminal-cleanup",
+            "review-decision",
+            "pending",
+        );
+        seed_dispatch_with_type(
+            &db,
+            "dispatch-rw-cleanup",
+            "card-terminal-cleanup",
+            "rework",
+            "dispatched",
+        );
+        seed_dispatch_with_type(
+            &db,
+            "dispatch-impl-keep",
+            "card-terminal-cleanup",
+            "implementation",
+            "pending",
+        );
+
+        fire_transition_hooks(&db, &engine, "card-terminal-cleanup", "review", "done");
+
+        let conn = db.lock().unwrap();
+        let (rd_status, rd_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, json_extract(result, '$.reason') FROM task_dispatches WHERE id = 'dispatch-rd-cleanup'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (rw_status, rw_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, json_extract(result, '$.reason') FROM task_dispatches WHERE id = 'dispatch-rw-cleanup'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let impl_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'dispatch-impl-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(rd_status, "cancelled");
+        assert_eq!(rd_reason.as_deref(), Some(TERMINAL_DISPATCH_CLEANUP_REASON));
+        assert_eq!(rw_status, "cancelled");
+        assert_eq!(rw_reason.as_deref(), Some(TERMINAL_DISPATCH_CLEANUP_REASON));
+        assert_eq!(
+            impl_status, "pending",
+            "terminal cleanup must not cancel unrelated pending work dispatches"
         );
     }
 
@@ -1295,6 +1567,120 @@ mod tests {
         assert_eq!(
             new_dispatches, 0,
             "no new dispatch should be created by pipeline.js onDispatchCompleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_pipeline_uses_card_scoped_worktree_instead_of_latest_session_cwd() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let policies_dir = temp.path().join("policies");
+        fs::create_dir_all(&policies_dir).unwrap();
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("policies")
+                .join("deploy-pipeline.js"),
+            policies_dir.join("deploy-pipeline.js"),
+        )
+        .unwrap();
+
+        let fake_bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&fake_bin_dir).unwrap();
+        let tmux_log = temp.path().join("tmux.log");
+        write_executable_script(
+            &fake_bin_dir.join("tmux"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = \"has-session\" ]; then\n  echo \"missing\" >&2\n  exit 1\nfi\nexit 0\n",
+                tmux_log.display()
+            ),
+        );
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let _path_guard = EnvVarGuard::set(
+            "PATH",
+            &format!("{}:{}", fake_bin_dir.display(), original_path),
+        );
+
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, &policies_dir);
+        seed_card_with_repo(&db, "card-deploy-301", "review", "repo-1");
+
+        let correct_worktree = temp.path().join("worktrees").join("card-301");
+        let wrong_worktree = temp.path().join("worktrees").join("other-card");
+        fs::create_dir_all(&correct_worktree).unwrap();
+        fs::create_dir_all(&wrong_worktree).unwrap();
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO pipeline_stages (repo_id, stage_name, stage_order, trigger_after, provider)
+                 VALUES ('repo-1', 'dev-deploy', 1, 'review_pass', 'self')",
+                [],
+            )
+            .unwrap();
+            let stage_id = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE kanban_cards
+                 SET pipeline_stage_id = ?1, blocked_reason = 'deploy:waiting', updated_at = datetime('now')
+                 WHERE id = 'card-deploy-301'",
+                [stage_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+                 ) VALUES (
+                    'dispatch-card-deploy-301', 'card-deploy-301', 'agent-1', 'implementation', 'completed',
+                    'Implementation Done', ?1, '{}', datetime('now'), datetime('now')
+                 )",
+                rusqlite::params![serde_json::json!({
+                    "worktree_path": correct_worktree.display().to_string(),
+                    "worktree_branch": "feat/301-correct-worktree"
+                })
+                .to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (
+                    session_key, agent_id, provider, status, cwd, last_heartbeat
+                 ) VALUES (
+                    'session-card-other', 'agent-1', 'codex', 'connected', ?1, datetime('now')
+                 )",
+                [wrong_worktree.display().to_string()],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("onTick30s", json!({}))
+            .unwrap();
+
+        let blocked_reason: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-deploy-301'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            blocked_reason.starts_with("deploy:deploying:adk-deploy-"),
+            "deploy queue should transition card into deploying state"
+        );
+
+        let tmux_invocations = fs::read_to_string(&tmux_log).unwrap();
+        println!("[test] deploy tmux invocations:\n{tmux_invocations}");
+        assert!(
+            tmux_invocations.contains(&correct_worktree.display().to_string()),
+            "deploy command must use card-scoped worktree path from dispatch context"
+        );
+        assert!(
+            !tmux_invocations.contains(&wrong_worktree.display().to_string()),
+            "deploy command must ignore latest session cwd from another card"
         );
     }
 

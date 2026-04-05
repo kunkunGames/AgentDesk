@@ -122,6 +122,23 @@ function isAllowedAuthor(author) {
   return false;
 }
 
+function sessionKeyToTmuxName(sessionKey) {
+  if (!sessionKey) return "";
+  var parts = String(sessionKey).split(":");
+  if (parts.length <= 1) return parts[0];
+  return parts.slice(1).join(":");
+}
+
+function tmuxSessionHasLivePane(tmuxName) {
+  if (!tmuxName) return false;
+  try {
+    var out = agentdesk.exec("tmux", ["list-panes", "-t", "=" + tmuxName, "-F", "#{pane_dead}"]);
+    return typeof out === "string" && out.indexOf("ERROR") === -1 && out.indexOf("0") !== -1;
+  } catch (e) {
+    return false;
+  }
+}
+
 /**
  * Process manual merge requests from kv_meta.
  * Set merge_request:{pr_number} = "{owner/repo}" to trigger.
@@ -279,11 +296,27 @@ function cleanupMergedWorktrees() {
         // Branch: "wt/claude-channel-20260329-070702" → dir suffix: "claude-channel-20260329-070702"
         var dirSuffix = branch.replace(/^wt\//, "");
         var sessions = agentdesk.db.query(
-          "SELECT cwd FROM sessions WHERE cwd LIKE ?",
+          "SELECT session_key, cwd FROM sessions WHERE cwd LIKE ?",
           ["%/worktrees/%" + dirSuffix + "%"]
         );
 
         if (sessions.length > 0) {
+          var inUseBy = null;
+          for (var s = 0; s < sessions.length; s++) {
+            var tmuxName = sessionKeyToTmuxName(sessions[s].session_key);
+            if (tmuxSessionHasLivePane(tmuxName)) {
+              inUseBy = sessions[s];
+              break;
+            }
+          }
+          if (inUseBy) {
+            agentdesk.log.info(
+              "[merge] Skipping cleanup for merged worktree still in use: " +
+              branch + " at " + inUseBy.cwd + " (" + inUseBy.session_key + ")"
+            );
+            continue;
+          }
+
           var cwd = sessions[0].cwd;
           agentdesk.log.info("[merge] Cleaning up merged worktree: " + branch + " at " + cwd);
 
@@ -452,13 +485,11 @@ function notifyAgentMainChannel(agentId, prNum, title) {
   var kvKey = "conflict_notified:" + prNum;
   if (agentdesk.kv.get(kvKey)) return;
 
-  var agent = agentdesk.db.query(
-    "SELECT discord_channel_id FROM agents WHERE id = ?",
-    [agentId]
-  );
-  if (agent.length > 0) {
+  // #304: resolve primary channel via centralized resolver
+  var mainCh = agentdesk.agents.resolvePrimaryChannel(agentId);
+  if (mainCh) {
     agentdesk.message.queue(
-      agent[0].discord_channel_id,
+      mainCh,
       "⚠️ PR #" + prNum + " (" + title + ") has merge conflicts with main. Please rebase.",
       "announce",
       "merge-automation"

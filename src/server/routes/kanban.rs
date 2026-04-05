@@ -19,6 +19,15 @@ pub(super) const CARD_SELECT: &str = "SELECT kc.id, kc.repo_id, kc.title, kc.sta
     kc.owner_agent_id, kc.requester_agent_id, kc.parent_card_id, kc.sort_order, kc.depth \
     FROM kanban_cards kc LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id";
 
+/// Latest meaningful activity for in-progress stall detection.
+///
+/// We intentionally consider the newest of:
+/// - latest dispatch creation time (fresh dispatch / redispatch)
+/// - card.updated_at (manual or pipeline-driven re-entry to in_progress)
+/// - started_at fallback for legacy rows
+pub(crate) const STALLED_ACTIVITY_AT_SQL: &str =
+    "MAX(COALESCE(td.created_at, ''), COALESCE(kc.updated_at, ''), COALESCE(kc.started_at, ''))";
+
 // ── Query / Body types ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1231,8 +1240,8 @@ pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<s
 
     let mut stmt = match conn.prepare(&format!(
         "{CARD_SELECT}
-         WHERE kc.status = 'in_progress' AND kc.started_at IS NOT NULL AND kc.started_at < datetime('now', '-2 hours'){}
-         ORDER BY kc.started_at ASC",
+         WHERE kc.status = 'in_progress' AND {STALLED_ACTIVITY_AT_SQL} < datetime('now', '-2 hours'){}
+         ORDER BY {STALLED_ACTIVITY_AT_SQL} ASC",
         repo_filter
     )) {
         Ok(s) => s,
@@ -2159,6 +2168,18 @@ pub async fn rereview_card(
         let sync_result = crate::engine::ops::review_state_sync_on_conn(&conn, &sync_payload);
         if sync_result.contains("\"error\"") {
             tracing::warn!("[kanban] rereview review_state_sync cleanup failed: {sync_result}");
+        }
+
+        // #272: Explicitly clear approach_change_round so a new re-review cycle
+        // starts with clean state.  The generic sync uses COALESCE (preserves old
+        // value when NULL is passed), so we do a targeted UPDATE here instead of
+        // widening the idle-sync semantics which would affect timeout / gate-failure
+        // paths that also sync to "idle".
+        if let Err(e) = conn.execute(
+            "UPDATE card_review_state SET approach_change_round = NULL WHERE card_id = ?1",
+            [&id],
+        ) {
+            tracing::warn!("[kanban] rereview approach_change_round reset failed: {e}");
         }
     }
 

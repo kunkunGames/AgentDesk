@@ -15,24 +15,95 @@ import type {
 export type { AuditLogEntry, KanbanCard, KanbanRepoSource } from "../types";
 
 const BASE = "";
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_RETRIES = 2;
+const INITIAL_BACKOFF_MS = 500;
 
-async function request<T>(
-  url: string,
-  opts?: RequestInit,
-): Promise<T> {
-  const res = await fetch(`${BASE}${url}`, {
-    credentials: "include",
-    ...opts,
-    headers: {
-      "Content-Type": "application/json",
-      ...opts?.headers,
-    },
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: "unknown" }));
-    throw new Error(err.error || `HTTP ${res.status}`);
+// ── GET deduplication ──
+const inflightGets = new Map<string, Promise<unknown>>();
+
+// ── Global error listener for toast integration ──
+type ApiErrorListener = (url: string, error: Error) => void;
+let apiErrorListener: ApiErrorListener | null = null;
+export function onApiError(listener: ApiErrorListener | null): void {
+  apiErrorListener = listener;
+}
+
+function isRetryable(status: number): boolean {
+  return status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
+async function request<T>(url: string, opts?: RequestInit): Promise<T> {
+  const method = opts?.method?.toUpperCase() ?? "GET";
+  const isGet = method === "GET";
+
+  // Deduplicate identical concurrent GET requests
+  if (isGet) {
+    const existing = inflightGets.get(url);
+    if (existing) return existing as Promise<T>;
   }
-  return res.json();
+
+  const execute = async (): Promise<T> => {
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = INITIAL_BACKOFF_MS * 2 ** (attempt - 1);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${BASE}${url}`, {
+          credentials: "include",
+          ...opts,
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            ...opts?.headers,
+          },
+        });
+        clearTimeout(timer);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: "unknown" }));
+          const error = new Error(err.error || `HTTP ${res.status}`);
+          if (isGet && isRetryable(res.status) && attempt < MAX_RETRIES) {
+            lastError = error;
+            continue;
+          }
+          throw error;
+        }
+        return await res.json();
+      } catch (e) {
+        clearTimeout(timer);
+        const error = e instanceof Error ? e : new Error(String(e));
+        if (error.name === "AbortError") {
+          lastError = new Error(`Request timeout: ${url}`);
+          if (isGet && attempt < MAX_RETRIES) continue;
+        } else if (
+          isGet &&
+          attempt < MAX_RETRIES &&
+          !error.message.startsWith("HTTP ")
+        ) {
+          lastError = error;
+          continue;
+        }
+        throw lastError ?? error;
+      }
+    }
+    throw lastError ?? new Error(`Request failed: ${url}`);
+  };
+
+  const promise = execute().finally(() => {
+    if (isGet) inflightGets.delete(url);
+  });
+
+  if (isGet) inflightGets.set(url, promise);
+
+  return promise.catch((e) => {
+    const error = e instanceof Error ? e : new Error(String(e));
+    apiErrorListener?.(url, error);
+    throw error;
+  });
 }
 
 function normalizeAgent(agent: Agent): Agent {
@@ -46,7 +117,10 @@ function normalizeAgent(agent: Agent): Agent {
 }
 
 // Auth
-export async function getSession(): Promise<{ ok: boolean; csrf_token: string }> {
+export async function getSession(): Promise<{
+  ok: boolean;
+  csrf_token: string;
+}> {
   return request("/api/auth/session");
 }
 
@@ -57,9 +131,7 @@ export async function getOffices(): Promise<Office[]> {
   return data.offices;
 }
 
-export async function createOffice(
-  office: Partial<Office>,
-): Promise<Office> {
+export async function createOffice(office: Partial<Office>): Promise<Office> {
   return request("/api/offices", {
     method: "POST",
     body: JSON.stringify(office),
@@ -87,7 +159,10 @@ export async function addAgentToOffice(
 ): Promise<void> {
   await request(`/api/offices/${officeId}/agents`, {
     method: "POST",
-    body: JSON.stringify({ agent_id: agentId, department_id: departmentId ?? null }),
+    body: JSON.stringify({
+      agent_id: agentId,
+      department_id: departmentId ?? null,
+    }),
   });
 }
 
@@ -158,8 +233,12 @@ export interface AgentOfficeMembership extends Office {
   joined_at?: number | null;
 }
 
-export async function getAgentOffices(agentId: string): Promise<AgentOfficeMembership[]> {
-  const data = await request<{ offices: AgentOfficeMembership[] }>(`/api/agents/${agentId}/offices`);
+export async function getAgentOffices(
+  agentId: string,
+): Promise<AgentOfficeMembership[]> {
+  const data = await request<{ offices: AgentOfficeMembership[] }>(
+    `/api/agents/${agentId}/offices`,
+  );
   return data.offices;
 }
 
@@ -173,7 +252,9 @@ export async function getAuditLogs(
   params.set("limit", String(limit));
   if (filter?.entityType) params.set("entityType", filter.entityType);
   if (filter?.entityId) params.set("entityId", filter.entityId);
-  const data = await request<{ logs: AuditLogEntry[] }>(`/api/audit-logs?${params.toString()}`);
+  const data = await request<{ logs: AuditLogEntry[] }>(
+    `/api/audit-logs?${params.toString()}`,
+  );
   return data.logs;
 }
 
@@ -301,10 +382,13 @@ export async function retryKanbanCard(
   id: string,
   payload?: { assignee_agent_id?: string | null; request_now?: boolean },
 ): Promise<KanbanCard> {
-  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/retry`, {
-    method: "POST",
-    body: JSON.stringify(payload ?? {}),
-  });
+  const res = await request<{ card: KanbanCard }>(
+    `/api/kanban-cards/${id}/retry`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload ?? {}),
+    },
+  );
   return res.card;
 }
 
@@ -312,21 +396,32 @@ export async function redispatchKanbanCard(
   id: string,
   payload?: { reason?: string | null },
 ): Promise<KanbanCard> {
-  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/redispatch`, {
-    method: "POST",
-    body: JSON.stringify(payload ?? {}),
-  });
+  const res = await request<{ card: KanbanCard }>(
+    `/api/kanban-cards/${id}/redispatch`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload ?? {}),
+    },
+  );
   return res.card;
 }
 
 export async function patchKanbanDeferDod(
   id: string,
-  payload: { items?: Array<{ label: string }>; verify?: string; unverify?: string; remove?: string },
+  payload: {
+    items?: Array<{ label: string }>;
+    verify?: string;
+    unverify?: string;
+    remove?: string;
+  },
 ): Promise<KanbanCard> {
-  const res = await request<{ card: KanbanCard }>(`/api/kanban-cards/${id}/defer-dod`, {
-    method: "PATCH",
-    body: JSON.stringify(payload),
-  });
+  const res = await request<{ card: KanbanCard }>(
+    `/api/kanban-cards/${id}/defer-dod`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
   return res.card;
 }
 
@@ -338,10 +433,13 @@ export async function assignKanbanIssue(payload: {
   description?: string | null;
   assignee_agent_id: string;
 }): Promise<KanbanCard> {
-  const res = await request<{ card: KanbanCard }>("/api/kanban-cards/assign-issue", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  const res = await request<{ card: KanbanCard }>(
+    "/api/kanban-cards/assign-issue",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
   return res.card;
 }
 
@@ -352,7 +450,10 @@ export async function getStalledCards(): Promise<KanbanCard[]> {
 export async function bulkKanbanAction(
   action: "pass" | "reset" | "cancel",
   card_ids: string[],
-): Promise<{ action: string; results: Array<{ id: string; ok: boolean; error?: string }> }> {
+): Promise<{
+  action: string;
+  results: Array<{ id: string; ok: boolean; error?: string }>;
+}> {
   return request("/api/kanban-cards/bulk-action", {
     method: "POST",
     body: JSON.stringify({ action, card_ids }),
@@ -360,18 +461,25 @@ export async function bulkKanbanAction(
 }
 
 export async function getKanbanRepoSources(): Promise<KanbanRepoSource[]> {
-  const data = await request<{ repos: KanbanRepoSource[] }>("/api/kanban-repos");
+  const data = await request<{ repos: KanbanRepoSource[] }>(
+    "/api/kanban-repos",
+  );
   return data.repos;
 }
 
-export async function addKanbanRepoSource(repo: string): Promise<KanbanRepoSource> {
+export async function addKanbanRepoSource(
+  repo: string,
+): Promise<KanbanRepoSource> {
   return request("/api/kanban-repos", {
     method: "POST",
     body: JSON.stringify({ repo }),
   });
 }
 
-export async function updateKanbanRepoSource(id: string, data: { default_agent_id?: string | null }): Promise<KanbanRepoSource> {
+export async function updateKanbanRepoSource(
+  id: string,
+  data: { default_agent_id?: string | null },
+): Promise<KanbanRepoSource> {
   return request(`/api/kanban-repos/${id}`, {
     method: "PATCH",
     body: JSON.stringify(data),
@@ -401,8 +509,12 @@ export interface KanbanReview {
   completed_at: number | null;
 }
 
-export async function getKanbanReviews(cardId: string): Promise<KanbanReview[]> {
-  const data = await request<{ reviews: KanbanReview[] }>(`/api/kanban-cards/${cardId}/reviews`);
+export async function getKanbanReviews(
+  cardId: string,
+): Promise<KanbanReview[]> {
+  const data = await request<{ reviews: KanbanReview[] }>(
+    `/api/kanban-cards/${cardId}/reviews`,
+  );
   return data.reviews;
 }
 
@@ -416,7 +528,9 @@ export async function saveReviewDecisions(
   });
 }
 
-export async function triggerDecidedRework(reviewId: string): Promise<{ ok: boolean }> {
+export async function triggerDecidedRework(
+  reviewId: string,
+): Promise<{ ok: boolean }> {
   return request(`/api/kanban-reviews/${reviewId}/trigger-rework`, {
     method: "POST",
   });
@@ -440,8 +554,12 @@ export interface GitHubComment {
   createdAt: string;
 }
 
-export async function getCardAuditLog(cardId: string): Promise<CardAuditLogEntry[]> {
-  const data = await request<{ logs: CardAuditLogEntry[] }>(`/api/kanban-cards/${cardId}/audit-log`);
+export async function getCardAuditLog(
+  cardId: string,
+): Promise<CardAuditLogEntry[]> {
+  const data = await request<{ logs: CardAuditLogEntry[] }>(
+    `/api/kanban-cards/${cardId}/audit-log`,
+  );
   return data.logs;
 }
 
@@ -450,8 +568,12 @@ export interface CardGitHubCommentsResult {
   body: string;
 }
 
-export async function getCardGitHubComments(cardId: string): Promise<CardGitHubCommentsResult> {
-  const data = await request<{ comments: GitHubComment[]; body?: string }>(`/api/kanban-cards/${cardId}/comments`);
+export async function getCardGitHubComments(
+  cardId: string,
+): Promise<CardGitHubCommentsResult> {
+  const data = await request<{ comments: GitHubComment[]; body?: string }>(
+    `/api/kanban-cards/${cardId}/comments`,
+  );
   return { comments: data.comments, body: data.body ?? "" };
 }
 
@@ -470,7 +592,9 @@ export interface PipelineStageInput {
   parallel_with?: string | null;
 }
 
-export async function getPipelineStages(repo: string): Promise<import("../types").PipelineStage[]> {
+export async function getPipelineStages(
+  repo: string,
+): Promise<import("../types").PipelineStage[]> {
   const data = await request<{ stages: import("../types").PipelineStage[] }>(
     `/api/pipeline/stages?repo=${encodeURIComponent(repo)}`,
   );
@@ -489,7 +613,9 @@ export async function savePipelineStages(
 }
 
 export async function deletePipelineStages(repo: string): Promise<void> {
-  await request(`/api/pipeline/stages?repo=${encodeURIComponent(repo)}`, { method: "DELETE" });
+  await request(`/api/pipeline/stages?repo=${encodeURIComponent(repo)}`, {
+    method: "DELETE",
+  });
 }
 
 export async function getCardPipelineStatus(cardId: string): Promise<{
@@ -508,17 +634,22 @@ export async function getTaskDispatches(filters?: {
 }): Promise<TaskDispatch[]> {
   const params = new URLSearchParams();
   if (filters?.status) params.set("status", filters.status);
-  if (filters?.from_agent_id) params.set("from_agent_id", filters.from_agent_id);
+  if (filters?.from_agent_id)
+    params.set("from_agent_id", filters.from_agent_id);
   if (filters?.to_agent_id) params.set("to_agent_id", filters.to_agent_id);
   if (filters?.limit) params.set("limit", String(filters.limit));
   const q = params.toString();
-  const data = await request<{ dispatches: TaskDispatch[] }>(`/api/dispatches${q ? `?${q}` : ""}`);
+  const data = await request<{ dispatches: TaskDispatch[] }>(
+    `/api/dispatches${q ? `?${q}` : ""}`,
+  );
   return data.dispatches;
 }
 
 // ── Dispatched Sessions ──
 
-export async function getDispatchedSessions(includeMerged = false): Promise<DispatchedSession[]> {
+export async function getDispatchedSessions(
+  includeMerged = false,
+): Promise<DispatchedSession[]> {
   const q = includeMerged ? "?includeMerged=1" : "";
   const data = await request<{ sessions: DispatchedSession[] }>(
     `/api/dispatched-sessions${q}`,
@@ -562,12 +693,18 @@ export interface CronJob {
 }
 
 export async function getAgentCron(agentId: string): Promise<CronJob[]> {
-  const data = await request<{ jobs: CronJob[] }>(`/api/agents/${agentId}/cron`);
+  const data = await request<{ jobs: CronJob[] }>(
+    `/api/agents/${agentId}/cron`,
+  );
   return data.jobs;
 }
 
-export async function getAgentDispatchedSessions(agentId: string): Promise<DispatchedSession[]> {
-  const data = await request<{ sessions: DispatchedSession[] }>(`/api/agents/${agentId}/dispatched-sessions`);
+export async function getAgentDispatchedSessions(
+  agentId: string,
+): Promise<DispatchedSession[]> {
+  const data = await request<{ sessions: DispatchedSession[] }>(
+    `/api/agents/${agentId}/dispatched-sessions`,
+  );
   return data.sessions;
 }
 
@@ -585,7 +722,9 @@ export interface AgentSkillsResponse {
   totalCount: number;
 }
 
-export async function getAgentSkills(agentId: string): Promise<AgentSkillsResponse> {
+export async function getAgentSkills(
+  agentId: string,
+): Promise<AgentSkillsResponse> {
   return request(`/api/agents/${agentId}/skills`);
 }
 
@@ -602,7 +741,10 @@ export interface TimelineEvent {
   detail?: Record<string, unknown>;
 }
 
-export async function getAgentTimeline(agentId: string, limit = 30): Promise<TimelineEvent[]> {
+export async function getAgentTimeline(
+  agentId: string,
+  limit = 30,
+): Promise<TimelineEvent[]> {
   const data = await request<{ events: TimelineEvent[] }>(
     `/api/agents/${agentId}/timeline?limit=${limit}`,
   );
@@ -614,12 +756,15 @@ export async function getAgentTimeline(agentId: string, limit = 30): Promise<Tim
 export interface DiscordBinding {
   agentId: string;
   channelId: string;
-  channelName?: string;
+  counterModelChannelId?: string;
+  provider?: string;
   source?: string;
 }
 
 export async function getDiscordBindings(): Promise<DiscordBinding[]> {
-  const data = await request<{ bindings: DiscordBinding[] }>("/api/discord-bindings");
+  const data = await request<{ bindings: DiscordBinding[] }>(
+    "/api/discord-bindings",
+  );
   return data.bindings;
 }
 
@@ -666,7 +811,9 @@ export interface MachineStatus {
 }
 
 export async function getMachineStatus(): Promise<MachineStatus[]> {
-  const data = await request<{ machines: MachineStatus[] }>("/api/machine-status");
+  const data = await request<{ machines: MachineStatus[] }>(
+    "/api/machine-status",
+  );
   return data.machines;
 }
 
@@ -764,7 +911,9 @@ export interface Achievement {
   avatar_emoji: string;
 }
 
-export async function getAchievements(agentId?: string): Promise<{ achievements: Achievement[] }> {
+export async function getAchievements(
+  agentId?: string,
+): Promise<{ achievements: Achievement[] }> {
   const q = agentId ? `?agentId=${agentId}` : "";
   return request(`/api/achievements${q}`);
 }
@@ -797,7 +946,8 @@ export async function getMessages(opts?: {
   const params = new URLSearchParams();
   if (opts?.receiverId) params.set("receiverId", opts.receiverId);
   if (opts?.receiverType) params.set("receiverType", opts.receiverType);
-  if (opts?.messageType && opts.messageType !== "all") params.set("messageType", opts.messageType);
+  if (opts?.messageType && opts.messageType !== "all")
+    params.set("messageType", opts.messageType);
   if (opts?.limit) params.set("limit", String(opts.limit));
   if (opts?.before) params.set("before", String(opts.before));
   const q = params.toString();
@@ -837,23 +987,32 @@ export async function closeGitHubIssue(
   issueNumber: number,
 ): Promise<{ ok: boolean; repo: string; number: number }> {
   const [owner, repoName] = repo.split("/");
-  return request(`/api/github-issues/${owner}/${repoName}/${issueNumber}/close`, {
-    method: "PATCH",
-  });
+  return request(
+    `/api/github-issues/${owner}/${repoName}/${issueNumber}/close`,
+    {
+      method: "PATCH",
+    },
+  );
 }
 
 // ── Round Table Meetings ──
 
 export async function getRoundTableMeetings(): Promise<RoundTableMeeting[]> {
-  const data = await request<{ meetings: RoundTableMeeting[] }>("/api/round-table-meetings");
+  const data = await request<{ meetings: RoundTableMeeting[] }>(
+    "/api/round-table-meetings",
+  );
   return data.meetings;
 }
 
-export async function getRoundTableMeeting(id: string): Promise<RoundTableMeeting> {
+export async function getRoundTableMeeting(
+  id: string,
+): Promise<RoundTableMeeting> {
   return request(`/api/round-table-meetings/${id}`);
 }
 
-export async function deleteRoundTableMeeting(id: string): Promise<{ ok: boolean }> {
+export async function deleteRoundTableMeeting(
+  id: string,
+): Promise<{ ok: boolean }> {
   return request(`/api/round-table-meetings/${id}`, { method: "DELETE" });
 }
 
@@ -891,7 +1050,10 @@ export interface RoundTableIssueCreationResponse {
   };
 }
 
-export async function createRoundTableIssues(id: string, repo?: string): Promise<RoundTableIssueCreationResponse> {
+export async function createRoundTableIssues(
+  id: string,
+  repo?: string,
+): Promise<RoundTableIssueCreationResponse> {
   return request(`/api/round-table-meetings/${id}/issues`, {
     method: "POST",
     body: JSON.stringify({ repo }),
@@ -901,16 +1063,18 @@ export async function createRoundTableIssues(id: string, repo?: string): Promise
 export async function discardRoundTableIssue(
   id: string,
   key: string,
-): Promise<{ ok: boolean; meeting: RoundTableMeeting; summary: RoundTableIssueCreationResponse["summary"] }> {
+): Promise<{
+  ok: boolean;
+  meeting: RoundTableMeeting;
+  summary: RoundTableIssueCreationResponse["summary"];
+}> {
   return request(`/api/round-table-meetings/${id}/issues/discard`, {
     method: "POST",
     body: JSON.stringify({ key }),
   });
 }
 
-export async function discardAllRoundTableIssues(
-  id: string,
-): Promise<{
+export async function discardAllRoundTableIssues(id: string): Promise<{
   ok: boolean;
   meeting: RoundTableMeeting;
   summary: RoundTableIssueCreationResponse["summary"];
@@ -929,14 +1093,20 @@ export async function startRoundTableMeeting(
 ): Promise<{ ok: boolean }> {
   return request("/api/round-table-meetings/start", {
     method: "POST",
-    body: JSON.stringify({ agenda, channel_id: channelId, primary_provider: primaryProvider ?? null }),
+    body: JSON.stringify({
+      agenda,
+      channel_id: channelId,
+      primary_provider: primaryProvider ?? null,
+    }),
   });
 }
 
 // ── Skill Catalog ──
 
 export async function getSkillCatalog(): Promise<SkillCatalogEntry[]> {
-  const data = await request<{ catalog: SkillCatalogEntry[] }>("/api/skills/catalog");
+  const data = await request<{ catalog: SkillCatalogEntry[] }>(
+    "/api/skills/catalog",
+  );
   return data.catalog;
 }
 
@@ -946,7 +1116,7 @@ export interface AutoQueueRun {
   id: string;
   repo: string | null;
   agent_id: string | null;
-  status: "pending" | "active" | "paused" | "completed";
+  status: "pending" | "generated" | "active" | "paused" | "completed";
   ai_model: string | null;
   ai_rationale: string | null;
   timeout_minutes: number;
@@ -981,27 +1151,55 @@ export interface ThreadGroupStatus {
   done: number;
   skipped: number;
   status: string;
-  entries: { id: string; card_id: string; github_issue_number?: number | null; status: string }[];
+  reason?: string | null;
+  entries: {
+    id: string;
+    card_id: string;
+    github_issue_number?: number | null;
+    status: string;
+  }[];
 }
 
 export interface AutoQueueStatus {
   run: AutoQueueRun | null;
   entries: DispatchQueueEntry[];
-  agents: Record<string, { pending: number; dispatched: number; done: number; skipped: number }>;
+  agents: Record<
+    string,
+    { pending: number; dispatched: number; done: number; skipped: number }
+  >;
   thread_groups?: Record<string, ThreadGroupStatus>;
 }
 
-export async function generateAutoQueue(repo?: string | null, agentId?: string | null, mode?: string | null): Promise<{
+export type AutoQueueGenerateMode =
+  | "priority-sort"
+  | "dependency-aware"
+  | "similarity-aware"
+  | "pm-assisted";
+
+export async function generateAutoQueue(
+  repo?: string | null,
+  agentId?: string | null,
+  mode?: AutoQueueGenerateMode | null,
+): Promise<{
   run: AutoQueueRun;
   entries: DispatchQueueEntry[];
 }> {
   return request("/api/auto-queue/generate", {
     method: "POST",
-    body: JSON.stringify({ repo: repo ?? null, agent_id: agentId ?? null, mode: mode ?? "priority-sort" }),
+    body: JSON.stringify({
+      repo: repo ?? null,
+      agent_id: agentId ?? null,
+      mode: mode ?? "priority-sort",
+      parallel: mode === "similarity-aware" || undefined,
+    }),
   });
 }
 
-export async function activateAutoQueue(repo?: string | null, agentId?: string | null, unifiedThread?: boolean): Promise<{
+export async function activateAutoQueue(
+  repo?: string | null,
+  agentId?: string | null,
+  unifiedThread?: boolean,
+): Promise<{
   dispatched: KanbanCard[];
   count: number;
 }> {
@@ -1015,7 +1213,10 @@ export async function activateAutoQueue(repo?: string | null, agentId?: string |
   });
 }
 
-export async function getAutoQueueStatus(repo?: string | null, agentId?: string | null): Promise<AutoQueueStatus> {
+export async function getAutoQueueStatus(
+  repo?: string | null,
+  agentId?: string | null,
+): Promise<AutoQueueStatus> {
   const params = new URLSearchParams();
   if (repo) params.set("repo", repo);
   if (agentId) params.set("agent_id", agentId);
@@ -1023,7 +1224,10 @@ export async function getAutoQueueStatus(repo?: string | null, agentId?: string 
   return request(`/api/auto-queue/status${qs ? `?${qs}` : ""}`);
 }
 
-export async function getPipelineStagesForAgent(repo: string, agentId: string): Promise<import("../types").PipelineStage[]> {
+export async function getPipelineStagesForAgent(
+  repo: string,
+  agentId: string,
+): Promise<import("../types").PipelineStage[]> {
   const params = new URLSearchParams({ repo, agent_id: agentId });
   const data = await request<{ stages: import("../types").PipelineStage[] }>(
     `/api/pipeline/stages?${params}`,
@@ -1059,8 +1263,17 @@ export async function reorderAutoQueueEntries(
   });
 }
 
-export async function resetAutoQueue(): Promise<{ ok: boolean; deleted_entries: number; completed_runs: number }> {
-  return request("/api/auto-queue/reset", { method: "POST" });
+export async function resetAutoQueue(agentId?: string | null): Promise<{
+  ok: boolean;
+  deleted_entries: number;
+  completed_runs: number;
+  protected_active_runs?: number;
+  warning?: string;
+}> {
+  return request("/api/auto-queue/reset", {
+    method: "POST",
+    body: JSON.stringify({ agent_id: agentId ?? undefined }),
+  });
 }
 
 // ── Pipeline Config Hierarchy (#135) ──
@@ -1070,7 +1283,9 @@ export interface PipelineConfigResponse {
   layers: { default: boolean; repo: boolean; agent: boolean };
 }
 
-export async function getDefaultPipeline(): Promise<import("../types").PipelineConfigFull> {
+export async function getDefaultPipeline(): Promise<
+  import("../types").PipelineConfigFull
+> {
   return request("/api/pipeline/config/default");
 }
 
@@ -1084,10 +1299,14 @@ export async function getEffectivePipeline(
   return request(`/api/pipeline/config/effective?${params}`);
 }
 
-export async function getRepoPipeline(repo: string): Promise<{ repo: string; pipeline_config: unknown }> {
+export async function getRepoPipeline(
+  repo: string,
+): Promise<{ repo: string; pipeline_config: unknown }> {
   // Server expects /repo/{owner}/{repo} as two segments, not one encoded segment
   const [owner, name] = repo.split("/");
-  return request(`/api/pipeline/config/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`);
+  return request(
+    `/api/pipeline/config/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`,
+  );
 }
 
 export async function setRepoPipeline(
@@ -1095,13 +1314,18 @@ export async function setRepoPipeline(
   config: unknown,
 ): Promise<{ ok: boolean }> {
   const [owner, name] = repo.split("/");
-  return request(`/api/pipeline/config/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, {
-    method: "PUT",
-    body: JSON.stringify({ config }),
-  });
+  return request(
+    `/api/pipeline/config/repo/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ config }),
+    },
+  );
 }
 
-export async function getAgentPipeline(agentId: string): Promise<{ agent_id: string; pipeline_config: unknown }> {
+export async function getAgentPipeline(
+  agentId: string,
+): Promise<{ agent_id: string; pipeline_config: unknown }> {
   return request(`/api/pipeline/config/agent/${agentId}`);
 }
 

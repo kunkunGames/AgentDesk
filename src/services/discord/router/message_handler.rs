@@ -74,13 +74,9 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Get session info, allowed tools, and pending uploads
     let (session_info, provider, allowed_tools, pending_uploads) = {
         let mut data = shared.core.lock().await;
-        let info = data.sessions.get(&channel_id).and_then(|session| {
-            session.current_path.as_ref().map(|_| {
-                (
-                    session.session_id.clone(),
-                    session.current_path.clone().unwrap_or_default(),
-                )
-            })
+        let info = data.sessions.get_mut(&channel_id).and_then(|session| {
+            let current_path = session.validated_path(channel_id)?;
+            Some((session.session_id.clone(), current_path))
         });
         let uploads = data
             .sessions
@@ -1015,7 +1011,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     };
 
-    let inflight_state = InflightTurnState::new(
+    let mut inflight_state = InflightTurnState::new(
         provider.clone(),
         channel_id.get(),
         channel_name.clone(),
@@ -1029,6 +1025,9 @@ pub(in crate::services::discord) async fn handle_text_message(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
+    // Persist identifiers for long-turn diagnostics (#130)
+    inflight_state.session_key = adk_session_key.clone();
+    inflight_state.dispatch_id = dispatch_id.clone();
     if let Err(e) = save_inflight_state(&inflight_state) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!("  [{ts}]   ⚠ inflight state save failed: {e}");
@@ -2503,6 +2502,7 @@ async fn reset_provider_session_if_pending(
 mod tests {
     use super::*;
     use crate::services::memory::RecallResponse;
+    use super::super::super::DiscordSession;
 
     fn sample_recall() -> RecallResponse {
         RecallResponse {
@@ -2510,6 +2510,26 @@ mod tests {
             longterm_catalog: Some("- notes.md".to_string()),
             external_recall: Some("[External Recall]".to_string()),
             warnings: Vec::new(),
+        }
+    }
+
+    fn make_session(
+        current_path: Option<String>,
+        remote_profile_name: Option<String>,
+    ) -> DiscordSession {
+        DiscordSession {
+            session_id: None,
+            current_path,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            remote_profile_name,
+            channel_id: None,
+            channel_name: None,
+            category_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: 0,
         }
     }
 
@@ -2578,5 +2598,34 @@ mod tests {
         assert_eq!(plan.shared_knowledge_for_system_prompt, None);
         assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
         assert_eq!(plan.longterm_catalog_for_system_prompt, Some("- notes.md"));
+    }
+
+    #[test]
+    fn session_path_is_usable_for_existing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_session(Some(dir.path().to_str().unwrap().to_string()), None);
+        assert!(session.validated_path("test-channel").is_some());
+    }
+
+    #[test]
+    fn session_path_is_not_usable_for_missing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().to_str().unwrap().to_string();
+        drop(dir);
+        let mut session = make_session(Some(missing_path), None);
+        assert!(session.validated_path("test-channel").is_none());
+        // Verify current_path and worktree were cleared
+        assert!(session.current_path.is_none());
+        assert!(session.worktree.is_none());
+    }
+
+    #[test]
+    fn session_path_is_stale_for_remote_session_with_missing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().to_str().unwrap().to_string();
+        drop(dir);
+        let mut session = make_session(Some(missing_path), Some("mac-mini".to_string()));
+        // Remote sessions should also validate local paths (no bypass)
+        assert!(session.validated_path("test-channel").is_none());
     }
 }

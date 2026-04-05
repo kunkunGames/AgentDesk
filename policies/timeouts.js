@@ -16,6 +16,7 @@
  * [J] Failed 디스패치 자동 재시도 (30초 쿨다운, ~60초 cadence, 최대 10회 + 즉시 Discord 알림)
  * [I] 턴 데드락 감지 + 자동 복구 (15분 주기, 최대 3회 연장 후 강제 중단 + 재디스패치)
  * [K] 고아 디스패치 복구 (5분) — in_progress 카드 + pending 디스패치 + 활성 세션 없음 → review 전이
+ * [L] Inflight 장시간 턴 감지 (#130) — heartbeat와 독립, started_at 기반 15/30/60/120분 단계별 알림
  * [M] Workspace branch 보호 (5분) — 메인 repo가 wt/* 브랜치로 이탈하면 자동 복구 (#181)
  */
 
@@ -55,6 +56,10 @@ function getTimeoutInterval(key, fallbackMinutes) {
   var val = parseInt(agentdesk.config.get(key), 10);
   if (!val || val <= 0) val = fallbackMinutes;
   return "-" + val + " minutes";
+}
+
+function latestCardActivityExpr(cardAlias, dispatchAlias) {
+  return "MAX(COALESCE(" + dispatchAlias + ".created_at, ''), COALESCE(" + cardAlias + ".updated_at, ''), COALESCE(" + cardAlias + ".started_at, ''))";
 }
 
 // #231: PM Decision notification dedup — durable kv_meta buffer.
@@ -314,7 +319,9 @@ var timeouts = {
     var bBlocked = bForce.length > 1 ? bForce[1] : bForce[0];
     var inProgressInterval = getTimeoutInterval("in_progress_stale_min", 120);
     var staleInProgress = agentdesk.db.query(
-      "SELECT id FROM kanban_cards WHERE status = ? AND started_at IS NOT NULL AND started_at < datetime('now', '" + inProgressInterval + "')",
+      "SELECT kc.id FROM kanban_cards kc " +
+      "LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id " +
+      "WHERE kc.status = ? AND " + latestCardActivityExpr("kc", "td") + " < datetime('now', '" + inProgressInterval + "')",
       [bInProgress]
     );
     for (var j = 0; j < staleInProgress.length; j++) {
@@ -950,6 +957,8 @@ var timeouts = {
   },
 
   _section_L: function() {
+    // ─── [L] Inflight 장시간 턴 감지 (#130) ──────────────────
+    // heartbeat와 독립 — inflight 파일의 started_at 기반 단계별 알림.
     // Prevents alarm fatigue while still notifying at key thresholds.
     var ALERT_THRESHOLDS = [15, 30, 60, 120]; // minutes
     try {
@@ -973,8 +982,28 @@ var timeouts = {
         var lastTier = agentdesk.db.query("SELECT value FROM kv_meta WHERE key = ?", [tierKey]);
         var lastAlertedTier = lastTier.length > 0 ? parseInt(lastTier[0].value, 10) : -1;
         if (currentTier <= lastAlertedTier) continue; // already alerted at this tier or higher
+        // Resolve agent_id: prefer dispatch target, fallback to channel owner (#130)
+        var agentId = "?";
+        if (inf.dispatch_id) {
+          var dispRow = agentdesk.db.query(
+            "SELECT to_agent_id FROM task_dispatches WHERE id = ? LIMIT 1",
+            [inf.dispatch_id]
+          );
+          if (dispRow.length > 0 && dispRow[0].to_agent_id) {
+            agentId = dispRow[0].to_agent_id;
+          }
+        }
+        if (agentId === "?") {
+          // #304: search all channel columns for reverse lookup
+          var agentRows = agentdesk.db.query(
+            "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
+            [inf.channel_id, inf.channel_id, inf.channel_id, inf.channel_id]
+          );
+          if (agentRows.length > 0) agentId = agentRows[0].id;
+        }
         sendDeadlockAlert(
           "⚠️ [장시간 턴] " + (inf.channel_name || inf.channel_id) + "\n" +
+          "agent_id: " + agentId + "\n" +
           "session_key: " + (inf.session_key || "?") + "\n" +
           "dispatch_id: " + (inf.dispatch_id || "?") + "\n" +
           "tmux: " + (inf.tmux_session_name || "?") + "\n" +
@@ -1076,7 +1105,8 @@ var timeouts = {
   },
 
   // ─── [N] Orphan review — review 상태인데 dispatch가 없는 카드 자동 복구 ──
-  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched review dispatch 0건
+  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched
+  // review/review-decision/e2e-test dispatch 0건
   // 원인: force-transition 후 dispatch 누락, dispatch 생성 중 에러, race condition 등
   // 복구: in_progress → review 재진입으로 OnReviewEnter 훅이 dispatch를 생성하도록 유도
   _section_N: function() {
@@ -1095,11 +1125,30 @@ var timeouts = {
       "AND NOT EXISTS (" +
       "  SELECT 1 FROM task_dispatches td " +
       "  WHERE td.kanban_card_id = kc.id " +
-      "  AND td.dispatch_type IN ('review', 'review-decision') " +
+      "  AND td.dispatch_type IN ('review', 'review-decision', 'e2e-test') " +
       "  AND td.status IN ('pending', 'dispatched')" +
       ")",
       [nReview]
     );
+
+    var protectedE2EReviews = agentdesk.db.query(
+      "SELECT kc.id, kc.title, kc.github_issue_number, td.id AS dispatch_id, td.status AS dispatch_status " +
+      "FROM kanban_cards kc " +
+      "JOIN task_dispatches td ON td.kanban_card_id = kc.id " +
+      "WHERE kc.status = ? " +
+      "AND kc.review_entered_at IS NOT NULL " +
+      "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
+      "AND td.dispatch_type = 'e2e-test' " +
+      "AND td.status IN ('pending', 'dispatched')",
+      [nReview]
+    );
+
+    for (var p = 0; p < protectedE2EReviews.length; p++) {
+      var pc = protectedE2EReviews[p];
+      agentdesk.log.info("[timeout] Orphan review guard: card " + pc.id +
+        " (#" + (pc.github_issue_number || "?") + ") keeps review state because e2e-test dispatch " +
+        pc.dispatch_id + " is still " + pc.dispatch_status);
+    }
 
     // Orphan review = review state with no active dispatch after 5 min.
     // Instead of reimplementing OnReviewEnter safeguards, escalate to
@@ -1170,10 +1219,11 @@ var timeouts = {
             [cooldownKey, "" + now]
           );
           // Discord notification
-          var agent = agentdesk.db.query("SELECT discord_channel_id FROM agents WHERE id = ?", [s.agent_id]);
-          if (agent.length > 0 && agent[0].discord_channel_id) {
+          // #304: resolve primary channel via centralized resolver
+          var compactCh = agentdesk.agents.resolvePrimaryChannel(s.agent_id);
+          if (compactCh) {
             sendNotifyAlert(
-              "channel:" + agent[0].discord_channel_id,
+              "channel:" + compactCh,
               "⚡ 컨텍스트 자동 compact 실행 (" + Math.round(pct) + "% → " + s.session_key + ")"
             );
           }
@@ -1195,10 +1245,11 @@ var timeouts = {
               "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
               [cooldownKey, "" + now]
             );
-            var agent2 = agentdesk.db.query("SELECT discord_channel_id FROM agents WHERE id = ?", [s.agent_id]);
-            if (agent2.length > 0 && agent2[0].discord_channel_id) {
+            // #304: resolve primary channel via centralized resolver
+            var clearCh = agentdesk.agents.resolvePrimaryChannel(s.agent_id);
+            if (clearCh) {
               sendNotifyAlert(
-                "channel:" + agent2[0].discord_channel_id,
+                "channel:" + clearCh,
                 "🧹 컨텍스트 자동 clear 실행 (" + Math.round(pct) + "%, idle " + Math.round(idleMin) + "분 → " + s.session_key + ")"
               );
             }
