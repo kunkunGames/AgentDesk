@@ -341,6 +341,10 @@ pub fn api_router(
         )
         .route(
             "/sessions/force-kill",
+            post(dispatched_sessions::force_kill_session_legacy),
+        )
+        .route(
+            "/sessions/{session_key}/force-kill",
             post(dispatched_sessions::force_kill_session),
         )
         // Session termination events (#212)
