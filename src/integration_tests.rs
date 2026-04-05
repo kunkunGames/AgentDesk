@@ -1597,6 +1597,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scenario_245_review_dispatch_uses_canonical_assigned_agent_id() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-245", "review");
+
+        kanban::fire_enter_hooks(&db, &engine, "card-245", "review");
+
+        let conn = db.lock().unwrap();
+        let to_agent_id: String = conn
+            .query_row(
+                "SELECT to_agent_id FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-245' AND dispatch_type = 'review' \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_agent_id, "agent-1",
+            "review dispatch must target canonical assigned_agent_id, not a channel alias"
+        );
+    }
+
     // ── #160: Process-level restart/delivery boundary tests ────
     //
     // Infrastructure: MockNotifier + process_outbox_batch + DB fallback helpers.

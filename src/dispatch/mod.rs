@@ -1912,6 +1912,33 @@ mod tests {
     }
 
     #[test]
+    fn create_dispatch_core_rejects_missing_agent_before_insert() {
+        let db = test_db();
+        seed_card(&db, "card-missing-agent", "ready");
+
+        let result = create_dispatch_core(
+            &db,
+            "card-missing-agent",
+            "agent-missing",
+            "implementation",
+            "Should fail",
+            &json!({}),
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("agent 'agent-missing' not found"));
+
+        let conn = db.separate_conn().unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-missing-agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 0, "missing agent must not persist rows");
+    }
+
+    #[test]
     fn create_dispatch_core_rejects_missing_primary_channel_before_insert() {
         let db = test_db();
         seed_card(&db, "card-no-channel", "ready");
