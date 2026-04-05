@@ -2,6 +2,8 @@
 
 `agentdesk migrate openclaw`는 OpenClaw의 durable state를 AgentDesk 런타임으로 이관하기 위한 CLI입니다.
 
+계약 수준의 상세 기준과 현재 구현 상태 차이는 `docs/openclaw-migration.md`를 참고하세요.
+
 ## 지원 범위
 
 - `openclaw.json` 또는 그 상위 루트 탐색
