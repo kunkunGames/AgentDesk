@@ -24,6 +24,7 @@ pub(crate) use cli::agentdesk_runtime_root;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 // ── Clap CLI definition ──────────────────────────────────────
@@ -51,7 +52,7 @@ enum Commands {
         /// Discord channel ID for restart completion report
         #[arg(long)]
         report_channel_id: Option<u64>,
-        /// Provider for restart report (claude, codex, or gemini)
+        /// Provider for restart report (claude, codex, gemini, or qwen)
         #[arg(long, value_enum)]
         report_provider: Option<ReportProvider>,
         /// Existing message ID to edit for restart report
@@ -308,6 +309,8 @@ enum ConfigAction {
 enum ReportProvider {
     Claude,
     Codex,
+    Gemini,
+    Qwen,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -631,6 +634,8 @@ fn build_restart_report_context(
             let provider = match provider_arg {
                 ReportProvider::Claude => ProviderKind::Claude,
                 ReportProvider::Codex => ProviderKind::Codex,
+                ReportProvider::Gemini => ProviderKind::Gemini,
+                ReportProvider::Qwen => ProviderKind::Qwen,
             };
             Ok(Some(RestartReportContext {
                 provider,
