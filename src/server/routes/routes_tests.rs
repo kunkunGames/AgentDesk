@@ -1779,6 +1779,58 @@ fn seed_live_auto_queue_run(db: &Db, run_id: &str, agent_id: &str, existing_card
     .unwrap();
 }
 
+fn seed_in_progress_stall_case(
+    db: &Db,
+    card_id: &str,
+    title: &str,
+    agent_id: &str,
+    started_offset: &str,
+    updated_offset: &str,
+    latest_dispatch: Option<(&str, &str)>,
+) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            started_at, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, 'in_progress', 'medium', ?3, 'test-repo',
+            datetime('now', ?4), datetime('now', ?4), datetime('now', ?5)
+        )",
+        rusqlite::params![card_id, title, agent_id, started_offset, updated_offset,],
+    )
+    .unwrap();
+
+    if let Some((dispatch_id, dispatch_offset)) = latest_dispatch {
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, 'implementation', 'dispatched', ?4, datetime('now', ?5), datetime('now', ?5)
+            )",
+            rusqlite::params![dispatch_id, card_id, agent_id, format!("{title} Dispatch"), dispatch_offset],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = ?1 WHERE id = ?2",
+            rusqlite::params![dispatch_id, card_id],
+        )
+        .unwrap();
+    }
+}
+
+fn drain_pending_transitions(db: &Db, engine: &PolicyEngine) {
+    loop {
+        let transitions = engine.drain_pending_transitions();
+        if transitions.is_empty() {
+            break;
+        }
+        for (card_id, old_s, new_s) in &transitions {
+            crate::kanban::fire_transition_hooks(db, engine, card_id, old_s, new_s);
+        }
+    }
+}
+
 #[tokio::test]
 async fn force_transition_rejects_without_channel_header() {
     let db = test_db();
@@ -1800,6 +1852,164 @@ async fn force_transition_rejects_without_channel_header() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn on_tick5min_stalled_timeout_uses_latest_activity_timestamp() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-stalled");
+
+    seed_in_progress_stall_case(
+        &db,
+        "card-fresh-dispatch",
+        "Fresh Dispatch",
+        "agent-stalled",
+        "-3 hours",
+        "-3 hours",
+        Some(("dispatch-fresh", "-10 minutes")),
+    );
+    seed_in_progress_stall_case(
+        &db,
+        "card-reentered",
+        "Re-entered",
+        "agent-stalled",
+        "-3 hours",
+        "-10 minutes",
+        Some(("dispatch-old", "-3 hours")),
+    );
+    seed_in_progress_stall_case(
+        &db,
+        "card-truly-stalled",
+        "Truly Stalled",
+        "agent-stalled",
+        "-3 hours",
+        "-3 hours",
+        Some(("dispatch-stale", "-3 hours")),
+    );
+
+    let _ = engine.try_fire_hook_by_name("OnTick5min", serde_json::json!({}));
+    drain_pending_transitions(&db, &engine);
+
+    let conn = db.lock().unwrap();
+    let rows: std::collections::HashMap<String, (String, Option<String>)> = conn
+        .prepare("SELECT id, status, blocked_reason FROM kanban_cards ORDER BY id ASC")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows.get("card-fresh-dispatch").map(|row| row.0.as_str()),
+        Some("in_progress"),
+        "fresh dispatch must reset the stalled timer"
+    );
+    assert_eq!(
+        rows.get("card-reentered").map(|row| row.0.as_str()),
+        Some("in_progress"),
+        "in_progress re-entry must reset the stalled timer even if latest dispatch is older"
+    );
+    assert_ne!(
+        rows.get("card-truly-stalled").map(|row| row.0.as_str()),
+        Some("in_progress"),
+        "truly stale card must still be detected by timeout policy"
+    );
+    assert!(
+        rows.get("card-truly-stalled")
+            .and_then(|row| row.1.as_deref())
+            .map(|reason| reason.contains("Stalled: no activity"))
+            .unwrap_or(false),
+        "truly stale card must carry the stalled blocked_reason"
+    );
+}
+
+#[tokio::test]
+async fn stalled_cards_and_stats_use_latest_activity_timestamp() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-stalled");
+    seed_repo(&db, "test-repo");
+
+    seed_in_progress_stall_case(
+        &db,
+        "card-fresh-dispatch",
+        "Fresh Dispatch",
+        "agent-stalled",
+        "-3 hours",
+        "-3 hours",
+        Some(("dispatch-fresh", "-10 minutes")),
+    );
+    seed_in_progress_stall_case(
+        &db,
+        "card-reentered",
+        "Re-entered",
+        "agent-stalled",
+        "-3 hours",
+        "-10 minutes",
+        Some(("dispatch-old", "-3 hours")),
+    );
+    seed_in_progress_stall_case(
+        &db,
+        "card-truly-stalled",
+        "Truly Stalled",
+        "agent-stalled",
+        "-3 hours",
+        "-3 hours",
+        Some(("dispatch-stale", "-3 hours")),
+    );
+
+    let app = test_api_router(db, engine, None);
+
+    let stalled_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards/stalled")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stalled_resp.status(), StatusCode::OK);
+    let stalled_body = axum::body::to_bytes(stalled_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stalled_json: serde_json::Value = serde_json::from_slice(&stalled_body).unwrap();
+    let stalled_ids: Vec<String> = stalled_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|card| card["id"].as_str().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        stalled_ids,
+        vec!["card-truly-stalled".to_string()],
+        "stalled endpoint must ignore fresh-dispatch and re-entered cards"
+    );
+
+    let stats_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_resp.status(), StatusCode::OK);
+    let stats_body = axum::body::to_bytes(stats_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats_json: serde_json::Value = serde_json::from_slice(&stats_body).unwrap();
+    assert_eq!(
+        stats_json["kanban"]["stale_in_progress"],
+        serde_json::json!(1),
+        "stats stale_in_progress count must match latest-activity stalled detection"
+    );
 }
 
 #[tokio::test]

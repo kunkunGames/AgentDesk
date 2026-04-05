@@ -19,6 +19,15 @@ pub(super) const CARD_SELECT: &str = "SELECT kc.id, kc.repo_id, kc.title, kc.sta
     kc.owner_agent_id, kc.requester_agent_id, kc.parent_card_id, kc.sort_order, kc.depth \
     FROM kanban_cards kc LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id";
 
+/// Latest meaningful activity for in-progress stall detection.
+///
+/// We intentionally consider the newest of:
+/// - latest dispatch creation time (fresh dispatch / redispatch)
+/// - card.updated_at (manual or pipeline-driven re-entry to in_progress)
+/// - started_at fallback for legacy rows
+pub(crate) const STALLED_ACTIVITY_AT_SQL: &str =
+    "MAX(COALESCE(td.created_at, ''), COALESCE(kc.updated_at, ''), COALESCE(kc.started_at, ''))";
+
 // ── Query / Body types ─────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1231,8 +1240,8 @@ pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<s
 
     let mut stmt = match conn.prepare(&format!(
         "{CARD_SELECT}
-         WHERE kc.status = 'in_progress' AND kc.started_at IS NOT NULL AND kc.started_at < datetime('now', '-2 hours'){}
-         ORDER BY kc.started_at ASC",
+         WHERE kc.status = 'in_progress' AND {STALLED_ACTIVITY_AT_SQL} < datetime('now', '-2 hours'){}
+         ORDER BY {STALLED_ACTIVITY_AT_SQL} ASC",
         repo_filter
     )) {
         Ok(s) => s,
