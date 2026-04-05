@@ -1819,6 +1819,51 @@ fn seed_in_progress_stall_case(
     }
 }
 
+fn seed_review_e2e_case(
+    db: &Db,
+    card_id: &str,
+    title: &str,
+    agent_id: &str,
+    review_offset: &str,
+    dispatch_id: &str,
+    dispatch_status: &str,
+    dispatch_offset: &str,
+) {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            review_entered_at, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, 'review', 'medium', ?3, 'test-repo',
+            datetime('now', ?4), datetime('now', ?4), datetime('now', ?4)
+        )",
+        rusqlite::params![card_id, title, agent_id, review_offset],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+        ) VALUES (
+            ?1, ?2, ?3, 'e2e-test', ?4, ?5, datetime('now', ?6), datetime('now', ?6)
+        )",
+        rusqlite::params![
+            dispatch_id,
+            card_id,
+            agent_id,
+            dispatch_status,
+            format!("{title} E2E"),
+            dispatch_offset
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE kanban_cards SET latest_dispatch_id = ?1 WHERE id = ?2",
+        rusqlite::params![dispatch_id, card_id],
+    )
+    .unwrap();
+}
+
 fn drain_pending_transitions(db: &Db, engine: &PolicyEngine) {
     loop {
         let transitions = engine.drain_pending_transitions();
@@ -1924,6 +1969,57 @@ fn on_tick5min_stalled_timeout_uses_latest_activity_timestamp() {
             .map(|reason| reason.contains("Stalled: no activity"))
             .unwrap_or(false),
         "truly stale card must carry the stalled blocked_reason"
+    );
+}
+
+#[test]
+fn on_tick1min_orphan_review_treats_e2e_dispatch_as_active() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-e2e");
+
+    seed_review_e2e_case(
+        &db,
+        "card-e2e-review",
+        "E2E Review",
+        "agent-e2e",
+        "-10 minutes",
+        "dispatch-e2e",
+        "dispatched",
+        "-10 minutes",
+    );
+
+    let _ = engine.try_fire_hook_by_name("OnTick1min", serde_json::json!({}));
+    drain_pending_transitions(&db, &engine);
+
+    let conn = db.lock().unwrap();
+    let (status, blocked_reason): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, blocked_reason FROM kanban_cards WHERE id = 'card-e2e-review'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let dispatch_status: String = conn
+        .query_row(
+            "SELECT status FROM task_dispatches WHERE id = 'dispatch-e2e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        status, "review",
+        "active e2e-test dispatch must keep the card out of orphan review recovery"
+    );
+    assert!(
+        blocked_reason.is_none(),
+        "protected review card must not gain an orphan-review blocked_reason"
+    );
+    assert_eq!(
+        dispatch_status, "dispatched",
+        "e2e-test dispatch should stay active after onTick1min orphan review sweep"
     );
 }
 
