@@ -333,22 +333,20 @@ pub async fn submit_review_decision(
             };
 
             // Create rework dispatch (original path, or fallback if direct review failed)
-            let rework_dispatch_created = if !direct_review_created {
-                // Transition card to rework target (e.g., in_progress) — only if not already done
-                if !skip_rework {
-                    if let Err(e) = crate::kanban::transition_status_with_opts(
-                        &state.db,
-                        &state.engine,
-                        &body.card_id,
-                        &rework_target,
-                        "review_decision_accept",
-                        true,
-                    ) {
-                        tracing::warn!(
-                            "[review-decision] #195 Transition to rework target failed for card {}: {e}",
-                            body.card_id
-                        );
-                    }
+            let rework_dispatch_created = if !direct_review_created && !skip_rework {
+                // Transition card to rework target (e.g., in_progress)
+                if let Err(e) = crate::kanban::transition_status_with_opts(
+                    &state.db,
+                    &state.engine,
+                    &body.card_id,
+                    &rework_target,
+                    "review_decision_accept",
+                    true,
+                ) {
+                    tracing::warn!(
+                        "[review-decision] #195 Transition to rework target failed for card {}: {e}",
+                        body.card_id
+                    );
                 }
 
                 if let Some(ref agent_id) = card_agent_id {
