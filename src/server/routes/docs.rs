@@ -48,6 +48,12 @@ pub async fn api_docs() -> (StatusCode, Json<Value>) {
         ),
         // Sessions
         ep("GET", "/api/sessions", "sessions", "List sessions"),
+        ep(
+            "POST",
+            "/api/sessions/{session_key}/force-kill",
+            "sessions",
+            "Force-kill session, clear inflight state, fail active dispatch, and optionally retry",
+        ),
         // Policies
         ep("GET", "/api/policies", "policies", "List policies"),
         // Auth
