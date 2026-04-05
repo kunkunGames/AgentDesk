@@ -53,6 +53,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE task_dispatches ADD COLUMN thread_id TEXT;");
     let _ =
         conn.execute_batch("ALTER TABLE task_dispatches ADD COLUMN retry_count INTEGER DEFAULT 0;");
+    let _ = conn.execute_batch("ALTER TABLE task_dispatches ADD COLUMN completed_at DATETIME;");
     let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN thread_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN primary_provider TEXT;");
     let _ = conn.execute_batch("ALTER TABLE meetings ADD COLUMN reviewer_provider TEXT;");
@@ -113,6 +114,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // Backfill lifecycle timestamps for existing cards that predate these columns.
     // Uses updated_at as best-available approximation; future transitions will use exact timestamps.
+    let _ = conn.execute_batch(
+        "UPDATE task_dispatches
+         SET completed_at = COALESCE(completed_at, updated_at)
+         WHERE status = 'completed' AND completed_at IS NULL;",
+    );
     let _ = conn.execute_batch(
         "UPDATE kanban_cards SET requested_at = updated_at WHERE status = 'requested' AND requested_at IS NULL;
          UPDATE kanban_cards SET started_at = updated_at WHERE status = 'in_progress' AND started_at IS NULL;

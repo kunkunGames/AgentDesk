@@ -22,6 +22,21 @@ fn test_engine(db: &Db) -> PolicyEngine {
     PolicyEngine::new(&config, db.clone()).unwrap()
 }
 
+struct WorktreeCommitOverrideGuard;
+
+impl WorktreeCommitOverrideGuard {
+    fn set(commit: &str) -> Self {
+        super::decision_route::set_test_worktree_commit_override(Some(commit.to_string()));
+        Self
+    }
+}
+
+impl Drop for WorktreeCommitOverrideGuard {
+    fn drop(&mut self) {
+        super::decision_route::clear_test_worktree_commit_override();
+    }
+}
+
 fn seed_review_card(db: &Db, dispatch_id: &str) {
     let conn = db.lock().unwrap();
     conn.execute(
@@ -1264,15 +1279,70 @@ async fn accept_clears_suggestion_pending_review_status() {
     );
 }
 
+#[test]
+fn latest_completed_review_lookup_prefers_completed_at() {
+    let db = test_db();
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) VALUES ('agent-rv', 'Agent RV', '123', '456')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES ('card-review-ts', 'Review Timestamp Card', 'review', 'agent-rv', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, completed_at, created_at, updated_at) \
+             VALUES ('review-older-finish', 'card-review-ts', 'agent-rv', 'review', 'completed', '[Review R1]', \
+             '{\"reviewed_commit\":\"old1111\"}', datetime('now', '-20 minutes'), datetime('now', '-30 minutes'), datetime('now', '-1 minute'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, completed_at, created_at, updated_at) \
+             VALUES ('review-newer-finish', 'card-review-ts', 'agent-rv', 'review', 'completed', '[Review R2]', \
+             '{\"reviewed_commit\":\"new2222\"}', datetime('now', '-5 minutes'), datetime('now', '-40 minutes'), datetime('now', '-10 minutes'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    let conn = db.lock().unwrap();
+    let latest_context: Option<String> = conn
+        .query_row(
+            "SELECT context FROM task_dispatches \
+             WHERE kanban_card_id = ?1 AND dispatch_type = 'review' AND status = 'completed' \
+             ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC, rowid DESC LIMIT 1",
+            ["card-review-ts"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let latest_reviewed_commit = latest_context
+        .and_then(|ctx| serde_json::from_str::<serde_json::Value>(&ctx).ok())
+        .and_then(|value| {
+            value
+                .get("reviewed_commit")
+                .and_then(|commit| commit.as_str())
+                .map(str::to_string)
+        });
+
+    assert_eq!(
+        latest_reviewed_commit,
+        Some("new2222".to_string()),
+        "skip_rework lookup must follow completed_at rather than a stale updated_at"
+    );
+}
+
 /// #266: When the agent already committed new work during the review-decision
 /// turn (skip_rework / direct_review_created path), OnReviewEnter sets
 /// review_status='reviewing'. The accept cleanup must NOT clear it.
-///
-/// This test requires a real git worktree for `find_worktree_for_issue()` to
-/// detect the differing commit and trigger skip_rework=true.
 #[tokio::test]
-#[ignore] // CI: requires a real git worktree with a newer commit than reviewed_commit
 async fn accept_direct_review_preserves_reviewing_status() {
+    let _worktree_override = WorktreeCommitOverrideGuard::set("bbb2222");
     let db = test_db();
     {
         let conn = db.lock().unwrap();
@@ -1318,22 +1388,28 @@ async fn accept_direct_review_preserves_reviewing_status() {
 
     assert_eq!(status, StatusCode::OK, "accept should succeed");
     let resp: serde_json::Value = serde_json::from_value(body.0).unwrap();
+    assert_eq!(
+        resp.get("direct_review_created"),
+        Some(&serde_json::Value::Bool(true)),
+        "skip_rework accept must create a direct review dispatch"
+    );
+    assert_eq!(
+        resp.get("rework_dispatch_created"),
+        Some(&serde_json::Value::Bool(false)),
+        "skip_rework accept must not create a rework dispatch"
+    );
 
-    // When skip_rework triggers, direct_review_created should be true
-    if resp.get("direct_review_created") == Some(&serde_json::Value::Bool(true)) {
-        let conn = db.lock().unwrap();
-        let review_status: Option<String> = conn
-            .query_row(
-                "SELECT review_status FROM kanban_cards WHERE id = 'card-266dr'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            review_status,
-            Some("reviewing".to_string()),
-            "#266: direct-review accept must preserve review_status='reviewing' set by OnReviewEnter"
-        );
-    }
-    // else: skip_rework was false (no real worktree found) — normal rework path tested above
+    let conn = db.lock().unwrap();
+    let review_status: Option<String> = conn
+        .query_row(
+            "SELECT review_status FROM kanban_cards WHERE id = 'card-266dr'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        review_status,
+        Some("reviewing".to_string()),
+        "#266: direct-review accept must preserve review_status='reviewing' set by OnReviewEnter"
+    );
 }
