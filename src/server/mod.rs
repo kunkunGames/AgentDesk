@@ -181,7 +181,7 @@ pub async fn run(
                 health_registry,
             ),
         )
-        .fallback_service(ServeDir::new(&dashboard_dir));
+        .fallback_service(ServeDir::new(&dashboard_dir).append_index_html_on_directories(true));
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
