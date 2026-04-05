@@ -1105,7 +1105,8 @@ var timeouts = {
   },
 
   // ─── [N] Orphan review — review 상태인데 dispatch가 없는 카드 자동 복구 ──
-  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched review dispatch 0건
+  // 패턴: card.status=review, review_entered_at > 5분 전, pending/dispatched
+  // review/review-decision/e2e-test dispatch 0건
   // 원인: force-transition 후 dispatch 누락, dispatch 생성 중 에러, race condition 등
   // 복구: in_progress → review 재진입으로 OnReviewEnter 훅이 dispatch를 생성하도록 유도
   _section_N: function() {
@@ -1124,11 +1125,30 @@ var timeouts = {
       "AND NOT EXISTS (" +
       "  SELECT 1 FROM task_dispatches td " +
       "  WHERE td.kanban_card_id = kc.id " +
-      "  AND td.dispatch_type IN ('review', 'review-decision') " +
+      "  AND td.dispatch_type IN ('review', 'review-decision', 'e2e-test') " +
       "  AND td.status IN ('pending', 'dispatched')" +
       ")",
       [nReview]
     );
+
+    var protectedE2EReviews = agentdesk.db.query(
+      "SELECT kc.id, kc.title, kc.github_issue_number, td.id AS dispatch_id, td.status AS dispatch_status " +
+      "FROM kanban_cards kc " +
+      "JOIN task_dispatches td ON td.kanban_card_id = kc.id " +
+      "WHERE kc.status = ? " +
+      "AND kc.review_entered_at IS NOT NULL " +
+      "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
+      "AND td.dispatch_type = 'e2e-test' " +
+      "AND td.status IN ('pending', 'dispatched')",
+      [nReview]
+    );
+
+    for (var p = 0; p < protectedE2EReviews.length; p++) {
+      var pc = protectedE2EReviews[p];
+      agentdesk.log.info("[timeout] Orphan review guard: card " + pc.id +
+        " (#" + (pc.github_issue_number || "?") + ") keeps review state because e2e-test dispatch " +
+        pc.dispatch_id + " is still " + pc.dispatch_status);
+    }
 
     // Orphan review = review state with no active dispatch after 5 min.
     // Instead of reimplementing OnReviewEnter safeguards, escalate to
