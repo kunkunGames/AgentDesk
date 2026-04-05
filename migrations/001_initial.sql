@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS task_dispatches (
     parent_dispatch_id  TEXT,
     chain_depth         INTEGER DEFAULT 0,
     created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at        DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

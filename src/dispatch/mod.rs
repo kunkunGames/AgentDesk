@@ -975,7 +975,11 @@ pub fn mark_dispatch_completed(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
     let changed = conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+        "UPDATE task_dispatches
+         SET status = 'completed',
+             result = ?1,
+             updated_at = datetime('now'),
+             completed_at = COALESCE(completed_at, datetime('now')) \
          WHERE id = ?2 AND status IN ('pending', 'dispatched')",
         rusqlite::params![result_str, dispatch_id],
     )?;
@@ -1006,7 +1010,11 @@ fn complete_dispatch_inner(
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
 
     let changed = conn.execute(
-        "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
+        "UPDATE task_dispatches
+         SET status = 'completed',
+             result = ?1,
+             updated_at = datetime('now'),
+             completed_at = COALESCE(completed_at, datetime('now')) \
          WHERE id = ?2 AND status IN ('pending', 'dispatched')",
         rusqlite::params![result_str, dispatch_id],
     )?;
@@ -1131,25 +1139,31 @@ pub fn query_dispatch_row(
     dispatch_id: &str,
 ) -> Result<serde_json::Value> {
     conn.query_row(
-        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at, COALESCE(retry_count, 0)
+        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type, status, title, context, result, parent_dispatch_id, chain_depth, created_at, updated_at, completed_at, COALESCE(retry_count, 0)
          FROM task_dispatches WHERE id = ?1",
         [dispatch_id],
         |row| {
+            let status: String = row.get(5)?;
+            let updated_at: String = row.get(12)?;
+            let completed_at: Option<String> = row
+                .get::<_, Option<String>>(13)?
+                .or_else(|| (status == "completed").then(|| updated_at.clone()));
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "kanban_card_id": row.get::<_, Option<String>>(1)?,
                 "from_agent_id": row.get::<_, Option<String>>(2)?,
                 "to_agent_id": row.get::<_, Option<String>>(3)?,
                 "dispatch_type": row.get::<_, Option<String>>(4)?,
-                "status": row.get::<_, String>(5)?,
+                "status": status,
                 "title": row.get::<_, Option<String>>(6)?,
                 "context": row.get::<_, Option<String>>(7)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "result": row.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "parent_dispatch_id": row.get::<_, Option<String>>(9)?,
                 "chain_depth": row.get::<_, i64>(10)?,
                 "created_at": row.get::<_, String>(11)?,
-                "updated_at": row.get::<_, String>(12)?,
-                "retry_count": row.get::<_, i64>(13)?,
+                "updated_at": updated_at,
+                "completed_at": completed_at,
+                "retry_count": row.get::<_, i64>(14)?,
             }))
         },
     )
@@ -1326,6 +1340,40 @@ fn provider_from_channel_suffix(channel: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn repo_dir_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct RepoDirOverride {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl RepoDirOverride {
+        fn new(path: &str) -> Self {
+            let lock = repo_dir_env_lock().lock().unwrap();
+            let previous = std::env::var("AGENTDESK_REPO_DIR").ok();
+            unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RepoDirOverride {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_deref() {
+                unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) };
+            } else {
+                unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
+            }
+        }
+    }
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1349,11 +1397,53 @@ mod tests {
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
 
+    fn run_git(repo_dir: &str, args: &[&str]) -> std::process::Output {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap();
+
+        run_git(repo_dir, &["init", "-b", "main"]);
+        run_git(repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(repo_dir, &["config", "user.name", "Test"]);
+        run_git(repo_dir, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let override_guard = RepoDirOverride::new(repo_dir);
+        (repo, override_guard)
+    }
+
+    fn git_commit(repo_dir: &str, message: &str) -> String {
+        run_git(repo_dir, &["commit", "--allow-empty", "-m", message]);
+        crate::services::platform::git_head_commit(repo_dir).unwrap()
+    }
+
     fn seed_card(db: &Db, card_id: &str, status: &str) {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, created_at, updated_at) VALUES (?1, 'Test Card', ?2, datetime('now'), datetime('now'))",
             rusqlite::params![card_id, status],
+        )
+        .unwrap();
+    }
+
+    fn set_card_issue_number(db: &Db, card_id: &str, issue_number: i64) {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET github_issue_number = ?1 WHERE id = ?2",
+            rusqlite::params![issue_number, card_id],
         )
         .unwrap();
     }
@@ -1443,6 +1533,46 @@ mod tests {
             complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
 
         assert_eq!(completed["status"], "completed");
+    }
+
+    #[test]
+    fn complete_dispatch_records_completed_at() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-2-ts", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-2-ts",
+            "agent-1",
+            "implementation",
+            "title",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        let completed =
+            complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
+
+        assert!(
+            completed["completed_at"].as_str().is_some(),
+            "completion result must expose completed_at"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        let stored_completed_at: Option<String> = conn
+            .query_row(
+                "SELECT completed_at FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored_completed_at.is_some(),
+            "task_dispatches.completed_at must be stored for completed rows"
+        );
     }
 
     #[test]
@@ -2198,5 +2328,87 @@ mod tests {
         if let Some(branch) = completed_branch {
             assert_eq!(parsed["branch"], branch);
         }
+    }
+
+    #[test]
+    fn review_context_accepts_latest_work_dispatch_commit_for_same_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-match", "review");
+        set_card_issue_number(&db, "card-review-match", 305);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let matching_commit = git_commit(repo_dir, "fix: target commit (#305)");
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-match', 'card-review-match', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": "main",
+                    "completed_commit": matching_commit.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-match", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["reviewed_commit"], matching_commit);
+        assert_eq!(parsed["worktree_path"], repo_dir);
+        assert_eq!(parsed["branch"], "main");
+    }
+
+    #[test]
+    fn review_context_rejects_latest_work_dispatch_commit_from_other_issue() {
+        let db = test_db();
+        seed_card(&db, "card-review-mismatch", "review");
+        set_card_issue_number(&db, "card-review-mismatch", 305);
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let expected_commit = git_commit(repo_dir, "fix: target commit (#305)");
+        let poisoned_commit = git_commit(repo_dir, "chore: unrelated (#999)");
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-mismatch', 'card-review-mismatch', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": "main",
+                    "completed_commit": poisoned_commit.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-mismatch", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["reviewed_commit"], expected_commit);
+        assert_ne!(parsed["reviewed_commit"], poisoned_commit);
+        assert_eq!(parsed["worktree_path"], repo_dir);
+        assert_eq!(parsed["branch"], "main");
     }
 }

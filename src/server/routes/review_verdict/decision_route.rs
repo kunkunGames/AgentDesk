@@ -8,6 +8,41 @@ use super::tuning_aggregate::{record_decision_tuning, spawn_aggregate_if_needed}
 
 // ── Review Decision (agent's response to counter-model review) ──────────────
 
+#[cfg(test)]
+fn test_worktree_commit_override_slot() -> &'static std::sync::Mutex<Option<Option<String>>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Option<String>>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(super) fn set_test_worktree_commit_override(commit: Option<String>) {
+    if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
+        *slot = Some(commit);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn clear_test_worktree_commit_override() {
+    if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
+        *slot = None;
+    }
+}
+
+fn current_issue_worktree_commit(issue_num: i64) -> Option<String> {
+    #[cfg(test)]
+    {
+        if let Ok(slot) = test_worktree_commit_override_slot().lock() {
+            if let Some(override_commit) = slot.clone() {
+                return override_commit;
+            }
+        }
+    }
+
+    let repo_dir = crate::services::platform::resolve_repo_dir().unwrap_or_default();
+    crate::services::platform::find_worktree_for_issue(&repo_dir, issue_num).map(|wt| wt.commit)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReviewDecisionBody {
     pub card_id: String,
@@ -242,11 +277,7 @@ pub async fn submit_review_decision(
 
                 if let (Some(prev_commit), Some(issue_num)) = (&last_reviewed_commit, issue_number)
                 {
-                    let repo_dir =
-                        crate::services::platform::resolve_repo_dir().unwrap_or_default();
-                    let current_commit =
-                        crate::services::platform::find_worktree_for_issue(&repo_dir, issue_num)
-                            .map(|wt| wt.commit);
+                    let current_commit = current_issue_worktree_commit(issue_num);
                     if let Some(ref cur) = current_commit {
                         let differs = cur != prev_commit;
                         if differs {
