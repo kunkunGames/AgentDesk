@@ -139,6 +139,27 @@ pub fn git_head_commit(repo_dir: &str) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// Find the most recent commit whose subject matches `(#issue_number)`.
+///
+/// Searches the last 20 commits to avoid expensive log scans.  Returns `None`
+/// when no matching commit is found or git is unavailable.
+pub fn git_latest_commit_for_issue(repo_dir: &str, issue_number: i64) -> Option<String> {
+    let pattern = format!("(#{})", issue_number);
+    Command::new("git")
+        .args(["log", "--format=%H %s", "-20"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find(|line| line.contains(&pattern))
+                .and_then(|line| line.split_whitespace().next())
+                .map(str::to_string)
+        })
+}
+
 /// Get the current branch name from a git directory (repo or worktree).
 pub fn git_branch_name(dir: &str) -> Option<String> {
     Command::new("git")
