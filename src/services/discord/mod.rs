@@ -49,8 +49,8 @@ use adk_session::{
 };
 use formatting::{
     BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
-    format_tool_input, normalize_empty_lines, remove_reaction_raw, send_long_message_raw,
-    truncate_str,
+    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
+    send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
