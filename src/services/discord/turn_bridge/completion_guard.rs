@@ -261,9 +261,30 @@ pub(in crate::services::discord) fn runtime_db_fallback_complete(
     changed > 0
 }
 
-fn work_dispatch_completion_context(adk_cwd: Option<&str>) -> Option<serde_json::Value> {
+fn lookup_card_issue_number(db: Option<&crate::db::Db>, card_id: Option<&str>) -> Option<i64> {
+    let db = db?;
+    let card_id = card_id?;
+    db.separate_conn()
+        .ok()?
+        .query_row(
+            "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
+            [card_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+fn work_dispatch_completion_context(
+    adk_cwd: Option<&str>,
+    issue_number: Option<i64>,
+) -> Option<serde_json::Value> {
     let cwd = adk_cwd.filter(|p| std::path::Path::new(p).is_dir())?;
-    let completed_commit = crate::services::platform::git_head_commit(cwd)?;
+    // Prefer the most recent commit that references this card's issue number.
+    // Falls back to plain HEAD when no issue number is known or no match found.
+    let completed_commit = issue_number
+        .and_then(|n| crate::services::platform::shell::git_latest_commit_for_issue(cwd, n))
+        .or_else(|| crate::services::platform::git_head_commit(cwd))?;
     let mut obj = serde_json::Map::new();
     obj.insert(
         "completed_worktree_path".to_string(),
@@ -286,8 +307,9 @@ fn completion_result_with_context(
     source: &str,
     needs_reconcile: bool,
     adk_cwd: Option<&str>,
+    issue_number: Option<i64>,
 ) -> serde_json::Value {
-    let mut result = work_dispatch_completion_context(adk_cwd)
+    let mut result = work_dispatch_completion_context(adk_cwd, issue_number)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
     if let Some(obj) = result.as_object_mut() {
         obj.insert(
@@ -391,7 +413,8 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
 
     // Direct finalize_dispatch with retry — single completion authority (#143)
     if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
-        let completion_context = work_dispatch_completion_context(adk_cwd);
+        let issue_number = lookup_card_issue_number(Some(db), snapshot.kanban_card_id.as_deref());
+        let completion_context = work_dispatch_completion_context(adk_cwd, issue_number);
         for attempt in 1..=3u8 {
             match crate::dispatch::finalize_dispatch(
                 db,
@@ -423,7 +446,7 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
         // All retries exhausted — DB fallback via pool, then runtime-root file
         let fallback_ok = db.separate_conn().ok().map_or(false, |conn| {
             let result_json =
-                completion_result_with_context("turn_bridge_db_fallback", true, adk_cwd)
+                completion_result_with_context("turn_bridge_db_fallback", true, adk_cwd, issue_number)
                     .to_string();
             let changed = conn.execute(
                 "UPDATE task_dispatches SET status = 'completed', \
@@ -453,7 +476,7 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
         let url = local_api_url(shared.api_port, &format!("/api/dispatches/{dispatch_id}"));
         let payload = serde_json::json!({
             "status": "completed",
-            "result": completion_result_with_context("turn_bridge_explicit", false, adk_cwd),
+            "result": completion_result_with_context("turn_bridge_explicit", false, adk_cwd, None),
         });
         for attempt in 1..=3u8 {
             match reqwest::Client::new()
