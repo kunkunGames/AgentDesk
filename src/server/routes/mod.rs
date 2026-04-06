@@ -269,6 +269,7 @@ pub fn api_router(
             "/offices",
             get(offices::list_offices).post(offices::create_office),
         )
+        .route("/offices/reorder", patch(offices::reorder_offices))
         .route(
             "/offices/{id}",
             patch(offices::update_office).delete(offices::delete_office),

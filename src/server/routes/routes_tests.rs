@@ -44,6 +44,103 @@ fn test_api_router(
 }
 
 #[tokio::test]
+async fn offices_reorder_accepts_bare_array_and_updates_listing_order() {
+    let db = test_db();
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO offices (id, name, sort_order) VALUES ('office-a', 'Alpha', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO offices (id, name, sort_order) VALUES ('office-b', 'Beta', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO offices (id, name, sort_order) VALUES ('office-c', 'Gamma', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let reorder_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/offices/reorder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"[{"id":"office-a","sort_order":1},{"id":"office-b","sort_order":2},{"id":"office-c","sort_order":0}]"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(reorder_response.status(), StatusCode::OK);
+    let reorder_body = axum::body::to_bytes(reorder_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let reorder_json: serde_json::Value = serde_json::from_slice(&reorder_body).unwrap();
+    assert_eq!(reorder_json["ok"], true);
+    assert_eq!(reorder_json["updated"], 3);
+
+    let list_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/offices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let offices = list_json["offices"].as_array().unwrap();
+
+    assert_eq!(offices.len(), 3);
+    assert_eq!(offices[0]["id"], "office-c");
+    assert_eq!(offices[0]["sort_order"], 0);
+    assert_eq!(offices[1]["id"], "office-a");
+    assert_eq!(offices[1]["sort_order"], 1);
+    assert_eq!(offices[2]["id"], "office-b");
+    assert_eq!(offices[2]["sort_order"], 2);
+}
+
+#[tokio::test]
+async fn offices_reorder_rejects_wrapped_order_body() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/offices/reorder")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"order":[{"id":"office-a","sort_order":0}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn health_returns_ok_with_db_status() {
     let db = test_db();
     let engine = test_engine(&db);

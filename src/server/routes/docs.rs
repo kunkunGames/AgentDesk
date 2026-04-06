@@ -299,6 +299,12 @@ pub async fn api_docs() -> (StatusCode, Json<Value>) {
         // Offices
         ep("GET", "/api/offices", "offices", "List offices"),
         ep("POST", "/api/offices", "offices", "Create office"),
+        ep(
+            "PATCH",
+            "/api/offices/reorder",
+            "offices",
+            "Reorder offices",
+        ),
         ep("PATCH", "/api/offices/{id}", "offices", "Update office"),
         ep("DELETE", "/api/offices/{id}", "offices", "Delete office"),
         ep(
