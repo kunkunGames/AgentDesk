@@ -10,6 +10,7 @@ mod github;
 pub(crate) mod kanban;
 pub(crate) mod pipeline;
 pub(crate) mod receipt;
+pub(crate) mod reconcile;
 pub(crate) mod runtime;
 pub(crate) mod runtime_layout;
 mod server;
