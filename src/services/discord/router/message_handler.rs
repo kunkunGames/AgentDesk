@@ -459,16 +459,11 @@ pub(in crate::services::discord) async fn handle_text_message(
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }
-    // Re-inject compact formatting reminder for interactive follow-up turns.
-    // System prompt is only sent at session creation; after context compaction
-    // these rules can be lost.
+    // Re-inject formatting + compaction reminder for interactive follow-up
+    // turns. System prompt is only sent at session creation; after context
+    // compaction these rules can be lost.
     if session_id.is_some() {
-        context_chunks.push(
-            "<system-reminder>\n\
-             Discord formatting: minimize code blocks, keep messages concise.\n\
-             </system-reminder>"
-                .to_string(),
-        );
+        context_chunks.push(super::super::prompt_builder::build_followup_turn_system_reminder());
     }
     context_chunks.push(sanitized_input);
     let mut context_prompt = context_chunks.join("\n\n");
@@ -499,33 +494,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Build skills notice for system prompt
     let skills_notice = {
         let skills = shared.skills_cache.read().await;
-        if skills.is_empty() {
-            String::new()
-        } else {
-            let list: Vec<String> = skills
-                .iter()
-                .map(|(name, desc)| format!("  - /{}: {}", name, desc))
-                .collect();
-            match &provider {
-                ProviderKind::Claude => format!(
-                    "\n\nAvailable skills (invoke via the Skill tool):\n{}",
-                    list.join("\n")
-                ),
-                ProviderKind::Codex => format!(
-                    "\n\nAvailable local Codex skills (use them by name when relevant):\n{}",
-                    list.join("\n")
-                ),
-                ProviderKind::Gemini => format!(
-                    "\n\nAvailable local Gemini skills (use them by name when relevant):\n{}",
-                    list.join("\n")
-                ),
-                ProviderKind::Qwen => format!(
-                    "\n\nAvailable local Qwen skills (use them by name when relevant):\n{}",
-                    list.join("\n")
-                ),
-                ProviderKind::Unsupported(_) => String::new(),
-            }
-        }
+        format_skills_notice(&provider, &skills)
     };
 
     // Build Discord context info
@@ -2293,12 +2262,14 @@ Any other message is sent to {p}.
                     if args_str.is_empty() {
                         format!(
                             "Execute the skill `/{skill}` now. \
-                             Use the Skill tool with skill=\"{skill}\"."
+                             Use the Skill tool with skill=\"{skill}\". \
+                             Read files under `references/` only if the skill points to them or you need extra detail."
                         )
                     } else {
                         format!(
                             "Execute the skill `/{skill}` with arguments: {args_str}\n\
-                             Use the Skill tool with skill=\"{skill}\", args=\"{args_str}\"."
+                             Use the Skill tool with skill=\"{skill}\", args=\"{args_str}\". \
+                             Read files under `references/` only if the skill points to them or you need extra detail."
                         )
                     }
                 }
@@ -2306,12 +2277,12 @@ Any other message is sent to {p}.
                     if args_str.is_empty() {
                         format!(
                             "Use the local Codex skill `/{skill}` now. \
-                             Follow its SKILL.md instructions exactly and complete the task."
+                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
                         )
                     } else {
                         format!(
                             "Use the local Codex skill `/{skill}` now with this user request: {args_str}\n\
-                             Follow its SKILL.md instructions exactly and adapt them to the request."
+                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
                         )
                     }
                 }
@@ -2319,12 +2290,12 @@ Any other message is sent to {p}.
                     if args_str.is_empty() {
                         format!(
                             "Use the local Gemini skill `/{skill}` now. \
-                             Follow its SKILL.md instructions exactly and complete the task."
+                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
                         )
                     } else {
                         format!(
                             "Use the local Gemini skill `/{skill}` now with this user request: {args_str}\n\
-                             Follow its SKILL.md instructions exactly and adapt them to the request."
+                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
                         )
                     }
                 }
@@ -2332,12 +2303,12 @@ Any other message is sent to {p}.
                     if args_str.is_empty() {
                         format!(
                             "Use the local Qwen skill `/{skill}` now. \
-                             Follow its SKILL.md instructions exactly and complete the task."
+                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
                         )
                     } else {
                         format!(
                             "Use the local Qwen skill `/{skill}` now with this user request: {args_str}\n\
-                             Follow its SKILL.md instructions exactly and adapt them to the request."
+                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
                         )
                     }
                 }
