@@ -470,6 +470,190 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scenario_251_boot_reconcile_backfills_missing_notify_outbox() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-251-outbox", "in_progress");
+        seed_dispatch(
+            &db,
+            "dispatch-251-outbox",
+            "card-251-outbox",
+            "implementation",
+            "pending",
+        );
+
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        assert_eq!(
+            stats.missing_notify_outbox_backfilled, 1,
+            "boot reconcile must backfill missing notify outbox rows"
+        );
+
+        let conn = db.lock().unwrap();
+        let outbox_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dispatch_outbox \
+                 WHERE dispatch_id = 'dispatch-251-outbox' AND action = 'notify'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox_count, 1,
+            "notify outbox row must exist after boot reconcile"
+        );
+    }
+
+    #[test]
+    fn scenario_251_boot_reconcile_resets_broken_auto_queue_entries() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-251-aq-orphan", "in_progress");
+        seed_card(&db, "card-251-aq-phantom", "in_progress");
+        seed_card(&db, "card-251-aq-cancelled", "in_progress");
+        seed_card(&db, "card-251-aq-completed", "in_progress");
+        seed_card(&db, "card-251-aq-valid", "in_progress");
+
+        {
+            let conn = db.lock().unwrap();
+            crate::server::routes::auto_queue::ensure_tables(&conn);
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
+                 VALUES ('run-251-aq', 'test-repo', 'agent-1', 'active')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+                 VALUES ('entry-251-aq-orphan', 'run-251-aq', 'card-251-aq-orphan', 'agent-1', 'dispatched', NULL, datetime('now', '-3 minutes'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+                 VALUES ('entry-251-aq-phantom', 'run-251-aq', 'card-251-aq-phantom', 'agent-1', 'dispatched', 'dispatch-251-aq-phantom', datetime('now', '-3 minutes'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title) \
+                 VALUES ('dispatch-251-aq-cancelled', 'card-251-aq-cancelled', 'agent-1', 'implementation', 'cancelled', 'cancelled')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+                 VALUES ('entry-251-aq-cancelled', 'run-251-aq', 'card-251-aq-cancelled', 'agent-1', 'dispatched', 'dispatch-251-aq-cancelled', datetime('now', '-3 minutes'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title) \
+                 VALUES ('dispatch-251-aq-completed', 'card-251-aq-completed', 'agent-1', 'implementation', 'completed', 'completed')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+                 VALUES ('entry-251-aq-completed', 'run-251-aq', 'card-251-aq-completed', 'agent-1', 'dispatched', 'dispatch-251-aq-completed', datetime('now', '-3 minutes'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title) \
+                 VALUES ('dispatch-251-aq-valid', 'card-251-aq-valid', 'agent-1', 'implementation', 'dispatched', 'valid')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+                 VALUES ('entry-251-aq-valid', 'run-251-aq', 'card-251-aq-valid', 'agent-1', 'dispatched', 'dispatch-251-aq-valid', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        assert_eq!(
+            stats.broken_auto_queue_entries_reset, 4,
+            "boot reconcile must reset orphan/phantom/cancelled/completed auto-queue entries"
+        );
+
+        let conn = db.lock().unwrap();
+        let orphan_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-251-aq-orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let phantom_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-251-aq-phantom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cancelled_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-251-aq-cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-251-aq-completed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let valid_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-251-aq-valid'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_status, "pending");
+        assert_eq!(phantom_status, "pending");
+        assert_eq!(cancelled_status, "pending");
+        assert_eq!(completed_status, "pending");
+        assert_eq!(valid_status, "dispatched");
+    }
+
+    #[test]
+    fn scenario_251_boot_reconcile_refires_missing_review_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-251-review", "review");
+
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        assert_eq!(
+            stats.missing_review_dispatches_refired, 1,
+            "boot reconcile must re-fire OnReviewEnter for review cards missing dispatch"
+        );
+
+        let conn = db.lock().unwrap();
+        let review_dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-251-review' \
+                   AND dispatch_type = 'review' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_dispatch_count, 1,
+            "review card must have one active review dispatch after boot reconcile"
+        );
+    }
+
     // ── Scenario 4: Card status full cycle ──────────────────────────
 
     #[test]
