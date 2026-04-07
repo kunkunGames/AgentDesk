@@ -35,6 +35,7 @@ pub(super) struct CreateAgentBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(super) struct UpdateAgentBody {
     name: Option<String>,
     name_ko: Option<String>,

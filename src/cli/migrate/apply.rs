@@ -198,7 +198,6 @@ struct RestoredAuditState {
 
 #[derive(Clone, Debug)]
 struct BotSettingsEntryPlan {
-    account_id: String,
     provider: String,
     role_id: Option<String>,
     token: String,
@@ -2162,7 +2161,6 @@ fn build_bot_settings_entry_plans(
             continue;
         }
         entries.push(BotSettingsEntryPlan {
-            account_id,
             provider,
             role_id,
             token,

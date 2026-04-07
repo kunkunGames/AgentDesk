@@ -17,6 +17,7 @@ pub struct CreateRepoBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct UpdateRepoBody {
     pub default_agent_id: Option<String>,
     pub pipeline_config: Option<serde_json::Value>,

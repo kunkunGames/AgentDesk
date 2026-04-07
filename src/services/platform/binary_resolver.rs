@@ -3,6 +3,8 @@
 //! Provides a single resolution contract for provider CLIs across macOS,
 //! Linux, and Windows.
 
+#![allow(dead_code)]
+
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

@@ -123,7 +123,6 @@ pub struct RepoRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

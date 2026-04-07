@@ -385,6 +385,7 @@ pub fn transition_status_no_hooks(
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TransitionResult {
     pub changed: bool,
     pub from: String,

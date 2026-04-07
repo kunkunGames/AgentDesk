@@ -565,6 +565,7 @@ impl Settings {
         }
     }
 
+    #[allow(dead_code)]
     pub fn config_dir() -> Option<std::path::PathBuf> {
         runtime_root().map(|root| crate::runtime_layout::config_dir(&root))
     }

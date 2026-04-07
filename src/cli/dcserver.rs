@@ -160,6 +160,7 @@ pub fn is_windows_service_running() -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn is_windows_service_running() -> bool {
     false
 }
@@ -425,6 +426,7 @@ pub fn kill_existing_dcserver_processes() {
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_restart_dcserver_report_context(
     args: &[String],
     start_index: usize,

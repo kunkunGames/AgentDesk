@@ -597,6 +597,7 @@ fn review_state_for(status: &str, pipeline: &PipelineConfig) -> String {
 ///
 /// Returns `Ok(true)` if the decision was Allowed and intents executed,
 /// `Ok(false)` if NoOp, and `Err` if Blocked.
+#[allow(dead_code)]
 pub fn execute_decision(db: &crate::db::Db, decision: &TransitionDecision) -> anyhow::Result<bool> {
     match &decision.outcome {
         TransitionOutcome::Blocked(reason) => {

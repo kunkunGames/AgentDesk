@@ -2,7 +2,6 @@ use super::handoff::{HandoffRecord, save_handoff};
 use super::settings::{resolve_role_binding, validate_bot_channel_routing};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
-use crate::services::tmux_common::tmux_exact_target;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
 use crate::utils::format::tail_with_ellipsis;
@@ -242,8 +241,6 @@ pub(super) async fn restore_inflight_turns(
     }
 
     let settings_snapshot = shared.settings.read().await.clone();
-
-    let current_gen = shared.current_generation;
 
     for state in states {
         let channel_id = ChannelId::new(state.channel_id);

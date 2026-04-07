@@ -408,6 +408,7 @@ impl PolicyEngine {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fire_hook(&self, hook: Hook, payload: serde_json::Value) -> Result<()> {
         let inner = self
             .inner
@@ -736,7 +737,6 @@ fn json_to_js<'js>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex as StdMutex};
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
