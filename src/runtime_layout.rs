@@ -1445,7 +1445,22 @@ fn remove_legacy_path(path: &Path) -> Result<(), String> {
 fn remove_link_or_path(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    if meta.file_type().is_symlink() {
+        #[cfg(windows)]
+        {
+            if fs::metadata(path)
+                .map(|target| target.is_dir())
+                .unwrap_or(false)
+            {
+                return fs::remove_dir(path)
+                    .map_err(|e| format!("Failed to remove '{}': {e}", path.display()));
+            }
+        }
+        return fs::remove_file(path)
+            .map_err(|e| format!("Failed to remove '{}': {e}", path.display()));
+    }
+
+    if meta.is_dir() {
         fs::remove_dir_all(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
     } else {
         fs::remove_file(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
@@ -1477,7 +1492,9 @@ mod tests {
 
     impl TestHomeGuard {
         fn install(home: &Path, runtime_root: &Path) -> Self {
-            let lock = test_home_lock().lock().unwrap();
+            let lock = test_home_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             fs::create_dir_all(home).unwrap();
             set_test_home_dir_override(Some(home.to_path_buf()));
             let previous_runtime_root = std::env::var_os("AGENTDESK_ROOT_DIR");
