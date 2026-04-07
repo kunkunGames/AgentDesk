@@ -7079,6 +7079,74 @@ async fn rereview_backlog_card_transitions_to_review_with_dispatch() {
 }
 
 #[tokio::test]
+async fn rereview_returns_bad_gateway_when_github_reopen_fails_before_response() {
+    let (_repo, _repo_guard) = setup_test_repo();
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-rereview-ghfail");
+    set_pmd_channel(&db, "pmd-chan-123");
+    ensure_auto_queue_tables(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, repo_id,
+                github_issue_url, created_at, updated_at, completed_at
+            ) VALUES (
+                'card-rereview-ghfail', 'Issue #336', 'done', 'medium', 'agent-rereview-ghfail',
+                'test-repo', 'https://example.com/not-github', datetime('now'),
+                datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                created_at, updated_at, completed_at
+            ) VALUES (
+                'impl-rereview-ghfail', 'card-rereview-ghfail', 'agent-rereview-ghfail',
+                'implementation', 'completed', 'impl', datetime('now', '-30 minutes'),
+                datetime('now', '-30 minutes'), datetime('now', '-30 minutes')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-rereview-ghfail/rereview")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"reason":"gh reopen failure test"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["rereviewed"], false);
+    assert_eq!(json["github_issue_url"], "https://example.com/not-github");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a github url"),
+        "expected invalid github url parse error, got {json}"
+    );
+}
+
+#[tokio::test]
 async fn batch_rereview_processes_multiple_issues() {
     let (_repo, _repo_guard) = setup_test_repo();
     crate::pipeline::ensure_loaded();

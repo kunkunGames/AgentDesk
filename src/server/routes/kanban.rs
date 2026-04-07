@@ -2256,7 +2256,9 @@ pub async fn rereview_card(
         }
     }
 
-    if current_status != "review" {
+    let transitioned_into_review = current_status != "review";
+
+    if transitioned_into_review {
         if let Err(e) = crate::kanban::transition_status_with_opts(
             &state.db,
             &state.engine,
@@ -2280,7 +2282,7 @@ pub async fn rereview_card(
         .ok()
         .and_then(|conn| find_active_review_dispatch_id(&conn, &id));
 
-    if review_dispatch_id.is_none() {
+    if review_dispatch_id.is_none() && !transitioned_into_review {
         let _ = state
             .engine
             .fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": id }));
@@ -2373,12 +2375,18 @@ pub async fn rereview_card(
     if !crate::pipeline::get().is_terminal("review")
         && crate::pipeline::get().is_terminal(&current_status)
     {
-        if let Some(url) = gh_url {
-            tokio::spawn(async move {
-                if let Err(e) = crate::github::reopen_issue_by_url(&url).await {
-                    tracing::warn!("[kanban] Failed to reopen GitHub issue {url}: {e}");
-                }
-            });
+        if let Some(url) = gh_url.as_deref() {
+            if let Err(e) = crate::github::reopen_issue_by_url(url).await {
+                tracing::warn!("[kanban] Failed to reopen GitHub issue {url}: {e}");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": format!("github issue reopen failed before rereview response: {e}"),
+                        "rereviewed": false,
+                        "github_issue_url": url,
+                    })),
+                );
+            }
         }
     }
 
