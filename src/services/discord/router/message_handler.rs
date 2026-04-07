@@ -2474,8 +2474,9 @@ async fn reset_provider_session_if_pending(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::DiscordSession;
+    use super::*;
+    use crate::services::memory::RecallResponse;
 
     fn make_session(
         current_path: Option<String>,

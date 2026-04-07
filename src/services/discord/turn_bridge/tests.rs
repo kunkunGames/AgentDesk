@@ -9,6 +9,7 @@ use super::retry_state::{
     clear_local_session_state, handle_gemini_retry_boundary, reset_gemini_retry_attempt_state,
     should_reset_gemini_retry_attempt_state,
 };
+use super::spawn_memory_capture_task;
 use super::stale_resume::{
     contains_stale_resume_error_text, output_file_has_stale_resume_error_after_offset,
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,
