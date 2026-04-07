@@ -485,17 +485,17 @@ pub(super) async fn restore_inflight_turns(
                 });
                 // Resolve thread parent so validation uses the same semantics
                 // as normal message routing (router.rs).
-                let provider_channel_name = if let Some((_pid, pname)) =
+                let (allowlist_channel_id, provider_channel_name) = if let Some((pid, pname)) =
                     super::resolve_thread_parent(http, channel_id).await
                 {
-                    pname.or(effective_channel_name.clone())
+                    (pid, pname.or(effective_channel_name.clone()))
                 } else {
-                    effective_channel_name.clone()
+                    (channel_id, effective_channel_name.clone())
                 };
                 if let Err(reason) = validate_bot_channel_routing_with_provider_channel(
                     &settings_snapshot,
                     provider,
-                    channel_id,
+                    allowlist_channel_id,
                     effective_channel_name.as_deref(),
                     provider_channel_name.as_deref(),
                     is_dm,
@@ -645,16 +645,16 @@ pub(super) async fn restore_inflight_turns(
         });
         // Resolve thread parent so validation uses the same semantics
         // as normal message routing (router.rs).
-        let provider_channel_name =
-            if let Some((_pid, pname)) = super::resolve_thread_parent(http, channel_id).await {
-                pname.or(channel_name.clone())
+        let (allowlist_channel_id, provider_channel_name) =
+            if let Some((pid, pname)) = super::resolve_thread_parent(http, channel_id).await {
+                (pid, pname.or(channel_name.clone()))
             } else {
-                channel_name.clone()
+                (channel_id, channel_name.clone())
             };
         if let Err(reason) = validate_bot_channel_routing_with_provider_channel(
             &settings_snapshot,
             provider,
-            channel_id,
+            allowlist_channel_id,
             channel_name.as_deref(),
             provider_channel_name.as_deref(),
             is_dm,

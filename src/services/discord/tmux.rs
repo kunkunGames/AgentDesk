@@ -1584,16 +1584,16 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         );
         // Resolve thread parent so validation uses the same semantics
         // as normal message routing (router.rs).
-        let provider_channel_name =
-            if let Some((_pid, pname)) = super::resolve_thread_parent(http, *channel_id).await {
-                pname.unwrap_or_else(|| channel_name.clone())
+        let (allowlist_channel_id, provider_channel_name) =
+            if let Some((pid, pname)) = super::resolve_thread_parent(http, *channel_id).await {
+                (pid, pname.unwrap_or_else(|| channel_name.clone()))
             } else {
-                channel_name.clone()
+                (*channel_id, channel_name.clone())
             };
         if let Err(reason) = validate_bot_channel_routing_with_provider_channel(
             &settings_snapshot,
             &provider,
-            *channel_id,
+            allowlist_channel_id,
             Some(&channel_name),
             Some(&provider_channel_name),
             is_dm,

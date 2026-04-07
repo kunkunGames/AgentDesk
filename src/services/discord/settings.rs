@@ -430,15 +430,17 @@ pub(super) fn validate_bot_channel_routing(
 pub(super) fn validate_bot_channel_routing_with_provider_channel(
     settings: &DiscordBotSettings,
     provider: &ProviderKind,
-    channel_id: ChannelId,
+    allowlist_channel_id: ChannelId,
     binding_channel_name: Option<&str>,
     provider_channel_name: Option<&str>,
     is_dm: bool,
 ) -> Result<(), BotChannelRoutingGuardFailure> {
-    let role_binding =
-        resolve_role_binding(channel_id, binding_channel_name.or(provider_channel_name));
+    let role_binding = resolve_role_binding(
+        allowlist_channel_id,
+        binding_channel_name.or(provider_channel_name),
+    );
 
-    if !bot_settings_allow_channel(settings, channel_id, is_dm) {
+    if !bot_settings_allow_channel(settings, allowlist_channel_id, is_dm) {
         return Err(BotChannelRoutingGuardFailure::ChannelNotAllowed);
     }
     if !bot_settings_allow_agent(settings, role_binding.as_ref(), is_dm) {
