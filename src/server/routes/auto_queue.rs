@@ -25,8 +25,10 @@ pub struct GenerateBody {
 
 #[derive(Debug, Deserialize)]
 pub struct ActivateBody {
+    pub run_id: Option<String>,
     pub repo: Option<String>,
     pub agent_id: Option<String>,
+    pub thread_group: Option<i64>,
     pub unified_thread: Option<bool>,
     /// Internal-only: continue only already-active runs, never promote generated drafts.
     pub active_only: Option<bool>,
@@ -133,6 +135,8 @@ impl GenerateMode {
     }
 }
 
+const DEFAULT_SLOT_POOL_SIZE: i64 = 3;
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub(crate) fn ensure_tables(conn: &rusqlite::Connection) {
@@ -160,9 +164,20 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) {
             reason          TEXT,
             status          TEXT DEFAULT 'pending',
             dispatch_id     TEXT,
+            slot_index      INTEGER,
             created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
             dispatched_at   DATETIME,
             completed_at    DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS auto_queue_slots (
+            agent_id             TEXT NOT NULL,
+            slot_index           INTEGER NOT NULL,
+            assigned_run_id      TEXT,
+            assigned_thread_group INTEGER,
+            thread_id_map        TEXT,
+            created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, slot_index)
         );",
     )
     .ok();
@@ -248,6 +263,343 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) {
         )
         .ok();
     }
+    let has_slot_index: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_entries') WHERE name = 'slot_index'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_slot_index {
+        conn.execute_batch("ALTER TABLE auto_queue_entries ADD COLUMN slot_index INTEGER;")
+            .ok();
+    }
+}
+
+fn ensure_agent_slot_rows(conn: &rusqlite::Connection, agent_id: &str) -> rusqlite::Result<()> {
+    for slot_index in 0..DEFAULT_SLOT_POOL_SIZE {
+        conn.execute(
+            "INSERT OR IGNORE INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
+             VALUES (?1, ?2, '{}')",
+            rusqlite::params![agent_id, slot_index],
+        )?;
+    }
+    Ok(())
+}
+
+fn clear_inactive_slot_assignments(conn: &rusqlite::Connection) {
+    conn.execute(
+        "UPDATE auto_queue_slots
+         SET assigned_run_id = NULL,
+             assigned_thread_group = NULL,
+             updated_at = datetime('now')
+         WHERE assigned_run_id IS NOT NULL
+           AND assigned_run_id NOT IN (
+               SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused')
+           )",
+        [],
+    )
+    .ok();
+}
+
+fn completed_group_slots(conn: &rusqlite::Connection, run_id: &str) -> Vec<(String, i64)> {
+    let mut stmt = match conn.prepare(
+        "SELECT agent_id, slot_index, assigned_thread_group
+         FROM auto_queue_slots
+         WHERE assigned_run_id = ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    let assigned: Vec<(String, i64, i64)> = stmt
+        .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .ok()
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        .unwrap_or_default();
+    drop(stmt);
+
+    let mut released = Vec::new();
+    for (agent_id, slot_index, thread_group) in assigned {
+        let still_active: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0
+                 FROM auto_queue_entries
+                 WHERE run_id = ?1
+                   AND agent_id = ?2
+                   AND COALESCE(thread_group, 0) = ?3
+                   AND status IN ('pending', 'dispatched')",
+                rusqlite::params![run_id, agent_id, thread_group],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if still_active {
+            continue;
+        }
+        released.push((agent_id, slot_index));
+    }
+
+    released
+}
+
+fn release_group_slots(conn: &rusqlite::Connection, slots: &[(String, i64)]) {
+    for (agent_id, slot_index) in slots {
+        conn.execute(
+            "UPDATE auto_queue_slots
+             SET assigned_run_id = NULL,
+                 assigned_thread_group = NULL,
+                 updated_at = datetime('now')
+             WHERE agent_id = ?1 AND slot_index = ?2",
+            rusqlite::params![agent_id, slot_index],
+        )
+        .ok();
+    }
+}
+
+fn release_run_slots(conn: &rusqlite::Connection, run_id: &str) {
+    conn.execute(
+        "UPDATE auto_queue_slots
+         SET assigned_run_id = NULL,
+             assigned_thread_group = NULL,
+             updated_at = datetime('now')
+         WHERE assigned_run_id = ?1",
+        [run_id],
+    )
+    .ok();
+}
+
+fn assigned_groups_with_pending_entries(conn: &rusqlite::Connection, run_id: &str) -> Vec<i64> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT s.assigned_thread_group
+         FROM auto_queue_slots s
+         WHERE s.assigned_run_id = ?1
+           AND s.assigned_thread_group IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+               FROM auto_queue_entries e
+               WHERE e.run_id = ?1
+                 AND e.agent_id = s.agent_id
+                 AND COALESCE(e.thread_group, 0) = COALESCE(s.assigned_thread_group, 0)
+                 AND e.status = 'pending'
+           )
+         ORDER BY s.assigned_thread_group ASC, s.slot_index ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([run_id], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        .unwrap_or_default()
+}
+
+fn allocate_slot_for_group_agent(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    thread_group: i64,
+    agent_id: &str,
+) -> Option<(i64, bool)> {
+    ensure_agent_slot_rows(conn, agent_id).ok()?;
+
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT slot_index
+             FROM auto_queue_slots
+             WHERE agent_id = ?1
+               AND assigned_run_id = ?2
+               AND COALESCE(assigned_thread_group, 0) = ?3
+             LIMIT 1",
+            rusqlite::params![agent_id, run_id, thread_group],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(slot_index) = existing {
+        conn.execute(
+            "UPDATE auto_queue_entries
+             SET slot_index = ?1
+             WHERE run_id = ?2
+               AND agent_id = ?3
+               AND COALESCE(thread_group, 0) = ?4
+               AND slot_index IS NULL",
+            rusqlite::params![slot_index, run_id, agent_id, thread_group],
+        )
+        .ok();
+        return Some((slot_index, false));
+    }
+
+    let free_slot: Option<i64> = conn
+        .query_row(
+            "SELECT slot_index
+             FROM auto_queue_slots
+             WHERE agent_id = ?1
+               AND assigned_run_id IS NULL
+             ORDER BY slot_index ASC
+             LIMIT 1",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(slot_index) = free_slot else {
+        return None;
+    };
+
+    conn.execute(
+        "UPDATE auto_queue_slots
+         SET assigned_run_id = ?1,
+             assigned_thread_group = ?2,
+             updated_at = datetime('now')
+         WHERE agent_id = ?3
+           AND slot_index = ?4
+           AND assigned_run_id IS NULL",
+        rusqlite::params![run_id, thread_group, agent_id, slot_index],
+    )
+    .ok()?;
+    conn.execute(
+        "UPDATE auto_queue_entries
+         SET slot_index = ?1
+         WHERE run_id = ?2
+           AND agent_id = ?3
+           AND COALESCE(thread_group, 0) = ?4
+           AND slot_index IS NULL",
+        rusqlite::params![slot_index, run_id, agent_id, thread_group],
+    )
+    .ok();
+    Some((slot_index, true))
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeSlotClearTarget {
+    provider_name: String,
+    thread_channel_id: u64,
+    session_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SlotClearTarget {
+    thread_channel_ids: Vec<u64>,
+    runtime_targets: Vec<RuntimeSlotClearTarget>,
+}
+
+fn build_slot_clear_target(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    slot_index: i64,
+) -> SlotClearTarget {
+    let raw_map: String = conn
+        .query_row(
+            "SELECT COALESCE(thread_id_map, '{}')
+             FROM auto_queue_slots
+             WHERE agent_id = ?1 AND slot_index = ?2",
+            rusqlite::params![agent_id, slot_index],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "{}".to_string());
+
+    let mut thread_channel_ids: Vec<u64> = serde_json::from_str::<serde_json::Value>(&raw_map)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|map| {
+            map.values()
+                .filter_map(|value| {
+                    value
+                        .as_str()
+                        .and_then(|raw| raw.trim().parse::<u64>().ok())
+                        .or_else(|| value.as_u64())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    thread_channel_ids.sort_unstable();
+    thread_channel_ids.dedup();
+
+    let runtime_targets = thread_channel_ids
+        .iter()
+        .filter_map(|thread_channel_id| {
+            let row: Option<(Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT provider, session_key
+                     FROM sessions
+                     WHERE thread_channel_id = ?1
+                     ORDER BY CASE status WHEN 'working' THEN 0 WHEN 'idle' THEN 1 ELSE 2 END,
+                              COALESCE(last_heartbeat, created_at) DESC,
+                              rowid DESC
+                     LIMIT 1",
+                    [thread_channel_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            let (provider_name, session_key) = row?;
+            let provider_name = provider_name
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    session_key.as_deref().and_then(|key| {
+                        key.split_once(':').and_then(|(_, tmux_name)| {
+                            crate::services::provider::parse_provider_and_channel_from_tmux_name(
+                                tmux_name,
+                            )
+                            .map(|(provider, _)| provider.as_str().to_string())
+                        })
+                    })
+                })?;
+            Some(RuntimeSlotClearTarget {
+                provider_name,
+                thread_channel_id: *thread_channel_id,
+                session_key,
+            })
+        })
+        .collect();
+
+    SlotClearTarget {
+        thread_channel_ids,
+        runtime_targets,
+    }
+}
+
+fn clear_slot_sessions_db(conn: &rusqlite::Connection, thread_channel_ids: &[u64]) -> usize {
+    thread_channel_ids
+        .iter()
+        .map(|thread_channel_id| {
+            conn.execute(
+                "UPDATE sessions
+                 SET status = 'idle',
+                     active_dispatch_id = NULL,
+                     session_info = 'Auto-queue slot cleared',
+                     tokens = 0,
+                     claude_session_id = NULL,
+                     last_heartbeat = datetime('now')
+                 WHERE thread_channel_id = ?1
+                   AND status IN ('working', 'idle')",
+                [thread_channel_id.to_string()],
+            )
+            .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn clear_slot_threads_for_slot(
+    state: &AppState,
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    slot_index: i64,
+) -> usize {
+    let target = build_slot_clear_target(conn, agent_id, slot_index);
+    let cleared = clear_slot_sessions_db(conn, &target.thread_channel_ids);
+
+    if let Some(registry) = state.health_registry.clone() {
+        let runtime_targets = target.runtime_targets;
+        tokio::spawn(async move {
+            for runtime_target in runtime_targets {
+                crate::services::discord::health::clear_provider_channel_runtime(
+                    &registry,
+                    &runtime_target.provider_name,
+                    poise::serenity_prelude::ChannelId::new(runtime_target.thread_channel_id),
+                    runtime_target.session_key.as_deref(),
+                )
+                .await;
+            }
+        });
+    }
+
+    cleared
 }
 
 fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<String> {
@@ -712,7 +1064,8 @@ fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Val
                 CASE WHEN e.dispatched_at IS NOT NULL THEN CAST(strftime('%s', e.dispatched_at) AS INTEGER) * 1000 END,
                 CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
                 kc.title, kc.github_issue_number, kc.github_issue_url,
-                COALESCE(e.thread_group, 0)
+                COALESCE(e.thread_group, 0),
+                e.slot_index
          FROM auto_queue_entries e
          LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id
          WHERE e.id = ?1",
@@ -732,6 +1085,7 @@ fn entry_to_json(conn: &rusqlite::Connection, entry_id: &str) -> serde_json::Val
                 "github_issue_number": row.get::<_, Option<i64>>(10)?,
                 "github_repo": row.get::<_, Option<String>>(11)?,
                 "thread_group": row.get::<_, i64>(12)?,
+                "slot_index": row.get::<_, Option<i64>>(13)?,
             }))
         },
     )
@@ -1422,16 +1776,20 @@ pub async fn activate(
         params.push(Box::new(agent_id.clone()));
     }
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let run_id: Option<String> = conn
-        .query_row(
+    let run_id: Option<String> = if let Some(run_id) = body.run_id.clone() {
+        Some(run_id)
+    } else {
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        conn.query_row(
             &format!(
                 "SELECT id FROM auto_queue_runs WHERE {run_filter} ORDER BY created_at DESC LIMIT 1"
             ),
             param_refs.as_slice(),
             |row| row.get(0),
         )
-        .ok();
+        .ok()
+    };
 
     let Some(run_id) = run_id else {
         return (
@@ -1457,6 +1815,20 @@ pub async fn activate(
         )
         .ok();
     }
+
+    clear_inactive_slot_assignments(&conn);
+    let completed_slots = completed_group_slots(&conn, &run_id);
+    let mut cleared_slots: HashSet<(String, i64)> = HashSet::new();
+    for (agent_id, slot_index) in &completed_slots {
+        let cleared = clear_slot_threads_for_slot(&state, &conn, agent_id, *slot_index);
+        if cleared > 0 {
+            tracing::info!(
+                "[auto-queue] cleared {cleared} slot thread session(s) before releasing {agent_id} slot {slot_index}"
+            );
+        }
+        cleared_slots.insert((agent_id.clone(), *slot_index));
+    }
+    release_group_slots(&conn, &completed_slots);
 
     // Stale empty run cleanup: after generate()/enqueue() fixes, normal paths never
     // leave an active run with 0 entries.  Any such run is legacy corruption — complete
@@ -1530,13 +1902,30 @@ pub async fn activate(
     }
 
     // #140: Read run parallel config
-    let (max_concurrent, max_per_agent, _thread_group_count): (i64, i64, i64) = conn
+    let (max_concurrent, max_per_agent, _thread_group_count, unified_thread_enabled): (
+        i64,
+        i64,
+        i64,
+        bool,
+    ) = conn
         .query_row(
-            "SELECT COALESCE(max_concurrent_threads, 1), COALESCE(max_concurrent_per_agent, 1), COALESCE(thread_group_count, 1) FROM auto_queue_runs WHERE id = ?1",
+            "SELECT COALESCE(max_concurrent_threads, 1),
+                    COALESCE(max_concurrent_per_agent, 1),
+                    COALESCE(thread_group_count, 1),
+                    COALESCE(unified_thread, 0)
+             FROM auto_queue_runs
+             WHERE id = ?1",
             [&run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
         )
-        .unwrap_or((1, 1, 1));
+        .unwrap_or((1, 1, 1, false));
 
     // Count currently active groups (groups with at least one 'dispatched' entry)
     let active_groups: Vec<i64> = {
@@ -1594,6 +1983,45 @@ pub async fn activate(
 
     let mut dispatched = Vec::new();
     let mut groups_to_dispatch: Vec<i64> = Vec::new();
+    let preferred_group = body.thread_group;
+
+    if let Some(group) = preferred_group {
+        let conn = state.db.separate_conn().unwrap();
+        let has_pending: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0
+                 FROM auto_queue_entries
+                 WHERE run_id = ?1
+                   AND COALESCE(thread_group, 0) = ?2
+                   AND status = 'pending'",
+                rusqlite::params![run_id, group],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let has_dispatched: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0
+                 FROM auto_queue_entries
+                 WHERE run_id = ?1
+                   AND COALESCE(thread_group, 0) = ?2
+                   AND status = 'dispatched'",
+                rusqlite::params![run_id, group],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_pending && !has_dispatched {
+            groups_to_dispatch.push(group);
+        }
+    }
+
+    if unified_thread_enabled {
+        let conn = state.db.separate_conn().unwrap();
+        for group in assigned_groups_with_pending_entries(&conn, &run_id) {
+            if !groups_to_dispatch.contains(&group) {
+                groups_to_dispatch.push(group);
+            }
+        }
+    }
 
     // Also dispatch next entry for active groups that have pending entries
     // (continuation within same group after prior entry completed)
@@ -1619,7 +2047,9 @@ pub async fn activate(
             // Only add group if it has pending entries AND no currently dispatched entries
             // (sequential within group)
             if has_pending && !has_dispatched {
-                groups_to_dispatch.push(grp);
+                if !groups_to_dispatch.contains(&grp) {
+                    groups_to_dispatch.push(grp);
+                }
             }
         }
     }
@@ -1760,7 +2190,158 @@ pub async fn activate(
             .unwrap_or_else(|_| "Dispatch".to_string());
         drop(conn);
 
+        // Preserve the legacy JS preflight contract when activate() became the
+        // authoritative dispatch path.
+        {
+            let conn = state.db.separate_conn().unwrap();
+            let metadata: Option<String> = conn
+                .query_row(
+                    "SELECT metadata FROM kanban_cards WHERE id = ?1",
+                    [&card_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            drop(conn);
+
+            if let Some(metadata) = metadata {
+                if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&metadata) {
+                    match parsed.get("preflight_status").and_then(|v| v.as_str()) {
+                        Some("consult_required") => {
+                            let consult_agent_id = {
+                                let conn = state.db.separate_conn().unwrap();
+                                let provider: String = conn
+                                    .query_row(
+                                        "SELECT COALESCE(cli_provider, 'claude') FROM agents WHERE id = ?1",
+                                        [&agent_id],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or_else(|_| "claude".to_string());
+                                let counter_provider = if provider == "claude" {
+                                    "codex"
+                                } else {
+                                    "claude"
+                                };
+                                conn.query_row(
+                                    "SELECT id FROM agents WHERE cli_provider = ?1 LIMIT 1",
+                                    [counter_provider],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .unwrap_or_else(|_| agent_id.clone())
+                            };
+
+                            let dispatch_result = tokio::task::block_in_place(|| {
+                                crate::dispatch::create_dispatch(
+                                    &state.db,
+                                    &state.engine,
+                                    &card_id,
+                                    &consult_agent_id,
+                                    "consultation",
+                                    &format!("[Consultation] {title}"),
+                                    &json!({
+                                        "auto_queue": true,
+                                        "entry_id": entry_id,
+                                        "thread_group": group,
+                                    }),
+                                )
+                            });
+                            if dispatch_result.is_err() {
+                                tracing::warn!(
+                                    "[auto-queue] consultation dispatch failed for entry {entry_id} (group {group})"
+                                );
+                                continue;
+                            }
+
+                            let dispatch_id = dispatch_result.as_ref().unwrap()["id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(obj) = parsed.as_object_mut() {
+                                obj.insert(
+                                    "consultation_status".to_string(),
+                                    serde_json::json!("pending"),
+                                );
+                                obj.insert(
+                                    "consultation_dispatch_id".to_string(),
+                                    serde_json::json!(dispatch_id),
+                                );
+                            }
+
+                            let conn = state.db.separate_conn().unwrap();
+                            conn.execute(
+                                "UPDATE kanban_cards SET metadata = ?1 WHERE id = ?2",
+                                rusqlite::params![parsed.to_string(), card_id],
+                            )
+                            .ok();
+                            conn.execute(
+                                "UPDATE auto_queue_entries
+                                 SET status = 'dispatched',
+                                     dispatch_id = ?1,
+                                     dispatched_at = datetime('now')
+                                 WHERE id = ?2",
+                                rusqlite::params![dispatch_id, entry_id],
+                            )
+                            .ok();
+                            *agent_dispatch_counts.entry(agent_id.clone()).or_insert(0) += 1;
+                            dispatched.push(entry_to_json(&conn, &entry_id));
+                            drop(conn);
+                            continue;
+                        }
+                        Some("invalid") | Some("already_applied") => {
+                            let conn = state.db.separate_conn().unwrap();
+                            conn.execute(
+                                "UPDATE auto_queue_entries
+                                 SET status = 'skipped',
+                                     completed_at = datetime('now')
+                                 WHERE id = ?1 AND status = 'pending'",
+                                [&entry_id],
+                            )
+                            .ok();
+                            drop(conn);
+                            tracing::info!(
+                                "[auto-queue] skipping entry {entry_id} for card {card_id} due to preflight_status={}",
+                                parsed
+                                    .get("preflight_status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // Create dispatch
+        let slot_allocation: Option<(i64, bool)> = if unified_thread_enabled {
+            let conn = state.db.separate_conn().unwrap();
+            allocate_slot_for_group_agent(&conn, &run_id, *group, &agent_id)
+        } else {
+            None
+        };
+        let slot_index = slot_allocation.as_ref().map(|(slot_index, _)| *slot_index);
+        if unified_thread_enabled && slot_allocation.is_none() {
+            tracing::info!(
+                "[auto-queue] Skipping group {group} for {agent_id}: no free slot in pool"
+            );
+            continue;
+        }
+        if let Some((assigned_slot, newly_assigned)) = slot_allocation {
+            let slot_key = (agent_id.clone(), assigned_slot);
+            if newly_assigned && !cleared_slots.contains(&slot_key) {
+                let clear_conn = state.db.separate_conn().unwrap();
+                let cleared =
+                    clear_slot_threads_for_slot(&state, &clear_conn, &agent_id, assigned_slot);
+                if cleared > 0 {
+                    tracing::info!(
+                        "[auto-queue] cleared {cleared} slot thread session(s) before assigning {agent_id} slot {assigned_slot} to group {group}"
+                    );
+                }
+                cleared_slots.insert(slot_key);
+            }
+        }
+
         let dispatch_result = tokio::task::block_in_place(|| {
             crate::dispatch::create_dispatch(
                 &state.db,
@@ -1769,7 +2350,12 @@ pub async fn activate(
                 &agent_id,
                 "implementation",
                 &title,
-                &json!({"auto_queue": true, "entry_id": entry_id, "thread_group": group}),
+                &json!({
+                    "auto_queue": true,
+                    "entry_id": entry_id,
+                    "thread_group": group,
+                    "slot_index": slot_index,
+                }),
             )
         });
 
@@ -1787,8 +2373,13 @@ pub async fn activate(
             .to_string();
         let conn = state.db.separate_conn().unwrap();
         conn.execute(
-            "UPDATE auto_queue_entries SET status = 'dispatched', dispatch_id = ?1, dispatched_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![dispatch_id, entry_id],
+            "UPDATE auto_queue_entries
+             SET status = 'dispatched',
+                 dispatch_id = ?1,
+                 slot_index = COALESCE(slot_index, ?2),
+                 dispatched_at = datetime('now')
+             WHERE id = ?3",
+            rusqlite::params![dispatch_id, slot_index, entry_id],
         )
         .ok();
         drop(conn);
@@ -1812,6 +2403,7 @@ pub async fn activate(
         .unwrap_or(0);
 
     if remaining == 0 {
+        release_run_slots(&conn, &run_id);
         let still_dispatched: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND status = 'dispatched'",
@@ -2292,8 +2884,10 @@ pub async fn resume_run(State(state): State<AppState>) -> (StatusCode, Json<serd
         let (_status, body) = activate(
             State(state),
             Json(ActivateBody {
+                run_id: None,
                 repo: None,
                 agent_id: None,
+                thread_group: None,
                 unified_thread: None,
                 active_only: Some(true),
             }),

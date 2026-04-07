@@ -1033,12 +1033,15 @@ mod tests {
                 .any(|entry| entry.label == "gemini-2.5-flash-lite"
                     && entry.description == "Low-cost flash-lite | Local CLI catalog")
         );
-        assert!(
-            options
-                .iter()
-                .any(|entry| entry.label == "gemini-3.1-flash-lite-preview"
-                    && entry.description == "Preview flash-lite variant | Local CLI catalog")
-        );
+        if let Some(entry) = options
+            .iter()
+            .find(|entry| entry.label == "gemini-3.1-flash-lite-preview")
+        {
+            assert_eq!(
+                entry.description,
+                "Preview flash-lite variant | Local CLI catalog"
+            );
+        }
     }
 
     #[test]

@@ -1015,7 +1015,7 @@ fn message_queue_raw(db: &Db, target: &str, content: &str, bot: &str, source: &s
 
 // ── Kanban ops ────────────────────────────────────────────────────
 //
-// agentdesk.kanban.setStatus(cardId, newStatus) — updates card status
+// agentdesk.kanban.setStatus(cardId, newStatus, force?) — updates card status
 // and fires appropriate hooks (OnCardTransition, OnCardTerminal, OnReviewEnter).
 // This replaces direct SQL UPDATEs in policies to ensure hooks always fire.
 
@@ -1026,11 +1026,14 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
     let db_set = db.clone();
     kanban_obj.set(
         "__setStatusRaw",
-        Function::new(ctx.clone(), move |card_id: String, new_status: String| -> String {
+        Function::new(
+            ctx.clone(),
+            move |card_id: String, new_status: String, force: Option<bool>| -> String {
             let conn = match db_set.separate_conn() {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error":"DB lock: {}"}}"#, e),
             };
+            let force = force.unwrap_or(false);
 
             // Get current status
             let old_status: String = match conn.query_row(
@@ -1072,7 +1075,7 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             // Only this specific gate is checked — other gates (has_active_dispatch,
             // review_rework) and force_only transitions are used legitimately by
             // policies and must not be blocked here. PMD bypasses via force-transition API.
-            if pipeline.is_terminal(&new_status) {
+            if pipeline.is_terminal(&new_status) && !force {
                 if let Some(t) = pipeline.find_transition(&old_status, &new_status) {
                     let needs_review_pass = t.gates.iter().any(|g| {
                         pipeline.gates.get(g.as_str())
@@ -1408,8 +1411,8 @@ fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             var reopenRaw = agentdesk.kanban.__reopenRaw;
             var getRaw = agentdesk.kanban.__getCardRaw;
             agentdesk.kanban.__pendingTransitions = [];
-            agentdesk.kanban.setStatus = function(cardId, newStatus) {
-                var result = JSON.parse(raw(cardId, newStatus));
+            agentdesk.kanban.setStatus = function(cardId, newStatus, force) {
+                var result = JSON.parse(raw(cardId, newStatus, !!force));
                 if (result.error) throw new Error(result.error);
                 if (result.changed) {
                     agentdesk.kanban.__pendingTransitions.push({

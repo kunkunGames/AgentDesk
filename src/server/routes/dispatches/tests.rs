@@ -23,6 +23,7 @@ fn test_engine(db: &Db) -> PolicyEngine {
 #[test]
 fn review_dispatch_uses_counter_model_channel() {
     assert!(use_counter_model_channel(Some("review")));
+    assert!(use_counter_model_channel(Some("e2e-test")));
     // #256: consultation dispatches go to counter-model channel
     assert!(use_counter_model_channel(Some("consultation")));
     // review-decision goes to the original agent's primary channel,
@@ -131,6 +132,51 @@ fn implementation_dispatch_message_stays_compact() {
     assert!(!message.contains("검토 전용"));
     // Implementation dispatches should NOT include verdict instructions
     assert!(!message.contains("review-verdict"));
+}
+
+#[test]
+fn e2e_test_dispatch_message_uses_general_completion_contract() {
+    let message = format_dispatch_message(
+        "dispatch-e2e",
+        "Run regression",
+        Some("https://github.com/itismyfield/AgentDesk/issues/340"),
+        Some(340),
+        true,
+        None,
+        Some("codex"),
+        None,
+        Some("e2e-test"),
+        None,
+    );
+
+    assert!(message.contains("[🧪 E2E 테스트]"));
+    assert!(message.contains("PATCH"));
+    assert!(message.contains("/api/dispatches/dispatch-e2e"));
+    assert!(!message.contains("검토 전용"));
+    assert!(!message.contains("review-verdict"));
+    assert!(!message.contains("VERDICT: pass|improve|reject|rework"));
+}
+
+#[test]
+fn consultation_dispatch_message_uses_general_completion_contract() {
+    let message = format_dispatch_message(
+        "dispatch-consult",
+        "Need investigation",
+        Some("https://github.com/itismyfield/AgentDesk/issues/256"),
+        Some(256),
+        true,
+        None,
+        Some("codex"),
+        None,
+        Some("consultation"),
+        None,
+    );
+
+    assert!(message.contains("PATCH"));
+    assert!(message.contains("/api/dispatches/dispatch-consult"));
+    assert!(!message.contains("검토 전용"));
+    assert!(!message.contains("review-verdict"));
+    assert!(!message.contains("VERDICT: pass|improve|reject|rework"));
 }
 
 #[test]

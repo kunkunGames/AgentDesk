@@ -429,7 +429,7 @@ pub(super) fn format_dispatch_message(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    if use_alt {
+    if dispatch_type == Some("review") {
         let mut message = format!(
             "DISPATCH:{dispatch_id} [{type_label}] - {title}\n\
              ⚠️ 검토 전용 — 작업 착수 금지\n\
@@ -495,6 +495,22 @@ pub(super) fn format_dispatch_message(
              tracked 변경이 남아 있으면 noop 완료가 거부되므로 먼저 commit 또는 정리를 해야 합니다.\n\
              이 marker가 있으면 일반 완료 대신 non-implementation terminal path로 처리됩니다.",
         );
+        message
+    } else if use_alt {
+        let mut message = if !issue_link.is_empty() {
+            format!("DISPATCH:{dispatch_id} [{type_label}] - {title}{reason_suffix}\n{issue_link}")
+        } else {
+            format!("DISPATCH:{dispatch_id} [{type_label}] - {title}{reason_suffix}")
+        };
+        let base_url = crate::config::local_api_url(crate::config::load_graceful().server.port, "");
+        message.push_str(&format!(
+            "\n\n작업을 마치면 일반 dispatch 완료 API로 종료하세요.\n\
+             리뷰 전용 verdict 절차를 쓰지 말고 아래 완료 경로를 그대로 사용하세요.\n\
+             완료 예시:\n\
+             `curl -sf -X PATCH {base_url}/api/dispatches/{dispatch_id} \
+             -H \"Content-Type: application/json\" \
+             -d '{{\"status\":\"completed\",\"result\":{{\"summary\":\"결과 요약\"}}}}'`"
+        ));
         message
     } else if !issue_link.is_empty() {
         format!("DISPATCH:{dispatch_id} [{type_label}] - {title}{reason_suffix}\n{issue_link}")

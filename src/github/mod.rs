@@ -47,10 +47,12 @@ pub async fn reopen_issue_by_url(url: &str) -> Result<(), String> {
     let number = &rest[slash_pos + "/issues/".len()..];
 
     // gh issue reopen <number> --repo <owner/repo>
-    let output = tokio::process::Command::new("gh")
-        .args(["issue", "reopen", number, "--repo", repo])
-        .output()
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.kill_on_drop(true);
+    cmd.args(["issue", "reopen", number, "--repo", repo]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
         .await
+        .map_err(|_| format!("gh issue reopen timed out after 5s: {repo}#{number}"))?
         .map_err(|e| format!("gh exec: {e}"))?;
 
     if !output.status.success() {

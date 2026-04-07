@@ -43,6 +43,26 @@ fn parse_thread_channel_id_from_session_key(session_key: &str) -> Option<String>
     })
 }
 
+fn normalize_thread_channel_id(thread_channel_id: Option<&str>) -> Option<String> {
+    let trimmed = thread_channel_id?.trim();
+    if trimmed.len() < 15 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn load_dispatch_thread_id(conn: &rusqlite::Connection, dispatch_id: &str) -> Option<String> {
+    let thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    normalize_thread_channel_id(thread_id.as_deref())
+}
+
 fn resolve_agent_id_from_channel_name(
     conn: &rusqlite::Connection,
     channel_name: &str,
@@ -134,6 +154,7 @@ pub struct HookSessionBody {
     pub tokens: Option<u64>,
     pub cwd: Option<String>,
     pub dispatch_id: Option<String>,
+    pub thread_channel_id: Option<String>,
     pub claude_session_id: Option<String>,
     pub session_id: Option<String>,
 }
@@ -463,12 +484,19 @@ pub async fn hook_session(
     // For thread channels (e.g. "adk-cc-t1485400795435372796"), extract the parent channel
     // name ("adk-cc") and resolve using that.
     let session_key_channel_name = parse_channel_name_from_session_key(&body.session_key);
-    let thread_channel_id = body
-        .name
-        .as_deref()
-        .and_then(parse_thread_channel_name)
-        .map(|(_, tid)| tid.to_string())
-        .or_else(|| parse_thread_channel_id_from_session_key(&body.session_key));
+    let thread_channel_id = normalize_thread_channel_id(body.thread_channel_id.as_deref())
+        .or_else(|| {
+            body.name
+                .as_deref()
+                .and_then(parse_thread_channel_name)
+                .map(|(_, tid)| tid.to_string())
+        })
+        .or_else(|| parse_thread_channel_id_from_session_key(&body.session_key))
+        .or_else(|| {
+            body.dispatch_id
+                .as_deref()
+                .and_then(|dispatch_id| load_dispatch_thread_id(&conn, dispatch_id))
+        });
 
     let agent_id = [body.name.as_deref(), session_key_channel_name.as_deref()]
         .into_iter()
@@ -938,25 +966,36 @@ pub async fn clear_session_id_by_key(
 }
 
 fn backfill_legacy_thread_channel_ids(conn: &rusqlite::Connection) -> usize {
-    let updates: Vec<(String, String)> = {
-        let mut stmt = match conn
-            .prepare("SELECT session_key FROM sessions WHERE thread_channel_id IS NULL")
-        {
+    let legacy_rows: Vec<(String, Option<String>)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT session_key, active_dispatch_id
+             FROM sessions
+             WHERE thread_channel_id IS NULL",
+        ) {
             Ok(stmt) => stmt,
             Err(_) => return 0,
         };
-        let rows = match stmt.query_map([], |row| row.get::<_, Option<String>>(0)) {
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        }) {
             Ok(rows) => rows,
             Err(_) => return 0,
         };
-        rows.filter_map(|row| {
-            row.ok().flatten().and_then(|session_key| {
-                parse_thread_channel_id_from_session_key(&session_key)
-                    .map(|thread_channel_id| (session_key, thread_channel_id))
-            })
-        })
-        .collect()
+        rows.filter_map(|row| row.ok()).collect()
     };
+
+    let updates: Vec<(String, String)> = legacy_rows
+        .into_iter()
+        .filter_map(|(session_key, active_dispatch_id)| {
+            parse_thread_channel_id_from_session_key(&session_key)
+                .or_else(|| {
+                    active_dispatch_id
+                        .as_deref()
+                        .and_then(|dispatch_id| load_dispatch_thread_id(conn, dispatch_id))
+                })
+                .map(|thread_channel_id| (session_key, thread_channel_id))
+        })
+        .collect();
 
     updates
         .into_iter()
@@ -1842,6 +1881,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -1861,6 +1901,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -1934,6 +1975,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -1953,6 +1995,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2023,6 +2066,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2042,6 +2086,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2114,6 +2159,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2133,6 +2179,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some(dispatch_id.to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2282,6 +2329,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backfill_legacy_thread_channel_ids_uses_active_dispatch_thread_id() {
+        let db = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
+             VALUES ('card-backfill', 'Backfill Card', 'in_progress', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches
+             (id, kanban_card_id, to_agent_id, dispatch_type, status, title, thread_id, created_at, updated_at)
+             VALUES ('dispatch-backfill', 'card-backfill', 'project-agentdesk', 'implementation', 'dispatched', 'Backfill dispatch', '1486333430516945008', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions
+             (session_key, provider, status, active_dispatch_id, last_heartbeat, created_at)
+             VALUES ('mac-mini:AgentDesk-codex-adk-cdx', 'codex', 'working', 'dispatch-backfill', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let updated = backfill_legacy_thread_channel_ids(&conn);
+        assert_eq!(updated, 1);
+
+        let thread_channel_id: Option<String> = conn
+            .query_row(
+                "SELECT thread_channel_id FROM sessions WHERE session_key = 'mac-mini:AgentDesk-codex-adk-cdx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thread_channel_id.as_deref(), Some("1486333430516945008"));
+    }
+
     #[tokio::test]
     async fn gc_thread_sessions_handler_reports_deleted_legacy_thread_rows() {
         let db = test_db();
@@ -2340,6 +2425,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: None,
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )
@@ -2388,6 +2474,56 @@ mod tests {
                 cwd: None,
                 dispatch_id: Some("dispatch-1".to_string()),
                 claude_session_id: None,
+                thread_channel_id: None,
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let conn = db.lock().unwrap();
+        let (agent_id, thread_channel_id): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT agent_id, thread_channel_id FROM sessions WHERE session_key = ?1",
+                [session_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(agent_id.as_deref(), Some("project-agentdesk"));
+        assert_eq!(thread_channel_id.as_deref(), Some("1485506232256168011"));
+    }
+
+    #[tokio::test]
+    async fn thread_session_accepts_explicit_thread_channel_id_without_thread_name() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState::test_state(db.clone(), engine);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
+                 VALUES ('project-agentdesk', 'AgentDesk', 'adk-cc', 'adk-cdx')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let session_key = "mac-mini:AgentDesk-codex-adk-cdx";
+        let (status, _) = hook_session(
+            State(state),
+            Json(HookSessionBody {
+                session_key: session_key.to_string(),
+                status: Some("working".to_string()),
+                provider: Some("codex".to_string()),
+                session_info: Some("thread work".to_string()),
+                name: Some("adk-cdx".to_string()),
+                model: None,
+                tokens: None,
+                cwd: None,
+                dispatch_id: None,
+                claude_session_id: None,
+                thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
             }),
         )
@@ -2436,6 +2572,7 @@ mod tests {
                 cwd: None,
                 dispatch_id: None,
                 claude_session_id: None,
+                thread_channel_id: None,
                 session_id: None,
             }),
         )

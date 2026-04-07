@@ -332,6 +332,62 @@ async fn send_dispatch_to_discord_inner(
     let dispatch_type_label = dispatch_type.as_deref().unwrap_or("implementation");
     let message = prefix_dispatch_message(dispatch_type_label, &message);
 
+    // #359: Slot-pooled auto-queue threads live in auto_queue_slots.thread_id_map
+    // and outlive a specific run/group assignment. Prefer that binding first.
+    let slot_thread_binding: Option<((String, i64), String)> = db.lock().ok().and_then(|conn| {
+        let row: Option<(String, Option<i64>, Option<String>)> = conn
+            .query_row(
+                "SELECT e.agent_id, e.slot_index, s.thread_id_map \
+                 FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 LEFT JOIN auto_queue_slots s
+                   ON s.agent_id = e.agent_id
+                  AND s.slot_index = e.slot_index \
+                 WHERE e.dispatch_id = ?1 \
+                   AND r.unified_thread = 1 \
+                   AND e.slot_index IS NOT NULL",
+                [dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok()
+            .or_else(|| {
+                conn.query_row(
+                    "SELECT e.agent_id, e.slot_index, s.thread_id_map \
+                     FROM auto_queue_entries e \
+                     JOIN auto_queue_runs r ON e.run_id = r.id \
+                     LEFT JOIN auto_queue_slots s
+                       ON s.agent_id = e.agent_id
+                      AND s.slot_index = e.slot_index \
+                     WHERE e.kanban_card_id = ?1 \
+                       AND e.status IN ('pending', 'dispatched') \
+                       AND r.unified_thread = 1 \
+                       AND e.slot_index IS NOT NULL \
+                     ORDER BY CASE e.status WHEN 'dispatched' THEN 0 ELSE 1 END, e.priority_rank ASC \
+                     LIMIT 1",
+                    [card_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .ok()
+            });
+        row.and_then(|(agent_id, slot_index, thread_map)| {
+            let slot_index = slot_index?;
+            let thread_id = thread_map
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|map| {
+                    map.get(&channel_id_num.to_string())
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+            thread_id.map(|thread_id| ((agent_id, slot_index), thread_id))
+        })
+    });
+    let slot_thread_id = slot_thread_binding
+        .as_ref()
+        .map(|(_, thread_id)| thread_id.clone());
+    let slot_binding = slot_thread_binding
+        .as_ref()
+        .map(|((agent_id, slot_index), _)| (agent_id.clone(), *slot_index));
+
     // #145/#140: Look up per-channel unified thread via dispatch_id path
     // #140: For parallel runs (thread_group_count > 1), threads are grouped:
     //   unified_thread_id = {"0": {"channel_id": "thread_id"}, "1": {"channel_id": "thread_id"}}
@@ -389,7 +445,9 @@ async fn send_dispatch_to_discord_inner(
     });
 
     // Try to reuse existing thread for this card (channel-specific)
-    let existing_thread_id: Option<String> = if unified_thread_id.is_some() {
+    let existing_thread_id: Option<String> = if slot_thread_id.is_some() {
+        slot_thread_id.clone()
+    } else if unified_thread_id.is_some() {
         unified_thread_id.clone()
     } else {
         let conn = match db.lock() {
@@ -416,6 +474,35 @@ async fn send_dispatch_to_discord_inner(
         {
             if reused {
                 return Ok(());
+            }
+        }
+    }
+
+    if slot_thread_id.is_some() {
+        if let Some((agent_id, slot_index)) = slot_binding.as_ref() {
+            if let Ok(conn) = db.lock() {
+                let existing: String = conn
+                    .query_row(
+                        "SELECT COALESCE(thread_id_map, '{}')
+                         FROM auto_queue_slots
+                         WHERE agent_id = ?1 AND slot_index = ?2",
+                        rusqlite::params![agent_id, slot_index],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_else(|_| "{}".to_string());
+                if let Ok(mut map) = serde_json::from_str::<serde_json::Value>(&existing) {
+                    if let Some(obj) = map.as_object_mut() {
+                        obj.remove(&channel_id_num.to_string());
+                        conn.execute(
+                            "UPDATE auto_queue_slots
+                             SET thread_id_map = ?1,
+                                 updated_at = datetime('now')
+                             WHERE agent_id = ?2 AND slot_index = ?3",
+                            rusqlite::params![map.to_string(), agent_id, slot_index],
+                        )
+                        .ok();
+                    }
+                }
             }
         }
     }
@@ -604,6 +691,31 @@ async fn send_dispatch_to_discord_inner(
                             )
                             .ok();
                             set_thread_for_channel(&conn, card_id, channel_id_num, thread_id);
+                            if let Some((agent_id, slot_index)) = slot_binding.as_ref() {
+                                let existing_slot_map: String = conn
+                                    .query_row(
+                                        "SELECT COALESCE(thread_id_map, '{}')
+                                         FROM auto_queue_slots
+                                         WHERE agent_id = ?1 AND slot_index = ?2",
+                                        rusqlite::params![agent_id, slot_index],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                let mut slot_map: serde_json::Value =
+                                    serde_json::from_str::<serde_json::Value>(&existing_slot_map)
+                                        .ok()
+                                        .filter(|v: &serde_json::Value| v.is_object())
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                slot_map[channel_id_num.to_string()] = serde_json::json!(thread_id);
+                                conn.execute(
+                                    "UPDATE auto_queue_slots
+                                     SET thread_id_map = ?1,
+                                         updated_at = datetime('now')
+                                     WHERE agent_id = ?2 AND slot_index = ?3",
+                                    rusqlite::params![slot_map.to_string(), agent_id, slot_index],
+                                )
+                                .ok();
+                            }
                             // #141/#140: Store unified thread per channel in JSON map
                             // Save when: no existing thread for this channel (unified_thread_id is None)
                             // AND this card belongs to a unified run
