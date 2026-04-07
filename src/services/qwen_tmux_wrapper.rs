@@ -239,6 +239,10 @@ fn run_turn(
         crate::services::qwen::normalize_resume_strategy(session_id.as_deref(), working_dir)?;
 
     for attempt in 0..=crate::services::qwen::QWEN_MAX_SESSION_RETRIES {
+        let output_checkpoint = output
+            .metadata()
+            .map_err(|err| format!("read Qwen output checkpoint: {}", err))?
+            .len();
         match run_turn_once(
             output,
             qwen_bin,
@@ -253,6 +257,7 @@ fn run_turn(
             Err(err)
                 if err.retryable && attempt < crate::services::qwen::QWEN_MAX_SESSION_RETRIES =>
             {
+                rewind_output_to_checkpoint(output, output_checkpoint)?;
                 *session_id = None;
                 resume_strategy = crate::services::qwen::QwenResumeStrategy::Fresh;
             }
@@ -382,7 +387,7 @@ fn run_turn_once(
         let message = derive_wrapper_error_message(&stderr, wait.status.code());
         return Err(TurnFailure {
             message,
-            retryable: false,
+            retryable: true,
         });
     }
 
@@ -831,6 +836,16 @@ fn derive_wrapper_error_message(stderr: &str, exit_code: Option<i32>) -> String 
     }
 }
 
+fn rewind_output_to_checkpoint(output: &mut std::fs::File, checkpoint: u64) -> Result<(), String> {
+    output
+        .flush()
+        .map_err(|err| format!("flush output before retry: {}", err))?;
+    output
+        .set_len(checkpoint)
+        .map_err(|err| format!("truncate output before retry: {}", err))?;
+    Ok(())
+}
+
 fn extract_init_session_id(value: &Value) -> Option<String> {
     if value.get("type").and_then(|v| v.as_str()) != Some("system") {
         return None;
@@ -885,6 +900,7 @@ mod tests {
     use super::{build_turn_args, decode_external_prompt, normalize_qwen_line};
     use crate::services::qwen::qwen_project_cache_key;
     use std::fs;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn with_temp_qwen_home<F>(f: F)
@@ -1002,5 +1018,30 @@ mod tests {
             );
             assert!(!args.iter().any(|arg| arg == "--continue"));
         });
+    }
+
+    #[test]
+    fn rewind_output_to_checkpoint_discards_retryable_partial_lines() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("turn.jsonl");
+        let mut output = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        writeln!(output, "{{\"type\":\"assistant\",\"message\":\"keep\"}}").unwrap();
+        output.flush().unwrap();
+        let checkpoint = output.metadata().unwrap().len();
+
+        writeln!(output, "{{\"type\":\"assistant\",\"message\":\"drop\"}}").unwrap();
+        output.flush().unwrap();
+
+        super::rewind_output_to_checkpoint(&mut output, checkpoint).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"type\":\"assistant\",\"message\":\"keep\"}\n"
+        );
     }
 }
