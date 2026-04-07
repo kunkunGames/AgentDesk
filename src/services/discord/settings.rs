@@ -418,15 +418,41 @@ pub(super) fn validate_bot_channel_routing(
     channel_name: Option<&str>,
     is_dm: bool,
 ) -> Result<(), BotChannelRoutingGuardFailure> {
-    let role_binding = resolve_role_binding(channel_id, channel_name);
+    validate_bot_channel_routing_with_provider_channel(
+        settings,
+        provider,
+        channel_id,
+        channel_name,
+        channel_name,
+        is_dm,
+    )
+}
 
-    if !bot_settings_allow_channel(settings, channel_id, is_dm) {
+pub(super) fn validate_bot_channel_routing_with_provider_channel(
+    settings: &DiscordBotSettings,
+    provider: &ProviderKind,
+    allowlist_channel_id: ChannelId,
+    binding_channel_name: Option<&str>,
+    provider_channel_name: Option<&str>,
+    is_dm: bool,
+) -> Result<(), BotChannelRoutingGuardFailure> {
+    let role_binding = resolve_role_binding(
+        allowlist_channel_id,
+        binding_channel_name.or(provider_channel_name),
+    );
+
+    if !bot_settings_allow_channel(settings, allowlist_channel_id, is_dm) {
         return Err(BotChannelRoutingGuardFailure::ChannelNotAllowed);
     }
     if !bot_settings_allow_agent(settings, role_binding.as_ref(), is_dm) {
         return Err(BotChannelRoutingGuardFailure::AgentMismatch);
     }
-    if !channel_supports_provider(provider, channel_name, is_dm, role_binding.as_ref()) {
+    if !channel_supports_provider(
+        provider,
+        provider_channel_name.or(binding_channel_name),
+        is_dm,
+        role_binding.as_ref(),
+    ) {
         return Err(BotChannelRoutingGuardFailure::ProviderMismatch);
     }
 
