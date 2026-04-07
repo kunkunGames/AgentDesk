@@ -304,6 +304,12 @@ fn dcserver_log_hint() -> String {
 }
 
 fn qwen_home_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("QWEN_HOME") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+
     #[cfg(test)]
     if let Some(path) = std::env::var_os("AGENTDESK_TEST_HOME") {
         let path = PathBuf::from(path);
@@ -312,7 +318,15 @@ fn qwen_home_dir() -> Option<PathBuf> {
         }
     }
 
-    dirs::home_dir()
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(dirs::home_dir)
 }
 
 fn qwen_project_dir() -> Option<PathBuf> {
@@ -1774,8 +1788,8 @@ mod tests {
     use super::{
         Check, CheckGroup, CheckStatus, FixAction, HealthSnapshot, build_json_report,
         check_provider_cli, check_qwen_auth_hints, check_qwen_runtime_artifacts,
-        check_server_running, configured_provider_names, discord_bot_check_from_health,
-        provider_capability_summary,
+        check_qwen_settings_files, check_server_running, configured_provider_names,
+        discord_bot_check_from_health, provider_capability_summary,
     };
     use crate::config::ServerConfig;
     use crate::services::provider::ProviderKind;
@@ -1789,6 +1803,7 @@ mod tests {
         let _guard = crate::services::discord::runtime_store::lock_test_env();
         let temp_home = tempfile::tempdir().unwrap();
         let temp_project = tempfile::tempdir().unwrap();
+        let prev_qwen_home = std::env::var_os("QWEN_HOME");
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
         let prev_test_home = std::env::var_os("AGENTDESK_TEST_HOME");
@@ -1807,6 +1822,10 @@ mod tests {
         match prev_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+        match prev_qwen_home {
+            Some(value) => unsafe { std::env::set_var("QWEN_HOME", value) },
+            None => unsafe { std::env::remove_var("QWEN_HOME") },
         }
         match prev_userprofile {
             Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
@@ -2048,6 +2067,28 @@ mod tests {
             assert_eq!(check.status, CheckStatus::Pass);
             assert!(check.detail.contains("project .qwen/.env"));
             assert!(check.detail.contains("project .env"));
+        });
+    }
+
+    #[test]
+    fn qwen_doctor_prefers_qwen_home_over_home() {
+        with_temp_qwen_doctor_env(|temp_home, _temp_project| {
+            let qwen_home = tempfile::tempdir().unwrap();
+            let qwen_settings = qwen_home.path().join(".qwen").join("settings.json");
+            std::fs::create_dir_all(qwen_settings.parent().unwrap()).unwrap();
+            std::fs::write(&qwen_settings, "{}").unwrap();
+
+            unsafe {
+                std::env::set_var("QWEN_HOME", qwen_home.path());
+                std::env::set_var("HOME", temp_home.path());
+            }
+
+            let check = check_qwen_settings_files(true);
+            assert_eq!(check.status, CheckStatus::Pass);
+            assert_eq!(
+                check.path.as_deref(),
+                Some(format!("user settings={}", qwen_settings.display()).as_str())
+            );
         });
     }
 
