@@ -13,6 +13,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::db;
     use crate::dispatch;
     use crate::engine::PolicyEngine;
@@ -330,9 +333,12 @@ mod tests {
             script_body
         );
         fs::write(&gh_path, script).unwrap();
-        let mut perms = fs::metadata(&gh_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&gh_path, perms).unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gh_path, perms).unwrap();
+        }
 
         let old_path = std::env::var_os("PATH");
         let new_path = match &old_path {
