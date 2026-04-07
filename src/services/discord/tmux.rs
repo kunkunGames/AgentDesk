@@ -212,7 +212,16 @@ pub(super) async fn start_restart_handoff_from_state(
             mode: super::InterventionMode::Soft,
             created_at: std::time::Instant::now(),
         });
-        super::save_channel_queue(provider_kind, channel_id, queue);
+        super::save_channel_queue(
+            provider_kind,
+            &shared.token_hash,
+            channel_id,
+            queue,
+            shared
+                .dispatch_role_overrides
+                .get(&channel_id)
+                .map(|r| r.value().get()),
+        );
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!(
             "  [{ts}] ↻ watcher death recovery: queued fallback handoff for channel {}",
@@ -749,7 +758,7 @@ pub(super) async fn tmux_output_watcher(
                         shared.api_port,
                         "/api/dispatched-sessions/clear-stale-session-id",
                     ))
-                    .json(&serde_json::json!({"claude_session_id": sid}))
+                    .json(&serde_json::json!({"session_id": sid}))
                     .send()
                     .await;
             }
@@ -1708,8 +1717,10 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let mut data = shared.core.lock().await;
         for (channel_id, channel_name) in &owned_sessions {
             let channel_key = channel_id.get().to_string();
-            let last_path = settings.last_sessions.get(&channel_key).cloned();
+            let yaml_path = settings.last_sessions.get(&channel_key).cloned();
             let remote_profile = settings.last_remotes.get(&channel_key).cloned();
+            let configured_path =
+                super::settings::resolve_workspace(*channel_id, Some(channel_name.as_str()));
 
             let session =
                 data.sessions
@@ -1722,7 +1733,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         cleared: false,
                         channel_name: Some(channel_name.clone()),
                         category_name: None,
-                        remote_profile_name: remote_profile,
+                        remote_profile_name: remote_profile.clone(),
                         channel_id: Some(channel_id.get()),
 
                         last_active: tokio::time::Instant::now(),
@@ -1735,20 +1746,41 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             if session.current_path.is_none() {
                 // Try DB cwd first — preserves worktree paths from previous session
                 let tmux_name = provider.build_tmux_session_name(channel_name);
-                let hostname = crate::services::platform::hostname_short();
-                let session_key = format!("{}:{}", hostname, tmux_name);
+                let session_keys = super::adk_session::build_session_key_candidates(
+                    &shared.token_hash,
+                    &provider,
+                    &tmux_name,
+                );
                 let db_cwd: Option<String> = shared.db.as_ref().and_then(|db| {
                     db.lock().ok().and_then(|conn| {
-                        conn.query_row(
-                            "SELECT cwd FROM sessions WHERE session_key = ?1",
-                            [&session_key],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                        .filter(|p| !p.is_empty() && std::path::Path::new(p).is_dir())
+                        session_keys.iter().find_map(|session_key| {
+                            conn.query_row(
+                                "SELECT cwd FROM sessions WHERE session_key = ?1",
+                                [session_key],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .ok()
+                            .filter(|p| !p.is_empty() && std::path::Path::new(p).is_dir())
+                        })
                     })
                 });
-                let effective_path = db_cwd.or(last_path);
+                if let (Some(configured), Some(restored)) =
+                    (configured_path.as_ref(), db_cwd.as_ref())
+                {
+                    if configured != restored {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] ⚠ Ignoring restored DB cwd for channel {}: {} (configured workspace: {})",
+                            channel_id, restored, configured
+                        );
+                    }
+                }
+                let effective_path = super::select_restored_session_path(
+                    configured_path,
+                    db_cwd,
+                    yaml_path,
+                    remote_profile.as_deref(),
+                );
                 if let Some(path) = effective_path {
                     session.current_path = Some(path);
                 }
@@ -1837,8 +1869,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
         for dc in &dead_cleanups {
             let tmux_name = provider.build_tmux_session_name(&dc.channel_name);
-            let hostname = crate::services::platform::hostname_short();
-            let session_key = format!("{}:{}", hostname, tmux_name);
+            let session_key = super::adk_session::build_namespaced_session_key(
+                &shared.token_hash,
+                &provider,
+                &tmux_name,
+            );
 
             super::adk_session::post_adk_session_status(
                 Some(&session_key),
@@ -2055,8 +2090,11 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
         // Dead session with no watcher — report idle to DB and kill
         let tmux_name =
             provider.build_tmux_session_name(channel_name.as_deref().unwrap_or("unknown"));
-        let hostname = crate::services::platform::hostname_short();
-        let session_key = format!("{}:{}", hostname, tmux_name);
+        let session_key = super::adk_session::build_namespaced_session_key(
+            &shared.token_hash,
+            &provider,
+            &tmux_name,
+        );
 
         // Check if this is a thread session (channel name contains -t{15+digit})
         let is_thread = channel_name

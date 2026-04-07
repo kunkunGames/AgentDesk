@@ -62,7 +62,15 @@ else
     if command -v pnpm &>/dev/null; then
       pnpm install --frozen-lockfile 2>/dev/null || pnpm install
       pnpm build
+    elif [ -f "pnpm-lock.yaml" ] && command -v corepack &>/dev/null; then
+      echo "  Using corepack pnpm (pnpm-lock.yaml detected)"
+      corepack pnpm install --frozen-lockfile 2>/dev/null || corepack pnpm install
+      corepack pnpm build
     elif command -v npm &>/dev/null; then
+      if [ -f "pnpm-lock.yaml" ] && [ ! -f "package-lock.json" ]; then
+        echo "  Error: pnpm-lock.yaml present but pnpm is unavailable. Install pnpm or enable corepack."
+        exit 1
+      fi
       npm ci --silent 2>/dev/null || npm install --silent
       npm run build
     else

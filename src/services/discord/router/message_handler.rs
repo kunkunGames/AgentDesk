@@ -3,8 +3,6 @@ use crate::services::memory::{
     RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
     resolve_memory_session_id,
 };
-#[cfg(unix)]
-use crate::services::tmux_common::tmux_exact_target;
 
 #[derive(Debug, PartialEq, Eq)]
 struct MemoryInjectionPlan<'a> {
@@ -21,7 +19,7 @@ fn build_memory_injection_plan<'a>(
     memory_recall: &'a RecallResponse,
 ) -> MemoryInjectionPlan<'a> {
     let should_inject_shared_knowledge =
-        !has_session_id && dispatch_profile == DispatchProfile::Full;
+        dispatch_profile == DispatchProfile::Full && !has_session_id;
     let shared_knowledge_for_context =
         if should_inject_shared_knowledge && !matches!(provider, ProviderKind::Claude) {
             memory_recall.shared_knowledge.as_deref()
@@ -29,7 +27,7 @@ fn build_memory_injection_plan<'a>(
             None
         };
     let shared_knowledge_for_system_prompt =
-        if should_inject_shared_knowledge && matches!(provider, ProviderKind::Claude) {
+        if dispatch_profile == DispatchProfile::Full && matches!(provider, ProviderKind::Claude) {
             memory_recall.shared_knowledge.as_deref()
         } else {
             None
@@ -722,7 +720,16 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
             // Write-through: persist this channel's queue to disk
             if let Some(q) = data.intervention_queue.get(&channel_id) {
-                super::super::save_channel_queue(&provider, channel_id, q);
+                super::super::save_channel_queue(
+                    &provider,
+                    &shared.token_hash,
+                    channel_id,
+                    q,
+                    shared
+                        .dispatch_role_overrides
+                        .get(&channel_id)
+                        .map(|r| r.value().get()),
+                );
             }
             drop(data);
             // Clean up: remove placeholder and reaction created before this check
@@ -1634,48 +1641,14 @@ pub(super) async fn handle_text_command(
         }
 
         "!clear" => {
-            let mut d = data.shared.core.lock().await;
-            if let Some(token) = d.cancel_tokens.remove(&channel_id) {
-                token.cancel_with_tmux_cleanup();
-            }
-            // Build tmux session name from channel name
-            let tmux_name = d
-                .sessions
-                .get(&channel_id)
-                .and_then(|s| s.channel_name.as_ref())
-                .map(|ch_name| data.provider.build_tmux_session_name(ch_name));
-            if let Some(session) = d.sessions.get_mut(&channel_id) {
-                session.history.clear();
-                session.pending_uploads.clear();
-                session.cleared = true;
-                session.session_id = None;
-            }
-            d.intervention_queue.remove(&channel_id);
-            drop(d);
-            // Clear stored provider session_id from DB
-            if let Some(key) = super::super::adk_session::build_adk_session_key(
+            super::super::commands::clear_channel_session_state(
+                &ctx.http,
                 &data.shared,
-                channel_id,
                 &data.provider,
+                channel_id,
+                "!clear",
             )
-            .await
-            {
-                super::super::adk_session::clear_provider_session_id(&key, data.shared.api_port)
-                    .await;
-            }
-            // Send /clear to the actual Claude Code session via tmux
-            #[cfg(unix)]
-            if data.provider == crate::services::provider::ProviderKind::Claude {
-                if let Some(ref name) = tmux_name {
-                    let exact_target = tmux_exact_target(name);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        std::process::Command::new("tmux")
-                            .args(["send-keys", "-t", &exact_target, "/clear", "Enter"])
-                            .output()
-                    })
-                    .await;
-                }
-            }
+            .await;
             let _ = msg.reply(&ctx.http, "Session cleared.").await;
             return Ok(true);
         }
@@ -2339,65 +2312,14 @@ Any other message is sent to {p}.
             }
 
             // Build the prompt
-            let skill_prompt = match &data.provider {
-                ProviderKind::Claude => {
-                    if args_str.is_empty() {
-                        format!(
-                            "Execute the skill `/{skill}` now. \
-                             Use the Skill tool with skill=\"{skill}\". \
-                             Read files under `references/` only if the skill points to them or you need extra detail."
-                        )
-                    } else {
-                        format!(
-                            "Execute the skill `/{skill}` with arguments: {args_str}\n\
-                             Use the Skill tool with skill=\"{skill}\", args=\"{args_str}\". \
-                             Read files under `references/` only if the skill points to them or you need extra detail."
-                        )
-                    }
-                }
-                ProviderKind::Codex => {
-                    if args_str.is_empty() {
-                        format!(
-                            "Use the local Codex skill `/{skill}` now. \
-                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    } else {
-                        format!(
-                            "Use the local Codex skill `/{skill}` now with this user request: {args_str}\n\
-                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    }
-                }
-                ProviderKind::Gemini => {
-                    if args_str.is_empty() {
-                        format!(
-                            "Use the local Gemini skill `/{skill}` now. \
-                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    } else {
-                        format!(
-                            "Use the local Gemini skill `/{skill}` now with this user request: {args_str}\n\
-                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    }
-                }
-                ProviderKind::Qwen => {
-                    if args_str.is_empty() {
-                        format!(
-                            "Use the local Qwen skill `/{skill}` now. \
-                             Load its `SKILL.md` first, follow it exactly, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    } else {
-                        format!(
-                            "Use the local Qwen skill `/{skill}` now with this user request: {args_str}\n\
-                             Load its `SKILL.md` first, adapt it to the request, and read files under `references/` only when the skill points to them or you need them."
-                        )
-                    }
-                }
-                ProviderKind::Unsupported(name) => {
-                    let _ = msg
-                        .reply(&ctx.http, format!("Provider '{}' is not installed.", name))
-                        .await;
+            let skill_prompt = match super::super::commands::build_provider_skill_prompt(
+                &data.provider,
+                &skill,
+                args_str,
+            ) {
+                Ok(prompt) => prompt,
+                Err(message) => {
+                    let _ = msg.reply(&ctx.http, message).await;
                     return Ok(true);
                 }
             };
@@ -2508,36 +2430,6 @@ mod tests {
     }
 
     #[test]
-    fn session_path_is_usable_for_existing_local_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut session = make_session(Some(dir.path().to_str().unwrap().to_string()), None);
-        assert!(session.validated_path("test-channel").is_some());
-    }
-
-    #[test]
-    fn session_path_is_not_usable_for_missing_local_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing_path = dir.path().to_str().unwrap().to_string();
-        drop(dir);
-        let mut session = make_session(Some(missing_path), None);
-        assert!(session.validated_path("test-channel").is_none());
-        // Verify current_path and worktree were cleared
-        assert!(session.current_path.is_none());
-        assert!(session.worktree.is_none());
-    }
-
-    #[test]
-    fn session_path_is_stale_for_remote_session_with_missing_local_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing_path = dir.path().to_str().unwrap().to_string();
-        drop(dir);
-        let mut session = make_session(Some(missing_path), Some("mac-mini".to_string()));
-        // Remote sessions keep their CWD even when it is non-local to this machine.
-        assert!(session.validated_path("test-channel").is_some());
-        assert!(session.current_path.is_some());
-    }
-
-    #[test]
     fn memory_injection_plan_routes_shared_knowledge_by_provider() {
         let recall = sample_recall();
 
@@ -2574,6 +2466,16 @@ mod tests {
         assert_eq!(codex.shared_knowledge_for_system_prompt, None);
         assert_eq!(codex.external_recall_for_context, Some("[External Recall]"));
         assert_eq!(codex.longterm_catalog_for_system_prompt, Some("- notes.md"));
+
+        let qwen =
+            build_memory_injection_plan(&ProviderKind::Qwen, false, DispatchProfile::Full, &recall);
+        assert_eq!(
+            qwen.shared_knowledge_for_context,
+            Some("[Shared Knowledge]")
+        );
+        assert_eq!(qwen.shared_knowledge_for_system_prompt, None);
+        assert_eq!(qwen.external_recall_for_context, Some("[External Recall]"));
+        assert_eq!(qwen.longterm_catalog_for_system_prompt, Some("- notes.md"));
     }
 
     #[test]
@@ -2602,5 +2504,52 @@ mod tests {
         assert_eq!(plan.shared_knowledge_for_system_prompt, None);
         assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
         assert_eq!(plan.longterm_catalog_for_system_prompt, Some("- notes.md"));
+    }
+
+    #[test]
+    fn memory_injection_plan_keeps_shared_knowledge_for_claude_resumed_sessions() {
+        let recall = sample_recall();
+        let plan = build_memory_injection_plan(
+            &ProviderKind::Claude,
+            true,
+            DispatchProfile::Full,
+            &recall,
+        );
+
+        assert_eq!(plan.shared_knowledge_for_context, None);
+        assert_eq!(
+            plan.shared_knowledge_for_system_prompt,
+            Some("[Shared Knowledge]")
+        );
+        assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
+        assert_eq!(plan.longterm_catalog_for_system_prompt, Some("- notes.md"));
+    }
+
+    #[test]
+    fn session_path_is_usable_for_existing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = make_session(Some(dir.path().to_str().unwrap().to_string()), None);
+        assert!(session.validated_path("test-channel").is_some());
+    }
+
+    #[test]
+    fn session_path_is_not_usable_for_missing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().to_str().unwrap().to_string();
+        drop(dir);
+        let mut session = make_session(Some(missing_path), None);
+        assert!(session.validated_path("test-channel").is_none());
+        assert!(session.current_path.is_none());
+        assert!(session.worktree.is_none());
+    }
+
+    #[test]
+    fn session_path_is_stale_for_remote_session_with_missing_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().to_str().unwrap().to_string();
+        drop(dir);
+        let mut session = make_session(Some(missing_path), Some("mac-mini".to_string()));
+        assert!(session.validated_path("test-channel").is_some());
+        assert!(session.current_path.is_some());
     }
 }
