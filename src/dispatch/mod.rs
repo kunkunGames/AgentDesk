@@ -1414,12 +1414,7 @@ fn provider_from_channel_suffix(channel: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn repo_dir_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use std::sync::MutexGuard;
 
     struct RepoDirOverride {
         _lock: MutexGuard<'static, ()>,
@@ -1428,7 +1423,7 @@ mod tests {
 
     impl RepoDirOverride {
         fn new(path: &str) -> Self {
-            let lock = repo_dir_env_lock().lock().unwrap();
+            let lock = crate::services::discord::runtime_store::lock_test_env();
             let previous = std::env::var("AGENTDESK_REPO_DIR").ok();
             unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) };
             Self {
@@ -1955,7 +1950,12 @@ mod tests {
         seed_card(&db, "card-no-channel", "ready");
         let conn = db.separate_conn().unwrap();
         conn.execute(
-            "UPDATE agents SET discord_channel_id = NULL WHERE id = 'agent-1'",
+            "UPDATE agents
+             SET discord_channel_id = NULL,
+                 discord_channel_alt = NULL,
+                 discord_channel_cc = NULL,
+                 discord_channel_cdx = NULL
+             WHERE id = 'agent-1'",
             [],
         )
         .unwrap();

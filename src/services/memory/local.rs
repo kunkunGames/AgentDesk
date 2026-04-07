@@ -39,13 +39,11 @@ mod tests {
         TempDir,
         Option<std::ffi::OsString>,
     ) {
-        let guard = crate::services::discord::runtime_store::test_env_lock()
-            .lock()
-            .unwrap();
+        let guard = crate::services::discord::runtime_store::lock_test_env();
         let temp = TempDir::new().unwrap();
         let root = temp.path().join(".adk");
-        let shared = root.join("shared_agent_memory");
-        let role_mem = root.join("role-context").join("codex.memory");
+        let shared = crate::runtime_layout::shared_agent_knowledge_dir(&root);
+        let role_mem = crate::runtime_layout::long_term_memory_root(&root).join("codex");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::create_dir_all(&role_mem).unwrap();
         std::fs::write(shared.join("shared_knowledge.md"), "Remember this").unwrap();

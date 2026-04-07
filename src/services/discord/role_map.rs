@@ -294,7 +294,7 @@ mod tests {
     where
         F: FnOnce(&TempDir),
     {
-        let _guard = super::super::runtime_store::test_env_lock().lock().unwrap();
+        let _guard = super::super::runtime_store::lock_test_env();
         let temp = TempDir::new().unwrap();
         let root = temp.path().join(".adk");
         std::fs::create_dir_all(&root).unwrap();

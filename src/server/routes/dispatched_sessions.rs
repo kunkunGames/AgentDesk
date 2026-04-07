@@ -1477,8 +1477,7 @@ mod tests {
     }
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::services::discord::runtime_store::lock_test_env()
     }
 
     struct EnvVarGuard {
