@@ -2,16 +2,16 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
-use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
+use crate::services::agent_protocol::{is_valid_session_id, StreamMessage};
 use crate::services::process::kill_child_tree;
 use crate::services::provider::{
-    CancelToken, ProviderKind, StreamAttemptFailure, StreamAttemptResult, StreamFinalState,
-    cancel_requested, register_child_pid, run_retrying_stream_attempts,
+    cancel_requested, register_child_pid, run_retrying_stream_attempts, CancelToken, ProviderKind,
+    StreamAttemptFailure, StreamAttemptResult, StreamFinalState,
 };
 use crate::services::remote::RemoteProfile;
 
@@ -332,18 +332,18 @@ where
                 if state.terminal_result_seen {
                     return GeminiStreamLoopResult::Eof;
                 }
-                if !state.meaningful_progress_seen {
-                    continue;
-                }
                 silent_for += poll_timeout;
                 if silent_for >= idle_watchdog {
-                    if !definitive_failure_observed() {
-                        continue;
-                    }
+                    let process_exited = definitive_failure_observed();
                     return GeminiStreamLoopResult::RetrySession {
                         message: format!(
-                            "Gemini stream produced no output for {} seconds",
-                            idle_watchdog.as_secs()
+                            "Gemini stream produced no output for {} seconds{}",
+                            idle_watchdog.as_secs(),
+                            if process_exited {
+                                " before the session recovered"
+                            } else {
+                                ""
+                            }
                         ),
                     };
                 }
@@ -777,13 +777,13 @@ fn render_gemini_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GEMINI_INVALID_RESUME_SELECTOR_MESSAGE, GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState,
-        GeminiStreamEvent, GeminiStreamLoopResult, build_exec_args,
-        build_gemini_tool_result_message, build_gemini_tool_use_message,
+        build_exec_args, build_gemini_tool_result_message, build_gemini_tool_use_message,
         collect_gemini_stream_events, execute_command_streaming, extract_gemini_error_message,
         extract_text_from_stream_output, finalize_gemini_attempt, looks_like_uuid,
         normalize_resume_selector, observed_session_to_resume_selector, process_gemini_stream_line,
-        remote_profile_not_supported_message, run_gemini_streaming_attempts,
+        remote_profile_not_supported_message, run_gemini_streaming_attempts, GeminiAttemptState,
+        GeminiStreamEvent, GeminiStreamLoopResult, GEMINI_INVALID_RESUME_SELECTOR_MESSAGE,
+        GEMINI_SESSION_DEAD_MESSAGE,
     };
     use crate::services::agent_protocol::StreamMessage;
     use crate::services::provider::{
@@ -791,9 +791,9 @@ mod tests {
     };
     use crate::services::remote::{RemoteAuth, RemoteProfile};
     use serde_json::json;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -801,20 +801,17 @@ mod tests {
         let args = build_exec_args("hello", Some("gemini-2.5-flash"), Some("latest"));
         assert!(args.windows(2).any(|pair| pair == ["--resume", "latest"]));
         assert!(args.windows(2).any(|pair| pair == ["-p", "hello"]));
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["-m", "gemini-2.5-flash"])
-        );
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["-m", "gemini-2.5-flash"]));
     }
 
     #[test]
     fn build_exec_args_includes_model_for_fresh_session() {
         let args = build_exec_args("hello", Some("gemini-2.5-flash"), None);
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-m", "gemini-2.5-flash"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-m", "gemini-2.5-flash"]));
         assert!(!args.iter().any(|arg| arg == "--resume"));
     }
 
@@ -1283,8 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_watchdog_does_not_retry_before_first_stream_progress() {
-        let token = Arc::new(CancelToken::new());
+    fn idle_watchdog_retries_before_first_stream_progress() {
         let (tx, rx) = mpsc::channel();
         let (stream_tx, stream_rx) = mpsc::channel();
         let mut state = GeminiAttemptState::new(None);
@@ -1292,23 +1288,23 @@ mod tests {
             r#"{"type":"init","session_id":"latest","model":"gemini-2.5-flash"}"#.to_string(),
         ))
         .unwrap();
-        let token_for_thread = token.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(4));
-            token_for_thread.cancelled.store(true, Ordering::Relaxed);
-        });
 
         let result = collect_gemini_stream_events(
             &rx,
             &stream_tx,
-            Some(token.as_ref()),
+            None,
             &mut state,
             Duration::from_millis(1),
             Duration::from_millis(2),
             || false,
         );
 
-        assert_eq!(result, GeminiStreamLoopResult::Cancelled);
+        match result {
+            GeminiStreamLoopResult::RetrySession { message } => {
+                assert!(message.contains("Gemini stream produced no output"));
+            }
+            other => panic!("expected RetrySession, got {:?}", other),
+        }
         assert!(!state.raw_stdout.is_empty());
         assert!(!state.meaningful_progress_seen);
         match stream_rx.recv().unwrap() {
@@ -1319,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_watchdog_waits_if_process_is_still_alive_during_extended_silence() {
+    fn idle_watchdog_retries_even_if_process_is_still_alive_during_extended_silence() {
         let (tx, rx) = mpsc::channel();
         let (stream_tx, stream_rx) = mpsc::channel();
         let mut state = GeminiAttemptState::new(None);
@@ -1327,24 +1323,23 @@ mod tests {
             r#"{"type":"message","role":"assistant","content":"partial"}"#.to_string(),
         ))
         .unwrap();
-        let token = Arc::new(CancelToken::new());
-        let token_for_thread = token.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            token_for_thread.cancelled.store(true, Ordering::Relaxed);
-        });
 
         let result = collect_gemini_stream_events(
             &rx,
             &stream_tx,
-            Some(token.as_ref()),
+            None,
             &mut state,
             Duration::from_millis(1),
             Duration::from_millis(3),
             || false,
         );
 
-        assert_eq!(result, GeminiStreamLoopResult::Cancelled);
+        match result {
+            GeminiStreamLoopResult::RetrySession { message } => {
+                assert!(message.contains("Gemini stream produced no output"));
+            }
+            other => panic!("expected RetrySession, got {:?}", other),
+        }
         assert_eq!(state.final_text, "partial");
         assert!(state.meaningful_progress_seen);
         match stream_rx.recv().unwrap() {

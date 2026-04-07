@@ -561,6 +561,64 @@ pub(super) fn requeue_intervention_front(
     }
 }
 
+pub(super) fn take_next_soft_intervention_persisted(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
+    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
+) -> Option<(Intervention, bool)> {
+    let mut remove_queue = false;
+    let (next, has_more) = if let Some(queue) = intervention_queue.get_mut(&channel_id) {
+        let next = dequeue_next_soft_intervention(queue);
+        let has_more = has_soft_intervention(queue);
+        remove_queue = queue.is_empty();
+        (next, has_more)
+    } else {
+        (None, false)
+    };
+
+    let intervention = next?;
+
+    if remove_queue {
+        save_channel_queue(provider, token_hash, channel_id, &[], None);
+        intervention_queue.remove(&channel_id);
+    } else if let Some(queue) = intervention_queue.get(&channel_id) {
+        save_channel_queue(
+            provider,
+            token_hash,
+            channel_id,
+            queue,
+            dispatch_role_overrides
+                .get(&channel_id)
+                .map(|override_id| override_id.value().get()),
+        );
+    }
+
+    Some((intervention, has_more))
+}
+
+pub(super) fn requeue_intervention_front_persisted(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
+    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
+    intervention: Intervention,
+) {
+    let queue = intervention_queue.entry(channel_id).or_default();
+    requeue_intervention_front(queue, intervention);
+    save_channel_queue(
+        provider,
+        token_hash,
+        channel_id,
+        queue,
+        dispatch_role_overrides
+            .get(&channel_id)
+            .map(|override_id| override_id.value().get()),
+    );
+}
+
 // ─── Pending queue persistence (write-through + SIGTERM) ─────────────────────
 
 /// Serializable form of a queued intervention for disk persistence.
@@ -586,11 +644,14 @@ pub(super) struct PendingQueueItem {
 ///
 /// Queue path: `discord_pending_queue/{provider}/{token_hash}/{channel_id}.json`
 /// The `token_hash` namespace prevents multi-bot queue cross-contamination on restart.
+/// `dispatch_role_override`: if `dispatch_role_overrides[channel_id]` is set, pass it here
+/// so it survives restart and can be restored to `SharedData.dispatch_role_overrides`.
 pub(super) fn save_channel_queue(
     provider: &ProviderKind,
     token_hash: &str,
     channel_id: ChannelId,
     queue: &[Intervention],
+    dispatch_role_override: Option<u64>,
 ) {
     let Some(root) = runtime_store::discord_pending_queue_root() else {
         return;
@@ -610,7 +671,7 @@ pub(super) fn save_channel_queue(
             text: i.text.clone(),
             channel_id: Some(channel_id.get()),
             channel_name: None,
-            override_channel_id: None,
+            override_channel_id: dispatch_role_override,
         })
         .collect();
     if let Ok(json) = serde_json::to_string_pretty(&items) {
@@ -619,10 +680,13 @@ pub(super) fn save_channel_queue(
 }
 
 /// Save all non-empty intervention queues to `discord_pending_queue/{provider}/{token_hash}/`.
+/// `dispatch_role_overrides` is snapshotted per channel so that `override_channel_id` survives
+/// restart and can be restored to `SharedData.dispatch_role_overrides`.
 fn save_pending_queues(
     provider: &ProviderKind,
     token_hash: &str,
     queues: &HashMap<ChannelId, Vec<Intervention>>,
+    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
 ) {
     let Some(root) = runtime_store::discord_pending_queue_root() else {
         return;
@@ -639,6 +703,7 @@ fn save_pending_queues(
         if queue.is_empty() {
             continue;
         }
+        let override_id = dispatch_role_overrides.get(channel_id).map(|r| r.value().get());
         let items: Vec<PendingQueueItem> = queue
             .iter()
             .map(|i| PendingQueueItem {
@@ -647,7 +712,7 @@ fn save_pending_queues(
                 text: i.text.clone(),
                 channel_id: Some(channel_id.get()),
                 channel_name: None,
-                override_channel_id: None,
+                override_channel_id: override_id,
             })
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&items) {
@@ -659,19 +724,21 @@ fn save_pending_queues(
 
 /// Load persisted pending queues from `discord_pending_queue/{provider}/{token_hash}/` and delete the files.
 /// Only reads files in this bot's token-namespaced subdirectory.
+/// Returns `(queues, dispatch_role_overrides)` so the caller can restore both.
 fn load_pending_queues(
     provider: &ProviderKind,
     token_hash: &str,
-) -> HashMap<ChannelId, Vec<Intervention>> {
+) -> (HashMap<ChannelId, Vec<Intervention>>, HashMap<ChannelId, ChannelId>) {
     let Some(root) = runtime_store::discord_pending_queue_root() else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let dir = root.join(provider.as_str()).join(token_hash);
     let Ok(entries) = fs::read_dir(&dir) else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let now = Instant::now();
     let mut result: HashMap<ChannelId, Vec<Intervention>> = HashMap::new();
+    let mut restored_overrides: HashMap<ChannelId, ChannelId> = HashMap::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -692,6 +759,10 @@ fn load_pending_queues(
             let _ = fs::remove_file(&path);
             continue;
         };
+        // Restore dispatch_role_override from snapshot (first non-None value wins)
+        if let Some(override_id) = items.iter().find_map(|item| item.override_channel_id) {
+            restored_overrides.insert(ChannelId::new(channel_id), ChannelId::new(override_id));
+        }
         let interventions: Vec<Intervention> = items
             .into_iter()
             .map(|item| Intervention {
@@ -707,7 +778,34 @@ fn load_pending_queues(
         }
         let _ = fs::remove_file(&path);
     }
-    result
+    (result, restored_overrides)
+}
+
+/// P1-2: Log a structured warning for legacy pending queue files at the old flat
+/// `discord_pending_queue/{provider}/` path (not in a token_hash subdirectory).
+/// These files were written before P0 namespacing and cannot be safely restored.
+/// Called once at startup after `load_pending_queues`.
+fn warn_legacy_pending_queue_files(provider: &ProviderKind) {
+    let Some(root) = runtime_store::discord_pending_queue_root() else {
+        return;
+    };
+    let dir = root.join(provider.as_str());
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Warn only about flat JSON files directly under {provider}/ (not subdirectories)
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!(
+                "  [{ts}] ⚠ LEGACY-QUEUE: found legacy pending queue file '{}' — \
+                predates bot-identity namespacing and will NOT be restored. \
+                Remove manually if no longer needed.",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Startup catch-up polling: fetch messages that arrived during the restart gap.
@@ -1342,8 +1440,9 @@ async fn kickoff_idle_queues(
     token: &str,
     provider: &ProviderKind,
 ) {
-    // Collect channels with queued items that are idle (no active turn)
-    let channels_to_kick: Vec<(ChannelId, Intervention, bool)> = {
+    // Collect channels with queued items that are idle (no active turn). Dequeue only
+    // after the routing guard passes so a rejected channel stays preserved on disk/in memory.
+    let channels_to_kick: Vec<ChannelId> = {
         let mut data = shared.core.lock().await;
         let mut result = Vec::new();
         let channel_ids: Vec<ChannelId> = data.intervention_queue.keys().cloned().collect();
@@ -1353,16 +1452,8 @@ async fn kickoff_idle_queues(
                 continue;
             }
             if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
-                if let Some(intervention) = dequeue_next_soft_intervention(queue) {
-                    let has_more = has_soft_intervention(queue);
-                    // Write-through: update disk after dequeue
-                    if queue.is_empty() {
-                        save_channel_queue(provider, &shared.token_hash, channel_id, &[]);
-                        data.intervention_queue.remove(&channel_id);
-                    } else {
-                        save_channel_queue(provider, &shared.token_hash, channel_id, queue);
-                    }
-                    result.push((channel_id, intervention, has_more));
+                if has_soft_intervention(queue) {
+                    result.push(channel_id);
                 }
             }
         }
@@ -1379,26 +1470,35 @@ async fn kickoff_idle_queues(
         channels_to_kick.len()
     );
 
-    for (channel_id, intervention, has_more) in channels_to_kick {
-        // Routing guard: ensure this channel still belongs to this bot before kicking off.
-        // Path isolation (token_hash in directory) is the primary defense; this is belt-and-suspenders.
+    for channel_id in channels_to_kick {
+        let settings_snapshot = shared.settings.read().await.clone();
+        if let Err(reason) =
+            validate_live_channel_routing(ctx, provider, &settings_snapshot, channel_id).await
         {
-            let settings = shared.settings.read().await;
-            if let Err(reason) = validate_bot_channel_routing(
-                &settings,
-                provider,
-                channel_id,
-                None,
-                false,
-            ) {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ⚠ KICKOFF: routing guard rejected channel {} (reason={:?}) — dropping misrouted queue item",
-                    channel_id, reason
-                );
-                continue;
-            }
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ KICKOFF-GUARD: preserving queued item(s) for channel {} (reason={})",
+                channel_id, reason
+            );
+            continue;
         }
+
+        let Some((intervention, has_more)) = ({
+            let mut data = shared.core.lock().await;
+            if data.cancel_tokens.contains_key(&channel_id) {
+                None
+            } else {
+                take_next_soft_intervention_persisted(
+                    provider,
+                    &shared.token_hash,
+                    channel_id,
+                    &mut data.intervention_queue,
+                    &shared.dispatch_role_overrides,
+                )
+            }
+        }) else {
+            continue;
+        };
 
         let owner_name = if intervention.author_id.get() <= 1 {
             "system".to_string()
@@ -1438,10 +1538,16 @@ async fn kickoff_idle_queues(
                 "  [{ts}]   ⚠ KICKOFF: failed to start turn for channel {}: {e}",
                 channel_id
             );
-            // Requeue so the message is not lost
+            // Requeue so the message is not lost, and persist immediately.
             let mut data = shared.core.lock().await;
-            let queue = data.intervention_queue.entry(channel_id).or_default();
-            requeue_intervention_front(queue, intervention);
+            requeue_intervention_front_persisted(
+                provider,
+                &shared.token_hash,
+                channel_id,
+                &mut data.intervention_queue,
+                &shared.dispatch_role_overrides,
+                intervention,
+            );
         }
     }
 }
@@ -1948,7 +2054,7 @@ pub async fn run_bot(
                                 let queue_count: usize =
                                     data.intervention_queue.values().map(|q| q.len()).sum();
                                 if queue_count > 0 {
-                                    save_pending_queues(&provider_for_deferred, &shared_for_deferred.token_hash, &data.intervention_queue);
+                                    save_pending_queues(&provider_for_deferred, &shared_for_deferred.token_hash, &data.intervention_queue, &shared_for_deferred.dispatch_role_overrides);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
@@ -2017,7 +2123,15 @@ pub async fn run_bot(
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
-                    let restored_queues = load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
+                    let (restored_queues, restored_overrides) = load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
+                    // P1-1: Restore dispatch_role_overrides from queue snapshots
+                    for (thread_channel_id, alt_channel_id) in &restored_overrides {
+                        shared_for_tmux2.dispatch_role_overrides.insert(*thread_channel_id, *alt_channel_id);
+                    }
+                    if !restored_overrides.is_empty() {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] 📋 FLUSH: restored {} dispatch_role_override(s) from queue snapshots", restored_overrides.len());
+                    }
                     if !restored_queues.is_empty() {
                         let mut added = 0usize;
                         let mut skipped = 0usize;
@@ -2039,6 +2153,9 @@ pub async fn run_bot(
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
+
+                    // P1-2: Warn about legacy queue files that cannot be restored
+                    warn_legacy_pending_queue_files(&provider_for_restore);
 
                     // Startup catch-up polling: recover messages lost during restart gap
                     catch_up_missed_messages(
@@ -2251,7 +2368,7 @@ pub async fn run_bot(
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(&provider_for_shutdown, &shared_for_signal.token_hash, &data.intervention_queue);
+                        save_pending_queues(&provider_for_shutdown, &shared_for_signal.token_hash, &data.intervention_queue, &shared_for_signal.dispatch_role_overrides);
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
                     }
@@ -2365,7 +2482,7 @@ pub async fn run_bot(
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(&provider_for_shutdown, &shared_for_signal.token_hash, &data.intervention_queue);
+                        save_pending_queues(&provider_for_shutdown, &shared_for_signal.token_hash, &data.intervention_queue, &shared_for_signal.dispatch_role_overrides);
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
                     }
@@ -3337,12 +3454,12 @@ pub(super) async fn resolve_channel_category(
     (ch_name, cat_name)
 }
 
-pub(super) async fn provider_handles_channel(
+pub(super) async fn validate_live_channel_routing(
     ctx: &serenity::prelude::Context,
     provider: &ProviderKind,
     settings: &DiscordBotSettings,
     channel_id: serenity::model::id::ChannelId,
-) -> bool {
+) -> Result<(), settings::BotChannelRoutingGuardFailure> {
     let is_dm = matches!(
         channel_id.to_channel(&ctx.http).await,
         Ok(serenity::model::channel::Channel::Private(_))
@@ -3362,7 +3479,17 @@ pub(super) async fn provider_handles_channel(
         effective_channel_name.as_deref(),
         is_dm,
     )
-    .is_ok()
+}
+
+pub(super) async fn provider_handles_channel(
+    ctx: &serenity::prelude::Context,
+    provider: &ProviderKind,
+    settings: &DiscordBotSettings,
+    channel_id: serenity::model::id::ChannelId,
+) -> bool {
+    validate_live_channel_routing(ctx, provider, settings, channel_id)
+        .await
+        .is_ok()
 }
 
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.
@@ -3645,7 +3772,8 @@ mod tests {
 
     use super::{
         Intervention, InterventionMode, PendingQueueItem, load_pending_queues, save_channel_queue,
-        save_pending_queues,
+        save_pending_queues, take_next_soft_intervention_persisted,
+        requeue_intervention_front_persisted,
     };
     use crate::services::discord::runtime_store::lock_test_env;
     use serenity::model::id::{MessageId, UserId};
@@ -3675,7 +3803,7 @@ mod tests {
         let channel_id = ChannelId::new(999);
 
         let queue = vec![make_intervention("hello")];
-        save_channel_queue(&provider, token_hash, channel_id, &queue);
+        save_channel_queue(&provider, token_hash, channel_id, &queue, None);
 
         // File must exist under token_hash subdirectory
         let expected = tmp
@@ -3710,14 +3838,14 @@ mod tests {
         let channel_id = ChannelId::new(42);
 
         // Bot A saves
-        save_channel_queue(&provider, "hash_bot_a", channel_id, &[make_intervention("from A")]);
+        save_channel_queue(&provider, "hash_bot_a", channel_id, &[make_intervention("from A")], None);
 
         // Bot B loads — must get nothing
-        let result = load_pending_queues(&provider, "hash_bot_b");
+        let (result, _overrides) = load_pending_queues(&provider, "hash_bot_b");
         assert!(result.is_empty(), "bot B must not restore bot A's queue");
 
         // Bot A loads — must get its own item
-        let result = load_pending_queues(&provider, "hash_bot_a");
+        let (result, _overrides) = load_pending_queues(&provider, "hash_bot_a");
         assert_eq!(result.len(), 1, "bot A must restore its own queue");
         assert_eq!(result[&channel_id][0].text, "from A");
 
@@ -3740,10 +3868,10 @@ mod tests {
         queues.insert(ch1, vec![make_intervention("msg1")]);
         queues.insert(ch2, vec![make_intervention("msg2a"), make_intervention("msg2b")]);
 
-        save_pending_queues(&provider, token_hash, &queues);
+        save_pending_queues(&provider, token_hash, &queues, &dashmap::DashMap::new());
 
         // load_pending_queues deletes files after reading
-        let restored = load_pending_queues(&provider, token_hash);
+        let (restored, _restored_overrides) = load_pending_queues(&provider, token_hash);
         assert_eq!(restored.get(&ch1).map(|v| v.len()), Some(1));
         assert_eq!(restored.get(&ch2).map(|v| v.len()), Some(2));
 
@@ -3756,6 +3884,71 @@ mod tests {
             .join(token_hash);
         let remaining: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
         assert!(remaining.is_empty(), "load must delete queue files after reading");
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    #[test]
+    fn persisted_queue_helpers_keep_remaining_items_and_restore_requeued_item() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let token_hash = "preserve_roundtrip";
+        let channel_id = ChannelId::new(41);
+        let alt_channel = ChannelId::new(99);
+
+        let mut queues = std::collections::HashMap::new();
+        queues.insert(
+            channel_id,
+            vec![make_intervention("first"), make_intervention("second")],
+        );
+        let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
+        overrides.insert(channel_id, alt_channel);
+        save_pending_queues(&provider, token_hash, &queues, &overrides);
+
+        let (popped, has_more) = take_next_soft_intervention_persisted(
+            &provider,
+            token_hash,
+            channel_id,
+            &mut queues,
+            &overrides,
+        )
+        .expect("queue item should be popped");
+        assert_eq!(popped.text, "first");
+        assert!(has_more);
+        assert_eq!(queues.get(&channel_id).map(|items| items.len()), Some(1));
+
+        let file = tmp
+            .path()
+            .join("runtime")
+            .join("discord_pending_queue")
+            .join("claude")
+            .join(token_hash)
+            .join(format!("{}.json", channel_id.get()));
+        let content = std::fs::read_to_string(&file).unwrap();
+        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "second");
+        assert_eq!(items[0].override_channel_id, Some(alt_channel.get()));
+
+        requeue_intervention_front_persisted(
+            &provider,
+            token_hash,
+            channel_id,
+            &mut queues,
+            &overrides,
+            popped,
+        );
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "first");
+        assert_eq!(items[1].text, "second");
+        assert_eq!(items[0].override_channel_id, Some(alt_channel.get()));
+        assert_eq!(items[1].override_channel_id, Some(alt_channel.get()));
 
         unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
@@ -3784,5 +3977,140 @@ mod tests {
         let parsed: PendingQueueItem = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.channel_id, Some(42));
         assert_eq!(parsed.channel_name.as_deref(), Some("test-channel"));
+    }
+
+    // ─── P2: Regression tests ─────────────────────────────────────────────────
+
+    /// P2: Two bots with empty or duplicate `agent` labels but different token hashes
+    /// must not collide — the namespace key is token_hash, not agent.
+    #[test]
+    fn agent_empty_or_duplicate_does_not_collide_namespace() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let ch = ChannelId::new(77);
+
+        // Both bots have the same agent label (or empty), different token hashes
+        save_channel_queue(&provider, "hash_x", ch, &[make_intervention("bot-x")], None);
+        save_channel_queue(&provider, "hash_y", ch, &[make_intervention("bot-y")], None);
+
+        // Each bot must only see its own queue
+        let (result_x, _) = load_pending_queues(&provider, "hash_x");
+        let (result_y, _) = load_pending_queues(&provider, "hash_y");
+
+        assert_eq!(result_x.get(&ch).map(|v| v[0].text.as_str()), Some("bot-x"));
+        assert_eq!(result_y.get(&ch).map(|v| v[0].text.as_str()), Some("bot-y"));
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    /// P2: review/reused thread override_channel_id survives a save/load round-trip.
+    /// This ensures dispatch_role_overrides are not lost on restart.
+    #[test]
+    fn review_thread_override_preserved_across_restart() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let token_hash = "review_hash";
+        let thread_channel = ChannelId::new(500);
+        let alt_channel = ChannelId::new(501);
+
+        // Save queue with override_channel_id set (simulating a review thread)
+        save_channel_queue(
+            &provider,
+            token_hash,
+            thread_channel,
+            &[make_intervention("review msg")],
+            Some(alt_channel.get()),
+        );
+
+        // Load and verify override is restored
+        let (queues, overrides) = load_pending_queues(&provider, token_hash);
+        assert_eq!(queues.get(&thread_channel).map(|v| v.len()), Some(1));
+        assert_eq!(
+            overrides.get(&thread_channel).copied(),
+            Some(alt_channel),
+            "override_channel_id must be restored from queue snapshot"
+        );
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    /// P2: save_pending_queues captures dispatch_role_overrides into override_channel_id.
+    #[test]
+    fn save_pending_queues_captures_dispatch_role_overrides() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let token_hash = "override_test";
+        let ch = ChannelId::new(300);
+        let alt_ch = ChannelId::new(301);
+
+        let mut queues = std::collections::HashMap::new();
+        queues.insert(ch, vec![make_intervention("queued msg")]);
+
+        let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
+        overrides.insert(ch, alt_ch);
+
+        save_pending_queues(&provider, token_hash, &queues, &overrides);
+
+        // Verify the file contains override_channel_id
+        let dir = tmp
+            .path()
+            .join("runtime")
+            .join("discord_pending_queue")
+            .join("claude")
+            .join(token_hash);
+        let file = dir.join(format!("{}.json", ch.get()));
+        let content = std::fs::read_to_string(&file).unwrap();
+        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
+        assert_eq!(items[0].override_channel_id, Some(alt_ch.get()));
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    /// P2: Legacy flat queue files (old path without token_hash) are NOT loaded
+    /// by load_pending_queues, which only reads from the token_hash subdirectory.
+    #[test]
+    fn legacy_flat_queue_file_is_not_restored() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let ch = ChannelId::new(999);
+
+        // Write a legacy flat file directly under {provider}/ (no token_hash dir)
+        let legacy_dir = tmp
+            .path()
+            .join("runtime")
+            .join("discord_pending_queue")
+            .join("claude");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join(format!("{}.json", ch.get()));
+        let item = PendingQueueItem {
+            author_id: 1,
+            message_id: 100,
+            text: "legacy msg".to_string(),
+            channel_id: None,
+            channel_name: None,
+            override_channel_id: None,
+        };
+        std::fs::write(&legacy_file, serde_json::to_string(&vec![item]).unwrap()).unwrap();
+
+        // load_pending_queues with any token_hash must NOT see the legacy file
+        let (result, _) = load_pending_queues(&provider, "any_hash");
+        assert!(result.is_empty(), "legacy flat file must not be restored by load_pending_queues");
+
+        // Legacy file must still exist (load_pending_queues must not delete files outside its dir)
+        assert!(legacy_file.exists(), "load_pending_queues must not delete legacy files");
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 }

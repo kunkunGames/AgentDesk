@@ -2,7 +2,7 @@ use poise::serenity_prelude as serenity;
 use serenity::CreateMessage;
 
 use super::super::meeting;
-use super::super::{Context, Error, check_auth, rate_limit_wait};
+use super::super::{check_auth, rate_limit_wait, Context, Error};
 use crate::services::provider::ProviderKind;
 
 #[poise::command(slash_command, rename = "meeting")]

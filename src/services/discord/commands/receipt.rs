@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use poise::serenity_prelude as serenity;
 use serenity::CreateAttachment;
 
-use super::super::{Context, Error, check_auth};
+use super::super::{check_auth, Context, Error};
 use crate::receipt;
 use crate::services::platform;
 

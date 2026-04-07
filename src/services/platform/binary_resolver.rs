@@ -457,11 +457,13 @@ fn resolve_login_shell_path_uncached() -> Option<OsString> {
         "printf '%s' '{delimiter}'; command env; printf '%s' '{delimiter}'; exit",
         delimiter = SHELL_ENV_DELIMITER
     );
+    let probe_dir = login_shell_probe_dir();
 
     for shell in login_shell_candidates() {
         let mut command = Command::new(&shell);
         command
             .args(["-ilc", &env_cmd])
+            .current_dir(&probe_dir)
             .env("DISABLE_AUTO_UPDATE", "true")
             .env("ZSH_TMUX_AUTOSTARTED", "true")
             .env("ZSH_TMUX_AUTOSTART", "false")
@@ -473,9 +475,13 @@ fn resolve_login_shell_path_uncached() -> Option<OsString> {
         };
 
         let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
+        let mut completed = false;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    completed = true;
+                    break;
+                }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -485,6 +491,10 @@ fn resolve_login_shell_path_uncached() -> Option<OsString> {
                     break;
                 }
             }
+        }
+
+        if !completed {
+            continue;
         }
 
         let Ok(output) = child.wait_with_output() else {
@@ -513,6 +523,11 @@ fn resolve_login_shell_path_uncached() -> Option<OsString> {
     }
 
     None
+}
+
+#[cfg(unix)]
+fn login_shell_probe_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[cfg(unix)]

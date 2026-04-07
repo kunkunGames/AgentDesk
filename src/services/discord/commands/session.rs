@@ -6,9 +6,9 @@ use poise::serenity_prelude as serenity;
 use super::super::formatting::send_long_message_ctx;
 use super::super::runtime_store::{self, workspace_root};
 use super::super::{
-    Context, DiscordSession, Error, WorktreeInfo, auto_restore_session, check_auth,
-    create_git_worktree, detect_worktree_conflict, resolve_channel_category, save_bot_settings,
-    scan_skills,
+    auto_restore_session, check_auth, create_git_worktree, detect_worktree_conflict,
+    resolve_channel_category, save_bot_settings, scan_skills, Context, DiscordSession, Error,
+    WorktreeInfo,
 };
 
 /// Autocomplete handler for remote profile names in /start

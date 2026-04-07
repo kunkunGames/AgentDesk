@@ -128,7 +128,7 @@ pub(super) async fn reset_session_for_auto_retry(
                 port,
                 "/api/dispatched-sessions/clear-stale-session-id",
             ))
-            .json(&serde_json::json!({"claude_session_id": sid_c}))
+            .json(&serde_json::json!({"session_id": sid_c}))
             .send()
             .await;
     }

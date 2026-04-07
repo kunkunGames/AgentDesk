@@ -10,13 +10,9 @@ from typing import Any, Iterable
 
 import pytest
 import requests
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except Exception:
-    pass
+load_dotenv()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:

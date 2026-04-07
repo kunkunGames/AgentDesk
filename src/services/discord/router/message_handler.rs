@@ -727,7 +727,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
             // Write-through: persist this channel's queue to disk
             if let Some(q) = data.intervention_queue.get(&channel_id) {
-                super::super::save_channel_queue(&provider, &shared.token_hash, channel_id, q);
+                super::super::save_channel_queue(&provider, &shared.token_hash, channel_id, q, shared.dispatch_role_overrides.get(&channel_id).map(|r| r.value().get()));
             }
             drop(data);
             // Clean up: remove placeholder and reaction created before this check

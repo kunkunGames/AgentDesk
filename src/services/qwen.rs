@@ -1,14 +1,14 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1607,7 +1607,7 @@ fn has_prior_qwen_chat_cache(working_dir: &str) -> bool {
 }
 
 fn qwen_chat_cache_dir_for_working_dir(working_dir: &str) -> Option<PathBuf> {
-    let home = qwen_home_dir()?;
+    let home = dirs::home_dir()?;
     Some(
         home.join(".qwen")
             .join("projects")
@@ -1629,29 +1629,12 @@ fn normalize_qwen_working_dir(working_dir: &str) -> PathBuf {
     std::fs::canonicalize(&expanded).unwrap_or(expanded)
 }
 
-fn qwen_home_dir() -> Option<PathBuf> {
-    std::env::var_os("QWEN_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(dirs::home_dir)
-}
-
 fn expand_home_dir(path: &str) -> PathBuf {
     if path == "~" {
-        return qwen_home_dir().unwrap_or_else(|| PathBuf::from(path));
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
     }
     if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = qwen_home_dir() {
+        if let Some(home) = dirs::home_dir() {
             return home.join(stripped);
         }
     }
@@ -1839,10 +1822,10 @@ fn render_qwen_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        QWEN_CODE_SYSTEM_SETTINGS_ENV, QwenAttemptState, QwenResumeStrategy,
         build_stream_exec_args, compose_qwen_prompt, create_system_settings_override,
         extract_text_from_json_output, normalize_resume_strategy, process_qwen_json_event,
-        qwen_project_cache_key, resolve_allowed_core_tools,
+        qwen_project_cache_key, resolve_allowed_core_tools, QwenAttemptState, QwenResumeStrategy,
+        QWEN_CODE_SYSTEM_SETTINGS_ENV,
     };
     use crate::services::agent_protocol::StreamMessage;
     use serde_json::json;
@@ -1907,14 +1890,12 @@ mod tests {
             Some("qwen3-coder"),
             &QwenResumeStrategy::Resume("session-123".to_string()),
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--resume", "session-123"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--model", "qwen3-coder"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--resume", "session-123"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "qwen3-coder"]));
         assert!(args.contains(&"--include-partial-messages".to_string()));
     }
 
