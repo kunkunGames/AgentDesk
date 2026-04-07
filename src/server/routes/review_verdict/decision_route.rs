@@ -93,6 +93,7 @@ fn current_card_status(db: &crate::db::Db, card_id: &str) -> Option<String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ReviewDecisionBody {
     pub card_id: String,
     pub decision: String, // "accept", "dispute", "dismiss"

@@ -61,6 +61,7 @@ pub(super) fn build_system_prompt(
     token: &str,
     disabled_notice: &str,
     skills_notice: &str,
+    narrate_progress: bool,
     role_binding: Option<&RoleBinding>,
     queued_turn: bool,
     profile: DispatchProfile,
@@ -68,6 +69,12 @@ pub(super) fn build_system_prompt(
     shared_knowledge: Option<&str>,
     longterm_catalog: Option<&str>,
 ) -> String {
+    let narration_guidance = if narrate_progress {
+        "\n\nAlways keep the user informed about what you are doing. Briefly explain each step as you work \
+         (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\")."
+    } else {
+        ""
+    };
     let mut system_prompt_owned = format!(
         "You are chatting with a user through Discord.\n\
          {}\n\
@@ -76,10 +83,7 @@ pub(super) fn build_system_prompt(
          send it by running this bash command:\n\n\
          agentdesk discord-sendfile <filepath> --channel {} --key {}\n\n\
          This delivers the file directly to the user's Discord channel.\n\
-         Do NOT tell the user to use /down — use the command above instead.\n\n\
-         Always keep the user informed about what you are doing. Briefly explain each step as you work \
-         (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
-         The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\
+         Do NOT tell the user to use /down — use the command above instead.{}\n\n\
          IMPORTANT: When reading, editing, or searching files, ALWAYS mention the specific file path and what you're looking for \
          (e.g. \"mod.rs:2700 부근의 시스템 프롬프트를 확인합니다\" not just \"코드를 확인합니다\"). \
          The user sees only your text output, not the tool calls themselves.\n\n\
@@ -94,6 +98,7 @@ pub(super) fn build_system_prompt(
         current_path,
         channel_id.get(),
         discord_token_hash(token),
+        narration_guidance,
         disabled_notice,
         // ReviewLite: omit skills to save tokens — reviewer only submits verdict
         if profile == DispatchProfile::ReviewLite {
@@ -246,6 +251,7 @@ mod tests {
             token,
             disabled_notice,
             skills_notice,
+            true,  // narrate_progress
             None,  // role_binding
             false, // queued_turn
             DispatchProfile::Full,
@@ -311,6 +317,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_system_prompt_includes_narration_when_enabled() {
+        let output = call_build("ctx", "/tmp", 1, "tok", "", "");
+        assert!(output.contains("Always keep the user informed about what you are doing."));
+        assert!(!output.contains("The user cannot see your tool calls"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_omits_narration_when_disabled() {
+        let output = build_system_prompt(
+            "ctx",
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            "",
+            "",
+            false,
+            None,
+            false,
+            DispatchProfile::Full,
+            None,
+            None,
+            None,
+        );
+
+        assert!(!output.contains("Always keep the user informed about what you are doing."));
+        assert!(!output.contains("The user cannot see your tool calls"));
+        assert!(output.contains("ALWAYS mention the specific file path"));
+    }
+
+    #[test]
     fn test_followup_turn_reminder_reinjects_compaction_rules() {
         let reminder = build_followup_turn_system_reminder();
 
@@ -340,6 +376,14 @@ mod tests {
             DispatchProfile::ReviewLite
         );
         assert_eq!(
+            DispatchProfile::from_dispatch_type(Some("e2e-test")),
+            DispatchProfile::Full
+        );
+        assert_eq!(
+            DispatchProfile::from_dispatch_type(Some("consultation")),
+            DispatchProfile::Full
+        );
+        assert_eq!(
             DispatchProfile::from_dispatch_type(Some("rework")),
             DispatchProfile::Full
         );
@@ -359,6 +403,7 @@ mod tests {
             "tok",
             "",
             skills_notice,
+            true,
             None,
             false,
             DispatchProfile::Full,
@@ -373,6 +418,7 @@ mod tests {
             "tok",
             "",
             skills_notice,
+            true,
             None,
             false,
             DispatchProfile::ReviewLite,
@@ -398,6 +444,7 @@ mod tests {
             "tok",
             "",
             "",
+            true,
             None,
             false,
             DispatchProfile::ReviewLite,
@@ -430,6 +477,7 @@ mod tests {
             "tok",
             "",
             "",
+            true,
             Some(&binding),
             false,
             DispatchProfile::ReviewLite,
@@ -444,6 +492,7 @@ mod tests {
             "tok",
             "",
             "",
+            true,
             Some(&binding),
             false,
             DispatchProfile::ReviewLite,
@@ -481,6 +530,7 @@ mod tests {
             "tok",
             "",
             "",
+            true,
             Some(&binding),
             false,
             DispatchProfile::Full,
@@ -513,6 +563,7 @@ mod tests {
             "tok",
             "",
             "",
+            true,
             Some(&binding),
             false,
             DispatchProfile::Full,

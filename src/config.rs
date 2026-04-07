@@ -339,16 +339,22 @@ pub fn load_graceful() -> Config {
 }
 
 #[cfg(test)]
+pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         AgentDef, BotConfig, Config, load_from_path, resolve_graceful_config_path, runtime_root,
-        save_to_path,
+        save_to_path, shared_test_env_lock,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        crate::services::discord::runtime_store::test_env_lock()
+        shared_test_env_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -559,6 +565,7 @@ impl Settings {
         }
     }
 
+    #[allow(dead_code)]
     pub fn config_dir() -> Option<std::path::PathBuf> {
         runtime_root().map(|root| crate::runtime_layout::config_dir(&root))
     }

@@ -8,14 +8,16 @@ use std::sync::OnceLock;
 fn gh_path() -> Option<&'static str> {
     static GH_PATH: OnceLock<Option<String>> = OnceLock::new();
     GH_PATH
-        .get_or_init(|| crate::services::platform::resolve_binary_with_login_shell("gh"))
+        .get_or_init(|| {
+            crate::services::platform::binary_resolver::resolve_binary_with_login_shell("gh")
+        })
         .as_deref()
 }
 
 fn gh_command() -> Result<std::process::Command, String> {
     let gh = gh_path().ok_or_else(|| "gh CLI is not available".to_string())?;
     let mut command = std::process::Command::new(gh);
-    crate::services::platform::apply_runtime_path(&mut command);
+    crate::services::platform::binary_resolver::apply_runtime_path(&mut command);
     Ok(command)
 }
 
@@ -76,10 +78,11 @@ pub async fn reopen_issue_by_url(url: &str) -> Result<(), String> {
 
     // gh issue reopen <number> --repo <owner/repo>
     let mut command = tokio_gh_command()?;
-    let output = command
-        .args(["issue", "reopen", number, "--repo", repo])
-        .output()
+    command.kill_on_drop(true);
+    command.args(["issue", "reopen", number, "--repo", repo]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
         .await
+        .map_err(|_| format!("gh issue reopen timed out after 5s: {repo}#{number}"))?
         .map_err(|e| format!("gh exec: {e}"))?;
 
     if !output.status.success() {
@@ -150,7 +153,6 @@ pub struct RepoRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

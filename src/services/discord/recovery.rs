@@ -2,7 +2,6 @@ use super::handoff::{HandoffRecord, save_handoff};
 use super::settings::{resolve_role_binding, validate_bot_channel_routing_with_provider_channel};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
-use crate::services::tmux_common::tmux_exact_target;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
 use crate::utils::format::tail_with_ellipsis;
@@ -242,8 +241,6 @@ pub(super) async fn restore_inflight_turns(
     }
 
     let settings_snapshot = shared.settings.read().await.clone();
-
-    let current_gen = shared.current_generation;
 
     for state in states {
         let channel_id = ChannelId::new(state.channel_id);
@@ -1151,6 +1148,9 @@ pub(super) async fn restore_inflight_turns(
             channel_name.as_deref(),
             last_path.as_deref(),
         );
+        let adk_thread_channel_id = adk_session_name
+            .as_deref()
+            .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name);
         post_adk_session_status(
             adk_session_key.as_deref(),
             adk_session_name.as_deref(),
@@ -1165,6 +1165,7 @@ pub(super) async fn restore_inflight_turns(
                 .await
                 .or_else(|| parse_dispatch_id(&state.user_text))
                 .as_deref(),
+            adk_thread_channel_id,
             shared.api_port,
         )
         .await;

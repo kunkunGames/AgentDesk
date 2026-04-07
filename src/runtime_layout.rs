@@ -45,6 +45,7 @@ pub struct SkillSyncReport {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct SkillManifest {
     #[serde(default = "default_skill_manifest_version")]
+    #[allow(dead_code)]
     version: u32,
     #[serde(default)]
     global_core_skills: Vec<String>,
@@ -189,6 +190,7 @@ fn default_shared_agent_memory_root(root: &Path) -> PathBuf {
     managed_memories_root(root).join("shared-agent-memory")
 }
 
+#[allow(dead_code)]
 pub fn shared_agent_memory_root(root: &Path) -> PathBuf {
     resolve_memory_path(root, &load_memory_backend(root).sam_path)
 }

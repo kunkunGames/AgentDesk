@@ -32,13 +32,9 @@ pub mod stats;
 pub mod termination_events;
 
 use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    Router,
     routing::{delete, get, patch, post},
 };
-use serde::Deserialize;
-use serde_json::json;
 
 use std::sync::Arc;
 

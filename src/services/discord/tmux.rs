@@ -1067,6 +1067,7 @@ pub(super) async fn tmux_output_watcher(
                 Some(tokens),
                 None,
                 None,
+                None,
                 shared.api_port,
             )
             .await;
@@ -1210,6 +1211,7 @@ pub(super) async fn tmux_output_watcher(
             None, // tokens
             None, // cwd
             None, // dispatch_id
+            None, // thread_channel_id
             api_port,
         )
         .await;
@@ -1887,6 +1889,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 None,
                 None,
                 None,
+                None,
                 api_port,
             )
             .await;
@@ -2124,6 +2127,7 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
                 None,
                 "idle",
                 &provider,
+                None,
                 None,
                 None,
                 None,

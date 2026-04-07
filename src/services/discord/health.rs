@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
 
 use super::SharedData;
+use crate::services::provider::ProviderKind;
 
 /// Per-provider snapshot for the health response.
 struct ProviderEntry {
@@ -77,6 +79,74 @@ impl HealthRegistry {
             }
         }
     }
+}
+
+/// Best-effort runtime-side equivalent of `/clear` for an existing Discord channel session.
+/// Used by auto-queue slot recycling so pooled unified-thread slots start the next group fresh
+/// without killing the shared thread itself.
+pub async fn clear_provider_channel_runtime(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+    session_key: Option<&str>,
+) -> bool {
+    let Some(provider) = ProviderKind::from_str(provider_name) else {
+        return false;
+    };
+
+    let shared = {
+        let providers = registry.providers.lock().await;
+        providers
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
+            .map(|entry| entry.shared.clone())
+    };
+    let Some(shared) = shared else {
+        return false;
+    };
+
+    let tmux_name = {
+        let mut data = shared.core.lock().await;
+        let tmux_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|session| session.channel_name.as_ref())
+            .map(|channel_name| provider.build_tmux_session_name(channel_name))
+            .or_else(|| {
+                session_key
+                    .and_then(|key| key.split_once(':'))
+                    .map(|(_, tmux_name)| tmux_name.to_string())
+            });
+
+        if let Some(token) = data.cancel_tokens.remove(&channel_id) {
+            super::turn_bridge::cancel_active_token(&token, true, "auto-queue slot clear");
+            shared.global_active.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            super::settings::cleanup_channel_uploads(channel_id);
+            session.session_id = None;
+            session.history.clear();
+            session.pending_uploads.clear();
+            session.cleared = true;
+        }
+
+        data.active_request_owner.remove(&channel_id);
+        data.intervention_queue.remove(&channel_id);
+        tmux_name
+    };
+
+    #[cfg(unix)]
+    if provider == ProviderKind::Claude {
+        if let Some(name) = tmux_name {
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
+            })
+            .await;
+        }
+    }
+
+    true
 }
 
 /// Build the health check JSON response.
@@ -640,6 +710,7 @@ pub fn spawn_watchdog(port: u16) {
 /// Parse a /api/send JSON body and extract (target, content, source).
 /// Returns Err with an error message on invalid input.
 /// Factored out of handle_send for testability.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str> {
     let json: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid JSON")?;
     let content = json

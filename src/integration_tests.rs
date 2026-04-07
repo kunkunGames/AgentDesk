@@ -7,6 +7,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::Mutex;
 
     #[cfg(unix)]
@@ -17,6 +18,7 @@ mod tests {
     use crate::engine::PolicyEngine;
     use crate::kanban;
     use crate::server::routes::AppState;
+    use serde_json::json;
 
     fn test_db() -> db::Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -49,6 +51,60 @@ mod tests {
         }
     }
 
+    fn repo_dir_env_lock() -> &'static Mutex<()> {
+        crate::config::shared_test_env_lock()
+    }
+
+    struct RepoDirOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl RepoDirOverride {
+        fn new(path: &std::path::Path) -> Self {
+            let guard = repo_dir_env_lock().lock().unwrap();
+            let previous = std::env::var_os("AGENTDESK_REPO_DIR");
+            unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RepoDirOverride {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") },
+            }
+        }
+    }
+
+    fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        let override_guard = RepoDirOverride::new(repo.path());
+        (repo, override_guard)
+    }
+
     fn seed_agent(db: &db::Db) {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -69,6 +125,15 @@ mod tests {
         .unwrap();
     }
 
+    fn set_config_key(db: &db::Db, key: &str, value: serde_json::Value) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value.to_string()],
+        )
+        .unwrap();
+    }
+
     fn seed_dispatch(db: &db::Db, dispatch_id: &str, card_id: &str, dtype: &str, status: &str) {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -80,6 +145,47 @@ mod tests {
         conn.execute(
             "UPDATE kanban_cards SET latest_dispatch_id = ?1 WHERE id = ?2",
             rusqlite::params![dispatch_id, card_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_completed_work_dispatch_for_review(
+        db: &db::Db,
+        dispatch_id: &str,
+        card_id: &str,
+        dispatch_type: &str,
+    ) {
+        let repo_dir = crate::services::platform::resolve_repo_dir()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap();
+        let reviewed_commit = crate::services::platform::git_head_commit(&repo_dir)
+            .unwrap_or_else(|| "ci-detached-head".to_string());
+        let completed_branch = crate::services::platform::shell::git_branch_name(&repo_dir);
+
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                result, created_at, updated_at, completed_at
+            ) VALUES (
+                ?1, ?2, 'agent-1', ?3, 'completed', 'Completed work',
+                ?4, datetime('now', '-5 minutes'), datetime('now', '-5 minutes'), datetime('now', '-5 minutes')
+            )",
+            rusqlite::params![
+                dispatch_id,
+                card_id,
+                dispatch_type,
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": completed_branch,
+                    "completed_commit": reviewed_commit,
+                })
+                .to_string(),
+            ],
         )
         .unwrap();
     }
@@ -191,6 +297,11 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn gh_env_lock() -> &'static Mutex<()> {
+        crate::config::shared_test_env_lock()
+    }
+
+    #[cfg(unix)]
     struct MockGhEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
@@ -215,9 +326,7 @@ mod tests {
 
     #[cfg(unix)]
     fn install_mock_gh(script_body: &str) -> MockGhEnv {
-        let lock = crate::services::discord::runtime_store::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = gh_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let gh_path = dir.path().join("gh");
         let log_path = dir.path().join("gh.log");
@@ -342,6 +451,7 @@ mod tests {
                     cwd: None,
                     dispatch_id: Some("d-s1".to_string()),
                     claude_session_id: None,
+                    thread_channel_id: None,
                     session_id: None,
                 },
             ),
@@ -658,6 +768,7 @@ mod tests {
 
     #[test]
     fn scenario_251_boot_reconcile_refires_missing_review_dispatch() {
+        let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -872,8 +983,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn auto_queue_on_tick_dispatches_ready_card_via_requested_preflight() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_queue_on_tick_dispatches_ready_card_via_requested_preflight() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -882,8 +993,8 @@ mod tests {
         {
             let conn = db.lock().unwrap();
             conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
-                 VALUES ('card-aq-ready', 'AQ Ready', 'ready', 'agent-1', datetime('now'), datetime('now'))",
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at) \
+                 VALUES ('card-aq-ready', 'AQ Ready', 'ready', 'agent-1', 'repo-1', datetime('now'), datetime('now'))",
                 [],
             )
             .unwrap();
@@ -901,7 +1012,29 @@ mod tests {
             .unwrap();
         }
 
-        let _ = engine.try_fire_hook_by_name("OnTick1min", serde_json::json!({}));
+        // onTick1min is now a thin localhost API trigger. In the unit harness there is
+        // no Axum server, so exercise the authoritative activate route directly.
+        let state = AppState {
+            db: db.clone(),
+            engine: engine.clone(),
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+        let (status, body) = crate::server::routes::auto_queue::activate(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-aq-ready".to_string()),
+                repo: None,
+                agent_id: None,
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body.0["count"].as_u64(), Some(1));
         kanban::drain_hook_side_effects(&db, &engine);
 
         let conn = db.lock().unwrap();
@@ -950,6 +1083,7 @@ mod tests {
 
     #[test]
     fn scenario_6_dispatch_roundtrip() {
+        let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -1844,6 +1978,7 @@ mod tests {
         let engine = test_engine(&db);
         seed_agent(&db);
         seed_card(&db, "card-158e", "review");
+        seed_completed_work_dispatch_for_review(&db, "impl-158e", "card-158e", "implementation");
 
         kanban::fire_enter_hooks(&db, &engine, "card-158e", "review");
 
@@ -1880,7 +2015,222 @@ mod tests {
     }
 
     #[test]
+    fn scenario_335_on_review_enter_reuses_round_without_new_completed_work() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-335-reopen", "review");
+        seed_completed_work_dispatch_for_review(
+            &db,
+            "impl-335-reopen",
+            "card-335-reopen",
+            "implementation",
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET review_round = 1 WHERE id = 'card-335-reopen'",
+                [],
+            )
+            .unwrap();
+        }
+
+        kanban::fire_enter_hooks(&db, &engine, "card-335-reopen", "review");
+
+        let conn = db.lock().unwrap();
+        let review_round: i64 = conn
+            .query_row(
+                "SELECT review_round FROM kanban_cards WHERE id = 'card-335-reopen'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_round, 1,
+            "#335: reopen without fresh implementation/rework must reuse the current review_round"
+        );
+        drop(conn);
+
+        assert_eq!(
+            latest_dispatch_title(&db, "card-335-reopen", "review").as_deref(),
+            Some("[Review R1] card-335-reopen")
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-335-reopen", "review"),
+            1
+        );
+    }
+
+    #[test]
+    fn scenario_335_on_review_enter_advances_round_after_completed_rework() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-335-rereview", "review");
+        seed_completed_work_dispatch_for_review(
+            &db,
+            "impl-335-rereview",
+            "card-335-rereview",
+            "implementation",
+        );
+        seed_completed_work_dispatch_for_review(
+            &db,
+            "rework-335-rereview",
+            "card-335-rereview",
+            "rework",
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET review_round = 1 WHERE id = 'card-335-rereview'",
+                [],
+            )
+            .unwrap();
+        }
+
+        kanban::fire_enter_hooks(&db, &engine, "card-335-rereview", "review");
+
+        let conn = db.lock().unwrap();
+        let review_round: i64 = conn
+            .query_row(
+                "SELECT review_round FROM kanban_cards WHERE id = 'card-335-rereview'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_round, 2,
+            "#335: completed rework must advance review_round for the next review cycle"
+        );
+        drop(conn);
+
+        assert_eq!(
+            latest_dispatch_title(&db, "card-335-rereview", "review").as_deref(),
+            Some("[Review R2] card-335-rereview")
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-335-rereview", "review"),
+            1
+        );
+    }
+
+    #[test]
+    fn scenario_review_disabled_on_review_enter_completes_card() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-review-disabled", "review");
+        set_config_key(&db, "review_enabled", json!(false));
+
+        kanban::fire_enter_hooks(&db, &engine, "card-review-disabled", "review");
+
+        assert_eq!(get_card_status(&db, "card-review-disabled"), "done");
+
+        {
+            let conn = db.lock().unwrap();
+            let review_round: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(review_round, 0) FROM kanban_cards WHERE id = 'card-review-disabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                review_round, 0,
+                "review-disabled path must not increment review_round"
+            );
+
+            let review_dispatch_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_dispatches \
+                     WHERE kanban_card_id = 'card-review-disabled' AND dispatch_type = 'review'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                review_dispatch_count, 0,
+                "review-disabled path must not create review dispatch"
+            );
+
+            let blocked_reason: Option<String> = conn
+                .query_row(
+                    "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-review-disabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                blocked_reason.is_none(),
+                "review-disabled completion must not leave blocked_reason"
+            );
+        }
+
+        let (state, _, _) = get_review_state(&db, "card-review-disabled")
+            .expect("terminal transition must sync canonical review state");
+        assert_eq!(state, "idle");
+    }
+
+    #[test]
+    fn scenario_counter_model_disabled_on_review_enter_completes_card_without_round() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-counter-disabled", "review");
+        set_config_key(&db, "counter_model_review_enabled", json!(false));
+
+        kanban::fire_enter_hooks(&db, &engine, "card-counter-disabled", "review");
+
+        assert_eq!(get_card_status(&db, "card-counter-disabled"), "done");
+
+        {
+            let conn = db.lock().unwrap();
+            let review_round: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(review_round, 0) FROM kanban_cards WHERE id = 'card-counter-disabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                review_round, 0,
+                "counter-model-disabled path must not increment review_round without a real review"
+            );
+
+            let review_dispatch_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_dispatches \
+                     WHERE kanban_card_id = 'card-counter-disabled' AND dispatch_type = 'review'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                review_dispatch_count, 0,
+                "counter-model-disabled path must not create review dispatch"
+            );
+
+            let blocked_reason: Option<String> = conn
+                .query_row(
+                    "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-counter-disabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                blocked_reason.is_none(),
+                "counter-model-disabled completion must not leave blocked_reason"
+            );
+        }
+
+        let (state, _, _) = get_review_state(&db, "card-counter-disabled")
+            .expect("terminal transition must sync canonical review state");
+        assert_eq!(state, "idle");
+    }
+
+    #[test]
     fn scenario_245_review_dispatch_uses_canonical_assigned_agent_id() {
+        let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -2541,6 +2891,7 @@ mod tests {
 
     #[test]
     fn scenario_195_rework_completion_triggers_review() {
+        let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);

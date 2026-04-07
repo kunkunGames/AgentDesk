@@ -135,7 +135,6 @@ struct QwenStatusSnapshot {
 #[derive(Debug, Default)]
 struct QwenPartialBlockState {
     kind: String,
-    tool_id: Option<String>,
     tool_name: Option<String>,
     input_json: String,
     thinking_signature: Option<String>,
@@ -157,6 +156,7 @@ struct QwenAttemptState {
     status: QwenStatusSnapshot,
 }
 
+#[allow(dead_code)]
 pub fn resolve_qwen_path() -> Option<String> {
     crate::services::platform::resolve_provider_binary("qwen").resolved_path
 }
@@ -582,7 +582,6 @@ fn process_qwen_partial_event(
                 index,
                 QwenPartialBlockState {
                     kind: block_type.clone(),
-                    tool_id: block.get("id").and_then(|v| v.as_str()).map(str::to_string),
                     tool_name: block
                         .get("name")
                         .and_then(|v| v.as_str())

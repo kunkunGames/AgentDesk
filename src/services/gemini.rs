@@ -3,7 +3,6 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
@@ -66,10 +65,6 @@ pub fn resolve_gemini_path() -> Option<String> {
 
 fn resolve_gemini_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("gemini")
-}
-
-fn get_gemini_path() -> Option<String> {
-    resolve_gemini_path()
 }
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {

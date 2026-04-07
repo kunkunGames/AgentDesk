@@ -2,6 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(not(test), allow(dead_code))]
 const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
 
 pub(super) fn agentdesk_root() -> Option<PathBuf> {
@@ -56,6 +57,7 @@ pub(super) fn discord_handoff_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_handoff"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn shared_agent_memory_root() -> Option<PathBuf> {
     agentdesk_root().map(|root| crate::runtime_layout::shared_agent_memory_root(&root))
 }
@@ -117,8 +119,7 @@ pub(super) fn save_all_last_message_ids(provider: &str, ids: &std::collections::
 /// All test modules must use this to avoid env var races.
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    crate::config::shared_test_env_lock()
 }
 
 pub(super) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {

@@ -467,6 +467,20 @@ var rules = {
     // #255: requested is a dispatch-free preflight state. Dispatch is created separately
     // by auto-queue, which triggers DispatchAttached to advance requested → in_progress.
     if (payload.to === initialState && payload.from !== initialState) {
+      var metaBeforePreflight = _loadCardMetadata(payload.card_id);
+      if (metaBeforePreflight.skip_preflight_once === "pmd_reopen") {
+        delete metaBeforePreflight.skip_preflight_once;
+        metaBeforePreflight.preflight_status = "skipped";
+        metaBeforePreflight.preflight_summary = "Skipped for PMD reopen";
+        metaBeforePreflight.preflight_checked_at = new Date().toISOString();
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET metadata = ? WHERE id = ?",
+          [JSON.stringify(metaBeforePreflight), payload.card_id]
+        );
+        agentdesk.log.info("[preflight] Skipped for PMD reopen: " + payload.card_id);
+        return;
+      }
+
       var preflight = _runPreflight(payload.card_id);
       // Store preflight result in metadata without clobbering unrelated keys.
       _mergeCardMetadata(payload.card_id, {

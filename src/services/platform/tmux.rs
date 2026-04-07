@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 
 fn tmux_command() -> Command {
     let mut command = Command::new("tmux");
-    crate::services::platform::apply_runtime_path(&mut command);
+    crate::services::platform::binary_resolver::apply_runtime_path(&mut command);
     command
 }
 
@@ -88,6 +88,7 @@ pub fn kill_session_output(session_name: &str) -> std::io::Result<Output> {
 }
 
 /// Kill a tmux session, returning an error on failure (for anyhow contexts).
+#[allow(dead_code)]
 pub fn kill_session_checked(session_name: &str) -> Result<(), String> {
     let status = tmux_command()
         .args(["kill-session", "-t", &exact_target(session_name)])

@@ -72,6 +72,7 @@ pub(crate) struct RoleBinding {
     /// Optional model override (e.g. "opus", "sonnet", "haiku", "o3")
     pub model: Option<String>,
     /// Optional reasoning effort for Codex (e.g. "low", "normal", "high", "xhigh")
+    #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     /// Whether this role may see peer-agent handoff guidance in the system prompt.
     pub peer_agents_enabled: bool,
@@ -627,6 +628,34 @@ fn extract_first_heading(content: &str) -> Option<String> {
     None
 }
 
+fn parse_boolish_config_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+pub(super) fn load_narrate_progress(db: Option<&crate::db::Db>) -> bool {
+    let Some(db) = db else {
+        return true;
+    };
+    let Ok(conn) = db.read_conn() else {
+        return true;
+    };
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'narrate_progress'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    value
+        .as_deref()
+        .and_then(parse_boolish_config_value)
+        .unwrap_or(true)
+}
+
 /// Load the shared agent prompt (e.g. AGENTS.md) configured in org.yaml or role_map.json.
 /// Returns None if not configured or file not found.
 pub(super) fn load_shared_prompt() -> Option<String> {
@@ -1028,6 +1057,7 @@ mod tests {
         load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
         resolve_memory_settings, resolve_role_binding, save_bot_settings,
         validate_bot_channel_routing, validate_bot_channel_routing_with_provider_channel,
+        load_narrate_progress, validate_bot_channel_routing,
     };
 
     fn with_temp_home<F>(f: F)
@@ -1159,6 +1189,26 @@ mod tests {
                 vec!["WebFetch".to_string(), "Bash".to_string()]
             );
         });
+    }
+
+    #[test]
+    fn test_load_narrate_progress_defaults_true_without_db() {
+        assert!(load_narrate_progress(None));
+    }
+
+    #[test]
+    fn test_load_narrate_progress_reads_false_from_db() {
+        let db = crate::db::test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('narrate_progress', 'false')",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(!load_narrate_progress(Some(&db)));
     }
 
     #[test]

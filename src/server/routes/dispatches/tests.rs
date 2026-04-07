@@ -23,6 +23,7 @@ fn test_engine(db: &Db) -> PolicyEngine {
 #[test]
 fn review_dispatch_uses_counter_model_channel() {
     assert!(use_counter_model_channel(Some("review")));
+    assert!(use_counter_model_channel(Some("e2e-test")));
     // #256: consultation dispatches go to counter-model channel
     assert!(use_counter_model_channel(Some("consultation")));
     // review-decision goes to the original agent's primary channel,
@@ -134,6 +135,51 @@ fn implementation_dispatch_message_stays_compact() {
 }
 
 #[test]
+fn e2e_test_dispatch_message_uses_general_completion_contract() {
+    let message = format_dispatch_message(
+        "dispatch-e2e",
+        "Run regression",
+        Some("https://github.com/itismyfield/AgentDesk/issues/340"),
+        Some(340),
+        true,
+        None,
+        Some("codex"),
+        None,
+        Some("e2e-test"),
+        None,
+    );
+
+    assert!(message.contains("[🧪 E2E 테스트]"));
+    assert!(message.contains("PATCH"));
+    assert!(message.contains("/api/dispatches/dispatch-e2e"));
+    assert!(!message.contains("검토 전용"));
+    assert!(!message.contains("review-verdict"));
+    assert!(!message.contains("VERDICT: pass|improve|reject|rework"));
+}
+
+#[test]
+fn consultation_dispatch_message_uses_general_completion_contract() {
+    let message = format_dispatch_message(
+        "dispatch-consult",
+        "Need investigation",
+        Some("https://github.com/itismyfield/AgentDesk/issues/256"),
+        Some(256),
+        true,
+        None,
+        Some("codex"),
+        None,
+        Some("consultation"),
+        None,
+    );
+
+    assert!(message.contains("PATCH"));
+    assert!(message.contains("/api/dispatches/dispatch-consult"));
+    assert!(!message.contains("검토 전용"));
+    assert!(!message.contains("review-verdict"));
+    assert!(!message.contains("VERDICT: pass|improve|reject|rework"));
+}
+
+#[test]
 fn review_decision_primary_message_includes_action_instructions() {
     let message = format_dispatch_message(
         "dispatch-rd",
@@ -216,7 +262,9 @@ async fn completed_review_dispatch_with_explicit_verdict_creates_followup() {
         .unwrap();
     }
 
-    handle_completed_dispatch_followups(&db, "dispatch-review").await;
+    handle_completed_dispatch_followups(&db, "dispatch-review")
+        .await
+        .expect("review followup should succeed");
 
     let conn = db.lock().unwrap();
     let latest_dispatch_id: String = conn
@@ -311,7 +359,9 @@ async fn auto_completed_review_dispatch_skips_rust_followup() {
         .unwrap();
     }
 
-    handle_completed_dispatch_followups(&db, "dispatch-auto").await;
+    handle_completed_dispatch_followups(&db, "dispatch-auto")
+        .await
+        .expect("auto-completed review followup should succeed");
 
     let conn = db.lock().unwrap();
     let latest_dispatch_id: String = conn
@@ -365,7 +415,9 @@ async fn impl_dispatch_followup_detects_new_review_dispatch() {
     // ('dispatch-review') differs from the completed dispatch ('dispatch-impl')
     // and attempt send_dispatch_to_discord (which no-ops without bot token).
     // The key assertion: no panic, no error, and the review dispatch stays pending.
-    handle_completed_dispatch_followups(&db, "dispatch-impl").await;
+    handle_completed_dispatch_followups(&db, "dispatch-impl")
+        .await
+        .expect("implementation followup should succeed");
 
     let conn = db.lock().unwrap();
     // latest_dispatch_id should still point to the review dispatch
@@ -415,7 +467,9 @@ async fn thread_not_archived_when_card_not_done() {
         .unwrap();
     }
 
-    handle_completed_dispatch_followups(&db, "dispatch-impl").await;
+    handle_completed_dispatch_followups(&db, "dispatch-impl")
+        .await
+        .expect("thread reuse followup should succeed");
 
     // active_thread_id should still be set (NOT cleared) because card is not done
     let conn = db.lock().unwrap();
@@ -455,7 +509,9 @@ async fn thread_archived_and_cleared_when_card_done() {
         .unwrap();
     }
 
-    handle_completed_dispatch_followups(&db, "dispatch-final").await;
+    handle_completed_dispatch_followups(&db, "dispatch-final")
+        .await
+        .expect("done-card followup should succeed");
 
     // active_thread_id should be cleared when card is done
     let conn = db.lock().unwrap();
@@ -498,7 +554,9 @@ async fn review_followup_skips_generic_resend_for_explicit_verdict() {
         .unwrap();
     }
 
-    handle_completed_dispatch_followups(&db, "dispatch-review").await;
+    handle_completed_dispatch_followups(&db, "dispatch-review")
+        .await
+        .expect("explicit review verdict followup should succeed");
 
     let conn = db.lock().unwrap();
     // A review-decision dispatch should have been created
@@ -570,7 +628,7 @@ async fn no_notified_marker_when_discord_send_fails() {
     // Channel ID "1" is a valid u64 but not a real Discord channel.
     // Thread creation and fallback will both fail with Discord API errors.
     // No notified marker should be written.
-    super::discord_delivery::send_dispatch_to_discord(
+    let send_result = super::discord_delivery::send_dispatch_to_discord(
         &db,
         "agent-1",
         "Test card",
@@ -578,6 +636,10 @@ async fn no_notified_marker_when_discord_send_fails() {
         "dispatch-1",
     )
     .await;
+    assert!(
+        send_result.is_err(),
+        "bogus Discord channel should fail delivery"
+    );
 
     let conn = db.lock().unwrap();
     let marker_count: i64 = conn
@@ -629,8 +691,15 @@ async fn review_followup_does_not_create_dispatch_for_done_card() {
         ).unwrap();
     }
 
-    // This triggers send_review_result_to_primary for a done card
-    handle_completed_dispatch_followups(&db, "dispatch-review").await;
+    // This triggers send_review_result_to_primary for a done card.
+    // The done-card guard should reject creating a review-decision dispatch,
+    // but the original dispatch/card state must remain unchanged.
+    let result = handle_completed_dispatch_followups(&db, "dispatch-review").await;
+    let error = result.expect_err("done-card review followup must fail closed");
+    assert!(
+        error.contains("Cannot create review-decision dispatch for terminal card"),
+        "unexpected followup error: {error}"
+    );
 
     let conn = db.lock().unwrap();
     // latest_dispatch_id should NOT have changed (no new dispatch created)

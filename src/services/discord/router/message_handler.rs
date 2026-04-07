@@ -3,6 +3,10 @@ use crate::services::memory::{
     RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
     resolve_memory_session_id,
 };
+use crate::services::provider::{CancelToken, cancel_requested};
+#[cfg(unix)]
+use crate::services::tmux_common::tmux_exact_target;
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 struct MemoryInjectionPlan<'a> {
@@ -646,6 +650,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Non-Claude providers receive SAK in the user context instead.
     let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
+    let narrate_progress = settings::load_narrate_progress(shared.db.as_ref());
 
     let system_prompt_owned = build_system_prompt(
         &discord_context,
@@ -654,6 +659,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         token,
         &disabled_notice,
         &skills_notice,
+        narrate_progress,
         role_binding.as_ref(),
         reply_to_user_message,
         dispatch_profile,
@@ -933,6 +939,15 @@ pub(in crate::services::discord) async fn handle_text_message(
         channel_name.as_deref(),
         Some(&current_path),
     );
+    let adk_thread_channel_id = adk_session_name
+        .as_deref()
+        .and_then(super::super::adk_session::parse_thread_channel_id_from_name)
+        .or_else(|| {
+            shared
+                .dispatch_thread_parents
+                .contains_key(&channel_id)
+                .then_some(channel_id.get())
+        });
     // #222: DB-based dispatch lookup takes priority over text parsing.
     // In unified threads, user_text may contain a stale DISPATCH: prefix
     // from a previous dispatch in the same thread. DB lookup uses the
@@ -953,6 +968,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         None,
         Some(&current_path),
         dispatch_id.as_deref(),
+        adk_thread_channel_id,
         shared.api_port,
     )
     .await;
@@ -1399,6 +1415,23 @@ pub(super) async fn handle_shell_command_raw(
     Ok(())
 }
 
+pub(super) enum TextStopLookup {
+    NoActiveTurn,
+    AlreadyStopping,
+    Stop(Arc<CancelToken>),
+}
+
+pub(super) fn lookup_text_stop_token(
+    cancel_tokens: &std::collections::HashMap<serenity::ChannelId, Arc<CancelToken>>,
+    channel_id: serenity::ChannelId,
+) -> TextStopLookup {
+    match cancel_tokens.get(&channel_id).cloned() {
+        Some(token) if cancel_requested(Some(token.as_ref())) => TextStopLookup::AlreadyStopping,
+        Some(token) => TextStopLookup::Stop(token),
+        None => TextStopLookup::NoActiveTurn,
+    }
+}
+
 /// Handle text-based commands (!start, !meeting, !stop, !clear, etc.).
 /// Returns true if the command was handled, false otherwise.
 pub(super) async fn handle_text_command(
@@ -1628,14 +1661,21 @@ pub(super) async fn handle_text_command(
         }
 
         "!stop" => {
-            let mut d = data.shared.core.lock().await;
-            if let Some(token) = d.cancel_tokens.remove(&channel_id) {
-                token.cancel_with_tmux_cleanup();
-                drop(d);
-                let _ = msg.reply(&ctx.http, "Turn cancelled.").await;
-            } else {
-                drop(d);
-                let _ = msg.reply(&ctx.http, "No active turn to stop.").await;
+            let stop_lookup = {
+                let d = data.shared.core.lock().await;
+                lookup_text_stop_token(&d.cancel_tokens, channel_id)
+            };
+            match stop_lookup {
+                TextStopLookup::Stop(token) => {
+                    super::super::turn_bridge::cancel_active_token(&token, true, "!stop");
+                    let _ = msg.reply(&ctx.http, "Turn cancelled.").await;
+                }
+                TextStopLookup::AlreadyStopping => {
+                    let _ = msg.reply(&ctx.http, "Already stopping...").await;
+                }
+                TextStopLookup::NoActiveTurn => {
+                    let _ = msg.reply(&ctx.http, "No active turn to stop.").await;
+                }
             }
             return Ok(true);
         }
@@ -2227,14 +2267,23 @@ Any other message is sent to {p}.
                     return Ok(true);
                 }
                 "stop" => {
-                    let mut d = data.shared.core.lock().await;
-                    if let Some(token) = d.cancel_tokens.remove(&channel_id) {
-                        token.cancel_with_tmux_cleanup();
-                        drop(d);
-                        let _ = msg.reply(&ctx.http, "Stopping...").await;
-                    } else {
-                        drop(d);
-                        let _ = msg.reply(&ctx.http, "No active request to stop.").await;
+                    let stop_lookup = {
+                        let d = data.shared.core.lock().await;
+                        lookup_text_stop_token(&d.cancel_tokens, channel_id)
+                    };
+                    match stop_lookup {
+                        TextStopLookup::Stop(token) => {
+                            super::super::turn_bridge::cancel_active_token(
+                                &token, true, "!cc stop",
+                            );
+                            let _ = msg.reply(&ctx.http, "Stopping...").await;
+                        }
+                        TextStopLookup::AlreadyStopping => {
+                            let _ = msg.reply(&ctx.http, "Already stopping...").await;
+                        }
+                        TextStopLookup::NoActiveTurn => {
+                            let _ = msg.reply(&ctx.http, "No active request to stop.").await;
+                        }
                     }
                     return Ok(true);
                 }

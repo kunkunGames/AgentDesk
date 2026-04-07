@@ -1,1113 +1,5 @@
-mod adk_session;
-mod commands;
-mod formatting;
-mod handoff;
-pub(crate) mod health;
-mod inflight;
-mod meeting;
-mod metrics;
-mod model_catalog;
-mod model_picker_interaction;
-mod org_schema;
-pub(crate) mod org_writer;
-mod prompt_builder;
-mod recovery;
-pub(crate) mod restart_report;
-mod role_map;
-mod router;
-pub mod runtime_store;
-pub(crate) mod settings;
-pub(crate) mod shared_memory;
-#[cfg(unix)]
-mod tmux;
-mod turn_bridge;
+use super::*;
 
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
-use tokio::sync::Mutex;
-
-use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
-
-use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
-use crate::services::claude;
-use crate::services::codex;
-use crate::services::gemini;
-use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
-use crate::services::qwen;
-use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
-
-use adk_session::{
-    build_adk_session_key, build_session_key_candidates, derive_adk_session_info,
-    lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
-};
-use formatting::{
-    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
-    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
-    send_long_message_raw, truncate_str,
-};
-use handoff::{clear_handoff, load_handoffs, update_handoff_state};
-use inflight::{
-    InflightTurnState, clear_inflight_state, load_inflight_states, save_inflight_state,
-};
-pub(crate) use prompt_builder::DispatchProfile;
-use prompt_builder::build_system_prompt;
-use recovery::restore_inflight_turns;
-use restart_report::flush_restart_reports;
-use router::{handle_event, handle_text_message};
-use runtime_store::worktrees_root;
-use settings::{
-    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
-    save_bot_settings, validate_bot_channel_routing_with_provider_channel,
-};
-#[cfg(unix)]
-use tmux::{
-    cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions, restore_tmux_watchers,
-    tmux_output_watcher,
-};
-use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
-
-pub use settings::{
-    load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
-};
-pub(in crate::services::discord) use self::settings::validate_bot_channel_routing;
-
-/// Discord message length limit
-pub(super) const DISCORD_MSG_LIMIT: usize = 2000;
-const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
-const INTERVENTION_TTL: Duration = Duration::from_secs(10 * 60);
-const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
-const UPLOAD_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const UPLOAD_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
-const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60); // 1 hour
-const SESSION_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60); // 1 day
-const DEAD_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
-const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Minimum interval between Discord placeholder edits for progress status.
-/// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
-pub(super) fn status_update_interval() -> Duration {
-    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let secs = std::env::var("AGENTDESK_STATUS_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        Duration::from_secs(secs)
-    })
-}
-
-/// Turn watchdog timeout. Configurable via AGENTDESK_TURN_TIMEOUT_SECS env var.
-/// Default: 3600 seconds (60 minutes).
-pub(super) fn turn_watchdog_timeout() -> Duration {
-    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let secs = std::env::var("AGENTDESK_TURN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(3600);
-        Duration::from_secs(secs)
-    })
-}
-
-/// Global watchdog deadline overrides, keyed by channel_id.
-/// Written by POST /api/turns/{channel_id}/extend-timeout, read by the watchdog loop.
-/// Values are Unix timestamp in milliseconds representing the new deadline.
-static WATCHDOG_DEADLINE_OVERRIDES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u64, i64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// Extend the watchdog deadline for a channel. Returns the new deadline_ms or None if at cap.
-pub fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
-    let extend_ms = extend_by_secs as i64 * 1000;
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut map = WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?;
-    let current = map.get(&channel_id).copied().unwrap_or(now_ms);
-    let new_deadline = std::cmp::max(current, now_ms) + extend_ms;
-    // Don't enforce max here — the watchdog will clamp against its own max
-    map.insert(channel_id, new_deadline);
-    Some(new_deadline)
-}
-
-/// Read and consume the deadline override for a channel (if any).
-pub(super) fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
-    WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?.remove(&channel_id)
-}
-
-/// Remove the deadline override for a channel (on turn completion).
-pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
-    if let Ok(mut map) = WATCHDOG_DEADLINE_OVERRIDES.lock() {
-        map.remove(&channel_id);
-    }
-}
-/// Check if a deferred restart has been requested and no active or finalizing turns remain
-/// **across all providers**.
-///
-/// `global_active` / `global_finalizing` are process-wide counters shared by every provider.
-/// A single provider draining to zero is NOT sufficient — we must wait for every provider.
-/// `shutdown_remaining` ensures all providers finish saving before any calls `exit(0)`.
-/// `shutdown_counted` (per-provider) prevents double-decrement when both deferred restart
-/// and SIGTERM paths run for the same provider.
-pub(super) fn check_deferred_restart(shared: &SharedData) {
-    let g_active = shared
-        .global_active
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let g_finalizing = shared
-        .global_finalizing
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if g_active > 0 || g_finalizing > 0 {
-        return;
-    }
-    if !shared
-        .restart_pending
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        return;
-    }
-    // CAS: ensure this provider only decrements once
-    if shared
-        .shutdown_counted
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        return;
-    }
-    // Only the last provider to finish calls exit(0)
-    if shared
-        .shutdown_remaining
-        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-        == 1
-    {
-        let Some(root) = crate::agentdesk_runtime_root() else {
-            return;
-        };
-        let marker = root.join("restart_pending");
-        let version = fs::read_to_string(&marker).unwrap_or_default();
-        let version = version.trim();
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] 🔄 Deferred restart: all turns complete, restarting for v{version}...");
-        let _ = fs::remove_file(&marker);
-        std::process::exit(0);
-    }
-}
-
-/// Per-channel session state
-#[derive(Clone)]
-pub(super) struct DiscordSession {
-    pub(super) session_id: Option<String>,
-    pub(super) current_path: Option<String>,
-    pub(super) history: Vec<HistoryItem>,
-    pub(super) pending_uploads: Vec<String>,
-    pub(super) cleared: bool,
-    /// Remote profile name for SSH execution (None = local)
-    pub(super) remote_profile_name: Option<String>,
-    pub(super) channel_id: Option<u64>,
-    pub(super) channel_name: Option<String>,
-    pub(super) category_name: Option<String>,
-    /// Last time this session was actively used (for TTL cleanup)
-    pub(super) last_active: tokio::time::Instant,
-    /// If this session runs in a git worktree, store the info here
-    pub(super) worktree: Option<WorktreeInfo>,
-    /// Restart generation at which this session was created/restored.
-    pub(super) born_generation: u64,
-}
-
-fn allows_nonlocal_session_path(remote_profile_name: Option<&str>) -> bool {
-    remote_profile_name.is_some_and(|name| !name.trim().is_empty())
-}
-
-fn session_path_is_usable(current_path: &str, remote_profile_name: Option<&str>) -> bool {
-    allows_nonlocal_session_path(remote_profile_name) || std::path::Path::new(current_path).is_dir()
-}
-
-pub(super) fn select_restored_session_path(
-    configured_path: Option<String>,
-    db_cwd: Option<String>,
-    yaml_path: Option<String>,
-    remote_profile_name: Option<&str>,
-) -> Option<String> {
-    configured_path
-        .filter(|path| session_path_is_usable(path, remote_profile_name))
-        .or_else(|| db_cwd.filter(|path| session_path_is_usable(path, remote_profile_name)))
-        .or_else(|| yaml_path.filter(|path| session_path_is_usable(path, remote_profile_name)))
-}
-
-impl DiscordSession {
-    /// Validate `current_path` and return it if it exists on disk.
-    /// If the path is stale (deleted), clear `current_path` and `worktree`, log, and return `None`.
-    pub(super) fn validated_path(&mut self, channel_id: impl std::fmt::Display) -> Option<String> {
-        let current_path = self.current_path.as_ref()?;
-        if session_path_is_usable(current_path, self.remote_profile_name.as_deref()) {
-            return Some(current_path.clone());
-        }
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] ⚠ Ignoring stale local session path for channel {}: {}",
-            channel_id, current_path
-        );
-        self.current_path = None;
-        self.worktree = None;
-        None
-    }
-}
-
-/// Worktree info for sessions that were auto-redirected to avoid conflicts
-#[derive(Clone, Debug)]
-pub(super) struct WorktreeInfo {
-    /// The original repo path that was conflicted
-    pub original_path: String,
-    /// The worktree directory path
-    pub worktree_path: String,
-    /// The branch name created for this worktree
-    pub branch_name: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InterventionMode {
-    Soft,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct Intervention {
-    author_id: UserId,
-    message_id: MessageId,
-    text: String,
-    mode: InterventionMode,
-    created_at: Instant,
-}
-
-/// Bot-level settings persisted to disk
-#[derive(Clone)]
-pub(super) struct DiscordBotSettings {
-    /// Optional agent identity (e.g. "codex", "spark") for same-provider isolation.
-    pub(super) agent: Option<String>,
-    pub(super) provider: ProviderKind,
-    pub(super) allowed_tools: Vec<String>,
-    /// Explicit Discord channel allowlist for this bot token.
-    /// Empty means "no channel restriction".
-    pub(super) allowed_channel_ids: Vec<u64>,
-    /// channel_id (string) → last working directory path
-    pub(super) last_sessions: std::collections::HashMap<String, String>,
-    /// channel_id (string) → last remote profile name
-    pub(super) last_remotes: std::collections::HashMap<String, String>,
-    /// channel_id (string) → persisted model override
-    pub(super) channel_model_overrides: std::collections::HashMap<String, String>,
-    /// Discord user ID of the registered owner (imprinting auth)
-    pub(super) owner_user_id: Option<u64>,
-    /// Additional authorized user IDs (added by owner via /adduser)
-    pub(super) allowed_user_ids: Vec<u64>,
-    /// When true, any Discord user may talk to this bot in allowed channels.
-    pub(super) allow_all_users: bool,
-    /// Bot IDs whose messages are NOT ignored (e.g. announce bot for CEO directives)
-    pub(super) allowed_bot_ids: Vec<u64>,
-}
-
-impl Default for DiscordBotSettings {
-    fn default() -> Self {
-        Self {
-            agent: None,
-            provider: ProviderKind::Claude,
-            allowed_tools: DEFAULT_ALLOWED_TOOLS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            allowed_channel_ids: Vec::new(),
-            last_sessions: std::collections::HashMap::new(),
-            last_remotes: std::collections::HashMap::new(),
-            channel_model_overrides: std::collections::HashMap::new(),
-            owner_user_id: None,
-            allowed_user_ids: Vec::new(),
-            allow_all_users: false,
-            allowed_bot_ids: Vec::new(),
-        }
-    }
-}
-
-/// Shared state for the Discord bot (multi-channel: each channel has its own session)
-/// Handle for a background tmux output watcher
-pub(super) struct TmuxWatcherHandle {
-    /// Signal to pause monitoring (while Discord handler reads its own turn)
-    pub(super) paused: Arc<std::sync::atomic::AtomicBool>,
-    /// After Discord handler finishes its turn, set this offset so watcher resumes from here
-    pub(super) resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
-    /// Signal to cancel the watcher (quiet exit, no "session ended" message)
-    pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Epoch counter: incremented each time paused is set to true.
-    /// Watcher snapshots this before reading; if it changed, the read is stale.
-    pub(super) pause_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Set by turn_bridge when it delivers the response directly (non-handoff path).
-    /// Watcher checks this before relay to avoid duplicate messages.
-    pub(super) turn_delivered: Arc<std::sync::atomic::AtomicBool>,
-}
-
-pub(super) fn synthetic_thread_channel_name(parent_name: &str, channel_id: ChannelId) -> String {
-    format!("{parent_name}-t{}", channel_id.get())
-}
-
-fn is_synthetic_thread_channel_name(channel_name: &str, channel_id: ChannelId) -> bool {
-    channel_name.ends_with(&format!("-t{}", channel_id.get()))
-}
-
-fn choose_restore_channel_name(
-    existing_channel_name: Option<&str>,
-    live_channel_name: Option<&str>,
-    thread_parent: Option<(ChannelId, Option<String>)>,
-    channel_id: ChannelId,
-) -> Option<String> {
-    if let Some(existing_name) = existing_channel_name {
-        if is_synthetic_thread_channel_name(existing_name, channel_id) {
-            return Some(existing_name.to_string());
-        }
-    }
-
-    if let Some((parent_id, parent_name)) = thread_parent {
-        let parent_name = parent_name.unwrap_or_else(|| parent_id.get().to_string());
-        return Some(synthetic_thread_channel_name(&parent_name, channel_id));
-    }
-
-    live_channel_name
-        .or(existing_channel_name)
-        .map(ToOwned::to_owned)
-}
-#[derive(Clone)]
-pub(super) struct ModelPickerPendingState {
-    pub(super) owner_user_id: UserId,
-    pub(super) target_channel_id: ChannelId,
-    pub(super) pending_model: Option<String>,
-    pub(super) updated_at: Instant,
-}
-
-/// Core state that requires atomic multi-field access (always locked together)
-pub(super) struct CoreState {
-    /// Per-channel sessions (each Discord channel can have its own Claude Code session)
-    pub(super) sessions: HashMap<ChannelId, DiscordSession>,
-    /// Per-channel cancel tokens for in-progress AI requests
-    pub(super) cancel_tokens: HashMap<ChannelId, Arc<CancelToken>>,
-    /// Per-channel owner of the currently running request
-    pub(super) active_request_owner: HashMap<ChannelId, UserId>,
-    /// Per-channel message queue: messages arriving during an active turn are queued here
-    /// and executed as subsequent turns after the current one finishes.
-    pub(super) intervention_queue: HashMap<ChannelId, Vec<Intervention>>,
-    /// Per-channel active meeting (one meeting per channel)
-    active_meetings: HashMap<ChannelId, meeting::Meeting>,
-}
-
-/// Shared state for the Discord bot — split into independently-lockable groups
-pub(super) struct SharedData {
-    /// Core state (sessions + request lifecycle) — requires atomic access
-    pub(super) core: Mutex<CoreState>,
-    /// Bot settings — mostly reads, rare writes
-    pub(super) settings: tokio::sync::RwLock<DiscordBotSettings>,
-    /// Per-channel timestamps of the last Discord API call (for rate limiting)
-    pub(super) api_timestamps: dashmap::DashMap<ChannelId, tokio::time::Instant>,
-    /// Cached skill list: (name, description)
-    pub(super) skills_cache: tokio::sync::RwLock<Vec<(String, String)>>,
-    /// Per-channel tmux output watchers for terminal→Discord relay
-    pub(super) tmux_watchers: dashmap::DashMap<ChannelId, TmuxWatcherHandle>,
-    /// Per-channel in-flight turn recovery marker (restart resume in progress)
-    /// Value is the Instant when recovery started, used for stale-recovery timeout.
-    pub(super) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
-    /// Global shutdown flag — when set, watchers exit quietly via cancel path
-    pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
-    /// Number of turns currently in finalization phase (response sending + cleanup).
-    /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
-    pub(super) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
-    /// Current restart generation — incremented on each --restart-dcserver.
-    /// Used to distinguish old (pre-restart) sessions from fresh ones.
-    pub(super) current_generation: u64,
-    /// Set when a `restart_pending` marker is detected. While true, the router
-    /// queues new messages instead of starting new turns (drain mode).
-    pub(super) restart_pending: Arc<std::sync::atomic::AtomicBool>,
-    /// Set to true after startup reconciliation + recovery is complete (#122).
-    /// Until true, the router queues all incoming messages.
-    pub(super) reconcile_done: Arc<std::sync::atomic::AtomicBool>,
-    /// Process-global active turn counter shared across all providers.
-    /// Deferred restart checks this instead of provider-local cancel_tokens.len().
-    pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
-    /// Process-global finalizing turn counter shared across all providers.
-    pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
-    /// Number of providers still needing to complete shutdown.
-    /// The last provider to decrement this to 0 calls `exit(0)`.
-    pub(super) shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
-    /// Per-provider flag: ensures this provider decrements `shutdown_remaining` at most once,
-    /// even if both the deferred restart poll loop and SIGTERM handler run.
-    pub(super) shutdown_counted: std::sync::atomic::AtomicBool,
-    /// Intake-level dedup cache: prevents the same message from starting two turns
-    /// when duplicate bot dispatches arrive nearly simultaneously.
-    /// Key: dedup key (dispatch_id or channel+author+text hash).
-    /// Value: (first-seen Instant, was_thread_context).
-    pub(super) intake_dedup: dashmap::DashMap<String, (std::time::Instant, bool)>,
-    /// Maps parent channel → active dispatch thread channel.
-    /// When a dispatch creates a thread, the parent is recorded here so that
-    /// subsequent bot messages to the parent are queued instead of starting
-    /// a parallel turn.  Cleared when the dispatch thread turn completes.
-    pub(super) dispatch_thread_parents: dashmap::DashMap<ChannelId, ChannelId>,
-    /// Set to true after Discord gateway ready event fires.
-    pub(super) bot_connected: std::sync::atomic::AtomicBool,
-    /// ISO 8601 timestamp of the last completed turn (for health reporting).
-    pub(super) last_turn_at: std::sync::Mutex<Option<String>>,
-    /// Per-channel model override, independent of session lifecycle.
-    /// Takes priority over role-map model. Cleared via the `/model` picker default option.
-    pub(super) model_overrides: dashmap::DashMap<ChannelId, String>,
-    /// Channels that must start a fresh provider session on the next turn
-    /// because the effective model override changed.
-    pub(super) model_session_reset_pending: dashmap::DashSet<ChannelId>,
-    /// Per-message staged model picker selection.
-    /// Key: picker message id. Value tracks owner, target channel, and staged model until submit.
-    pub(super) model_picker_pending: dashmap::DashMap<MessageId, ModelPickerPendingState>,
-    /// Per-thread role/model override for cross-channel dispatch reuse.
-    /// When a review dispatch reuses an implementation thread, this maps
-    /// thread_channel_id → alt_channel_id so role_binding and model_for_turn
-    /// resolve from the counter-model channel instead of the thread's parent.
-    /// Cleared when the turn completes.
-    pub(super) dispatch_role_overrides: dashmap::DashMap<ChannelId, ChannelId>,
-    /// Per-channel last processed message ID — used for startup catch-up polling.
-    pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
-    /// Per-channel turn start time — used for metrics duration calculation.
-    pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
-    /// Cached serenity context for deferred queue drain (set once during ready event).
-    pub(super) cached_serenity_ctx: tokio::sync::OnceCell<serenity::Context>,
-    /// Cached bot token for deferred queue drain.
-    pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
-    /// SHA-256 hash of the bot token — used to namespace the pending-queue directory
-    /// so that multiple bots sharing the same runtime root cannot steal each other's queues.
-    pub(super) token_hash: String,
-    /// HTTP API port for self-referencing requests (from config server.port).
-    pub(super) api_port: u16,
-    /// Shared DB handle for direct dispatch finalization (avoids HTTP round-trip).
-    pub(super) db: Option<crate::db::Db>,
-    /// Shared policy engine for direct dispatch finalization.
-    pub(super) engine: Option<crate::engine::PolicyEngine>,
-    /// Set of registered slash command names (populated at framework setup).
-    /// Used by the router to distinguish known slash commands from arbitrary
-    /// `/`-prefixed user text that should fall through to the AI provider.
-    pub(super) known_slash_commands: tokio::sync::OnceCell<std::collections::HashSet<String>>,
-}
-
-/// Poise user data type
-pub(super) struct Data {
-    pub(super) shared: Arc<SharedData>,
-    pub(super) token: String,
-    pub(super) provider: ProviderKind,
-}
-
-pub(super) type Error = Box<dyn std::error::Error + Send + Sync>;
-pub(super) type Context<'a> = poise::Context<'a, Data, Error>;
-
-fn prune_interventions(queue: &mut Vec<Intervention>) {
-    let now = Instant::now();
-    queue.retain(|i| now.duration_since(i.created_at) <= INTERVENTION_TTL);
-    if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
-        let overflow = queue.len() - MAX_INTERVENTIONS_PER_CHANNEL;
-        queue.drain(0..overflow);
-    }
-}
-
-fn enqueue_intervention(queue: &mut Vec<Intervention>, intervention: Intervention) -> bool {
-    prune_interventions(queue);
-
-    if let Some(last) = queue.last() {
-        if last.author_id == intervention.author_id
-            && last.text == intervention.text
-            && intervention.created_at.duration_since(last.created_at) <= INTERVENTION_DEDUP_WINDOW
-        {
-            return false;
-        }
-    }
-
-    queue.push(intervention);
-    if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
-        let overflow = queue.len() - MAX_INTERVENTIONS_PER_CHANNEL;
-        queue.drain(0..overflow);
-    }
-    true
-}
-
-pub(super) fn has_soft_intervention(queue: &mut Vec<Intervention>) -> bool {
-    prune_interventions(queue);
-    queue.iter().any(|item| item.mode == InterventionMode::Soft)
-}
-
-pub(super) fn dequeue_next_soft_intervention(
-    queue: &mut Vec<Intervention>,
-) -> Option<Intervention> {
-    prune_interventions(queue);
-    let index = queue
-        .iter()
-        .position(|item| item.mode == InterventionMode::Soft)?;
-    Some(queue.remove(index))
-}
-
-pub(super) fn requeue_intervention_front(
-    queue: &mut Vec<Intervention>,
-    intervention: Intervention,
-) {
-    prune_interventions(queue);
-    queue.insert(0, intervention);
-    if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
-        queue.truncate(MAX_INTERVENTIONS_PER_CHANNEL);
-    }
-}
-
-pub(super) fn take_next_soft_intervention_persisted(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: ChannelId,
-    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-) -> Option<(Intervention, bool)> {
-    let mut remove_queue = false;
-    let (next, has_more) = if let Some(queue) = intervention_queue.get_mut(&channel_id) {
-        let next = dequeue_next_soft_intervention(queue);
-        let has_more = has_soft_intervention(queue);
-        remove_queue = queue.is_empty();
-        (next, has_more)
-    } else {
-        (None, false)
-    };
-
-    if next.is_none() {
-        if remove_queue {
-            intervention_queue.remove(&channel_id);
-            dispatch_role_overrides.remove(&channel_id);
-            save_channel_queue(provider, token_hash, channel_id, &[], None);
-        }
-        return None;
-    }
-
-    let intervention = next.unwrap();
-
-    if remove_queue {
-        intervention_queue.remove(&channel_id);
-        dispatch_role_overrides.remove(&channel_id);
-        save_channel_queue(provider, token_hash, channel_id, &[], None);
-    } else if let Some(queue) = intervention_queue.get(&channel_id) {
-        save_channel_queue(
-            provider,
-            token_hash,
-            channel_id,
-            queue,
-            dispatch_role_overrides
-                .get(&channel_id)
-                .map(|override_id| override_id.value().get()),
-        );
-    }
-
-    Some((intervention, has_more))
-}
-
-pub(super) fn requeue_intervention_front_persisted(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: ChannelId,
-    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-    intervention: Intervention,
-) {
-    let queue = intervention_queue.entry(channel_id).or_default();
-    requeue_intervention_front(queue, intervention);
-    save_channel_queue(
-        provider,
-        token_hash,
-        channel_id,
-        queue,
-        dispatch_role_overrides
-            .get(&channel_id)
-            .map(|override_id| override_id.value().get()),
-    );
-}
-
-// ─── Pending queue persistence (write-through + SIGTERM) ─────────────────────
-
-/// Serializable form of a queued intervention for disk persistence.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct PendingQueueItem {
-    pub(super) author_id: u64,
-    pub(super) message_id: u64,
-    pub(super) text: String,
-    /// Channel this item belongs to (routing snapshot — used by the kickoff guard).
-    #[serde(default)]
-    pub(super) channel_id: Option<u64>,
-    /// Human-readable channel name at save time (best-effort, may be None).
-    #[serde(default)]
-    pub(super) channel_name: Option<String>,
-    /// Active dispatch role override at save time (lost on restart; stored for diagnostics).
-    #[serde(default)]
-    pub(super) override_channel_id: Option<u64>,
-}
-
-/// Write-through: save a single channel's queue to disk.
-/// If the queue is empty the file is removed.
-/// This is designed to be called from `tokio::spawn` after every enqueue/dequeue.
-///
-/// Queue path: `discord_pending_queue/{provider}/{token_hash}/{channel_id}.json`
-/// The `token_hash` namespace prevents multi-bot queue cross-contamination on restart.
-/// `dispatch_role_override`: if `dispatch_role_overrides[channel_id]` is set, pass it here
-/// so it survives restart and can be restored to `SharedData.dispatch_role_overrides`.
-pub(super) fn save_channel_queue(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: ChannelId,
-    queue: &[Intervention],
-    dispatch_role_override: Option<u64>,
-) {
-    let Some(root) = runtime_store::discord_pending_queue_root() else {
-        return;
-    };
-    let dir = root.join(provider.as_str()).join(token_hash);
-    let path = dir.join(format!("{}.json", channel_id.get()));
-    if queue.is_empty() {
-        let _ = fs::remove_file(&path);
-        return;
-    }
-    let _ = fs::create_dir_all(&dir);
-    let items: Vec<PendingQueueItem> = queue
-        .iter()
-        .map(|i| PendingQueueItem {
-            author_id: i.author_id.get(),
-            message_id: i.message_id.get(),
-            text: i.text.clone(),
-            channel_id: Some(channel_id.get()),
-            channel_name: None,
-            override_channel_id: dispatch_role_override,
-        })
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&items) {
-        let _ = runtime_store::atomic_write(&path, &json);
-    }
-}
-
-/// Save all non-empty intervention queues to `discord_pending_queue/{provider}/{token_hash}/`.
-/// `dispatch_role_overrides` is snapshotted per channel so that `override_channel_id` survives
-/// restart and can be restored to `SharedData.dispatch_role_overrides`.
-fn save_pending_queues(
-    provider: &ProviderKind,
-    token_hash: &str,
-    queues: &HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-) {
-    let Some(root) = runtime_store::discord_pending_queue_root() else {
-        return;
-    };
-    let dir = root.join(provider.as_str()).join(token_hash);
-    let _ = fs::create_dir_all(&dir);
-    // Clean stale files first (within this bot's namespace)
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-    for (channel_id, queue) in queues {
-        if queue.is_empty() {
-            continue;
-        }
-        let override_id = dispatch_role_overrides
-            .get(channel_id)
-            .map(|r| r.value().get());
-        let items: Vec<PendingQueueItem> = queue
-            .iter()
-            .map(|i| PendingQueueItem {
-                author_id: i.author_id.get(),
-                message_id: i.message_id.get(),
-                text: i.text.clone(),
-                channel_id: Some(channel_id.get()),
-                channel_name: None,
-                override_channel_id: override_id,
-            })
-            .collect();
-        if let Ok(json) = serde_json::to_string_pretty(&items) {
-            let path = dir.join(format!("{}.json", channel_id.get()));
-            let _ = runtime_store::atomic_write(&path, &json);
-        }
-    }
-}
-
-/// Load persisted pending queues from `discord_pending_queue/{provider}/{token_hash}/` and delete the files.
-/// Only reads files in this bot's token-namespaced subdirectory.
-/// Returns `(queues, dispatch_role_overrides)` so the caller can restore both.
-fn load_pending_queues(
-    provider: &ProviderKind,
-    token_hash: &str,
-) -> (
-    HashMap<ChannelId, Vec<Intervention>>,
-    HashMap<ChannelId, ChannelId>,
-) {
-    let Some(root) = runtime_store::discord_pending_queue_root() else {
-        return (HashMap::new(), HashMap::new());
-    };
-    let dir = root.join(provider.as_str()).join(token_hash);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return (HashMap::new(), HashMap::new());
-    };
-    let now = Instant::now();
-    let mut result: HashMap<ChannelId, Vec<Intervention>> = HashMap::new();
-    let mut restored_overrides: HashMap<ChannelId, ChannelId> = HashMap::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let channel_id: u64 = match path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse().ok())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&content) else {
-            let _ = fs::remove_file(&path);
-            continue;
-        };
-        // Restore dispatch_role_override from snapshot (first non-None value wins)
-        if let Some(override_id) = items.iter().find_map(|item| item.override_channel_id) {
-            restored_overrides.insert(ChannelId::new(channel_id), ChannelId::new(override_id));
-        }
-        let interventions: Vec<Intervention> = items
-            .into_iter()
-            .map(|item| Intervention {
-                author_id: UserId::new(item.author_id),
-                message_id: MessageId::new(item.message_id),
-                text: item.text,
-                mode: InterventionMode::Soft,
-                created_at: now,
-            })
-            .collect();
-        if !interventions.is_empty() {
-            result.insert(ChannelId::new(channel_id), interventions);
-        }
-        let _ = fs::remove_file(&path);
-    }
-    (result, restored_overrides)
-}
-
-/// P1-2: Log a structured warning for legacy pending queue files at the old flat
-/// `discord_pending_queue/{provider}/` path (not in a token_hash subdirectory).
-/// These files were written before P0 namespacing and cannot be safely restored.
-/// Called once at startup after `load_pending_queues`.
-fn warn_legacy_pending_queue_files(provider: &ProviderKind) {
-    let Some(root) = runtime_store::discord_pending_queue_root() else {
-        return;
-    };
-    let dir = root.join(provider.as_str());
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Warn only about flat JSON files directly under {provider}/ (not subdirectories)
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!(
-                "  [{ts}] ⚠ LEGACY-QUEUE: found legacy pending queue file '{}' — \
-                predates bot-identity namespacing and will NOT be restored. \
-                Remove manually if no longer needed.",
-                path.display()
-            );
-        }
-    }
-}
-
-/// Startup catch-up polling: fetch messages that arrived during the restart gap.
-/// Uses saved last_message_ids to query Discord REST API for missed messages,
-/// filters out bot messages and duplicates, and inserts into intervention queue.
-async fn catch_up_missed_messages(
-    http: &Arc<serenity::Http>,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-) {
-    let Some(root) = runtime_store::last_message_root() else {
-        return;
-    };
-    let dir = root.join(provider.as_str());
-    if !dir.is_dir() {
-        return;
-    }
-
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    let mut total_recovered = 0usize;
-    let now = Instant::now();
-    let max_age = std::time::Duration::from_secs(300); // Only catch up messages within 5 minutes
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(channel_id_raw) = stem.parse::<u64>() else {
-            continue;
-        };
-        let Ok(last_id_str) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(last_id) = last_id_str.trim().parse::<u64>() else {
-            continue;
-        };
-
-        let channel_id = ChannelId::new(channel_id_raw);
-        let after_msg = MessageId::new(last_id);
-
-        // Fetch messages after last_id (Discord returns oldest first with after=)
-        let messages = match channel_id
-            .messages(
-                http,
-                serenity::builder::GetMessages::new()
-                    .after(after_msg)
-                    .limit(10),
-            )
-            .await
-        {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
-                    "  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}"
-                );
-                continue;
-            }
-        };
-
-        if messages.is_empty() {
-            continue;
-        }
-
-        // Get bot's own user ID to filter out self-messages
-        let bot_user_id = {
-            let settings = shared.settings.read().await;
-            settings.owner_user_id
-        };
-
-        // Collect existing message IDs in queue for dedup
-        let existing_ids: std::collections::HashSet<u64> = {
-            let data = shared.core.lock().await;
-            data.intervention_queue
-                .get(&channel_id)
-                .map(|q| q.iter().map(|i| i.message_id.get()).collect())
-                .unwrap_or_default()
-        };
-
-        let allowed_bot_ids: Vec<u64> = {
-            let settings = shared.settings.read().await;
-            settings.allowed_bot_ids.clone()
-        };
-
-        let mut channel_recovered = 0usize;
-        let mut max_recovered_id: Option<u64> = None;
-        let mut data = shared.core.lock().await;
-        let queue = data.intervention_queue.entry(channel_id).or_default();
-
-        for msg in &messages {
-            // Skip system messages (thread creation, slash commands, etc.)
-            if !router::should_process_turn_message(msg.kind) {
-                continue;
-            }
-            // Skip own messages
-            if Some(msg.author.id.get()) == bot_user_id {
-                continue;
-            }
-            // Skip if already in queue
-            if existing_ids.contains(&msg.id.get()) {
-                continue;
-            }
-            // Skip messages older than max_age (use message snowflake timestamp)
-            let msg_ts = msg.id.created_at();
-            let msg_age = chrono::Utc::now().signed_duration_since(*msg_ts);
-            if msg_age.num_seconds() > max_age.as_secs() as i64 {
-                continue;
-            }
-            let text = msg.content.trim();
-            if text.is_empty() {
-                continue;
-            }
-            // Only process messages from allowed bots or authorized users
-            let is_allowed = !msg.author.bot || allowed_bot_ids.contains(&msg.author.id.get());
-            if !is_allowed {
-                continue;
-            }
-
-            queue.push(Intervention {
-                author_id: msg.author.id,
-                message_id: msg.id,
-                text: text.to_string(),
-                mode: InterventionMode::Soft,
-                created_at: now,
-            });
-            channel_recovered += 1;
-            // Track the newest actually-recovered message for checkpoint
-            let mid = msg.id.get();
-            if max_recovered_id.map(|m| mid > m).unwrap_or(true) {
-                max_recovered_id = Some(mid);
-            }
-        }
-        drop(data);
-
-        if channel_recovered > 0 {
-            total_recovered += channel_recovered;
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] 🔍 CATCH-UP: recovered {} message(s) for channel {}",
-                channel_recovered, channel_id
-            );
-        }
-
-        // Only advance checkpoint if we actually recovered messages
-        if let Some(newest) = max_recovered_id {
-            shared.last_message_ids.insert(channel_id, newest);
-        }
-    }
-
-    if total_recovered > 0 {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] 🔍 CATCH-UP: total {total_recovered} message(s) recovered across channels"
-        );
-    }
-
-    // Phase 2: Scan for unanswered messages since last bot response.
-    // Catches messages that were queued in-memory but lost on restart.
-    let Ok(entries2) = fs::read_dir(&dir) else {
-        return;
-    };
-    let mut phase2_recovered = 0usize;
-    let bot_user_id_phase2 = {
-        let settings = shared.settings.read().await;
-        settings.owner_user_id
-    };
-    let allowed_bot_ids_phase2: Vec<u64> = {
-        let settings = shared.settings.read().await;
-        settings.allowed_bot_ids.clone()
-    };
-
-    for entry in entries2.flatten() {
-        let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(channel_id_raw) = stem.parse::<u64>() else {
-            continue;
-        };
-        let channel_id = ChannelId::new(channel_id_raw);
-
-        // Fetch last 20 messages (newest first — default Discord order)
-        let recent = match channel_id
-            .messages(http, serenity::builder::GetMessages::new().limit(20))
-            .await
-        {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
-                    "  [{ts}] ⚠ catch-up phase2: failed to fetch recent messages for channel {channel_id}: {e}"
-                );
-                continue;
-            }
-        };
-
-        if recent.is_empty() {
-            continue;
-        }
-
-        // Find the newest bot response (first bot message in newest-first order)
-        let last_bot_idx = recent.iter().position(|m| {
-            Some(m.author.id.get()) == bot_user_id_phase2 && !m.content.trim().is_empty()
-        });
-
-        // Messages at indices 0..last_bot_idx are newer than the last bot response
-        let unanswered_slice = match last_bot_idx {
-            Some(0) => continue, // Latest message is from bot — nothing unanswered
-            Some(idx) => &recent[..idx],
-            None => continue, // No bot response found — skip (new/inactive channel)
-        };
-
-        // Collect existing queue IDs for dedup
-        let existing_ids: std::collections::HashSet<u64> = {
-            let data = shared.core.lock().await;
-            data.intervention_queue
-                .get(&channel_id)
-                .map(|q| q.iter().map(|i| i.message_id.get()).collect())
-                .unwrap_or_default()
-        };
-
-        let mut channel_recovered = 0usize;
-        let mut data = shared.core.lock().await;
-        let queue = data.intervention_queue.entry(channel_id).or_default();
-
-        // Iterate in reverse (oldest first) for chronological queue order
-        for msg in unanswered_slice.iter().rev() {
-            if !router::should_process_turn_message(msg.kind) {
-                continue;
-            }
-            if Some(msg.author.id.get()) == bot_user_id_phase2 {
-                continue;
-            }
-            if existing_ids.contains(&msg.id.get()) {
-                continue;
-            }
-            let text = msg.content.trim();
-            if text.is_empty() {
-                continue;
-            }
-            let is_allowed =
-                !msg.author.bot || allowed_bot_ids_phase2.contains(&msg.author.id.get());
-            if !is_allowed {
-                continue;
-            }
-            // Skip messages older than 10 minutes (generous window for restart gap)
-            let msg_age = chrono::Utc::now().signed_duration_since(*msg.id.created_at());
-            if msg_age.num_seconds() > 600 {
-                continue;
-            }
-
-            queue.push(Intervention {
-                author_id: msg.author.id,
-                message_id: msg.id,
-                text: text.to_string(),
-                mode: InterventionMode::Soft,
-                created_at: now,
-            });
-            channel_recovered += 1;
-        }
-        drop(data);
-
-        if channel_recovered > 0 {
-            phase2_recovered += channel_recovered;
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] 🔍 CATCH-UP phase2: recovered {} unanswered message(s) for channel {}",
-                channel_recovered, channel_id
-            );
-        }
-    }
-
-    if phase2_recovered > 0 {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] 🔍 CATCH-UP phase2: total {phase2_recovered} unanswered message(s) recovered"
-        );
-    }
-}
-
-/// Execute durable handoff turns saved before a restart.
-/// Runs after tmux watcher restore and pending queue restore, but before
-/// restart report flush. Skips channels that already have pending queue messages
-/// (user intent takes priority over automatic follow-up).
 async fn execute_handoff_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -1154,18 +46,17 @@ async fn execute_handoff_turns(
             channel_id.to_channel(http).await,
             Ok(serenity::model::channel::Channel::Private(_))
         );
-        let (allowlist_channel_id, provider_channel_name) =
+        let (eff_id, eff_name) =
             if let Some((pid, pname)) = resolve_thread_parent(http, channel_id).await {
                 (pid, pname.or(record.channel_name.clone()))
             } else {
                 (channel_id, record.channel_name.clone())
             };
-        if let Err(reason) = validate_bot_channel_routing_with_provider_channel(
+        if let Err(reason) = validate_bot_channel_routing(
             &settings_snapshot,
             provider,
-            allowlist_channel_id,
-            record.channel_name.as_deref(),
-            provider_channel_name.as_deref(),
+            eff_id,
+            eff_name.as_deref(),
             is_dm,
         ) {
             println!(
@@ -1450,125 +341,6 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
 /// turn running. This bridges the gap where restored pending queues or
 /// handoff injections sit idle because no turn-completion event triggers
 /// the dequeue chain.
-async fn kickoff_idle_queues(
-    ctx: &serenity::Context,
-    shared: &Arc<SharedData>,
-    token: &str,
-    provider: &ProviderKind,
-) {
-    // Collect channels with queued items that are idle (no active turn). Dequeue only
-    // after the routing guard passes so a rejected channel stays preserved on disk/in memory.
-    let channels_to_kick: Vec<ChannelId> = {
-        let mut data = shared.core.lock().await;
-        let mut result = Vec::new();
-        let channel_ids: Vec<ChannelId> = data.intervention_queue.keys().cloned().collect();
-        for channel_id in channel_ids {
-            // Skip if active turn already running — it will dequeue when done
-            if data.cancel_tokens.contains_key(&channel_id) {
-                continue;
-            }
-            if let Some(queue) = data.intervention_queue.get_mut(&channel_id) {
-                if has_soft_intervention(queue) {
-                    result.push(channel_id);
-                }
-            }
-        }
-        result
-    };
-
-    if channels_to_kick.is_empty() {
-        return;
-    }
-
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!(
-        "  [{ts}] 🚀 KICKOFF: starting turns for {} idle channel(s) with queued messages",
-        channels_to_kick.len()
-    );
-
-    for channel_id in channels_to_kick {
-        let settings_snapshot = shared.settings.read().await.clone();
-        if let Err(reason) =
-            validate_live_channel_routing(ctx, provider, &settings_snapshot, channel_id).await
-        {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] ⚠ KICKOFF-GUARD: preserving queued item(s) for channel {} (reason={})",
-                channel_id, reason
-            );
-            continue;
-        }
-
-        let Some((intervention, has_more)) = ({
-            let mut data = shared.core.lock().await;
-            if data.cancel_tokens.contains_key(&channel_id) {
-                None
-            } else {
-                take_next_soft_intervention_persisted(
-                    provider,
-                    &shared.token_hash,
-                    channel_id,
-                    &mut data.intervention_queue,
-                    &shared.dispatch_role_overrides,
-                )
-            }
-        }) else {
-            continue;
-        };
-
-        let owner_name = if intervention.author_id.get() <= 1 {
-            "system".to_string()
-        } else {
-            intervention
-                .author_id
-                .to_user(&ctx.http)
-                .await
-                .map(|u| u.name.clone())
-                .unwrap_or_else(|_| format!("user-{}", intervention.author_id.get()))
-        };
-
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] 🚀 KICKOFF: starting queued turn for channel {}",
-            channel_id
-        );
-
-        if let Err(e) = router::handle_text_message(
-            ctx,
-            channel_id,
-            intervention.message_id,
-            intervention.author_id,
-            &owner_name,
-            &intervention.text,
-            shared,
-            token,
-            true,     // reply_to_user_message
-            has_more, // defer_watcher_resume
-            false,    // wait_for_completion — don't block, let channels run concurrently
-            None,     // reply_context
-        )
-        .await
-        {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}]   ⚠ KICKOFF: failed to start turn for channel {}: {e}",
-                channel_id
-            );
-            // Requeue so the message is not lost, and persist immediately.
-            let mut data = shared.core.lock().await;
-            requeue_intervention_front_persisted(
-                provider,
-                &shared.token_hash,
-                channel_id,
-                &mut data.intervention_queue,
-                &shared.dispatch_role_overrides,
-                intervention,
-            );
-        }
-    }
-}
-
-/// Scan for provider-specific skills available to this bot.
 pub(super) fn scan_skills(
     provider: &ProviderKind,
     project_path: Option<&str>,
@@ -1831,7 +603,7 @@ fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Entry point: start the Discord bot
-pub async fn run_bot(
+pub(crate) async fn run_bot(
     token: &str,
     provider: ProviderKind,
     global_active: Arc<std::sync::atomic::AtomicUsize>,
@@ -1924,7 +696,6 @@ pub async fn run_bot(
         turn_start_times: dashmap::DashMap::new(),
         cached_serenity_ctx: tokio::sync::OnceCell::new(),
         cached_bot_token: tokio::sync::OnceCell::new(),
-        token_hash: settings::discord_token_hash(token),
         api_port,
         db,
         engine,
@@ -2070,7 +841,7 @@ pub async fn run_bot(
                                 let queue_count: usize =
                                     data.intervention_queue.values().map(|q| q.len()).sum();
                                 if queue_count > 0 {
-                                    save_pending_queues(&provider_for_deferred, &shared_for_deferred.token_hash, &data.intervention_queue, &shared_for_deferred.dispatch_role_overrides);
+                                    save_pending_queues(&provider_for_deferred, &data.intervention_queue);
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
@@ -2139,15 +910,7 @@ pub async fn run_bot(
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
-                    let (restored_queues, restored_overrides) = load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
-                    // P1-1: Restore dispatch_role_overrides from queue snapshots
-                    for (thread_channel_id, alt_channel_id) in &restored_overrides {
-                        shared_for_tmux2.dispatch_role_overrides.insert(*thread_channel_id, *alt_channel_id);
-                    }
-                    if !restored_overrides.is_empty() {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 📋 FLUSH: restored {} dispatch_role_override(s) from queue snapshots", restored_overrides.len());
-                    }
+                    let restored_queues = load_pending_queues(&provider_for_restore);
                     if !restored_queues.is_empty() {
                         let mut added = 0usize;
                         let mut skipped = 0usize;
@@ -2170,8 +933,20 @@ pub async fn run_bot(
                         println!("  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)");
                     }
 
-                    // P1-2: Warn about legacy queue files that cannot be restored
-                    warn_legacy_pending_queue_files(&provider_for_restore);
+                    if let Some(ref db) = shared_for_tmux2.db {
+                        let (checked, cleared) =
+                            crate::server::routes::dispatches::validate_channel_thread_maps_on_startup(
+                                db,
+                                &token_for_kickoff,
+                            )
+                            .await;
+                        if checked > 0 || cleared > 0 {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!(
+                                "  [{ts}] 🧹 THREAD-MAP: validated {checked} mapping(s), cleared {cleared} stale binding(s)"
+                            );
+                        }
+                    }
 
                     // Startup catch-up polling: recover messages lost during restart gap
                     catch_up_missed_messages(
@@ -2384,12 +1159,7 @@ pub async fn run_bot(
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &data.intervention_queue,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
+                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
                     }
@@ -2503,12 +1273,7 @@ pub async fn run_bot(
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &data.intervention_queue,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
+                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
                     }
@@ -2591,7 +1356,7 @@ pub(super) async fn check_auth(
     }
 }
 
-fn user_is_authorized(settings: &DiscordBotSettings, user_id: u64) -> bool {
+pub(super) fn user_is_authorized(settings: &DiscordBotSettings, user_id: u64) -> bool {
     settings.allow_all_users
         || settings.owner_user_id == Some(user_id)
         || settings.allowed_user_ids.contains(&user_id)
@@ -2723,7 +1488,7 @@ fn resolve_channel_to_u64(raw: &str) -> Result<u64, String> {
 
 /// Retry DM reply notifications that previously failed (`_notify_failed` in context).
 /// Called from the 5-min tick loop.
-pub async fn retry_failed_dm_notifications(db: &crate::db::Db) {
+pub(crate) async fn retry_failed_dm_notifications(db: &crate::db::Db) {
     let db2 = db.clone();
     let entries: Vec<(i64, String, String, Option<String>)> =
         match tokio::task::spawn_blocking(move || {
@@ -2800,6 +1565,7 @@ pub async fn retry_failed_dm_notifications(db: &crate::db::Db) {
     }
 }
 
+#[allow(dead_code)]
 struct ConsumedDmReply {
     id: i64,
     source_agent: String,
@@ -2876,7 +1642,7 @@ pub(super) async fn rate_limit_wait(shared: &Arc<SharedData>, channel_id: Channe
 }
 
 /// Add a reaction to a message
-async fn add_reaction(
+pub(super) async fn add_reaction(
     ctx: &serenity::Context,
     channel_id: ChannelId,
     message_id: MessageId,
@@ -2950,7 +1716,7 @@ async fn gc_stale_fixed_working_sessions(shared: &Arc<SharedData>) {
 
 /// Periodically clean up idle sessions and their associated data.
 /// Called from handle_event; uses a static Mutex to track the last cleanup time.
-async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
+pub(super) async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     use std::sync::OnceLock;
     static LAST_CLEANUP: OnceLock<tokio::sync::Mutex<tokio::time::Instant>> = OnceLock::new();
     let last = LAST_CLEANUP.get_or_init(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
@@ -2975,6 +1741,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     }
     // Collect session_keys for audit before removing from memory
     let expired_keys: Vec<(ChannelId, String)> = {
+        let hostname = crate::services::platform::hostname_short();
         let provider = shared.settings.read().await.provider.clone();
         let data = shared.core.lock().await;
         expired
@@ -2983,14 +1750,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
                 data.sessions.get(ch).and_then(|s| {
                     s.channel_name.as_ref().map(|name| {
                         let tmux_name = provider.build_tmux_session_name(name);
-                        (
-                            *ch,
-                            adk_session::build_namespaced_session_key(
-                                &shared.token_hash,
-                                &provider,
-                                &tmux_name,
-                            ),
-                        )
+                        (*ch, format!("{}:{}", hostname, tmux_name))
                     })
                 })
             })
@@ -3194,7 +1954,7 @@ fn cleanup_git_worktree(wt_info: &WorktreeInfo) {
 // ─── Sendfile (CLI) ──────────────────────────────────────────────────────────
 
 /// Send a file to a Discord channel (called from CLI --discord-sendfile)
-pub async fn send_file_to_channel(
+pub(crate) async fn send_file_to_channel(
     token: &str,
     channel_id: u64,
     file_path: &str,
@@ -3225,7 +1985,7 @@ pub async fn send_file_to_channel(
 }
 
 /// Send a text message to a Discord channel (called from CLI --discord-sendmessage)
-pub async fn send_message_to_channel(
+pub(crate) async fn send_message_to_channel(
     token: &str,
     channel_id: u64,
     message: &str,
@@ -3241,7 +2001,7 @@ pub async fn send_message_to_channel(
 }
 
 /// Send a text message to a Discord user DM (called from CLI --discord-senddm)
-pub async fn send_message_to_user(
+pub(crate) async fn send_message_to_user(
     token: &str,
     user_id: u64,
     message: &str,
@@ -3281,54 +2041,34 @@ pub(super) async fn auto_restore_session(
     );
 
     // Read settings first to get last_sessions/last_remotes info
+    // DB cwd takes priority over yaml last_sessions (preserves worktree paths)
     let (last_path, saved_remote, provider) = {
         let settings = shared.settings.read().await;
         let channel_key = channel_id.get().to_string();
         let yaml_path = settings.last_sessions.get(&channel_key).cloned();
         let saved_remote = settings.last_remotes.get(&channel_key).cloned();
         let provider = settings.provider.clone();
-        let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref());
 
         // Use the effective tmux channel name here so restart recovery keeps
         // looking up the same session key for thread sessions that intentionally
         // use a synthetic "{parent}-t{thread_id}" channel name.
         let db_cwd: Option<String> = restore_ch_name.as_ref().and_then(|ch| {
             let tmux_name = provider.build_tmux_session_name(ch);
-            let session_keys =
-                build_session_key_candidates(&shared.token_hash, &provider, &tmux_name);
+            let hostname = crate::services::platform::hostname_short();
+            let session_key = format!("{}:{}", hostname, tmux_name);
             shared.db.as_ref().and_then(|db| {
                 db.lock().ok().and_then(|conn| {
-                    session_keys.iter().find_map(|session_key| {
-                        conn.query_row(
-                            "SELECT cwd FROM sessions WHERE session_key = ?1",
-                            [session_key],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .ok()
-                        .filter(|p| {
-                            !p.is_empty() && session_path_is_usable(p, saved_remote.as_deref())
-                        })
-                    })
+                    conn.query_row(
+                        "SELECT cwd FROM sessions WHERE session_key = ?1",
+                        [&session_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .filter(|p| !p.is_empty() && session_path_is_usable(p, saved_remote.as_deref()))
                 })
             })
         });
-
-        if let (Some(configured), Some(restored)) = (configured_path.as_ref(), db_cwd.as_ref()) {
-            if configured != restored {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ⚠ Ignoring restored DB cwd for channel {}: {} (configured workspace: {})",
-                    channel_id, restored, configured
-                );
-            }
-        }
-
-        let last_path = select_restored_session_path(
-            configured_path,
-            db_cwd,
-            yaml_path,
-            saved_remote.as_deref(),
-        );
+        let last_path = db_cwd.or(yaml_path);
 
         (last_path, saved_remote, provider)
     };
@@ -3396,7 +2136,7 @@ pub(super) async fn auto_restore_session(
 /// Create a lightweight session for a thread, bootstrapped from the parent channel's path.
 /// The session's `channel_name` uses `{parent_channel}-t{thread_id}` so the derived
 /// tmux session name stays short and unique instead of using the full thread title.
-async fn bootstrap_thread_session(
+pub(super) async fn bootstrap_thread_session(
     shared: &Arc<SharedData>,
     thread_channel_id: ChannelId,
     parent_path: &str,
@@ -3490,56 +2230,32 @@ pub(super) async fn resolve_channel_category(
     (ch_name, cat_name)
 }
 
-pub(in crate::services::discord) async fn validate_live_channel_routing_with_dm_hint(
-    ctx: &serenity::prelude::Context,
-    provider: &ProviderKind,
-    settings: &DiscordBotSettings,
-    channel_id: serenity::model::id::ChannelId,
-    is_dm_hint: Option<bool>,
-) -> Result<(), settings::BotChannelRoutingGuardFailure> {
-    let is_dm = match is_dm_hint {
-        Some(is_dm) => is_dm,
-        None => matches!(
-            channel_id.to_channel(&ctx.http).await,
-            Ok(serenity::model::channel::Channel::Private(_))
-        ),
-    };
-    let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
-    let (allowlist_channel_id, provider_channel_name) = if let Some((parent_id, parent_name)) =
-        resolve_thread_parent(&ctx.http, channel_id).await
-    {
-        (parent_id, parent_name.or(channel_name.clone()))
-    } else {
-        (channel_id, channel_name.clone())
-    };
-    validate_bot_channel_routing_with_provider_channel(
-        settings,
-        provider,
-        allowlist_channel_id,
-        channel_name.as_deref(),
-        provider_channel_name.as_deref(),
-        is_dm,
-    )
-}
-
-pub(in crate::services::discord) async fn validate_live_channel_routing(
-    ctx: &serenity::prelude::Context,
-    provider: &ProviderKind,
-    settings: &DiscordBotSettings,
-    channel_id: serenity::model::id::ChannelId,
-) -> Result<(), settings::BotChannelRoutingGuardFailure> {
-    validate_live_channel_routing_with_dm_hint(ctx, provider, settings, channel_id, None).await
-}
-
 pub(super) async fn provider_handles_channel(
     ctx: &serenity::prelude::Context,
     provider: &ProviderKind,
     settings: &DiscordBotSettings,
     channel_id: serenity::model::id::ChannelId,
 ) -> bool {
-    validate_live_channel_routing(ctx, provider, settings, channel_id)
-        .await
-        .is_ok()
+    let is_dm = matches!(
+        channel_id.to_channel(&ctx.http).await,
+        Ok(serenity::model::channel::Channel::Private(_))
+    );
+    let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
+    let (effective_channel_id, effective_channel_name) = if let Some((parent_id, parent_name)) =
+        resolve_thread_parent(&ctx.http, channel_id).await
+    {
+        (parent_id, parent_name.or(channel_name))
+    } else {
+        (channel_id, channel_name)
+    };
+    validate_bot_channel_routing(
+        settings,
+        provider,
+        effective_channel_id,
+        effective_channel_name.as_deref(),
+        is_dm,
+    )
+    .is_ok()
 }
 
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.
@@ -3552,7 +2268,7 @@ pub(super) async fn resolve_thread_parent(
     let serenity::model::channel::Channel::Guild(gc) = channel else {
         return None;
     };
-    use serenity::model::channel::ChannelType;
+    use poise::serenity_prelude::model::channel::ChannelType;
     match gc.kind {
         ChannelType::PublicThread | ChannelType::PrivateThread => {
             let parent_id = gc.parent_id?;
@@ -3680,511 +2396,5 @@ fn enrich_role_map_with_channel_ids() {
         if let Ok(pretty) = serde_json::to_string_pretty(&json) {
             let _ = runtime_store::atomic_write(&path, &pretty);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ChannelId;
-    use super::{
-        DiscordBotSettings, allows_nonlocal_session_path, choose_restore_channel_name,
-        is_synthetic_thread_channel_name, select_restored_session_path, session_path_is_usable,
-        synthetic_thread_channel_name, user_is_authorized,
-    };
-    use crate::services::discord::settings::{
-        BotChannelRoutingGuardFailure, validate_bot_channel_routing,
-    };
-    use crate::services::provider::ProviderKind;
-
-    #[test]
-    fn synthetic_thread_channel_name_round_trips() {
-        let channel_id = ChannelId::new(12345);
-        let synthetic = synthetic_thread_channel_name("agentdesk-codex", channel_id);
-
-        assert_eq!(synthetic, "agentdesk-codex-t12345");
-        assert!(is_synthetic_thread_channel_name(&synthetic, channel_id));
-        assert!(!is_synthetic_thread_channel_name(
-            "agentdesk-codex",
-            channel_id
-        ));
-    }
-
-    #[test]
-    fn choose_restore_channel_name_prefers_existing_synthetic_thread_name() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(
-            Some("agentdesk-codex-t12345"),
-            Some("새 스레드 제목"),
-            Some((ChannelId::new(777), Some("agentdesk-codex".to_string()))),
-            channel_id,
-        );
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex-t12345"));
-    }
-
-    #[test]
-    fn choose_restore_channel_name_builds_synthetic_name_for_threads() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(
-            None,
-            Some("새 스레드 제목"),
-            Some((ChannelId::new(777), Some("agentdesk-codex".to_string()))),
-            channel_id,
-        );
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex-t12345"));
-    }
-
-    #[test]
-    fn choose_restore_channel_name_keeps_existing_name_when_live_metadata_missing() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(Some("agentdesk-codex"), None, None, channel_id);
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex"));
-    }
-
-    #[test]
-    fn user_is_authorized_allows_owner_and_explicit_users() {
-        let mut settings = DiscordBotSettings::default();
-        settings.owner_user_id = Some(42);
-        settings.allowed_user_ids = vec![7];
-
-        assert!(user_is_authorized(&settings, 42));
-        assert!(user_is_authorized(&settings, 7));
-        assert!(!user_is_authorized(&settings, 99));
-    }
-
-    #[test]
-    fn user_is_authorized_allows_everyone_when_flag_enabled() {
-        let mut settings = DiscordBotSettings::default();
-        settings.owner_user_id = Some(42);
-        settings.allow_all_users = true;
-
-        assert!(user_is_authorized(&settings, 42));
-        assert!(user_is_authorized(&settings, 99));
-    }
-
-    #[test]
-    fn handoff_routing_guard_rejects_wrong_agent_settings() {
-        let mut settings = DiscordBotSettings::default();
-        settings.provider = ProviderKind::Codex;
-        settings.agent = Some("openclaw-maker".to_string());
-        settings.allowed_channel_ids = vec![1488022491992424448];
-
-        let result = validate_bot_channel_routing(
-            &settings,
-            &ProviderKind::Codex,
-            ChannelId::new(1488022491992424448),
-            Some("agentdesk-spark"),
-            false,
-        );
-
-        assert_eq!(result, Err(BotChannelRoutingGuardFailure::AgentMismatch));
-    }
-
-    #[test]
-    fn allows_nonlocal_session_path_requires_remote_profile_name() {
-        assert!(allows_nonlocal_session_path(Some("mac-mini")));
-        assert!(!allows_nonlocal_session_path(Some("")));
-        assert!(!allows_nonlocal_session_path(None));
-    }
-
-    #[test]
-    fn session_path_is_usable_for_remote_nonlocal_path() {
-        assert!(session_path_is_usable("~/repo", Some("mac-mini")));
-    }
-
-    #[test]
-    fn select_restored_session_path_prefers_configured_workspace() {
-        let selected = select_restored_session_path(
-            Some("/new/workspace".to_string()),
-            Some("/old/workspace".to_string()),
-            Some("/yaml/workspace".to_string()),
-            Some("remote"),
-        );
-
-        assert_eq!(selected.as_deref(), Some("/new/workspace"));
-    }
-
-    #[test]
-    fn select_restored_session_path_falls_back_when_configured_missing() {
-        let selected = select_restored_session_path(
-            None,
-            Some("/db/workspace".to_string()),
-            Some("/yaml/workspace".to_string()),
-            Some("remote"),
-        );
-
-        assert_eq!(selected.as_deref(), Some("/db/workspace"));
-    }
-
-    // ─── Pending queue isolation tests ───────────────────────────────────────
-
-    use super::{
-        Intervention, InterventionMode, PendingQueueItem, load_pending_queues,
-        requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
-        take_next_soft_intervention_persisted,
-    };
-    use crate::services::discord::runtime_store::test_env_lock;
-    use serenity::model::id::{MessageId, UserId};
-    use std::time::Instant;
-
-    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
-
-    fn make_intervention(text: &str) -> Intervention {
-        Intervention {
-            author_id: UserId::new(1),
-            message_id: MessageId::new(100),
-            text: text.to_string(),
-            mode: InterventionMode::Soft,
-            created_at: Instant::now(),
-        }
-    }
-
-    /// Queue files must land under `{provider}/{token_hash}/` — not the legacy flat path.
-    #[test]
-    fn pending_queue_path_uses_token_hash() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "abc123";
-        let channel_id = ChannelId::new(999);
-
-        let queue = vec![make_intervention("hello")];
-        save_channel_queue(&provider, token_hash, channel_id, &queue, None);
-
-        // File must exist under token_hash subdirectory
-        let expected = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude")
-            .join(token_hash)
-            .join(format!("{}.json", channel_id.get()));
-        assert!(
-            expected.exists(),
-            "queue file not found at expected path: {expected:?}"
-        );
-
-        // Legacy flat path must NOT exist
-        let legacy = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude")
-            .join(format!("{}.json", channel_id.get()));
-        assert!(
-            !legacy.exists(),
-            "queue file must not be written to legacy flat path"
-        );
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// Bot A writes a queue; Bot B (different token_hash) must not see it on load.
-    #[test]
-    fn load_pending_queues_only_reads_own_namespace() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(42);
-
-        // Bot A saves
-        save_channel_queue(
-            &provider,
-            "hash_bot_a",
-            channel_id,
-            &[make_intervention("from A")],
-            None,
-        );
-
-        // Bot B loads — must get nothing
-        let (result, _overrides) = load_pending_queues(&provider, "hash_bot_b");
-        assert!(result.is_empty(), "bot B must not restore bot A's queue");
-
-        // Bot A loads — must get its own item
-        let (result, _overrides) = load_pending_queues(&provider, "hash_bot_a");
-        assert_eq!(result.len(), 1, "bot A must restore its own queue");
-        assert_eq!(result[&channel_id][0].text, "from A");
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// save_pending_queues + load_pending_queues round-trip with token_hash namespacing.
-    #[test]
-    fn save_pending_queues_roundtrip() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "roundtrip_hash";
-        let ch1 = ChannelId::new(1);
-        let ch2 = ChannelId::new(2);
-
-        let mut queues = std::collections::HashMap::new();
-        queues.insert(ch1, vec![make_intervention("msg1")]);
-        queues.insert(
-            ch2,
-            vec![make_intervention("msg2a"), make_intervention("msg2b")],
-        );
-
-        save_pending_queues(&provider, token_hash, &queues, &dashmap::DashMap::new());
-
-        // load_pending_queues deletes files after reading
-        let (restored, _restored_overrides) = load_pending_queues(&provider, token_hash);
-        assert_eq!(restored.get(&ch1).map(|v| v.len()), Some(1));
-        assert_eq!(restored.get(&ch2).map(|v| v.len()), Some(2));
-
-        // Files should be gone after load
-        let dir = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude")
-            .join(token_hash);
-        let remaining: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert!(
-            remaining.is_empty(),
-            "load must delete queue files after reading"
-        );
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[test]
-    fn persisted_queue_helpers_keep_remaining_items_and_restore_requeued_item() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "preserve_roundtrip";
-        let channel_id = ChannelId::new(41);
-        let alt_channel = ChannelId::new(99);
-
-        let mut queues = std::collections::HashMap::new();
-        queues.insert(
-            channel_id,
-            vec![make_intervention("first"), make_intervention("second")],
-        );
-        let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
-        overrides.insert(channel_id, alt_channel);
-        save_pending_queues(&provider, token_hash, &queues, &overrides);
-
-        let (popped, has_more) = take_next_soft_intervention_persisted(
-            &provider,
-            token_hash,
-            channel_id,
-            &mut queues,
-            &overrides,
-        )
-        .expect("queue item should be popped");
-        assert_eq!(popped.text, "first");
-        assert!(has_more);
-        assert_eq!(queues.get(&channel_id).map(|items| items.len()), Some(1));
-
-        let file = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude")
-            .join(token_hash)
-            .join(format!("{}.json", channel_id.get()));
-        let content = std::fs::read_to_string(&file).unwrap();
-        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].text, "second");
-        assert_eq!(items[0].override_channel_id, Some(alt_channel.get()));
-
-        requeue_intervention_front_persisted(
-            &provider,
-            token_hash,
-            channel_id,
-            &mut queues,
-            &overrides,
-            popped,
-        );
-
-        let content = std::fs::read_to_string(&file).unwrap();
-        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].text, "first");
-        assert_eq!(items[1].text, "second");
-        assert_eq!(items[0].override_channel_id, Some(alt_channel.get()));
-        assert_eq!(items[1].override_channel_id, Some(alt_channel.get()));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// PendingQueueItem serializes routing snapshot fields and deserializes with defaults for old format.
-    #[test]
-    fn pending_queue_item_serde_backward_compatible() {
-        // Old format (no routing snapshot fields)
-        let old_json = r#"[{"author_id":1,"message_id":100,"text":"hello"}]"#;
-        let items: Vec<PendingQueueItem> = serde_json::from_str(old_json).unwrap();
-        assert_eq!(items[0].text, "hello");
-        assert!(items[0].channel_id.is_none());
-        assert!(items[0].channel_name.is_none());
-        assert!(items[0].override_channel_id.is_none());
-
-        // New format (with routing snapshot)
-        let new_item = PendingQueueItem {
-            author_id: 1,
-            message_id: 100,
-            text: "hello".to_string(),
-            channel_id: Some(42),
-            channel_name: Some("test-channel".to_string()),
-            override_channel_id: None,
-        };
-        let json = serde_json::to_string(&new_item).unwrap();
-        let parsed: PendingQueueItem = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.channel_id, Some(42));
-        assert_eq!(parsed.channel_name.as_deref(), Some("test-channel"));
-    }
-
-    // ─── P2: Regression tests ─────────────────────────────────────────────────
-
-    /// P2: Two bots with empty or duplicate `agent` labels but different token hashes
-    /// must not collide — the namespace key is token_hash, not agent.
-    #[test]
-    fn agent_empty_or_duplicate_does_not_collide_namespace() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let ch = ChannelId::new(77);
-
-        // Both bots have the same agent label (or empty), different token hashes
-        save_channel_queue(&provider, "hash_x", ch, &[make_intervention("bot-x")], None);
-        save_channel_queue(&provider, "hash_y", ch, &[make_intervention("bot-y")], None);
-
-        // Each bot must only see its own queue
-        let (result_x, _) = load_pending_queues(&provider, "hash_x");
-        let (result_y, _) = load_pending_queues(&provider, "hash_y");
-
-        assert_eq!(result_x.get(&ch).map(|v| v[0].text.as_str()), Some("bot-x"));
-        assert_eq!(result_y.get(&ch).map(|v| v[0].text.as_str()), Some("bot-y"));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// P2: review/reused thread override_channel_id survives a save/load round-trip.
-    /// This ensures dispatch_role_overrides are not lost on restart.
-    #[test]
-    fn review_thread_override_preserved_across_restart() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "review_hash";
-        let thread_channel = ChannelId::new(500);
-        let alt_channel = ChannelId::new(501);
-
-        // Save queue with override_channel_id set (simulating a review thread)
-        save_channel_queue(
-            &provider,
-            token_hash,
-            thread_channel,
-            &[make_intervention("review msg")],
-            Some(alt_channel.get()),
-        );
-
-        // Load and verify override is restored
-        let (queues, overrides) = load_pending_queues(&provider, token_hash);
-        assert_eq!(queues.get(&thread_channel).map(|v| v.len()), Some(1));
-        assert_eq!(
-            overrides.get(&thread_channel).copied(),
-            Some(alt_channel),
-            "override_channel_id must be restored from queue snapshot"
-        );
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// P2: save_pending_queues captures dispatch_role_overrides into override_channel_id.
-    #[test]
-    fn save_pending_queues_captures_dispatch_role_overrides() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "override_test";
-        let ch = ChannelId::new(300);
-        let alt_ch = ChannelId::new(301);
-
-        let mut queues = std::collections::HashMap::new();
-        queues.insert(ch, vec![make_intervention("queued msg")]);
-
-        let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
-        overrides.insert(ch, alt_ch);
-
-        save_pending_queues(&provider, token_hash, &queues, &overrides);
-
-        // Verify the file contains override_channel_id
-        let dir = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude")
-            .join(token_hash);
-        let file = dir.join(format!("{}.json", ch.get()));
-        let content = std::fs::read_to_string(&file).unwrap();
-        let items: Vec<PendingQueueItem> = serde_json::from_str(&content).unwrap();
-        assert_eq!(items[0].override_channel_id, Some(alt_ch.get()));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    /// P2: Legacy flat queue files (old path without token_hash) are NOT loaded
-    /// by load_pending_queues, which only reads from the token_hash subdirectory.
-    #[test]
-    fn legacy_flat_queue_file_is_not_restored() {
-        let _lock = test_env_lock().lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let ch = ChannelId::new(999);
-
-        // Write a legacy flat file directly under {provider}/ (no token_hash dir)
-        let legacy_dir = tmp
-            .path()
-            .join("runtime")
-            .join("discord_pending_queue")
-            .join("claude");
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        let legacy_file = legacy_dir.join(format!("{}.json", ch.get()));
-        let item = PendingQueueItem {
-            author_id: 1,
-            message_id: 100,
-            text: "legacy msg".to_string(),
-            channel_id: None,
-            channel_name: None,
-            override_channel_id: None,
-        };
-        std::fs::write(&legacy_file, serde_json::to_string(&vec![item]).unwrap()).unwrap();
-
-        // load_pending_queues with any token_hash must NOT see the legacy file
-        let (result, _) = load_pending_queues(&provider, "any_hash");
-        assert!(
-            result.is_empty(),
-            "legacy flat file must not be restored by load_pending_queues"
-        );
-
-        // Legacy file must still exist (load_pending_queues must not delete files outside its dir)
-        assert!(
-            legacy_file.exists(),
-            "load_pending_queues must not delete legacy files"
-        );
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
     }
 }

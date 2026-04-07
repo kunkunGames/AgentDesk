@@ -628,6 +628,76 @@ pub(in crate::services::discord) async fn handle_event(
                 return Ok(());
             }
 
+            // Idle backlog guard: if older queued messages are still pending on an
+            // otherwise-idle channel, keep FIFO order by queuing this message behind
+            // them and re-triggering idle queue kickoff instead of letting this turn
+            // jump ahead.
+            let queued_behind_idle_backlog = {
+                let mut d = data.shared.core.lock().await;
+                let has_pending_soft = d
+                    .intervention_queue
+                    .get(&channel_id)
+                    .map(|queue| {
+                        queue
+                            .iter()
+                            .any(|item| matches!(item.mode, InterventionMode::Soft))
+                    })
+                    .unwrap_or(false);
+                if d.cancel_tokens.contains_key(&channel_id) || !has_pending_soft {
+                    None
+                } else {
+                    let inserted = {
+                        let queue = d.intervention_queue.entry(channel_id).or_default();
+                        enqueue_intervention(
+                            queue,
+                            Intervention {
+                                author_id: user_id,
+                                message_id: new_message.id,
+                                text: text.to_string(),
+                                mode: InterventionMode::Soft,
+                                created_at: Instant::now(),
+                            },
+                        )
+                    };
+                    if inserted {
+                        if let Some(q) = d.intervention_queue.get(&channel_id) {
+                            save_channel_queue(
+                                &data.provider,
+                                &data.shared.token_hash,
+                                channel_id,
+                                q,
+                                data.shared
+                                    .dispatch_role_overrides
+                                    .get(&channel_id)
+                                    .map(|r| r.value().get()),
+                            );
+                        }
+                    }
+                    Some(inserted)
+                }
+            };
+            if let Some(inserted) = queued_behind_idle_backlog {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                if inserted {
+                    println!(
+                        "  [{ts}] 📬 IDLE-QUEUE: queued message from [{user_name}] in channel {} behind pending backlog",
+                        channel_id
+                    );
+                    add_reaction(ctx, channel_id, new_message.id, '📬').await;
+                    data.shared
+                        .last_message_ids
+                        .insert(channel_id, new_message.id.get());
+                } else {
+                    println!(
+                        "  [{ts}] ↪ IDLE-QUEUE: duplicate message from [{user_name}] already pending in channel {}",
+                        channel_id
+                    );
+                }
+                super::super::kickoff_idle_queues(ctx, &data.shared, &data.token, &data.provider)
+                    .await;
+                return Ok(());
+            }
+
             // Meeting command from text (e.g. announce bot sending "/meeting start ...")
             if text.starts_with("/meeting ") {
                 let ts = chrono::Local::now().format("%H:%M:%S");
