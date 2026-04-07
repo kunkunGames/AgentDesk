@@ -33,42 +33,6 @@ pub(super) fn is_model_picker_component_custom_id(
     super::super::commands::parse_model_picker_custom_id(custom_id, fallback_channel_id).is_some()
 }
 
-async fn reset_provider_session_if_pending(
-    shared: &Arc<SharedData>,
-    channel_id: serenity::ChannelId,
-    provider: &ProviderKind,
-) {
-    if shared
-        .model_session_reset_pending
-        .remove(&channel_id)
-        .is_none()
-    {
-        return;
-    }
-
-    let channel_name = {
-        let mut data = shared.core.lock().await;
-        if let Some(session) = data.sessions.get_mut(&channel_id) {
-            session.session_id = None;
-            session.channel_name.clone()
-        } else {
-            None
-        }
-    };
-
-    if provider.uses_managed_tmux_backend() {
-        if let Some(name) = channel_name.as_deref() {
-            crate::services::claude::terminate_local_session(
-                &provider.build_tmux_session_name(name),
-            );
-        }
-    }
-
-    if let Some(session_key) = build_adk_session_key(shared, channel_id, provider).await {
-        super::super::adk_session::clear_provider_session_id(&session_key, shared.api_port).await;
-    }
-}
-
 pub(in crate::services::discord) async fn handle_event(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -409,7 +373,7 @@ pub(in crate::services::discord) async fn handle_event(
                             },
                         );
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                         drop(d);
                         add_reaction(ctx, channel_id, new_message.id, '📬').await;
@@ -447,7 +411,7 @@ pub(in crate::services::discord) async fn handle_event(
                     };
                     if inserted {
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                     }
                     drop(d);
@@ -489,7 +453,7 @@ pub(in crate::services::discord) async fn handle_event(
                     // so it survives SIGKILL, OOM kill, or crash.
                     if inserted {
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                     }
 
@@ -548,7 +512,7 @@ pub(in crate::services::discord) async fn handle_event(
                 );
                 // Write-through: persist queue to disk (matches drain-mode contract)
                 if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(&data.provider, channel_id, q);
+                    save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                 }
                 drop(d);
                 // Checkpoint: track last processed message
@@ -586,7 +550,7 @@ pub(in crate::services::discord) async fn handle_event(
 
                 // Write-through: persist this channel's queue to disk immediately
                 if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(&data.provider, channel_id, q);
+                    save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                 }
                 drop(d);
 

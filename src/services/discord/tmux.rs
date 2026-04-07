@@ -212,7 +212,7 @@ pub(super) async fn start_restart_handoff_from_state(
             mode: super::InterventionMode::Soft,
             created_at: std::time::Instant::now(),
         });
-        super::save_channel_queue(provider_kind, channel_id, queue);
+        super::save_channel_queue(provider_kind, &shared.token_hash, channel_id, queue);
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!(
             "  [{ts}] ↻ watcher death recovery: queued fallback handoff for channel {}",
@@ -749,7 +749,7 @@ pub(super) async fn tmux_output_watcher(
                         shared.api_port,
                         "/api/dispatched-sessions/clear-stale-session-id",
                     ))
-                    .json(&serde_json::json!({"claude_session_id": sid}))
+                    .json(&serde_json::json!({"session_id": sid}))
                     .send()
                     .await;
             }
@@ -1708,8 +1708,10 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let mut data = shared.core.lock().await;
         for (channel_id, channel_name) in &owned_sessions {
             let channel_key = channel_id.get().to_string();
-            let last_path = settings.last_sessions.get(&channel_key).cloned();
+            let yaml_path = settings.last_sessions.get(&channel_key).cloned();
             let remote_profile = settings.last_remotes.get(&channel_key).cloned();
+            let configured_path =
+                super::settings::resolve_workspace(*channel_id, Some(channel_name.as_str()));
 
             let session =
                 data.sessions
@@ -1722,7 +1724,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         cleared: false,
                         channel_name: Some(channel_name.clone()),
                         category_name: None,
-                        remote_profile_name: remote_profile,
+                        remote_profile_name: remote_profile.clone(),
                         channel_id: Some(channel_id.get()),
 
                         last_active: tokio::time::Instant::now(),
@@ -1748,7 +1750,23 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                         .filter(|p| !p.is_empty() && std::path::Path::new(p).is_dir())
                     })
                 });
-                let effective_path = db_cwd.or(last_path);
+                if let (Some(configured), Some(restored)) =
+                    (configured_path.as_ref(), db_cwd.as_ref())
+                {
+                    if configured != restored {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] ⚠ Ignoring restored DB cwd for channel {}: {} (configured workspace: {})",
+                            channel_id, restored, configured
+                        );
+                    }
+                }
+                let effective_path = super::select_restored_session_path(
+                    configured_path,
+                    db_cwd,
+                    yaml_path,
+                    remote_profile.as_deref(),
+                );
                 if let Some(path) = effective_path {
                     session.current_path = Some(path);
                 }
