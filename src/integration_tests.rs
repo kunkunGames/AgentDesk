@@ -8,7 +8,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
 
     use crate::db;
     use crate::dispatch;
@@ -159,11 +158,6 @@ mod tests {
             .unwrap()
     }
 
-    fn gh_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     struct MockGhEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
@@ -186,7 +180,7 @@ mod tests {
     }
 
     fn install_mock_gh(script_body: &str) -> MockGhEnv {
-        let lock = gh_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::services::discord::runtime_store::lock_test_env();
         let dir = tempfile::tempdir().unwrap();
         let gh_path = dir.path().join("gh");
         let log_path = dir.path().join("gh.log");

@@ -1044,7 +1044,6 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_db() -> Db {
@@ -1739,8 +1738,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn deploy_pipeline_uses_card_scoped_worktree_instead_of_latest_session_cwd() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _env_guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env_guard = crate::services::discord::runtime_store::lock_test_env();
 
         let temp = TempDir::new().unwrap();
         let policies_dir = temp.path().join("policies");

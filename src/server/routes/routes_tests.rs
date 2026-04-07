@@ -48,8 +48,7 @@ fn test_api_router(
 }
 
 fn env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    crate::services::discord::runtime_store::lock_test_env()
 }
 
 struct EnvVarGuard {
@@ -72,6 +71,40 @@ impl Drop for EnvVarGuard {
             None => unsafe { std::env::remove_var(self.key) },
         }
     }
+}
+
+fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_commit(repo_dir: &std::path::Path, message: &str) -> String {
+    let filename = format!(
+        "commit-{}.txt",
+        message
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>()
+    );
+    std::fs::write(repo_dir.join(filename), format!("{message}\n")).unwrap();
+    run_git(repo_dir, &["add", "."]);
+    run_git(repo_dir, &["commit", "-m", message]);
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 #[tokio::test]
@@ -3208,11 +3241,20 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
 #[tokio::test]
 async fn rereview_reactivates_done_card_with_fresh_review_dispatch() {
     crate::pipeline::ensure_loaded();
+    let _env_lock = env_lock();
     let db = test_db();
     let engine = test_engine(&db);
     seed_agent(&db, "agent-rereview");
     set_pmd_channel(&db, "pmd-chan-123");
     ensure_auto_queue_tables(&db);
+
+    let repo = tempfile::tempdir().unwrap();
+    run_git(repo.path(), &["init", "-b", "main"]);
+    run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+    run_git(repo.path(), &["config", "user.name", "Test"]);
+    run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+    let expected_commit = git_commit(repo.path(), "fix: review target (#269)");
+    let _repo_dir = EnvVarGuard::set_path("AGENTDESK_REPO_DIR", repo.path());
 
     let completed_commit = "1111111111111111111111111111111111111269";
     {
@@ -3333,12 +3375,10 @@ async fn rereview_reactivates_done_card_with_fresh_review_dispatch() {
         )
         .unwrap();
     assert_eq!(dispatch_status, "pending");
-    // The fake SHA from dispatch history is unreachable via git, so
-    // commit_belongs_to_card_issue() rejects it (fail-closed) and the
-    // fallback chain supplies a valid commit instead.
-    assert!(
-        reviewed_commit.as_deref().is_some_and(|c| !c.is_empty()),
-        "reviewed_commit should be populated by fallback chain"
+    assert_eq!(
+        reviewed_commit.as_deref(),
+        Some(expected_commit.as_str()),
+        "reviewed_commit should be recovered from the repo fallback chain"
     );
 
     let (entry_status, entry_dispatch_id): (String, String) = conn
