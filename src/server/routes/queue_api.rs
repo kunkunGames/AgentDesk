@@ -19,11 +19,9 @@ pub async fn list_channel_queue(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
 ) -> Json<serde_json::Value> {
-    let channel_id_num: u64 = match channel_id.parse() {
-        Ok(n) => n,
-        Err(_) => return Json(json!({"error": "invalid channel_id", "queue": []})),
-    };
-    let cid = serenity::model::id::ChannelId::new(channel_id_num);
+    if channel_id.parse::<u64>().is_err() {
+        return Json(json!({"error": "invalid channel_id", "queue": []}));
+    }
 
     // Access SharedData via engine's shared_data (not available here)
     // Instead, read from the DB-backed pending queue files

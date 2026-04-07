@@ -1,6 +1,5 @@
 use crate::services::platform::BinaryResolution;
 use crate::utils::format::safe_prefix;
-use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
@@ -131,6 +130,7 @@ impl ProviderKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resolve_runtime_path(&self) -> Option<String> {
         match self {
             Self::Claude => crate::services::claude::resolve_claude_path(),
@@ -210,6 +210,7 @@ impl ProviderKind {
     /// Returns provider-specific environment variables for auto-compact configuration.
     /// - Claude: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = percent
     /// - Codex: uses CLI args instead (see compact_cli_config)
+    #[allow(dead_code)]
     pub fn compact_env_vars(&self, percent: u64) -> Vec<(String, String)> {
         match self {
             Self::Claude => vec![(

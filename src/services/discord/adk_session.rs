@@ -226,10 +226,6 @@ pub(super) async fn clear_provider_session_id(session_key: &str, api_port: u16) 
     }
 }
 
-pub(super) async fn clear_claude_session_id(session_key: &str, api_port: u16) {
-    clear_provider_session_id(session_key, api_port).await;
-}
-
 /// Save a provider session_id to DB so it survives dcserver restarts.
 /// Stored in the legacy `claude_session_id` column for compatibility.
 pub(super) async fn save_provider_session_id(
@@ -289,24 +285,6 @@ pub(super) async fn fetch_provider_session_id(
         .or_else(|| json.get("claude_session_id").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-}
-
-pub(super) async fn save_claude_session_id(
-    session_key: &str,
-    claude_session_id: &str,
-    api_port: u16,
-) {
-    save_provider_session_id(
-        session_key,
-        claude_session_id,
-        &ProviderKind::Claude,
-        api_port,
-    )
-    .await
-}
-
-pub(super) async fn fetch_claude_session_id(session_key: &str, api_port: u16) -> Option<String> {
-    fetch_provider_session_id(session_key, &ProviderKind::Claude, api_port).await
 }
 
 fn normalize_user_task_summary(input: &str) -> Option<String> {

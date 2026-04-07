@@ -25,16 +25,13 @@ use crate::services::tmux_diagnostics::{
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
 /// Public so onboarding/health-check can use the exact same resolution contract.
+#[allow(dead_code)]
 pub fn resolve_codex_path() -> Option<String> {
     crate::services::platform::resolve_provider_binary("codex").resolved_path
 }
 
 fn resolve_codex_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("codex")
-}
-
-fn get_codex_path() -> Option<String> {
-    resolve_codex_path()
 }
 
 fn build_tmux_launch_env_lines(
@@ -76,7 +73,7 @@ fn build_tmux_launch_env_lines(
 }
 
 #[cfg(unix)]
-use crate::services::tmux_common::{tmux_exact_target, tmux_owner_path, write_tmux_owner_marker};
+use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let resolution = resolve_codex_binary();
@@ -993,8 +990,6 @@ fn handle_codex_json_line(
 mod tests {
     use std::sync::mpsc;
 
-    #[cfg(unix)]
-    use super::send_followup_to_tmux;
     use super::{
         TMUX_PROMPT_B64_PREFIX, base_exec_args, build_tmux_launch_env_lines, compose_codex_prompt,
         handle_codex_json_line,

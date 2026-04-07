@@ -144,6 +144,7 @@ pub struct UpdateDispatchedSessionBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HookSessionBody {
     pub session_key: String,
     pub status: Option<String>,

@@ -201,7 +201,6 @@ pub fn sync_agents_from_config(db: &Db, agents: &[AgentDef]) -> Result<usize> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     fn test_db() -> Db {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

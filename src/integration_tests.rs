@@ -326,9 +326,7 @@ mod tests {
 
     #[cfg(unix)]
     fn install_mock_gh(script_body: &str) -> MockGhEnv {
-        let lock = gh_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let lock = gh_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let gh_path = dir.path().join("gh");
         let log_path = dir.path().join("gh.log");

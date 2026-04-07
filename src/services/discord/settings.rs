@@ -72,6 +72,7 @@ pub(crate) struct RoleBinding {
     /// Optional model override (e.g. "opus", "sonnet", "haiku", "o3")
     pub model: Option<String>,
     /// Optional reasoning effort for Codex (e.g. "low", "normal", "high", "xhigh")
+    #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     /// Whether this role may see peer-agent handoff guidance in the system prompt.
     pub peer_agents_enabled: bool,
@@ -1029,8 +1030,7 @@ mod tests {
         channel_supports_provider, discord_token_hash, load_bot_settings,
         load_discord_bot_launch_configs, load_narrate_progress, load_peer_agents,
         render_peer_agent_guidance, resolve_memory_settings, resolve_role_binding,
-        save_bot_settings,
-        validate_bot_channel_routing,
+        save_bot_settings, validate_bot_channel_routing,
     };
 
     fn with_temp_home<F>(f: F)

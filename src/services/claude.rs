@@ -2,7 +2,6 @@ use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::mpsc::Sender;
 
 use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage, is_valid_session_id};
@@ -20,8 +19,6 @@ use crate::services::tmux_diagnostics::{
     record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
     tmux_session_exists, tmux_session_has_live_pane,
 };
-use crate::utils::format::safe_prefix;
-
 /// Resolve the path to the claude binary.
 pub fn resolve_claude_path() -> Option<String> {
     crate::services::platform::resolve_provider_binary("claude").resolved_path

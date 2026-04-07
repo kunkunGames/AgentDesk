@@ -16,6 +16,7 @@ pub(crate) const UNBOUND_MEMORY_ROLE_ID: &str = "__unbound_role__";
 pub(crate) type MemoryFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct RecallRequest {
     pub provider: ProviderKind,
     pub role_id: String,

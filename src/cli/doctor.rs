@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::process::Command;
 use std::time::Duration;
 
 use super::dcserver;

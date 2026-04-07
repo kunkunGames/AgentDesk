@@ -68,12 +68,14 @@ pub struct AssignCardBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct RetryCardBody {
     pub assignee_agent_id: Option<String>,
     pub request_now: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct RedispatchCardBody {
     pub reason: Option<String>,
 }
@@ -2450,6 +2452,7 @@ pub async fn batch_rereview(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ReopenBody {
     pub review_status: Option<String>,
     pub dispatch_type: Option<String>,

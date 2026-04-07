@@ -3,8 +3,6 @@ use serenity::CreateAttachment;
 use std::path::Path;
 
 use crate::services::provider::cancel_requested;
-#[cfg(unix)]
-use crate::services::tmux_common::tmux_exact_target;
 
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::settings::cleanup_channel_uploads;
