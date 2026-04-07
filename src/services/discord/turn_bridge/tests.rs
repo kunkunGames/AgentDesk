@@ -5,11 +5,11 @@ use super::completion_guard::{
 use super::context_window::{
     persisted_context_tokens, resolve_done_response, total_context_tokens,
 };
-use super::spawn_memory_capture_task;
 use super::retry_state::{
     clear_local_session_state, handle_gemini_retry_boundary, reset_gemini_retry_attempt_state,
     should_reset_gemini_retry_attempt_state,
 };
+use super::spawn_memory_capture_task;
 use super::stale_resume::{
     contains_stale_resume_error_text, output_file_has_stale_resume_error_after_offset,
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,

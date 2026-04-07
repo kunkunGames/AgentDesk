@@ -6,9 +6,11 @@
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use crate::db;
     use crate::dispatch;
@@ -159,11 +161,7 @@ mod tests {
             .unwrap()
     }
 
-    fn gh_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
+    #[cfg(unix)]
     struct MockGhEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
@@ -171,6 +169,7 @@ mod tests {
         log_path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl Drop for MockGhEnv {
         fn drop(&mut self) {
             if let Some(old_path) = &self.old_path {
@@ -185,8 +184,11 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn install_mock_gh(script_body: &str) -> MockGhEnv {
-        let lock = gh_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let lock = crate::services::discord::runtime_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let gh_path = dir.path().join("gh");
         let log_path = dir.path().join("gh.log");
@@ -217,6 +219,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn gh_log(env: &MockGhEnv) -> String {
         fs::read_to_string(&env.log_path).unwrap_or_default()
     }
@@ -2437,6 +2440,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_creates_codex_rework_and_dedups_review() {
         let _gh = install_mock_gh(
@@ -2509,6 +2513,7 @@ esac
         assert_eq!(message_outbox_rows(&db).len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_notifies_clean_codex_pass() {
         let _gh = install_mock_gh(
@@ -2577,6 +2582,7 @@ esac
         assert_eq!(message_outbox_rows(&db).len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn scenario_208_merge_guard_blocks_unresolved_codex_comments() {
         let gh = install_mock_gh(

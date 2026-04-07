@@ -369,7 +369,6 @@ fn windows_provider_subdirs(_provider: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-
 fn standard_fallback_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -614,11 +613,12 @@ fn join_paths_lossy(paths: Vec<PathBuf>) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     fn env_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        crate::services::discord::runtime_store::test_env_lock()
+            .lock()
+            .unwrap()
     }
 
     #[cfg(unix)]
@@ -724,7 +724,6 @@ mod tests {
             }
         }
     }
-
 
     #[cfg(unix)]
     #[test]

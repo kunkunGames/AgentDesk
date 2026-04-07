@@ -2478,9 +2478,9 @@ async fn reset_provider_session_if_pending(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::DiscordSession;
     use super::*;
     use crate::services::memory::RecallResponse;
-    use super::super::super::DiscordSession;
 
     fn sample_recall() -> RecallResponse {
         RecallResponse {

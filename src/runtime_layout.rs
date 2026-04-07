@@ -1477,7 +1477,9 @@ mod tests {
 
     impl TestHomeGuard {
         fn install(home: &Path, runtime_root: &Path) -> Self {
-            let lock = test_home_lock().lock().unwrap();
+            let lock = crate::services::discord::runtime_store::test_env_lock()
+                .lock()
+                .unwrap();
             fs::create_dir_all(home).unwrap();
             set_test_home_dir_override(Some(home.to_path_buf()));
             let previous_runtime_root = std::env::var_os("AGENTDESK_ROOT_DIR");
@@ -1497,11 +1499,6 @@ mod tests {
                 None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
             }
         }
-    }
-
-    fn test_home_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]

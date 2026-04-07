@@ -258,9 +258,17 @@ fn extract_result_items<'a>(payload: &'a Value) -> Vec<&'a Map<String, Value>> {
 }
 
 fn extract_relation_items<'a>(payload: &'a Value) -> Vec<&'a Map<String, Value>> {
-    payload
-        .as_object()
-        .and_then(|map| map.get("relations"))
+    let Some(map) = payload.as_object() else {
+        return Vec::new();
+    };
+
+    if let Some(items) = map.get("relations").and_then(Value::as_array) {
+        return items.iter().filter_map(Value::as_object).collect();
+    }
+
+    map.get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("relations"))
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(Value::as_object).collect())
         .unwrap_or_default()
@@ -695,6 +703,31 @@ mod tests {
         assert_eq!(formatted.matches("AgentDesk uses Neo4j").count(), 1);
         assert_eq!(formatted.matches("agentdesk -- uses -- neo4j").count(), 1);
         assert!(formatted.contains("critic -- uses -- falkordb"));
+    }
+
+    #[test]
+    fn test_format_search_payload_reads_wrapped_relations() {
+        let payload = json!({
+            "response": {
+                "results": [
+                    {
+                        "memory": "Planner uses Neo4j for architecture notes."
+                    }
+                ],
+                "relations": [
+                    {
+                        "source": "planner",
+                        "relationship": "uses",
+                        "destination": "neo4j"
+                    }
+                ]
+            }
+        });
+
+        let formatted = format_search_payload_for_external_recall(&payload, 5)
+            .expect("formatted wrapped recall should exist");
+        assert!(formatted.contains("Planner uses Neo4j for architecture notes."));
+        assert!(formatted.contains("planner -- uses -- neo4j"));
     }
 
     #[tokio::test]
