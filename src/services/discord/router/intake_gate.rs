@@ -373,7 +373,7 @@ pub(in crate::services::discord) async fn handle_event(
                             },
                         );
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                         drop(d);
                         add_reaction(ctx, channel_id, new_message.id, '📬').await;
@@ -411,7 +411,7 @@ pub(in crate::services::discord) async fn handle_event(
                     };
                     if inserted {
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                     }
                     drop(d);
@@ -453,7 +453,7 @@ pub(in crate::services::discord) async fn handle_event(
                     // so it survives SIGKILL, OOM kill, or crash.
                     if inserted {
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                         }
                     }
 
@@ -512,7 +512,7 @@ pub(in crate::services::discord) async fn handle_event(
                 );
                 // Write-through: persist queue to disk (matches drain-mode contract)
                 if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(&data.provider, channel_id, q);
+                    save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                 }
                 drop(d);
                 // Checkpoint: track last processed message
@@ -550,7 +550,7 @@ pub(in crate::services::discord) async fn handle_event(
 
                 // Write-through: persist this channel's queue to disk immediately
                 if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(&data.provider, channel_id, q);
+                    save_channel_queue(&data.provider, &data.shared.token_hash, channel_id, q);
                 }
                 drop(d);
 

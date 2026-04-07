@@ -1472,9 +1472,9 @@ pub(super) fn spawn_turn_bridge(
                     // Write-through: update disk after dequeue
                     if next.0.is_some() {
                         if remove_queue {
-                            super::save_channel_queue(&provider, channel_id, &[]);
+                            super::save_channel_queue(&provider, &shared_owned.token_hash, channel_id, &[]);
                         } else if let Some(q) = data.intervention_queue.get(&channel_id) {
-                            super::save_channel_queue(&provider, channel_id, q);
+                            super::save_channel_queue(&provider, &shared_owned.token_hash, channel_id, q);
                         }
                     }
                     if remove_queue {
