@@ -25,9 +25,9 @@ mod turn_bridge;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
-use crate::services::agent_protocol::{StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
 use crate::services::claude;
 use crate::services::codex;
 use crate::services::gemini;
@@ -48,13 +48,13 @@ use adk_session::{
     parse_dispatch_id, post_adk_session_status,
 };
 use formatting::{
-    add_reaction_raw, extract_skill_description, format_for_discord, format_skills_notice,
-    format_tool_input, normalize_empty_lines, remove_reaction_raw, send_long_message_raw,
-    truncate_str, BUILTIN_SKILLS,
+    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
+    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
+    send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
-    clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
+    InflightTurnState, clear_inflight_state, load_inflight_states, save_inflight_state,
 };
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
@@ -62,15 +62,15 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
-    save_bot_settings, validate_bot_channel_routing, RoleBinding,
+    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
+    save_bot_settings, validate_bot_channel_routing,
 };
 #[cfg(unix)]
 use tmux::{
     cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions, restore_tmux_watchers,
     tmux_output_watcher,
 };
-use turn_bridge::{spawn_turn_bridge, tmux_runtime_paths, TurnBridgeContext};
+use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
 
 pub(crate) use prompt_builder::DispatchProfile;
 
@@ -578,11 +578,21 @@ pub(super) fn take_next_soft_intervention_persisted(
         (None, false)
     };
 
-    let intervention = next?;
+    if next.is_none() {
+        if remove_queue {
+            intervention_queue.remove(&channel_id);
+            dispatch_role_overrides.remove(&channel_id);
+            save_channel_queue(provider, token_hash, channel_id, &[], None);
+        }
+        return None;
+    }
+
+    let intervention = next.unwrap();
 
     if remove_queue {
-        save_channel_queue(provider, token_hash, channel_id, &[], None);
         intervention_queue.remove(&channel_id);
+        dispatch_role_overrides.remove(&channel_id);
+        save_channel_queue(provider, token_hash, channel_id, &[], None);
     } else if let Some(queue) = intervention_queue.get(&channel_id) {
         save_channel_queue(
             provider,
@@ -2334,7 +2344,7 @@ pub async fn run_bot(
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3469,16 +3479,20 @@ pub(super) async fn resolve_channel_category(
     (ch_name, cat_name)
 }
 
-pub(in crate::services::discord) async fn validate_live_channel_routing(
+pub(in crate::services::discord) async fn validate_live_channel_routing_with_dm_hint(
     ctx: &serenity::prelude::Context,
     provider: &ProviderKind,
     settings: &DiscordBotSettings,
     channel_id: serenity::model::id::ChannelId,
+    is_dm_hint: Option<bool>,
 ) -> Result<(), settings::BotChannelRoutingGuardFailure> {
-    let is_dm = matches!(
-        channel_id.to_channel(&ctx.http).await,
-        Ok(serenity::model::channel::Channel::Private(_))
-    );
+    let is_dm = match is_dm_hint {
+        Some(is_dm) => is_dm,
+        None => matches!(
+            channel_id.to_channel(&ctx.http).await,
+            Ok(serenity::model::channel::Channel::Private(_))
+        ),
+    };
     let (channel_name, _) = resolve_channel_category(ctx, channel_id).await;
     let (effective_channel_id, effective_channel_name) = if let Some((parent_id, parent_name)) =
         resolve_thread_parent(&ctx.http, channel_id).await
@@ -3494,6 +3508,15 @@ pub(in crate::services::discord) async fn validate_live_channel_routing(
         effective_channel_name.as_deref(),
         is_dm,
     )
+}
+
+pub(in crate::services::discord) async fn validate_live_channel_routing(
+    ctx: &serenity::prelude::Context,
+    provider: &ProviderKind,
+    settings: &DiscordBotSettings,
+    channel_id: serenity::model::id::ChannelId,
+) -> Result<(), settings::BotChannelRoutingGuardFailure> {
+    validate_live_channel_routing_with_dm_hint(ctx, provider, settings, channel_id, None).await
 }
 
 pub(super) async fn provider_handles_channel(
@@ -3652,12 +3675,12 @@ fn enrich_role_map_with_channel_ids() {
 mod tests {
     use super::ChannelId;
     use super::{
-        allows_nonlocal_session_path, choose_restore_channel_name,
+        DiscordBotSettings, allows_nonlocal_session_path, choose_restore_channel_name,
         is_synthetic_thread_channel_name, select_restored_session_path, session_path_is_usable,
-        synthetic_thread_channel_name, user_is_authorized, DiscordBotSettings,
+        synthetic_thread_channel_name, user_is_authorized,
     };
     use crate::services::discord::settings::{
-        validate_bot_channel_routing, BotChannelRoutingGuardFailure,
+        BotChannelRoutingGuardFailure, validate_bot_channel_routing,
     };
     use crate::services::provider::ProviderKind;
 
@@ -3786,11 +3809,11 @@ mod tests {
     // ─── Pending queue isolation tests ───────────────────────────────────────
 
     use super::{
-        load_pending_queues, requeue_intervention_front_persisted, save_channel_queue,
-        save_pending_queues, take_next_soft_intervention_persisted, Intervention, InterventionMode,
-        PendingQueueItem,
+        Intervention, InterventionMode, PendingQueueItem, load_pending_queues,
+        requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
+        take_next_soft_intervention_persisted,
     };
-    use crate::services::discord::runtime_store::lock_test_env;
+    use crate::services::discord::runtime_store::test_env_lock;
     use serenity::model::id::{MessageId, UserId};
     use std::time::Instant;
 
@@ -3809,7 +3832,7 @@ mod tests {
     /// Queue files must land under `{provider}/{token_hash}/` — not the legacy flat path.
     #[test]
     fn pending_queue_path_uses_token_hash() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -3851,7 +3874,7 @@ mod tests {
     /// Bot A writes a queue; Bot B (different token_hash) must not see it on load.
     #[test]
     fn load_pending_queues_only_reads_own_namespace() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -3882,7 +3905,7 @@ mod tests {
     /// save_pending_queues + load_pending_queues round-trip with token_hash namespacing.
     #[test]
     fn save_pending_queues_roundtrip() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -3923,7 +3946,7 @@ mod tests {
 
     #[test]
     fn persisted_queue_helpers_keep_remaining_items_and_restore_requeued_item() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4018,7 +4041,7 @@ mod tests {
     /// must not collide — the namespace key is token_hash, not agent.
     #[test]
     fn agent_empty_or_duplicate_does_not_collide_namespace() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4043,7 +4066,7 @@ mod tests {
     /// This ensures dispatch_role_overrides are not lost on restart.
     #[test]
     fn review_thread_override_preserved_across_restart() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4076,7 +4099,7 @@ mod tests {
     /// P2: save_pending_queues captures dispatch_role_overrides into override_channel_id.
     #[test]
     fn save_pending_queues_captures_dispatch_role_overrides() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4112,7 +4135,7 @@ mod tests {
     /// by load_pending_queues, which only reads from the token_hash subdirectory.
     #[test]
     fn legacy_flat_queue_file_is_not_restored() {
-        let _lock = lock_test_env();
+        let _lock = test_env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 

@@ -8,11 +8,11 @@ mod tmux_runtime;
 #[cfg(test)]
 mod tests;
 
-use super::handoff::{save_handoff, HandoffRecord};
-use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
+use super::handoff::{HandoffRecord, save_handoff};
+use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
 use crate::services::memory::{
-    build_memory_backend, resolve_memory_role_id, resolve_memory_session_id, CaptureRequest,
+    CaptureRequest, build_memory_backend, resolve_memory_role_id, resolve_memory_session_id,
 };
 use crate::services::provider::cancel_requested;
 #[cfg(unix)]
@@ -1453,10 +1453,11 @@ pub(super) fn spawn_turn_bridge(
             } else if let (Some(ctx), Some(owner), Some(tok)) =
                 (serenity_ctx.as_ref(), request_owner, token.as_deref())
             {
+                let bot_owner_provider = super::resolve_discord_bot_provider(tok);
                 let settings_snapshot = shared_owned.settings.read().await.clone();
                 if let Err(reason) = super::validate_live_channel_routing(
                     ctx,
-                    &provider,
+                    &bot_owner_provider,
                     &settings_snapshot,
                     channel_id,
                 )
@@ -1471,7 +1472,7 @@ pub(super) fn spawn_turn_bridge(
                     let next_intervention = {
                         let mut data = shared_owned.core.lock().await;
                         super::take_next_soft_intervention_persisted(
-                            &provider,
+                            &bot_owner_provider,
                             &shared_owned.token_hash,
                             channel_id,
                             &mut data.intervention_queue,
@@ -1504,7 +1505,7 @@ pub(super) fn spawn_turn_bridge(
                             println!("  [{ts}]   ⚠ queued command failed: {e}");
                             let mut data = shared_owned.core.lock().await;
                             super::requeue_intervention_front_persisted(
-                                &provider,
+                                &bot_owner_provider,
                                 &shared_owned.token_hash,
                                 channel_id,
                                 &mut data.intervention_queue,
@@ -1529,20 +1530,20 @@ pub(super) fn spawn_turn_bridge(
                 }
                 // Deferred drain: wait briefly then kickoff idle queues using cached context
                 let shared_for_drain = shared_owned.clone();
-                let provider_for_drain = provider.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     if let (Some(ctx), Some(tok)) = (
                         shared_for_drain.cached_serenity_ctx.get(),
                         shared_for_drain.cached_bot_token.get(),
                     ) {
+                        let bot_owner_provider = super::resolve_discord_bot_provider(tok);
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] 🚀 Deferred drain: kicking off idle queues");
                         super::kickoff_idle_queues(
                             ctx,
                             &shared_for_drain,
                             tok,
-                            &provider_for_drain,
+                            &bot_owner_provider,
                         )
                         .await;
                     } else {

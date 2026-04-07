@@ -195,9 +195,15 @@ pub(in crate::services::discord) async fn handle_event(
                 .map(|(parent_id, _)| parent_id)
                 .unwrap_or(channel_id);
             let settings_snapshot = { data.shared.settings.read().await.clone() };
-            if validate_live_channel_routing(ctx, &data.provider, &settings_snapshot, channel_id)
-                .await
-                .is_err()
+            if validate_live_channel_routing_with_dm_hint(
+                ctx,
+                &data.provider,
+                &settings_snapshot,
+                channel_id,
+                Some(new_message.guild_id.is_none()),
+            )
+            .await
+            .is_err()
             {
                 return Ok(());
             }

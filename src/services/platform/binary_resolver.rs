@@ -369,7 +369,6 @@ fn windows_provider_subdirs(_provider: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-
 fn standard_fallback_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -724,7 +723,6 @@ mod tests {
             }
         }
     }
-
 
     #[cfg(unix)]
     #[test]
