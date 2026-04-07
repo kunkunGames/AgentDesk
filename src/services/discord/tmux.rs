@@ -212,7 +212,16 @@ pub(super) async fn start_restart_handoff_from_state(
             mode: super::InterventionMode::Soft,
             created_at: std::time::Instant::now(),
         });
-        super::save_channel_queue(provider_kind, &shared.token_hash, channel_id, queue);
+        super::save_channel_queue(
+            provider_kind,
+            &shared.token_hash,
+            channel_id,
+            queue,
+            shared
+                .dispatch_role_overrides
+                .get(&channel_id)
+                .map(|r| r.value().get()),
+        );
         let ts = chrono::Local::now().format("%H:%M:%S");
         println!(
             "  [{ts}] ↻ watcher death recovery: queued fallback handoff for channel {}",

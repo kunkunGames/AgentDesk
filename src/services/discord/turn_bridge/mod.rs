@@ -8,11 +8,11 @@ mod tmux_runtime;
 #[cfg(test)]
 mod tests;
 
-use super::handoff::{save_handoff, HandoffRecord};
-use super::restart_report::{clear_restart_report, save_restart_report, RestartCompletionReport};
+use super::handoff::{HandoffRecord, save_handoff};
+use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
 use crate::services::memory::{
-    build_memory_backend, resolve_memory_role_id, resolve_memory_session_id, CaptureRequest,
+    CaptureRequest, build_memory_backend, resolve_memory_role_id, resolve_memory_session_id,
 };
 use crate::services::provider::cancel_requested;
 #[cfg(unix)]
@@ -1461,10 +1461,11 @@ pub(super) fn spawn_turn_bridge(
             } else if let (Some(ctx), Some(owner), Some(tok)) =
                 (serenity_ctx.as_ref(), request_owner, token.as_deref())
             {
+                let bot_owner_provider = super::resolve_discord_bot_provider(tok);
                 let settings_snapshot = shared_owned.settings.read().await.clone();
                 if let Err(reason) = super::validate_live_channel_routing(
                     ctx,
-                    &provider,
+                    &bot_owner_provider,
                     &settings_snapshot,
                     channel_id,
                 )
@@ -1479,7 +1480,7 @@ pub(super) fn spawn_turn_bridge(
                     let next_intervention = {
                         let mut data = shared_owned.core.lock().await;
                         super::take_next_soft_intervention_persisted(
-                            &provider,
+                            &bot_owner_provider,
                             &shared_owned.token_hash,
                             channel_id,
                             &mut data.intervention_queue,
@@ -1512,7 +1513,7 @@ pub(super) fn spawn_turn_bridge(
                             println!("  [{ts}]   ⚠ queued command failed: {e}");
                             let mut data = shared_owned.core.lock().await;
                             super::requeue_intervention_front_persisted(
-                                &provider,
+                                &bot_owner_provider,
                                 &shared_owned.token_hash,
                                 channel_id,
                                 &mut data.intervention_queue,
