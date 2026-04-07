@@ -16,6 +16,7 @@ use super::formatting::normalize_allowed_tools;
 use super::org_schema;
 use super::role_map::{
     is_known_agent as is_known_agent_from_role_map,
+    list_registered_channel_bindings as list_registered_channel_bindings_from_role_map,
     load_peer_agents as load_peer_agents_from_role_map,
     load_shared_prompt_path as load_shared_prompt_path_from_role_map,
     resolve_role_binding as resolve_role_binding_from_role_map,
@@ -77,6 +78,13 @@ pub(crate) struct RoleBinding {
     /// Whether this role may see peer-agent handoff guidance in the system prompt.
     pub peer_agents_enabled: bool,
     pub memory: ResolvedMemorySettings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredChannelBinding {
+    pub channel_id: u64,
+    pub owner_provider: ProviderKind,
+    pub fallback_name: Option<String>,
 }
 
 const DEFAULT_MEMORY_RECALL_TIMEOUT_MS: u64 = 500;
@@ -492,6 +500,13 @@ pub(super) fn resolve_role_binding(
         }
     }
     resolve_role_binding_from_role_map(channel_id, channel_name)
+}
+
+pub(crate) fn list_registered_channel_bindings() -> Vec<RegisteredChannelBinding> {
+    if org_schema::org_schema_exists() {
+        return org_schema::list_registered_channel_bindings();
+    }
+    list_registered_channel_bindings_from_role_map()
 }
 
 /// Resolve workspace path from role_map.json (or org.yaml) for a given channel.
@@ -1054,10 +1069,10 @@ mod tests {
     use super::{
         BotChannelRoutingGuardFailure, bot_settings_allow_agent, bot_settings_allow_channel,
         channel_supports_provider, discord_token_hash, load_bot_settings,
-        load_discord_bot_launch_configs, load_peer_agents, render_peer_agent_guidance,
-        resolve_memory_settings, resolve_role_binding, save_bot_settings,
-        validate_bot_channel_routing, validate_bot_channel_routing_with_provider_channel,
-        load_narrate_progress, validate_bot_channel_routing,
+        load_discord_bot_launch_configs, load_narrate_progress, load_peer_agents,
+        render_peer_agent_guidance, resolve_memory_settings, resolve_role_binding,
+        save_bot_settings, validate_bot_channel_routing,
+        validate_bot_channel_routing_with_provider_channel,
     };
 
     fn with_temp_home<F>(f: F)
