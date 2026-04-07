@@ -185,6 +185,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
       channel.channel_name.toLowerCase().includes(query)
       || channel.channel_id.includes(query)
       || channel.owner_provider.toLowerCase().includes(query)
+      || `${channel.channel_name} (${channel.channel_id})`.toLowerCase().includes(query)
     );
   });
 

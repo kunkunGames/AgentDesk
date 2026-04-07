@@ -504,7 +504,10 @@ pub(super) fn resolve_role_binding(
 
 pub(crate) fn list_registered_channel_bindings() -> Vec<RegisteredChannelBinding> {
     if org_schema::org_schema_exists() {
-        return org_schema::list_registered_channel_bindings();
+        let bindings = org_schema::list_registered_channel_bindings();
+        if !bindings.is_empty() {
+            return bindings;
+        }
     }
     list_registered_channel_bindings_from_role_map()
 }
@@ -1068,10 +1071,10 @@ mod tests {
 
     use super::{
         BotChannelRoutingGuardFailure, bot_settings_allow_agent, bot_settings_allow_channel,
-        channel_supports_provider, discord_token_hash, load_bot_settings,
-        load_discord_bot_launch_configs, load_narrate_progress, load_peer_agents,
-        render_peer_agent_guidance, resolve_memory_settings, resolve_role_binding,
-        save_bot_settings, validate_bot_channel_routing,
+        channel_supports_provider, discord_token_hash, list_registered_channel_bindings,
+        load_bot_settings, load_discord_bot_launch_configs, load_narrate_progress,
+        load_peer_agents, render_peer_agent_guidance, resolve_memory_settings,
+        resolve_role_binding, save_bot_settings, validate_bot_channel_routing,
         validate_bot_channel_routing_with_provider_channel,
     };
 
@@ -1618,6 +1621,52 @@ mod tests {
                 false,
                 Some(&binding)
             ));
+        });
+    }
+
+    #[test]
+    fn test_list_registered_channel_bindings_falls_back_to_role_map_when_org_has_no_by_id() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "byChannelId": {
+                        "123": {
+                            "roleId": "family-routine",
+                            "promptFile": "/tmp/family-routine.prompt.md",
+                            "provider": "codex"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                settings_dir.join("org.yaml"),
+                r#"
+version: 1
+name: AgentDesk
+agents:
+  codex:
+    display_name: Codex
+    provider: codex
+channels:
+  by_name:
+    enabled: true
+    mappings:
+      test-channel:
+        agent: codex
+"#,
+            )
+            .unwrap();
+
+            let bindings = list_registered_channel_bindings();
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].channel_id, 123);
+            assert_eq!(bindings[0].owner_provider, ProviderKind::Codex);
         });
     }
 
