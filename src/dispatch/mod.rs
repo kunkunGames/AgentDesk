@@ -2780,4 +2780,42 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    #[test]
+    fn review_context_rejects_commitless_completed_work_when_repo_root_is_dirty() {
+        let db = test_db();
+        seed_card(&db, "card-review-dirty-completion", "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        std::fs::write(repo.path().join("tracked.txt"), "baseline\n").unwrap();
+        run_git(repo_dir, &["add", "tracked.txt"]);
+        run_git(repo_dir, &["commit", "-m", "feat: add tracked file"]);
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-dirty-completion', 'card-review-dirty-completion', 'agent-1', 'implementation', 'completed',
+                'Implemented without commit', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({}).to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = build_review_context(&db, "card-review-dirty-completion", "agent-1", &json!({}))
+            .expect_err("dirty repo root must block fallback after commitless completion");
+
+        assert!(
+            err.to_string()
+                .contains("repo-root HEAD fallback is unsafe while tracked changes exist"),
+            "unexpected error: {err:#}"
+        );
+    }
 }
