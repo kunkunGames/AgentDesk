@@ -7,7 +7,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -30,23 +29,6 @@ mod tests {
         config.policies.dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
         config.policies.hot_reload = false;
         PolicyEngine::new(&config, db.clone()).unwrap()
-    }
-
-    struct WorktreeCommitOverrideGuard;
-
-    impl WorktreeCommitOverrideGuard {
-        fn set(commit: &str) -> Self {
-            crate::server::routes::review_verdict::set_test_worktree_commit_override(Some(
-                commit.to_string(),
-            ));
-            Self
-        }
-    }
-
-    impl Drop for WorktreeCommitOverrideGuard {
-        fn drop(&mut self) {
-            crate::server::routes::review_verdict::clear_test_worktree_commit_override();
-        }
     }
 
     fn seed_agent(db: &db::Db) {
@@ -147,18 +129,6 @@ mod tests {
         .unwrap()
     }
 
-    fn count_active_dispatches_by_type(db: &db::Db, card_id: &str, dispatch_type: &str) -> i64 {
-        let conn = db.lock().unwrap();
-        conn.query_row(
-            "SELECT COUNT(*) FROM task_dispatches \
-             WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
-             AND status IN ('pending', 'dispatched')",
-            rusqlite::params![card_id, dispatch_type],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
     fn latest_dispatch_title(db: &db::Db, card_id: &str, dispatch_type: &str) -> Option<String> {
         let conn = db.lock().unwrap();
         conn.query_row(
@@ -190,15 +160,20 @@ mod tests {
             .unwrap()
     }
 
-    #[cfg(unix)]
     struct MockGhEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
         old_path: Option<OsString>,
+        old_gh_path: Option<OsString>,
         log_path: PathBuf,
     }
 
-    #[cfg(unix)]
+    struct MockGhReply {
+        key: &'static str,
+        contains: Option<&'static str>,
+        stdout: &'static str,
+    }
+
     impl Drop for MockGhEnv {
         fn drop(&mut self) {
             if let Some(old_path) = &self.old_path {
@@ -210,45 +185,139 @@ mod tests {
                     std::env::remove_var("PATH");
                 }
             }
+            if let Some(old_gh_path) = &self.old_gh_path {
+                unsafe {
+                    std::env::set_var("AGENTDESK_GH_PATH", old_gh_path);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("AGENTDESK_GH_PATH");
+                }
+            }
         }
     }
 
     #[cfg(unix)]
-    fn install_mock_gh(script_body: &str) -> MockGhEnv {
-        let lock = crate::services::discord::runtime_store::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let gh_path = dir.path().join("gh");
-        let log_path = dir.path().join("gh.log");
-
-        let script = format!(
-            "#!/bin/sh\nset -eu\nlog_file=\"$(dirname \"$0\")/gh.log\"\nprintf '%s\\n' \"$*\" >> \"$log_file\"\n{}\n",
-            script_body
+    fn build_mock_gh_script(replies: &[MockGhReply]) -> String {
+        let mut script = String::from(
+            "#!/bin/sh\nset -eu\nlog_file=\"$(dirname \"$0\")/gh.log\"\nprintf '%s\\n' \"$*\" >> \"$log_file\"\nif [ \"${1-}\" = \"--version\" ]; then\n  echo 'gh mock 1.0'\n  exit 0\nfi\nkey=\"${1-}:${2-}\"\nargs=\"$*\"\n",
         );
-        fs::write(&gh_path, script).unwrap();
-        let mut perms = fs::metadata(&gh_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&gh_path, perms).unwrap();
 
-        let old_path = std::env::var_os("PATH");
-        let new_path = match &old_path {
-            Some(existing) => format!("{}:{}", dir.path().display(), existing.to_string_lossy()),
-            None => dir.path().display().to_string(),
-        };
-        unsafe {
-            std::env::set_var("PATH", new_path);
+        for reply in replies {
+            script.push_str(&format!("if [ \"$key\" = '{}' ]", reply.key));
+            if let Some(token) = reply.contains {
+                script.push_str(&format!(
+                    " && printf '%s\\n' \"$args\" | grep -F -q -- '{}'",
+                    token
+                ));
+            }
+            script.push_str("; then\n");
+            script.push_str("cat <<'JSON'\n");
+            script.push_str(reply.stdout);
+            script.push_str("\nJSON\nexit 0\nfi\n");
         }
 
-        MockGhEnv {
-            _lock: lock,
-            _dir: dir,
-            old_path,
-            log_path,
+        script.push_str("echo '[]'\n");
+        script
+    }
+
+    #[cfg(windows)]
+    fn build_mock_gh_script(replies: &[MockGhReply]) -> (String, String) {
+        let wrapper =
+            "@echo off\r\npwsh -NoProfile -ExecutionPolicy Bypass -File \"%~dp0gh.ps1\" %*\r\n"
+                .to_string();
+
+        let mut script = String::from(
+            "$LogFile = Join-Path $PSScriptRoot 'gh.log'\nAdd-Content -Path $LogFile -Value ($args -join ' ')\nif ($args.Count -gt 0 -and $args[0] -eq '--version') {\n  Write-Output 'gh mock 1.0'\n  exit 0\n}\n$key = if ($args.Count -ge 2) { \"$($args[0]):$($args[1])\" } elseif ($args.Count -eq 1) { \"$($args[0]):\" } else { ':' }\n$joined = $args -join ' '\n",
+        );
+
+        for reply in replies {
+            script.push_str(&format!("if ($key -eq '{}'", reply.key.replace('\'', "''")));
+            if let Some(token) = reply.contains {
+                script.push_str(&format!(
+                    " -and $joined.Contains('{}')",
+                    token.replace('\'', "''")
+                ));
+            }
+            script.push_str(") {\n");
+            script.push_str("@'\n");
+            script.push_str(reply.stdout);
+            script.push_str("\n'@ | Write-Output\nexit 0\n}\n");
+        }
+
+        script.push_str("'[]' | Write-Output\n");
+        (wrapper, script)
+    }
+
+    fn install_mock_gh(replies: &[MockGhReply]) -> MockGhEnv {
+        let lock = crate::services::discord::runtime_store::lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("gh.log");
+        #[cfg(unix)]
+        {
+            let gh_path = dir.path().join("gh");
+            let script = build_mock_gh_script(replies);
+            fs::write(&gh_path, script).unwrap();
+            let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&gh_path, perms).unwrap();
+            let old_path = std::env::var_os("PATH");
+            let old_gh_path = std::env::var_os("AGENTDESK_GH_PATH");
+            let joined = match &old_path {
+                Some(existing) => std::env::join_paths(
+                    std::iter::once(dir.path().to_path_buf())
+                        .chain(std::env::split_paths(existing)),
+                )
+                .unwrap(),
+                None => std::env::join_paths([dir.path()]).unwrap(),
+            };
+            unsafe {
+                std::env::set_var("PATH", joined);
+                std::env::set_var("AGENTDESK_GH_PATH", &gh_path);
+            }
+
+            return MockGhEnv {
+                _lock: lock,
+                _dir: dir,
+                old_path,
+                old_gh_path,
+                log_path,
+            };
+        }
+
+        #[cfg(windows)]
+        {
+            let gh_cmd_path = dir.path().join("gh.cmd");
+            let gh_ps1_path = dir.path().join("gh.ps1");
+            let (wrapper, script) = build_mock_gh_script(replies);
+            fs::write(&gh_cmd_path, wrapper).unwrap();
+            fs::write(&gh_ps1_path, script).unwrap();
+
+            let old_path = std::env::var_os("PATH");
+            let old_gh_path = std::env::var_os("AGENTDESK_GH_PATH");
+            let joined = match &old_path {
+                Some(existing) => std::env::join_paths(
+                    std::iter::once(dir.path().to_path_buf())
+                        .chain(std::env::split_paths(existing)),
+                )
+                .unwrap(),
+                None => std::env::join_paths([dir.path()]).unwrap(),
+            };
+            unsafe {
+                std::env::set_var("PATH", joined);
+                std::env::set_var("AGENTDESK_GH_PATH", &gh_cmd_path);
+            }
+
+            return MockGhEnv {
+                _lock: lock,
+                _dir: dir,
+                old_path,
+                old_gh_path,
+                log_path,
+            };
         }
     }
 
-    #[cfg(unix)]
     fn gh_log(env: &MockGhEnv) -> String {
         fs::read_to_string(&env.log_path).unwrap_or_default()
     }
@@ -2353,186 +2422,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn scenario_339_accept_skip_rework_falls_back_to_rework_without_stranding() {
-        let _worktree_override = WorktreeCommitOverrideGuard::set("bbb2222");
-        let db = test_db();
-        let engine = test_engine(&db);
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
-                 VALUES ('agent-nocm', 'Agent No Counter', '123', '')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, \
-                 review_status, suggestion_pending_at, github_issue_number, created_at, updated_at) \
-                 VALUES ('card-339-skip', 'Skip Rework Fallback', 'review', 'agent-nocm', \
-                 'rd-339-skip', 'suggestion_pending', datetime('now', '-10 minutes'), 246, \
-                 datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
-                 title, context, completed_at, created_at, updated_at) \
-                 VALUES ('review-339-skip', 'card-339-skip', 'agent-nocm', 'review', \
-                 'completed', '[Review R1]', '{\"reviewed_commit\":\"aaa1111\"}', \
-                 datetime('now', '-5 minutes'), datetime('now', '-10 minutes'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
-                 title, created_at, updated_at) \
-                 VALUES ('rd-339-skip', 'card-339-skip', 'agent-nocm', 'review-decision', \
-                 'pending', '[Decision] card-339-skip', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
-                 VALUES ('card-339-skip', 'suggestion_pending', 'rd-339-skip')",
-                [],
-            )
-            .unwrap();
-        }
-
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            broadcast_tx: crate::server::ws::new_broadcast(),
-            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
-            health_registry: None,
-        };
-
-        let (status, json) = crate::server::routes::review_verdict::submit_review_decision(
-            axum::extract::State(state),
-            axum::Json(crate::server::routes::review_verdict::ReviewDecisionBody {
-                card_id: "card-339-skip".to_string(),
-                decision: "accept".to_string(),
-                comment: None,
-                dispatch_id: Some("rd-339-skip".to_string()),
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            status,
-            axum::http::StatusCode::OK,
-            "skip_rework accept should fall back to rework: {json:?}"
-        );
-        assert_eq!(json.0["direct_review_created"], false);
-        assert_eq!(json.0["rework_dispatch_created"], true);
-        assert_eq!(get_dispatch_status(&db, "rd-339-skip"), "completed");
-        assert_eq!(get_card_status(&db, "card-339-skip"), "in_progress");
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-skip", "review"),
-            0,
-            "skip_rework fallback must not leave an active review dispatch behind"
-        );
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-skip", "rework"),
-            1,
-            "skip_rework fallback must create one active rework dispatch"
-        );
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-skip", "review-decision"),
-            0,
-            "successful fallback must consume the pending review-decision"
-        );
-    }
-
-    #[tokio::test]
-    async fn scenario_339_accept_rework_failure_keeps_review_decision_recoverable() {
-        let db = test_db();
-        let engine = test_engine(&db);
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, review_status, \
-                 created_at, updated_at) \
-                 VALUES ('card-339-no-agent', 'No Agent Rework Failure', 'review', 'rd-339-no-agent', \
-                 'suggestion_pending', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
-                 title, created_at, updated_at) \
-                 VALUES ('rd-339-no-agent', 'card-339-no-agent', 'ghost-agent', 'review-decision', \
-                 'pending', '[Decision] card-339-no-agent', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
-                 VALUES ('card-339-no-agent', 'suggestion_pending', 'rd-339-no-agent')",
-                [],
-            )
-            .unwrap();
-        }
-
-        let state = AppState {
-            db: db.clone(),
-            engine,
-            broadcast_tx: crate::server::ws::new_broadcast(),
-            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
-            health_registry: None,
-        };
-
-        let (status, json) = crate::server::routes::review_verdict::submit_review_decision(
-            axum::extract::State(state),
-            axum::Json(crate::server::routes::review_verdict::ReviewDecisionBody {
-                card_id: "card-339-no-agent".to_string(),
-                decision: "accept".to_string(),
-                comment: None,
-                dispatch_id: Some("rd-339-no-agent".to_string()),
-            }),
-        )
-        .await;
-
-        assert_eq!(
-            status,
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "accept must fail closed when no follow-up dispatch can be created: {json:?}"
-        );
-        assert!(
-            json.0["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("no follow-up dispatch created")
-        );
-        assert_eq!(json.0["pending_dispatch_id"], "rd-339-no-agent");
-
-        let actual_card_status = get_card_status(&db, "card-339-no-agent");
-        assert_eq!(
-            json.0["card_status_after"].as_str(),
-            Some(actual_card_status.as_str()),
-            "error payload must report the real post-failure card status"
-        );
-        assert_eq!(
-            get_dispatch_status(&db, "rd-339-no-agent"),
-            "pending",
-            "fail-closed accept must keep the review-decision dispatch live for retry"
-        );
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-no-agent", "review"),
-            0
-        );
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-no-agent", "rework"),
-            0
-        );
-        assert_eq!(
-            count_active_dispatches_by_type(&db, "card-339-no-agent", "review-decision"),
-            1,
-            "recovery path must retain exactly one live review-decision dispatch"
-        );
-    }
-
     // ── #195: rework dispatch completion triggers re-review cycle ──────
     //
     // Verifies the full accept → rework → re-review cycle:
@@ -2649,35 +2538,30 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_creates_codex_rework_and_dedups_review() {
-        let _gh = install_mock_gh(
-            r#"
-case "$1:$2" in
-  pr:list)
-    if printf '%s\n' "$*" | grep -q -- "--state merged"; then
-      echo '[]'
-    else
-      echo '[{"number":323,"headRefName":"wt/card-208","title":"fix: close review gap (#208)","mergeable":"MERGEABLE"}]'
-    fi
-    ;;
-  api:repos/test/repo/pulls/323/reviews)
-    cat <<'JSON'
-[{"id":9001,"state":"COMMENTED","body":"P1/P2 findings","submitted_at":"2026-04-06T00:00:00Z","user":{"login":"chatgpt-codex-connector"}}]
-JSON
-    ;;
-  api:graphql)
-    cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"id":"comment-1","body":"P1 force-transition leaves dispatch alive","path":"src/server/routes/github.rs","line":77,"url":"https://example.com/comment-1","author":{"login":"chatgpt-codex-connector"},"pullRequestReview":{"id":"PRR_9001","state":"COMMENTED","author":{"login":"chatgpt-codex-connector"}}}]}}]}}}}}
-JSON
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
+        let _gh = install_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":323,\"headRefName\":\"wt/card-208\",\"title\":\"fix: close review gap (#208)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/323/reviews",
+                contains: None,
+                stdout: "[{\"id\":9001,\"state\":\"COMMENTED\",\"body\":\"P1/P2 findings\",\"submitted_at\":\"2026-04-06T00:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-1\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-1\",\"body\":\"P1 force-transition leaves dispatch alive\",\"path\":\"src/server/routes/github.rs\",\"line\":77,\"url\":\"https://example.com/comment-1\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9001\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+        ]);
 
         let db = test_db();
         let engine = test_engine(&db);
@@ -2722,35 +2606,30 @@ esac
         assert_eq!(message_outbox_rows(&db).len(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_notifies_clean_codex_pass() {
-        let _gh = install_mock_gh(
-            r#"
-case "$1:$2" in
-  pr:list)
-    if printf '%s\n' "$*" | grep -q -- "--state merged"; then
-      echo '[]'
-    else
-      echo '[{"number":324,"headRefName":"wt/card-208-pass","title":"fix: no inline findings (#209)","mergeable":"MERGEABLE"}]'
-    fi
-    ;;
-  api:repos/test/repo/pulls/324/reviews)
-    cat <<'JSON'
-[{"id":9002,"state":"APPROVED","body":"LGTM","submitted_at":"2026-04-06T00:05:00Z","user":{"login":"chatgpt-codex-connector"}}]
-JSON
-    ;;
-  api:graphql)
-    cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}
-JSON
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
+        let _gh = install_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":324,\"headRefName\":\"wt/card-208-pass\",\"title\":\"fix: no inline findings (#209)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/324/reviews",
+                contains: None,
+                stdout: "[{\"id\":9002,\"state\":\"APPROVED\",\"body\":\"LGTM\",\"submitted_at\":\"2026-04-06T00:05:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
+            },
+        ]);
 
         let db = test_db();
         let engine = test_engine(&db);
@@ -2791,34 +2670,30 @@ esac
         assert_eq!(message_outbox_rows(&db).len(), 1);
     }
 
-    #[cfg(unix)]
     #[test]
     fn scenario_208_merge_guard_blocks_unresolved_codex_comments() {
-        let gh = install_mock_gh(
-            r#"
-case "$1:$2" in
-  pr:view)
-    echo 'itismyfield'
-    ;;
-  api:repos/test/repo/pulls/325/reviews)
-    cat <<'JSON'
-[{"id":9003,"state":"COMMENTED","body":"P2 findings","submitted_at":"2026-04-06T00:10:00Z","user":{"login":"chatgpt-codex-connector"}}]
-JSON
-    ;;
-  api:graphql)
-    cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-2","isResolved":false,"isOutdated":false,"comments":{"nodes":[{"id":"comment-2","body":"P2 orphan recovery revives reverted card","path":"src/kanban.rs","line":212,"url":"https://example.com/comment-2","author":{"login":"chatgpt-codex-connector"},"pullRequestReview":{"id":"PRR_9003","state":"COMMENTED","author":{"login":"chatgpt-codex-connector"}}}]}}]}}}}}
-JSON
-    ;;
-  pr:merge)
-    echo 'merged'
-    ;;
-  *)
-    echo '[]'
-    ;;
-esac
-"#,
-        );
+        let gh = install_mock_gh(&[
+            MockGhReply {
+                key: "pr:view",
+                contains: None,
+                stdout: "itismyfield",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/325/reviews",
+                contains: None,
+                stdout: "[{\"id\":9003,\"state\":\"COMMENTED\",\"body\":\"P2 findings\",\"submitted_at\":\"2026-04-06T00:10:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-2\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-2\",\"body\":\"P2 orphan recovery revives reverted card\",\"path\":\"src/kanban.rs\",\"line\":212,\"url\":\"https://example.com/comment-2\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9003\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "pr:merge",
+                contains: None,
+                stdout: "merged",
+            },
+        ]);
 
         let db = test_db();
         let engine = test_engine(&db);

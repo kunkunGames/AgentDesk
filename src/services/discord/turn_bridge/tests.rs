@@ -5,7 +5,6 @@ use super::completion_guard::{
 use super::context_window::{
     persisted_context_tokens, resolve_done_response, total_context_tokens,
 };
-use super::spawn_memory_capture_task;
 use super::retry_state::{
     clear_local_session_state, handle_gemini_retry_boundary, reset_gemini_retry_attempt_state,
     should_reset_gemini_retry_attempt_state,
@@ -45,9 +44,7 @@ fn set_mem0_env(
     Option<std::ffi::OsString>,
     Option<std::ffi::OsString>,
 ) {
-    let guard = crate::services::discord::runtime_store::test_env_lock()
-        .lock()
-        .unwrap();
+    let guard = crate::services::discord::runtime_store::lock_test_env();
     let prev_api_key = std::env::var_os("MEM0_API_KEY");
     let prev_base_url = std::env::var_os("MEM0_BASE_URL");
     unsafe {

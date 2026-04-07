@@ -1445,30 +1445,25 @@ fn remove_legacy_path(path: &Path) -> Result<(), String> {
 fn remove_link_or_path(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path)
         .map_err(|e| format!("Failed to stat '{}': {e}", path.display()))?;
-    if meta.is_dir() && !meta.file_type().is_symlink() {
-        fs::remove_dir_all(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
-    } else {
+    if meta.file_type().is_symlink() {
         #[cfg(windows)]
         {
-            match fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(file_err) if meta.file_type().is_symlink() => {
-                    fs::remove_dir(path).map_err(|dir_err| {
-                        format!(
-                            "Failed to remove '{}': {file_err}; fallback remove_dir also failed: {dir_err}",
-                            path.display()
-                        )
-                    })
-                }
-                Err(file_err) => {
-                    Err(format!("Failed to remove '{}': {file_err}", path.display()))
-                }
+            if fs::metadata(path)
+                .map(|target| target.is_dir())
+                .unwrap_or(false)
+            {
+                return fs::remove_dir(path)
+                    .map_err(|e| format!("Failed to remove '{}': {e}", path.display()));
             }
         }
-        #[cfg(not(windows))]
-        {
-            fs::remove_file(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
-        }
+        return fs::remove_file(path)
+            .map_err(|e| format!("Failed to remove '{}': {e}", path.display()));
+    }
+
+    if meta.is_dir() {
+        fs::remove_dir_all(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
+    } else {
+        fs::remove_file(path).map_err(|e| format!("Failed to remove '{}': {e}", path.display()))
     }
 }
 
@@ -1497,9 +1492,9 @@ mod tests {
 
     impl TestHomeGuard {
         fn install(home: &Path, runtime_root: &Path) -> Self {
-            let lock = crate::services::discord::runtime_store::test_env_lock()
+            let lock = test_home_lock()
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(|poison| poison.into_inner());
             fs::create_dir_all(home).unwrap();
             set_test_home_dir_override(Some(home.to_path_buf()));
             let previous_runtime_root = std::env::var_os("AGENTDESK_ROOT_DIR");
@@ -1519,6 +1514,11 @@ mod tests {
                 None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
             }
         }
+    }
+
+    fn test_home_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[test]

@@ -369,7 +369,6 @@ fn windows_provider_subdirs(_provider: &str) -> Vec<PathBuf> {
     Vec::new()
 }
 
-
 fn standard_fallback_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -617,9 +616,7 @@ mod tests {
     use std::sync::MutexGuard;
 
     fn env_guard() -> MutexGuard<'static, ()> {
-        crate::services::discord::runtime_store::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::services::discord::runtime_store::lock_test_env()
     }
 
     #[cfg(unix)]
@@ -725,7 +722,6 @@ mod tests {
             }
         }
     }
-
 
     #[cfg(unix)]
     #[test]
