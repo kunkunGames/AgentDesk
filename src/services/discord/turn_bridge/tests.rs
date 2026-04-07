@@ -5,19 +5,19 @@ use super::completion_guard::{
 use super::context_window::{
     persisted_context_tokens, resolve_done_response, total_context_tokens,
 };
-use super::spawn_memory_capture_task;
 use super::retry_state::{
     clear_local_session_state, handle_gemini_retry_boundary, reset_gemini_retry_attempt_state,
     should_reset_gemini_retry_attempt_state,
 };
+use super::spawn_memory_capture_task;
 use super::stale_resume::{
     contains_stale_resume_error_text, output_file_has_stale_resume_error_after_offset,
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,
 };
 use super::tmux_runtime::should_resume_watcher_after_turn;
+use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
 use crate::services::discord::ChannelId;
 use crate::services::discord::InflightTurnState;
-use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
 use crate::services::memory::CaptureRequest;
 use crate::services::provider::ProviderKind;
 use std::io::Write;
@@ -44,9 +44,7 @@ fn set_mem0_env(
     Option<std::ffi::OsString>,
     Option<std::ffi::OsString>,
 ) {
-    let guard = crate::services::discord::runtime_store::test_env_lock()
-        .lock()
-        .unwrap();
+    let guard = crate::services::discord::runtime_store::lock_test_env();
     let prev_api_key = std::env::var_os("MEM0_API_KEY");
     let prev_base_url = std::env::var_os("MEM0_BASE_URL");
     unsafe {

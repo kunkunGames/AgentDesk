@@ -403,6 +403,7 @@ mod tests {
             DispatchProfile::ReviewLite,
             Some("review"),
             None,
+            None,
         );
 
         assert!(!prompt.contains("[Context Compression]"));
