@@ -30,6 +30,23 @@ mod tests {
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
 
+    struct WorktreeCommitOverrideGuard;
+
+    impl WorktreeCommitOverrideGuard {
+        fn set(commit: &str) -> Self {
+            crate::server::routes::review_verdict::set_test_worktree_commit_override(Some(
+                commit.to_string(),
+            ));
+            Self
+        }
+    }
+
+    impl Drop for WorktreeCommitOverrideGuard {
+        fn drop(&mut self) {
+            crate::server::routes::review_verdict::clear_test_worktree_commit_override();
+        }
+    }
+
     fn seed_agent(db: &db::Db) {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -122,6 +139,18 @@ mod tests {
         let conn = db.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = ?1 AND dispatch_type = ?2",
+            rusqlite::params![card_id, dispatch_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn count_active_dispatches_by_type(db: &db::Db, card_id: &str, dispatch_type: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM task_dispatches \
+             WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
+             AND status IN ('pending', 'dispatched')",
             rusqlite::params![card_id, dispatch_type],
             |row| row.get(0),
         )
@@ -2318,6 +2347,186 @@ mod tests {
             review_state.as_deref(),
             Some("rework_pending"),
             "#195: canonical review state must be 'rework_pending' after accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_339_accept_skip_rework_falls_back_to_rework_without_stranding() {
+        let _worktree_override = WorktreeCommitOverrideGuard::set("bbb2222");
+        let db = test_db();
+        let engine = test_engine(&db);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+                 VALUES ('agent-nocm', 'Agent No Counter', '123', '')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, \
+                 review_status, suggestion_pending_at, github_issue_number, created_at, updated_at) \
+                 VALUES ('card-339-skip', 'Skip Rework Fallback', 'review', 'agent-nocm', \
+                 'rd-339-skip', 'suggestion_pending', datetime('now', '-10 minutes'), 246, \
+                 datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+                 title, context, completed_at, created_at, updated_at) \
+                 VALUES ('review-339-skip', 'card-339-skip', 'agent-nocm', 'review', \
+                 'completed', '[Review R1]', '{\"reviewed_commit\":\"aaa1111\"}', \
+                 datetime('now', '-5 minutes'), datetime('now', '-10 minutes'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+                 title, created_at, updated_at) \
+                 VALUES ('rd-339-skip', 'card-339-skip', 'agent-nocm', 'review-decision', \
+                 'pending', '[Decision] card-339-skip', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
+                 VALUES ('card-339-skip', 'suggestion_pending', 'rd-339-skip')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+
+        let (status, json) = crate::server::routes::review_verdict::submit_review_decision(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::ReviewDecisionBody {
+                card_id: "card-339-skip".to_string(),
+                decision: "accept".to_string(),
+                comment: None,
+                dispatch_id: Some("rd-339-skip".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "skip_rework accept should fall back to rework: {json:?}"
+        );
+        assert_eq!(json.0["direct_review_created"], false);
+        assert_eq!(json.0["rework_dispatch_created"], true);
+        assert_eq!(get_dispatch_status(&db, "rd-339-skip"), "completed");
+        assert_eq!(get_card_status(&db, "card-339-skip"), "in_progress");
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-skip", "review"),
+            0,
+            "skip_rework fallback must not leave an active review dispatch behind"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-skip", "rework"),
+            1,
+            "skip_rework fallback must create one active rework dispatch"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-skip", "review-decision"),
+            0,
+            "successful fallback must consume the pending review-decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_339_accept_rework_failure_keeps_review_decision_recoverable() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, review_status, \
+                 created_at, updated_at) \
+                 VALUES ('card-339-no-agent', 'No Agent Rework Failure', 'review', 'rd-339-no-agent', \
+                 'suggestion_pending', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+                 title, created_at, updated_at) \
+                 VALUES ('rd-339-no-agent', 'card-339-no-agent', 'ghost-agent', 'review-decision', \
+                 'pending', '[Decision] card-339-no-agent', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO card_review_state (card_id, state, pending_dispatch_id) \
+                 VALUES ('card-339-no-agent', 'suggestion_pending', 'rd-339-no-agent')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let state = AppState {
+            db: db.clone(),
+            engine,
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+
+        let (status, json) = crate::server::routes::review_verdict::submit_review_decision(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::ReviewDecisionBody {
+                card_id: "card-339-no-agent".to_string(),
+                decision: "accept".to_string(),
+                comment: None,
+                dispatch_id: Some("rd-339-no-agent".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "accept must fail closed when no follow-up dispatch can be created: {json:?}"
+        );
+        assert!(
+            json.0["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no follow-up dispatch created")
+        );
+        assert_eq!(json.0["pending_dispatch_id"], "rd-339-no-agent");
+
+        let actual_card_status = get_card_status(&db, "card-339-no-agent");
+        assert_eq!(
+            json.0["card_status_after"].as_str(),
+            Some(actual_card_status.as_str()),
+            "error payload must report the real post-failure card status"
+        );
+        assert_eq!(
+            get_dispatch_status(&db, "rd-339-no-agent"),
+            "pending",
+            "fail-closed accept must keep the review-decision dispatch live for retry"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-no-agent", "review"),
+            0
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-no-agent", "rework"),
+            0
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-339-no-agent", "review-decision"),
+            1,
+            "recovery path must retain exactly one live review-decision dispatch"
         );
     }
 

@@ -16,14 +16,14 @@ fn test_worktree_commit_override_slot() -> &'static std::sync::Mutex<Option<Opti
 }
 
 #[cfg(test)]
-pub(super) fn set_test_worktree_commit_override(commit: Option<String>) {
+pub(crate) fn set_test_worktree_commit_override(commit: Option<String>) {
     if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
         *slot = Some(commit);
     }
 }
 
 #[cfg(test)]
-pub(super) fn clear_test_worktree_commit_override() {
+pub(crate) fn clear_test_worktree_commit_override() {
     if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
         *slot = None;
     }
