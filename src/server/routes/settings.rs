@@ -148,18 +148,11 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         None,
     ),
     (
-        "context_clear_percent",
-        "context",
-        "컨텍스트 clear 임계값 (%)",
-        "Context Clear Threshold (%)",
-        Some("40"),
-    ),
-    (
-        "context_clear_idle_minutes",
-        "context",
-        "컨텍스트 clear 유휴 시간 (분)",
-        "Context Clear Idle Time (min)",
-        Some("60"),
+        "narrate_progress",
+        "system",
+        "진행 상황 내레이션",
+        "Narrate Progress",
+        Some("true"),
     ),
 ];
 
@@ -392,6 +385,9 @@ mod tests {
 
         assert!(keys.contains("context_compact_percent_codex"));
         assert!(keys.contains("context_compact_percent_claude"));
+        assert!(keys.contains("narrate_progress"));
+        assert!(!keys.contains("context_clear_percent"));
+        assert!(!keys.contains("context_clear_idle_minutes"));
     }
 
     #[tokio::test]
@@ -404,11 +400,12 @@ mod tests {
             Json(json!({
                 "context_compact_percent_codex": "85",
                 "context_compact_percent_claude": "75",
+                "narrate_progress": false,
             })),
         )
         .await;
         assert_eq!(patch_status, StatusCode::OK);
-        assert_eq!(patch_body["updated"], json!(2));
+        assert_eq!(patch_body["updated"], json!(3));
         assert_eq!(patch_body["rejected"], json!([]));
 
         let (get_status, Json(get_body)) = get_config_entries(State(state)).await;
@@ -428,5 +425,24 @@ mod tests {
             values.get("context_compact_percent_claude"),
             Some(&Some("75"))
         );
+        assert_eq!(values.get("narrate_progress"), Some(&Some("false")));
+    }
+
+    #[test]
+    fn seed_config_defaults_inserts_narrate_progress_true() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        db::schema::migrate(&conn).unwrap();
+
+        seed_config_defaults(&conn);
+
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'narrate_progress'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "true");
     }
 }

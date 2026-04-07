@@ -1048,7 +1048,6 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_db() -> Db {
@@ -1890,8 +1889,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_completion_enqueues_notify_to_main_channel() {
+    #[tokio::test]
+    async fn run_completion_enqueues_notify_to_main_channel() {
         let db = test_db();
         ensure_auto_queue_tables(&db);
         let engine = test_engine(&db);
@@ -1931,6 +1930,31 @@ mod tests {
         let result =
             transition_status_with_opts(&db, &engine, "card-notify", "done", "review", true);
         assert!(result.is_ok(), "transition to done should succeed");
+
+        // onCardTerminal completes the run by calling the authoritative activate API.
+        // In this unit harness no localhost Axum server is listening, so invoke the
+        // route directly before asserting the persisted run status.
+        let state = crate::server::routes::AppState {
+            db: db.clone(),
+            engine: engine.clone(),
+            broadcast_tx: crate::server::ws::new_broadcast(),
+            batch_buffer: crate::server::ws::spawn_batch_flusher(crate::server::ws::new_broadcast()),
+            health_registry: None,
+        };
+        let (status, body) = crate::server::routes::auto_queue::activate(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-notify".to_string()),
+                repo: None,
+                agent_id: None,
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body.0["count"].as_u64(), Some(0));
 
         let conn = db.lock().unwrap();
         let run_status: String = conn

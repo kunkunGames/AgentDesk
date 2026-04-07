@@ -117,8 +117,7 @@ pub(super) fn save_all_last_message_ids(provider: &str, ids: &std::collections::
 /// All test modules must use this to avoid env var races.
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    crate::config::shared_test_env_lock()
 }
 
 pub(super) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {

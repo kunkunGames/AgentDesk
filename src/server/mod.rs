@@ -171,7 +171,7 @@ pub async fn run(
 /// 3 tiers to prevent slow sections from blocking time-critical recovery:
 /// - OnTick30s (30s): retry, unsent notification recovery, deadlock detection [I], orphan recovery [K]
 /// - OnTick1min (1m): non-critical timeouts [A][C][D][E][L], stale detection
-/// - OnTick5min (5m): non-critical reconciliation [R][B][F][G][H], context check
+/// - OnTick5min (5m): non-critical reconciliation [R][B][F][G][H][M][O], idle session cleanup
 /// - OnTick (legacy, 5m): backward compat for policies that only register onTick
 async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
     use std::time::Duration;

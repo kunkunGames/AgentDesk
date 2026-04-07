@@ -1149,6 +1149,9 @@ pub(super) async fn restore_inflight_turns(
             channel_name.as_deref(),
             last_path.as_deref(),
         );
+        let adk_thread_channel_id = adk_session_name
+            .as_deref()
+            .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name);
         post_adk_session_status(
             adk_session_key.as_deref(),
             adk_session_name.as_deref(),
@@ -1163,6 +1166,7 @@ pub(super) async fn restore_inflight_turns(
                 .await
                 .or_else(|| parse_dispatch_id(&state.user_text))
                 .as_deref(),
+            adk_thread_channel_id,
             shared.api_port,
         )
         .await;

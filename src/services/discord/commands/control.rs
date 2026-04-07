@@ -139,6 +139,7 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
             Some(0),
             None,
             None,
+            None,
             shared.api_port,
         )
         .await;

@@ -660,6 +660,9 @@ pub(super) fn spawn_turn_bridge(
                     None,
                     adk_cwd.as_deref(),
                     dispatch_id.as_deref(),
+                    adk_session_name.as_deref().and_then(
+                        crate::services::discord::adk_session::parse_thread_channel_id_from_name,
+                    ),
                     shared_owned.api_port,
                 )
                 .await;
@@ -713,6 +716,9 @@ pub(super) fn spawn_turn_bridge(
             persisted_context_tokens(accumulated_input_tokens, accumulated_output_tokens),
             adk_cwd.as_deref(),
             dispatch_id.as_deref(),
+            adk_session_name
+                .as_deref()
+                .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name),
             shared_owned.api_port,
         )
         .await;

@@ -1047,6 +1047,9 @@ pub(super) async fn tmux_output_watcher(
                     .get(&channel_id)
                     .and_then(|s| s.channel_name.clone())
             };
+            let thread_channel_id = channel_name
+                .as_deref()
+                .and_then(super::adk_session::parse_thread_channel_id_from_name);
             super::adk_session::post_adk_session_status(
                 session_key.as_deref(),
                 channel_name.as_deref(),
@@ -1057,6 +1060,7 @@ pub(super) async fn tmux_output_watcher(
                 Some(tokens),
                 None,
                 None,
+                thread_channel_id,
                 shared.api_port,
             )
             .await;
@@ -1190,6 +1194,9 @@ pub(super) async fn tmux_output_watcher(
                 .get(&channel_id)
                 .and_then(|s| s.channel_name.clone())
         };
+        let thread_channel_id = channel_name
+            .as_deref()
+            .and_then(super::adk_session::parse_thread_channel_id_from_name);
         super::adk_session::post_adk_session_status(
             session_key.as_deref(),
             channel_name.as_deref(),
@@ -1200,6 +1207,7 @@ pub(super) async fn tmux_output_watcher(
             None, // tokens
             None, // cwd
             None, // dispatch_id
+            thread_channel_id,
             api_port,
         )
         .await;
@@ -1839,6 +1847,8 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             let tmux_name = provider.build_tmux_session_name(&dc.channel_name);
             let hostname = crate::services::platform::hostname_short();
             let session_key = format!("{}:{}", hostname, tmux_name);
+            let thread_channel_id =
+                super::adk_session::parse_thread_channel_id_from_name(&dc.channel_name);
 
             super::adk_session::post_adk_session_status(
                 Some(&session_key),
@@ -1850,6 +1860,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 None,
                 None,
                 None,
+                thread_channel_id,
                 api_port,
             )
             .await;
@@ -2088,6 +2099,9 @@ pub(super) async fn reap_dead_tmux_sessions(shared: &Arc<SharedData>) {
                 None,
                 None,
                 None,
+                channel_name
+                    .as_deref()
+                    .and_then(super::adk_session::parse_thread_channel_id_from_name),
                 api_port,
             )
             .await;

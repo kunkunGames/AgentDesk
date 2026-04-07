@@ -2454,6 +2454,7 @@ pub struct ReopenBody {
     pub review_status: Option<String>,
     pub dispatch_type: Option<String>,
     pub reason: Option<String>,
+    pub reset_full: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2475,6 +2476,8 @@ pub async fn reopen_card(
     headers: HeaderMap,
     Json(body): Json<ReopenBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let reset_full = body.reset_full.unwrap_or(false);
+
     // ── Auth: same two-factor check as force-transition ──
     let config = crate::config::load_graceful();
     if let Some(expected_token) = config.server.auth_token.as_deref() {
@@ -2586,79 +2589,138 @@ pub async fn reopen_card(
             pipeline.initial_state().to_string()
         });
 
+    {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+        if let Err(e) = mark_pmd_reopen_skip_preflight_on_conn(&conn, &id) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to stage PMD reopen preflight skip: {e}")})),
+            );
+        }
+    }
+
     // ── Transition terminal → work state (force=true bypasses terminal guard) ──
     let reason = body.reason.as_deref().unwrap_or("reopen via API");
-    match crate::kanban::transition_status_with_opts(
-        &state.db,
-        &state.engine,
-        &id,
-        &reopen_target,
-        &format!("pmd:reopen({})", reason),
-        true,
-    ) {
-        Ok(result) => {
+    match {
+        let result = crate::kanban::transition_status_with_opts(
+            &state.db,
+            &state.engine,
+            &id,
+            &reopen_target,
+            &format!("pmd:reopen({})", reason),
+            true,
+        );
+        result.map(|result| (result.from, result.to))
+    } {
+        Ok((from_status, to_status)) => {
             crate::kanban::correct_tn_to_fn_on_reopen(&state.db, &id);
 
-            // ── Post-transition cleanup: clear completed_at and optional recovery fields ──
-            let conn = match state.db.lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("{e}")})),
-                    );
-                }
-            };
+            let (gh_url, card, cleanup_counts): (
+                Option<String>,
+                Result<serde_json::Value, String>,
+                (usize, usize),
+            ) = {
+                // ── Post-transition cleanup: clear completed_at and optional recovery fields ──
+                let conn = match state.db.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": format!("{e}")})),
+                        );
+                    }
+                };
 
-            // Always clear completed_at on reopen
-            conn.execute(
-                "UPDATE kanban_cards SET completed_at = NULL, updated_at = datetime('now') WHERE id = ?1",
-                [&id],
-            )
-            .ok();
+                let cleanup_counts = if reset_full {
+                    match cleanup_force_transition_revert_on_conn(&conn, &id, &reopen_target) {
+                        Ok(counts) => {
+                            crate::server::routes::dispatches::clear_all_threads(&conn, &id);
+                            if let Err(e) = clear_reopen_preflight_cache_on_conn(&conn, &id) {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(
+                                        json!({"error": format!("failed to clear reopen cache: {e}")}),
+                                    ),
+                                );
+                            }
+                            counts
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": format!("{e}")})),
+                            );
+                        }
+                    }
+                } else {
+                    (0, 0)
+                };
 
-            // #155: Optional review_status via intent
-            if let Some(ref rs) = body.review_status {
-                crate::engine::transition::execute_intent_on_conn(
-                    &conn,
-                    &crate::engine::transition::TransitionIntent::SetReviewStatus {
-                        card_id: id.clone(),
-                        review_status: Some(rs.clone()),
-                    },
+                // Always clear completed_at on reopen
+                conn.execute(
+                    "UPDATE kanban_cards SET completed_at = NULL, updated_at = datetime('now') WHERE id = ?1",
+                    [&id],
                 )
                 .ok();
-            }
 
-            // Reactivate auto_queue_entries that were marked done
-            conn.execute(
-                "UPDATE auto_queue_entries SET status = 'dispatched', completed_at = NULL \
-                 WHERE kanban_card_id = ?1 AND status = 'done'",
-                [&id],
-            )
-            .ok();
+                // #155: Optional review_status via intent
+                if let Some(ref rs) = body.review_status {
+                    crate::engine::transition::execute_intent_on_conn(
+                        &conn,
+                        &crate::engine::transition::TransitionIntent::SetReviewStatus {
+                            card_id: id.clone(),
+                            review_status: Some(rs.clone()),
+                        },
+                    )
+                    .ok();
+                }
 
-            // Re-open GitHub issue if linked
-            let gh_url: Option<String> = conn
-                .query_row(
-                    "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+                // Reactivate auto_queue_entries that were marked done
+                conn.execute(
+                    "UPDATE auto_queue_entries SET status = 'dispatched', completed_at = NULL \
+                     WHERE kanban_card_id = ?1 AND status = 'done'",
                     [&id],
-                    |row| row.get(0),
                 )
-                .ok()
-                .flatten();
+                .ok();
 
-            let card = conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-                card_row_to_json(row)
-            });
-            drop(conn);
+                // Re-open GitHub issue if linked
+                let gh_url: Option<String> = conn
+                    .query_row(
+                        "SELECT github_issue_url FROM kanban_cards WHERE id = ?1",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
 
-            // Async: reopen GitHub issue
-            if let Some(url) = gh_url {
-                tokio::spawn(async move {
-                    if let Err(e) = crate::github::reopen_issue_by_url(&url).await {
-                        tracing::warn!("[kanban] Failed to reopen GitHub issue {url}: {e}");
-                    }
-                });
+                let card = conn
+                    .query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+                        card_row_to_json(row)
+                    })
+                    .map_err(|e| format!("{e}"));
+                (gh_url, card, cleanup_counts)
+            };
+
+            if let Some(url) = gh_url.as_deref() {
+                if let Err(e) = crate::github::reopen_issue_by_url(url).await {
+                    tracing::warn!("[kanban] Failed to reopen GitHub issue {url}: {e}");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "error": format!("github issue reopen failed before reopen response: {e}"),
+                            "reopened": false,
+                            "github_issue_url": url,
+                        })),
+                    );
+                }
             }
 
             match card {
@@ -2673,22 +2735,27 @@ pub async fn reopen_card(
                         Json(json!({
                             "card": c,
                             "reopened": true,
-                            "from": result.from,
-                            "to": result.to,
+                            "reset_full": reset_full,
+                            "cancelled_dispatches": cleanup_counts.0,
+                            "skipped_auto_queue_entries": cleanup_counts.1,
+                            "from": from_status,
+                            "to": to_status,
                             "reason": reason,
                         })),
                     )
                 }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                ),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
+        Err(e) => {
+            if let Ok(conn) = state.db.lock() {
+                let _ = clear_pmd_reopen_skip_preflight_on_conn(&conn, &id);
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            )
+        }
     }
 }
 
@@ -2953,6 +3020,83 @@ fn cleanup_force_transition_revert_on_conn(
     )?;
 
     Ok((cancelled_dispatches, skipped_auto_queue_entries))
+}
+
+fn load_card_metadata_map_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let metadata_raw: Option<String> = conn.query_row(
+        "SELECT metadata FROM kanban_cards WHERE id = ?1",
+        [card_id],
+        |row| row.get(0),
+    )?;
+
+    match metadata_raw {
+        Some(raw) if !raw.trim().is_empty() => {
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            Ok(value.as_object().cloned().unwrap_or_default())
+        }
+        _ => Ok(serde_json::Map::new()),
+    }
+}
+
+fn save_card_metadata_map_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    if metadata.is_empty() {
+        conn.execute(
+            "UPDATE kanban_cards SET metadata = NULL WHERE id = ?1",
+            [card_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE kanban_cards SET metadata = ?1 WHERE id = ?2",
+            rusqlite::params![serde_json::to_string(metadata)?, card_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn mark_pmd_reopen_skip_preflight_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> anyhow::Result<()> {
+    let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
+    metadata.insert(
+        "skip_preflight_once".to_string(),
+        serde_json::Value::String("pmd_reopen".to_string()),
+    );
+    save_card_metadata_map_on_conn(conn, card_id, &metadata)
+}
+
+fn clear_pmd_reopen_skip_preflight_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> anyhow::Result<()> {
+    let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
+    metadata.remove("skip_preflight_once");
+    save_card_metadata_map_on_conn(conn, card_id, &metadata)
+}
+
+fn clear_reopen_preflight_cache_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> anyhow::Result<()> {
+    let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
+    for key in [
+        "skip_preflight_once",
+        "preflight_status",
+        "preflight_summary",
+        "preflight_checked_at",
+        "consultation_status",
+        "consultation_result",
+    ] {
+        metadata.remove(key);
+    }
+    save_card_metadata_map_on_conn(conn, card_id, &metadata)
 }
 
 /// POST /api/kanban-cards/:id/force-transition

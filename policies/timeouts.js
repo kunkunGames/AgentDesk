@@ -18,6 +18,8 @@
  * [K] 고아 디스패치 복구 (5분) — in_progress 카드 + pending 디스패치 + 활성 세션 없음 → review 전이
  * [L] Inflight 장시간 턴 감지 (#130) — heartbeat와 독립, started_at 기반 15/30/60/120분 단계별 알림
  * [M] Workspace branch 보호 (5분) — 메인 repo가 wt/* 브랜치로 이탈하면 자동 복구 (#181)
+ * [N] Orphan review 자동 복구 (1분) — review 상태인데 활성 review 계열 dispatch가 없으면 pending_decision
+ * [O] Idle session TTL cleanup (5분) — idle 60분 tmux-backed 세션 force-kill + notify
  */
 
 // Send notification via notify bot (system alerts, not agent communication)
@@ -1170,16 +1172,20 @@ var timeouts = {
     }
   },
 
-  // ─── [I] 컨텍스트 윈도우 자동 관리 ─────────────────────
-  // onTick에서 세션 토큰 사용량을 모니터링하고 compact/clear 자동 호출
-  onContextCheck: function() {
-    var CONTEXT_WINDOW = 1000000; // 1M tokens
-    var compactPercent = parseInt(agentdesk.config.get("context_compact_percent") || "60", 10);
-    var clearPercent = parseInt(agentdesk.config.get("context_clear_percent") || "40", 10);
-    var clearIdleMin = parseInt(agentdesk.config.get("context_clear_idle_minutes") || "60", 10);
+  // ─── [O] Idle session TTL cleanup — idle 60분 tmux-backed 세션 force-kill ──
+  _section_O: function() {
+    var apiPort = agentdesk.config.get("server_port");
+    if (!apiPort) {
+      agentdesk.log.error("[idle-kill] server_port missing — cannot call force-kill API");
+      return;
+    }
 
     var sessions = agentdesk.db.query(
-      "SELECT session_key, agent_id, tokens, status, last_heartbeat, provider FROM sessions WHERE status IN ('idle', 'working')"
+      "SELECT session_key, agent_id, provider, COALESCE(last_heartbeat, created_at) AS last_seen_at " +
+      "FROM sessions " +
+      "WHERE status = 'idle' " +
+      "AND provider IN ('claude', 'codex', 'qwen') " +
+      "AND COALESCE(last_heartbeat, created_at) < datetime('now', '-60 minutes')"
     );
 
     var now = Date.now();
@@ -1188,72 +1194,42 @@ var timeouts = {
       var s = sessions[i];
       if (!s.session_key) continue;
 
-      // Skip non-Claude sessions
-      var provider = s.provider || "claude";
-      if (provider !== "claude") continue;
+      var lastSeenMs = s.last_seen_at ? new Date(s.last_seen_at).getTime() : NaN;
+      var idleMin = isNaN(lastSeenMs) ? 60 : Math.max(60, Math.round((now - lastSeenMs) / 60000));
 
-      // Skip working sessions — turn-end handler in tmux watcher handles compact
-      if (s.status === "working") continue;
-
-      // Check cooldown (5 min) to avoid spamming commands
-      var cooldownKey = "context_action_" + s.session_key;
-      var lastAction = agentdesk.db.query(
-        "SELECT value FROM kv_meta WHERE key = ?", [cooldownKey]
-      );
-      if (lastAction.length > 0) {
-        var lastMs = parseInt(lastAction[0].value, 10);
-        if (now - lastMs < 300000) continue; // 5 min cooldown
+      var forceKillResp = null;
+      try {
+        var forceKillUrl = "http://127.0.0.1:" + apiPort +
+          "/api/sessions/" + encodeURIComponent(s.session_key) + "/force-kill";
+        forceKillResp = agentdesk.http.post(forceKillUrl, { retry: false });
+      } catch (e) {
+        agentdesk.log.error("[idle-kill] force-kill API exception for " + s.session_key + ": " + e);
+        continue;
       }
 
-      // Use DB tokens directly — updated from result events by tmux watcher/turn_bridge
-      var pct = (s.tokens / CONTEXT_WINDOW) * 100;
-
-      // Compact: >= compactPercent
-      if (pct >= compactPercent) {
-        var result = JSON.parse(agentdesk.session.sendCommand(s.session_key, "/compact"));
-        if (result.ok) {
-          agentdesk.log.info("[context] Auto-compact: " + s.session_key + " (" + Math.round(pct) + "%)");
-          agentdesk.db.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
-            [cooldownKey, "" + now]
-          );
-          // Discord notification
-          // #304: resolve primary channel via centralized resolver
-          var compactCh = agentdesk.agents.resolvePrimaryChannel(s.agent_id);
-          if (compactCh) {
-            sendNotifyAlert(
-              "channel:" + compactCh,
-              "⚡ 컨텍스트 자동 compact 실행 (" + Math.round(pct) + "% → " + s.session_key + ")"
-            );
-          }
-        }
-        continue; // Don't also clear in same tick
+      if (!forceKillResp || !forceKillResp.ok) {
+        agentdesk.log.error("[idle-kill] force-kill API failed for " + s.session_key + ": " + JSON.stringify(forceKillResp));
+        continue;
       }
 
-      // Clear: >= clearPercent AND idle for clearIdleMin
-      if (pct >= clearPercent && s.last_heartbeat) {
-        var lastHb = new Date(s.last_heartbeat).getTime();
-        var idleMs = now - lastHb;
-        var idleMin = idleMs / 60000;
+      if (!forceKillResp.tmux_killed) {
+        agentdesk.log.warn("[idle-kill] force-kill API succeeded but tmux was already gone for " + s.session_key);
+        continue;
+      }
 
-        if (idleMin >= clearIdleMin) {
-          var result2 = JSON.parse(agentdesk.session.sendCommand(s.session_key, "/clear"));
-          if (result2.ok) {
-            agentdesk.log.info("[context] Auto-clear: " + s.session_key + " (" + Math.round(pct) + "%, idle " + Math.round(idleMin) + "min)");
-            agentdesk.db.execute(
-              "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
-              [cooldownKey, "" + now]
-            );
-            // #304: resolve primary channel via centralized resolver
-            var clearCh = agentdesk.agents.resolvePrimaryChannel(s.agent_id);
-            if (clearCh) {
-              sendNotifyAlert(
-                "channel:" + clearCh,
-                "🧹 컨텍스트 자동 clear 실행 (" + Math.round(pct) + "%, idle " + Math.round(idleMin) + "분 → " + s.session_key + ")"
-              );
-            }
-          }
-        }
+      agentdesk.log.info("[idle-kill] Killed idle session after " + idleMin + "min: " + s.session_key);
+
+      var primaryChannel = s.agent_id ? agentdesk.agents.resolvePrimaryChannel(s.agent_id) : null;
+      var notifyTarget = primaryChannel ? ("channel:" + primaryChannel) : getPMDChannel();
+      if (notifyTarget) {
+        sendNotifyAlert(
+          notifyTarget,
+          "💤 [Idle 세션 자동 종료] " + (s.agent_id || "unknown-agent") + "\n" +
+          "provider: `" + (s.provider || "unknown") + "`\n" +
+          "session_key: `" + s.session_key + "`\n" +
+          "idle: `" + idleMin + "분`\n" +
+          "원인: idle 60분 경과 → tmux kill"
+        );
       }
     }
   }
@@ -1299,7 +1275,7 @@ timeouts.onTick1min = function(ev) {
   agentdesk.log.debug("[tick1min] total " + (Date.now() - start) + "ms");
 };
 
-// 5min tier: [R] [B] [F] [G] [H] [ctx] + TTL cleanup (non-critical reconciliation)
+// 5min tier: [R] [B] [F] [G] [H] [M] [O] + TTL cleanup (non-critical reconciliation)
 // [I] moved to 30s tier for critical-path isolation (#127)
 timeouts.onTick5min = function(ev) {
   var start = Date.now();
@@ -1322,11 +1298,8 @@ timeouts.onTick5min = function(ev) {
   agentdesk.log.debug("[tick5min][H] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_M(); } catch(e) { agentdesk.log.warn("[tick5min] M error: " + e); }
   agentdesk.log.debug("[tick5min][M] " + (Date.now() - t) + "ms");
-  // DISABLED — token counting unreliable (double-count, stale after /clear). Re-enable after fix.
-  // if (timeouts.onContextCheck) {
-  //   t = Date.now(); try { timeouts.onContextCheck(); } catch(e) { agentdesk.log.warn("[tick5min] ctx error: " + e); }
-  //   agentdesk.log.debug("[tick5min][ctx] " + (Date.now() - t) + "ms");
-  // }
+  t = Date.now(); try { timeouts._section_O(); } catch(e) { agentdesk.log.warn("[tick5min] O error: " + e); }
+  agentdesk.log.debug("[tick5min][O] " + (Date.now() - t) + "ms");
   agentdesk.log.debug("[tick5min] total " + (Date.now() - start) + "ms");
 };
 

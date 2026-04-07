@@ -49,6 +49,15 @@ pub(super) async fn lookup_pending_dispatch_for_thread(
         .map(|s| s.to_string())
 }
 
+pub(super) fn parse_thread_channel_id_from_name(channel_name: &str) -> Option<u64> {
+    let pos = channel_name.rfind("-t")?;
+    let suffix = &channel_name[pos + 2..];
+    if suffix.len() < 15 || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<u64>().ok()
+}
+
 pub(super) async fn build_adk_session_key(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -113,6 +122,7 @@ pub(super) async fn post_adk_session_status(
     tokens: Option<u64>,
     cwd: Option<&str>,
     dispatch_id: Option<&str>,
+    thread_channel_id: Option<u64>,
     api_port: u16,
 ) {
     let Some(session_key) = session_key else {
@@ -140,6 +150,9 @@ pub(super) async fn post_adk_session_status(
     }
     if let Some(did) = dispatch_id.and_then(clean_nonempty) {
         body["dispatch_id"] = serde_json::json!(did);
+    }
+    if let Some(thread_channel_id) = thread_channel_id {
+        body["thread_channel_id"] = serde_json::json!(thread_channel_id.to_string());
     }
 
     match reqwest::Client::new()
@@ -523,7 +536,7 @@ fn clean_nonempty(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_adk_session_info;
+    use super::{derive_adk_session_info, parse_thread_channel_id_from_name};
 
     #[test]
     fn derive_uses_user_text_when_human_readable() {
@@ -598,6 +611,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_thread_channel_id_from_name_valid() {
+        assert_eq!(
+            parse_thread_channel_id_from_name("adk-cdx-t1485506232256168011"),
+            Some(1485506232256168011)
+        );
+    }
+
+    #[test]
+    fn test_parse_thread_channel_id_from_name_invalid() {
+        assert_eq!(parse_thread_channel_id_from_name("adk-cdx"), None);
+        assert_eq!(parse_thread_channel_id_from_name("adk-cdx-t123"), None);
+    }
+
+    #[test]
     fn test_derive_session_info_max_chars() {
         // SESSION_INFO_MAX_CHARS = 60
         // A long user text should be truncated to 60 chars (with ellipsis)
@@ -637,7 +664,7 @@ mod tests {
 }
 
 /// Context window management thresholds.
-/// Single source of truth used by both Rust turn-end compact and JS onContextCheck.
+/// Single source of truth used by Rust turn-end compact logic.
 /// Provider-specific overrides: `context_compact_percent_codex`, `context_compact_percent_claude`, etc.
 pub(super) struct ContextThresholds {
     pub compact_pct: u64,
