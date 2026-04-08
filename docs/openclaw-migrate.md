@@ -2,8 +2,6 @@
 
 `agentdesk migrate openclaw`는 OpenClaw의 durable state를 AgentDesk 런타임으로 이관하기 위한 CLI입니다.
 
-계약 수준의 상세 기준과 현재 구현 상태 차이는 `docs/openclaw-migration.md`를 참고하세요.
-
 ## 지원 범위
 
 - `openclaw.json` 또는 그 상위 루트 탐색
@@ -58,6 +56,8 @@ channel binding, bot 설정, 세션까지 함께 이관:
 - `discord-auth-report.json`
 - `channel-binding-preview.yaml`
 
+이 audit 산출물은 일회성 임시 파일이 아니라 `--resume`과 사후 검증을 위한 durable provenance입니다. migrate가 끝나도 기본적으로 그대로 남습니다.
+
 ## 프롬프트/메모리 입력
 
 다음 bootstrap 파일이 있으면 AgentDesk prompt로 병합합니다.
@@ -80,6 +80,17 @@ channel binding, bot 설정, 세션까지 함께 이관:
 - 원본 OpenClaw workspace 경로
 
 운영 기준은 AgentDesk가 생성한 memory/workspace 경로이며, 원본 OpenClaw 경로는 provenance로만 남깁니다. `--no-memory` 또는 `--no-workspace`를 쓴 경우에는 prompt에 해당 상태가 그대로 표시됩니다.
+
+## 이관 후 남는 데이터
+
+migrate는 OpenClaw 흔적을 완전히 제거하는 cleanup 도구가 아니라, AgentDesk 런타임으로 state를 옮기면서 provenance를 남기는 import 도구입니다.
+
+- `AGENTDESK_ROOT_DIR/openclaw/imports/<import_id>/` 아래 audit 파일
+- `AGENTDESK_ROOT_DIR/openclaw/workspaces/<role>/` 아래 복사된 workspace
+- prompt 상단의 migrated runtime 참조와 원본 source path
+- 세션/메모리 레코드의 `imported_from`, `source_session_id`, `source_path` 계열 provenance 메타데이터
+
+따라서 "이관 완료"와 "OpenClaw 관련 흔적 삭제 완료"는 같은 의미가 아닙니다. 후자가 필요하면 import 검증이 끝난 뒤 별도의 정리 정책을 운영해야 합니다.
 
 ## 주요 플래그
 
@@ -105,3 +116,5 @@ channel binding, bot 설정, 세션까지 함께 이관:
 - Windows source에서 넘어온 `C:\...` 또는 `D:/...` workspace 경로는 절대경로로 유지한 뒤, 필요하면 `--workspace-root-rewrite`로 현 환경 경로에 맞춰 바꿔야 합니다.
 - workspace가 없거나 provider 매핑이 불가능한 agent는 audit에는 남지만 apply에서 건너뜁니다.
 - token/tool policy는 기본적으로 `report` 모드이며, 실제 쓰기 전 dry-run과 audit 결과를 먼저 확인하는 것이 안전합니다.
+- macOS처럼 symlink 경로와 realpath가 다를 수 있는 환경에서는 `config/org.yaml`, channel binding, DB `sessions.cwd`가 하나의 canonical path를 쓰도록 맞추는 편이 안전합니다. 경로 표현이 섞이면 런타임에서 `Ignoring restored DB cwd` 경고가 나거나 restored session 복구가 꼬일 수 있습니다.
+- migrate로 세션까지 옮긴 뒤 workspace 경로를 수동으로 바꾸거나 runtime root를 이동했다면, 기존 provider `session_id`를 같이 정리해야 합니다. 오래된 `session_id`가 남아 있으면 Discord agent가 죽은 세션을 resume하려고 하다가 응답 없이 hang처럼 보일 수 있습니다.
