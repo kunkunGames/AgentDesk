@@ -27,6 +27,8 @@ import MeetingProviderFlow, {
 import MarkdownContent from "./common/MarkdownContent";
 
 const STORAGE_KEY = "pcd_meeting_channel_id";
+const PRIMARY_PROVIDER_STORAGE_KEY = "pcd_meeting_primary_provider";
+const REVIEWER_PROVIDER_STORAGE_KEY = "pcd_meeting_reviewer_provider";
 const MEETING_PROVIDERS = ["claude", "codex", "gemini", "qwen"] as const;
 const PROVIDER_LABELS: Record<string, string> = {
   claude: "Claude",
@@ -46,6 +48,25 @@ function ownerProviderBadgeStyle(provider: string) {
     color: meta.color,
     border: `1px solid ${meta.border}`,
   } as const;
+}
+
+function normalizeMeetingProvider(raw: string | null): string | null {
+  if (!raw) return null;
+  const normalized = raw.trim().toLowerCase();
+  return MEETING_PROVIDERS.includes(normalized as typeof MEETING_PROVIDERS[number]) ? normalized : null;
+}
+
+function providerLabel(provider: string) {
+  return PROVIDER_LABELS[provider] ?? provider.toUpperCase();
+}
+
+function providerMatchesQuery(provider: string, query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+  return (
+    provider.toLowerCase().includes(normalizedQuery)
+    || providerLabel(provider).toLowerCase().includes(normalizedQuery)
+  );
 }
 
 interface Props {
@@ -102,8 +123,21 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   const [showStartForm, setShowStartForm] = useState(false);
   const [agenda, setAgenda] = useState("");
   const [channelId, setChannelId] = useState(() => localStorage.getItem(STORAGE_KEY) || "");
-  const [primaryProvider, setPrimaryProvider] = useState<string>("claude");
-  const [reviewerProvider, setReviewerProvider] = useState<string>("");
+  const [primaryProvider, setPrimaryProvider] = useState<string>(
+    () => normalizeMeetingProvider(localStorage.getItem(PRIMARY_PROVIDER_STORAGE_KEY)) ?? "claude",
+  );
+  const [primaryProviderQuery, setPrimaryProviderQuery] = useState<string>(
+    () => providerLabel(normalizeMeetingProvider(localStorage.getItem(PRIMARY_PROVIDER_STORAGE_KEY)) ?? "claude"),
+  );
+  const [reviewerProvider, setReviewerProvider] = useState<string>(
+    () => normalizeMeetingProvider(localStorage.getItem(REVIEWER_PROVIDER_STORAGE_KEY)) ?? "",
+  );
+  const [reviewerProviderQuery, setReviewerProviderQuery] = useState<string>(
+    () => {
+      const saved = normalizeMeetingProvider(localStorage.getItem(REVIEWER_PROVIDER_STORAGE_KEY));
+      return saved ? providerLabel(saved) : "";
+    },
+  );
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>([]);
@@ -121,6 +155,21 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   useEffect(() => {
     if (channelId) localStorage.setItem(STORAGE_KEY, channelId);
   }, [channelId]);
+
+  useEffect(() => {
+    localStorage.setItem(PRIMARY_PROVIDER_STORAGE_KEY, primaryProvider);
+    setPrimaryProviderQuery(providerLabel(primaryProvider));
+  }, [primaryProvider]);
+
+  useEffect(() => {
+    if (reviewerProvider) {
+      localStorage.setItem(REVIEWER_PROVIDER_STORAGE_KEY, reviewerProvider);
+      setReviewerProviderQuery(providerLabel(reviewerProvider));
+      return;
+    }
+    localStorage.removeItem(REVIEWER_PROVIDER_STORAGE_KEY);
+    setReviewerProviderQuery("");
+  }, [reviewerProvider]);
 
   useEffect(() => {
     let cancelled = false;
@@ -190,6 +239,8 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   const reviewerOptions = MEETING_PROVIDERS.filter(
     (provider) => provider !== primaryProvider && provider !== selectedChannel?.owner_provider,
   );
+  const filteredPrimaryProviders = MEETING_PROVIDERS.filter((provider) => providerMatchesQuery(provider, primaryProviderQuery));
+  const filteredReviewerProviders = reviewerOptions.filter((provider) => providerMatchesQuery(provider, reviewerProviderQuery));
   const filteredChannels = meetingChannels.filter((channel) => {
     const query = channelQuery.trim().toLowerCase();
     if (!query) return true;
@@ -577,14 +628,6 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                   })
                 )}
               </div>
-              {selectedChannel && (
-                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {t({
-                    ko: `선택된 채널: ${selectedChannel.channel_name} (${selectedChannel.channel_id}) · 담당 ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider}`,
-                    en: `Selected channel: ${selectedChannel.channel_name} (${selectedChannel.channel_id}) · owner ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider}`,
-                  })}
-                </div>
-              )}
               {channelError && (
                 <div className="text-xs px-3 py-1.5 rounded-lg" style={{ background: "rgba(239,68,68,0.1)", color: "#f87171" }}>
                   {channelError}
@@ -608,56 +651,119 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
             />
           </div>
 
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24" style={{ color: "var(--th-text-muted)" }}>
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
+            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
               {t({ ko: "진행 에이전트", en: "Primary Agent" })}
             </label>
-            <select
-              value={primaryProvider}
-              onChange={(e) => {
-                setPrimaryProvider(e.target.value);
-                setReviewerProvider("");
-              }}
-              className="px-3 py-1.5 rounded-lg text-xs"
-              style={inputStyle}
-            >
-              {MEETING_PROVIDERS.map((p) => (
-                <option key={p} value={p}>{PROVIDER_LABELS[p] ?? p.toUpperCase()}</option>
-              ))}
-            </select>
+            <div className="flex-1 space-y-2">
+              <input
+                type="text"
+                value={primaryProviderQuery}
+                onChange={(e) => setPrimaryProviderQuery(e.target.value)}
+                placeholder={t({ ko: "진행 에이전트 검색", en: "Search primary agent" })}
+                className="w-full px-3 py-1.5 rounded-lg text-sm"
+                style={inputStyle}
+              />
+              <div
+                className="max-h-36 overflow-y-auto rounded-xl border p-2 space-y-1"
+                style={{ background: "var(--th-bg-surface)", borderColor: "var(--th-border)" }}
+              >
+                {filteredPrimaryProviders.length === 0 ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "조건에 맞는 진행 에이전트가 없습니다", en: "No primary agent matches the filter" })}
+                  </div>
+                ) : (
+                  filteredPrimaryProviders.map((provider) => {
+                    const isSelected = provider === primaryProvider;
+                    return (
+                      <button
+                        key={provider}
+                        onClick={() => setPrimaryProvider(provider)}
+                        className="w-full rounded-lg border px-3 py-2 text-left transition-colors"
+                        style={{
+                          background: isSelected ? "rgba(245,158,11,0.12)" : "transparent",
+                          borderColor: isSelected ? "rgba(245,158,11,0.35)" : "var(--th-border)",
+                        }}
+                      >
+                        <div className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: "var(--th-text)" }}>
+                          <span>{providerLabel(provider)}</span>
+                          <span
+                            className="rounded-full px-2 py-0.5 text-xs"
+                            style={ownerProviderBadgeStyle(provider)}
+                          >
+                            {provider}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
           </div>
 
-          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24" style={{ color: "var(--th-text-muted)" }}>
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
+            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
               {t({ ko: "리뷰 에이전트", en: "Reviewer Agent" })}
             </label>
-            <select
-              value={reviewerProvider}
-              onChange={(e) => setReviewerProvider(e.target.value)}
-              className="px-3 py-1.5 rounded-lg text-xs"
-              style={inputStyle}
-              disabled={reviewerOptions.length === 0}
-            >
-              {reviewerOptions.length === 0 ? (
-                <option value="">
-                  {t({ ko: "선택 가능한 리뷰 에이전트 없음", en: "No reviewer agent available" })}
-                </option>
-              ) : (
-                reviewerOptions.map((provider) => (
-                  <option key={provider} value={provider}>
-                    {PROVIDER_LABELS[provider] ?? provider.toUpperCase()}
-                  </option>
-                ))
-              )}
-            </select>
-            <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-              {selectedChannel
-                ? t({
-                    ko: "리뷰 에이전트는 채널 담당 에이전트, 진행 에이전트와 달라야 합니다",
-                    en: "Reviewer agent must differ from the channel owner and primary agent",
+            <div className="flex-1 space-y-2">
+              <input
+                type="text"
+                value={reviewerProviderQuery}
+                onChange={(e) => setReviewerProviderQuery(e.target.value)}
+                placeholder={t({ ko: "리뷰 에이전트 검색", en: "Search reviewer agent" })}
+                className="w-full px-3 py-1.5 rounded-lg text-sm"
+                style={inputStyle}
+                disabled={reviewerOptions.length === 0}
+              />
+              <div
+                className="max-h-36 overflow-y-auto rounded-xl border p-2 space-y-1"
+                style={{ background: "var(--th-bg-surface)", borderColor: "var(--th-border)" }}
+              >
+                {reviewerOptions.length === 0 ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "선택 가능한 리뷰 에이전트 없음", en: "No reviewer agent available" })}
+                  </div>
+                ) : filteredReviewerProviders.length === 0 ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "조건에 맞는 리뷰 에이전트가 없습니다", en: "No reviewer agent matches the filter" })}
+                  </div>
+                ) : (
+                  filteredReviewerProviders.map((provider) => {
+                    const isSelected = provider === reviewerProvider;
+                    return (
+                      <button
+                        key={provider}
+                        onClick={() => setReviewerProvider(provider)}
+                        className="w-full rounded-lg border px-3 py-2 text-left transition-colors"
+                        style={{
+                          background: isSelected ? "rgba(245,158,11,0.12)" : "transparent",
+                          borderColor: isSelected ? "rgba(245,158,11,0.35)" : "var(--th-border)",
+                        }}
+                      >
+                        <div className="flex flex-wrap items-center gap-2 text-sm font-medium" style={{ color: "var(--th-text)" }}>
+                          <span>{providerLabel(provider)}</span>
+                          <span
+                            className="rounded-full px-2 py-0.5 text-xs"
+                            style={ownerProviderBadgeStyle(provider)}
+                          >
+                            {provider}
+                          </span>
+                        </div>
+                      </button>
+                    );
                   })
-                : t({ ko: "채널 선택 후 리뷰 에이전트를 정하세요", en: "Pick a reviewer agent after selecting a channel" })}
-            </span>
+                )}
+              </div>
+              <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                {selectedChannel
+                  ? t({
+                      ko: "리뷰 에이전트는 채널 담당 에이전트, 진행 에이전트와 달라야 합니다",
+                      en: "Reviewer agent must differ from the channel owner and primary agent",
+                    })
+                  : t({ ko: "채널 선택 후 리뷰 에이전트를 정하세요", en: "Pick a reviewer agent after selecting a channel" })}
+              </span>
+            </div>
           </div>
 
           {startError && (
