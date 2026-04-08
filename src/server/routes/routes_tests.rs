@@ -107,6 +107,8 @@ fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
             _env: env,
         },
     )
+}
+
 fn git_commit(repo_dir: &std::path::Path, message: &str) -> String {
     let filename = format!(
         "commit-{}.txt",
@@ -3491,6 +3493,23 @@ async fn rereview_reactivates_done_card_with_fresh_review_dispatch() {
             |row| row.get(0),
         )
         .unwrap();
+    let reviewed_commit = conn
+        .query_row(
+            "SELECT context FROM task_dispatches WHERE id = ?1",
+            [&review_dispatch_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .and_then(|context| {
+            serde_json::from_str::<serde_json::Value>(&context)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("reviewed_commit")
+                        .and_then(|entry| entry.as_str())
+                        .map(str::to_string)
+                })
+        });
     assert_eq!(dispatch_status, "pending");
     assert_eq!(
         reviewed_commit.as_deref(),

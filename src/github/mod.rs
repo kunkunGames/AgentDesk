@@ -3,6 +3,9 @@ pub mod sync;
 pub mod triage;
 
 use crate::db::Db;
+use crate::services::platform::binary_resolver::{
+    apply_runtime_path, resolve_binary_with_login_shell,
+};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -15,14 +18,14 @@ fn gh_path() -> Option<String> {
 
     static GH_PATH: OnceLock<Option<String>> = OnceLock::new();
     GH_PATH
-        .get_or_init(|| crate::services::platform::resolve_binary_with_login_shell("gh"))
+        .get_or_init(|| resolve_binary_with_login_shell("gh"))
         .clone()
 }
 
 fn gh_command() -> Result<std::process::Command, String> {
     let gh = gh_path().ok_or_else(|| "gh CLI is not available".to_string())?;
     let mut command = std::process::Command::new(&gh);
-    crate::services::platform::apply_runtime_path(&mut command);
+    apply_runtime_path(&mut command);
     Ok(command)
 }
 

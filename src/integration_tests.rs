@@ -13,9 +13,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     use crate::db;
     use crate::dispatch;
     use crate::engine::PolicyEngine;
