@@ -626,7 +626,7 @@ export default function AgentInfoCard({
   return (
     <div
       ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-x-hidden overflow-y-auto px-3 py-4 sm:items-center sm:p-4"
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-hidden px-3 py-4 sm:items-center sm:p-4"
       style={{
         background: "var(--th-modal-overlay)",
         paddingTop: "max(1rem, calc(env(safe-area-inset-top) + 0.75rem))",
@@ -640,12 +640,15 @@ export default function AgentInfoCard({
         role="dialog"
         aria-modal="true"
         aria-label={`${localeName(locale, agent)} — ${tr("직원 상세", "Agent Details")}`}
-        className="w-full self-start max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[32px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-4xl sm:p-5"
+        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[32px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-4xl sm:p-5"
         style={{
-          background: "var(--th-card-bg)",
-          border: "1px solid var(--th-card-border)",
+          borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
+          background:
+            "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 96%, transparent) 100%)",
           backdropFilter: "blur(20px)",
           paddingBottom: "max(env(safe-area-inset-bottom), 0px)",
+          WebkitOverflowScrolling: "touch",
+          touchAction: "pan-y",
         }}
       >
         {/* Header */}

@@ -171,7 +171,7 @@ export default function ControlCenterView({
   ], [activeSessionCount, agents.length, departments.length, offices.length]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex min-h-full flex-col sm:h-full sm:min-h-0">
       <div className="border-b" style={{ borderColor: "var(--th-border-subtle)" }}>
         <div className="px-4 py-4">
           <SurfaceSection
@@ -278,9 +278,15 @@ export default function ControlCenterView({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-hidden">
+      <div className="sm:min-h-0 sm:flex-1 sm:overflow-hidden">
         {controlTab === "organization" && (
-          <div className="h-full overflow-x-hidden overflow-y-auto">
+          <div
+            className="sm:h-full sm:overflow-x-hidden sm:overflow-y-auto"
+            style={{
+              WebkitOverflowScrolling: "touch",
+              touchAction: "pan-y",
+            }}
+          >
             <div className="mx-auto max-w-5xl px-4 pt-4 sm:px-6">
               <SurfaceSection
                 eyebrow={t("인력 운영", "Staff Ops")}
@@ -357,6 +363,7 @@ export default function ControlCenterView({
                 showTabBar={false}
                 title={t("조직 · 에이전트", "Organization · Agents")}
                 subtitle={t("프로필, XP, 스킬, provider, 오피스 소속을 관리합니다.", "Manage profiles, XP, skills, providers, and office membership.")}
+                scrollable={false}
               />
             )}
 
