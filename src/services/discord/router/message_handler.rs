@@ -567,8 +567,9 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
             // Write-through: persist this channel's queue to disk
             if let Some(q) = data.intervention_queue.get(&channel_id) {
+                let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
                 super::super::save_channel_queue(
-                    &provider,
+                    &bot_owner_provider,
                     &shared.token_hash,
                     channel_id,
                     q,
@@ -2416,6 +2417,15 @@ mod tests {
     use super::*;
     use crate::services::memory::RecallResponse;
 
+    fn sample_recall() -> RecallResponse {
+        RecallResponse {
+            shared_knowledge: Some("[Shared Knowledge]".to_string()),
+            longterm_catalog: Some("- notes.md".to_string()),
+            external_recall: Some("[External Recall]".to_string()),
+            warnings: Vec::new(),
+        }
+    }
+
     fn make_session(
         current_path: Option<String>,
         remote_profile_name: Option<String>,
@@ -2433,15 +2443,6 @@ mod tests {
             last_active: tokio::time::Instant::now(),
             worktree: None,
             born_generation: 0,
-        }
-    }
-
-    fn sample_recall() -> RecallResponse {
-        RecallResponse {
-            shared_knowledge: Some("[Shared Knowledge]".to_string()),
-            longterm_catalog: Some("- notes.md".to_string()),
-            external_recall: Some("[External Recall]".to_string()),
-            warnings: Vec::new(),
         }
     }
 
