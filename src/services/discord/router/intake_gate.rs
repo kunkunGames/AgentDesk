@@ -654,7 +654,16 @@ pub(in crate::services::discord) async fn handle_event(
                     };
                     if inserted {
                         if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(&data.provider, channel_id, q);
+                            save_channel_queue(
+                                &data.provider,
+                                &data.shared.token_hash,
+                                channel_id,
+                                q,
+                                data.shared
+                                    .dispatch_role_overrides
+                                    .get(&channel_id)
+                                    .map(|r| r.value().get()),
+                            );
                         }
                     }
                     Some(inserted)

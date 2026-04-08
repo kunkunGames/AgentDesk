@@ -29,9 +29,9 @@ mod turn_bridge;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -39,7 +39,7 @@ use tokio::sync::Mutex;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId, UserId};
 
-use crate::services::agent_protocol::{StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
 use crate::services::claude;
 use crate::services::codex;
 use crate::services::gemini;
@@ -52,13 +52,13 @@ use adk_session::{
     lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
 };
 use formatting::{
-    add_reaction_raw, extract_skill_description, format_for_discord, format_skills_notice,
-    format_tool_input, normalize_empty_lines, remove_reaction_raw, send_long_message_raw,
-    truncate_str, BUILTIN_SKILLS,
+    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
+    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
+    send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
-    clear_inflight_state, load_inflight_states, save_inflight_state, InflightTurnState,
+    InflightTurnState, clear_inflight_state, load_inflight_states, save_inflight_state,
 };
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
@@ -66,15 +66,15 @@ use restart_report::flush_restart_reports;
 use router::{handle_event, handle_text_message};
 use runtime_store::worktrees_root;
 use settings::{
-    channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
-    save_bot_settings, validate_bot_channel_routing, RoleBinding,
+    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
+    save_bot_settings, validate_bot_channel_routing,
 };
 #[cfg(unix)]
 use tmux::{
     cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions, restore_tmux_watchers,
     tmux_output_watcher,
 };
-use turn_bridge::{spawn_turn_bridge, tmux_runtime_paths, TurnBridgeContext};
+use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
 
 pub(crate) use prompt_builder::DispatchProfile;
 
@@ -95,10 +95,10 @@ const DEAD_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60); // 1 minut
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-pub(in crate::services::discord) use bot_init::*;
-pub(crate) use bot_init::{
-    RunBotContext, retry_failed_dm_notifications, run_bot, send_file_to_channel,
-    send_message_to_channel, send_message_to_user,
+pub(crate) use bot_init::RunBotContext;
+pub(in crate::services::discord) use queue_io::{
+    channel_has_pending_soft_queue, channel_has_pending_soft_queue_at,
+    schedule_deferred_idle_queue_kickoff, watcher_should_kickoff_idle_queue,
 };
 pub(in crate::services::discord) use shared_state::*;
 /// Minimum interval between Discord placeholder edits for progress status.
@@ -1840,17 +1840,16 @@ fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Entry point: start the Discord bot
-pub async fn run_bot(
-    token: &str,
-    provider: ProviderKind,
-    global_active: Arc<std::sync::atomic::AtomicUsize>,
-    global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
-    shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
-    health_registry: Arc<health::HealthRegistry>,
-    api_port: u16,
-    db: Option<crate::db::Db>,
-    engine: Option<crate::engine::PolicyEngine>,
-) {
+pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext) {
+    let RunBotContext {
+        global_active,
+        global_finalizing,
+        shutdown_remaining,
+        health_registry,
+        api_port,
+        db,
+        engine,
+    } = context;
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
 
@@ -2354,7 +2353,7 @@ pub async fn run_bot(
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3695,17 +3694,17 @@ fn enrich_role_map_with_channel_ids() {
 mod tests {
     use super::{ChannelId, MessageId, UserId};
     use super::{
-        DiscordBotSettings, Intervention, InterventionMode, allows_nonlocal_session_path,
-        channel_has_pending_soft_queue_at, choose_restore_channel_name,
-        is_synthetic_thread_channel_name, load_pending_queues, save_channel_queue,
-        save_pending_queues, select_restored_session_path, session_path_is_usable,
-        synthetic_thread_channel_name, user_is_authorized, watcher_should_kickoff_idle_queue,
-        PendingQueueItem, requeue_intervention_front_persisted,
-        take_next_soft_intervention_persisted,
+        DiscordBotSettings, Intervention, InterventionMode, PendingQueueItem,
+        allows_nonlocal_session_path, channel_has_pending_soft_queue_at,
+        choose_restore_channel_name, is_synthetic_thread_channel_name, load_pending_queues,
+        requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
+        select_restored_session_path, session_path_is_usable, synthetic_thread_channel_name,
+        take_next_soft_intervention_persisted, user_is_authorized,
+        watcher_should_kickoff_idle_queue,
     };
     use crate::services::discord::runtime_store::test_env_lock;
     use crate::services::discord::settings::{
-        validate_bot_channel_routing, BotChannelRoutingGuardFailure,
+        BotChannelRoutingGuardFailure, validate_bot_channel_routing,
     };
     use crate::services::provider::CancelToken;
     use crate::services::provider::ProviderKind;

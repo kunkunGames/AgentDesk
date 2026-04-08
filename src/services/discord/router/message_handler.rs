@@ -4,8 +4,6 @@ use crate::services::memory::{
     resolve_memory_session_id,
 };
 use crate::services::provider::{CancelToken, cancel_requested};
-#[cfg(unix)]
-use crate::services::tmux_common::tmux_exact_target;
 use std::sync::Arc;
 
 const DISCORD_FORMATTING_REMINDER: &str = "<system-reminder>\n\
@@ -569,7 +567,16 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
             // Write-through: persist this channel's queue to disk
             if let Some(q) = data.intervention_queue.get(&channel_id) {
-                super::super::save_channel_queue(&provider, &shared.token_hash, channel_id, q);
+                super::super::save_channel_queue(
+                    &provider,
+                    &shared.token_hash,
+                    channel_id,
+                    q,
+                    shared
+                        .dispatch_role_overrides
+                        .get(&channel_id)
+                        .map(|r| r.value().get()),
+                );
             }
             drop(data);
             // Clean up: remove placeholder and reaction created before this check

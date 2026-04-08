@@ -707,6 +707,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         turn_start_times: dashmap::DashMap::new(),
         cached_serenity_ctx: tokio::sync::OnceCell::new(),
         cached_bot_token: tokio::sync::OnceCell::new(),
+        token_hash: settings::discord_token_hash(token),
         api_port,
         db,
         engine,
@@ -855,7 +856,12 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                 let queue_count: usize =
                                     data.intervention_queue.values().map(|q| q.len()).sum();
                                 if queue_count > 0 {
-                                    save_pending_queues(&provider_for_deferred, &data.intervention_queue);
+                                    save_pending_queues(
+                                        &provider_for_deferred,
+                                        &shared_for_deferred.token_hash,
+                                        &data.intervention_queue,
+                                        &shared_for_deferred.dispatch_role_overrides,
+                                    );
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
                                 }
@@ -924,7 +930,22 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
-                    let restored_queues = load_pending_queues(&provider_for_restore);
+                    let (restored_queues, restored_overrides) = load_pending_queues(
+                        &provider_for_restore,
+                        &shared_for_tmux2.token_hash,
+                    );
+                    for (thread_channel_id, alt_channel_id) in &restored_overrides {
+                        shared_for_tmux2
+                            .dispatch_role_overrides
+                            .insert(*thread_channel_id, *alt_channel_id);
+                    }
+                    if !restored_overrides.is_empty() {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!(
+                            "  [{ts}] 📋 FLUSH: restored {} dispatch_role_override(s) from queue snapshots",
+                            restored_overrides.len()
+                        );
+                    }
                     if !restored_queues.is_empty() {
                         let mut added = 0usize;
                         let mut skipped = 0usize;
@@ -1173,7 +1194,12 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
+                        save_pending_queues(
+                            &provider_for_shutdown,
+                            &shared_for_signal.token_hash,
+                            &data.intervention_queue,
+                            &shared_for_signal.dispatch_role_overrides,
+                        );
                         let ts3 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
                     }
@@ -1287,7 +1313,12 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                     let queue_count: usize =
                         data.intervention_queue.values().map(|q| q.len()).sum();
                     if queue_count > 0 {
-                        save_pending_queues(&provider_for_shutdown, &data.intervention_queue);
+                        save_pending_queues(
+                            &provider_for_shutdown,
+                            &shared_for_signal.token_hash,
+                            &data.intervention_queue,
+                            &shared_for_signal.dispatch_role_overrides,
+                        );
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
                     }
