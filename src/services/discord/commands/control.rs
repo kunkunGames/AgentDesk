@@ -54,21 +54,65 @@ async fn resolve_session_key_for_clear(
         return Some(key);
     }
 
-    let channel_name =
+    let guild_channel =
         channel_id
             .to_channel(http)
             .await
             .ok()
             .and_then(|channel| match channel {
-                serenity::Channel::Guild(guild_channel) => Some(guild_channel.name),
+                serenity::Channel::Guild(guild_channel) => Some(guild_channel),
                 _ => None,
             })?;
-    let hostname = crate::services::platform::hostname_short();
-    Some(format!(
-        "{}:{}",
-        hostname,
-        provider.build_tmux_session_name(&channel_name)
+    let thread_parent = resolve_thread_parent_for_clear(http, &guild_channel).await;
+    Some(build_fallback_session_key_for_clear(
+        &shared.token_hash,
+        provider,
+        channel_id,
+        &guild_channel.name,
+        thread_parent,
     ))
+}
+
+async fn resolve_thread_parent_for_clear(
+    http: &serenity::Http,
+    guild_channel: &serenity::GuildChannel,
+) -> Option<(serenity::ChannelId, Option<String>)> {
+    use serenity::model::channel::ChannelType;
+
+    match guild_channel.kind {
+        ChannelType::PublicThread | ChannelType::PrivateThread => {
+            let parent_id = guild_channel.parent_id?;
+            let parent_name =
+                parent_id
+                    .to_channel(http)
+                    .await
+                    .ok()
+                    .and_then(|channel| match channel {
+                        serenity::Channel::Guild(parent_channel) => Some(parent_channel.name),
+                        _ => None,
+                    });
+            Some((parent_id, parent_name))
+        }
+        _ => None,
+    }
+}
+
+fn build_fallback_session_key_for_clear(
+    token_hash: &str,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    live_channel_name: &str,
+    thread_parent: Option<(serenity::ChannelId, Option<String>)>,
+) -> String {
+    let channel_name = match thread_parent {
+        Some((parent_id, parent_name)) => {
+            let parent = parent_name.unwrap_or_else(|| parent_id.get().to_string());
+            super::super::synthetic_thread_channel_name(&parent, channel_id)
+        }
+        None => live_channel_name.to_string(),
+    };
+    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    super::super::adk_session::build_namespaced_session_key(token_hash, provider, &tmux_name)
 }
 
 pub(in crate::services::discord) async fn reset_provider_session_if_pending(
@@ -320,10 +364,12 @@ pub(in crate::services::discord) async fn cmd_down(
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedSessionClearBehavior, ManagedSessionResetBehavior, managed_session_clear_behavior,
+        ManagedSessionClearBehavior, ManagedSessionResetBehavior,
+        build_fallback_session_key_for_clear, managed_session_clear_behavior,
         managed_session_reset_behavior,
     };
     use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::ChannelId;
 
     #[test]
     fn managed_session_clear_behavior_matches_provider_transport() {
@@ -363,6 +409,49 @@ mod tests {
             managed_session_reset_behavior(&ProviderKind::Gemini),
             ManagedSessionResetBehavior::Noop
         );
+    }
+
+    #[test]
+    fn fallback_clear_key_uses_namespaced_session_key() {
+        let channel_id = ChannelId::new(123);
+        let key = build_fallback_session_key_for_clear(
+            "tokenxyz",
+            &ProviderKind::Codex,
+            channel_id,
+            "adk-cdx",
+            None,
+        );
+        let expected_tmux = ProviderKind::Codex.build_tmux_session_name("adk-cdx");
+        let expected = crate::services::discord::adk_session::build_namespaced_session_key(
+            "tokenxyz",
+            &ProviderKind::Codex,
+            &expected_tmux,
+        );
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn fallback_clear_key_uses_synthetic_thread_name_for_threads() {
+        let channel_id = ChannelId::new(1479671301387059200);
+        let key = build_fallback_session_key_for_clear(
+            "tokenxyz",
+            &ProviderKind::Codex,
+            channel_id,
+            "review-thread-live-name",
+            Some((
+                ChannelId::new(1479671301387059201),
+                Some("adk-cdx".to_string()),
+            )),
+        );
+        let synthetic_name =
+            crate::services::discord::synthetic_thread_channel_name("adk-cdx", channel_id);
+        let expected_tmux = ProviderKind::Codex.build_tmux_session_name(&synthetic_name);
+        let expected = crate::services::discord::adk_session::build_namespaced_session_key(
+            "tokenxyz",
+            &ProviderKind::Codex,
+            &expected_tmux,
+        );
+        assert_eq!(key, expected);
     }
 }
 
