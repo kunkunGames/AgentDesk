@@ -567,7 +567,17 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
             // Write-through: persist this channel's queue to disk
             if let Some(q) = data.intervention_queue.get(&channel_id) {
-                super::super::save_channel_queue(&provider, channel_id, q);
+                let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
+                super::super::save_channel_queue(
+                    &bot_owner_provider,
+                    &shared.token_hash,
+                    channel_id,
+                    q,
+                    shared
+                        .dispatch_role_overrides
+                        .get(&channel_id)
+                        .map(|r| r.value().get()),
+                );
             }
             drop(data);
             // Clean up: remove placeholder and reaction created before this check
@@ -756,7 +766,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         session_id.is_some(),
         prompt_prep_duration_ms
     );
-
     // Spawn turn watchdog — cancels the turn if it exceeds the deadline.
     // The deadline is stored in cancel_token.watchdog_deadline_ms and can be
     // extended via POST /api/turns/{channel_id}/extend-timeout (up to 3h cap).
