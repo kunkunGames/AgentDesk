@@ -41,9 +41,13 @@ export default function AgentCard({
     <SurfaceCard
       onClick={onEdit}
       className="group cursor-pointer rounded-3xl p-4 transition-all hover:-translate-y-0.5"
+      draggable={false}
+      onDragStart={(e) => e.preventDefault()}
       style={{
         background: "color-mix(in srgb, var(--th-card-bg) 94%, transparent)",
         borderColor: "color-mix(in srgb, var(--th-border) 68%, transparent)",
+        touchAction: "pan-y",
+        userSelect: "none",
       }}
     >
       <div className="flex items-start gap-3">
