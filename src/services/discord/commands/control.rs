@@ -81,7 +81,7 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
         let mut data = ctx.data().shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
             cleanup_channel_uploads(channel_id);
-            session.session_id = None;
+            session.clear_provider_session();
             session.history.clear();
             session.pending_uploads.clear();
             session.cleared = true;
