@@ -242,22 +242,23 @@ fn run_turn(
         args.push("-c".to_string());
         args.push(format!("model_auto_compact_token_limit={}", limit));
     }
+    if readonly_mode {
+        args.extend([
+            "-a".to_string(),
+            "never".to_string(),
+            "-s".to_string(),
+            "read-only".to_string(),
+        ]);
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
     args.push("exec".to_string());
     if let Some(existing_thread_id) = thread_id.as_deref() {
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
     }
     args.extend(["--skip-git-repo-check".to_string(), "--json".to_string()]);
-    if readonly_mode {
-        args.extend([
-            "--sandbox".to_string(),
-            "read-only".to_string(),
-            "-a".to_string(),
-            "never".to_string(),
-        ]);
-    } else {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    }
+    args.push("--".to_string());
     args.push(prompt.to_string());
 
     let mut cmd = Command::new(codex_bin);
