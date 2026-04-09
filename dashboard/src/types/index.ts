@@ -328,6 +328,13 @@ export interface RoundTableMeetingChannelOption {
   channel_id: string;
   channel_name: string;
   owner_provider: string;
+  available_experts: RoundTableMeetingExpertOption[];
+}
+
+export interface RoundTableMeetingExpertOption {
+  role_id: string;
+  display_name: string;
+  keywords: string[];
 }
 
 export interface RoundTableMeeting {

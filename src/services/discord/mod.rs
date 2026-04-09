@@ -4,7 +4,7 @@ mod formatting;
 mod handoff;
 pub(crate) mod health;
 mod inflight;
-mod meeting;
+pub(crate) mod meeting;
 mod metrics;
 mod model_catalog;
 mod model_picker_interaction;

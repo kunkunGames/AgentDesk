@@ -74,7 +74,7 @@ export function formatProviderFlow(
 ): string {
   const primary = getProviderMeta(primaryProvider).label;
   const reviewer = getProviderMeta(reviewerProvider).label;
-  return `${primary} -> ${reviewer}`;
+  return `${primary} / ${reviewer}`;
 }
 
 export function providerFlowCaption(
@@ -86,11 +86,23 @@ export function providerFlowCaption(
   const reviewer = getProviderMeta(reviewerProvider).label;
   if (t) {
     return t({
-      ko: `초안/최종: ${primary} · 비판 검토: ${reviewer}`,
-      en: `Draft/Final: ${primary} · Critique: ${reviewer}`,
+      ko: `진행자: ${primary} · 리뷰어: ${reviewer}`,
+      en: `Facilitator: ${primary} · Reviewer: ${reviewer}`,
     });
   }
-  return `Draft/Final: ${primary} · Critique: ${reviewer}`;
+  return `Facilitator: ${primary} · Reviewer: ${reviewer}`;
+}
+
+export function providerOperatorHelper(
+  t?: (text: { ko: string; en: string }) => string,
+): string {
+  if (t) {
+    return t({
+      ko: "진행자와 리뷰어는 도메인 메모리나 Identity 없이 provider CLI의 기본 모델 세션으로만 운영됩니다.",
+      en: "Facilitator and reviewer run as provider CLI default-model sessions without domain memory or identity.",
+    });
+  }
+  return "Facilitator and reviewer run as provider CLI default-model sessions without domain memory or identity.";
 }
 
 export default function MeetingProviderFlow({
@@ -115,19 +127,19 @@ export default function MeetingProviderFlow({
     }}>
       {!compact && (
         <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
-          Provider Flow
+          {t({ ko: "운영자", en: "Operator Roles" })}
         </span>
       )}
       <ProviderChip label={primary.label} bg={primary.bg} color={primary.color} border={primary.border} />
       <span className="text-xs font-semibold" style={{ color: "var(--th-text-muted)" }}>
-        {t({ ko: "초안/최종", en: "draft/final" })}
+        {t({ ko: "진행자", en: "Facilitator" })}
       </span>
       <span className="text-xs font-semibold px-1" style={{ color: "var(--th-text-muted)" }}>
         →
       </span>
       <ProviderChip label={reviewer.label} bg={reviewer.bg} color={reviewer.color} border={reviewer.border} />
       <span className="text-xs font-semibold" style={{ color: "var(--th-text-muted)" }}>
-        {t({ ko: "비판 검토", en: "critique" })}
+        {t({ ko: "리뷰어", en: "Reviewer" })}
       </span>
     </div>
   );
