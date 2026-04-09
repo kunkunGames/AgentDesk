@@ -51,8 +51,8 @@ use adk_session::{
     lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
 };
 use channel_mailbox::{
-    ChannelMailboxRegistry, ChannelMailboxSnapshot, ClearChannelResult, FinishTurnResult,
-    QueuePersistenceContext,
+    CancelActiveTurnResult, ChannelMailboxRegistry, ChannelMailboxSnapshot, ClearChannelResult,
+    FinishTurnResult, QueuePersistenceContext, RecoveryKickoffResult,
 };
 use formatting::{
     BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
@@ -130,34 +130,24 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
     })
 }
 
-/// Global watchdog deadline overrides, keyed by channel_id.
-/// Written by POST /api/turns/{channel_id}/extend-timeout, read by the watchdog loop.
-/// Values are Unix timestamp in milliseconds representing the new deadline.
-static WATCHDOG_DEADLINE_OVERRIDES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u64, i64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// Extend the watchdog deadline for a channel. Returns the new deadline_ms or None if at cap.
-pub fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
-    let extend_ms = extend_by_secs as i64 * 1000;
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut map = WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?;
-    let current = map.get(&channel_id).copied().unwrap_or(now_ms);
-    let new_deadline = std::cmp::max(current, now_ms) + extend_ms;
-    // Don't enforce max here — the watchdog will clamp against its own max
-    map.insert(channel_id, new_deadline);
-    Some(new_deadline)
+pub async fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
+    ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
+        .extend_timeout(extend_by_secs)
+        .await
 }
 
 /// Read and consume the deadline override for a channel (if any).
-pub(super) fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
-    WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?.remove(&channel_id)
+pub(super) async fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
+    ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
+        .take_timeout_override()
+        .await
 }
 
 /// Remove the deadline override for a channel (on turn completion).
-pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
-    if let Ok(mut map) = WATCHDOG_DEADLINE_OVERRIDES.lock() {
-        map.remove(&channel_id);
+pub(super) async fn clear_watchdog_deadline_override(channel_id: u64) {
+    if let Some(handle) = ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id)) {
+        handle.clear_timeout_override().await;
     }
 }
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
@@ -557,6 +547,13 @@ async fn mailbox_cancel_token(
     shared.mailbox(channel_id).cancel_token().await
 }
 
+async fn mailbox_cancel_active_turn(
+    shared: &SharedData,
+    channel_id: ChannelId,
+) -> CancelActiveTurnResult {
+    shared.mailbox(channel_id).cancel_active_turn().await
+}
+
 async fn mailbox_has_active_turn(shared: &SharedData, channel_id: ChannelId) -> bool {
     shared.mailbox(channel_id).has_active_turn().await
 }
@@ -574,6 +571,7 @@ async fn mailbox_try_start_turn(
         .await
 }
 
+#[allow(dead_code)]
 async fn mailbox_restore_active_turn(
     shared: &SharedData,
     channel_id: ChannelId,
@@ -585,6 +583,29 @@ async fn mailbox_restore_active_turn(
         .mailbox(channel_id)
         .restore_active_turn(cancel_token, request_owner, user_message_id)
         .await;
+}
+
+async fn mailbox_recovery_kickoff(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    cancel_token: Arc<CancelToken>,
+    request_owner: UserId,
+    user_message_id: MessageId,
+) -> RecoveryKickoffResult {
+    let result = shared
+        .mailbox(channel_id)
+        .recovery_kickoff(cancel_token, request_owner, user_message_id)
+        .await;
+    if result.activated_turn {
+        shared
+            .global_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+async fn mailbox_clear_recovery_marker(shared: &SharedData, channel_id: ChannelId) {
+    shared.mailbox(channel_id).clear_recovery_marker().await;
 }
 
 async fn mailbox_enqueue_intervention(
@@ -689,6 +710,17 @@ async fn mailbox_replace_queue(
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
+}
+
+async fn mailbox_restart_drain_all(shared: &SharedData, provider: &ProviderKind) -> usize {
+    shared
+        .mailboxes
+        .restart_drain_all(
+            provider,
+            &shared.token_hash,
+            &shared.dispatch_role_overrides,
+        )
+        .await
 }
 
 async fn mailbox_queue_snapshots(shared: &SharedData) -> HashMap<ChannelId, Vec<Intervention>> {
@@ -810,7 +842,7 @@ pub(super) fn requeue_intervention_front(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn take_next_soft_intervention_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -858,7 +890,7 @@ pub(super) fn take_next_soft_intervention_persisted(
     Some((intervention, has_more))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn requeue_intervention_front_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -943,6 +975,7 @@ pub(super) fn save_channel_queue(
 /// Save all non-empty intervention queues to `discord_pending_queue/{provider}/{token_hash}/`.
 /// `dispatch_role_overrides` is snapshotted per channel so that `override_channel_id` survives
 /// restart and can be restored to `SharedData.dispatch_role_overrides`.
+#[cfg(test)]
 fn save_pending_queues(
     provider: &ProviderKind,
     token_hash: &str,
@@ -2298,21 +2331,12 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                         let g_active = shared_for_deferred.global_active.load(Ordering::Relaxed);
                         let g_finalizing = shared_for_deferred.global_finalizing.load(Ordering::Relaxed);
                         if g_active == 0 && g_finalizing == 0 && shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
-                            // Save pending queues before exiting so they survive restart
-                            {
-                                let queues = mailbox_queue_snapshots(&shared_for_deferred).await;
-                                let queue_count: usize =
-                                    queues.values().map(|queue| queue.len()).sum();
-                                if queue_count > 0 {
-                                    save_pending_queues(
-                                        &provider_for_deferred,
-                                        &shared_for_deferred.token_hash,
-                                        &queues,
-                                        &shared_for_deferred.dispatch_role_overrides,
-                                    );
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
-                                }
+                            let queue_count =
+                                mailbox_restart_drain_all(&shared_for_deferred, &provider_for_deferred)
+                                    .await;
+                            if queue_count > 0 {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}] 📋 DRAIN: mailbox persisted {queue_count} pending queue item(s) before deferred restart");
                             }
                             check_deferred_restart(&shared_for_deferred);
                             // This provider has saved and decremented — stop polling
@@ -2636,20 +2660,11 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                 // Save pending queues and last_message_ids FIRST, before any
                 // network calls that might block/timeout and prevent saving.
 
-                // Persist pending intervention queues so they survive restart
-                {
-                    let queues = mailbox_queue_snapshots(&shared_for_signal).await;
-                    let queue_count: usize = queues.values().map(|queue| queue.len()).sum();
-                    if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &queues,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
-                        let ts3 = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
-                    }
+                let queue_count =
+                    mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
+                if queue_count > 0 {
+                    let ts3 = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts3}] 📋 mailbox persisted {queue_count} pending queue item(s)");
                 }
 
                 // Persist last_message_ids for catch-up polling after restart
@@ -2756,17 +2771,13 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                 // finished and mutated queues/last_message_ids. Re-save to capture
                 // any changes that occurred after the initial save.
                 {
-                    let queues = mailbox_queue_snapshots(&shared_for_signal).await;
-                    let queue_count: usize = queues.values().map(|queue| queue.len()).sum();
+                    let queue_count =
+                        mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
                     if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &queues,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
+                        println!(
+                            "  [{ts4}] 📋 mailbox final drain: {queue_count} pending queue item(s)"
+                        );
                     }
                 }
                 {

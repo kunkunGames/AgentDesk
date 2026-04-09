@@ -1105,10 +1105,9 @@ pub(super) async fn restore_inflight_turns(
             .recovering_channels
             .insert(channel_id, std::time::Instant::now());
 
-        let last_path =
-            load_last_session_path(shared.db.as_ref(), &shared.token_hash, channel_id.get());
-        let saved_remote =
-            load_last_remote_profile(shared.db.as_ref(), &shared.token_hash, channel_id.get());
+        let channel_key = channel_id.get().to_string();
+        let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
+        let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
 
         let cancel_token = Arc::new(CancelToken::new());
         if let Ok(mut guard) = cancel_token.tmux_session.lock() {
@@ -1150,12 +1149,7 @@ pub(super) async fn restore_inflight_turns(
             }
         }
 
-        if !mailbox_has_active_turn(shared, channel_id).await {
-            shared
-                .global_active
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        mailbox_restore_active_turn(
+        mailbox_recovery_kickoff(
             shared,
             channel_id,
             cancel_token.clone(),

@@ -188,7 +188,7 @@ pub async fn extend_turn_timeout(
         }
     };
 
-    match crate::services::discord::extend_watchdog_deadline(channel_num, body.extend_secs) {
+    match crate::services::discord::extend_watchdog_deadline(channel_num, body.extend_secs).await {
         Some(new_deadline_ms) => {
             let remaining_min =
                 (new_deadline_ms - chrono::Utc::now().timestamp_millis()) / 1000 / 60;

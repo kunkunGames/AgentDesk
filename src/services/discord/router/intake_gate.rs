@@ -178,7 +178,7 @@ async fn handle_reaction_remove(
             }
 
             let stop_lookup =
-                super::message_handler::lookup_text_stop_token_mailbox(&data.shared, channel_id)
+                super::message_handler::cancel_text_stop_token_mailbox(&data.shared, channel_id)
                     .await;
             match stop_lookup {
                 super::message_handler::TextStopLookup::Stop(token) => {

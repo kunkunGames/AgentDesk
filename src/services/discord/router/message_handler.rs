@@ -932,13 +932,13 @@ pub(in crate::services::discord) async fn handle_text_message(
                     .cancelled
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num);
+                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num).await;
                     return;
                 }
 
                 // Check for API-based deadline extension
                 if let Some(new_deadline) =
-                    super::super::take_watchdog_deadline_override(watchdog_channel_id_num)
+                    super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
                     let max_dl = watchdog_token
                         .watchdog_max_deadline_ms
@@ -1569,12 +1569,25 @@ pub(super) fn lookup_text_stop_token(
     }
 }
 
+#[allow(dead_code)]
 pub(super) async fn lookup_text_stop_token_mailbox(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
 ) -> TextStopLookup {
     match super::super::mailbox_cancel_token(shared, channel_id).await {
         Some(token) if cancel_requested(Some(token.as_ref())) => TextStopLookup::AlreadyStopping,
+        Some(token) => TextStopLookup::Stop(token),
+        None => TextStopLookup::NoActiveTurn,
+    }
+}
+
+pub(super) async fn cancel_text_stop_token_mailbox(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> TextStopLookup {
+    let result = super::super::mailbox_cancel_active_turn(shared, channel_id).await;
+    match result.token {
+        Some(_) if result.already_stopping => TextStopLookup::AlreadyStopping,
         Some(token) => TextStopLookup::Stop(token),
         None => TextStopLookup::NoActiveTurn,
     }
@@ -1811,7 +1824,7 @@ pub(super) async fn handle_text_command(
         }
 
         "!stop" => {
-            let stop_lookup = lookup_text_stop_token_mailbox(&data.shared, channel_id).await;
+            let stop_lookup = cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
             match stop_lookup {
                 TextStopLookup::Stop(token) => {
                     super::super::turn_bridge::cancel_active_token(&token, true, "!stop");
@@ -2415,7 +2428,7 @@ Any other message is sent to {p}.
                 }
                 "stop" => {
                     let stop_lookup =
-                        lookup_text_stop_token_mailbox(&data.shared, channel_id).await;
+                        cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
                     match stop_lookup {
                         TextStopLookup::Stop(token) => {
                             super::super::turn_bridge::cancel_active_token(
