@@ -2333,7 +2333,6 @@ fn ensure_auto_queue_tables(db: &Db) {
             created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             completed_at DATETIME,
             max_concurrent_threads INTEGER DEFAULT 1,
-            max_concurrent_per_agent INTEGER DEFAULT 1,
             thread_group_count INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS auto_queue_entries (
@@ -2383,6 +2382,71 @@ fn seed_auto_queue_card(db: &Db, card_id: &str, issue_number: i64, status: &str,
         ],
     )
     .unwrap();
+}
+
+#[test]
+fn auto_queue_ensure_tables_drops_legacy_max_concurrent_per_agent_column() {
+    let db = test_db();
+    let conn = db.lock().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE auto_queue_runs (
+            id          TEXT PRIMARY KEY,
+            repo        TEXT,
+            agent_id    TEXT,
+            status      TEXT DEFAULT 'active',
+            ai_model    TEXT,
+            ai_rationale TEXT,
+            timeout_minutes INTEGER DEFAULT 120,
+            unified_thread INTEGER DEFAULT 0,
+            unified_thread_id TEXT,
+            unified_thread_channel_id TEXT,
+            max_concurrent_threads INTEGER DEFAULT 1,
+            max_concurrent_per_agent INTEGER DEFAULT 1,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completed_at DATETIME
+        );
+        CREATE TABLE auto_queue_entries (
+            id              TEXT PRIMARY KEY,
+            run_id          TEXT REFERENCES auto_queue_runs(id),
+            kanban_card_id  TEXT REFERENCES kanban_cards(id),
+            agent_id        TEXT,
+            priority_rank   INTEGER DEFAULT 0,
+            reason          TEXT,
+            status          TEXT DEFAULT 'pending',
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            dispatched_at   DATETIME,
+            completed_at    DATETIME
+        );",
+    )
+    .unwrap();
+
+    crate::server::routes::auto_queue::ensure_tables(&conn);
+
+    let has_legacy_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'max_concurrent_per_agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let has_max_threads: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'max_concurrent_threads'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let has_thread_group_count: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'thread_group_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert!(!has_legacy_column);
+    assert!(has_max_threads);
+    assert!(has_thread_group_count);
 }
 
 fn seed_live_auto_queue_run(db: &Db, run_id: &str, agent_id: &str, existing_card_id: &str) {
@@ -5277,9 +5341,9 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         conn.execute(
             "INSERT INTO auto_queue_runs (
                 id, repo, agent_id, status, unified_thread,
-                max_concurrent_threads, max_concurrent_per_agent, thread_group_count
+                max_concurrent_threads, thread_group_count
             ) VALUES (
-                'run-slot', 'test-repo', 'agent-slot', 'active', 1, 2, 2, 3
+                'run-slot', 'test-repo', 'agent-slot', 'active', 1, 2, 3
             )",
             [],
         )
@@ -5550,9 +5614,9 @@ async fn auto_queue_activate_keeps_same_group_slot_context_between_entries() {
         conn.execute(
             "INSERT INTO auto_queue_runs (
                 id, repo, agent_id, status, unified_thread,
-                max_concurrent_threads, max_concurrent_per_agent, thread_group_count
+                max_concurrent_threads, thread_group_count
             ) VALUES (
-                'run-same-group', 'test-repo', 'agent-same-group', 'active', 1, 1, 1, 1
+                'run-same-group', 'test-repo', 'agent-same-group', 'active', 1, 1, 1
             )",
             [],
         )
@@ -5719,9 +5783,9 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         conn.execute(
             "INSERT INTO auto_queue_runs (
                 id, repo, agent_id, status, unified_thread,
-                max_concurrent_threads, max_concurrent_per_agent, thread_group_count
+                max_concurrent_threads, thread_group_count
             ) VALUES (
-                'run-slot-expand', 'test-repo', 'agent-slot-expand', 'active', 1, 4, 4, 4
+                'run-slot-expand', 'test-repo', 'agent-slot-expand', 'active', 1, 4, 4
             )",
             [],
         )
@@ -6121,7 +6185,7 @@ async fn parallel_generate_creates_correct_thread_groups() {
     // Verify run has correct parallel config
     let run = &json["run"];
     assert_eq!(run["max_concurrent_threads"], 3);
-    assert_eq!(run["max_concurrent_per_agent"], 3);
+    assert!(run.get("max_concurrent_per_agent").is_none());
 
     // Collect thread_group assignments per issue number
     let mut groups: std::collections::HashMap<i64, Vec<(i64, i64)>> =
@@ -6688,6 +6752,100 @@ async fn parallel_false_keeps_single_group_sequential() {
 /// Regression test for #191: onTick1min recovery must reset stuck auto-queue
 /// entries that are 'dispatched' but have orphan (NULL), phantom (missing row),
 /// or cancelled/failed dispatch_ids — while leaving valid dispatches untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_agent(&db, "agent-393");
+    seed_auto_queue_card(&db, "card-393-1", 3931, "ready", "agent-393");
+    seed_auto_queue_card(&db, "card-393-2", 3932, "ready", "agent-393");
+
+    let app = test_api_router(db.clone(), engine.clone(), None);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "agent-393",
+                        "parallel": true,
+                        "max_concurrent_threads": 2,
+                        "max_concurrent_per_agent": 1,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let generated_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let run = &generated_json["run"];
+    assert_eq!(run["max_concurrent_threads"], 2);
+    assert!(run.get("max_concurrent_per_agent").is_none());
+
+    {
+        let conn = db.lock().unwrap();
+        let run_id = run["id"].as_str().unwrap();
+        conn.execute(
+            "UPDATE auto_queue_entries
+             SET thread_group = CASE id
+                 WHEN ?1 THEN 0
+                 WHEN ?2 THEN 1
+                 ELSE thread_group
+             END
+             WHERE run_id = ?3",
+            rusqlite::params![
+                generated_json["entries"][0]["id"].as_str().unwrap(),
+                generated_json["entries"][1]["id"].as_str().unwrap(),
+                run_id
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE auto_queue_runs SET thread_group_count = 2 WHERE id = ?1",
+            [run_id],
+        )
+        .unwrap();
+    }
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "agent-393",
+                        "unified_thread": false,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let activate_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(activate_json["count"], 2);
+    assert_eq!(activate_json["active_groups"], 2);
+}
+
 #[test]
 fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries() {
     crate::pipeline::ensure_loaded();

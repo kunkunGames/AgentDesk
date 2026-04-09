@@ -80,14 +80,6 @@ var autoQueue = {
     );
     var groupDone = groupRemaining.length > 0 && groupRemaining[0].cnt === 0;
 
-    // Read run config for parallel dispatch
-    var runCfg = agentdesk.db.query(
-      "SELECT COALESCE(max_concurrent_threads, 1) as mct, COALESCE(max_concurrent_per_agent, 1) as mca FROM auto_queue_runs WHERE id = ?",
-      [runId]
-    );
-    var maxConcurrent = (runCfg.length > 0) ? runCfg[0].mct : 1;
-    var maxPerAgent = (runCfg.length > 0) ? runCfg[0].mca : 1;
-
     // Check if agent has any active (non-terminal) cards — don't dispatch if busy
     var tCfg = agentdesk.pipeline.getConfig();
     var tKickoff = agentdesk.pipeline.kickoffState(tCfg);

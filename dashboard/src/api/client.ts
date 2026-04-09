@@ -1156,7 +1156,6 @@ export interface AutoQueueRun {
   created_at: number;
   completed_at: number | null;
   max_concurrent_threads?: number;
-  max_concurrent_per_agent?: number;
   thread_group_count?: number;
 }
 
