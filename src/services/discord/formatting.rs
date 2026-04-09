@@ -503,6 +503,17 @@ mod tests {
     }
 
     #[test]
+    fn test_preserve_previous_tool_status_keeps_previous_for_distinct_same_tool() {
+        let mut prev = None;
+        preserve_previous_tool_status(
+            &mut prev,
+            Some("✓ Bash: git status"),
+            Some("⚙ Bash: cargo build"),
+        );
+        assert_eq!(prev.as_deref(), Some("✓ Bash: git status"));
+    }
+
+    #[test]
     fn test_build_placeholder_status_block_uses_two_line_trail_only_without_narration() {
         let two_line = build_placeholder_status_block(
             "⠋",
@@ -1224,11 +1235,7 @@ fn tool_status_identity(line: &str) -> (&str, &str) {
         .or_else(|| trimmed.strip_prefix("✗"))
     {
         let stripped = stripped.trim();
-        let subject = stripped
-            .split_once(':')
-            .map(|(head, _)| head.trim())
-            .unwrap_or(stripped);
-        return ("tool", subject);
+        return ("tool", stripped);
     }
     ("other", trimmed)
 }
