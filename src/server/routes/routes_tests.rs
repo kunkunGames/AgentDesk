@@ -6110,6 +6110,64 @@ async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() 
 }
 
 #[tokio::test]
+async fn auto_queue_generate_persists_unified_thread_flag() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-generate-unified");
+    seed_repo(&db, "test-repo");
+    seed_auto_queue_card(
+        &db,
+        "card-generate-unified",
+        3881,
+        "ready",
+        "agent-generate-unified",
+    );
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "agent-generate-unified",
+                        "unified_thread": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["run"]["unified_thread"], serde_json::json!(true));
+
+    let run_id = json["run"]["id"]
+        .as_str()
+        .expect("generated run id must be present");
+    let conn = db.lock().unwrap();
+    let stored_unified_thread: i64 = conn
+        .query_row(
+            "SELECT unified_thread FROM auto_queue_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_unified_thread, 1,
+        "generate must persist unified_thread to the run"
+    );
+}
+
+#[tokio::test]
 async fn generate_similarity_aware_groups_by_file_paths_and_recommends_threads() {
     let db = test_db();
     let engine = test_engine(&db);

@@ -18,6 +18,7 @@ pub struct GenerateBody {
     pub agent_id: Option<String>,
     pub issue_numbers: Option<Vec<i64>>,
     pub mode: Option<String>, // "priority-sort" (default), "dependency-aware", "similarity-aware", or "pm-assisted"
+    pub unified_thread: Option<bool>,
     pub parallel: Option<bool>,
     pub max_concurrent_threads: Option<i64>,
     pub max_concurrent_per_agent: Option<i64>,
@@ -1433,9 +1434,16 @@ pub async fn generate(
         // Create pending run
         let run_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
-            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale) VALUES (?1, ?2, ?3, 'pending', 'pm-assisted', ?4)",
-            rusqlite::params![run_id, body.repo, body.agent_id, format!("PMD 분석 대기 중 — {}개 카드 제출", cards.len())],
-        ).ok();
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, unified_thread) VALUES (?1, ?2, ?3, 'pending', 'pm-assisted', ?4, ?5)",
+            rusqlite::params![
+                run_id,
+                body.repo,
+                body.agent_id,
+                format!("PMD 분석 대기 중 — {}개 카드 제출", cards.len()),
+                body.unified_thread.unwrap_or(false)
+            ],
+        )
+        .ok();
 
         // Collect card info for PMD request
         let mut card_summaries = Vec::new();
@@ -1694,9 +1702,19 @@ pub async fn generate(
     };
     let ai_model_str = ai_model.to_string();
     conn.execute(
-        "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, max_concurrent_threads, max_concurrent_per_agent, thread_group_count) \
-         VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![run_id, body.repo, body.agent_id, ai_model_str, ai_rationale, max_concurrent, max_per_agent, thread_group_count],
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, max_concurrent_per_agent, thread_group_count) \
+         VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            run_id,
+            body.repo,
+            body.agent_id,
+            ai_model_str,
+            ai_rationale,
+            body.unified_thread.unwrap_or(false),
+            max_concurrent,
+            max_per_agent,
+            thread_group_count
+        ],
     )
     .ok();
 
