@@ -63,26 +63,6 @@ function providerLabel(provider: string) {
   return PROVIDER_LABELS[provider] ?? provider.toUpperCase();
 }
 
-function metadataConfidenceMeta(confidence: RoundTableMeetingExpertOption["metadata_confidence"]) {
-  switch (confidence) {
-    case "high":
-      return {
-        label: { ko: "메타 높음", en: "Meta high" },
-        style: { background: "rgba(16,185,129,0.12)", color: "#34d399" },
-      };
-    case "medium":
-      return {
-        label: { ko: "메타 보통", en: "Meta medium" },
-        style: { background: "rgba(245,158,11,0.12)", color: "#f59e0b" },
-      };
-    default:
-      return {
-        label: { ko: "메타 낮음", en: "Meta low" },
-        style: { background: "rgba(239,68,68,0.12)", color: "#f87171" },
-      };
-  }
-}
-
 function providerMatchesQuery(provider: string, query: string) {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return true;
@@ -903,7 +883,6 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                 ) : (
                   filteredExperts.map((expert) => {
                     const isSelected = fixedParticipantRoleIds.includes(expert.role_id);
-                    const confidenceMeta = metadataConfidenceMeta(expert.metadata_confidence);
                     return (
                       <button
                         key={expert.role_id}
@@ -919,20 +898,6 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                             {expert.display_name}
                           </div>
                           <div className="flex items-center gap-1.5">
-                            <span
-                              className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
-                              style={confidenceMeta.style}
-                            >
-                              {t(confidenceMeta.label)}
-                            </span>
-                            {expert.metadata_missing && (
-                              <span
-                                className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
-                                style={{ background: "rgba(245,158,11,0.12)", color: "#f59e0b" }}
-                              >
-                                {t({ ko: "메타 보강 필요", en: "Metadata missing" })}
-                              </span>
-                            )}
                             {isSelected && (
                               <span
                                 className="rounded-full px-2 py-0.5 text-xs font-semibold"
