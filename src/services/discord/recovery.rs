@@ -1,3 +1,4 @@
+use super::gateway::DiscordGateway;
 use super::handoff::{HandoffRecord, save_handoff};
 use super::settings::{
     load_last_remote_profile, load_last_session_path, resolve_role_binding,
@@ -1273,19 +1274,16 @@ pub(super) async fn restore_inflight_turns(
         let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
 
         spawn_turn_bridge(
-            http.clone(),
             shared.clone(),
             cancel_token,
             rx,
             TurnBridgeContext {
                 provider: provider.clone(),
+                gateway: Arc::new(DiscordGateway::new(http.clone(), shared.clone(), None)),
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),
                 request_owner_name: String::new(),
-                request_owner: None,
-                serenity_ctx: None,
-                token: None,
                 role_binding,
                 adk_session_key,
                 adk_session_name,
