@@ -3,11 +3,7 @@ use std::fs;
 use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
-<<<<<<< HEAD
 use serde::{Deserialize, Serialize};
-=======
-use serde::{Deserialize, Serialize};
->>>>>>> fix/meeting-start-ui-pr23
 use serenity::{
     AutoArchiveDuration, ChannelId, ChannelType, CreateMessage,
     builder::{CreateThread, EditThread},
@@ -2169,15 +2165,9 @@ mod tests {
         ActiveMeetingSlot, MAX_MEETING_PARTICIPANTS, MIN_MEETING_PARTICIPANTS, Meeting,
         MeetingAgentConfig, MeetingConfig, MeetingStatus, MeetingUtterance, ProviderKind,
         SummaryAgentConfig, build_meeting_participants, build_meeting_status_payload,
-<<<<<<< HEAD
         canonical_candidate_pool, derive_agent_metadata_quality, effective_round_count,
         meeting_readonly_tools, meeting_slot_state, parse_meeting_start_text,
         parse_selected_role_ids_response,
-=======
-        canonical_candidate_pool, derive_agent_metadata_quality, effective_round_count,
-        meeting_readonly_tools, meeting_slot_state, parse_meeting_start_text,
-        parse_selected_role_ids_response,
->>>>>>> fix/meeting-start-ui-pr23
     };
     use crate::services::discord::settings::RoleBinding;
     use serde_json::json;
