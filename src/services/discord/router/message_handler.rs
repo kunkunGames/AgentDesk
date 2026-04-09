@@ -678,7 +678,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
-
     let reset_session_for_model_change = super::super::commands::reset_provider_session_if_pending(
         &ctx.http, shared, &provider, channel_id,
     )
