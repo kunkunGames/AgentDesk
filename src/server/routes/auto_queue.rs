@@ -21,6 +21,8 @@ pub struct GenerateBody {
     pub unified_thread: Option<bool>,
     pub parallel: Option<bool>,
     pub max_concurrent_threads: Option<i64>,
+    // Legacy compatibility only. Accepted from callers, but ignored.
+    #[allow(dead_code)]
     pub max_concurrent_per_agent: Option<i64>,
 }
 
@@ -151,6 +153,8 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) {
             unified_thread  INTEGER DEFAULT 0,
             unified_thread_id TEXT,
             unified_thread_channel_id TEXT,
+            max_concurrent_threads INTEGER DEFAULT 1,
+            thread_group_count INTEGER DEFAULT 1,
             created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             completed_at DATETIME
         );
@@ -220,11 +224,33 @@ pub(crate) fn ensure_tables(conn: &rusqlite::Connection) {
         .unwrap_or(false);
     if !has_max_concurrent {
         conn.execute_batch(
-            "ALTER TABLE auto_queue_runs ADD COLUMN max_concurrent_threads INTEGER DEFAULT 1;
-             ALTER TABLE auto_queue_runs ADD COLUMN max_concurrent_per_agent INTEGER DEFAULT 1;
-             ALTER TABLE auto_queue_runs ADD COLUMN thread_group_count INTEGER DEFAULT 1;",
+            "ALTER TABLE auto_queue_runs ADD COLUMN max_concurrent_threads INTEGER DEFAULT 1;",
         )
         .ok();
+    }
+    let has_thread_group_count: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'thread_group_count'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_thread_group_count {
+        conn.execute_batch(
+            "ALTER TABLE auto_queue_runs ADD COLUMN thread_group_count INTEGER DEFAULT 1;",
+        )
+        .ok();
+    }
+    let has_max_per_agent: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_runs') WHERE name = 'max_concurrent_per_agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if has_max_per_agent {
+        conn.execute_batch("ALTER TABLE auto_queue_runs DROP COLUMN max_concurrent_per_agent;")
+            .ok();
     }
 
     // #145: dispatch_id on entries — direct dispatch→run association
@@ -1116,7 +1142,6 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
                 CASE WHEN completed_at IS NOT NULL THEN CAST(strftime('%s', completed_at) AS INTEGER) * 1000 END,
                 unified_thread, unified_thread_id,
                 COALESCE(max_concurrent_threads, 1),
-                COALESCE(max_concurrent_per_agent, 1),
                 COALESCE(thread_group_count, 1)
          FROM auto_queue_runs WHERE id = ?1",
         [run_id],
@@ -1134,8 +1159,7 @@ fn run_to_json(conn: &rusqlite::Connection, run_id: &str) -> serde_json::Value {
                 "unified_thread": row.get::<_, i64>(9).unwrap_or(0) != 0,
                 "unified_thread_id": row.get::<_, Option<String>>(10)?,
                 "max_concurrent_threads": row.get::<_, i64>(11)?,
-                "max_concurrent_per_agent": row.get::<_, i64>(12)?,
-                "thread_group_count": row.get::<_, i64>(13)?,
+                "thread_group_count": row.get::<_, i64>(12)?,
             }))
         },
     )
@@ -1613,7 +1637,6 @@ pub async fn generate(
             .min(plan.thread_group_count.max(1)),
         None => 1,
     };
-    let max_per_agent = body.max_concurrent_per_agent.unwrap_or(1).clamp(1, 10);
 
     let (
         grouped_entries,
@@ -1717,8 +1740,8 @@ pub async fn generate(
     };
     let ai_model_str = ai_model.to_string();
     conn.execute(
-        "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, max_concurrent_per_agent, thread_group_count) \
-         VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, thread_group_count) \
+         VALUES (?1, ?2, ?3, 'generated', ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             run_id,
             body.repo,
@@ -1727,7 +1750,6 @@ pub async fn generate(
             ai_rationale,
             body.unified_thread.unwrap_or(false),
             max_concurrent,
-            max_per_agent,
             thread_group_count
         ],
     )
@@ -1935,30 +1957,17 @@ pub async fn activate(
     }
 
     // #140: Read run parallel config
-    let (max_concurrent, max_per_agent, _thread_group_count, unified_thread_enabled): (
-        i64,
-        i64,
-        i64,
-        bool,
-    ) = conn
+    let (max_concurrent, _thread_group_count, unified_thread_enabled): (i64, i64, bool) = conn
         .query_row(
             "SELECT COALESCE(max_concurrent_threads, 1),
-                    COALESCE(max_concurrent_per_agent, 1),
                     COALESCE(thread_group_count, 1),
                     COALESCE(unified_thread, 0)
              FROM auto_queue_runs
              WHERE id = ?1",
             [&run_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get::<_, i64>(3)? != 0,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
         )
-        .unwrap_or((1, 1, 1, false));
+        .unwrap_or((1, 1, false));
 
     // Count currently active groups (groups with at least one 'dispatched' entry)
     let active_groups: Vec<i64> = {
@@ -1972,22 +1981,6 @@ pub async fn activate(
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
-    };
-
-    // Count per-agent active dispatches (across all groups in this run)
-    let mut agent_dispatch_counts: HashMap<String, i64> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent_id, COUNT(*) FROM auto_queue_entries \
-                 WHERE run_id = ?1 AND status = 'dispatched' GROUP BY agent_id",
-            )
-            .unwrap();
-        stmt.query_map([&run_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
     };
 
     let active_group_count = active_groups.len() as i64;
@@ -2121,15 +2114,6 @@ pub async fn activate(
         let Some((entry_id, card_id, agent_id)) = entry else {
             continue;
         };
-
-        // Per-agent concurrency guard (#140)
-        let current_agent_count = agent_dispatch_counts.get(&agent_id).copied().unwrap_or(0);
-        if current_agent_count >= max_per_agent {
-            tracing::info!(
-                "[auto-queue] Skipping group {group} for {agent_id}: at max_concurrent_per_agent ({max_per_agent})"
-            );
-            continue;
-        }
 
         // Busy-agent guard (#110): skip if agent has active cards outside auto-queue.
         // Exclude the card being dispatched (#162) and cards that belong to the
@@ -2315,7 +2299,6 @@ pub async fn activate(
                                 rusqlite::params![dispatch_id, entry_id],
                             )
                             .ok();
-                            *agent_dispatch_counts.entry(agent_id.clone()).or_insert(0) += 1;
                             dispatched.push(entry_to_json(&conn, &entry_id));
                             drop(conn);
                             continue;
@@ -2416,9 +2399,6 @@ pub async fn activate(
         )
         .ok();
         drop(conn);
-
-        // #140: Update local per-agent count so subsequent iterations respect max_concurrent_per_agent
-        *agent_dispatch_counts.entry(agent_id.clone()).or_insert(0) += 1;
 
         let conn = state.db.separate_conn().unwrap();
         dispatched.push(entry_to_json(&conn, &entry_id));
