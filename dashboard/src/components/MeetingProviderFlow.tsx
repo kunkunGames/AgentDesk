@@ -93,18 +93,6 @@ export function providerFlowCaption(
   return `Facilitator: ${primary} · Reviewer: ${reviewer}`;
 }
 
-export function providerOperatorHelper(
-  t?: (text: { ko: string; en: string }) => string,
-): string {
-  if (t) {
-    return t({
-      ko: "진행자와 리뷰어는 도메인 메모리나 Identity 없이 provider CLI의 기본 모델 세션으로만 운영됩니다.",
-      en: "Facilitator and reviewer run as provider CLI default-model sessions without domain memory or identity.",
-    });
-  }
-  return "Facilitator and reviewer run as provider CLI default-model sessions without domain memory or identity.";
-}
-
 export default function MeetingProviderFlow({
   primaryProvider,
   reviewerProvider,

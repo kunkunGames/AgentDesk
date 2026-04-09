@@ -24,7 +24,6 @@ import MeetingDetailModal from "./MeetingDetailModal";
 import MeetingProviderFlow, {
   getProviderMeta,
   providerFlowCaption,
-  providerOperatorHelper,
 } from "./MeetingProviderFlow";
 import MarkdownContent from "./common/MarkdownContent";
 
@@ -833,31 +832,25 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                 )}
               </div>
               <div className="space-y-1">
-                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {selectedChannel
-                    ? t({
-                        ko: "리뷰어는 채널 담당 프로바이더와 진행자와 달라야 합니다",
-                        en: "Reviewer must differ from the channel owner and facilitator",
-                      })
-                    : t({ ko: "채널 선택 후 리뷰어를 정하세요", en: "Pick a reviewer after selecting a channel" })}
-                </span>
-                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {providerOperatorHelper(t)}
-                </span>
+                {selectedChannel ? null : (
+                  <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "채널 선택 후 리뷰어를 정하세요", en: "Pick a reviewer after selecting a channel" })}
+                  </span>
+                )}
               </div>
             </div>
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
             <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "고정 초대 전문가", en: "Fixed Expert Invites" })}
+              {t({ ko: "고정 에이전트", en: "Pinned Agents" })}
             </label>
             <div className="flex-1 space-y-2">
               <input
                 type="text"
                 value={expertQuery}
                 onChange={(e) => setExpertQuery(e.target.value)}
-                placeholder={t({ ko: "전문가 검색 후 고정 초대 선택", en: "Search experts and pin invites" })}
+                placeholder={t({ ko: "에이전트 검색 후 고정 선택", en: "Search agents and pin" })}
                 className="w-full px-3 py-1.5 rounded-lg text-sm"
                 style={inputStyle}
                 disabled={!selectedChannel || availableExperts.length === 0}
@@ -872,11 +865,11 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                   </div>
                 ) : availableExperts.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "이 채널에 등록된 도메인 전문가가 없습니다", en: "No domain experts are registered for this channel" })}
+                    {t({ ko: "이 채널에 등록된 에이전트가 없습니다", en: "No agents are registered for this channel" })}
                   </div>
                 ) : filteredExperts.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "조건에 맞는 전문가가 없습니다", en: "No expert matches the filter" })}
+                    {t({ ko: "조건에 맞는 에이전트가 없습니다", en: "No agent matches the filter" })}
                   </div>
                 ) : (
                   filteredExperts.map((expert) => {
@@ -924,7 +917,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               <div className="flex flex-wrap gap-1.5">
                 {selectedFixedExperts.length === 0 ? (
                   <span className="text-xs px-2.5 py-1 rounded-full" style={{ background: "rgba(148,163,184,0.12)", color: "var(--th-text-muted)" }}>
-                    {t({ ko: "고정 초대 없음", en: "No pinned experts" })}
+                    {t({ ko: "고정 없음", en: "No pinned agents" })}
                   </span>
                 ) : (
                   selectedFixedExperts.map((expert) => (
@@ -945,8 +938,8 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               </div>
               <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
                 {t({
-                  ko: `고정 초대 ${fixedParticipantRoleIds.length}/5, 복수 선택 가능. 진행자는 남은 슬롯만 자동 선정합니다. 전문가는 memory read / recall만 사용하고 write / capture는 허용되지 않습니다.`,
-                  en: `Pinned experts ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots. Experts can use memory read / recall only, with write / capture disabled.`,
+                  ko: `고정 ${fixedParticipantRoleIds.length}/5, 복수 선택 가능. 진행자는 남은 슬롯만 자동 선정합니다.`,
+                  en: `Pinned ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots.`,
                 })}
               </div>
             </div>
@@ -1040,8 +1033,8 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
 
               {/* Participants */}
               <div className="space-y-1.5">
-                <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
-                  {t({ ko: "도메인 전문가", en: "Domain Experts" })}
+                  <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
+                  {t({ ko: "에이전트", en: "Agents" })}
                 </div>
                 <div className="flex items-center gap-1.5 flex-wrap">
                 {m.participant_names.map((name) => (
