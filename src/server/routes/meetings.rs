@@ -145,6 +145,7 @@ pub async fn list_meeting_channels(
                 "anti_signals": agent.anti_signals,
                 "provider_hint": agent.provider_hint,
                 "metadata_missing": agent.metadata_missing,
+                "metadata_confidence": agent.metadata_confidence,
             })).collect::<Vec<_>>(),
         }));
     }

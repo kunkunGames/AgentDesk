@@ -341,6 +341,7 @@ export interface RoundTableMeetingExpertOption {
   anti_signals: string[];
   provider_hint?: string | null;
   metadata_missing: boolean;
+  metadata_confidence: "low" | "medium" | "high";
 }
 
 export interface RoundTableMeeting {

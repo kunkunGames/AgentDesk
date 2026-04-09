@@ -3,7 +3,10 @@ use std::fs;
 
 use poise::serenity_prelude::ChannelId;
 
-use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
+use super::meeting::{
+    MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule,
+    derive_agent_metadata_quality,
+};
 use super::runtime_store::role_map_path;
 use super::settings::{
     MemoryConfigOverride, PeerAgentInfo, RegisteredChannelBinding, RoleBinding,
@@ -121,19 +124,12 @@ fn parse_meeting_agent_metadata(value: &serde_json::Value) -> Option<ParsedMeeti
         .get("provider_hint")
         .and_then(|v| v.as_str())
         .map(|value| value.to_string());
-    let metadata_missing = domain_summary
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-        && strengths.is_empty()
-        && task_types.is_empty()
-        && anti_signals.is_empty()
-        && provider_hint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none();
+    let (metadata_missing, metadata_confidence) = derive_agent_metadata_quality(
+        domain_summary.as_deref(),
+        &strengths,
+        &task_types,
+        &anti_signals,
+    );
     Some(ParsedMeetingAgentMetadata {
         role_id,
         display_name,
@@ -144,6 +140,7 @@ fn parse_meeting_agent_metadata(value: &serde_json::Value) -> Option<ParsedMeeti
         anti_signals,
         provider_hint,
         metadata_missing,
+        metadata_confidence,
     })
 }
 
@@ -175,6 +172,7 @@ fn collect_registry_entry(
             anti_signals: Vec::new(),
             provider_hint: None,
             metadata_missing: true,
+            metadata_confidence: "low".to_string(),
         });
 
     registry
@@ -189,6 +187,7 @@ fn collect_registry_entry(
             anti_signals: metadata.anti_signals,
             provider_hint: metadata.provider_hint,
             metadata_missing: metadata.metadata_missing,
+            metadata_confidence: metadata.metadata_confidence,
             binding,
             workspace,
         });
@@ -205,6 +204,7 @@ struct ParsedMeetingAgentMetadata {
     anti_signals: Vec<String>,
     provider_hint: Option<String>,
     metadata_missing: bool,
+    metadata_confidence: String,
 }
 
 fn fallback_enabled(json: &serde_json::Value) -> bool {
@@ -604,6 +604,7 @@ mod tests {
                 Some("gemini")
             );
             assert!(!config.available_agents[0].metadata_missing);
+            assert_eq!(config.available_agents[0].metadata_confidence, "high");
             assert_eq!(
                 config.available_agents[0].binding.provider,
                 Some(ProviderKind::Codex)

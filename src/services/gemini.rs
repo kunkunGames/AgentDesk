@@ -10,7 +10,7 @@ use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
 use crate::services::process::kill_child_tree;
 use crate::services::provider::{
     CancelToken, ProviderKind, StreamAttemptFailure, StreamAttemptResult, StreamFinalState,
-    cancel_requested, register_child_pid, run_retrying_stream_attempts,
+    cancel_requested, is_readonly_tool_policy, register_child_pid, run_retrying_stream_attempts,
 };
 use crate::services::remote::RemoteProfile;
 
@@ -77,7 +77,7 @@ pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     let mut command = Command::new(&gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
     let output = command
-        .args(build_exec_args(prompt, None, None))
+        .args(build_exec_args(prompt, None, None, false))
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -135,6 +135,7 @@ pub fn execute_command_streaming(
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
     let prompt = compose_gemini_prompt(prompt, system_prompt, allowed_tools);
+    let readonly_mode = is_readonly_tool_policy(allowed_tools);
     run_gemini_streaming_attempts(&sender, resume_selector, |resume_selector| {
         execute_gemini_streaming_attempt(
             &gemini_bin,
@@ -145,6 +146,7 @@ pub fn execute_command_streaming(
             working_dir,
             sender.clone(),
             cancel_token.clone(),
+            readonly_mode,
         )
     })
 }
@@ -182,11 +184,17 @@ fn execute_gemini_streaming_attempt(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<Arc<CancelToken>>,
+    readonly_mode: bool,
 ) -> Result<StreamAttemptResult, String> {
     let mut command = Command::new(gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, resolution);
     let mut child = command
-        .args(build_exec_args(prompt, model, resume_selector.as_deref()))
+        .args(build_exec_args(
+            prompt,
+            model,
+            resume_selector.as_deref(),
+            readonly_mode,
+        ))
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -584,7 +592,12 @@ fn compose_gemini_prompt(
     crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
 }
 
-fn build_exec_args(prompt: &str, model: Option<&str>, session_id: Option<&str>) -> Vec<String> {
+fn build_exec_args(
+    prompt: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    readonly_mode: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
     if session_id.is_none() {
@@ -603,9 +616,16 @@ fn build_exec_args(prompt: &str, model: Option<&str>, session_id: Option<&str>) 
     args.push(prompt.to_string());
     args.push("--output-format".to_string());
     args.push("stream-json".to_string());
-    args.push("-y".to_string());
-    args.push("--sandbox".to_string());
-    args.push("false".to_string());
+    if readonly_mode {
+        args.push("--sandbox".to_string());
+        args.push("true".to_string());
+        args.push("--approval-mode".to_string());
+        args.push("plan".to_string());
+    } else {
+        args.push("-y".to_string());
+        args.push("--sandbox".to_string());
+        args.push("false".to_string());
+    }
     args
 }
 
@@ -806,7 +826,7 @@ mod tests {
 
     #[test]
     fn build_exec_args_includes_resume_when_session_present() {
-        let args = build_exec_args("hello", Some("gemini-2.5-flash"), Some("latest"));
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), Some("latest"), false);
         assert!(args.windows(2).any(|pair| pair == ["--resume", "latest"]));
         assert!(args.windows(2).any(|pair| pair == ["-p", "hello"]));
         assert!(
@@ -818,12 +838,23 @@ mod tests {
 
     #[test]
     fn build_exec_args_includes_model_for_fresh_session() {
-        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None);
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None, false);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-m", "gemini-2.5-flash"])
         );
         assert!(!args.iter().any(|arg| arg == "--resume"));
+    }
+
+    #[test]
+    fn build_exec_args_uses_plan_mode_for_readonly_sessions() {
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None, true);
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "true"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--approval-mode", "plan"])
+        );
+        assert!(!args.iter().any(|arg| arg == "-y"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub(crate) struct MeetingExpertOption {
     pub anti_signals: Vec<String>,
     pub provider_hint: Option<String>,
     pub metadata_missing: bool,
+    pub metadata_confidence: String,
 }
 
 #[derive(Clone, Debug)]
@@ -144,13 +145,22 @@ pub(super) struct MeetingAgentConfig {
     pub anti_signals: Vec<String>,
     pub provider_hint: Option<String>,
     pub metadata_missing: bool,
+    pub metadata_confidence: String,
     pub binding: RoleBinding,
     pub workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MeetingSelectionResponse {
+    #[serde(default)]
     selected_role_ids: Vec<String>,
+    #[serde(default)]
+    selected: Vec<MeetingSelectionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MeetingSelectionChoice {
+    role_id: String,
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -243,9 +253,24 @@ fn parse_selected_role_ids_response(text: &str) -> Result<Vec<String>, String> {
         return Err("No JSON object found".to_string());
     };
 
-    serde_json::from_str::<MeetingSelectionResponse>(json_str)
-        .map(|parsed| parsed.selected_role_ids)
-        .map_err(|e| format!("Failed to parse meeting selection JSON: {}", e))
+    let parsed = serde_json::from_str::<MeetingSelectionResponse>(json_str)
+        .map_err(|e| format!("Failed to parse meeting selection JSON: {}", e))?;
+
+    let selected_role_ids = if parsed.selected_role_ids.is_empty() {
+        parsed
+            .selected
+            .into_iter()
+            .map(|entry| entry.role_id)
+            .collect::<Vec<_>>()
+    } else {
+        parsed.selected_role_ids
+    };
+
+    if selected_role_ids.is_empty() {
+        return Err("Meeting selection JSON did not include any selected role IDs".to_string());
+    }
+
+    Ok(selected_role_ids)
 }
 
 fn truncate_for_meeting(text: &str, max_chars: usize) -> String {
@@ -399,10 +424,42 @@ pub(crate) fn load_meeting_expert_options() -> Vec<MeetingExpertOption> {
                     anti_signals: agent.anti_signals,
                     provider_hint: agent.provider_hint,
                     metadata_missing: agent.metadata_missing,
+                    metadata_confidence: agent.metadata_confidence,
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(super) fn derive_agent_metadata_quality(
+    domain_summary: Option<&str>,
+    strengths: &[String],
+    task_types: &[String],
+    anti_signals: &[String],
+) -> (bool, String) {
+    let has_domain_summary = domain_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let has_strengths = !strengths.is_empty();
+    let has_task_types = !task_types.is_empty();
+    let has_anti_signals = !anti_signals.is_empty();
+
+    let core_count =
+        usize::from(has_domain_summary) + usize::from(has_strengths) + usize::from(has_task_types);
+
+    let metadata_confidence = if core_count == 3 && has_anti_signals {
+        "high"
+    } else if core_count >= 2 {
+        "medium"
+    } else {
+        "low"
+    };
+
+    (
+        metadata_confidence != "high",
+        metadata_confidence.to_string(),
+    )
 }
 
 fn normalize_role_id_list(values: &[String]) -> Vec<String> {
@@ -1071,13 +1128,14 @@ fn build_selection_candidate_card(agent: &MeetingAgentConfig, fixed: bool) -> St
         .unwrap_or("unspecified");
 
     format!(
-        "- role_id: {role_id}\n  display_name: {display_name}\n  fixed: {fixed}\n  bound_provider: {bound_provider}\n  provider_hint: {provider_hint}\n  metadata_missing: {metadata_missing}\n  keywords: {keywords}\n  domain_summary: {domain_summary}\n  strengths: {strengths}\n  task_types: {task_types}\n  anti_signals: {anti_signals}",
+        "- role_id: {role_id}\n  display_name: {display_name}\n  fixed: {fixed}\n  bound_provider: {bound_provider}\n  provider_hint: {provider_hint}\n  metadata_missing: {metadata_missing}\n  metadata_confidence: {metadata_confidence}\n  keywords: {keywords}\n  domain_summary: {domain_summary}\n  strengths: {strengths}\n  task_types: {task_types}\n  anti_signals: {anti_signals}",
         role_id = agent.role_id,
         display_name = agent.display_name,
         fixed = if fixed { "yes" } else { "no" },
         bound_provider = bound_provider,
         provider_hint = format_optional_or_none(agent.provider_hint.as_deref()),
         metadata_missing = if agent.metadata_missing { "yes" } else { "no" },
+        metadata_confidence = agent.metadata_confidence,
         keywords = join_or_none(&agent.keywords),
         domain_summary = format_optional_or_none(agent.domain_summary.as_deref()),
         strengths = join_or_none(&agent.strengths),
@@ -1211,9 +1269,23 @@ async fn select_participants(
 - JSON만 출력, 다른 텍스트 금지
 - 형식:
   {{
-    "selected_role_ids": ["role_id1", "role_id2"],
-    "required_axes": ["축1", "축2"],
-    "selection_notes": ["짧은 메모 1", "짧은 메모 2"]
+    "agenda_summary": "짧은 요약",
+    "required_axes": [
+      {{"axis": "축1", "reason": "왜 필요한지", "priority": "high"}}
+    ],
+    "selected": [
+      {{
+        "role_id": "role_id1",
+        "why_selected": "선정 이유",
+        "covers_axes": ["축1"],
+        "fixed": true,
+        "confidence": "high"
+      }}
+    ],
+    "rejected": [
+      {{"role_id": "role_id3", "reason": "제외 이유"}}
+    ],
+    "selection_gaps": []
   }}"#,
         agenda,
         fixed_desc,
@@ -1280,9 +1352,23 @@ async fn select_participants(
 - JSON만 응답하라
 - 형식:
   {{
-    "selected_role_ids": ["role_id1", "role_id2"],
-    "required_axes": ["축1", "축2"],
-    "selection_notes": ["짧은 메모 1", "짧은 메모 2"]
+    "agenda_summary": "짧은 요약",
+    "required_axes": [
+      {{"axis": "축1", "reason": "왜 필요한지", "priority": "high"}}
+    ],
+    "selected": [
+      {{
+        "role_id": "role_id1",
+        "why_selected": "선정 이유",
+        "covers_axes": ["축1"],
+        "fixed": true,
+        "confidence": "high"
+      }}
+    ],
+    "rejected": [
+      {{"role_id": "role_id3", "reason": "제외 이유"}}
+    ],
+    "selection_gaps": []
   }}"#,
         agenda = agenda,
         fixed = fixed_desc,
@@ -2079,8 +2165,9 @@ mod tests {
         ActiveMeetingSlot, MAX_MEETING_PARTICIPANTS, MIN_MEETING_PARTICIPANTS, Meeting,
         MeetingAgentConfig, MeetingConfig, MeetingStatus, MeetingUtterance, ProviderKind,
         SummaryAgentConfig, build_meeting_participants, build_meeting_status_payload,
-        canonical_candidate_pool, effective_round_count, meeting_readonly_tools,
-        meeting_slot_state, parse_meeting_start_text, parse_selected_role_ids_response,
+        canonical_candidate_pool, derive_agent_metadata_quality, effective_round_count,
+        meeting_readonly_tools, meeting_slot_state, parse_meeting_start_text,
+        parse_selected_role_ids_response,
     };
     use crate::services::discord::settings::RoleBinding;
     use serde_json::json;
@@ -2209,6 +2296,19 @@ mod tests {
         assert_eq!(meeting_readonly_tools(), vec!["Read".to_string()]);
     }
 
+    #[test]
+    fn test_derive_agent_metadata_quality_marks_full_metadata_high() {
+        let (missing, confidence) = derive_agent_metadata_quality(
+            Some("구현 품질과 아키텍처 리스크를 본다"),
+            &["리뷰".to_string()],
+            &["설계".to_string()],
+            &["브랜딩 단독 담당".to_string()],
+        );
+
+        assert!(!missing);
+        assert_eq!(confidence, "high");
+    }
+
     fn fixture_agent(role_id: &str) -> MeetingAgentConfig {
         MeetingAgentConfig {
             role_id: role_id.to_string(),
@@ -2220,6 +2320,7 @@ mod tests {
             anti_signals: Vec::new(),
             provider_hint: None,
             metadata_missing: true,
+            metadata_confidence: "low".to_string(),
             binding: RoleBinding {
                 role_id: role_id.to_string(),
                 prompt_file: String::new(),
@@ -2332,5 +2433,24 @@ mod tests {
         .expect("structured response should parse");
 
         assert_eq!(parsed, vec!["td".to_string(), "pd".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_selected_role_ids_response_accepts_spec_selected_shape() {
+        let parsed = parse_selected_role_ids_response(
+            r#"{
+  "agenda_summary": "요약",
+  "required_axes": [{"axis":"설계","reason":"핵심","priority":"high"}],
+  "selected": [
+    {"role_id":"ch-td","why_selected":"설계 검토","covers_axes":["설계"],"fixed":false,"confidence":"high"},
+    {"role_id":"ch-pd","why_selected":"제품 판단","covers_axes":["제품"],"fixed":false,"confidence":"medium"}
+  ],
+  "rejected": [],
+  "selection_gaps": []
+}"#,
+        )
+        .expect("selected shape should parse");
+
+        assert_eq!(parsed, vec!["ch-td".to_string(), "ch-pd".to_string()]);
     }
 }

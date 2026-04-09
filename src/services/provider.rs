@@ -360,6 +360,16 @@ pub fn compose_structured_turn_prompt(
     sections.join("\n\n")
 }
 
+pub fn is_readonly_tool_policy(allowed_tools: Option<&[String]>) -> bool {
+    let Some(allowed_tools) = allowed_tools.filter(|tools| !tools.is_empty()) else {
+        return false;
+    };
+
+    allowed_tools
+        .iter()
+        .all(|tool| tool.trim().eq_ignore_ascii_case("read"))
+}
+
 /// Cooperative cancellation token shared by provider runtimes and Discord orchestration.
 pub struct CancelToken {
     pub cancelled: AtomicBool,

@@ -4,7 +4,10 @@ use std::fs;
 use poise::serenity_prelude::ChannelId;
 use serde::Deserialize;
 
-use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
+use super::meeting::{
+    MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule,
+    derive_agent_metadata_quality,
+};
 use super::runtime_store::org_schema_path;
 use super::settings::{
     MemoryConfigOverride, PeerAgentInfo, RegisteredChannelBinding, RoleBinding,
@@ -317,42 +320,26 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
                         .map(|root| format!("{}/agents/{}/IDENTITY.md", root, role_id))
                 })
                 .unwrap_or_default();
+            let strengths = def.strengths.clone().unwrap_or_default();
+            let task_types = def.task_types.clone().unwrap_or_default();
+            let anti_signals = def.anti_signals.clone().unwrap_or_default();
+            let (metadata_missing, metadata_confidence) = derive_agent_metadata_quality(
+                def.domain_summary.as_deref(),
+                &strengths,
+                &task_types,
+                &anti_signals,
+            );
             MeetingAgentConfig {
                 role_id: role_id.clone(),
                 display_name: def.display_name.clone(),
                 keywords: def.keywords.clone().unwrap_or_default(),
                 domain_summary: def.domain_summary.clone(),
-                strengths: def.strengths.clone().unwrap_or_default(),
-                task_types: def.task_types.clone().unwrap_or_default(),
-                anti_signals: def.anti_signals.clone().unwrap_or_default(),
+                strengths,
+                task_types,
+                anti_signals,
                 provider_hint: def.provider_hint.clone(),
-                metadata_missing: def
-                    .domain_summary
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_none()
-                    && def
-                        .strengths
-                        .as_ref()
-                        .map(|values| values.is_empty())
-                        .unwrap_or(true)
-                    && def
-                        .task_types
-                        .as_ref()
-                        .map(|values| values.is_empty())
-                        .unwrap_or(true)
-                    && def
-                        .anti_signals
-                        .as_ref()
-                        .map(|values| values.is_empty())
-                        .unwrap_or(true)
-                    && def
-                        .provider_hint
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .is_none(),
+                metadata_missing,
+                metadata_confidence,
                 binding: RoleBinding {
                     role_id: role_id.clone(),
                     prompt_file,
@@ -795,6 +782,7 @@ channels:
             assert_eq!(td.anti_signals, vec!["사업성 판단 단독 담당"]);
             assert_eq!(td.provider_hint.as_deref(), Some("codex"));
             assert!(!td.metadata_missing);
+            assert_eq!(td.metadata_confidence, "high");
         });
     }
 

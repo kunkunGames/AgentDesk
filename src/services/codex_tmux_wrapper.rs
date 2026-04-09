@@ -17,6 +17,7 @@ pub fn run(
     reasoning_effort: Option<&str>,
     input_mode: InputMode,
     compact_token_limit: Option<u64>,
+    readonly_mode: bool,
 ) {
     let mode_label = match input_mode {
         InputMode::Fifo => "tmux resume loop",
@@ -143,6 +144,7 @@ pub fn run(
         &prompt,
         &mut thread_id,
         compact_token_limit,
+        readonly_mode,
     ) {
         emit_result_error(&mut output, &err);
         let exit_reason_path = format!("{}.exit_reason", output_file);
@@ -163,6 +165,7 @@ pub fn run(
             next_prompt.trim(),
             &mut thread_id,
             compact_token_limit,
+            readonly_mode,
         ) {
             emit_result_error(&mut output, &err);
             followup_error = Some(err);
@@ -212,6 +215,7 @@ fn run_turn(
     prompt: &str,
     thread_id: &mut Option<String>,
     compact_token_limit: Option<u64>,
+    readonly_mode: bool,
 ) -> Result<(), String> {
     emit_status("[sending...]");
 
@@ -235,12 +239,18 @@ fn run_turn(
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
     }
-    args.extend([
-        "--skip-git-repo-check".to_string(),
-        "--json".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-        prompt.to_string(),
-    ]);
+    args.extend(["--skip-git-repo-check".to_string(), "--json".to_string()]);
+    if readonly_mode {
+        args.extend([
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+            "-a".to_string(),
+            "never".to_string(),
+        ]);
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    args.push(prompt.to_string());
 
     let mut cmd = Command::new(codex_bin);
     crate::services::platform::augment_exec_path(&mut cmd, codex_bin);
