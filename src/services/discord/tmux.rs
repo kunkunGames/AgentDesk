@@ -2053,7 +2053,10 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             continue;
         }
 
-        if let Some(started) = shared.recovering_channels.get(channel_id) {
+        if let Some(started) = super::mailbox_snapshot(&shared, *channel_id)
+            .await
+            .recovery_started_at
+        {
             if started.elapsed() < std::time::Duration::from_secs(60) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
@@ -2070,8 +2073,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 session_name,
                 started.elapsed().as_secs_f64()
             );
-            drop(started);
-            shared.recovering_channels.remove(channel_id);
+            super::mailbox_clear_recovery_marker(&shared, *channel_id).await;
         }
 
         if shared.tmux_watchers.contains_key(channel_id) {

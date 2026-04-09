@@ -918,7 +918,7 @@ pub(super) fn spawn_turn_bridge(
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         // Clean up any pending watchdog deadline override for this channel
-        super::clear_watchdog_deadline_override(channel_id.get());
+        super::clear_watchdog_deadline_override(channel_id.get()).await;
         // Clean up dispatch-thread parent mapping when the thread turn ends.
         // Iterate and remove entries whose thread matches this channel_id.
         shared_owned
@@ -1567,7 +1567,7 @@ pub(super) fn spawn_turn_bridge(
         clear_inflight_state(&provider, channel_id.get());
         // Defuse the guard — cleanup already done above.
         inflight_guard.provider.take();
-        shared_owned.recovering_channels.remove(&channel_id);
+        super::mailbox_clear_recovery_marker(&shared_owned, channel_id).await;
 
         // For dispatch-based turns (threads), kill the tmux session after
         // finalization. Thread sessions are one-shot — keeping claude alive
