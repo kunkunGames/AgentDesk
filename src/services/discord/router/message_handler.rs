@@ -1,3 +1,4 @@
+use super::super::gateway::{DiscordGateway, LiveDiscordTurnContext};
 use super::super::*;
 use crate::services::memory::{
     RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
@@ -1342,19 +1343,24 @@ pub(in crate::services::discord) async fn handle_text_message(
     });
 
     spawn_turn_bridge(
-        ctx.http.clone(),
         shared.clone(),
         cancel_token.clone(),
         rx,
         TurnBridgeContext {
             provider,
+            gateway: Arc::new(DiscordGateway::new(
+                ctx.http.clone(),
+                shared.clone(),
+                Some(LiveDiscordTurnContext {
+                    ctx: ctx.clone(),
+                    token: token.to_string(),
+                    request_owner,
+                }),
+            )),
             channel_id,
             user_msg_id,
             user_text_owned: user_text.to_string(),
             request_owner_name: request_owner_name.to_string(),
-            request_owner: Some(request_owner),
-            serenity_ctx: Some(ctx.clone()),
-            token: Some(token.to_string()),
             role_binding: role_binding.clone(),
             adk_session_key,
             adk_session_name,
