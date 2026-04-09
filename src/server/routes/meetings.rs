@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::AppState;
-use crate::services::discord::{health, settings};
+use crate::services::discord::{health, meeting, settings};
 use crate::services::provider::ProviderKind;
 
 // ── Body types ─────────────────────────────────────────────────
@@ -24,6 +24,7 @@ pub struct StartMeetingBody {
     pub channel_id: Option<String>,
     pub primary_provider: Option<String>,
     pub reviewer_provider: Option<String>,
+    pub fixed_participants: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +113,7 @@ pub async fn list_meeting_channels(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let bindings = settings::list_registered_channel_bindings();
     let registry = state.health_registry.as_ref();
+    let available_experts = meeting::load_meeting_expert_options();
 
     let mut channels = Vec::new();
     for binding in bindings {
@@ -133,6 +135,11 @@ pub async fn list_meeting_channels(
             "channel_id": binding.channel_id.to_string(),
             "channel_name": channel_name,
             "owner_provider": binding.owner_provider.as_str(),
+            "available_experts": available_experts.iter().map(|agent| json!({
+                "role_id": agent.role_id,
+                "display_name": agent.display_name,
+                "keywords": agent.keywords,
+            })).collect::<Vec<_>>(),
         }));
     }
 
@@ -670,6 +677,16 @@ pub async fn start_meeting(
     {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": error})));
     }
+    let fixed_participants = match meeting::validate_fixed_participant_role_ids(
+        &primary_provider,
+        &reviewer_provider,
+        body.fixed_participants.as_deref().unwrap_or(&[]),
+    ) {
+        Ok(role_ids) => role_ids,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error})));
+        }
+    };
 
     match health::start_direct_meeting(
         registry,
@@ -678,6 +695,7 @@ pub async fn start_meeting(
         primary_provider,
         reviewer_provider,
         agenda.to_string(),
+        fixed_participants,
     )
     .await
     {
@@ -1299,6 +1317,7 @@ mod tests {
                 channel_id: Some("999999999999".to_string()),
                 primary_provider: None,
                 reviewer_provider: Some("codex".to_string()),
+                fixed_participants: None,
             }),
         )
         .await;
@@ -1322,6 +1341,7 @@ mod tests {
                 channel_id: Some("999999999999".to_string()),
                 primary_provider: Some("qwen".to_string()),
                 reviewer_provider: Some("codex".to_string()),
+                fixed_participants: None,
             }),
         )
         .await;

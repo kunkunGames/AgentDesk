@@ -5,6 +5,7 @@ import type {
   ProposedIssue,
   RoundTableMeeting,
   RoundTableMeetingChannelOption,
+  RoundTableMeetingExpertOption,
 } from "../types";
 import {
   createRoundTableIssues,
@@ -23,12 +24,14 @@ import MeetingDetailModal from "./MeetingDetailModal";
 import MeetingProviderFlow, {
   getProviderMeta,
   providerFlowCaption,
+  providerOperatorHelper,
 } from "./MeetingProviderFlow";
 import MarkdownContent from "./common/MarkdownContent";
 
 const STORAGE_KEY = "pcd_meeting_channel_id";
 const PRIMARY_PROVIDER_STORAGE_KEY = "pcd_meeting_primary_provider";
 const REVIEWER_PROVIDER_STORAGE_KEY = "pcd_meeting_reviewer_provider";
+const FIXED_PARTICIPANTS_STORAGE_KEY = "pcd_meeting_fixed_participants";
 const MEETING_PROVIDERS = ["claude", "codex", "gemini", "qwen"] as const;
 const PROVIDER_LABELS: Record<string, string> = {
   claude: "Claude",
@@ -66,6 +69,38 @@ function providerMatchesQuery(provider: string, query: string) {
   return (
     provider.toLowerCase().includes(normalizedQuery)
     || providerLabel(provider).toLowerCase().includes(normalizedQuery)
+  );
+}
+
+function normalizeRoleIdList(values: string[]) {
+  const deduped = new Set<string>();
+  return values
+    .map((value) => value.trim())
+    .filter((value) => {
+      if (!value || deduped.has(value)) return false;
+      deduped.add(value);
+      return true;
+    });
+}
+
+function parseStoredRoleIds(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return normalizeRoleIdList(parsed.filter((value): value is string => typeof value === "string"));
+  } catch {
+    return [];
+  }
+}
+
+function expertMatchesQuery(expert: RoundTableMeetingExpertOption, query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return true;
+  return (
+    expert.display_name.toLowerCase().includes(normalizedQuery)
+    || expert.role_id.toLowerCase().includes(normalizedQuery)
+    || expert.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedQuery))
   );
 }
 
@@ -138,6 +173,10 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
       return saved ? providerLabel(saved) : "";
     },
   );
+  const [fixedParticipantRoleIds, setFixedParticipantRoleIds] = useState<string[]>(
+    () => parseStoredRoleIds(localStorage.getItem(FIXED_PARTICIPANTS_STORAGE_KEY)),
+  );
+  const [expertQuery, setExpertQuery] = useState("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>([]);
@@ -170,6 +209,17 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
     localStorage.removeItem(REVIEWER_PROVIDER_STORAGE_KEY);
     setReviewerProviderQuery("");
   }, [reviewerProvider]);
+
+  useEffect(() => {
+    if (fixedParticipantRoleIds.length > 0) {
+      localStorage.setItem(
+        FIXED_PARTICIPANTS_STORAGE_KEY,
+        JSON.stringify(fixedParticipantRoleIds),
+      );
+      return;
+    }
+    localStorage.removeItem(FIXED_PARTICIPANTS_STORAGE_KEY);
+  }, [fixedParticipantRoleIds]);
 
   useEffect(() => {
     let cancelled = false;
@@ -236,11 +286,17 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   }, [meetings]);
 
   const selectedChannel = meetingChannels.find((channel) => channel.channel_id === channelId) ?? null;
+  const availableExperts = selectedChannel?.available_experts ?? [];
+  const availableExpertIds = new Set(availableExperts.map((expert) => expert.role_id));
+  const selectedFixedExperts = fixedParticipantRoleIds
+    .map((roleId) => availableExperts.find((expert) => expert.role_id === roleId) ?? null)
+    .filter((expert): expert is RoundTableMeetingExpertOption => expert !== null);
   const reviewerOptions = MEETING_PROVIDERS.filter(
     (provider) => provider !== primaryProvider && provider !== selectedChannel?.owner_provider,
   );
   const filteredPrimaryProviders = MEETING_PROVIDERS.filter((provider) => providerMatchesQuery(provider, primaryProviderQuery));
   const filteredReviewerProviders = reviewerOptions.filter((provider) => providerMatchesQuery(provider, reviewerProviderQuery));
+  const filteredExperts = availableExperts.filter((expert) => expertMatchesQuery(expert, expertQuery));
   const filteredChannels = meetingChannels.filter((channel) => {
     const query = channelQuery.trim().toLowerCase();
     if (!query) return true;
@@ -256,6 +312,13 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
     if (!selectedChannel) return;
     setChannelQuery(`${selectedChannel.channel_name} (${selectedChannel.channel_id})`);
   }, [selectedChannel?.channel_id]);
+
+  useEffect(() => {
+    setFixedParticipantRoleIds((prev) => {
+      const filtered = prev.filter((roleId) => availableExpertIds.has(roleId));
+      return filtered.length === prev.length ? prev : filtered;
+    });
+  }, [selectedChannel?.channel_id, availableExperts.map((expert) => expert.role_id).join(",")]);
 
   useEffect(() => {
     if (reviewerOptions.length === 0) {
@@ -422,6 +485,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
         channelId.trim(),
         primaryProvider,
         reviewerProvider,
+        fixedParticipantRoleIds,
       );
       setAgenda("");
       setShowStartForm(false);
@@ -430,6 +494,18 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
     } finally {
       setStarting(false);
     }
+  };
+
+  const toggleFixedParticipant = (roleId: string) => {
+    setFixedParticipantRoleIds((prev) => {
+      if (prev.includes(roleId)) {
+        return prev.filter((value) => value !== roleId);
+      }
+      if (prev.length >= 5) {
+        return prev;
+      }
+      return [...prev, roleId];
+    });
   };
 
   const statusBadge = (status: string) => {
@@ -450,6 +526,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   };
 
   const inputStyle = { background: "var(--th-bg-surface)", border: "1px solid var(--th-border)", color: "var(--th-text)" };
+  const formLabelClassName = "text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-28 sm:pt-2";
 
   const getIssueProgress = (meeting: RoundTableMeeting) => {
     const total = meeting.proposed_issues?.length ?? 0;
@@ -554,7 +631,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
 
           {/* Channel selector */}
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
+            <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
               {t({ ko: "채널", en: "Channel" })}
             </label>
             <div className="flex-1 space-y-2">
@@ -638,7 +715,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
 
           {/* Agenda input */}
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
+            <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
               {t({ ko: "안건", en: "Agenda" })}
             </label>
             <textarea
@@ -652,15 +729,15 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "진행 프로바이더", en: "Primary Provider" })}
+            <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "진행자", en: "Facilitator" })}
             </label>
             <div className="flex-1 space-y-2">
               <input
                 type="text"
                 value={primaryProviderQuery}
                 onChange={(e) => setPrimaryProviderQuery(e.target.value)}
-                placeholder={t({ ko: "진행 프로바이더 검색", en: "Search primary provider" })}
+                placeholder={t({ ko: "진행자 검색", en: "Search facilitator" })}
                 className="w-full px-3 py-1.5 rounded-lg text-sm"
                 style={inputStyle}
               />
@@ -670,7 +747,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               >
                 {filteredPrimaryProviders.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "조건에 맞는 진행 프로바이더가 없습니다", en: "No primary provider matches the filter" })}
+                    {t({ ko: "조건에 맞는 진행자가 없습니다", en: "No facilitator matches the filter" })}
                   </div>
                 ) : (
                   filteredPrimaryProviders.map((provider) => {
@@ -703,15 +780,15 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
-            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-24 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "리뷰 프로바이더", en: "Reviewer Provider" })}
+            <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "리뷰어", en: "Reviewer" })}
             </label>
             <div className="flex-1 space-y-2">
               <input
                 type="text"
                 value={reviewerProviderQuery}
                 onChange={(e) => setReviewerProviderQuery(e.target.value)}
-                placeholder={t({ ko: "리뷰 프로바이더 검색", en: "Search reviewer provider" })}
+                placeholder={t({ ko: "리뷰어 검색", en: "Search reviewer" })}
                 className="w-full px-3 py-1.5 rounded-lg text-sm"
                 style={inputStyle}
                 disabled={reviewerOptions.length === 0}
@@ -722,11 +799,11 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               >
                 {reviewerOptions.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "선택 가능한 리뷰 프로바이더 없음", en: "No reviewer provider available" })}
+                    {t({ ko: "선택 가능한 리뷰어 없음", en: "No reviewer available" })}
                   </div>
                 ) : filteredReviewerProviders.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "조건에 맞는 리뷰 프로바이더가 없습니다", en: "No reviewer provider matches the filter" })}
+                    {t({ ko: "조건에 맞는 리뷰어가 없습니다", en: "No reviewer matches the filter" })}
                   </div>
                 ) : (
                   filteredReviewerProviders.map((provider) => {
@@ -755,14 +832,123 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                   })
                 )}
               </div>
-              <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                {selectedChannel
-                  ? t({
-                      ko: "리뷰 프로바이더는 채널 담당 프로바이더, 진행 프로바이더와 달라야 합니다",
-                      en: "Reviewer provider must differ from the channel owner and primary provider",
-                    })
-                  : t({ ko: "채널 선택 후 리뷰 프로바이더를 정하세요", en: "Pick a reviewer provider after selecting a channel" })}
-              </span>
+              <div className="space-y-1">
+                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
+                  {selectedChannel
+                    ? t({
+                        ko: "리뷰어는 채널 담당 프로바이더와 진행자와 달라야 합니다",
+                        en: "Reviewer must differ from the channel owner and facilitator",
+                      })
+                    : t({ ko: "채널 선택 후 리뷰어를 정하세요", en: "Pick a reviewer after selecting a channel" })}
+                </span>
+                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
+                  {providerOperatorHelper(t)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
+            <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "고정 초대 전문가", en: "Fixed Expert Invites" })}
+            </label>
+            <div className="flex-1 space-y-2">
+              <input
+                type="text"
+                value={expertQuery}
+                onChange={(e) => setExpertQuery(e.target.value)}
+                placeholder={t({ ko: "전문가 검색 후 고정 초대 선택", en: "Search experts and pin invites" })}
+                className="w-full px-3 py-1.5 rounded-lg text-sm"
+                style={inputStyle}
+                disabled={!selectedChannel || availableExperts.length === 0}
+              />
+              <div
+                className="max-h-44 overflow-y-auto rounded-xl border p-2 space-y-1"
+                style={{ background: "var(--th-bg-surface)", borderColor: "var(--th-border)" }}
+              >
+                {!selectedChannel ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "먼저 회의 채널을 선택하세요", en: "Select a meeting channel first" })}
+                  </div>
+                ) : availableExperts.length === 0 ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "이 채널에 등록된 도메인 전문가가 없습니다", en: "No domain experts are registered for this channel" })}
+                  </div>
+                ) : filteredExperts.length === 0 ? (
+                  <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "조건에 맞는 전문가가 없습니다", en: "No expert matches the filter" })}
+                  </div>
+                ) : (
+                  filteredExperts.map((expert) => {
+                    const isSelected = fixedParticipantRoleIds.includes(expert.role_id);
+                    return (
+                      <button
+                        key={expert.role_id}
+                        onClick={() => toggleFixedParticipant(expert.role_id)}
+                        className="w-full rounded-lg border px-3 py-2 text-left transition-colors"
+                        style={{
+                          background: isSelected ? "rgba(99,102,241,0.12)" : "transparent",
+                          borderColor: isSelected ? "rgba(99,102,241,0.35)" : "var(--th-border)",
+                        }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="text-sm font-medium" style={{ color: "var(--th-text)" }}>
+                            {expert.display_name}
+                          </div>
+                          {isSelected && (
+                            <span
+                              className="rounded-full px-2 py-0.5 text-xs font-semibold"
+                              style={{ background: "rgba(99,102,241,0.18)", color: "#818cf8" }}
+                            >
+                              {t({ ko: "고정", en: "Pinned" })}
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
+                          <span className="font-mono">{expert.role_id}</span>
+                          {expert.keywords.slice(0, 4).map((keyword) => (
+                            <span
+                              key={`${expert.role_id}:${keyword}`}
+                              className="rounded-full px-2 py-0.5"
+                              style={{ background: "rgba(148,163,184,0.12)", color: "var(--th-text-muted)" }}
+                            >
+                              {keyword}
+                            </span>
+                          ))}
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {selectedFixedExperts.length === 0 ? (
+                  <span className="text-xs px-2.5 py-1 rounded-full" style={{ background: "rgba(148,163,184,0.12)", color: "var(--th-text-muted)" }}>
+                    {t({ ko: "고정 초대 없음", en: "No pinned experts" })}
+                  </span>
+                ) : (
+                  selectedFixedExperts.map((expert) => (
+                    <button
+                      key={`selected:${expert.role_id}`}
+                      onClick={() => toggleFixedParticipant(expert.role_id)}
+                      className="text-xs px-2.5 py-1 rounded-full font-medium border transition-colors"
+                      style={{
+                        background: "rgba(99,102,241,0.12)",
+                        borderColor: "rgba(99,102,241,0.28)",
+                        color: "#818cf8",
+                      }}
+                    >
+                      {expert.display_name}
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                {t({
+                  ko: `고정 초대 ${fixedParticipantRoleIds.length}/5, 복수 선택 가능. 진행자는 남은 슬롯만 자동 선정합니다. 전문가는 memory read / recall만 사용하고 write / capture는 허용되지 않습니다.`,
+                  en: `Pinned experts ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots. Experts can use memory read / recall only, with write / capture disabled.`,
+                })}
+              </div>
             </div>
           </div>
 

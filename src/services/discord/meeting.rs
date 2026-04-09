@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 
@@ -6,6 +7,7 @@ use serenity::{
     AutoArchiveDuration, ChannelId, ChannelType, CreateMessage,
     builder::{CreateThread, EditThread},
 };
+use serde::Serialize;
 
 use crate::services::memory::{RecallRequest, build_memory_backend};
 use crate::services::provider::ProviderKind;
@@ -21,8 +23,15 @@ use super::{SharedData, rate_limit_wait};
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
 const MIN_MEETING_PARTICIPANTS: usize = 2;
-const MAX_MEETING_PARTICIPANTS: usize = 4;
+const MAX_MEETING_PARTICIPANTS: usize = 5;
 const MEETING_READONLY_ALLOWED_TOOLS: &[&str] = &["Read"];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct MeetingExpertOption {
+    pub role_id: String,
+    pub display_name: String,
+    pub keywords: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct MeetingParticipant {
@@ -336,6 +345,68 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
     load_meeting_config_from_role_map()
 }
 
+pub(crate) fn load_meeting_expert_options() -> Vec<MeetingExpertOption> {
+    load_meeting_config()
+        .map(|config| {
+            config
+                .available_agents
+                .into_iter()
+                .map(|agent| MeetingExpertOption {
+                    role_id: agent.role_id,
+                    display_name: agent.display_name,
+                    keywords: agent.keywords,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_role_id_list(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+
+    normalized
+}
+
+pub(crate) fn validate_fixed_participant_role_ids(
+    primary_provider: &ProviderKind,
+    reviewer_provider: &ProviderKind,
+    requested_role_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let normalized = normalize_role_id_list(requested_role_ids);
+    if normalized.len() > MAX_MEETING_PARTICIPANTS {
+        return Err(format!(
+            "fixed_participants cannot exceed {} experts",
+            MAX_MEETING_PARTICIPANTS
+        ));
+    }
+
+    let config =
+        load_meeting_config().ok_or("Meeting config not found in org.yaml or role_map.json")?;
+    let candidate_pool = canonical_candidate_pool(&config, primary_provider, reviewer_provider);
+
+    for role_id in &normalized {
+        if !candidate_pool.iter().any(|agent| agent.role_id == *role_id) {
+            return Err(format!(
+                "fixed participant '{}' is not available for meetings",
+                role_id
+            ));
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Check if a channel name matches the configured meeting channel
 #[allow(dead_code)]
 pub(super) fn is_meeting_channel(channel_name: &str) -> bool {
@@ -362,6 +433,7 @@ pub(super) async fn start_meeting(
         agenda,
         primary_provider,
         reviewer_provider,
+        Vec::new(),
         shared,
     )
     .await
@@ -373,6 +445,7 @@ pub(crate) async fn start_meeting_with_reviewer(
     agenda: &str,
     primary_provider: ProviderKind,
     reviewer_provider: ProviderKind,
+    fixed_participants: Vec<String>,
     shared: &Arc<SharedData>,
 ) -> Result<Option<String>, Error> {
     let config =
@@ -430,17 +503,29 @@ pub(crate) async fn start_meeting_with_reviewer(
         .send_message(
             http,
             CreateMessage::new().content(format!(
-                "📋 **라운드 테이블 회의 시작**\n안건: {}\n진행 프로바이더: {} / 리뷰 프로바이더: {}\n도메인 전문가 선정 중...",
+                "📋 **라운드 테이블 회의 시작**\n안건: {}\n진행자: {}\n리뷰어: {}\n{}\n도메인 전문가 선정 중...",
                 agenda,
                 primary_provider.display_name(),
-                reviewer_provider.display_name()
+                reviewer_provider.display_name(),
+                if fixed_participants.is_empty() {
+                    "고정 초대: 없음".to_string()
+                } else {
+                    format!("고정 초대: {}", fixed_participants.join(", "))
+                }
             )),
         )
         .await;
 
     // Select participants via primary provider + reviewer cross-check
-    let participants =
-        match select_participants(&config, agenda, primary_provider, reviewer_provider).await {
+    let participants = match select_participants(
+        &config,
+        agenda,
+        primary_provider,
+        reviewer_provider,
+        &fixed_participants,
+    )
+    .await
+    {
             Ok(p) if !p.is_empty() => p,
             Ok(_) => {
                 cleanup_meeting_if_current(shared, channel_id, &meeting_id).await;
@@ -577,6 +662,7 @@ pub(crate) async fn spawn_direct_start(
     agenda: String,
     primary_provider: ProviderKind,
     reviewer_provider: ProviderKind,
+    fixed_participants: Vec<String>,
     shared: Arc<SharedData>,
 ) -> Result<(), String> {
     if primary_provider == reviewer_provider {
@@ -601,6 +687,7 @@ pub(crate) async fn spawn_direct_start(
             &agenda,
             primary_provider,
             reviewer_provider,
+            fixed_participants,
             &shared,
         )
         .await
@@ -702,7 +789,7 @@ pub(super) async fn meeting_status(
                 .send_message(
                     http,
                     CreateMessage::new().content(format!(
-                        "📊 **회의 현황**\n안건: {}\n상태: {}\n진행 프로바이더: {} / 리뷰 프로바이더: {}\n라운드: {}/{}\n도메인 전문가: {}명\n발언: {}개",
+                        "📊 **회의 현황**\n안건: {}\n상태: {}\n진행자: {} / 리뷰어: {}\n라운드: {}/{}\n도메인 전문가: {}명\n발언: {}개",
                         agenda,
                         status_str,
                         primary.display_name(),
@@ -783,7 +870,7 @@ fn build_meeting_expert_system_prompt(
 ) -> String {
     let mut sections = vec![format!(
         "당신은 라운드 테이블 회의에 참여하는 도메인 전문가 `{}` ({})이다.\n\
-         - 당신은 회의 운영자(진행/리뷰 프로바이더)가 아니라 실제 참가자다.\n\
+         - 당신은 회의 운영자(진행자/리뷰어)가 아니라 실제 참가자다.\n\
          - 회의 중에는 `meeting_readonly` 정책을 따른다.\n\
          - memory write, capture, 파일 수정, 외부 상태 변경, 자동 저장은 금지다.\n\
          - 제공된 역할 프롬프트와 recall을 근거로만 발언하라.\n\
@@ -915,14 +1002,59 @@ fn canonical_candidate_pool<'a>(
         .collect()
 }
 
+fn build_meeting_participants(
+    candidate_pool: &[&MeetingAgentConfig],
+    selected_role_ids: &[String],
+    required_role_ids: &[String],
+) -> Result<Vec<MeetingParticipant>, String> {
+    let normalized_selected = normalize_role_id_list(selected_role_ids);
+
+    if normalized_selected.len() < MIN_MEETING_PARTICIPANTS
+        || normalized_selected.len() > MAX_MEETING_PARTICIPANTS
+    {
+        return Err(format!(
+            "Invalid participant count after cross-check: {}",
+            normalized_selected.len()
+        ));
+    }
+
+    for required_role_id in required_role_ids {
+        if !normalized_selected.iter().any(|role_id| role_id == required_role_id) {
+            return Err(format!(
+                "Fixed participant '{}' is missing from final selection",
+                required_role_id
+            ));
+        }
+    }
+
+    normalized_selected
+        .into_iter()
+        .map(|role_id| {
+            let agent = candidate_pool
+                .iter()
+                .find(|candidate| candidate.role_id == role_id)
+                .ok_or_else(|| format!("Unknown meeting participant '{}'", role_id))?;
+
+            Ok(MeetingParticipant {
+                role_id: agent.role_id.clone(),
+                display_name: agent.display_name.clone(),
+                binding: agent.binding.clone(),
+                workspace: agent.workspace.clone(),
+            })
+        })
+        .collect()
+}
+
 /// Select participants using primary provider + reviewer micro cross-check.
 async fn select_participants(
     config: &MeetingConfig,
     agenda: &str,
     primary_provider: ProviderKind,
     reviewer_provider: ProviderKind,
+    fixed_participant_role_ids: &[String],
 ) -> Result<Vec<MeetingParticipant>, String> {
     let candidate_pool = canonical_candidate_pool(config, &primary_provider, &reviewer_provider);
+    let fixed_role_ids = normalize_role_id_list(fixed_participant_role_ids);
 
     let agents_desc: Vec<String> = candidate_pool
         .iter()
@@ -936,20 +1068,49 @@ async fn select_participants(
         })
         .collect();
 
+    for fixed_role_id in &fixed_role_ids {
+        if !candidate_pool.iter().any(|agent| agent.role_id == *fixed_role_id) {
+            return Err(format!(
+                "Fixed participant '{}' is not available in candidate pool",
+                fixed_role_id
+            ));
+        }
+    }
+
+    let fixed_desc = if fixed_role_ids.is_empty() {
+        "- 없음".to_string()
+    } else {
+        fixed_role_ids
+            .iter()
+            .filter_map(|role_id| {
+                candidate_pool
+                    .iter()
+                    .find(|agent| agent.role_id == *role_id)
+                    .map(|agent| format!("- {} ({}): 고정 초대", agent.role_id, agent.display_name))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let selection_prompt = format!(
         r#"다음 안건에 대한 라운드 테이블 회의에 참여할 에이전트를 선정해줘.
 
 안건: {}
 
+반드시 포함해야 하는 고정 초대 전문가:
+{}
+
 사용 가능한 에이전트:
 {}
 
 규칙:
-- 2~4명 선정
+- 고정 초대 전문가는 모두 포함
+- 최종 결과는 2~5명
 - 안건과 관련된 전문성을 가진 에이전트만 선택
 - JSON 배열로만 응답 (다른 텍스트 없이)
 - 형식: ["role_id1", "role_id2", ...]"#,
         agenda,
+        fixed_desc,
         agents_desc.join("\n")
     );
 
@@ -962,6 +1123,9 @@ async fn select_participants(
 
 안건: {agenda}
 
+반드시 포함해야 하는 고정 초대 전문가:
+{fixed}
+
 사용 가능한 에이전트:
 {agents}
 
@@ -970,10 +1134,12 @@ async fn select_participants(
 
 검토 규칙:
 - 빠진 역할, 중복 역할, 안건과의 부적합만 짚어라
+- 고정 초대 전문가 누락 여부를 먼저 확인하라
 - 4개 이하 bullet만 사용하라
 - 전체를 다시 쓰지 말고, 비판적으로만 검토하라
 - 도구나 명령 실행은 하지 마라"#,
         agenda = agenda,
+        fixed = fixed_desc,
         agents = agents_desc.join("\n"),
         current = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
     );
@@ -986,6 +1152,9 @@ async fn select_participants(
 
 안건: {agenda}
 
+반드시 포함해야 하는 고정 초대 전문가:
+{fixed}
+
 사용 가능한 에이전트:
 {agents}
 
@@ -997,10 +1166,12 @@ async fn select_participants(
 
 규칙:
 - 리뷰가 타당하면 반영하고, 타당하지 않으면 유지하라
-- 최종 결과는 2~4명이어야 한다
+- 고정 초대 전문가는 모두 포함해야 한다
+- 최종 결과는 2~5명이어야 한다
 - JSON 배열로만 응답하라
 - 형식: ["role_id1", "role_id2", ...]"#,
         agenda = agenda,
+        fixed = fixed_desc,
         agents = agents_desc.join("\n"),
         initial = serde_json::to_string(&initial_selected).unwrap_or_else(|_| "[]".to_string()),
         review = review_notes.trim(),
@@ -1009,32 +1180,7 @@ async fn select_participants(
     let final_response =
         provider_exec::execute_simple(primary_provider.clone(), finalize_prompt).await?;
     let selected = parse_json_array_fragment(&final_response)?;
-
-    let participants: Vec<MeetingParticipant> = selected
-        .iter()
-        .filter_map(|role_id| {
-            candidate_pool
-                .iter()
-                .find(|a| &a.role_id == role_id)
-                .map(|a| MeetingParticipant {
-                    role_id: a.role_id.clone(),
-                    display_name: a.display_name.clone(),
-                    binding: a.binding.clone(),
-                    workspace: a.workspace.clone(),
-                })
-        })
-        .collect();
-
-    if participants.len() < MIN_MEETING_PARTICIPANTS
-        || participants.len() > MAX_MEETING_PARTICIPANTS
-    {
-        return Err(format!(
-            "Invalid participant count after cross-check: {}",
-            participants.len()
-        ));
-    }
-
-    Ok(participants)
+    build_meeting_participants(&candidate_pool, &selected, &fixed_role_ids)
 }
 
 /// Run one round: each participant speaks in order
@@ -1684,7 +1830,7 @@ fn build_meeting_markdown(m: &Meeting) -> String {
         .unwrap_or_else(|| "_회의록이 작성되지 않았습니다._".to_string());
 
     format!(
-        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\nprimary_provider: {primary_provider}\nreviewer_provider: {reviewer_provider}\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여 전문가**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n> **진행 프로바이더**: {primary_provider}\n> **리뷰 프로바이더**: {reviewer_provider}\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
+        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\nprimary_provider: {primary_provider}\nreviewer_provider: {reviewer_provider}\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여 전문가**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n> **진행자**: {primary_provider}\n> **리뷰어**: {reviewer_provider}\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
         date = date_str,
         status = status_str,
         participants = participants_inline,
@@ -1818,8 +1964,8 @@ mod tests {
     use super::{
         ActiveMeetingSlot, MAX_MEETING_PARTICIPANTS, MIN_MEETING_PARTICIPANTS, Meeting,
         MeetingAgentConfig, MeetingConfig, MeetingStatus, MeetingUtterance, ProviderKind,
-        SummaryAgentConfig, build_meeting_status_payload, canonical_candidate_pool,
-        effective_round_count, meeting_readonly_tools, meeting_slot_state,
+        SummaryAgentConfig, build_meeting_participants, build_meeting_status_payload,
+        canonical_candidate_pool, effective_round_count, meeting_readonly_tools, meeting_slot_state,
         parse_meeting_start_text,
     };
     use crate::services::discord::settings::RoleBinding;
@@ -1997,5 +2143,60 @@ mod tests {
         assert_eq!(role_ids, vec!["td", "pd"]);
         assert!(role_ids.len() >= MIN_MEETING_PARTICIPANTS);
         assert!(role_ids.len() <= MAX_MEETING_PARTICIPANTS);
+    }
+
+    #[test]
+    fn test_build_meeting_participants_requires_fixed_invites_to_be_present() {
+        let agents = vec![
+            fixture_agent("td"),
+            fixture_agent("pd"),
+            fixture_agent("uxd"),
+        ];
+        let candidate_pool: Vec<&MeetingAgentConfig> = agents.iter().collect();
+
+        let error = build_meeting_participants(
+            &candidate_pool,
+            &["td".to_string(), "pd".to_string()],
+            &["uxd".to_string()],
+        )
+        .expect_err("missing fixed invite should fail");
+
+        assert_eq!(
+            error,
+            "Fixed participant 'uxd' is missing from final selection"
+        );
+    }
+
+    #[test]
+    fn test_build_meeting_participants_accepts_five_experts_with_fixed_invites() {
+        let agents = vec![
+            fixture_agent("td"),
+            fixture_agent("pd"),
+            fixture_agent("uxd"),
+            fixture_agent("qad"),
+            fixture_agent("devops"),
+        ];
+        let candidate_pool: Vec<&MeetingAgentConfig> = agents.iter().collect();
+
+        let participants = build_meeting_participants(
+            &candidate_pool,
+            &[
+                "td".to_string(),
+                "pd".to_string(),
+                "uxd".to_string(),
+                "qad".to_string(),
+                "devops".to_string(),
+            ],
+            &["td".to_string(), "uxd".to_string()],
+        )
+        .expect("five experts should be allowed");
+
+        let role_ids: Vec<&str> = participants
+            .iter()
+            .map(|participant| participant.role_id.as_str())
+            .collect();
+
+        assert_eq!(participants.len(), MAX_MEETING_PARTICIPANTS);
+        assert_eq!(role_ids, vec!["td", "pd", "uxd", "qad", "devops"]);
     }
 }

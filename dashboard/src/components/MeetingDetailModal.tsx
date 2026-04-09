@@ -1,6 +1,10 @@
 import { useEffect, useRef } from "react";
 import type { RoundTableMeeting, RoundTableEntry } from "../types";
-import MeetingProviderFlow, { formatProviderFlow, providerFlowCaption } from "./MeetingProviderFlow";
+import MeetingProviderFlow, {
+  formatProviderFlow,
+  providerFlowCaption,
+  providerOperatorHelper,
+} from "./MeetingProviderFlow";
 import MarkdownContent from "./common/MarkdownContent";
 import { useI18n } from "../i18n";
 
@@ -112,13 +116,33 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
               <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
                 {providerFlowCaption(meeting.primary_provider, meeting.reviewer_provider, t)}
               </div>
+              <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                {providerOperatorHelper(t)}
+              </div>
             </div>
           )}
+
+          <div className="space-y-2">
+            <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "도메인 전문가", en: "Domain Experts" })}
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {meeting.participant_names.map((name) => (
+                <span
+                  key={`participant:${name}`}
+                  className="text-xs px-2 py-0.5 rounded-full font-medium"
+                  style={{ background: "rgba(99,102,241,0.15)", color: "#818cf8" }}
+                >
+                  {name}
+                </span>
+              ))}
+            </div>
+          </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <MetaCard label={t({ ko: "상태", en: "Status" })} value={statusLabel} />
             <MetaCard label={t({ ko: "라운드", en: "Rounds" })} value={`${meeting.total_rounds}R`} />
-            <MetaCard label={t({ ko: "참여자", en: "Participants" })} value={`${meeting.participant_names.length}`} />
+            <MetaCard label={t({ ko: "도메인 전문가", en: "Domain Experts" })} value={`${meeting.participant_names.length}`} />
             <MetaCard
               label={t({ ko: "시작", en: "Started" })}
               value={new Date(meeting.started_at).toLocaleString(locale, {
