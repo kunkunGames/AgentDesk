@@ -874,22 +874,23 @@ fn base_exec_args(
         args.push("-m".to_string());
         args.push(model.to_string());
     }
+    if readonly_mode {
+        args.extend([
+            "-a".to_string(),
+            "never".to_string(),
+            "-s".to_string(),
+            "read-only".to_string(),
+        ]);
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
     args.push("exec".to_string());
     if let Some(existing_thread_id) = session_id {
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
     }
     args.extend(["--skip-git-repo-check".to_string(), "--json".to_string()]);
-    if readonly_mode {
-        args.extend([
-            "--sandbox".to_string(),
-            "read-only".to_string(),
-            "-a".to_string(),
-            "never".to_string(),
-        ]);
-    } else {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    }
+    args.push("--".to_string());
     args.push(prompt.to_string());
     args
 }
@@ -1194,16 +1195,14 @@ mod tests {
     #[test]
     fn test_base_exec_args_enables_readonly_sandbox_when_requested() {
         let args = base_exec_args(None, "hello", None, true);
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"])
-        );
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
         assert!(args.windows(2).any(|pair| pair == ["-a", "never"]));
         assert!(
             !args
                 .iter()
                 .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
         );
+        assert!(args.iter().any(|arg| arg == "--"));
     }
 
     #[test]
@@ -1212,12 +1211,13 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "exec".to_string(),
                 "resume".to_string(),
                 "thread-123".to_string(),
                 "--skip-git-repo-check".to_string(),
                 "--json".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--".to_string(),
                 "hello".to_string(),
             ]
         );
