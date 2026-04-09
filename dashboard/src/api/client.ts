@@ -352,7 +352,6 @@ export interface HealthResponse {
 export async function getHealth(): Promise<HealthResponse> {
   return request("/api/health");
 }
-
 export async function getRuntimeConfig(): Promise<RuntimeConfigResponse> {
   return request("/api/settings/runtime-config");
 }
