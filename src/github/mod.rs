@@ -55,8 +55,7 @@ pub fn gh_available() -> bool {
 /// Run a `gh` CLI command and return its stdout as a String.
 /// Returns an error if the command fails or is not available.
 pub(crate) fn run_gh(args: &[&str]) -> Result<String, String> {
-    let mut command = gh_command()?;
-    let output = command
+    let output = gh_command()?
         .args(args)
         .output()
         .map_err(|e| format!("gh command failed to execute: {e}"))?;
@@ -85,10 +84,10 @@ pub async fn reopen_issue_by_url(url: &str) -> Result<(), String> {
     let number = &rest[slash_pos + "/issues/".len()..];
 
     // gh issue reopen <number> --repo <owner/repo>
-    let mut command = tokio_gh_command()?;
-    command.kill_on_drop(true);
-    command.args(["issue", "reopen", number, "--repo", repo]);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+    let mut cmd = tokio_gh_command()?;
+    cmd.kill_on_drop(true);
+    cmd.args(["issue", "reopen", number, "--repo", repo]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
         .await
         .map_err(|_| format!("gh issue reopen timed out after 5s: {repo}#{number}"))?
         .map_err(|e| format!("gh exec: {e}"))?;

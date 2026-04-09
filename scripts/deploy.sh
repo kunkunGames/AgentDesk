@@ -214,10 +214,17 @@ if [ -d "$PROJECT_DIR/dashboard/dist" ]; then
   ok "Dashboard: $AD_HOME/dashboard/dist/"
 fi
 
+if [ -d "$PROJECT_DIR/skills" ]; then
+  mkdir -p "$AD_HOME/skills"
+  rsync -a --delete "$PROJECT_DIR/skills/" "$AD_HOME/skills/"
+  ok "Managed skills: $AD_HOME/skills/"
+fi
+
 # ── Step 3: Install/update service ────────────────────────────────────────────
 install_launchd() {
   local PLIST_SRC="$SCRIPT_DIR/com.agentdesk.release.plist"
   local PLIST_DST="$HOME/Library/LaunchAgents/com.agentdesk.release.plist"
+  local LAUNCHD_ENV_FILE="$AD_HOME/config/launchd.env"
 
   # Migrate: remove legacy com.agentdesk plist if present
   local LEGACY_PLIST="$HOME/Library/LaunchAgents/com.agentdesk.plist"
@@ -239,6 +246,11 @@ install_launchd() {
     -e "s|AGENTDESK_BIN|$BIN_DIR/agentdesk|g" \
     -e "s|AGENTDESK_HOME|$AD_HOME|g" \
     "$PLIST_SRC" > "$PLIST_DST"
+
+  if [ -f "$LAUNCHD_ENV_FILE" ]; then
+    sync_launchd_plist_environment_from_file "$PLIST_DST" "$LAUNCHD_ENV_FILE"
+    ok "Applied local launchd env: $LAUNCHD_ENV_FILE"
+  fi
 
   ok "Plist installed: $PLIST_DST"
 }
