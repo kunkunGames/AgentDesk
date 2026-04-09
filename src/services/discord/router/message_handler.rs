@@ -604,7 +604,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             .and_then(|_| dispatch_type_str.as_deref()),
     );
 
-    super::super::commands::reset_provider_session_if_pending(
+    let reset_session_for_model_change = super::super::commands::reset_provider_session_if_pending(
         &ctx.http, shared, &provider, channel_id,
     )
     .await;
@@ -624,8 +624,9 @@ pub(in crate::services::discord) async fn handle_text_message(
         (channel_name, tmux_session_name)
     };
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
-    let mut session_id = session_id;
-    if session_id.is_none() {
+    let mut session_id =
+        resolve_session_id_for_current_turn(session_id, reset_session_for_model_change);
+    if session_id.is_none() && !reset_session_for_model_change {
         if let Some(ref key) = adk_session_key {
             let restored = super::super::adk_session::fetch_provider_session_id(
                 key,
@@ -2519,6 +2520,13 @@ Any other message is sent to {p}.
     Ok(false)
 }
 
+fn resolve_session_id_for_current_turn(
+    session_id: Option<String>,
+    reset_applied: bool,
+) -> Option<String> {
+    if reset_applied { None } else { session_id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::DiscordSession;
@@ -2648,6 +2656,40 @@ mod tests {
         );
         assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
         assert_eq!(plan.longterm_catalog_for_system_prompt, Some("- notes.md"));
+    }
+
+    #[test]
+    fn resolve_session_id_for_current_turn_drops_resume_after_model_reset() {
+        assert_eq!(
+            resolve_session_id_for_current_turn(Some("session-123".to_string()), true),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_for_current_turn_keeps_existing_session_when_not_reset() {
+        assert_eq!(
+            resolve_session_id_for_current_turn(Some("session-123".to_string()), false),
+            Some("session-123".to_string())
+        );
+    }
+
+    #[test]
+    fn memory_injection_plan_treats_model_reset_as_fresh_turn() {
+        let recall = sample_recall();
+        let session_id = resolve_session_id_for_current_turn(Some("session-123".to_string()), true);
+        let plan = build_memory_injection_plan(
+            &ProviderKind::Codex,
+            session_id.is_some(),
+            DispatchProfile::Full,
+            &recall,
+        );
+
+        assert_eq!(
+            plan.shared_knowledge_for_context,
+            Some("[Shared Knowledge]")
+        );
+        assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
     }
 
     #[test]

@@ -10,6 +10,17 @@ pub(super) fn build_model_picker_close_response() -> serenity::CreateInteraction
     serenity::CreateInteractionResponse::Acknowledge
 }
 
+pub(super) fn build_model_picker_saved_response(
+    content: impl Into<String>,
+) -> serenity::CreateInteractionResponse {
+    serenity::CreateInteractionResponse::UpdateMessage(
+        serenity::CreateInteractionResponseMessage::new()
+            .content(content)
+            .embeds(Vec::new())
+            .components(Vec::new()),
+    )
+}
+
 async fn close_model_picker_interaction(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -20,6 +31,29 @@ async fn close_model_picker_interaction(
     let _ = component.message.delete(&ctx.http).await;
 
     Ok(())
+}
+
+async fn save_model_picker_interaction(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    content: impl Into<String>,
+) -> Result<(), Error> {
+    component
+        .create_response(ctx, build_model_picker_saved_response(content))
+        .await?;
+    Ok(())
+}
+
+fn model_picker_submit_notice(saved_model: Option<&str>) -> String {
+    match saved_model {
+        Some(model) => format!(
+            "모델 설정을 `{model}`로 저장했습니다. 다음 메시지부터 새 세션 + 새 모델로 적용됩니다."
+        ),
+        None => {
+            "모델 설정을 기본값으로 저장했습니다. 다음 메시지부터 기본 모델 설정으로 적용됩니다."
+                .to_string()
+        }
+    }
 }
 
 pub(super) async fn handle_model_picker_interaction(
@@ -208,10 +242,15 @@ pub(super) async fn handle_model_picker_interaction(
                 .get(&message_id)
                 .and_then(|state| state.pending_model.clone());
 
-            super::commands::clear_model_picker_pending(&data.shared, message_id);
-            close_model_picker_interaction(ctx, component).await?;
+            let next_override =
+                super::commands::model_picker_pending_to_override(pending_model.as_deref());
+            let notice = match next_override.as_ref() {
+                Some(Some(model)) => model_picker_submit_notice(Some(model)),
+                Some(None) => model_picker_submit_notice(None),
+                None => "변경 사항이 없습니다. `/model`을 다시 열어 모델을 선택하세요.".to_string(),
+            };
 
-            match super::commands::model_picker_pending_to_override(pending_model.as_deref()) {
+            match next_override {
                 Some(Some(model)) => {
                     super::commands::update_channel_model_override(
                         &data.shared,
@@ -235,11 +274,12 @@ pub(super) async fn handle_model_picker_interaction(
                 None => {}
             }
 
+            super::commands::clear_model_picker_pending(&data.shared, message_id);
+            save_model_picker_interaction(ctx, component, notice).await?;
             return Ok(());
         }
         super::commands::ModelPickerAction::Reset => {
             super::commands::clear_model_picker_pending(&data.shared, message_id);
-            close_model_picker_interaction(ctx, component).await?;
             super::commands::update_channel_model_override(
                 &data.shared,
                 &data.token,
@@ -248,6 +288,7 @@ pub(super) async fn handle_model_picker_interaction(
                 None,
             )
             .await;
+            save_model_picker_interaction(ctx, component, model_picker_submit_notice(None)).await?;
             return Ok(());
         }
         super::commands::ModelPickerAction::Cancel => {
@@ -291,4 +332,25 @@ pub(super) async fn handle_model_picker_interaction(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_model_picker_saved_response, model_picker_submit_notice};
+
+    #[test]
+    fn model_picker_submit_notice_describes_next_turn_new_model_session() {
+        let notice = model_picker_submit_notice(Some("gpt-5.4-mini"));
+        assert!(notice.contains("`gpt-5.4-mini`"));
+        assert!(notice.contains("다음 메시지부터 새 세션 + 새 모델"));
+    }
+
+    #[test]
+    fn model_picker_saved_response_clears_components_and_embeds() {
+        let response = build_model_picker_saved_response("저장 완료");
+        let debug = format!("{response:?}");
+        assert!(debug.contains("UpdateMessage"));
+        assert!(debug.contains("components: Some([])"));
+        assert!(debug.contains("embeds: Some([])"));
+    }
 }
