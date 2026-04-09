@@ -147,6 +147,9 @@ enum Commands {
         /// Auto-compact token limit (absolute token count)
         #[arg(long)]
         compact_token_limit: Option<u64>,
+        /// Run Codex with read-only sandboxing
+        #[arg(long)]
+        readonly_mode: bool,
     },
     /// tmux + Qwen CLI integration wrapper (Unix only)
     #[cfg(unix)]
@@ -423,6 +426,7 @@ fn main() -> Result<()> {
                 cwd,
                 input_mode,
                 compact_token_limit,
+                readonly_mode,
             }) => {
                 let mode = match input_mode {
                     InputModeArg::Pipe => services::tmux_wrapper::InputMode::Pipe,
@@ -438,6 +442,7 @@ fn main() -> Result<()> {
                     reasoning_effort.as_deref(),
                     mode,
                     compact_token_limit,
+                    readonly_mode,
                 );
                 return Ok(());
             }

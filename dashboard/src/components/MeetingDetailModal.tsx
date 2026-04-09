@@ -3,7 +3,6 @@ import type { RoundTableMeeting, RoundTableEntry } from "../types";
 import MeetingProviderFlow, {
   formatProviderFlow,
   providerFlowCaption,
-  providerOperatorHelper,
 } from "./MeetingProviderFlow";
 import MarkdownContent from "./common/MarkdownContent";
 import { useI18n } from "../i18n";
@@ -116,15 +115,12 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
               <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
                 {providerFlowCaption(meeting.primary_provider, meeting.reviewer_provider, t)}
               </div>
-              <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                {providerOperatorHelper(t)}
-              </div>
             </div>
           )}
 
           <div className="space-y-2">
             <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "도메인 전문가", en: "Domain Experts" })}
+              {t({ ko: "전문 에이전트", en: "Specialist Agents" })}
             </div>
             <div className="flex items-center gap-2 flex-wrap">
               {meeting.participant_names.map((name) => (
@@ -142,7 +138,7 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <MetaCard label={t({ ko: "상태", en: "Status" })} value={statusLabel} />
             <MetaCard label={t({ ko: "라운드", en: "Rounds" })} value={`${meeting.total_rounds}R`} />
-            <MetaCard label={t({ ko: "도메인 전문가", en: "Domain Experts" })} value={`${meeting.participant_names.length}`} />
+            <MetaCard label={t({ ko: "전문 에이전트", en: "Specialist Agents" })} value={`${meeting.participant_names.length}`} />
             <MetaCard
               label={t({ ko: "시작", en: "Started" })}
               value={new Date(meeting.started_at).toLocaleString(locale, {

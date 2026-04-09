@@ -24,7 +24,6 @@ import MeetingDetailModal from "./MeetingDetailModal";
 import MeetingProviderFlow, {
   getProviderMeta,
   providerFlowCaption,
-  providerOperatorHelper,
 } from "./MeetingProviderFlow";
 import MarkdownContent from "./common/MarkdownContent";
 
@@ -63,6 +62,26 @@ function providerLabel(provider: string) {
   return PROVIDER_LABELS[provider] ?? provider.toUpperCase();
 }
 
+function metadataConfidenceMeta(confidence: RoundTableMeetingExpertOption["metadata_confidence"]) {
+  switch (confidence) {
+    case "high":
+      return {
+        label: { ko: "메타 높음", en: "Meta high" },
+        style: { background: "rgba(16,185,129,0.12)", color: "#34d399" },
+      };
+    case "medium":
+      return {
+        label: { ko: "메타 보통", en: "Meta medium" },
+        style: { background: "rgba(245,158,11,0.12)", color: "#f59e0b" },
+      };
+    default:
+      return {
+        label: { ko: "메타 낮음", en: "Meta low" },
+        style: { background: "rgba(239,68,68,0.12)", color: "#f87171" },
+      };
+  }
+}
+
 function providerMatchesQuery(provider: string, query: string) {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return true;
@@ -97,10 +116,18 @@ function parseStoredRoleIds(raw: string | null): string[] {
 function expertMatchesQuery(expert: RoundTableMeetingExpertOption, query: string) {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return true;
+  const haystacks = [
+    expert.display_name,
+    expert.role_id,
+    ...expert.keywords,
+    expert.domain_summary ?? "",
+    ...(expert.strengths ?? []),
+    ...(expert.task_types ?? []),
+    ...(expert.anti_signals ?? []),
+    expert.provider_hint ?? "",
+  ];
   return (
-    expert.display_name.toLowerCase().includes(normalizedQuery)
-    || expert.role_id.toLowerCase().includes(normalizedQuery)
-    || expert.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedQuery))
+    haystacks.some((value) => value.toLowerCase().includes(normalizedQuery))
   );
 }
 
@@ -833,31 +860,25 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                 )}
               </div>
               <div className="space-y-1">
-                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {selectedChannel
-                    ? t({
-                        ko: "리뷰어는 채널 담당 프로바이더와 진행자와 달라야 합니다",
-                        en: "Reviewer must differ from the channel owner and facilitator",
-                      })
-                    : t({ ko: "채널 선택 후 리뷰어를 정하세요", en: "Pick a reviewer after selecting a channel" })}
-                </span>
-                <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {providerOperatorHelper(t)}
-                </span>
+                {selectedChannel ? null : (
+                  <span className="block text-xs" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "채널 선택 후 리뷰어를 정하세요", en: "Pick a reviewer after selecting a channel" })}
+                  </span>
+                )}
               </div>
             </div>
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
             <label className={formLabelClassName} style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "고정 초대 전문가", en: "Fixed Expert Invites" })}
+              {t({ ko: "고정 전문 에이전트", en: "Pinned Specialist Agents" })}
             </label>
             <div className="flex-1 space-y-2">
               <input
                 type="text"
                 value={expertQuery}
                 onChange={(e) => setExpertQuery(e.target.value)}
-                placeholder={t({ ko: "전문가 검색 후 고정 초대 선택", en: "Search experts and pin invites" })}
+                placeholder={t({ ko: "전문 에이전트 검색 후 고정 선택", en: "Search specialist agents and pin" })}
                 className="w-full px-3 py-1.5 rounded-lg text-sm"
                 style={inputStyle}
                 disabled={!selectedChannel || availableExperts.length === 0}
@@ -872,15 +893,16 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                   </div>
                 ) : availableExperts.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "이 채널에 등록된 도메인 전문가가 없습니다", en: "No domain experts are registered for this channel" })}
+                    {t({ ko: "이 채널에 등록된 전문 에이전트가 없습니다", en: "No specialist agents are registered for this channel" })}
                   </div>
                 ) : filteredExperts.length === 0 ? (
                   <div className="px-2 py-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    {t({ ko: "조건에 맞는 전문가가 없습니다", en: "No expert matches the filter" })}
+                    {t({ ko: "조건에 맞는 전문 에이전트가 없습니다", en: "No specialist agent matches the filter" })}
                   </div>
                 ) : (
                   filteredExperts.map((expert) => {
                     const isSelected = fixedParticipantRoleIds.includes(expert.role_id);
+                    const confidenceMeta = metadataConfidenceMeta(expert.metadata_confidence);
                     return (
                       <button
                         key={expert.role_id}
@@ -895,18 +917,47 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                           <div className="text-sm font-medium" style={{ color: "var(--th-text)" }}>
                             {expert.display_name}
                           </div>
-                          {isSelected && (
+                          <div className="flex items-center gap-1.5">
                             <span
-                              className="rounded-full px-2 py-0.5 text-xs font-semibold"
-                              style={{ background: "rgba(99,102,241,0.18)", color: "#818cf8" }}
+                              className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                              style={confidenceMeta.style}
                             >
-                              {t({ ko: "고정", en: "Pinned" })}
+                              {t(confidenceMeta.label)}
                             </span>
-                          )}
+                            {expert.metadata_missing && (
+                              <span
+                                className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                                style={{ background: "rgba(245,158,11,0.12)", color: "#f59e0b" }}
+                              >
+                                {t({ ko: "메타 보강 필요", en: "Metadata missing" })}
+                              </span>
+                            )}
+                            {isSelected && (
+                              <span
+                                className="rounded-full px-2 py-0.5 text-xs font-semibold"
+                                style={{ background: "rgba(99,102,241,0.18)", color: "#818cf8" }}
+                              >
+                                {t({ ko: "고정", en: "Pinned" })}
+                              </span>
+                            )}
+                          </div>
                         </div>
+                        {expert.domain_summary && (
+                          <div className="mt-1 text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>
+                            {expert.domain_summary}
+                          </div>
+                        )}
                         <div className="mt-1 flex flex-wrap items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                           <span className="font-mono">{expert.role_id}</span>
-                          {expert.keywords.slice(0, 4).map((keyword) => (
+                          {expert.provider_hint && (
+                            <span
+                              className="rounded-full px-2 py-0.5"
+                              style={{ background: "rgba(59,130,246,0.12)", color: "#60a5fa" }}
+                            >
+                              {t({ ko: `권장 ${expert.provider_hint}`, en: `Hint ${expert.provider_hint}` })}
+                            </span>
+                          )}
+                          {expert.keywords.slice(0, 3).map((keyword) => (
                             <span
                               key={`${expert.role_id}:${keyword}`}
                               className="rounded-full px-2 py-0.5"
@@ -915,7 +966,21 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                               {keyword}
                             </span>
                           ))}
+                          {expert.task_types.slice(0, 2).map((taskType) => (
+                            <span
+                              key={`${expert.role_id}:task:${taskType}`}
+                              className="rounded-full px-2 py-0.5"
+                              style={{ background: "rgba(16,185,129,0.12)", color: "#34d399" }}
+                            >
+                              {taskType}
+                            </span>
+                          ))}
                         </div>
+                        {expert.strengths.length > 0 && (
+                          <div className="mt-1 text-[11px] leading-5" style={{ color: "var(--th-text-muted)" }}>
+                            {t({ ko: "강점", en: "Strengths" })}: {expert.strengths.slice(0, 3).join(", ")}
+                          </div>
+                        )}
                       </button>
                     );
                   })
@@ -924,7 +989,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               <div className="flex flex-wrap gap-1.5">
                 {selectedFixedExperts.length === 0 ? (
                   <span className="text-xs px-2.5 py-1 rounded-full" style={{ background: "rgba(148,163,184,0.12)", color: "var(--th-text-muted)" }}>
-                    {t({ ko: "고정 초대 없음", en: "No pinned experts" })}
+                    {t({ ko: "고정 없음", en: "No pinned agents" })}
                   </span>
                 ) : (
                   selectedFixedExperts.map((expert) => (
@@ -945,8 +1010,8 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
               </div>
               <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
                 {t({
-                  ko: `고정 초대 ${fixedParticipantRoleIds.length}/5, 복수 선택 가능. 진행자는 남은 슬롯만 자동 선정합니다. 전문가는 memory read / recall만 사용하고 write / capture는 허용되지 않습니다.`,
-                  en: `Pinned experts ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots. Experts can use memory read / recall only, with write / capture disabled.`,
+                  ko: `고정 ${fixedParticipantRoleIds.length}/5, 복수 선택 가능. 진행자는 남은 슬롯만 자동 선정합니다.`,
+                  en: `Pinned ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots.`,
                 })}
               </div>
             </div>
@@ -1040,8 +1105,8 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
 
               {/* Participants */}
               <div className="space-y-1.5">
-                <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
-                  {t({ ko: "도메인 전문가", en: "Domain Experts" })}
+                  <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--th-text-muted)" }}>
+                  {t({ ko: "전문 에이전트", en: "Specialist Agents" })}
                 </div>
                 <div className="flex items-center gap-1.5 flex-wrap">
                 {m.participant_names.map((name) => (

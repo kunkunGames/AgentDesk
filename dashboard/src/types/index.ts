@@ -335,6 +335,13 @@ export interface RoundTableMeetingExpertOption {
   role_id: string;
   display_name: string;
   keywords: string[];
+  domain_summary?: string | null;
+  strengths: string[];
+  task_types: string[];
+  anti_signals: string[];
+  provider_hint?: string | null;
+  metadata_missing: boolean;
+  metadata_confidence: "low" | "medium" | "high";
 }
 
 export interface RoundTableMeeting {

@@ -4,7 +4,10 @@ use std::fs;
 use poise::serenity_prelude::ChannelId;
 use serde::Deserialize;
 
-use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
+use super::meeting::{
+    MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule,
+    derive_agent_metadata_quality,
+};
 use super::runtime_store::org_schema_path;
 use super::settings::{
     MemoryConfigOverride, PeerAgentInfo, RegisteredChannelBinding, RoleBinding,
@@ -39,6 +42,11 @@ pub(super) struct AgentDef {
     pub display_name: String,
     pub prompt_file: Option<String>,
     pub keywords: Option<Vec<String>>,
+    pub domain_summary: Option<String>,
+    pub strengths: Option<Vec<String>>,
+    pub task_types: Option<Vec<String>>,
+    pub anti_signals: Option<Vec<String>>,
+    pub provider_hint: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub workspace: Option<String>,
@@ -312,10 +320,26 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
                         .map(|root| format!("{}/agents/{}/IDENTITY.md", root, role_id))
                 })
                 .unwrap_or_default();
+            let strengths = def.strengths.clone().unwrap_or_default();
+            let task_types = def.task_types.clone().unwrap_or_default();
+            let anti_signals = def.anti_signals.clone().unwrap_or_default();
+            let (metadata_missing, metadata_confidence) = derive_agent_metadata_quality(
+                def.domain_summary.as_deref(),
+                &strengths,
+                &task_types,
+                &anti_signals,
+            );
             MeetingAgentConfig {
                 role_id: role_id.clone(),
                 display_name: def.display_name.clone(),
                 keywords: def.keywords.clone().unwrap_or_default(),
+                domain_summary: def.domain_summary.clone(),
+                strengths,
+                task_types,
+                anti_signals,
+                provider_hint: def.provider_hint.clone(),
+                metadata_missing,
+                metadata_confidence,
                 binding: RoleBinding {
                     role_id: role_id.clone(),
                     prompt_file,
@@ -708,6 +732,11 @@ agents:
   td:
     display_name: "TD"
     keywords: ["code"]
+    domain_summary: "코드 구조와 구현 위험을 본다"
+    strengths: ["아키텍처", "구현 검토"]
+    task_types: ["설계", "리뷰"]
+    anti_signals: ["사업성 판단 단독 담당"]
+    provider_hint: "codex"
   pd:
     display_name: "PD"
     keywords: ["product"]
@@ -739,6 +768,21 @@ channels:
                 "qad should NOT be in available_agents"
             );
             assert_eq!(config.available_agents.len(), 2);
+            let td = config
+                .available_agents
+                .iter()
+                .find(|agent| agent.role_id == "td")
+                .expect("td metadata");
+            assert_eq!(
+                td.domain_summary.as_deref(),
+                Some("코드 구조와 구현 위험을 본다")
+            );
+            assert_eq!(td.strengths, vec!["아키텍처", "구현 검토"]);
+            assert_eq!(td.task_types, vec!["설계", "리뷰"]);
+            assert_eq!(td.anti_signals, vec!["사업성 판단 단독 담당"]);
+            assert_eq!(td.provider_hint.as_deref(), Some("codex"));
+            assert!(!td.metadata_missing);
+            assert_eq!(td.metadata_confidence, "high");
         });
     }
 
