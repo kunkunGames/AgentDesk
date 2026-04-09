@@ -5,6 +5,7 @@
 //! lifetime issues with Value<'js> in MutFn closures.
 
 mod agent_ops;
+mod cards_ops;
 mod config_ops;
 mod db_ops;
 mod dispatch_ops;
@@ -16,6 +17,8 @@ mod kv_ops;
 mod log_ops;
 mod message_ops;
 mod pipeline_ops;
+mod queue_ops;
+mod review_ops;
 
 #[cfg(test)]
 mod tests;
@@ -51,6 +54,9 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
     // ── agentdesk.db ─────────────────────────────────────────────
     db_ops::register_db_ops(ctx, db.clone())?;
 
+    // ── agentdesk.cards ──────────────────────────────────────────
+    cards_ops::register_card_ops(ctx, db.clone())?;
+
     // ── agentdesk.log ────────────────────────────────────────────
     log_ops::register_log_ops(ctx)?;
 
@@ -68,6 +74,12 @@ pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
 
     // ── agentdesk.kv ─────────────────────────────────────────────
     kv_ops::register_kv_ops(ctx, db.clone())?;
+
+    // ── agentdesk.review ─────────────────────────────────────────
+    review_ops::register_review_ops(ctx, db.clone())?;
+
+    // ── agentdesk.queue ──────────────────────────────────────────
+    queue_ops::register_queue_ops(ctx, db.clone())?;
 
     // ── agentdesk.message ────────────────────────────────────────
     let db_for_pipeline = db.clone();

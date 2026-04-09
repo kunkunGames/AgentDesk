@@ -134,6 +134,216 @@ fn test_engine_db_query_no_params() {
     });
 }
 
+#[test]
+fn test_cards_facade_get_list_assign_set_priority() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, provider, status, discord_channel_id) \
+             VALUES ('ag-card', 'Card Bot', 'claude', 'idle', '111')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, priority, metadata, github_issue_number, github_issue_url, created_at, updated_at) \
+             VALUES ('card-facade', 'Facade Card', 'backlog', 'medium', '{\"labels\":\"agent:card-bot priority:high\"}', 348, 'https://github.com/itismyfield/AgentDesk/issues/348', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var found = agentdesk.cards.get("card-facade");
+                    if (!found || found.metadata.labels !== "agent:card-bot priority:high") {
+                        throw new Error("cards.get returned unexpected metadata");
+                    }
+                    var listed = agentdesk.cards.list({
+                        status: "backlog",
+                        unassigned: true,
+                        metadata_present: true
+                    });
+                    if (listed.length !== 1 || listed[0].id !== "card-facade") {
+                        throw new Error("cards.list filter did not match expected card");
+                    }
+                    agentdesk.cards.assign("card-facade", "ag-card");
+                    agentdesk.cards.setPriority("card-facade", "urgent");
+                    var updated = agentdesk.cards.get("card-facade");
+                    return JSON.stringify({
+                        assigned_agent_id: updated.assigned_agent_id,
+                        priority: updated.priority
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"assigned_agent_id":"ag-card","priority":"urgent"}"#
+        );
+    });
+}
+
+#[test]
+fn test_agents_facade_get_and_primary_channel() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, provider, status, xp, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx) \
+             VALUES ('ag-agent', 'Agent Bot', 'codex', 'idle', 7, '111', '222', '333', '444')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var agent = agentdesk.agents.get("ag-agent");
+                    return JSON.stringify({
+                        id: agent.id,
+                        primary: agentdesk.agents.primaryChannel("ag-agent"),
+                        counter: agent.counter_model_channel,
+                        channels: agent.all_channels.length
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"id":"ag-agent","primary":"444","counter":"333","channels":4}"#
+        );
+    });
+}
+
+#[test]
+fn test_review_get_verdict_facade() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        seed_card_for_review(&conn, "card-review-facade");
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, review_round, state, pending_dispatch_id, last_verdict, last_decision, decided_by, decided_at, review_entered_at, updated_at) \
+             VALUES ('card-review-facade', 2, 'suggestion_pending', 'dispatch-1', 'improve', 'accept', 'pmd', datetime('now'), datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var review = agentdesk.review.getVerdict("card-review-facade");
+                    return JSON.stringify({
+                        verdict: review.verdict,
+                        state: review.state,
+                        review_round: review.review_round,
+                        source: review.source
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"verdict":"improve","state":"suggestion_pending","review_round":2,"source":"review_state"}"#
+        );
+    });
+}
+
+#[test]
+fn test_queue_status_facade() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        crate::server::routes::auto_queue::ensure_tables(&conn);
+        conn.execute(
+            "INSERT INTO agents (id, name, discord_channel_id) VALUES ('ag-queue', 'Queue Bot', '111')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES ('card-queue', 'Queue Card', 'in_progress', 'ag-queue', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+             VALUES ('dispatch-queue', 'card-queue', 'ag-queue', 'implementation', 'pending', 'Queue Dispatch', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_outbox (target, content, bot, source, status) \
+             VALUES ('channel:111', 'hello', 'announce', 'system', 'pending')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dispatch_outbox (dispatch_id, action, status) VALUES ('dispatch-queue', 'notify', 'failed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status) VALUES ('run-1', 'itismyfield/AgentDesk', 'ag-queue', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status) \
+             VALUES ('entry-1', 'run-1', 'card-queue', 'ag-queue', 'pending')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var status = agentdesk.queue.status();
+                    return JSON.stringify({
+                        pending_dispatches: status.dispatches.pending,
+                        pending_messages: status.message_outbox.pending,
+                        failed_dispatch_outbox: status.dispatch_outbox.failed,
+                        active_runs: status.auto_queue.active_runs,
+                        pending_entries: status.auto_queue.pending_entries
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"pending_dispatches":1,"pending_messages":1,"failed_dispatch_outbox":1,"active_runs":1,"pending_entries":1}"#
+        );
+    });
+}
+
 /// #128: JS setStatus("in_progress") sets started_at.
 /// With pipeline coalesce mode: preserves existing started_at.
 /// Without pipeline (fallback): resets to now.
