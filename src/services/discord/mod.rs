@@ -3,6 +3,7 @@ pub(crate) mod agentdesk_config;
 mod channel_mailbox;
 mod commands;
 mod formatting;
+mod gateway;
 mod handoff;
 pub(crate) mod health;
 mod inflight;
@@ -55,9 +56,8 @@ use channel_mailbox::{
     FinishTurnResult, QueuePersistenceContext, RecoveryKickoffResult,
 };
 use formatting::{
-    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
-    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
-    send_long_message_raw, truncate_str,
+    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_skills_notice,
+    format_tool_input, normalize_empty_lines, send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
@@ -66,7 +66,7 @@ use inflight::{
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
 use restart_report::flush_restart_reports;
-use router::{handle_event, handle_text_message};
+use router::handle_event;
 use runtime_store::worktrees_root;
 use settings::{
     RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings,

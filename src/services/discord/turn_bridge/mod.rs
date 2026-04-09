@@ -10,6 +10,7 @@ mod tmux_runtime;
 #[cfg(test)]
 mod tests;
 
+use super::gateway::TurnGateway;
 use super::handoff::{HandoffRecord, save_handoff};
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
@@ -52,13 +53,11 @@ use tmux_runtime::{is_dcserver_restart_command, should_resume_watcher_after_turn
 
 pub(super) struct TurnBridgeContext {
     pub(super) provider: ProviderKind,
+    pub(super) gateway: Arc<dyn TurnGateway>,
     pub(super) channel_id: ChannelId,
     pub(super) user_msg_id: MessageId,
     pub(super) user_text_owned: String,
     pub(super) request_owner_name: String,
-    pub(super) request_owner: Option<UserId>,
-    pub(super) serenity_ctx: Option<serenity::Context>,
-    pub(super) token: Option<String>,
     pub(super) role_binding: Option<RoleBinding>,
     pub(super) adk_session_key: Option<String>,
     pub(super) adk_session_name: Option<String>,
@@ -77,7 +76,6 @@ pub(super) struct TurnBridgeContext {
 }
 
 pub(super) fn spawn_turn_bridge(
-    http: Arc<serenity::Http>,
     shared_owned: Arc<SharedData>,
     cancel_token: Arc<CancelToken>,
     rx: mpsc::Receiver<StreamMessage>,
@@ -87,12 +85,10 @@ pub(super) fn spawn_turn_bridge(
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let channel_id = bridge.channel_id;
         let provider = bridge.provider.clone();
+        let gateway = bridge.gateway.clone();
         let user_msg_id = bridge.user_msg_id;
         let user_text_owned = bridge.user_text_owned.clone();
         let request_owner_name = bridge.request_owner_name.clone();
-        let request_owner = bridge.request_owner;
-        let serenity_ctx = bridge.serenity_ctx.clone();
-        let token = bridge.token.clone();
         let role_binding = bridge.role_binding.clone();
         let adk_session_key = bridge.adk_session_key.clone();
         let adk_session_name = bridge.adk_session_name.clone();
@@ -317,13 +313,8 @@ pub(super) fn spawn_turn_bridge(
                                     }
 
                                     let handoff_text = "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
-                                    rate_limit_wait(&shared_owned, channel_id).await;
-                                    let _ = channel_id
-                                        .edit_message(
-                                            &http,
-                                            current_msg_id,
-                                            EditMessage::new().content(handoff_text),
-                                        )
+                                    let _ = gateway
+                                        .edit_message(channel_id, current_msg_id, handoff_text)
                                         .await;
                                     last_edit_text = handoff_text.to_string();
                                     inflight_state.current_msg_id = current_msg_id.get();
@@ -513,21 +504,29 @@ pub(super) fn spawn_turn_bridge(
                             if watcher_claimed {
                                 #[cfg(unix)]
                                 {
-                                    let http_bg = http.clone();
-                                    let shared_bg = shared_owned.clone();
-                                    tokio::spawn(tmux_output_watcher(
-                                        channel_id,
-                                        http_bg,
-                                        shared_bg,
-                                        output_path,
-                                        tmux_session_name,
-                                        last_offset,
-                                        cancel,
-                                        paused,
-                                        resume_offset,
-                                        pause_epoch,
-                                        turn_delivered,
-                                    ));
+                                    if let Some(ctx) = shared_owned.cached_serenity_ctx.get() {
+                                        let http_bg = ctx.http.clone();
+                                        let shared_bg = shared_owned.clone();
+                                        tokio::spawn(tmux_output_watcher(
+                                            channel_id,
+                                            http_bg,
+                                            shared_bg,
+                                            output_path,
+                                            tmux_session_name,
+                                            last_offset,
+                                            cancel,
+                                            paused,
+                                            resume_offset,
+                                            pause_epoch,
+                                            turn_delivered,
+                                        ));
+                                    } else {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        eprintln!(
+                                            "  [{ts}] ⚠ cached serenity context missing; tmux watcher not started for channel {}",
+                                            channel_id
+                                        );
+                                    }
                                 }
                             }
                             state_dirty = true;
@@ -593,13 +592,8 @@ pub(super) fn spawn_turn_bridge(
                 && !done
                 && last_status_edit.elapsed() >= status_interval
             {
-                rate_limit_wait(&shared_owned, channel_id).await;
-                let _ = channel_id
-                    .edit_message(
-                        &http,
-                        current_msg_id,
-                        EditMessage::new().content(&stable_display_text),
-                    )
+                let _ = gateway
+                    .edit_message(channel_id, current_msg_id, &stable_display_text)
                     .await;
                 last_edit_text = stable_display_text;
                 last_status_edit = tokio::time::Instant::now();
@@ -693,8 +687,7 @@ pub(super) fn spawn_turn_bridge(
         )
         .await;
 
-        let can_chain_locally =
-            serenity_ctx.is_some() && request_owner.is_some() && token.is_some();
+        let can_chain_locally = gateway.can_chain_locally();
         // Mark this turn as finalizing — deferred restart must wait until we finish
         // sending the Discord response and cleaning up state.
         shared_owned
@@ -732,7 +725,7 @@ pub(super) fn spawn_turn_bridge(
         // When tmux watcher is handling the response, it will do ⏳→✅ after delivery.
         let tmux_handoff_path = rx_disconnected && tmux_handed_off && full_response.is_empty();
         if !tmux_handoff_path {
-            remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
+            gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
 
         // Recovery auto-retry: session died during restart recovery
@@ -753,19 +746,19 @@ pub(super) fn spawn_turn_bridge(
             )
             .await;
             // Auto-retry with Discord history
-            let http_c = http.clone();
+            let gateway_c = gateway.clone();
             let retry_text = user_text_owned.clone();
-            let retry_port = shared_owned.api_port;
             tokio::spawn(async move {
-                auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                gateway_c
+                    .schedule_retry_with_history(channel_id, &retry_text)
+                    .await;
             });
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
-            let _ = channel_id
+            let _ = gateway
                 .edit_message(
-                    &http,
+                    channel_id,
                     current_msg_id,
-                    serenity::EditMessage::new()
-                        .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                    "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
                 )
                 .await;
             full_response = String::new();
@@ -780,15 +773,25 @@ pub(super) fn spawn_turn_bridge(
                     } else {
                         full_response.clone()
                     };
-                let handed_off = super::tmux::start_restart_handoff_from_state(
-                    channel_id,
-                    &http,
-                    &shared_owned,
-                    &provider,
-                    inflight_state.clone(),
-                    &best_response,
-                )
-                .await;
+                let handed_off = if let Some(ctx) = shared_owned.cached_serenity_ctx.get() {
+                    let http = ctx.http.clone();
+                    super::tmux::start_restart_handoff_from_state(
+                        channel_id,
+                        &http,
+                        &shared_owned,
+                        &provider,
+                        inflight_state.clone(),
+                        &best_response,
+                    )
+                    .await
+                } else {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⚠ cached serenity context missing; restart handoff unavailable (channel {})",
+                        channel_id
+                    );
+                    false
+                };
                 if handed_off {
                     full_response = String::new();
                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -812,18 +815,18 @@ pub(super) fn spawn_turn_bridge(
                         "restart recovery handoff failed",
                     )
                     .await;
-                    let http_c = http.clone();
+                    let gateway_c = gateway.clone();
                     let retry_text = user_text_owned.clone();
-                    let retry_port = shared_owned.api_port;
                     tokio::spawn(async move {
-                        auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                        gateway_c
+                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .await;
                     });
-                    let _ = channel_id
+                    let _ = gateway
                         .edit_message(
-                            &http,
+                            channel_id,
                             current_msg_id,
-                            serenity::EditMessage::new()
-                                .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                            "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
                         )
                         .await;
                     full_response = String::new();
@@ -842,41 +845,27 @@ pub(super) fn spawn_turn_bridge(
                 format!("{}\n\n[Stopped]", formatted)
             };
 
-            rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = super::formatting::replace_long_message_raw(
-                &http,
-                channel_id,
-                current_msg_id,
-                &full_response,
-                &shared_owned,
-            )
-            .await;
+            let _ = gateway
+                .replace_message(channel_id, current_msg_id, &full_response)
+                .await;
 
-            add_reaction_raw(&http, channel_id, user_msg_id, '🛑').await;
+            gateway.add_reaction(channel_id, user_msg_id, '🛑').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Stopped");
         } else if is_prompt_too_long {
-            let mention = request_owner
-                .map(|uid| format!("<@{}>", uid.get()))
-                .unwrap_or_default();
+            let mention = gateway.requester_mention().unwrap_or_default();
             full_response = format!(
                 "{} ⚠️ 프롬프트가 너무 깁니다. 대화 컨텍스트가 모델 한도를 초과했습니다.\n\n\
                  다음 메시지를 보내면 자동으로 새 턴이 시작됩니다.\n\
                  컨텍스트를 줄이려면 `/compact` 또는 `/clear`를 사용해 주세요.",
                 mention
             );
-            rate_limit_wait(&shared_owned, channel_id).await;
-            let _ = super::formatting::replace_long_message_raw(
-                &http,
-                channel_id,
-                current_msg_id,
-                &full_response,
-                &shared_owned,
-            )
-            .await;
+            let _ = gateway
+                .replace_message(channel_id, current_msg_id, &full_response)
+                .await;
 
-            add_reaction_raw(&http, channel_id, user_msg_id, '⚠').await;
+            gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
@@ -884,12 +873,8 @@ pub(super) fn spawn_turn_bridge(
             // Tmux watcher is handling response delivery — this is normal.
             // Don't delete placeholder — update it so the user sees the turn is still active.
             // The tmux watcher will replace this content when output arrives.
-            let _ = channel_id
-                .edit_message(
-                    &http,
-                    current_msg_id,
-                    serenity::builder::EditMessage::new().content("⏳ 처리 중..."),
-                )
+            let _ = gateway
+                .edit_message(channel_id, current_msg_id, "⏳ 처리 중...")
                 .await;
             let ts = chrono::Local::now().format("%H:%M:%S");
             eprintln!(
@@ -916,11 +901,12 @@ pub(super) fn spawn_turn_bridge(
                 )
                 .await;
                 // Auto-retry with Discord history context
-                let http_c = http.clone();
+                let gateway_c = gateway.clone();
                 let retry_text = user_text_owned.clone();
-                let retry_port = shared_owned.api_port;
                 tokio::spawn(async move {
-                    auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                    gateway_c
+                        .schedule_retry_with_history(channel_id, &retry_text)
+                        .await;
                 });
                 full_response = String::new(); // Suppress error message to user
             } else if full_response.is_empty() {
@@ -969,11 +955,12 @@ pub(super) fn spawn_turn_bridge(
                         "stale session_id in recovered output",
                     )
                     .await;
-                    let http_c = http.clone();
+                    let gateway_c = gateway.clone();
                     let retry_text = user_text_owned.clone();
-                    let retry_port = shared_owned.api_port;
                     tokio::spawn(async move {
-                        auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port).await;
+                        gateway_c
+                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .await;
                     });
                     full_response = String::new();
                 } else {
@@ -985,33 +972,33 @@ pub(super) fn spawn_turn_bridge(
                         && output_file_has_stale_resume_error_after_offset(
                             path,
                             inflight_state.last_offset,
-                        )
-                    {
-                        resume_failed = true;
-                        resume_failure_detected = true;
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        eprintln!(
-                            "  [{ts}] ⚠ Resume failed (stale session_id in output file), auto-retrying (channel {})",
-                            channel_id
-                        );
-                        reset_session_for_auto_retry(
-                            &shared_owned,
-                            channel_id,
-                            &cancel_token,
-                            adk_session_key.as_deref(),
-                            &mut new_session_id,
-                            &mut inflight_state,
-                            "stale session_id in output file",
-                        )
-                        .await;
-                        let http_c = http.clone();
-                        let retry_text = user_text_owned.clone();
-                        let retry_port = shared_owned.api_port;
-                        tokio::spawn(async move {
-                            auto_retry_with_history(&http_c, channel_id, &retry_text, retry_port)
-                                .await;
-                        });
-                        full_response = String::new();
+                        ) {
+                            resume_failed = true;
+                            resume_failure_detected = true;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ⚠ Resume failed (stale session_id in output file), auto-retrying (channel {})",
+                                channel_id
+                            );
+                            reset_session_for_auto_retry(
+                                &shared_owned,
+                                channel_id,
+                                &cancel_token,
+                                adk_session_key.as_deref(),
+                                &mut new_session_id,
+                                &mut inflight_state,
+                                "stale session_id in output file",
+                            )
+                            .await;
+                            let gateway_c = gateway.clone();
+                            let retry_text = user_text_owned.clone();
+                            tokio::spawn(async move {
+                                gateway_c
+                                    .schedule_retry_with_history(channel_id, &retry_text)
+                                    .await;
+                            });
+                            full_response = String::new();
+                        }
                     }
                     // Method 2: quick exit (<10s) + empty response + had a session_id to resume
                     if !resume_failed && quick_exit && rx_disconnected {
@@ -1040,17 +1027,12 @@ pub(super) fn spawn_turn_bridge(
                                 "quick exit with empty response",
                             )
                             .await;
-                            let http_c = http.clone();
+                            let gateway_c = gateway.clone();
                             let retry_text = user_text_owned.clone();
-                            let retry_port = shared_owned.api_port;
                             tokio::spawn(async move {
-                                auto_retry_with_history(
-                                    &http_c,
-                                    channel_id,
-                                    &retry_text,
-                                    retry_port,
-                                )
-                                .await;
+                                gateway_c
+                                    .schedule_retry_with_history(channel_id, &retry_text)
+                                    .await;
                             });
                             full_response = String::new();
                         }
@@ -1080,25 +1062,19 @@ pub(super) fn spawn_turn_bridge(
             // If response is empty (e.g. auto-retry on stale session), show
             // recovery notice instead of deleting — avoids visual gap.
             if full_response.trim().is_empty() {
-                let _ = channel_id
+                let _ = gateway
                     .edit_message(
-                        &http,
+                        channel_id,
                         current_msg_id,
-                        serenity::EditMessage::new()
-                            .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
+                        "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
                     )
                     .await;
             } else {
                 full_response =
                     super::formatting::format_for_discord_with_provider(&full_response, &provider);
-                let _ = super::formatting::replace_long_message_raw(
-                    &http,
-                    channel_id,
-                    current_msg_id,
-                    &full_response,
-                    &shared_owned,
-                )
-                .await;
+                let _ = gateway
+                    .replace_message(channel_id, current_msg_id, &full_response)
+                    .await;
             }
 
             // Signal the watcher that this turn's response was already delivered.
@@ -1108,7 +1084,7 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if !full_response.trim().is_empty() {
-                add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
+                gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1451,19 +1427,8 @@ pub(super) fn spawn_turn_bridge(
                     "  [{ts}] ⏸ DRAIN: skipping queued turn dequeue for channel {} (restart pending)",
                     channel_id
                 );
-            } else if let (Some(ctx), Some(owner), Some(tok)) =
-                (serenity_ctx.as_ref(), request_owner, token.as_deref())
-            {
-                let bot_owner_provider = super::resolve_discord_bot_provider(tok);
-                let settings_snapshot = shared_owned.settings.read().await.clone();
-                if let Err(reason) = super::validate_live_channel_routing(
-                    ctx,
-                    &bot_owner_provider,
-                    &settings_snapshot,
-                    channel_id,
-                )
-                .await
-                {
+            } else if let Some(bot_owner_provider) = gateway.bot_owner_provider() {
+                if let Err(reason) = gateway.validate_live_routing(channel_id).await {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
                         "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} (reason={})",
@@ -1480,23 +1445,15 @@ pub(super) fn spawn_turn_bridge(
                     if let Some((intervention, has_more_queued_turns)) = next_intervention {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}] 📋 Processing next queued command");
-                        // Remove 📬 (queued) reaction before processing
-                        remove_reaction_raw(&http, channel_id, intervention.message_id, '📬').await;
-                        if let Err(e) = handle_text_message(
-                            ctx,
-                            channel_id,
-                            intervention.message_id,
-                            owner,
-                            &request_owner_name,
-                            &intervention.text,
-                            &shared_owned,
-                            tok,
-                            true,
-                            has_more_queued_turns,
-                            true,
-                            None,
-                        )
-                        .await
+                        if let Err(e) = gateway
+                            .dispatch_queued_turn(
+                                channel_id,
+                                intervention.message_id,
+                                &request_owner_name,
+                                &intervention.text,
+                                has_more_queued_turns,
+                            )
+                            .await
                         {
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             println!("  [{ts}]   ⚠ queued command failed: {e}");
