@@ -1091,10 +1091,6 @@ pub(super) async fn restore_inflight_turns(
             continue;
         }
 
-        shared
-            .recovering_channels
-            .insert(channel_id, std::time::Instant::now());
-
         let channel_key = channel_id.get().to_string();
         let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
         let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
@@ -1139,12 +1135,7 @@ pub(super) async fn restore_inflight_turns(
             }
         }
 
-        if !mailbox_has_active_turn(shared, channel_id).await {
-            shared
-                .global_active
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        mailbox_restore_active_turn(
+        mailbox_recovery_kickoff(
             shared,
             channel_id,
             cancel_token.clone(),
