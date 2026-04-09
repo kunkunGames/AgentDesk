@@ -39,6 +39,25 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pr_tracking (
+            card_id        TEXT PRIMARY KEY REFERENCES kanban_cards(id) ON DELETE CASCADE,
+            repo_id        TEXT,
+            worktree_path  TEXT,
+            branch         TEXT,
+            pr_number      INTEGER,
+            head_sha       TEXT,
+            state          TEXT NOT NULL DEFAULT 'create-pr',
+            last_error     TEXT,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_pr_tracking_state ON pr_tracking(state);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_tracking_repo_pr
+        ON pr_tracking(repo_id, pr_number)
+        WHERE repo_id IS NOT NULL AND pr_number IS NOT NULL;",
+    )?;
+
     // Additive columns — ALTER TABLE errors are ignored if column already exists
     let _ = conn.execute_batch("ALTER TABLE kanban_cards ADD COLUMN deferred_dod_json TEXT;");
     let _ = conn.execute_batch("ALTER TABLE github_repos ADD COLUMN default_agent_id TEXT;");
@@ -577,6 +596,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_ste_session_key ON session_termination_events(session_key);
         CREATE INDEX IF NOT EXISTS idx_ste_dispatch_id ON session_termination_events(dispatch_id);
         CREATE INDEX IF NOT EXISTS idx_ste_created_at ON session_termination_events(created_at);",
+    )?;
+
+    // #398: Runtime supervisor decision audit
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runtime_decisions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal        TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            chosen_action TEXT NOT NULL,
+            actor         TEXT NOT NULL,
+            session_key   TEXT,
+            dispatch_id   TEXT,
+            created_at    DATETIME DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_runtime_decisions_signal
+            ON runtime_decisions(signal);
+        CREATE INDEX IF NOT EXISTS idx_runtime_decisions_dispatch_id
+            ON runtime_decisions(dispatch_id);
+        CREATE INDEX IF NOT EXISTS idx_runtime_decisions_created_at
+            ON runtime_decisions(created_at);",
     )?;
 
     // #189: Generic DM reply tracking — replaces family profile probe hardcode.

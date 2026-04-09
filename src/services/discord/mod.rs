@@ -1,7 +1,9 @@
 mod adk_session;
+pub(crate) mod agentdesk_config;
 mod channel_mailbox;
 mod commands;
 mod formatting;
+mod gateway;
 mod handoff;
 pub(crate) mod health;
 mod inflight;
@@ -50,13 +52,12 @@ use adk_session::{
     lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
 };
 use channel_mailbox::{
-    ChannelMailboxRegistry, ChannelMailboxSnapshot, ClearChannelResult, FinishTurnResult,
-    QueuePersistenceContext,
+    CancelActiveTurnResult, ChannelMailboxRegistry, ChannelMailboxSnapshot, ClearChannelResult,
+    FinishTurnResult, QueuePersistenceContext, RecoveryKickoffResult,
 };
 use formatting::{
-    BUILTIN_SKILLS, add_reaction_raw, extract_skill_description, format_for_discord,
-    format_skills_notice, format_tool_input, normalize_empty_lines, remove_reaction_raw,
-    send_long_message_raw, truncate_str,
+    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_skills_notice,
+    format_tool_input, normalize_empty_lines, send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
@@ -66,11 +67,12 @@ pub(crate) use prompt_builder::DispatchProfile;
 use prompt_builder::build_system_prompt;
 use recovery::restore_inflight_turns;
 use restart_report::flush_restart_reports;
-use router::{handle_event, handle_text_message};
+use router::handle_event;
 use runtime_store::worktrees_root;
 use settings::{
-    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings, resolve_role_binding,
-    save_bot_settings, validate_bot_channel_routing_with_provider_channel,
+    RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings,
+    load_last_remote_profile, load_last_session_path, resolve_role_binding, save_bot_settings,
+    validate_bot_channel_routing_with_provider_channel,
 };
 #[cfg(unix)]
 use tmux::{
@@ -128,34 +130,24 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
     })
 }
 
-/// Global watchdog deadline overrides, keyed by channel_id.
-/// Written by POST /api/turns/{channel_id}/extend-timeout, read by the watchdog loop.
-/// Values are Unix timestamp in milliseconds representing the new deadline.
-static WATCHDOG_DEADLINE_OVERRIDES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<u64, i64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// Extend the watchdog deadline for a channel. Returns the new deadline_ms or None if at cap.
-pub fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
-    let extend_ms = extend_by_secs as i64 * 1000;
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut map = WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?;
-    let current = map.get(&channel_id).copied().unwrap_or(now_ms);
-    let new_deadline = std::cmp::max(current, now_ms) + extend_ms;
-    // Don't enforce max here — the watchdog will clamp against its own max
-    map.insert(channel_id, new_deadline);
-    Some(new_deadline)
+pub async fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
+    ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
+        .extend_timeout(extend_by_secs)
+        .await
 }
 
 /// Read and consume the deadline override for a channel (if any).
-pub(super) fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
-    WATCHDOG_DEADLINE_OVERRIDES.lock().ok()?.remove(&channel_id)
+pub(super) async fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
+    ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
+        .take_timeout_override()
+        .await
 }
 
 /// Remove the deadline override for a channel (on turn completion).
-pub(super) fn clear_watchdog_deadline_override(channel_id: u64) {
-    if let Ok(mut map) = WATCHDOG_DEADLINE_OVERRIDES.lock() {
-        map.remove(&channel_id);
+pub(super) async fn clear_watchdog_deadline_override(channel_id: u64) {
+    if let Some(handle) = ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id)) {
+        handle.clear_timeout_override().await;
     }
 }
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
@@ -329,10 +321,6 @@ pub(super) struct DiscordBotSettings {
     /// Explicit Discord channel allowlist for this bot token.
     /// Empty means "no channel restriction".
     pub(super) allowed_channel_ids: Vec<u64>,
-    /// channel_id (string) → last working directory path
-    pub(super) last_sessions: std::collections::HashMap<String, String>,
-    /// channel_id (string) → last remote profile name
-    pub(super) last_remotes: std::collections::HashMap<String, String>,
     /// channel_id (string) → persisted model override
     pub(super) channel_model_overrides: std::collections::HashMap<String, String>,
     /// Discord user ID of the registered owner (imprinting auth)
@@ -355,8 +343,6 @@ impl Default for DiscordBotSettings {
                 .map(|s| s.to_string())
                 .collect(),
             allowed_channel_ids: Vec::new(),
-            last_sessions: std::collections::HashMap::new(),
-            last_remotes: std::collections::HashMap::new(),
             channel_model_overrides: std::collections::HashMap::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
@@ -561,6 +547,13 @@ async fn mailbox_cancel_token(
     shared.mailbox(channel_id).cancel_token().await
 }
 
+async fn mailbox_cancel_active_turn(
+    shared: &SharedData,
+    channel_id: ChannelId,
+) -> CancelActiveTurnResult {
+    shared.mailbox(channel_id).cancel_active_turn().await
+}
+
 async fn mailbox_has_active_turn(shared: &SharedData, channel_id: ChannelId) -> bool {
     shared.mailbox(channel_id).has_active_turn().await
 }
@@ -570,23 +563,49 @@ async fn mailbox_try_start_turn(
     channel_id: ChannelId,
     cancel_token: Arc<CancelToken>,
     request_owner: UserId,
+    user_message_id: MessageId,
 ) -> bool {
     shared
         .mailbox(channel_id)
-        .try_start_turn(cancel_token, request_owner)
+        .try_start_turn(cancel_token, request_owner, user_message_id)
         .await
 }
 
+#[allow(dead_code)]
 async fn mailbox_restore_active_turn(
     shared: &SharedData,
     channel_id: ChannelId,
     cancel_token: Arc<CancelToken>,
     request_owner: UserId,
+    user_message_id: MessageId,
 ) {
     shared
         .mailbox(channel_id)
-        .restore_active_turn(cancel_token, request_owner)
+        .restore_active_turn(cancel_token, request_owner, user_message_id)
         .await;
+}
+
+async fn mailbox_recovery_kickoff(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    cancel_token: Arc<CancelToken>,
+    request_owner: UserId,
+    user_message_id: MessageId,
+) -> RecoveryKickoffResult {
+    let result = shared
+        .mailbox(channel_id)
+        .recovery_kickoff(cancel_token, request_owner, user_message_id)
+        .await;
+    if result.activated_turn {
+        shared
+            .global_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+async fn mailbox_clear_recovery_marker(shared: &SharedData, channel_id: ChannelId) {
+    shared.mailbox(channel_id).clear_recovery_marker().await;
 }
 
 async fn mailbox_enqueue_intervention(
@@ -641,6 +660,21 @@ async fn mailbox_requeue_intervention_front(
         .await;
 }
 
+async fn mailbox_cancel_soft_intervention(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Option<Intervention> {
+    shared
+        .mailbox(channel_id)
+        .cancel_queued_message(
+            message_id,
+            queue_persistence_context(shared, provider, channel_id),
+        )
+        .await
+}
+
 async fn mailbox_finish_turn(
     shared: &SharedData,
     provider: &ProviderKind,
@@ -676,6 +710,17 @@ async fn mailbox_replace_queue(
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
+}
+
+async fn mailbox_restart_drain_all(shared: &SharedData, provider: &ProviderKind) -> usize {
+    shared
+        .mailboxes
+        .restart_drain_all(
+            provider,
+            &shared.token_hash,
+            &shared.dispatch_role_overrides,
+        )
+        .await
 }
 
 async fn mailbox_queue_snapshots(shared: &SharedData) -> HashMap<ChannelId, Vec<Intervention>> {
@@ -774,6 +819,17 @@ pub(super) fn dequeue_next_soft_intervention(
     Some(queue.remove(index))
 }
 
+pub(super) fn cancel_soft_intervention_by_message_id(
+    queue: &mut Vec<Intervention>,
+    message_id: MessageId,
+) -> Option<Intervention> {
+    prune_interventions(queue);
+    let index = queue
+        .iter()
+        .position(|item| item.mode == InterventionMode::Soft && item.message_id == message_id)?;
+    Some(queue.remove(index))
+}
+
 pub(super) fn requeue_intervention_front(
     queue: &mut Vec<Intervention>,
     intervention: Intervention,
@@ -785,7 +841,7 @@ pub(super) fn requeue_intervention_front(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn take_next_soft_intervention_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -833,7 +889,7 @@ pub(super) fn take_next_soft_intervention_persisted(
     Some((intervention, has_more))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(super) fn requeue_intervention_front_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -918,6 +974,7 @@ pub(super) fn save_channel_queue(
 /// Save all non-empty intervention queues to `discord_pending_queue/{provider}/{token_hash}/`.
 /// `dispatch_role_overrides` is snapshotted per channel so that `override_channel_id` survives
 /// restart and can be restored to `SharedData.dispatch_role_overrides`.
+#[cfg(test)]
 fn save_pending_queues(
     provider: &ProviderKind,
     token_hash: &str,
@@ -2273,21 +2330,12 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                         let g_active = shared_for_deferred.global_active.load(Ordering::Relaxed);
                         let g_finalizing = shared_for_deferred.global_finalizing.load(Ordering::Relaxed);
                         if g_active == 0 && g_finalizing == 0 && shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
-                            // Save pending queues before exiting so they survive restart
-                            {
-                                let queues = mailbox_queue_snapshots(&shared_for_deferred).await;
-                                let queue_count: usize =
-                                    queues.values().map(|queue| queue.len()).sum();
-                                if queue_count > 0 {
-                                    save_pending_queues(
-                                        &provider_for_deferred,
-                                        &shared_for_deferred.token_hash,
-                                        &queues,
-                                        &shared_for_deferred.dispatch_role_overrides,
-                                    );
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}] 📋 DRAIN: saved {queue_count} pending queue item(s) before deferred restart");
-                                }
+                            let queue_count =
+                                mailbox_restart_drain_all(&shared_for_deferred, &provider_for_deferred)
+                                    .await;
+                            if queue_count > 0 {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}] 📋 DRAIN: mailbox persisted {queue_count} pending queue item(s) before deferred restart");
                             }
                             check_deferred_restart(&shared_for_deferred);
                             // This provider has saved and decremented — stop polling
@@ -2611,20 +2659,11 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                 // Save pending queues and last_message_ids FIRST, before any
                 // network calls that might block/timeout and prevent saving.
 
-                // Persist pending intervention queues so they survive restart
-                {
-                    let queues = mailbox_queue_snapshots(&shared_for_signal).await;
-                    let queue_count: usize = queues.values().map(|queue| queue.len()).sum();
-                    if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &queues,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
-                        let ts3 = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts3}] 📋 saved {queue_count} pending queue item(s) to disk");
-                    }
+                let queue_count =
+                    mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
+                if queue_count > 0 {
+                    let ts3 = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts3}] 📋 mailbox persisted {queue_count} pending queue item(s)");
                 }
 
                 // Persist last_message_ids for catch-up polling after restart
@@ -2731,17 +2770,13 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                 // finished and mutated queues/last_message_ids. Re-save to capture
                 // any changes that occurred after the initial save.
                 {
-                    let queues = mailbox_queue_snapshots(&shared_for_signal).await;
-                    let queue_count: usize = queues.values().map(|queue| queue.len()).sum();
+                    let queue_count =
+                        mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
                     if queue_count > 0 {
-                        save_pending_queues(
-                            &provider_for_shutdown,
-                            &shared_for_signal.token_hash,
-                            &queues,
-                            &shared_for_signal.dispatch_role_overrides,
-                        );
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts4}] 📋 final save: {queue_count} pending queue item(s)");
+                        println!(
+                            "  [{ts4}] 📋 mailbox final drain: {queue_count} pending queue item(s)"
+                        );
                     }
                 }
                 {
@@ -3510,14 +3545,13 @@ pub(super) async fn auto_restore_session(
         channel_id,
     );
 
-    // Read settings first to get last_sessions/last_remotes info
+    // Read settings first to get provider and runtime restore metadata.
     let (last_path, saved_remote, provider) = {
         let settings = shared.settings.read().await;
-        let channel_key = channel_id.get().to_string();
-        let yaml_path = settings.last_sessions.get(&channel_key).cloned();
-        let saved_remote = settings.last_remotes.get(&channel_key).cloned();
         let provider = settings.provider.clone();
         let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref());
+        let saved_remote =
+            load_last_remote_profile(shared.db.as_ref(), &shared.token_hash, channel_id.get());
 
         // Use the effective tmux channel name here so restart recovery keeps
         // looking up the same session key for thread sessions that intentionally
@@ -3542,6 +3576,8 @@ pub(super) async fn auto_restore_session(
                 })
             })
         });
+        let persisted_path =
+            load_last_session_path(shared.db.as_ref(), &shared.token_hash, channel_id.get());
 
         if let (Some(configured), Some(restored)) = (configured_path.as_ref(), db_cwd.as_ref()) {
             if configured != restored {
@@ -3556,7 +3592,7 @@ pub(super) async fn auto_restore_session(
         let last_path = select_restored_session_path(
             configured_path,
             db_cwd,
-            yaml_path,
+            persisted_path,
             saved_remote.as_deref(),
         );
 
@@ -3669,9 +3705,36 @@ async fn bootstrap_thread_session(
             worktree: None,
             born_generation: runtime_store::load_generation(),
         });
-    session.current_path = Some(parent_path.to_string());
+    // Always create a worktree for thread sessions to isolate concurrent work.
+    let effective_path = {
+        let ch = session.channel_name.as_deref().unwrap_or("unknown");
+        let provider_str = shared.settings.read().await.provider.as_str().to_string();
+        match create_git_worktree(parent_path, ch, &provider_str) {
+            Ok((wt_path, branch)) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] 🌿 Thread worktree created: {} (branch: {})",
+                    wt_path, branch
+                );
+                session.worktree = Some(WorktreeInfo {
+                    original_path: parent_path.to_string(),
+                    worktree_path: wt_path.clone(),
+                    branch_name: branch,
+                });
+                wt_path
+            }
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Thread worktree creation failed: {e}, falling back to parent path"
+                );
+                parent_path.to_string()
+            }
+        }
+    };
+    session.current_path = Some(effective_path.clone());
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ↻ Bootstrapped thread session from parent path: {parent_path}");
+    println!("  [{ts}] ↻ Bootstrapped thread session: {effective_path}");
 }
 
 /// Resolve the channel name and parent category name for a Discord channel.
@@ -4158,10 +4221,16 @@ mod tests {
         }
     }
 
+    fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+        test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Queue files must land under `{provider}/{token_hash}/` — not the legacy flat path.
     #[test]
     fn pending_queue_path_uses_token_hash() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4203,7 +4272,7 @@ mod tests {
     /// Bot A writes a queue; Bot B (different token_hash) must not see it on load.
     #[test]
     fn load_pending_queues_only_reads_own_namespace() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4234,7 +4303,7 @@ mod tests {
     /// save_pending_queues + load_pending_queues round-trip with token_hash namespacing.
     #[test]
     fn save_pending_queues_roundtrip() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4275,7 +4344,7 @@ mod tests {
 
     #[test]
     fn persisted_queue_helpers_keep_remaining_items_and_restore_requeued_item() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4370,7 +4439,7 @@ mod tests {
     /// must not collide — the namespace key is token_hash, not agent.
     #[test]
     fn agent_empty_or_duplicate_does_not_collide_namespace() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4395,7 +4464,7 @@ mod tests {
     /// This ensures dispatch_role_overrides are not lost on restart.
     #[test]
     fn review_thread_override_preserved_across_restart() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4428,7 +4497,7 @@ mod tests {
     /// P2: save_pending_queues captures dispatch_role_overrides into override_channel_id.
     #[test]
     fn save_pending_queues_captures_dispatch_role_overrides() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 
@@ -4464,7 +4533,7 @@ mod tests {
     /// by load_pending_queues, which only reads from the token_hash subdirectory.
     #[test]
     fn legacy_flat_queue_file_is_not_restored() {
-        let _lock = test_env_lock().lock().unwrap();
+        let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
 

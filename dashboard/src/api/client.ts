@@ -1177,7 +1177,6 @@ export interface AutoQueueRun {
   created_at: number;
   completed_at: number | null;
   max_concurrent_threads?: number;
-  max_concurrent_per_agent?: number;
   thread_group_count?: number;
 }
 
@@ -1232,18 +1231,23 @@ export async function generateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
   mode?: AutoQueueGenerateMode | null,
+  unifiedThread?: boolean | null,
 ): Promise<{
   run: AutoQueueRun;
   entries: DispatchQueueEntry[];
 }> {
+  const body: Record<string, unknown> = {
+    repo: repo ?? null,
+    agent_id: agentId ?? null,
+    mode: mode ?? "priority-sort",
+    parallel: mode === "similarity-aware" || undefined,
+  };
+  if (unifiedThread !== undefined && unifiedThread !== null) {
+    body.unified_thread = unifiedThread;
+  }
   return request("/api/auto-queue/generate", {
     method: "POST",
-    body: JSON.stringify({
-      repo: repo ?? null,
-      agent_id: agentId ?? null,
-      mode: mode ?? "priority-sort",
-      parallel: mode === "similarity-aware" || undefined,
-    }),
+    body: JSON.stringify(body),
   });
 }
 

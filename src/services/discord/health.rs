@@ -315,7 +315,10 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
             .deferred_hook_backlog
             .load(std::sync::atomic::Ordering::Relaxed);
         let provider_watchers = entry.shared.tmux_watchers.len();
-        let recovering_channels = entry.shared.recovering_channels.len();
+        let recovering_channels = mailbox_snapshots
+            .values()
+            .filter(|snapshot| snapshot.recovery_started_at.is_some())
+            .count();
         let provider_recovery_duration = recovery_duration_secs(&entry.shared);
         let last_turn_at = entry
             .shared
