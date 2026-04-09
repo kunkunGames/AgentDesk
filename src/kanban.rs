@@ -1592,7 +1592,6 @@ mod tests {
                 unified_thread_id TEXT,
                 unified_thread_channel_id TEXT,
                 max_concurrent_threads INTEGER DEFAULT 1,
-                max_concurrent_per_agent INTEGER DEFAULT 1,
                 thread_group_count INTEGER DEFAULT 1,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 completed_at DATETIME
