@@ -156,7 +156,7 @@ fn category_description(category: &str) -> &'static str {
         "queue" => "Pending dispatch queue views and live turn control.",
         "reviews" => "Review verdict submission, decisions, and tuning aggregation.",
         "sessions" => "Sessions, transcript search, force-kill, and termination events.",
-        "settings" => "Runtime settings and config override management.",
+        "settings" => "Settings surfaces, live overrides, precedence, and onboarding contracts.",
         "skills" => "Skill catalog and usage ranking.",
         "stats" => "Aggregate system counters.",
         _ => "Miscellaneous API endpoints.",
@@ -1094,37 +1094,180 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/settings",
             "settings",
-            "Get company settings JSON",
+            "Get the canonical company settings JSON stored in `kv_meta['settings']`",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "companyName": "AgentDesk",
+                "language": "ko",
+                "theme": "midnight"
+            }),
         ),
         ep(
             "PUT",
             "/api/settings",
             "settings",
-            "Replace company settings JSON",
+            "Full-replace company settings JSON. Callers must send a merged payload if hidden keys should survive.",
+        )
+        .with_example(
+            json!({
+                "companyName": "AgentDesk",
+                "language": "ko",
+                "theme": "midnight"
+            }),
+            json!({"ok": true}),
         ),
         ep(
             "GET",
             "/api/settings/config",
             "settings",
-            "Get whitelisted runtime config entries",
+            "Get editable policy/config keys with effective value, baseline, and restart-behavior metadata",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "entries": [
+                    {
+                        "key": "merge_strategy",
+                        "value": "merge",
+                        "default": "rebase",
+                        "baseline": "rebase",
+                        "baseline_source": "yaml",
+                        "override_active": true,
+                        "editable": true,
+                        "restart_behavior": "reseed-from-yaml",
+                        "category": "automation",
+                        "label_ko": "자동 머지 전략",
+                        "label_en": "Merge Strategy"
+                    },
+                    {
+                        "key": "server_port",
+                        "value": "8791",
+                        "default": "8791",
+                        "baseline": "8791",
+                        "baseline_source": "config",
+                        "override_active": false,
+                        "editable": false,
+                        "restart_behavior": "config-only",
+                        "category": "system",
+                        "label_ko": "서버 포트",
+                        "label_en": "Server Port"
+                    }
+                ]
+            }),
         ),
         ep(
             "PATCH",
             "/api/settings/config",
             "settings",
-            "Patch whitelisted runtime config entries",
+            "Patch live overrides for editable whitelisted config keys. YAML-backed keys are re-seeded on restart.",
+        )
+        .with_example(
+            json!({
+                "merge_strategy": "merge",
+                "max_review_rounds": 5
+            }),
+            json!({"ok": true, "updated": 2, "rejected": []}),
         ),
         ep(
             "GET",
             "/api/settings/runtime-config",
             "settings",
-            "Get runtime config with overrides applied",
+            "Get runtime tuning as `current` merged over YAML-or-hardcoded `defaults`",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "current": {
+                    "dispatchPollSec": 15,
+                    "maxRetries": 7
+                },
+                "defaults": {
+                    "dispatchPollSec": 30,
+                    "maxRetries": 3
+                }
+            }),
         ),
         ep(
             "PUT",
             "/api/settings/runtime-config",
             "settings",
-            "Replace runtime config overrides",
+            "Replace the stored runtime-config override object",
+        )
+        .with_example(
+            json!({
+                "dispatchPollSec": 15,
+                "maxRetries": 7
+            }),
+            json!({"ok": true}),
+        ),
+        ep(
+            "GET",
+            "/api/settings/escalation",
+            "settings",
+            "Get escalation routing defaults plus the current override-applied value",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "current": {
+                    "mode": "scheduled",
+                    "owner_user_id": 343742347365974026u64,
+                    "pm_channel_id": "kanban-manager",
+                    "schedule": {
+                        "pm_hours": "09:00-18:00",
+                        "timezone": "Asia/Seoul"
+                    }
+                },
+                "defaults": {
+                    "mode": "pm",
+                    "owner_user_id": 343742347365974026u64,
+                    "pm_channel_id": "kanban-manager",
+                    "schedule": {
+                        "pm_hours": "00:00-08:00",
+                        "timezone": "Asia/Seoul"
+                    }
+                }
+            }),
+        ),
+        ep(
+            "PUT",
+            "/api/settings/escalation",
+            "settings",
+            "Replace the escalation override. Sending the default body clears the stored override.",
+        )
+        .with_example(
+            json!({
+                "mode": "scheduled",
+                "owner_user_id": 343742347365974026u64,
+                "pm_channel_id": "kanban-manager",
+                "schedule": {
+                    "pm_hours": "09:00-18:00",
+                    "timezone": "Asia/Seoul"
+                }
+            }),
+            json!({
+                "ok": true,
+                "current": {
+                    "mode": "scheduled",
+                    "owner_user_id": 343742347365974026u64,
+                    "pm_channel_id": "kanban-manager",
+                    "schedule": {
+                        "pm_hours": "09:00-18:00",
+                        "timezone": "Asia/Seoul"
+                    }
+                },
+                "defaults": {
+                    "mode": "pm",
+                    "owner_user_id": 343742347365974026u64,
+                    "pm_channel_id": "kanban-manager",
+                    "schedule": {
+                        "pm_hours": "00:00-08:00",
+                        "timezone": "Asia/Seoul"
+                    }
+                }
+            }),
         ),
         ep(
             "GET",
