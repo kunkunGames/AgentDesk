@@ -1036,8 +1036,12 @@ pub fn spawn_watchdog(port: u16) {
                     let mut buf = [0u8; 512];
                     match stream.read(&mut buf) {
                         Ok(n) if n > 0 => {
-                            let resp = String::from_utf8_lossy(&buf[..n]);
-                            resp.contains("200 OK")
+                            // Any HTTP response means the process is alive and serving.
+                            // Only TCP failure (Err/_) indicates a true hang/deadlock.
+                            // A 503 (degraded/unhealthy state) still means the runtime is
+                            // responsive — killing it would create an infinite crash loop
+                            // when a provider is temporarily disconnected.
+                            true
                         }
                         _ => false,
                     }

@@ -159,6 +159,8 @@ impl DispatchService {
                     let message = format!("{error}");
                     if message.contains("not found") {
                         ServiceError::not_found(message)
+                    } else if message.contains("no agent execution evidence") {
+                        ServiceError::bad_request(message)
                     } else {
                         ServiceError::internal(message)
                     }

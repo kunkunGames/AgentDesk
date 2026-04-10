@@ -100,11 +100,8 @@ fn match_channel(
     channel_name: Option<&str>,
 ) -> Option<u8> {
     let channel_id_str = channel_id.get().to_string();
-    let channel_target = channel.target();
-    if channel.channel_id().as_deref() == Some(channel_id_str.as_str())
-        || channel_target.as_deref() == Some(channel_id_str.as_str())
-    {
-        return Some(2);
+    if let Some(explicit_channel_id) = channel.channel_id() {
+        return (explicit_channel_id == channel_id_str).then_some(2);
     }
 
     let channel_name = channel_name?.trim();
@@ -348,6 +345,32 @@ pub(super) fn find_discord_bot_by_token(token: &str) -> Option<ResolvedDiscordBo
         .find(|bot| bot.token == token)
 }
 
+/// Collect bot names that are actually referenced by agent channel configs.
+/// Only these bots should be launched as full agent bots via `run_bot()`.
+/// Utility bots (e.g. announce, notify) that aren't mapped to any agent channel
+/// are excluded, preventing them from processing agent messages.
+pub(super) fn collect_agent_bot_names() -> HashSet<String> {
+    let Some(config) = load_agentdesk_config() else {
+        return HashSet::new();
+    };
+    let mut names = HashSet::new();
+    for agent in &config.agents {
+        if agent.channels.claude.is_some() {
+            names.insert("claude".to_string());
+        }
+        if agent.channels.codex.is_some() {
+            names.insert("codex".to_string());
+        }
+        if agent.channels.gemini.is_some() {
+            names.insert("gemini".to_string());
+        }
+        if agent.channels.qwen.is_some() {
+            names.insert("qwen".to_string());
+        }
+    }
+    names
+}
+
 pub(super) fn is_known_agent(role_id: &str) -> Option<bool> {
     let config = load_agentdesk_config()?;
     Some(config.agents.iter().any(|agent| agent.id == role_id))
@@ -552,6 +575,35 @@ agents:
             let workspace = resolve_workspace(ChannelId::new(1479671301387059200), Some("adk-cdx"))
                 .expect("workspace");
             assert!(workspace.ends_with("/workspaces/agentdesk"));
+        });
+    }
+
+    #[test]
+    fn resolve_role_binding_does_not_match_different_explicit_channel_id_by_name() {
+        with_temp_root(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home.path(),
+                r#"
+server:
+  port: 8791
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1484070499783803081"
+        name: "adk-cc"
+        aliases: ["agentdesk-cc"]
+"#,
+            );
+
+            assert!(
+                resolve_role_binding(ChannelId::new(1479671298497183835), Some("adk-cc")).is_none()
+            );
+            assert!(
+                resolve_workspace(ChannelId::new(1479671298497183835), Some("adk-cc")).is_none()
+            );
         });
     }
 

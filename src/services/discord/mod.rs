@@ -99,6 +99,53 @@ const DEAD_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60); // 1 minut
 const RESTART_REPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFERRED_RESTART_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+pub(super) fn should_process_allowed_bot_turn_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    parse_dispatch_id(trimmed).is_some()
+        && !trimmed.contains("검토 전용")
+        && !trimmed.contains("작업 착수 금지")
+}
+
+pub(in crate::services::discord) fn is_allowed_turn_sender(
+    allowed_bot_ids: &[u64],
+    author_id: u64,
+    author_is_bot: bool,
+    text: &str,
+) -> bool {
+    if allowed_bot_ids.contains(&author_id) {
+        return should_process_allowed_bot_turn_text(text);
+    }
+    !author_is_bot
+}
+
+pub(in crate::services::discord) fn should_phase2_recover_message(
+    message_id: u64,
+    checkpoint: Option<u64>,
+    existing_ids: &std::collections::HashSet<u64>,
+) -> bool {
+    if existing_ids.contains(&message_id) {
+        return false;
+    }
+    if checkpoint.is_some_and(|saved| message_id <= saved) {
+        return false;
+    }
+    true
+}
+
+pub(in crate::services::discord) fn recovery_known_message_ids(
+    snapshot: &ChannelMailboxSnapshot,
+) -> std::collections::HashSet<u64> {
+    let mut ids = snapshot
+        .intervention_queue
+        .iter()
+        .map(|item| item.message_id.get())
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(active_id) = snapshot.active_user_message_id {
+        ids.insert(active_id.get());
+    }
+    ids
+}
+
 #[cfg(test)]
 pub(in crate::services::discord) use queue_io::channel_has_pending_soft_queue_at;
 pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff;
@@ -623,6 +670,35 @@ async fn mailbox_enqueue_intervention(
         .await
 }
 
+async fn enqueue_internal_followup(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    reply_message_id: MessageId,
+    text: impl Into<String>,
+    reason: &'static str,
+) -> bool {
+    let enqueued = mailbox_enqueue_intervention(
+        shared,
+        provider,
+        channel_id,
+        Intervention {
+            author_id: UserId::new(1),
+            message_id: reply_message_id,
+            text: text.into(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+        },
+    )
+    .await;
+
+    if enqueued {
+        schedule_deferred_idle_queue_kickoff(shared.clone(), provider.clone(), channel_id, reason);
+    }
+
+    enqueued
+}
+
 async fn mailbox_has_pending_soft_queue(
     shared: &SharedData,
     provider: &ProviderKind,
@@ -658,21 +734,6 @@ async fn mailbox_requeue_intervention_front(
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
-}
-
-async fn mailbox_cancel_soft_intervention(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    message_id: MessageId,
-) -> Option<Intervention> {
-    shared
-        .mailbox(channel_id)
-        .cancel_queued_message(
-            message_id,
-            queue_persistence_context(shared, provider, channel_id),
-        )
-        .await
 }
 
 async fn mailbox_finish_turn(
@@ -816,17 +877,6 @@ pub(super) fn dequeue_next_soft_intervention(
     let index = queue
         .iter()
         .position(|item| item.mode == InterventionMode::Soft)?;
-    Some(queue.remove(index))
-}
-
-pub(super) fn cancel_soft_intervention_by_message_id(
-    queue: &mut Vec<Intervention>,
-    message_id: MessageId,
-) -> Option<Intervention> {
-    prune_interventions(queue);
-    let index = queue
-        .iter()
-        .position(|item| item.mode == InterventionMode::Soft && item.message_id == message_id)?;
     Some(queue.remove(index))
 }
 
@@ -1147,6 +1197,21 @@ async fn catch_up_missed_messages(
         let channel_id = ChannelId::new(channel_id_raw);
         let after_msg = MessageId::new(last_id);
 
+        match resolve_runtime_channel_binding_status(http, channel_id).await {
+            RuntimeChannelBindingStatus::Owned => {}
+            RuntimeChannelBindingStatus::Unowned => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⏭ catch-up: dropping stale checkpoint for unowned channel {} ({})",
+                    channel_id,
+                    path.display()
+                );
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            RuntimeChannelBindingStatus::Unknown => continue,
+        }
+
         // Fetch messages after last_id (Discord returns oldest first with after=)
         let messages = match channel_id
             .messages(
@@ -1178,14 +1243,7 @@ async fn catch_up_missed_messages(
         };
 
         // Collect existing message IDs in queue for dedup
-        let existing_ids: std::collections::HashSet<u64> = {
-            mailbox_snapshot(shared, channel_id)
-                .await
-                .intervention_queue
-                .into_iter()
-                .map(|i| i.message_id.get())
-                .collect()
-        };
+        let existing_ids = recovery_known_message_ids(&mailbox_snapshot(shared, channel_id).await);
 
         let allowed_bot_ids: Vec<u64> = {
             let settings = shared.settings.read().await;
@@ -1218,9 +1276,8 @@ async fn catch_up_missed_messages(
             if text.is_empty() {
                 continue;
             }
-            // Only process messages from allowed bots or authorized users
-            let is_allowed = !msg.author.bot || allowed_bot_ids.contains(&msg.author.id.get());
-            if !is_allowed {
+            if !is_allowed_turn_sender(&allowed_bot_ids, msg.author.id.get(), msg.author.bot, text)
+            {
                 continue;
             }
 
@@ -1292,6 +1349,11 @@ async fn catch_up_missed_messages(
         };
         let channel_id = ChannelId::new(channel_id_raw);
 
+        match resolve_runtime_channel_binding_status(http, channel_id).await {
+            RuntimeChannelBindingStatus::Owned => {}
+            RuntimeChannelBindingStatus::Unowned | RuntimeChannelBindingStatus::Unknown => continue,
+        }
+
         // Fetch last 20 messages (newest first — default Discord order)
         let recent = match channel_id
             .messages(http, serenity::builder::GetMessages::new().limit(20))
@@ -1324,14 +1386,9 @@ async fn catch_up_missed_messages(
         };
 
         // Collect existing queue IDs for dedup
-        let existing_ids: std::collections::HashSet<u64> = {
-            mailbox_snapshot(shared, channel_id)
-                .await
-                .intervention_queue
-                .into_iter()
-                .map(|i| i.message_id.get())
-                .collect()
-        };
+        let mut existing_ids =
+            recovery_known_message_ids(&mailbox_snapshot(shared, channel_id).await);
+        let mut phase2_checkpoint = shared.last_message_ids.get(&channel_id).map(|v| *v);
 
         let mut channel_recovered = 0usize;
 
@@ -1343,16 +1400,20 @@ async fn catch_up_missed_messages(
             if Some(msg.author.id.get()) == bot_user_id_phase2 {
                 continue;
             }
-            if existing_ids.contains(&msg.id.get()) {
-                continue;
-            }
             let text = msg.content.trim();
             if text.is_empty() {
                 continue;
             }
-            let is_allowed =
-                !msg.author.bot || allowed_bot_ids_phase2.contains(&msg.author.id.get());
-            if !is_allowed {
+            let mid = msg.id.get();
+            if !is_allowed_turn_sender(
+                &allowed_bot_ids_phase2,
+                msg.author.id.get(),
+                msg.author.bot,
+                text,
+            ) {
+                continue;
+            }
+            if !should_phase2_recover_message(mid, phase2_checkpoint, &existing_ids) {
                 continue;
             }
             // Skip messages older than 10 minutes (generous window for restart gap)
@@ -1374,6 +1435,8 @@ async fn catch_up_missed_messages(
                 },
             )
             .await;
+            existing_ids.insert(mid);
+            phase2_checkpoint = Some(phase2_checkpoint.map_or(mid, |saved| saved.max(mid)));
             channel_recovered += 1;
         }
 
@@ -2096,6 +2159,22 @@ fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+fn discord_gateway_intents() -> serenity::GatewayIntents {
+    serenity::GatewayIntents::GUILDS
+        | serenity::GatewayIntents::GUILD_MESSAGES
+        | serenity::GatewayIntents::DIRECT_MESSAGES
+        | serenity::GatewayIntents::MESSAGE_CONTENT
+}
+
+fn should_skip_agent_runtime_launch(token: &str) -> Option<String> {
+    let bot = agentdesk_config::find_discord_bot_by_token(token)?;
+    let agent_bot_names = agentdesk_config::collect_agent_bot_names();
+    if !agent_bot_names.is_empty() && !agent_bot_names.contains(&bot.name) {
+        return Some(bot.name);
+    }
+    None
+}
+
 /// Entry point: start the Discord bot
 pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext) {
     let RunBotContext {
@@ -2107,6 +2186,17 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
         db,
         engine,
     } = context;
+
+    if let Some(bot_name) = should_skip_agent_runtime_launch(token) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⏭ BOT-LAUNCH: skipping utility bot '{}' in run_bot() — not mapped to any agent channel",
+            bot_name
+        );
+        shutdown_remaining.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
 
@@ -2398,12 +2488,31 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                 let provider_for_restore = provider.clone();
                 tokio::spawn(async move {
                     gc_stale_fixed_working_sessions(&shared_for_tmux2).await;
+
+                    // #429: catch-up FIRST to minimize message loss window.
+                    catch_up_missed_messages(
+                        &http_for_tmux,
+                        &shared_for_tmux2,
+                        &provider_for_restore,
+                    ).await;
+
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
                     let (restored_queues, restored_overrides) = load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
+                    let allowed_bot_ids_for_restore: Vec<u64> = {
+                        let settings = shared_for_tmux2.settings.read().await;
+                        settings.allowed_bot_ids.clone()
+                    };
                     // P1-1: Restore dispatch_role_overrides from queue snapshots
                     for (thread_channel_id, alt_channel_id) in &restored_overrides {
+                        if !matches!(
+                            resolve_runtime_channel_binding_status(&http_for_tmux, *thread_channel_id)
+                                .await,
+                            RuntimeChannelBindingStatus::Owned
+                        ) {
+                            continue;
+                        }
                         shared_for_tmux2.dispatch_role_overrides.insert(*thread_channel_id, *alt_channel_id);
                     }
                     if !restored_overrides.is_empty() {
@@ -2414,11 +2523,24 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                         let mut added = 0usize;
                         let mut skipped = 0usize;
                         for (channel_id, items) in restored_queues {
+                            if !matches!(
+                                resolve_runtime_channel_binding_status(&http_for_tmux, channel_id)
+                                    .await,
+                                RuntimeChannelBindingStatus::Owned
+                            ) {
+                                skipped += items.len();
+                                continue;
+                            }
                             let snapshot = mailbox_snapshot(&shared_for_tmux2, channel_id).await;
+                            let mut existing_ids = recovery_known_message_ids(&snapshot);
                             let mut queue = snapshot.intervention_queue;
-                            let mut existing_ids: std::collections::HashSet<u64> =
-                                queue.iter().map(|item| item.message_id.get()).collect();
                             for item in items {
+                                if allowed_bot_ids_for_restore.contains(&item.author_id.get())
+                                    && !should_process_allowed_bot_turn_text(&item.text)
+                                {
+                                    skipped += 1;
+                                    continue;
+                                }
                                 if existing_ids.insert(item.message_id.get()) {
                                     queue.push(item);
                                     added += 1;
@@ -2441,27 +2563,25 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                     // P1-2: Warn about legacy queue files that cannot be restored
                     warn_legacy_pending_queue_files(&provider_for_restore);
 
+                    // #429: thread-map validation in background — non-blocking
                     if let Some(ref db) = shared_for_tmux2.db {
-                        let (checked, cleared) =
-                            crate::server::routes::dispatches::validate_channel_thread_maps_on_startup(
-                                db,
-                                &token_for_kickoff,
-                            )
-                            .await;
-                        if checked > 0 || cleared > 0 {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!(
-                                "  [{ts}] 🧹 THREAD-MAP: validated {checked} mapping(s), cleared {cleared} stale binding(s)"
-                            );
-                        }
+                        let db_bg = db.clone();
+                        let token_bg = token_for_kickoff.clone();
+                        tokio::spawn(async move {
+                            let (checked, cleared) =
+                                crate::server::routes::dispatches::validate_channel_thread_maps_on_startup(
+                                    &db_bg,
+                                    &token_bg,
+                                )
+                                .await;
+                            if checked > 0 || cleared > 0 {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!(
+                                    "  [{ts}] 🧹 THREAD-MAP: validated {checked} mapping(s), cleared {cleared} stale binding(s)"
+                                );
+                            }
+                        });
                     }
-
-                    // Startup catch-up polling: recover messages lost during restart gap
-                    catch_up_missed_messages(
-                        &http_for_tmux,
-                        &shared_for_tmux2,
-                        &provider_for_restore,
-                    ).await;
 
                     // #226: Collect channels that recovery already handled (spawned + ended watchers).
                     // restore_tmux_watchers must skip these to prevent duplicate watcher creation.
@@ -2610,10 +2730,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
         })
         .build();
 
-    let intents = serenity::GatewayIntents::GUILDS
-        | serenity::GatewayIntents::GUILD_MESSAGES
-        | serenity::GatewayIntents::DIRECT_MESSAGES
-        | serenity::GatewayIntents::MESSAGE_CONTENT;
+    let intents = discord_gateway_intents();
 
     let mut client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
@@ -3530,6 +3647,13 @@ pub(super) async fn auto_restore_session(
     channel_id: ChannelId,
     serenity_ctx: &serenity::prelude::Context,
 ) {
+    if matches!(
+        resolve_runtime_channel_binding_status(&serenity_ctx.http, channel_id).await,
+        RuntimeChannelBindingStatus::Unowned
+    ) {
+        return;
+    }
+
     // Resolve channel/category before taking the lock for mutation
     let (live_ch_name, cat_name) = resolve_channel_category(serenity_ctx, channel_id).await;
     let existing_channel_name = {
@@ -3839,6 +3963,60 @@ pub(super) async fn provider_handles_channel(
         .is_ok()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeChannelBindingStatus {
+    Owned,
+    Unowned,
+    Unknown,
+}
+
+pub(super) async fn resolve_runtime_channel_binding_status(
+    http: &Arc<serenity::Http>,
+    channel_id: serenity::model::id::ChannelId,
+) -> RuntimeChannelBindingStatus {
+    if settings::has_configured_channel_binding(channel_id, None) {
+        return RuntimeChannelBindingStatus::Owned;
+    }
+
+    let Ok(channel) = channel_id.to_channel(http).await else {
+        return RuntimeChannelBindingStatus::Unknown;
+    };
+
+    match channel {
+        serenity::model::channel::Channel::Private(_) => RuntimeChannelBindingStatus::Owned,
+        serenity::model::channel::Channel::Guild(gc) => {
+            use serenity::model::channel::ChannelType;
+            match gc.kind {
+                ChannelType::PublicThread | ChannelType::PrivateThread => {
+                    let Some(parent_id) = gc.parent_id else {
+                        return RuntimeChannelBindingStatus::Unowned;
+                    };
+                    let parent_name = match parent_id.to_channel(http).await {
+                        Ok(serenity::model::channel::Channel::Guild(parent)) => {
+                            Some(parent.name.clone())
+                        }
+                        Ok(_) => None,
+                        Err(_) => None,
+                    };
+                    if settings::has_configured_channel_binding(parent_id, parent_name.as_deref()) {
+                        RuntimeChannelBindingStatus::Owned
+                    } else {
+                        RuntimeChannelBindingStatus::Unowned
+                    }
+                }
+                _ => {
+                    if settings::has_configured_channel_binding(channel_id, Some(&gc.name)) {
+                        RuntimeChannelBindingStatus::Owned
+                    } else {
+                        RuntimeChannelBindingStatus::Unowned
+                    }
+                }
+            }
+        }
+        _ => RuntimeChannelBindingStatus::Unowned,
+    }
+}
+
 /// If `channel_id` is a Discord thread, return the parent channel ID and name.
 /// For non-thread channels, returns `None`.
 pub(super) async fn resolve_thread_parent(
@@ -3982,25 +4160,37 @@ fn enrich_role_map_with_channel_ids() {
 
 #[cfg(test)]
 mod tests {
-    use super::ChannelId;
+    use super::{ChannelId, MessageId, UserId};
     use super::{
         DiscordBotSettings, Intervention, InterventionMode, PendingQueueItem,
         allows_nonlocal_session_path, channel_has_pending_soft_queue_at,
-        choose_restore_channel_name, is_synthetic_thread_channel_name, load_pending_queues,
+        choose_restore_channel_name, discord_gateway_intents, is_allowed_turn_sender,
+        is_synthetic_thread_channel_name, load_pending_queues, recovery_known_message_ids,
         requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
-        select_restored_session_path, session_path_is_usable, synthetic_thread_channel_name,
-        take_next_soft_intervention_persisted, user_is_authorized,
+        select_restored_session_path, session_path_is_usable, should_phase2_recover_message,
+        synthetic_thread_channel_name, take_next_soft_intervention_persisted, user_is_authorized,
         watcher_should_kickoff_idle_queue,
     };
-    use crate::services::discord::runtime_store::test_env_lock;
     use crate::services::discord::settings::{
         BotChannelRoutingGuardFailure, validate_bot_channel_routing,
     };
-    use crate::services::provider::{CancelToken, ProviderKind};
-    use poise::serenity_prelude::{MessageId, UserId};
-    use std::collections::HashMap;
+    use crate::services::discord::{
+        runtime_store::test_env_lock, should_process_allowed_bot_turn_text,
+    };
+    use crate::services::provider::CancelToken;
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::GatewayIntents;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn discord_gateway_intents_do_not_include_reaction_events() {
+        let intents = discord_gateway_intents();
+
+        assert!(!intents.contains(GatewayIntents::GUILD_MESSAGE_REACTIONS));
+        assert!(!intents.contains(GatewayIntents::DIRECT_MESSAGE_REACTIONS));
+    }
 
     #[test]
     fn synthetic_thread_channel_name_round_trips() {
@@ -4072,6 +4262,57 @@ mod tests {
 
         assert!(user_is_authorized(&settings, 42));
         assert!(user_is_authorized(&settings, 99));
+    }
+
+    #[test]
+    fn allowed_bot_review_only_text_is_rejected_even_without_bot_flag() {
+        let allowed_bot_ids = vec![123];
+        let review_only = "⚠️ 검토 전용 — 작업 착수 금지";
+        let dispatch = "DISPATCH: abc123\n작업 시작";
+
+        assert!(!should_process_allowed_bot_turn_text(review_only));
+        assert!(!is_allowed_turn_sender(
+            &allowed_bot_ids,
+            123,
+            false,
+            review_only
+        ));
+        assert!(is_allowed_turn_sender(
+            &allowed_bot_ids,
+            123,
+            false,
+            dispatch
+        ));
+    }
+
+    #[test]
+    fn phase2_recovery_skips_messages_at_or_before_checkpoint() {
+        let existing = HashSet::from([300u64]);
+
+        assert!(!should_phase2_recover_message(300, None, &existing));
+        assert!(!should_phase2_recover_message(200, Some(250), &existing));
+        assert!(!should_phase2_recover_message(250, Some(250), &existing));
+        assert!(should_phase2_recover_message(251, Some(250), &existing));
+    }
+
+    #[test]
+    fn recovery_known_message_ids_include_active_turn_message() {
+        let snapshot = super::ChannelMailboxSnapshot {
+            active_user_message_id: Some(MessageId::new(200)),
+            intervention_queue: vec![Intervention {
+                author_id: UserId::new(42),
+                message_id: MessageId::new(100),
+                text: "queued".to_string(),
+                mode: InterventionMode::Soft,
+                created_at: Instant::now(),
+            }],
+            ..Default::default()
+        };
+
+        let existing = recovery_known_message_ids(&snapshot);
+        assert!(existing.contains(&100));
+        assert!(existing.contains(&200));
+        assert!(!should_phase2_recover_message(200, None, &existing));
     }
 
     #[test]

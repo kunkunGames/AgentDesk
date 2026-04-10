@@ -82,8 +82,41 @@ struct LegacyBotSettingsEntry {
 
 fn load_legacy_bot_settings_json() -> Option<serde_json::Value> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<serde_json::Value>(&content).ok()
+    let content = fs::read_to_string(&path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+
+    // Retire the legacy file if it has no runtime-only data (channel_model_overrides).
+    // Auth fields are already in agentdesk.yaml; this file is only needed for overrides.
+    let has_runtime_data = json
+        .as_object()
+        .map(|obj| {
+            obj.values().any(|entry| {
+                entry
+                    .get("channel_model_overrides")
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|m| !m.is_empty())
+            })
+        })
+        .unwrap_or(false);
+
+    if !has_runtime_data {
+        let migrated = path.with_extension("json.migrated");
+        if let Err(e) = fs::rename(&path, &migrated) {
+            tracing::warn!(
+                "Failed to retire '{}' → '{}': {e}",
+                path.display(),
+                migrated.display()
+            );
+        } else {
+            tracing::info!(
+                "[bot-settings] Retired '{}' → '{}' (auth migrated to agentdesk.yaml)",
+                path.display(),
+                migrated.display()
+            );
+        }
+    }
+
+    Some(json)
 }
 
 fn load_legacy_bot_settings_entry(token: &str) -> LegacyBotSettingsEntry {
@@ -898,6 +931,17 @@ pub(super) fn resolve_workspace(
     resolve_workspace_from_role_map(channel_id, channel_name)
 }
 
+/// Returns true only when this runtime has an explicit or resolved binding for
+/// the concrete Discord channel ID. This deliberately avoids channel-name-only
+/// fallback for unrelated runtimes that happen to share a channel name.
+pub(super) fn has_configured_channel_binding(
+    channel_id: ChannelId,
+    channel_name: Option<&str>,
+) -> bool {
+    resolve_role_binding(channel_id, channel_name).is_some()
+        || resolve_workspace(channel_id, channel_name).is_some()
+}
+
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     let prompt_path = Path::new(&binding.prompt_file);
     let raw = fs::read_to_string(prompt_path)
@@ -1272,8 +1316,13 @@ pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
 pub fn load_discord_bot_launch_configs() -> Vec<DiscordBotLaunchConfig> {
     let configured = agentdesk_config::load_discord_bot_configs();
     if !configured.is_empty() {
+        // Only launch bots that are mapped to at least one agent channel.
+        // Utility bots (announce, notify) that aren't referenced by any agent
+        // channel config are excluded to prevent them from processing agent messages.
+        let agent_bot_names = agentdesk_config::collect_agent_bot_names();
         let mut configs = configured
             .into_iter()
+            .filter(|bot| agent_bot_names.contains(&bot.name))
             .map(|bot| {
                 let legacy = load_legacy_bot_settings_entry(&bot.token);
                 DiscordBotLaunchConfig {
@@ -1913,6 +1962,62 @@ memory:
             assert_eq!(configs.len(), 2);
             assert_eq!(configs[0].provider, ProviderKind::Claude);
             assert_eq!(configs[1].provider, ProviderKind::Codex);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_excludes_unmapped_utility_bots_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    claude:
+      token: "claude-token"
+      provider: "claude"
+    codex:
+      token: "codex-token"
+      provider: "codex"
+    announce:
+      token: "announce-token"
+      provider: "claude"
+    notify:
+      token: "notify-token"
+      provider: "claude"
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1479671298497183835"
+        name: "adk-cc"
+      codex:
+        id: "1479671301387059200"
+        name: "adk-cdx"
+"#,
+            );
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.token.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["codex-token", "claude-token"]
+            );
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.provider.clone())
+                    .collect::<Vec<ProviderKind>>(),
+                vec![ProviderKind::Codex, ProviderKind::Claude]
+            );
         });
     }
 
@@ -2561,6 +2666,37 @@ channels:
         ));
         assert!(!bot_settings_allow_agent(&settings, None, false));
         assert!(bot_settings_allow_agent(&settings, None, true));
+    }
+
+    #[test]
+    fn test_has_configured_channel_binding_requires_matching_explicit_channel_id() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1484070499783803081"
+        name: "adk-cc"
+        aliases: ["agentdesk-cc"]
+"#,
+            );
+
+            assert!(super::has_configured_channel_binding(
+                ChannelId::new(1484070499783803081),
+                Some("adk-cc"),
+            ));
+            assert!(!super::has_configured_channel_binding(
+                ChannelId::new(1479671298497183835),
+                Some("adk-cc"),
+            ));
+        });
     }
 
     #[test]

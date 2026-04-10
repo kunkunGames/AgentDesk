@@ -1063,6 +1063,23 @@ fn merge_role_map_into_agentdesk_yaml(root: &Path) -> Result<(), String> {
         crate::config::save_to_path(&yaml_path, &config)
             .map_err(|e| format!("Failed to write config '{}': {e}", yaml_path.display()))?;
     }
+
+    // Migration complete — retire the legacy file so it is never re-merged.
+    let migrated = role_map.with_extension("json.migrated");
+    if let Err(e) = fs::rename(&role_map, &migrated) {
+        tracing::warn!(
+            "Failed to rename '{}' → '{}': {e}",
+            role_map.display(),
+            migrated.display()
+        );
+    } else {
+        tracing::info!(
+            "[role-map] Migrated '{}' → '{}' (one-time merge into agentdesk.yaml)",
+            role_map.display(),
+            migrated.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -2413,7 +2430,9 @@ mod tests {
             !managed_agents_root(root).join("alpha.memory").exists(),
             "role-context/*.memory should not be copied into config/agents"
         );
-        let role_map = fs::read_to_string(role_map_path(root)).unwrap();
+        // After merge_role_map_into_agentdesk_yaml, role_map.json is retired to .migrated
+        let migrated = role_map_path(root).with_extension("json.migrated");
+        let role_map = fs::read_to_string(&migrated).unwrap();
         assert!(role_map.contains("/tmp/config/agents/alpha/IDENTITY.md"));
         let backend = load_memory_backend(root);
         assert_eq!(backend.version, 2);

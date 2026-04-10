@@ -216,6 +216,81 @@ fn latest_completed_work_dispatch_target(
     trusted_path.and_then(execution_target_from_dir)
 }
 
+fn is_work_dispatch_type(dispatch_type: Option<&str>) -> bool {
+    matches!(dispatch_type, Some("implementation") | Some("rework"))
+}
+
+fn result_has_work_completion_evidence(result: &serde_json::Value) -> bool {
+    json_string_field(result, "completed_commit").is_some()
+        || json_string_field(result, "assistant_message").is_some()
+        || result
+            .get("agent_response_present")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || json_string_field(result, "work_outcome").is_some()
+}
+
+fn dispatch_has_assistant_response(conn: &rusqlite::Connection, dispatch_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM session_transcripts
+         WHERE dispatch_id = ?1
+           AND TRIM(assistant_message) <> ''",
+        [dispatch_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| anyhow::anyhow!("session transcript lookup failed: {e}"))
+}
+
+fn validate_dispatch_completion_evidence_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<()> {
+    let (dispatch_type, status): (Option<String>, String) = conn
+        .query_row(
+            "SELECT dispatch_type, status FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| anyhow::anyhow!("Dispatch lookup error: {e}"))?;
+
+    if !matches!(status.as_str(), "pending" | "dispatched")
+        || !is_work_dispatch_type(dispatch_type.as_deref())
+    {
+        return Ok(());
+    }
+
+    if result_has_work_completion_evidence(result)
+        || dispatch_has_assistant_response(conn, dispatch_id)?
+    {
+        return Ok(());
+    }
+
+    let dispatch_label = dispatch_type.as_deref().unwrap_or("work");
+    let completion_source = json_string_field(result, "completion_source").unwrap_or("unknown");
+    tracing::warn!(
+        "[dispatch] rejecting {} completion for {}: no agent execution evidence",
+        dispatch_label,
+        dispatch_id
+    );
+    Err(anyhow::anyhow!(
+        "Cannot complete {dispatch_label} dispatch {dispatch_id} via {completion_source}: no agent execution evidence (expected assistant response, completed_commit, or explicit work_outcome)"
+    ))
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_dispatch_completion_evidence(
+    db: &Db,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<()> {
+    let conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
+    validate_dispatch_completion_evidence_on_conn(&conn, dispatch_id, result)
+}
+
 fn apply_review_target_context(
     target: &DispatchExecutionTarget,
     obj: &mut serde_json::Map<String, serde_json::Value>,
@@ -1213,10 +1288,12 @@ fn complete_dispatch_inner(
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
 
+    validate_dispatch_completion_evidence_on_conn(&conn, dispatch_id, result)?;
+
     let changed = conn.execute(
         "UPDATE task_dispatches
          SET status = 'completed',
-             result = ?1,
+         result = ?1,
              updated_at = datetime('now'),
              completed_at = COALESCE(completed_at, datetime('now')) \
          WHERE id = ?2 AND status IN ('pending', 'dispatched')",
@@ -1374,150 +1451,19 @@ pub fn query_dispatch_row(
     .map_err(|e| anyhow::anyhow!("Dispatch query error: {e}"))
 }
 
-/// Check whether a dispatch belongs to an active unified-thread auto-queue run.
-///
-/// Returns `true` when:
-/// - The dispatch's kanban card is part of an active/paused auto-queue run
-/// - That run has `unified_thread_id IS NOT NULL`
-/// - The run still has pending or dispatched entries remaining
-///
-/// When `true`, callers should **not** tear down the tmux session because the
-/// same thread will be reused for subsequent queue entries.
-///
-/// Uses a standalone `rusqlite::Connection` opened from the runtime DB path
-/// to avoid lock contention with the main `Db` mutex.
 pub fn is_unified_thread_active(dispatch_id: &str) -> bool {
-    let root = match crate::cli::agentdesk_runtime_root() {
-        Some(r) => r,
-        None => return false,
-    };
-    let db_path = root.join("data/agentdesk.sqlite");
-    let conn = match rusqlite::Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // #145: Direct dispatch→entry→run lookup via auto_queue_entries.dispatch_id.
-    // Eliminates kanban_card_id-based ambiguity when the same card is re-queued.
-    let result: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 \
-             FROM auto_queue_entries e \
-             JOIN auto_queue_runs r ON e.run_id = r.id \
-             WHERE e.run_id = ( \
-                 SELECT e2.run_id FROM auto_queue_entries e2 \
-                 WHERE e2.dispatch_id = ?1 \
-                 ORDER BY CASE e2.status WHEN 'dispatched' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END \
-                 LIMIT 1 \
-             ) \
-             AND r.status IN ('active', 'paused') \
-             AND e.status IN ('pending', 'dispatched') \
-             AND r.unified_thread_id IS NOT NULL",
-            [dispatch_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    let has_slot_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'auto_queue_slots'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !has_slot_table {
-        return result;
-    }
-    let slot_result: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 \
-             FROM auto_queue_entries e \
-             JOIN auto_queue_slots s
-               ON s.agent_id = e.agent_id
-              AND s.slot_index = e.slot_index \
-             WHERE e.dispatch_id = ?1 \
-               AND e.slot_index IS NOT NULL \
-               AND COALESCE(s.thread_id_map, '') != ''",
-            [dispatch_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    result || slot_result
+    let _ = dispatch_id;
+    false
 }
 
-/// Check whether a thread channel belongs to an active unified-thread auto-queue run.
-///
-/// Looks up `auto_queue_runs` by `unified_thread_channel_id` matching the
-/// given Discord channel ID. Also searches within `unified_thread_id` JSON
-/// for parallel runs where each group has its own thread (#140).
-/// Returns `true` when a matching active/paused run still has pending or dispatched entries.
 pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
-    let root = match crate::cli::agentdesk_runtime_root() {
-        Some(r) => r,
-        None => return false,
-    };
-    let db_path = root.join("data/agentdesk.sqlite");
-    let conn = match rusqlite::Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let channel_str = channel_id.to_string();
-    let quoted = format!("\"{}\"", channel_str);
-    let has_slot_table: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'auto_queue_slots'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if has_slot_table {
-        let slot_match: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0
-                 FROM auto_queue_slots
-                 WHERE COALESCE(thread_id_map, '') != ''
-                   AND INSTR(thread_id_map, ?1) > 0",
-                [&quoted],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if slot_match {
-            return true;
-        }
-    }
-    // Check scalar unified_thread_channel_id (covers non-parallel and last-written parallel)
-    let scalar_match: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 \
-             FROM auto_queue_entries e \
-             JOIN auto_queue_runs r ON e.run_id = r.id \
-             WHERE r.unified_thread_channel_id = ?1 \
-             AND r.status IN ('active', 'paused') \
-             AND e.status IN ('pending', 'dispatched') \
-             AND r.unified_thread_id IS NOT NULL",
-            [&channel_str],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if scalar_match {
-        return true;
-    }
-    // #140: Also search within unified_thread_id JSON for parallel runs.
-    // Thread IDs stored as quoted string values, so searching for '"thread_id"' is safe.
-    conn.query_row(
-        "SELECT COUNT(*) > 0 \
-         FROM auto_queue_entries e \
-         JOIN auto_queue_runs r ON e.run_id = r.id \
-         WHERE r.status IN ('active', 'paused') \
-         AND e.status IN ('pending', 'dispatched') \
-         AND r.unified_thread_id IS NOT NULL \
-         AND INSTR(r.unified_thread_id, ?1) > 0",
-        [&quoted],
-        |row| row.get(0),
-    )
-    .unwrap_or(false)
+    let _ = channel_id;
+    false
 }
 
 /// Extract thread channel ID from a channel name's `-t{15+digit}` suffix.
 /// Pure parsing — no DB access. Used by both production guards and tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_thread_channel_id(channel_name: &str) -> Option<u64> {
     let pos = channel_name.rfind("-t")?;
     let suffix = &channel_name[pos + 2..];
@@ -1533,45 +1479,12 @@ pub fn extract_thread_channel_id(channel_name: &str) -> Option<u64> {
 /// unified-thread auto-queue run. Extracts the thread channel ID from the
 /// `-t{15+digit}` suffix in the channel name.
 pub fn is_unified_thread_channel_name_active(channel_name: &str) -> bool {
-    let Some(thread_channel_id) = extract_thread_channel_id(channel_name) else {
-        return false;
-    };
-    is_unified_thread_channel_active(thread_channel_id)
+    let _ = channel_name;
+    false
 }
 
-/// Drain `kill_unified_thread:*` kv_meta entries and return the channel names to kill.
-/// Each entry is consumed (deleted from DB) on read.
 pub fn drain_unified_thread_kill_signals() -> Vec<String> {
-    let root = match crate::cli::agentdesk_runtime_root() {
-        Some(r) => r,
-        None => return vec![],
-    };
-    let db_path = root.join("data/agentdesk.sqlite");
-    let conn = match rusqlite::Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let mut stmt = match conn
-        .prepare("SELECT key, value FROM kv_meta WHERE key LIKE 'kill_unified_thread:%'")
-    {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let entries: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    let mut channels = Vec::new();
-    for (key, _run_id) in &entries {
-        if let Some(ch) = key.strip_prefix("kill_unified_thread:") {
-            channels.push(ch.to_string());
-        }
-        conn.execute("DELETE FROM kv_meta WHERE key = ?1", [key])
-            .ok();
-    }
-    channels
+    Vec::new()
 }
 
 /// Determine provider from a Discord channel name suffix.
@@ -1715,6 +1628,23 @@ mod tests {
         .unwrap()
     }
 
+    fn seed_assistant_response_for_dispatch(db: &Db, dispatch_id: &str, message: &str) {
+        crate::db::session_transcripts::persist_turn(
+            db,
+            crate::db::session_transcripts::PersistSessionTranscript {
+                turn_id: &format!("dispatch-test:{dispatch_id}"),
+                session_key: Some("dispatch-test-session"),
+                channel_id: Some("123"),
+                agent_id: Some("agent-1"),
+                provider: Some("codex"),
+                dispatch_id: Some(dispatch_id),
+                user_message: "Implement the task",
+                assistant_message: message,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn create_dispatch_inserts_and_updates_card() {
         let db = test_db();
@@ -1786,6 +1716,7 @@ mod tests {
         )
         .unwrap();
         let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented");
 
         let completed =
             complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
@@ -1810,6 +1741,7 @@ mod tests {
         )
         .unwrap();
         let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented");
 
         let completed =
             complete_dispatch(&db, &engine, &dispatch_id, &json!({"output": "done"})).unwrap();
@@ -1840,6 +1772,45 @@ mod tests {
 
         let result = complete_dispatch(&db, &engine, "nonexistent", &json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn complete_dispatch_rejects_work_without_execution_evidence() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-no-evidence", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-no-evidence",
+            "agent-1",
+            "implementation",
+            "title",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        let result = complete_dispatch(
+            &db,
+            &engine,
+            &dispatch_id,
+            &json!({"completion_source": "test_harness"}),
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("no agent execution evidence"));
+        assert_eq!(dispatch["status"], "pending");
+
+        let conn = db.separate_conn().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 
     #[test]
@@ -2377,6 +2348,7 @@ mod tests {
         )
         .unwrap();
         let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented");
 
         let completed =
             finalize_dispatch(&db, &engine, &dispatch_id, "turn_bridge_explicit", None).unwrap();
@@ -2412,7 +2384,7 @@ mod tests {
             &engine,
             &dispatch_id,
             "session_idle",
-            Some(&json!({ "auto_completed": true })),
+            Some(&json!({ "auto_completed": true, "agent_response_present": true })),
         )
         .unwrap();
 
@@ -2528,6 +2500,7 @@ mod tests {
         let id1 = d1["id"].as_str().unwrap().to_string();
 
         // Complete the first dispatch
+        seed_assistant_response_for_dispatch(&db, &id1, "implemented first attempt");
         complete_dispatch(&db, &engine, &id1, &json!({"output": "done"})).unwrap();
 
         // New dispatch of same type → should succeed (old one is completed)

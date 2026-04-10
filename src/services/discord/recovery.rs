@@ -130,6 +130,42 @@ fn extract_response_from_output(output_path: &str, start_offset: u64) -> String 
     extract_response_from_output_pub(output_path, start_offset)
 }
 
+fn persist_recovered_transcript(
+    db: &crate::db::Db,
+    provider: &ProviderKind,
+    state: &inflight::InflightTurnState,
+    dispatch_id: Option<&str>,
+    assistant_message: &str,
+) -> bool {
+    let assistant_message = assistant_message.trim();
+    if assistant_message.is_empty() {
+        return false;
+    }
+
+    let turn_id = format!("discord:{}:{}", state.channel_id, state.user_msg_id);
+    let channel_id_text = state.channel_id.to_string();
+    match crate::db::session_transcripts::persist_turn(
+        db,
+        crate::db::session_transcripts::PersistSessionTranscript {
+            turn_id: &turn_id,
+            session_key: state.session_key.as_deref(),
+            channel_id: Some(channel_id_text.as_str()),
+            agent_id: None,
+            provider: Some(provider.as_str()),
+            dispatch_id,
+            user_message: &state.user_text,
+            assistant_message,
+        },
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            eprintln!("  [{ts}] ⚠ recovery: failed to persist session transcript: {e}");
+            false
+        }
+    }
+}
+
 /// Public wrapper for turn_bridge fallback recovery.
 ///
 /// Mirrors the `resolve_done_response` logic from `turn_bridge.rs`:
@@ -285,17 +321,18 @@ pub(super) async fn restore_inflight_turns(
                     .as_deref()
                     .map(|p| extract_response_from_output(p, state.last_offset))
                     .unwrap_or_default();
-                let final_text = if extracted.trim().is_empty() {
-                    if state.full_response.trim().is_empty() {
-                        "(복구됨 — 응답 텍스트 없음)".to_string()
-                    } else {
-                        super::formatting::format_for_discord_with_provider(
-                            &state.full_response,
-                            provider,
-                        )
-                    }
+                let assistant_response = if extracted.trim().is_empty() {
+                    state.full_response.clone()
                 } else {
-                    super::formatting::format_for_discord_with_provider(&extracted, provider)
+                    extracted
+                };
+                let final_text = if assistant_response.trim().is_empty() {
+                    "(복구됨 — 응답 텍스트 없음)".to_string()
+                } else {
+                    super::formatting::format_for_discord_with_provider(
+                        &assistant_response,
+                        provider,
+                    )
                 };
                 let channel_id = ChannelId::new(state.channel_id);
                 let current_msg_id = MessageId::new(state.current_msg_id);
@@ -320,17 +357,58 @@ pub(super) async fn restore_inflight_turns(
                     lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id)
                         .await
                         .or_else(|| parse_dispatch_id(&state.user_text));
+                let has_completion_evidence = if let Some(db) = shared.db.as_ref() {
+                    persist_recovered_transcript(
+                        db,
+                        provider,
+                        &state,
+                        recovered_dispatch_id
+                            .as_deref()
+                            .or(state.dispatch_id.as_deref()),
+                        &assistant_response,
+                    )
+                } else {
+                    !assistant_response.trim().is_empty()
+                };
+                let completion_context = has_completion_evidence
+                    .then(|| serde_json::json!({ "agent_response_present": true }));
+                let fallback_result = completion_context
+                    .clone()
+                    .map(|mut result| {
+                        if let Some(obj) = result.as_object_mut() {
+                            obj.insert(
+                                "completion_source".to_string(),
+                                serde_json::Value::String("recovery_db_fallback".to_string()),
+                            );
+                            obj.insert(
+                                "needs_reconcile".to_string(),
+                                serde_json::Value::Bool(true),
+                            );
+                        }
+                        result
+                    })
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "completion_source": "recovery_db_fallback",
+                            "needs_reconcile": true,
+                        })
+                    });
                 let mut dispatch_completed = recovered_dispatch_id.is_none();
                 if let Some(ref did) = recovered_dispatch_id {
-                    // #143: Use finalize_dispatch directly with retry.
-                    if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                    if !has_completion_evidence {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!(
+                            "  [{ts}] ⚠ recovery: refusing to complete work dispatch {did} without assistant response"
+                        );
+                    } else if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                        // #143: Use finalize_dispatch directly with retry.
                         for attempt in 1..=3u8 {
                             match crate::dispatch::finalize_dispatch(
                                 db,
                                 engine,
                                 did,
                                 "recovery_completed_during_downtime",
-                                None,
+                                completion_context.as_ref(),
                             ) {
                                 Ok(_) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -359,9 +437,9 @@ pub(super) async fn restore_inflight_turns(
                             let pool_ok = db.separate_conn().ok().map_or(false, |conn| {
                                 let changed = conn.execute(
                                     "UPDATE task_dispatches SET status = 'completed', \
-                                     result = '{\"completion_source\":\"recovery_db_fallback\",\"needs_reconcile\":true}', \
-                                     updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-                                    [did.as_str()],
+                                     result = ?1, \
+                                     updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
+                                    rusqlite::params![fallback_result.to_string(), did.as_str()],
                                 ).unwrap_or(0);
                                 if changed > 0 {
                                     conn.execute(
@@ -375,9 +453,9 @@ pub(super) async fn restore_inflight_turns(
                                 dispatch_completed = true;
                             } else {
                                 dispatch_completed =
-                                    super::turn_bridge::runtime_db_fallback_complete(
+                                    super::turn_bridge::runtime_db_fallback_complete_with_result(
                                         did,
-                                        "recovery_db_fallback",
+                                        &fallback_result,
                                     );
                             }
                         }
@@ -389,7 +467,19 @@ pub(super) async fn restore_inflight_turns(
                         );
                         let payload = serde_json::json!({
                             "status": "completed",
-                            "result": {"completion_source": "recovery_completed_during_downtime"},
+                            "result": completion_context.clone().map(|mut result| {
+                                if let Some(obj) = result.as_object_mut() {
+                                    obj.insert(
+                                        "completion_source".to_string(),
+                                        serde_json::Value::String(
+                                            "recovery_completed_during_downtime".to_string(),
+                                        ),
+                                    );
+                                }
+                                result
+                            }).unwrap_or_else(|| {
+                                serde_json::json!({"completion_source": "recovery_completed_during_downtime"})
+                            }),
                         });
                         for attempt in 1..=3u8 {
                             match reqwest::Client::new()
@@ -426,10 +516,11 @@ pub(super) async fn restore_inflight_turns(
                         }
                         // API retries exhausted — runtime-root DB fallback
                         if !dispatch_completed {
-                            dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
-                                did,
-                                "recovery_db_fallback",
-                            );
+                            dispatch_completed =
+                                super::turn_bridge::runtime_db_fallback_complete_with_result(
+                                    did,
+                                    &fallback_result,
+                                );
                         }
                     }
                 }
@@ -733,17 +824,15 @@ pub(super) async fn restore_inflight_turns(
                 .as_deref()
                 .map(|p| extract_response_from_output(p, state.last_offset))
                 .unwrap_or_default();
-            let final_text = if extracted.trim().is_empty() {
-                if state.full_response.trim().is_empty() {
-                    "(복구됨 — 응답 텍스트 없음)".to_string()
-                } else {
-                    super::formatting::format_for_discord_with_provider(
-                        &state.full_response,
-                        provider,
-                    )
-                }
+            let assistant_response = if extracted.trim().is_empty() {
+                state.full_response.clone()
             } else {
-                super::formatting::format_for_discord_with_provider(&extracted, provider)
+                extracted
+            };
+            let final_text = if assistant_response.trim().is_empty() {
+                "(복구됨 — 응답 텍스트 없음)".to_string()
+            } else {
+                super::formatting::format_for_discord_with_provider(&assistant_response, provider)
             };
             // #225 P1-1: Track relay success — only clear inflight if Discord delivery succeeds
             let relay_ok = super::formatting::replace_long_message_raw(
@@ -767,6 +856,39 @@ pub(super) async fn restore_inflight_turns(
             // #225 P1-3: Use DB lookup for dispatch ID (text parsing fails in unified threads)
             let recovered_dispatch_id = parse_dispatch_id(&state.user_text)
                 .or(lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id).await);
+            let has_completion_evidence = if let Some(db) = shared.db.as_ref() {
+                persist_recovered_transcript(
+                    db,
+                    provider,
+                    &state,
+                    recovered_dispatch_id
+                        .as_deref()
+                        .or(state.dispatch_id.as_deref()),
+                    &assistant_response,
+                )
+            } else {
+                !assistant_response.trim().is_empty()
+            };
+            let completion_context = has_completion_evidence
+                .then(|| serde_json::json!({ "agent_response_present": true }));
+            let fallback_result = completion_context
+                .clone()
+                .map(|mut result| {
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "completion_source".to_string(),
+                            serde_json::Value::String("recovery_output_db_fallback".to_string()),
+                        );
+                        obj.insert("needs_reconcile".to_string(), serde_json::Value::Bool(true));
+                    }
+                    result
+                })
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "completion_source": "recovery_output_db_fallback",
+                        "needs_reconcile": true,
+                    })
+                });
             let mut dispatch_completed = recovered_dispatch_id.is_none();
             if let Some(ref did) = recovered_dispatch_id {
                 let dispatch_type = shared.db.as_ref().and_then(|db| {
@@ -782,14 +904,19 @@ pub(super) async fn restore_inflight_turns(
 
                 match dispatch_type.as_deref() {
                     Some("implementation") | Some("rework") => {
-                        if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                        if !has_completion_evidence {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            eprintln!(
+                                "  [{ts}] ⚠ recovery: refusing to complete work dispatch {did} without assistant response"
+                            );
+                        } else if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
                             for attempt in 1..=3u8 {
                                 match crate::dispatch::finalize_dispatch(
                                     db,
                                     engine,
                                     did,
                                     "recovery_output_completed",
-                                    None,
+                                    completion_context.as_ref(),
                                 ) {
                                     Ok(_) => {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -816,16 +943,17 @@ pub(super) async fn restore_inflight_turns(
                             }
                             if !dispatch_completed {
                                 dispatch_completed =
-                                    super::turn_bridge::runtime_db_fallback_complete(
+                                    super::turn_bridge::runtime_db_fallback_complete_with_result(
                                         did,
-                                        "recovery_output_db_fallback",
+                                        &fallback_result,
                                     );
                             }
                         } else {
-                            dispatch_completed = super::turn_bridge::runtime_db_fallback_complete(
-                                did,
-                                "recovery_output_db_fallback",
-                            );
+                            dispatch_completed =
+                                super::turn_bridge::runtime_db_fallback_complete_with_result(
+                                    did,
+                                    &fallback_result,
+                                );
                         }
                         if !dispatch_completed {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1201,7 +1329,7 @@ pub(super) async fn restore_inflight_turns(
         let recovery_session_id = state.session_id.clone();
         let retry_channel_id = channel_id.get();
         std::thread::spawn(move || {
-            match claude::read_output_file_until_result(
+            match crate::services::session_backend::read_output_file_until_result(
                 &output_for_reader,
                 start_offset,
                 tx.clone(),
@@ -1277,7 +1405,12 @@ pub(super) async fn restore_inflight_turns(
             rx,
             TurnBridgeContext {
                 provider: provider.clone(),
-                gateway: Arc::new(DiscordGateway::new(http.clone(), shared.clone(), None)),
+                gateway: Arc::new(DiscordGateway::new(
+                    http.clone(),
+                    shared.clone(),
+                    provider.clone(),
+                    None,
+                )),
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),

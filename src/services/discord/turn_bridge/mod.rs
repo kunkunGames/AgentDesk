@@ -24,7 +24,8 @@ use crate::utils::format::tail_with_ellipsis;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
 pub(super) use completion_guard::{
-    fail_dispatch_with_retry, guard_review_dispatch_completion, runtime_db_fallback_complete,
+    fail_dispatch_with_retry, guard_review_dispatch_completion,
+    runtime_db_fallback_complete_with_result,
 };
 pub(super) use recovery_text::auto_retry_with_history;
 pub(super) use stale_resume::result_event_has_stale_resume_error;
@@ -746,7 +747,7 @@ pub(super) fn spawn_turn_bridge(
             let retry_text = user_text_owned.clone();
             tokio::spawn(async move {
                 gateway_c
-                    .schedule_retry_with_history(channel_id, &retry_text)
+                    .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                     .await;
             });
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
@@ -815,7 +816,7 @@ pub(super) fn spawn_turn_bridge(
                     let retry_text = user_text_owned.clone();
                     tokio::spawn(async move {
                         gateway_c
-                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                             .await;
                     });
                     let _ = gateway
@@ -901,7 +902,7 @@ pub(super) fn spawn_turn_bridge(
                 let retry_text = user_text_owned.clone();
                 tokio::spawn(async move {
                     gateway_c
-                        .schedule_retry_with_history(channel_id, &retry_text)
+                        .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                         .await;
                 });
                 full_response = String::new(); // Suppress error message to user
@@ -955,7 +956,7 @@ pub(super) fn spawn_turn_bridge(
                     let retry_text = user_text_owned.clone();
                     tokio::spawn(async move {
                         gateway_c
-                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                             .await;
                     });
                     full_response = String::new();
@@ -991,7 +992,7 @@ pub(super) fn spawn_turn_bridge(
                         let retry_text = user_text_owned.clone();
                         tokio::spawn(async move {
                             gateway_c
-                                .schedule_retry_with_history(channel_id, &retry_text)
+                                .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                                 .await;
                         });
                         full_response = String::new();
@@ -1027,7 +1028,11 @@ pub(super) fn spawn_turn_bridge(
                             let retry_text = user_text_owned.clone();
                             tokio::spawn(async move {
                                 gateway_c
-                                    .schedule_retry_with_history(channel_id, &retry_text)
+                                    .schedule_retry_with_history(
+                                        channel_id,
+                                        user_msg_id,
+                                        &retry_text,
+                                    )
                                     .await;
                             });
                             full_response = String::new();
@@ -1055,9 +1060,20 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
+            let mut delivery_response = full_response.clone();
+            if let Some(warning) = review_dispatch_warning.as_deref() {
+                let warning = warning.trim();
+                if !warning.is_empty() {
+                    if !delivery_response.trim().is_empty() {
+                        delivery_response.push_str("\n\n");
+                    }
+                    delivery_response.push_str(warning);
+                }
+            }
+
             // If response is empty (e.g. auto-retry on stale session), show
             // recovery notice instead of deleting — avoids visual gap.
-            if full_response.trim().is_empty() {
+            if delivery_response.trim().is_empty() {
                 let _ = gateway
                     .edit_message(
                         channel_id,
@@ -1066,10 +1082,12 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
             } else {
-                full_response =
-                    super::formatting::format_for_discord_with_provider(&full_response, &provider);
+                delivery_response = super::formatting::format_for_discord_with_provider(
+                    &delivery_response,
+                    &provider,
+                );
                 let _ = gateway
-                    .replace_message(channel_id, current_msg_id, &full_response)
+                    .replace_message(channel_id, current_msg_id, &delivery_response)
                     .await;
             }
 
@@ -1079,7 +1097,7 @@ pub(super) fn spawn_turn_bridge(
                 watcher.turn_delivered.store(true, Ordering::Relaxed);
             }
 
-            if !full_response.trim().is_empty() {
+            if !delivery_response.trim().is_empty() {
                 gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
 
@@ -1087,26 +1105,6 @@ pub(super) fn spawn_turn_bridge(
             println!("  [{ts}] ▶ Response sent");
             if let Ok(mut last) = shared_owned.last_turn_at.lock() {
                 *last = Some(chrono::Local::now().to_rfc3339());
-            }
-
-            if let Some(warning) = review_dispatch_warning.as_deref() {
-                // Send via announce bot so the agent sees this as an external
-                // message and re-triggers a turn to handle the pending review.
-                // Using the provider bot (claude/codex) would be ignored as
-                // the agent treats its own bot's messages as self-messages.
-                let _ = reqwest::Client::new()
-                    .post(crate::config::local_api_url(
-                        shared_owned.api_port,
-                        "/api/send",
-                    ))
-                    .json(&serde_json::json!({
-                        "target": format!("channel:{}", channel_id),
-                        "content": warning,
-                        "source": "pipeline",
-                        "bot": "announce",
-                    }))
-                    .send()
-                    .await;
             }
         }
 

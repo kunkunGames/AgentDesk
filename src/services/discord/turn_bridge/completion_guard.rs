@@ -332,7 +332,10 @@ pub(in crate::services::discord) async fn guard_review_dispatch_completion(
 /// Opens a fresh connection to the on-disk DB (bypassing the Db pool) and writes
 /// a status + reconciliation marker so onTick can run the hook chain later.
 /// Returns `true` if the UPDATE affected at least one row.
-fn runtime_db_fallback_complete_with_result(dispatch_id: &str, result: &serde_json::Value) -> bool {
+pub(in crate::services::discord) fn runtime_db_fallback_complete_with_result(
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> bool {
     let Some(root) = crate::cli::agentdesk_runtime_root() else {
         return false;
     };
@@ -358,6 +361,7 @@ fn runtime_db_fallback_complete_with_result(dispatch_id: &str, result: &serde_js
     changed > 0
 }
 
+#[allow(dead_code)]
 pub(in crate::services::discord) fn runtime_db_fallback_complete(
     dispatch_id: &str,
     source: &str,

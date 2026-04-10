@@ -1194,6 +1194,7 @@ export interface DispatchQueueEntry {
   github_issue_number?: number | null;
   github_repo?: string | null;
   thread_group?: number;
+  batch_phase?: number;
 }
 
 export interface ThreadGroupStatus {
@@ -1231,7 +1232,6 @@ export async function generateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
   mode?: AutoQueueGenerateMode | null,
-  unifiedThread?: boolean | null,
 ): Promise<{
   run: AutoQueueRun;
   entries: DispatchQueueEntry[];
@@ -1242,9 +1242,6 @@ export async function generateAutoQueue(
     mode: mode ?? "priority-sort",
     parallel: mode === "similarity-aware" || undefined,
   };
-  if (unifiedThread !== undefined && unifiedThread !== null) {
-    body.unified_thread = unifiedThread;
-  }
   return request("/api/auto-queue/generate", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1254,7 +1251,6 @@ export async function generateAutoQueue(
 export async function activateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
-  unifiedThread?: boolean,
 ): Promise<{
   dispatched: KanbanCard[];
   count: number;
@@ -1262,7 +1258,6 @@ export async function activateAutoQueue(
   const body: Record<string, unknown> = {};
   if (repo) body.repo = repo;
   if (agentId) body.agent_id = agentId;
-  if (unifiedThread !== undefined) body.unified_thread = unifiedThread;
   return request("/api/auto-queue/activate", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1298,11 +1293,9 @@ export async function skipAutoQueueEntry(id: string): Promise<{ ok: boolean }> {
 export async function updateAutoQueueRun(
   id: string,
   status?: "paused" | "active" | "completed",
-  unified_thread?: boolean,
 ): Promise<{ ok: boolean }> {
   const body: Record<string, unknown> = {};
   if (status !== undefined) body.status = status;
-  if (unified_thread !== undefined) body.unified_thread = unified_thread;
   return request(`/api/auto-queue/runs/${id}`, {
     method: "PATCH",
     body: JSON.stringify(body),

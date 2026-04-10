@@ -149,6 +149,23 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_assistant_response_for_dispatch(db: &db::Db, dispatch_id: &str, message: &str) {
+        crate::db::session_transcripts::persist_turn(
+            db,
+            crate::db::session_transcripts::PersistSessionTranscript {
+                turn_id: &format!("integration-test:{dispatch_id}"),
+                session_key: Some("integration-test-session"),
+                channel_id: Some("111"),
+                agent_id: Some("agent-1"),
+                provider: Some("codex"),
+                dispatch_id: Some(dispatch_id),
+                user_message: "Implement the task",
+                assistant_message: message,
+            },
+        )
+        .unwrap();
+    }
+
     fn seed_completed_work_dispatch_for_review(
         db: &db::Db,
         dispatch_id: &str,
@@ -833,7 +850,6 @@ mod tests {
 
         {
             let conn = db.lock().unwrap();
-            crate::server::routes::auto_queue::ensure_tables(&conn);
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
                  VALUES ('run-251-aq', 'test-repo', 'agent-1', 'active')",
@@ -1294,6 +1310,7 @@ mod tests {
         // Step 2: Complete via dispatch::complete_dispatch — the canonical path
         // used by PATCH /api/dispatches/:id and turn_bridge.
         // This handles: DB update → OnDispatchCompleted → drain transitions → fire_transition_hooks
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented card-s6");
         let result = dispatch::complete_dispatch(
             &db,
             &engine,
@@ -2107,6 +2124,7 @@ mod tests {
 
         // Create implementation dispatch and complete it to trigger review transition
         seed_dispatch(&db, "d-158d", "card-158d", "implementation", "pending");
+        seed_assistant_response_for_dispatch(&db, "d-158d", "implemented review target");
 
         let result = dispatch::complete_dispatch(
             &db,
@@ -2576,6 +2594,11 @@ mod tests {
 
         // Verify outbox entry transitioned to done
         assert_eq!(outbox_status(&db, "d-160-1"), vec!["done"]);
+        assert_eq!(
+            get_dispatch_status(&db, "d-160-1"),
+            "dispatched",
+            "successful notify must transition pending dispatch to dispatched"
+        );
 
         // Second batch should find nothing pending
         let processed2 = process_outbox_batch(&db, &mock).await;
@@ -2595,6 +2618,7 @@ mod tests {
         seed_agent(&db);
         seed_card(&db, "card-160r", "in_progress");
         seed_dispatch(&db, "d-160r", "card-160r", "implementation", "pending");
+        seed_assistant_response_for_dispatch(&db, "d-160r", "completed during downtime");
 
         // Step 1: Verify finalize_dispatch works on the happy path
         let result = dispatch::finalize_dispatch(
@@ -2602,7 +2626,7 @@ mod tests {
             &engine,
             "d-160r",
             "recovery_completed_during_downtime",
-            Some(&serde_json::json!({"summary": "completed during downtime"})),
+            Some(&serde_json::json!({"agent_response_present": true})),
         );
         assert!(
             result.is_ok(),
@@ -2622,7 +2646,7 @@ mod tests {
             let changed = fallback_conn
                 .execute(
                     "UPDATE task_dispatches SET status = 'completed', \
-                     result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true}', \
+                     result = '{\"completion_source\":\"turn_bridge_db_fallback\",\"needs_reconcile\":true,\"agent_response_present\":true}', \
                      updated_at = datetime('now') WHERE id = ?1 AND status IN ('pending', 'dispatched')",
                     ["d-160r2"],
                 )
@@ -2695,6 +2719,9 @@ mod tests {
         assert_eq!(outbox_status(&db, "d-160o-a"), vec!["done"]);
         assert_eq!(outbox_status(&db, "d-160o-b"), vec!["done"]);
         assert_eq!(outbox_status(&db, "d-160o-c"), vec!["done"]);
+        assert_eq!(get_dispatch_status(&db, "d-160o-a"), "dispatched");
+        assert_eq!(get_dispatch_status(&db, "d-160o-b"), "dispatched");
+        assert_eq!(get_dispatch_status(&db, "d-160o-c"), "dispatched");
     }
 
     /// Scenario 160-4: Duplicate outbox entries for the same dispatch.
@@ -2768,6 +2795,31 @@ mod tests {
                     dispatch_id: "d-160m-f".into(),
                 },
             ]
+        );
+    }
+
+    /// Scenario 160-6: Notify success must not rewrite terminal dispatch states.
+    ///
+    /// Verifies the `status = 'pending'` guard keeps completed dispatches
+    /// terminal while still draining the outbox entry successfully.
+    #[tokio::test]
+    async fn scenario_160_6_notify_success_keeps_completed_dispatch_terminal() {
+        let db = test_db();
+        seed_agent(&db);
+        seed_card(&db, "card-160c", "done");
+        seed_dispatch(&db, "d-160c", "card-160c", "implementation", "completed");
+        seed_outbox(&db, "d-160c", "notify");
+
+        let mock = MockNotifier::new();
+        let processed = process_outbox_batch(&db, &mock).await;
+
+        assert_eq!(processed, 1);
+        assert_eq!(mock.notify_count(), 1);
+        assert_eq!(outbox_status(&db, "d-160c"), vec!["done"]);
+        assert_eq!(
+            get_dispatch_status(&db, "d-160c"),
+            "completed",
+            "terminal dispatch status must not be rewritten by notify success"
         );
     }
 
@@ -3076,6 +3128,7 @@ mod tests {
 
         // Create and complete a rework dispatch — simulates the rework turn finishing
         seed_dispatch(&db, "rw-195b", "card-195b", "rework", "pending");
+        seed_assistant_response_for_dispatch(&db, "rw-195b", "reworked after review");
 
         let result = dispatch::complete_dispatch(
             &db,

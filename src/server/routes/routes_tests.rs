@@ -1650,7 +1650,9 @@ async fn dispatch_complete() {
                 .method("PATCH")
                 .uri(&format!("/dispatches/{dispatch_id}"))
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"status":"completed","result":{"ok":true}}"#))
+                .body(Body::from(
+                    r#"{"status":"completed","result":{"ok":true,"agent_response_present":true}}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -2496,7 +2498,8 @@ fn ensure_auto_queue_tables(db: &Db) {
             created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
             dispatched_at   DATETIME,
             completed_at    DATETIME,
-            thread_group    INTEGER DEFAULT 0
+            thread_group    INTEGER DEFAULT 0,
+            batch_phase     INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS auto_queue_slots (
             agent_id              TEXT NOT NULL,
@@ -2533,9 +2536,20 @@ fn seed_auto_queue_card(db: &Db, card_id: &str, issue_number: i64, status: &str,
 }
 
 #[test]
-fn auto_queue_ensure_tables_drops_legacy_max_concurrent_per_agent_column() {
-    let db = test_db();
-    let conn = db.lock().unwrap();
+fn auto_queue_schema_migration_drops_legacy_max_concurrent_per_agent_column() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE kanban_cards (id TEXT PRIMARY KEY);
+         CREATE TABLE task_dispatches (
+            id TEXT PRIMARY KEY,
+            kanban_card_id TEXT,
+            to_agent_id TEXT,
+            dispatch_type TEXT,
+            created_at DATETIME
+         );",
+    )
+    .unwrap();
     conn.execute_batch(
         "CREATE TABLE auto_queue_runs (
             id          TEXT PRIMARY KEY,
@@ -2568,7 +2582,7 @@ fn auto_queue_ensure_tables_drops_legacy_max_concurrent_per_agent_column() {
     )
     .unwrap();
 
-    crate::server::routes::auto_queue::ensure_tables(&conn);
+    crate::db::schema::ensure_auto_queue_schema(&conn).unwrap();
 
     let has_legacy_column: bool = conn
         .query_row(
@@ -2591,10 +2605,18 @@ fn auto_queue_ensure_tables_drops_legacy_max_concurrent_per_agent_column() {
             |row| row.get(0),
         )
         .unwrap();
+    let has_batch_phase: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('auto_queue_entries') WHERE name = 'batch_phase'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     assert!(!has_legacy_column);
     assert!(has_max_threads);
     assert!(has_thread_group_count);
+    assert!(has_batch_phase);
 }
 
 fn seed_live_auto_queue_run(db: &Db, run_id: &str, agent_id: &str, existing_card_id: &str) {
@@ -2920,21 +2942,33 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let review_dispatch_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_dispatches
+             WHERE kanban_card_id = 'card-orphan-330' AND dispatch_type = 'review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     assert_eq!(
-        card_status, "review",
-        "true orphan implementation dispatch must still promote the card into review"
-    );
-    assert_eq!(
-        dispatch_status, "completed",
-        "true orphan implementation dispatch must be marked completed"
+        dispatch_status, "failed",
+        "true orphan implementation dispatch must be failed when no agent work was observed"
     );
     assert!(
         dispatch_result
             .as_deref()
             .unwrap_or("")
-            .contains("orphan_recovery"),
-        "true orphan recovery must keep the orphan_recovery completion marker"
+            .contains("orphan_recovery_rollback"),
+        "true orphan recovery must keep the rollback marker"
+    );
+    assert_ne!(
+        card_status, "review",
+        "true orphan implementation dispatch must not auto-promote the card into review"
+    );
+    assert_eq!(
+        review_dispatch_count, 0,
+        "true orphan recovery must not create a follow-up review dispatch"
     );
     assert_eq!(decision_signal, "OrphanCandidate");
     assert_eq!(chosen_action, "Resume");
@@ -3025,8 +3059,8 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
         "post-complete race guard must keep a backlogged card from reviving into review"
     );
     assert_eq!(
-        dispatch_status, "completed",
-        "the orphan implementation dispatch may still complete, but must not resurrect the card"
+        dispatch_status, "failed",
+        "the orphan implementation dispatch must fail instead of completing without work evidence"
     );
     assert_eq!(
         review_dispatch_count, 0,
@@ -5154,9 +5188,9 @@ async fn auto_queue_enqueue_rejects_card_with_active_dispatch() {
     );
 }
 
-/// #162 DoD: unified_thread continuity — dispatches entry correctly within unified run.
+/// #430: legacy unified_thread runs still dispatch, but via slot pooling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_queue_activate_unified_thread_run_dispatches_to_same_run() {
+async fn auto_queue_activate_legacy_unified_thread_run_dispatches_via_slot_pool() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
     let engine = test_engine(&db);
@@ -5579,8 +5613,6 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        // #392: Session persistence — slot release preserves claude_session_id
-        // and tokens so the next dispatch can resume the conversation.
         assert_eq!(
             first_slot_session.0, "idle",
             "slot session status must be idle after release"
@@ -5589,9 +5621,13 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
             first_slot_session.1, None,
             "active_dispatch_id must be cleared on slot release"
         );
+        assert_eq!(
+            first_slot_session.2, 0,
+            "tokens must be cleared so the slot starts from a fresh session"
+        );
         assert!(
-            first_slot_session.3.is_some(),
-            "claude_session_id must be preserved for session reuse (#392)"
+            first_slot_session.3.is_none(),
+            "claude_session_id must be cleared on slot release"
         );
         assert_eq!(
             second_slot_session.0, "idle",
@@ -5600,6 +5636,14 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         assert_eq!(
             second_slot_session.1, None,
             "active_dispatch_id must be cleared on slot release"
+        );
+        assert_eq!(
+            second_slot_session.2, 0,
+            "tokens must be cleared so the slot starts from a fresh session"
+        );
+        assert!(
+            second_slot_session.3.is_none(),
+            "claude_session_id must be cleared on slot release"
         );
         let first_slot: Option<i64> = conn
             .query_row(
@@ -5722,7 +5766,6 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    // #392: Session persistence — slot release preserves session context for reuse
     assert_eq!(
         recycled_slot_session.0, "idle",
         "status must be idle after slot release"
@@ -5730,6 +5773,14 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
     assert_eq!(
         recycled_slot_session.1, None,
         "active_dispatch_id must be cleared"
+    );
+    assert_eq!(
+        recycled_slot_session.2, 0,
+        "recycled slot must clear prior token counts before the next dispatch"
+    );
+    assert!(
+        recycled_slot_session.3.is_none(),
+        "recycled slot must clear claude_session_id before the next dispatch"
     );
     assert_eq!(
         untouched_slot_session,
@@ -5744,7 +5795,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_queue_activate_keeps_same_group_slot_context_between_entries() {
+async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
     let engine = test_engine(&db);
@@ -5830,16 +5881,11 @@ async fn auto_queue_activate_keeps_same_group_slot_context_between_entries() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        // #392: Session persistence — slot release preserves session context
         assert_eq!(
-            cleared_session.0, "idle",
-            "status must be idle after slot release"
+            cleared_session,
+            ("idle".to_string(), None, 0, None),
+            "slot release must clear provider session continuity before dispatch"
         );
-        assert_eq!(
-            cleared_session.1, None,
-            "active_dispatch_id must be cleared"
-        );
-        // claude_session_id and tokens are preserved for session reuse (#392)
         conn.execute(
             "UPDATE sessions
              SET status = 'working',
@@ -5900,18 +5946,172 @@ async fn auto_queue_activate_keeps_same_group_slot_context_between_entries() {
         .unwrap();
     assert_eq!(
         continued_session,
-        (
-            "working".to_string(),
-            Some("dispatch-same-group-hot".to_string()),
-            77,
-            Some("claude-same-group-hot".to_string())
-        ),
-        "entries from the same group must keep reusing the slot context without an extra clear"
+        ("idle".to_string(), None, 0, None),
+        "same-group continuation must keep the slot assignment but start from a fresh session"
     );
     assert_eq!(
         slot_group,
         Some(0),
         "same-group continuation must keep the original slot assignment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_is_active() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-same-group-guard");
+    ensure_auto_queue_tables(&db);
+    seed_auto_queue_card(
+        &db,
+        "card-same-group-guard-0",
+        4160,
+        "ready",
+        "agent-same-group-guard",
+    );
+    seed_auto_queue_card(
+        &db,
+        "card-same-group-guard-1",
+        4161,
+        "ready",
+        "agent-same-group-guard",
+    );
+    seed_auto_queue_card(
+        &db,
+        "card-same-group-guard-2",
+        4162,
+        "ready",
+        "agent-same-group-guard",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
+             VALUES ('agent-same-group-guard', 0, ?1)",
+            [json!({"111": "222000000000000201"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
+             VALUES ('agent-same-group-guard', 1, ?1)",
+            [json!({"111": "222000000000000202"}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, unified_thread,
+                max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-same-group-guard', 'test-repo', 'agent-same-group-guard', 'active', 1, 2, 2
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group)
+             VALUES ('entry-same-group-guard-0', 'run-same-group-guard', 'card-same-group-guard-0', 'agent-same-group-guard', 'pending', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group)
+             VALUES ('entry-same-group-guard-1', 'run-same-group-guard', 'card-same-group-guard-1', 'agent-same-group-guard', 'pending', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group)
+             VALUES ('entry-same-group-guard-2', 'run-same-group-guard', 'card-same-group-guard-2', 'agent-same-group-guard', 'pending', 0, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-same-group-guard",
+                        "active_only": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(
+        first_json["count"], 2,
+        "first activate should dispatch one entry per group"
+    );
+
+    let second_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-same-group-guard",
+                        "active_only": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(
+        second_json["count"], 0,
+        "same-group follow-up must stay pending while the prior entry is still dispatched"
+    );
+
+    let conn = db.lock().unwrap();
+    let guard_entry_status: String = conn
+        .query_row(
+            "SELECT status FROM auto_queue_entries WHERE id = 'entry-same-group-guard-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        guard_entry_status, "pending",
+        "follow-up entry must not be marked dispatched before prior same-group work completes"
+    );
+
+    let guard_dispatch_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM task_dispatches
+             WHERE kanban_card_id = 'card-same-group-guard-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        guard_dispatch_count, 0,
+        "no dispatch row should be created for the blocked same-group follow-up"
     );
 }
 
@@ -6494,7 +6694,7 @@ async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() 
 }
 
 #[tokio::test]
-async fn auto_queue_generate_persists_unified_thread_flag() {
+async fn auto_queue_generate_accepts_but_ignores_unified_thread_flag() {
     let db = test_db();
     let engine = test_engine(&db);
     seed_agent(&db, "agent-generate-unified");
@@ -6532,7 +6732,7 @@ async fn auto_queue_generate_persists_unified_thread_flag() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["run"]["unified_thread"], serde_json::json!(true));
+    assert_eq!(json["run"]["unified_thread"], serde_json::json!(false));
 
     let run_id = json["run"]["id"]
         .as_str()
@@ -6546,9 +6746,92 @@ async fn auto_queue_generate_persists_unified_thread_flag() {
         )
         .unwrap();
     assert_eq!(
-        stored_unified_thread, 1,
-        "generate must persist unified_thread to the run"
+        stored_unified_thread, 0,
+        "generate must ignore unified_thread and keep slot pooling enabled"
     );
+}
+
+#[tokio::test]
+async fn auto_queue_generate_entries_payload_persists_batch_phases() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-generate-phase");
+    seed_repo(&db, "test-repo");
+    seed_auto_queue_card(
+        &db,
+        "card-generate-phase-1",
+        4231,
+        "ready",
+        "agent-generate-phase",
+    );
+    seed_auto_queue_card(
+        &db,
+        "card-generate-phase-2",
+        4232,
+        "ready",
+        "agent-generate-phase",
+    );
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "agent-generate-phase",
+                        "entries": [
+                            { "issue_number": 4232, "batch_phase": 2 },
+                            { "issue_number": 4231, "batch_phase": 1 }
+                        ],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entries = json["entries"].as_array().expect("entries must be array");
+
+    let phases_by_issue: std::collections::HashMap<i64, i64> = entries
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                entry["github_issue_number"].as_i64()?,
+                entry["batch_phase"].as_i64()?,
+            ))
+        })
+        .collect();
+
+    assert_eq!(phases_by_issue.get(&4231), Some(&1));
+    assert_eq!(phases_by_issue.get(&4232), Some(&2));
+
+    let conn = db.lock().unwrap();
+    let stored_phases: std::collections::HashMap<i64, i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT kc.github_issue_number, COALESCE(e.batch_phase, 0)
+                 FROM auto_queue_entries e
+                 JOIN kanban_cards kc ON kc.id = e.kanban_card_id
+                 ORDER BY kc.github_issue_number ASC",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect()
+    };
+    assert_eq!(stored_phases.get(&4231), Some(&1));
+    assert_eq!(stored_phases.get(&4232), Some(&2));
 }
 
 #[tokio::test]
@@ -6910,6 +7193,209 @@ async fn parallel_false_keeps_single_group_sequential() {
     }
     assert_eq!(run["thread_group_count"], 1);
     assert_eq!(run["max_concurrent_threads"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activate_waits_for_current_batch_phase_before_dispatching_next_phase() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_agent(&db, "agent-phase-a");
+    seed_agent(&db, "agent-phase-b");
+    seed_auto_queue_card(&db, "card-phase-1-a", 4241, "ready", "agent-phase-a");
+    seed_auto_queue_card(&db, "card-phase-1-b", 4242, "ready", "agent-phase-b");
+    seed_auto_queue_card(&db, "card-phase-2-a", 4243, "ready", "agent-phase-a");
+    seed_auto_queue_card(&db, "card-phase-2-b", 4244, "ready", "agent-phase-b");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-batch-phase', 'test-repo', 'active', 2, 2
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-phase-1-a', 'run-batch-phase', 'card-phase-1-a', 'agent-phase-a', 'pending', 0, 0, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-phase-1-b', 'run-batch-phase', 'card-phase-1-b', 'agent-phase-b', 'pending', 1, 1, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-phase-2-a', 'run-batch-phase', 'card-phase-2-a', 'agent-phase-a', 'pending', 2, 0, 2
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-phase-2-b', 'run-batch-phase', 'card-phase-2-b', 'agent-phase-b', 'pending', 3, 1, 2
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+
+    let first_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-batch-phase",
+                        "active_only": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_json["count"], 2);
+
+    {
+        let conn = db.lock().unwrap();
+        let dispatched_phases: std::collections::HashMap<String, i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, COALESCE(batch_phase, 0)
+                     FROM auto_queue_entries
+                     WHERE status = 'dispatched'
+                     ORDER BY id ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect()
+        };
+        assert_eq!(dispatched_phases.len(), 2);
+        assert_eq!(dispatched_phases.get("entry-phase-1-a"), Some(&1));
+        assert_eq!(dispatched_phases.get("entry-phase-1-b"), Some(&1));
+    }
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE auto_queue_entries
+             SET status = 'done', dispatch_id = NULL, completed_at = datetime('now')
+             WHERE id = 'entry-phase-1-a'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let second_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-batch-phase",
+                        "active_only": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_body = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(
+        second_json["count"], 0,
+        "phase 2 must stay blocked while phase 1 still has an in-flight entry"
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE auto_queue_entries
+             SET status = 'done', dispatch_id = NULL, completed_at = datetime('now')
+             WHERE id = 'entry-phase-1-b'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let third_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-batch-phase",
+                        "active_only": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third_response.status(), StatusCode::OK);
+    let third_body = axum::body::to_bytes(third_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let third_json: serde_json::Value = serde_json::from_slice(&third_body).unwrap();
+    assert_eq!(
+        third_json["count"], 2,
+        "next batch phase should become dispatchable once phase 1 is complete"
+    );
+
+    let conn = db.lock().unwrap();
+    let phase_two_dispatched: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM auto_queue_entries
+             WHERE status = 'dispatched' AND COALESCE(batch_phase, 0) = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase_two_dispatched, 2);
 }
 
 /// Regression test for #191: onTick1min recovery must reset stuck auto-queue
