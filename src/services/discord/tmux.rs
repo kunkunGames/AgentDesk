@@ -1343,6 +1343,31 @@ pub(super) async fn tmux_output_watcher(
                             })
                         })
                     });
+                let has_assistant_response = !full_response.trim().is_empty();
+                if has_assistant_response && let Some(db) = shared.db.as_ref() {
+                    let turn_id = format!("discord:{}:{}", channel_id.get(), state.user_msg_id);
+                    let channel_id_text = channel_id.get().to_string();
+                    if let Err(e) = crate::db::session_transcripts::persist_turn(
+                        db,
+                        crate::db::session_transcripts::PersistSessionTranscript {
+                            turn_id: &turn_id,
+                            session_key: state.session_key.as_deref(),
+                            channel_id: Some(channel_id_text.as_str()),
+                            agent_id: None,
+                            provider: Some(provider_kind.as_str()),
+                            dispatch_id: resolved_did.as_deref().or(state.dispatch_id.as_deref()),
+                            user_message: &state.user_text,
+                            assistant_message: &full_response,
+                        },
+                    ) {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        eprintln!("  [{ts}] ⚠ watcher: failed to persist session transcript: {e}");
+                    }
+                }
+
+                let work_completion_context = has_assistant_response
+                    .then(|| serde_json::json!({ "agent_response_present": true }));
+
                 let dispatch_ok = if let Some(did) = resolved_did {
                     let dispatch_type = shared.db.as_ref().and_then(|db| {
                         db.separate_conn().ok().and_then(|conn| {
@@ -1357,13 +1382,19 @@ pub(super) async fn tmux_output_watcher(
 
                     match dispatch_type.as_deref() {
                         Some("implementation") | Some("rework") => {
-                            if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
+                            if !has_assistant_response {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                eprintln!(
+                                    "  [{ts}] ⚠ watcher: refusing to complete work dispatch {did} without assistant response"
+                                );
+                                false
+                            } else if let (Some(db), Some(engine)) = (&shared.db, &shared.engine) {
                                 match crate::dispatch::finalize_dispatch(
                                     db,
                                     engine,
                                     &did,
                                     "watcher_completed",
-                                    None,
+                                    work_completion_context.as_ref(),
                                 ) {
                                     Ok(_) => {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1380,16 +1411,24 @@ pub(super) async fn tmux_output_watcher(
                                         eprintln!(
                                             "  [{ts}] ⚠ watcher: finalize_dispatch failed for {did}: {e}"
                                         );
-                                        super::turn_bridge::runtime_db_fallback_complete(
+                                        super::turn_bridge::runtime_db_fallback_complete_with_result(
                                             &did,
-                                            "watcher_db_fallback",
+                                            &serde_json::json!({
+                                                "completion_source": "watcher_db_fallback",
+                                                "needs_reconcile": true,
+                                                "agent_response_present": true,
+                                            }),
                                         )
                                     }
                                 }
                             } else {
-                                super::turn_bridge::runtime_db_fallback_complete(
+                                super::turn_bridge::runtime_db_fallback_complete_with_result(
                                     &did,
-                                    "watcher_db_fallback",
+                                    &serde_json::json!({
+                                        "completion_source": "watcher_db_fallback",
+                                        "needs_reconcile": true,
+                                        "agent_response_present": true,
+                                    }),
                                 )
                             }
                         }
@@ -1413,7 +1452,7 @@ pub(super) async fn tmux_output_watcher(
                 // #225 P1-2: Only mark relayed + clear inflight if Discord relay succeeded.
                 // If relay failed, preserve retry/handoff path for next startup.
                 if relay_ok {
-                    if !full_response.trim().is_empty() {
+                    if has_assistant_response {
                         let mut data = shared.core.lock().await;
                         if let Some(session) = data.sessions.get_mut(&channel_id) {
                             if !session.cleared {
@@ -1428,30 +1467,6 @@ pub(super) async fn tmux_output_watcher(
                             }
                         }
                         drop(data);
-
-                        if let Some(db) = shared.db.as_ref() {
-                            let turn_id =
-                                format!("discord:{}:{}", channel_id.get(), state.user_msg_id);
-                            let channel_id_text = channel_id.get().to_string();
-                            if let Err(e) = crate::db::session_transcripts::persist_turn(
-                                db,
-                                crate::db::session_transcripts::PersistSessionTranscript {
-                                    turn_id: &turn_id,
-                                    session_key: state.session_key.as_deref(),
-                                    channel_id: Some(channel_id_text.as_str()),
-                                    agent_id: None,
-                                    provider: Some(provider_kind.as_str()),
-                                    dispatch_id: state.dispatch_id.as_deref(),
-                                    user_message: &state.user_text,
-                                    assistant_message: &full_response,
-                                },
-                            ) {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!(
-                                    "  [{ts}] ⚠ watcher: failed to persist session transcript: {e}"
-                                );
-                            }
-                        }
                     }
                     turn_result_relayed = true;
                     if dispatch_ok {
