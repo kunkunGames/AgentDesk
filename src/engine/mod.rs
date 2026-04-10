@@ -26,6 +26,13 @@ struct PolicyEngineInner {
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
+#[derive(Default)]
+struct DeferredDrainResult {
+    had_deferred: bool,
+    replayed_transitions: Vec<(String, String, String)>,
+    preserved_transitions: Vec<(String, String, String)>,
+}
+
 impl Drop for PolicyEngineInner {
     fn drop(&mut self) {
         // Clear all persistent JS values before the runtime is dropped
@@ -159,7 +166,7 @@ impl PolicyEngine {
         };
         // Execute the requested hook
         Self::fire_hook_with_guard(&inner, hook, payload)?;
-        let had_deferred = Self::drain_deferred_with_guard(&self.db, &inner);
+        let deferred = Self::drain_deferred_with_guard(&self.db, &inner);
         // Must drop inner (engine lock) BEFORE draining intents — intent
         // execution needs a fresh lock acquisition via drain_pending_intents.
         drop(inner);
@@ -172,7 +179,7 @@ impl PolicyEngine {
             let result = self.drain_pending_intents();
             if !result.created_dispatches.is_empty() || result.errors > 0 {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                let source = if had_deferred {
+                let source = if deferred.had_deferred {
                     "deferred+direct"
                 } else {
                     "direct"
@@ -184,6 +191,10 @@ impl PolicyEngine {
                 );
             }
         }
+        for (card_id, old_s, new_s) in &deferred.replayed_transitions {
+            crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
+        }
+        self.restore_pending_transitions(&deferred.preserved_transitions);
         Ok(())
     }
 
@@ -309,7 +320,7 @@ impl PolicyEngine {
             }
         };
         Self::fire_dynamic_hook_with_guard(&inner, hook_name, payload)?;
-        let had_deferred = Self::drain_deferred_with_guard(&self.db, &inner);
+        let deferred = Self::drain_deferred_with_guard(&self.db, &inner);
         // Drop engine lock before draining intents — intent execution needs
         // a fresh lock acquisition via drain_pending_intents (#248).
         drop(inner);
@@ -320,7 +331,7 @@ impl PolicyEngine {
             let result = self.drain_pending_intents();
             if !result.created_dispatches.is_empty() || result.errors > 0 {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                let source = if had_deferred {
+                let source = if deferred.had_deferred {
                     "deferred+direct"
                 } else {
                     "direct"
@@ -332,6 +343,10 @@ impl PolicyEngine {
                 );
             }
         }
+        for (card_id, old_s, new_s) in &deferred.replayed_transitions {
+            crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
+        }
+        self.restore_pending_transitions(&deferred.preserved_transitions);
         Ok(())
     }
 
@@ -349,9 +364,13 @@ impl PolicyEngine {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("engine lock poisoned: {e}"))?;
             Self::fire_hook_with_guard(&inner, h, payload)?;
-            Self::drain_deferred_with_guard(&self.db, &inner);
+            let deferred = Self::drain_deferred_with_guard(&self.db, &inner);
             drop(inner);
             self.drain_pending_intents();
+            for (card_id, old_s, new_s) in &deferred.replayed_transitions {
+                crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
+            }
+            self.restore_pending_transitions(&deferred.preserved_transitions);
             return Ok(());
         }
         let inner = self
@@ -359,10 +378,14 @@ impl PolicyEngine {
             .lock()
             .map_err(|e| anyhow::anyhow!("engine lock poisoned: {e}"))?;
         Self::fire_dynamic_hook_with_guard(&inner, hook_name, payload)?;
-        Self::drain_deferred_with_guard(&self.db, &inner);
+        let deferred = Self::drain_deferred_with_guard(&self.db, &inner);
         drop(inner);
         // Drain any deferred intents — same pattern as try_fire_hook_by_name (#248).
         self.drain_pending_intents();
+        for (card_id, old_s, new_s) in &deferred.replayed_transitions {
+            crate::kanban::fire_transition_hooks(&self.db, self, card_id, old_s, new_s);
+        }
+        self.restore_pending_transitions(&deferred.preserved_transitions);
         Ok(())
     }
 
@@ -515,13 +538,93 @@ impl PolicyEngine {
         })
     }
 
+    fn take_pending_transitions_with_guard(
+        inner: &std::sync::MutexGuard<'_, PolicyEngineInner>,
+    ) -> Vec<(String, String, String)> {
+        inner.context.with(|ctx| {
+            let code = r#"
+                var arr = agentdesk.kanban.__pendingTransitions || [];
+                agentdesk.kanban.__pendingTransitions = [];
+                JSON.stringify(arr);
+            "#;
+            let result: rquickjs::Result<String> = ctx.eval(code);
+            match result {
+                Ok(ref json) => serde_json::from_str::<Vec<serde_json::Value>>(json)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|v| {
+                        Some((
+                            v.get("card_id")?.as_str()?.to_string(),
+                            v.get("from")?.as_str()?.to_string(),
+                            v.get("to")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect(),
+                Err(ref e) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    println!("  [{ts}] ⚠ take_pending_transitions_with_guard: JS eval error: {e}");
+                    Vec::new()
+                }
+            }
+        })
+    }
+
+    fn restore_pending_transitions_with_guard(
+        inner: &std::sync::MutexGuard<'_, PolicyEngineInner>,
+        transitions: &[(String, String, String)],
+    ) {
+        if transitions.is_empty() {
+            return;
+        }
+
+        let mut current = Self::take_pending_transitions_with_guard(inner);
+        let mut restored = transitions.to_vec();
+        restored.append(&mut current);
+        let payload = serde_json::to_string(
+            &restored
+                .iter()
+                .map(|(card_id, from, to)| {
+                    serde_json::json!({
+                        "card_id": card_id,
+                        "from": from,
+                        "to": to,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+
+        inner.context.with(|ctx| {
+            let code = format!("agentdesk.kanban.__pendingTransitions = {payload};");
+            let result: rquickjs::Result<()> = ctx.eval(code);
+            if let Err(e) = result {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ restore_pending_transitions_with_guard: JS eval error: {e}");
+            }
+        });
+    }
+
+    fn restore_pending_transitions(&self, transitions: &[(String, String, String)]) {
+        if transitions.is_empty() {
+            return;
+        }
+        let inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ⚠ restore_pending_transitions: engine lock poisoned: {e}");
+                return;
+            }
+        };
+        Self::restore_pending_transitions_with_guard(&inner, transitions);
+    }
+
     /// Drain deferred hooks from the DB while holding the engine guard.
-    /// Returns true if any deferred hooks were found and processed.
     fn drain_deferred_with_guard(
         db: &crate::db::Db,
         inner: &std::sync::MutexGuard<'_, PolicyEngineInner>,
-    ) -> bool {
-        let mut had_deferred = false;
+    ) -> DeferredDrainResult {
+        let mut result = DeferredDrainResult::default();
         loop {
             let rows: Vec<(i64, String, String)> = {
                 let conn = match db.separate_conn() {
@@ -543,7 +646,10 @@ impl PolicyEngine {
             if rows.is_empty() {
                 break;
             }
-            had_deferred = true;
+            result.had_deferred = true;
+            if result.preserved_transitions.is_empty() {
+                result.preserved_transitions = Self::take_pending_transitions_with_guard(inner);
+            }
             for (id, hook_name, payload_str) in &rows {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] 🔄 fire_hook(deferred {hook_name}, id={id})");
@@ -560,9 +666,12 @@ impl PolicyEngine {
                 if let Ok(conn) = db.separate_conn() {
                     let _ = conn.execute("DELETE FROM deferred_hooks WHERE id = ?1", [id]);
                 }
+                result
+                    .replayed_transitions
+                    .extend(Self::take_pending_transitions_with_guard(inner));
             }
         }
-        had_deferred
+        result
     }
 
     /// Drain pending card transitions accumulated by `agentdesk.kanban.setStatus()`
@@ -577,44 +686,16 @@ impl PolicyEngine {
                 return Vec::new();
             }
         };
-        inner.context.with(|ctx| {
-            let code = r#"
-                var arr = agentdesk.kanban.__pendingTransitions || [];
-                agentdesk.kanban.__pendingTransitions = [];
-                JSON.stringify(arr);
-            "#;
-            let result: rquickjs::Result<String> = ctx.eval(code);
-            match result {
-                Ok(ref json) => {
-                    let transitions: Vec<(String, String, String)> =
-                        serde_json::from_str::<Vec<serde_json::Value>>(json)
-                            .unwrap_or_default()
-                            .iter()
-                            .filter_map(|v| {
-                                Some((
-                                    v.get("card_id")?.as_str()?.to_string(),
-                                    v.get("from")?.as_str()?.to_string(),
-                                    v.get("to")?.as_str()?.to_string(),
-                                ))
-                            })
-                            .collect();
-                    if !transitions.is_empty() {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] 🔄 drain_pending_transitions: {} transition(s): {:?}",
-                            transitions.len(),
-                            transitions
-                        );
-                    }
-                    transitions
-                }
-                Err(ref e) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ drain_pending_transitions: JS eval error: {e}");
-                    Vec::new()
-                }
-            }
-        })
+        let transitions = Self::take_pending_transitions_with_guard(&inner);
+        if !transitions.is_empty() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🔄 drain_pending_transitions: {} transition(s): {:?}",
+                transitions.len(),
+                transitions
+            );
+        }
+        transitions
     }
 
     /// Drain pending intents accumulated by bridge functions during hook execution.
@@ -1278,5 +1359,76 @@ mod tests {
         let context_json: serde_json::Value = serde_json::from_str(&context).unwrap();
         assert_eq!(context_json["force_new_session"], true);
         assert_eq!(context_json["reset_reason"], "repeated_findings");
+    }
+
+    #[test]
+    fn deferred_review_enter_replays_terminal_transition_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("deferred-review-terminal.js"),
+            r#"
+            var policy = {
+                name: "deferred-review-terminal",
+                priority: 1,
+                onReviewEnter: function(payload) {
+                    agentdesk.kanban.setStatus(payload.card_id, "done", true);
+                },
+                onCardTerminal: function(payload) {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('terminal_fired', ?)",
+                        [payload.card_id]
+                    );
+                }
+            };
+            agentdesk.registerPolicy(policy);
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, priority) \
+                 VALUES ('card-deferred-review', 'Deferred review', 'review', 'medium')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let config = test_config_with_dir(dir.path());
+        let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+
+        let busy_guard = engine.inner.lock().unwrap();
+        engine
+            .try_fire_hook(
+                Hook::OnReviewEnter,
+                serde_json::json!({"card_id": "card-deferred-review"}),
+            )
+            .unwrap();
+        drop(busy_guard);
+
+        engine
+            .try_fire_hook(Hook::OnTick, serde_json::json!({}))
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-deferred-review'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("deferred review hook should still move the card to done");
+        assert_eq!(status, "done");
+
+        let terminal_marker: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'terminal_fired'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("terminal follow-up hook must fire for deferred review transitions");
+        assert_eq!(terminal_marker, "card-deferred-review");
     }
 }
