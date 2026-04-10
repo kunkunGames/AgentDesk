@@ -1,4 +1,5 @@
 pub mod agent_protocol;
+pub mod auto_queue;
 pub mod claude;
 pub mod codex;
 #[cfg(unix)]
@@ -6,6 +7,7 @@ pub mod codex_tmux_wrapper;
 pub mod discord;
 pub mod dispatches;
 pub mod gemini;
+pub mod kanban;
 pub mod memory;
 pub mod platform;
 pub mod process;
