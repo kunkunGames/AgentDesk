@@ -1540,6 +1540,20 @@ async fn catch_up_missed_messages(
     }
 }
 
+fn spawn_startup_thread_map_validation(db: crate::db::Db, token: String) {
+    tokio::spawn(async move {
+        let (checked, cleared) =
+            crate::server::routes::dispatches::validate_channel_thread_maps_on_startup(&db, &token)
+                .await;
+        if checked > 0 || cleared > 0 {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] 🧹 THREAD-MAP: validated {checked} mapping(s), cleared {cleared} stale binding(s)"
+            );
+        }
+    });
+}
+
 /// Execute durable handoff turns saved before a restart.
 /// Runs after tmux watcher restore and pending queue restore, but before
 /// restart report flush. Skips channels that already have pending queue messages
@@ -2581,19 +2595,21 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                         println!("  [{ts}] ✓ Utility bot reconcile — skipped recovery");
                     } else {
 
-                    gc_stale_fixed_working_sessions(&shared_for_tmux2).await;
-
-                    // #429: catch-up FIRST to minimize message loss window.
+                    // #429: Recover restart-gap messages first so new user input gets queued
+                    // within seconds of bot ready instead of waiting behind slower
+                    // Discord API-heavy inflight/thread-map recovery passes.
                     catch_up_missed_messages(
                         &http_for_tmux,
                         &shared_for_tmux2,
                         &provider_for_restore,
                     ).await;
 
+                    gc_stale_fixed_working_sessions(&shared_for_tmux2).await;
                     restore_inflight_turns(&http_for_tmux, &shared_for_tmux2, &provider_for_restore).await;
 
                     // Restore pending intervention queues saved during previous SIGTERM
-                    let (restored_queues, restored_overrides) = load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
+                    let (restored_queues, restored_overrides) =
+                        load_pending_queues(&provider_for_restore, &shared_for_tmux2.token_hash);
                     let allowed_bot_ids_for_restore: Vec<u64> = {
                         let settings = shared_for_tmux2.settings.read().await;
                         settings.allowed_bot_ids.clone()
@@ -2758,6 +2774,15 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
                         &provider_for_restore,
                     )
                     .await;
+
+                    // Thread-map validation is best-effort hygiene and can spend
+                    // multiple REST round-trips on startup. Do not block intake
+                    // reopening or queued-turn kickoff on it.
+                    if let Some(db) = shared_for_tmux2.db.clone() {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] 🧹 THREAD-MAP: continuing validation in background");
+                        spawn_startup_thread_map_validation(db, token_for_kickoff.clone());
+                    }
 
                     // NOW flush restart reports (recovery is done, safe to delete them)
                     flush_restart_reports(
@@ -4919,5 +4944,51 @@ mod tests {
         );
 
         unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    #[test]
+    fn startup_recovery_source_prioritizes_catch_up_and_backgrounds_thread_map_validation() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("// Restore inflight turns FIRST, then flush restart reports.")
+            .expect("startup recovery block comment missing");
+        let end = source[start..]
+            .find("// Background: periodic cleanup for stale Discord upload files")
+            .map(|offset| start + offset)
+            .expect("startup recovery block terminator missing");
+        let startup_block = &source[start..end];
+
+        let catch_up = startup_block
+            .find("catch_up_missed_messages(")
+            .expect("catch-up call missing");
+        let gc = startup_block
+            .find("gc_stale_fixed_working_sessions(&shared_for_tmux2).await;")
+            .expect("gc call missing");
+        let restore = startup_block
+            .find("restore_inflight_turns(")
+            .expect("restore_inflight_turns call missing");
+        let intake_open = startup_block
+            .find("✓ Reconcile complete — intake open")
+            .expect("reconcile completion log missing");
+        let background_validation = startup_block
+            .find("spawn_startup_thread_map_validation(db, token_for_kickoff.clone());")
+            .expect("background thread-map validation spawn missing");
+
+        assert!(
+            catch_up < gc,
+            "catch-up must run before stale fixed-working-session cleanup"
+        );
+        assert!(
+            catch_up < restore,
+            "catch-up must run before inflight restore so restart-gap messages queue immediately"
+        );
+        assert!(
+            background_validation > intake_open,
+            "thread-map validation must not block reconcile completion or kickoff"
+        );
+        assert!(
+            !startup_block.contains("validate_channel_thread_maps_on_startup("),
+            "startup critical path must not await thread-map validation directly"
+        );
     }
 }
