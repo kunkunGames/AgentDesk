@@ -623,6 +623,35 @@ async fn mailbox_enqueue_intervention(
         .await
 }
 
+async fn enqueue_internal_followup(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    reply_message_id: MessageId,
+    text: impl Into<String>,
+    reason: &'static str,
+) -> bool {
+    let enqueued = mailbox_enqueue_intervention(
+        shared,
+        provider,
+        channel_id,
+        Intervention {
+            author_id: UserId::new(1),
+            message_id: reply_message_id,
+            text: text.into(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+        },
+    )
+    .await;
+
+    if enqueued {
+        schedule_deferred_idle_queue_kickoff(shared.clone(), provider.clone(), channel_id, reason);
+    }
+
+    enqueued
+}
+
 async fn mailbox_has_pending_soft_queue(
     shared: &SharedData,
     provider: &ProviderKind,
@@ -2097,6 +2126,24 @@ fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
+fn discord_gateway_intents() -> serenity::GatewayIntents {
+    serenity::GatewayIntents::GUILDS
+        | serenity::GatewayIntents::GUILD_MESSAGES
+        | serenity::GatewayIntents::GUILD_MESSAGE_REACTIONS
+        | serenity::GatewayIntents::DIRECT_MESSAGES
+        | serenity::GatewayIntents::DIRECT_MESSAGE_REACTIONS
+        | serenity::GatewayIntents::MESSAGE_CONTENT
+}
+
+fn should_skip_agent_runtime_launch(token: &str) -> Option<String> {
+    let bot = agentdesk_config::find_discord_bot_by_token(token)?;
+    let agent_bot_names = agentdesk_config::collect_agent_bot_names();
+    if !agent_bot_names.is_empty() && !agent_bot_names.contains(&bot.name) {
+        return Some(bot.name);
+    }
+    None
+}
+
 /// Entry point: start the Discord bot
 pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext) {
     let RunBotContext {
@@ -2108,6 +2155,17 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
         db,
         engine,
     } = context;
+
+    if let Some(bot_name) = should_skip_agent_runtime_launch(token) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] ⏭ BOT-LAUNCH: skipping utility bot '{}' in run_bot() — not mapped to any agent channel",
+            bot_name
+        );
+        shutdown_remaining.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
 
@@ -2611,10 +2669,7 @@ pub async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext
         })
         .build();
 
-    let intents = serenity::GatewayIntents::GUILDS
-        | serenity::GatewayIntents::GUILD_MESSAGES
-        | serenity::GatewayIntents::DIRECT_MESSAGES
-        | serenity::GatewayIntents::MESSAGE_CONTENT;
+    let intents = discord_gateway_intents();
 
     let mut client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
@@ -3987,10 +4042,10 @@ mod tests {
     use super::{
         DiscordBotSettings, Intervention, InterventionMode, PendingQueueItem,
         allows_nonlocal_session_path, channel_has_pending_soft_queue_at,
-        choose_restore_channel_name, is_synthetic_thread_channel_name, load_pending_queues,
-        requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
-        select_restored_session_path, session_path_is_usable, synthetic_thread_channel_name,
-        take_next_soft_intervention_persisted, user_is_authorized,
+        choose_restore_channel_name, discord_gateway_intents, is_synthetic_thread_channel_name,
+        load_pending_queues, requeue_intervention_front_persisted, save_channel_queue,
+        save_pending_queues, select_restored_session_path, session_path_is_usable,
+        synthetic_thread_channel_name, take_next_soft_intervention_persisted, user_is_authorized,
         watcher_should_kickoff_idle_queue,
     };
     use crate::services::discord::runtime_store::test_env_lock;
@@ -3999,9 +4054,18 @@ mod tests {
     };
     use crate::services::provider::CancelToken;
     use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::GatewayIntents;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn discord_gateway_intents_include_reaction_events() {
+        let intents = discord_gateway_intents();
+
+        assert!(intents.contains(GatewayIntents::GUILD_MESSAGE_REACTIONS));
+        assert!(intents.contains(GatewayIntents::DIRECT_MESSAGE_REACTIONS));
+    }
 
     #[test]
     fn synthetic_thread_channel_name_round_trips() {

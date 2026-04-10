@@ -1274,7 +1274,12 @@ pub(super) async fn restore_inflight_turns(
             rx,
             TurnBridgeContext {
                 provider: provider.clone(),
-                gateway: Arc::new(DiscordGateway::new(http.clone(), shared.clone(), None)),
+                gateway: Arc::new(DiscordGateway::new(
+                    http.clone(),
+                    shared.clone(),
+                    provider.clone(),
+                    None,
+                )),
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),

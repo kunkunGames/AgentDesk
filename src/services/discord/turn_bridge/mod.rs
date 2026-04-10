@@ -750,7 +750,7 @@ pub(super) fn spawn_turn_bridge(
             let retry_text = user_text_owned.clone();
             tokio::spawn(async move {
                 gateway_c
-                    .schedule_retry_with_history(channel_id, &retry_text)
+                    .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                     .await;
             });
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
@@ -819,7 +819,7 @@ pub(super) fn spawn_turn_bridge(
                     let retry_text = user_text_owned.clone();
                     tokio::spawn(async move {
                         gateway_c
-                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                             .await;
                     });
                     let _ = gateway
@@ -905,7 +905,7 @@ pub(super) fn spawn_turn_bridge(
                 let retry_text = user_text_owned.clone();
                 tokio::spawn(async move {
                     gateway_c
-                        .schedule_retry_with_history(channel_id, &retry_text)
+                        .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                         .await;
                 });
                 full_response = String::new(); // Suppress error message to user
@@ -959,7 +959,7 @@ pub(super) fn spawn_turn_bridge(
                     let retry_text = user_text_owned.clone();
                     tokio::spawn(async move {
                         gateway_c
-                            .schedule_retry_with_history(channel_id, &retry_text)
+                            .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                             .await;
                     });
                     full_response = String::new();
@@ -995,7 +995,7 @@ pub(super) fn spawn_turn_bridge(
                         let retry_text = user_text_owned.clone();
                         tokio::spawn(async move {
                             gateway_c
-                                .schedule_retry_with_history(channel_id, &retry_text)
+                                .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
                                 .await;
                         });
                         full_response = String::new();
@@ -1031,7 +1031,11 @@ pub(super) fn spawn_turn_bridge(
                             let retry_text = user_text_owned.clone();
                             tokio::spawn(async move {
                                 gateway_c
-                                    .schedule_retry_with_history(channel_id, &retry_text)
+                                    .schedule_retry_with_history(
+                                        channel_id,
+                                        user_msg_id,
+                                        &retry_text,
+                                    )
                                     .await;
                             });
                             full_response = String::new();
@@ -1094,23 +1098,22 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if let Some(warning) = review_dispatch_warning.as_deref() {
-                // Send via announce bot so the agent sees this as an external
-                // message and re-triggers a turn to handle the pending review.
-                // Using the provider bot (claude/codex) would be ignored as
-                // the agent treats its own bot's messages as self-messages.
-                let _ = reqwest::Client::new()
-                    .post(crate::config::local_api_url(
-                        shared_owned.api_port,
-                        "/api/send",
-                    ))
-                    .json(&serde_json::json!({
-                        "target": format!("channel:{}", channel_id),
-                        "content": warning,
-                        "source": "pipeline",
-                        "bot": "announce",
-                    }))
-                    .send()
-                    .await;
+                let enqueued = super::enqueue_internal_followup(
+                    &shared_owned,
+                    &provider,
+                    channel_id,
+                    user_msg_id,
+                    warning.to_string(),
+                    "review dispatch warning",
+                )
+                .await;
+                if !enqueued {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    eprintln!(
+                        "  [{ts}] ⏭ review dispatch warning deduped for channel {}",
+                        channel_id
+                    );
+                }
             }
         }
 

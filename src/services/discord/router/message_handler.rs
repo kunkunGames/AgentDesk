@@ -1347,10 +1347,11 @@ pub(in crate::services::discord) async fn handle_text_message(
         cancel_token.clone(),
         rx,
         TurnBridgeContext {
-            provider,
+            provider: provider.clone(),
             gateway: Arc::new(DiscordGateway::new(
                 ctx.http.clone(),
                 shared.clone(),
+                provider.clone(),
                 Some(LiveDiscordTurnContext {
                     ctx: ctx.clone(),
                     token: token.to_string(),
