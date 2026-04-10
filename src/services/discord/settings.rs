@@ -753,25 +753,19 @@ pub(super) fn channel_supports_provider(
         return provider.is_supported();
     }
 
-    if let Some(bound_provider) = role_binding.and_then(|binding| binding.provider.as_ref()) {
-        return bound_provider == provider;
-    }
-
-    // Check global suffix_map from bot_settings.json
-    if let Some(ch) = channel_name {
-        if let Some(mapped) = lookup_suffix_provider(ch) {
-            return mapped == *provider;
-        }
-    }
+    let explicit_provider = role_binding
+        .and_then(|binding| binding.provider.as_ref())
+        .cloned()
+        .or_else(|| channel_name.and_then(lookup_suffix_provider));
 
     // When org.yaml is present, require an explicit channel binding or suffix match.
     // This avoids the legacy "Claude catches all generic channels" behavior leaking
     // into deployments that already opted into explicit org routing.
-    if org_schema::org_schema_exists() {
+    if org_schema::org_schema_exists() && explicit_provider.is_none() {
         return false;
     }
 
-    provider.is_channel_supported(channel_name, is_dm)
+    provider.is_channel_supported(channel_name, is_dm, explicit_provider.as_ref())
 }
 
 pub(super) fn bot_settings_allow_channel(

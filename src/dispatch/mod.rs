@@ -1467,15 +1467,13 @@ pub fn drain_unified_thread_kill_signals() -> Vec<String> {
 
 /// Determine provider from a Discord channel name suffix.
 fn provider_from_channel_suffix(channel: &str) -> Option<&'static str> {
-    if channel.ends_with("-cc") {
-        Some("claude")
-    } else if channel.ends_with("-cdx") {
-        Some("codex")
-    } else if channel.ends_with("-gm") {
-        Some("gemini")
-    } else {
-        None
-    }
+    ProviderKind::from_channel_suffix(channel).and_then(|provider| match provider {
+        ProviderKind::Claude => Some("claude"),
+        ProviderKind::Codex => Some("codex"),
+        ProviderKind::Gemini => Some("gemini"),
+        ProviderKind::Qwen => Some("qwen"),
+        ProviderKind::Unsupported(_) => None,
+    })
 }
 
 #[cfg(test)]
@@ -1900,6 +1898,7 @@ mod tests {
         assert_eq!(provider_from_channel_suffix("agent-cc"), Some("claude"));
         assert_eq!(provider_from_channel_suffix("agent-cdx"), Some("codex"));
         assert_eq!(provider_from_channel_suffix("agent-gm"), Some("gemini"));
+        assert_eq!(provider_from_channel_suffix("agent-qw"), Some("qwen"));
         assert_eq!(provider_from_channel_suffix("agent"), None);
     }
 

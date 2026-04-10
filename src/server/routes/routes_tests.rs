@@ -5409,6 +5409,87 @@ async fn auto_queue_activate_consult_required_creates_consultation_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_activate_consult_required_prefers_registry_counterpart_provider() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-qwen");
+    seed_agent(&db, "agent-codex");
+    ensure_auto_queue_tables(&db);
+    seed_auto_queue_card(&db, "card-consult-qwen", 1721, "ready", "agent-qwen");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET provider = 'qwen' WHERE id = 'agent-qwen'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agents SET provider = 'codex' WHERE id = 'agent-codex'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET metadata = ?1 WHERE id = 'card-consult-qwen'",
+            [serde_json::json!({
+                "preflight_status": "consult_required",
+                "preflight_summary": "need external consultation"
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
+             VALUES ('run-consult-qwen', 'test-repo', 'agent-qwen', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank) \
+             VALUES ('entry-consult-qwen', 'run-consult-qwen', 'card-consult-qwen', 'agent-qwen', 'pending', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-consult-qwen",
+                        "active_only": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let conn = db.lock().unwrap();
+    let to_agent_id: String = conn
+        .query_row(
+            "SELECT to_agent_id
+             FROM task_dispatches
+             WHERE kanban_card_id = 'card-consult-qwen'
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(to_agent_id, "agent-codex");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_queue_activate_already_applied_skips_entry_and_completes_run() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
