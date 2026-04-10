@@ -201,6 +201,67 @@ async fn health_api_http_reports_observability_metrics_and_degraded_outbox_backl
 }
 
 #[tokio::test]
+async fn health_api_includes_latest_config_audit_report() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let harness = crate::services::discord::health::TestHealthHarness::new().await;
+    let app = axum::Router::new().nest(
+        "/api",
+        test_api_router(db.clone(), engine, Some(harness.registry())),
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        let report = crate::services::discord::config_audit::ConfigAuditReport {
+            generated_at: "2026-04-11T01:23:45Z".to_string(),
+            status: "warn".to_string(),
+            dry_run: false,
+            warnings_count: 1,
+            warnings: vec!["DB agent 'alpha' differs from agentdesk.yaml on provider".to_string()],
+            actions: vec![
+                "synced 1 agent definitions from agentdesk.yaml into the agents table".to_string(),
+            ],
+            sources: crate::services::discord::config_audit::ConfigAuditSources {
+                yaml_path: "/tmp/agentdesk.yaml".to_string(),
+                yaml_present: true,
+                role_map_path: Some("/tmp/role_map.json".to_string()),
+                role_map_present: true,
+                bot_settings_path: Some("/tmp/bot_settings.json".to_string()),
+                bot_settings_present: false,
+            },
+            db: crate::services::discord::config_audit::ConfigAuditDbSummary {
+                missing_agents: Vec::new(),
+                extra_agents: Vec::new(),
+                mismatched_agents: vec!["alpha".to_string()],
+                synced_agents: Some(1),
+            },
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('config_audit_report', ?1)",
+            [serde_json::to_string(&report).unwrap()],
+        )
+        .unwrap();
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let json: serde_json::Value = reqwest::get(format!("http://{addr}/api/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(json["config_audit"]["status"], "warn");
+    assert_eq!(json["config_audit"]["warnings_count"], 1);
+    assert_eq!(json["config_audit"]["db"]["mismatched_agents"][0], "alpha");
+}
+
+#[tokio::test]
 async fn offices_reorder_accepts_bare_array_and_updates_listing_order() {
     let db = test_db();
     let engine = test_engine(&db);
