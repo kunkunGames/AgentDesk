@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RoundTableMeeting, RoundTableMeetingChannelOption, RoundTableMeetingExpertOption } from "../types";
 import {
+  filterMeetingExpertsByQuery,
   getMeetingReferenceHashes,
   openMeetingDetailWithFallback,
   pruneFixedParticipantRoleIdsForLoadedChannel,
@@ -81,6 +82,30 @@ describe("pruneFixedParticipantRoleIdsForLoadedChannel", () => {
     const next = pruneFixedParticipantRoleIdsForLoadedChannel(previous, false, channel(["td", "pd"]));
 
     expect(next).toEqual(["td", "pd"]);
+  });
+});
+
+describe("filterMeetingExpertsByQuery", () => {
+  it("returns every expert when the query is blank", () => {
+    const experts = [expert("td"), expert("pd")];
+
+    expect(filterMeetingExpertsByQuery(experts, "   ")).toEqual(experts);
+  });
+
+  it("matches expert metadata case-insensitively across role id and specialist fields", () => {
+    const matched = expert("gemini-domain");
+    matched.domain_summary = "Meeting orchestration and provider review";
+    matched.provider_hint = "gemini";
+    matched.strengths = ["Architecture"];
+    matched.task_types = ["Spec Review"];
+    matched.anti_signals = ["One-line status"];
+
+    const unmatched = expert("codex-ui");
+    unmatched.domain_summary = "Frontend polish";
+
+    expect(filterMeetingExpertsByQuery([matched, unmatched], "gemini").map((item) => item.role_id)).toEqual(["gemini-domain"]);
+    expect(filterMeetingExpertsByQuery([matched, unmatched], "architecture").map((item) => item.role_id)).toEqual(["gemini-domain"]);
+    expect(filterMeetingExpertsByQuery([matched, unmatched], "spec review").map((item) => item.role_id)).toEqual(["gemini-domain"]);
   });
 });
 

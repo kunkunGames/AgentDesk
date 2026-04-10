@@ -6,13 +6,15 @@ This document records the runtime contract for dashboard-started round table mee
 
 - Clicking `회의 시작` must show an immediate request-accepted toast by reusing the existing dashboard notification layer.
 - The same notification lifecycle must be upgraded to success or failure after the start API returns so users do not see duplicated success and failure toasts for one click.
+- The `안건` field in the start form must remain a multiline `textarea` with a default `3`-row height so longer meeting prompts are visible before submit.
+- The `고정 전문 에이전트` control must keep a searchable multi-select flow instead of collapsing back to an unfiltered full list.
 - `상세 보기` must request the clicked `meeting.id` explicitly. If the detail fetch fails, the dashboard should fall back to the cached meeting snapshot and emit a console-visible error instead of silently doing nothing.
 - Persisted `meeting_hash` / `thread_hash` values must stay visible on the meeting list and detail modal as stable `#meeting-*` / `#thread-*` references.
 
 ## Terminology Mapping
 
-- `진행 모델` in dashboard UI maps to the operator `primary_provider`.
-- `리뷰 모델` in dashboard UI maps to the operator `reviewer_provider`.
+- `진행 프로바이더` in dashboard UI maps to the operator `primary_provider`.
+- `리뷰 프로바이더` in dashboard UI maps to the operator `reviewer_provider`.
 - `고정 전문 에이전트` means pinned specialists selected from the meeting candidate pool for that channel.
 - `회의 #해시` and `스레드 #해시` are the user-facing labels for the persisted `meeting_hash` and `thread_hash` fields.
 
