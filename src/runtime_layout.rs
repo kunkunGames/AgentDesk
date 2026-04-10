@@ -1063,6 +1063,23 @@ fn merge_role_map_into_agentdesk_yaml(root: &Path) -> Result<(), String> {
         crate::config::save_to_path(&yaml_path, &config)
             .map_err(|e| format!("Failed to write config '{}': {e}", yaml_path.display()))?;
     }
+
+    // Migration complete — retire the legacy file so it is never re-merged.
+    let migrated = role_map.with_extension("json.migrated");
+    if let Err(e) = fs::rename(&role_map, &migrated) {
+        tracing::warn!(
+            "Failed to rename '{}' → '{}': {e}",
+            role_map.display(),
+            migrated.display()
+        );
+    } else {
+        tracing::info!(
+            "[role-map] Migrated '{}' → '{}' (one-time merge into agentdesk.yaml)",
+            role_map.display(),
+            migrated.display()
+        );
+    }
+
     Ok(())
 }
 
