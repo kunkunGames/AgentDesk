@@ -1,4 +1,5 @@
 pub mod routes;
+mod worker_registry;
 pub mod ws;
 
 use std::sync::Arc;
@@ -35,84 +36,10 @@ pub async fn run(
     engine: PolicyEngine,
     health_registry: Option<Arc<HealthRegistry>>,
 ) -> Result<()> {
-    refresh_memory_health_for_startup().await;
-
-    // Startup: drain any deferred hooks persisted before last shutdown (#125)
-    engine.drain_startup_hooks();
-
-    // #251 (boot-only): reconcile broken DB/runtime state before workers begin
-    // draining outbox rows or ticks resume.
-    crate::reconcile::reconcile_boot_runtime(&db, &engine)?;
-
-    // Spawn periodic GitHub sync task
-    let sync_interval = config.github.sync_interval_minutes;
-    if sync_interval > 0 {
-        let sync_db = db.clone();
-        let sync_engine = engine.clone();
-        tokio::spawn(async move {
-            github_sync_loop(sync_db, sync_engine, sync_interval).await;
-        });
-    }
-
-    // Spawn periodic policy tick on a DEDICATED OS thread to avoid
-    // engine lock deadlock with request handler threads.
-    // The std::thread runs its own blocking loop, never competing with
-    // tokio workers for the engine Mutex.
-    {
-        let tick_engine = engine.clone();
-        let tick_db = db.clone();
-        std::thread::Builder::new()
-            .name("policy-tick".to_string())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap_or_else(|e| {
-                        eprintln!("Fatal: failed to create policy-tick runtime: {e}");
-                        std::process::exit(1);
-                    });
-                rt.block_on(policy_tick_loop(tick_engine, tick_db));
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to spawn policy-tick thread: {e}"))?;
-    }
-
-    // Spawn periodic rate-limit cache sync (every 120s)
-    {
-        let rl_db = db.clone();
-        tokio::spawn(async move {
-            rate_limit_sync_loop(rl_db).await;
-        });
-    }
-
-    // Spawn async message outbox worker (#120) — drains queued messages
-    {
-        let outbox_db = db.clone();
-        let outbox_port = config.server.port;
-        tokio::spawn(async move {
-            message_outbox_loop(outbox_db, outbox_port).await;
-        });
-    }
-
-    // #144: Spawn dispatch notification outbox worker — centralizes Discord side-effects
-    {
-        let dispatch_outbox_db = db.clone();
-        tokio::spawn(async move {
-            routes::dispatches::dispatch_outbox_loop(dispatch_outbox_db).await;
-        });
-    }
-
-    // #189: Spawn DM reply notification retry loop (5-min interval)
-    {
-        let dm_retry_db = db.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-            interval.tick().await; // skip immediate first tick
-            loop {
-                interval.tick().await;
-                crate::services::discord::retry_failed_dm_notifications(&dm_retry_db).await;
-            }
-        });
-    }
+    let mut worker_registry =
+        worker_registry::SupervisedWorkerRegistry::new(config.clone(), db.clone(), engine.clone());
+    worker_registry.run_boot_only_steps().await?;
+    worker_registry.start_after_boot_reconcile()?;
 
     // Resolve dashboard dist path relative to runtime root or binary location
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
@@ -150,7 +77,7 @@ pub async fn run(
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);
 
     let broadcast_tx = ws::new_broadcast();
-    let batch_buffer = ws::spawn_batch_flusher(broadcast_tx.clone());
+    let batch_buffer = worker_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
 
     // Seed config defaults + store server port in kv_meta so policy JS can read them
     if let Ok(conn) = db.lock() {
@@ -879,5 +806,14 @@ async fn message_outbox_loop(db: Db, port: u16) {
                 }
             }
         }
+    }
+}
+
+async fn dm_reply_retry_loop(db: Db) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.tick().await; // skip immediate first tick
+    loop {
+        interval.tick().await;
+        crate::services::discord::retry_failed_dm_notifications(&db).await;
     }
 }
