@@ -310,19 +310,20 @@ fn build_slot_thread_name(
     issue_number: Option<i64>,
     title: &str,
 ) -> String {
+    let mut batch_phase_for_label: i64 = 0;
     let grouped_issue_label: Option<String> = db.lock().ok().and_then(|conn| {
-        let group_info: Option<(String, i64)> = conn
+        let group_info: Option<(String, i64, i64)> = conn
             .query_row(
-                "SELECT run_id, COALESCE(thread_group, 0)
+                "SELECT run_id, COALESCE(thread_group, 0), COALESCE(batch_phase, 0)
                  FROM auto_queue_entries
                  WHERE dispatch_id = ?1",
                 [dispatch_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .ok()
             .or_else(|| {
                 conn.query_row(
-                    "SELECT run_id, COALESCE(thread_group, 0)
+                    "SELECT run_id, COALESCE(thread_group, 0), COALESCE(batch_phase, 0)
                      FROM auto_queue_entries
                      WHERE kanban_card_id = ?1
                        AND status IN ('pending', 'dispatched')
@@ -330,11 +331,12 @@ fn build_slot_thread_name(
                               priority_rank ASC
                      LIMIT 1",
                     [card_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .ok()
             });
-        let (run_id, thread_group) = group_info?;
+        let (run_id, thread_group, batch_phase) = group_info?;
+        batch_phase_for_label = batch_phase;
         let mut stmt = conn
             .prepare(
                 "SELECT kc.github_issue_number, e.kanban_card_id
@@ -386,7 +388,12 @@ fn build_slot_thread_name(
     } else {
         title.chars().take(90).collect()
     };
-    format!("[slot {}] {}", slot_index, base)
+    let phase_prefix = if batch_phase_for_label > 0 {
+        format!("P{} ", batch_phase_for_label)
+    } else {
+        String::new()
+    };
+    format!("[slot {}] {}{}", slot_index, phase_prefix, base)
         .chars()
         .take(100)
         .collect()
