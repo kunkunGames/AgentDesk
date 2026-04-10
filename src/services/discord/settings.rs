@@ -1891,6 +1891,62 @@ memory:
     }
 
     #[test]
+    fn test_load_bot_launch_configs_excludes_unmapped_utility_bots_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    claude:
+      token: "claude-token"
+      provider: "claude"
+    codex:
+      token: "codex-token"
+      provider: "codex"
+    announce:
+      token: "announce-token"
+      provider: "claude"
+    notify:
+      token: "notify-token"
+      provider: "claude"
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1479671298497183835"
+        name: "adk-cc"
+      codex:
+        id: "1479671301387059200"
+        name: "adk-cdx"
+"#,
+            );
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.token.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["codex-token", "claude-token"]
+            );
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.provider.clone())
+                    .collect::<Vec<ProviderKind>>(),
+                vec![ProviderKind::Codex, ProviderKind::Claude]
+            );
+        });
+    }
+
+    #[test]
     fn test_load_bot_settings_accepts_string_encoded_ids() {
         with_temp_home(|temp_home: &TempDir| {
             let settings_dir = temp_home.path().join(".adk").join("config");

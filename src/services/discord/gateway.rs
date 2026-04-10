@@ -47,6 +47,7 @@ pub(super) trait TurnGateway: Send + Sync {
     fn schedule_retry_with_history<'a>(
         &'a self,
         channel_id: ChannelId,
+        user_message_id: MessageId,
         user_text: &'a str,
     ) -> GatewayFuture<'a, ()>;
 
@@ -81,6 +82,7 @@ pub(super) struct LiveDiscordTurnContext {
 pub(super) struct DiscordGateway {
     http: Arc<serenity::Http>,
     shared: Arc<SharedData>,
+    provider: ProviderKind,
     live_turn: Option<LiveDiscordTurnContext>,
 }
 
@@ -88,11 +90,13 @@ impl DiscordGateway {
     pub(super) fn new(
         http: Arc<serenity::Http>,
         shared: Arc<SharedData>,
+        provider: ProviderKind,
         live_turn: Option<LiveDiscordTurnContext>,
     ) -> Self {
         Self {
             http,
             shared,
+            provider,
             live_turn,
         }
     }
@@ -163,10 +167,19 @@ impl TurnGateway for DiscordGateway {
     fn schedule_retry_with_history<'a>(
         &'a self,
         channel_id: ChannelId,
+        user_message_id: MessageId,
         user_text: &'a str,
     ) -> GatewayFuture<'a, ()> {
         Box::pin(async move {
-            auto_retry_with_history(&self.http, channel_id, user_text, self.shared.api_port).await;
+            auto_retry_with_history(
+                &self.http,
+                &self.shared,
+                &self.provider,
+                channel_id,
+                user_message_id,
+                user_text,
+            )
+            .await;
         })
     }
 
@@ -239,5 +252,6 @@ impl TurnGateway for DiscordGateway {
         self.live_turn
             .as_ref()
             .map(|live_turn| resolve_discord_bot_provider(&live_turn.token))
+            .or_else(|| Some(self.provider.clone()))
     }
 }

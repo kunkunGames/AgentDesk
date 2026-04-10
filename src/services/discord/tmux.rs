@@ -5,7 +5,7 @@ use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
 
 use crate::services::claude;
-use crate::services::provider::parse_provider_and_channel_from_tmux_name;
+use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
 use crate::services::tmux_diagnostics::{
     build_tmux_death_diagnostic, read_tmux_exit_reason, record_tmux_exit_reason,
     tmux_session_exists, tmux_session_has_live_pane,
@@ -194,7 +194,9 @@ fn record_provider_overload_retry(
 fn schedule_provider_overload_retry(
     shared: Arc<SharedData>,
     http: Arc<serenity::Http>,
+    provider: ProviderKind,
     channel_id: ChannelId,
+    user_message_id: serenity::MessageId,
     retry_text: String,
     attempt: u8,
     delay: std::time::Duration,
@@ -230,9 +232,11 @@ fn schedule_provider_overload_retry(
         );
         super::turn_bridge::auto_retry_with_history(
             &http,
+            &shared,
+            &provider,
             channel_id,
+            user_message_id,
             &retry_text,
-            shared.api_port,
         )
         .await;
     });
@@ -1076,15 +1080,21 @@ pub(super) async fn tmux_output_watcher(
                     fingerprint,
                 } => {
                     if let Some(retry_text) = retry_text {
-                        schedule_provider_overload_retry(
-                            shared.clone(),
-                            http.clone(),
-                            channel_id,
-                            retry_text,
-                            attempt,
-                            delay,
-                            fingerprint,
-                        );
+                        if let Some(state) = inflight_state.as_ref() {
+                            schedule_provider_overload_retry(
+                                shared.clone(),
+                                http.clone(),
+                                watcher_provider.clone(),
+                                channel_id,
+                                serenity::MessageId::new(state.user_msg_id),
+                                retry_text,
+                                attempt,
+                                delay,
+                                fingerprint,
+                            );
+                        } else {
+                            clear_provider_overload_retry_state(channel_id);
+                        }
                     } else {
                         clear_provider_overload_retry_state(channel_id);
                     }
@@ -1200,53 +1210,32 @@ pub(super) async fn tmux_output_watcher(
                     )
                     .await;
             }
-            // Auto-retry: fetch Discord history, store in kv_meta for LLM injection,
-            // then re-send only the original user message via announce bot.
-            if let Ok(msgs) = channel_id
-                .messages(&http, serenity::builder::GetMessages::new().limit(10))
-                .await
+            // Auto-retry: persist Discord history for LLM injection, then queue the
+            // original user message as an internal follow-up instead of self-routing
+            // through /api/send announce.
+            if let Some(state) =
+                super::inflight::load_inflight_state(&watcher_provider, channel_id.get())
             {
-                let mut history_lines = Vec::new();
-                let mut last_user_msg = String::new();
-                for msg in msgs.iter().rev() {
-                    if !msg.content.trim().is_empty() {
-                        let content: String = msg.content.chars().take(300).collect();
-                        history_lines.push(format!("{}: {}", msg.author.name, content));
-                        if !msg.author.bot {
-                            last_user_msg = msg.content.clone();
-                        }
-                    }
-                }
-                if !last_user_msg.is_empty() {
-                    // Store history in kv_meta for router to inject into LLM prompt
-                    if !history_lines.is_empty() {
-                        let _ = reqwest::Client::new()
-                            .post(crate::config::local_api_url(shared.api_port, "/api/kv"))
-                            .json(&serde_json::json!({
-                                "key": format!("session_retry_context:{}", channel_id),
-                                "value": history_lines.join("\n"),
-                            }))
-                            .send()
-                            .await;
-                    }
-                    // Discord: short notice + original message only
-                    let retry_content = format!(
-                        "[이전 대화 복원 — 세션이 만료되어 최근 대화를 컨텍스트로 제공합니다]\n\n{}",
-                        last_user_msg
-                    );
-                    let _ = reqwest::Client::new()
-                        .post(crate::config::local_api_url(shared.api_port, "/api/send"))
-                        .json(&serde_json::json!({
-                            "target": format!("channel:{}", channel_id),
-                            "content": retry_content,
-                            "source": "pipeline",
-                            "bot": "announce",
-                        }))
-                        .send()
-                        .await;
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!("  [{ts}] ↻ Watcher auto-retry sent for channel {channel_id}");
-                }
+                super::turn_bridge::auto_retry_with_history(
+                    &http,
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    serenity::MessageId::new(state.user_msg_id),
+                    &state.user_text,
+                )
+                .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ↻ Watcher auto-retry queued for channel {}",
+                    channel_id
+                );
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Watcher auto-retry skipped: inflight state missing for channel {}",
+                    channel_id
+                );
             }
             // Skip normal response relay
             full_response = String::new();
@@ -1560,28 +1549,7 @@ pub(super) async fn tmux_output_watcher(
                         .ok();
                     }
                 }
-                // Notify agent channel via notify bot
-                {
-                    let api_port = shared.api_port;
-                    let ch = channel_id.get();
-                    let msg = format!(
-                        "⚡ 컨텍스트 자동 compact 실행 ({}% — {} tokens)",
-                        pct, tokens
-                    );
-                    tokio::spawn(async move {
-                        let url = crate::config::local_api_url(api_port, "/api/send");
-                        let _ = reqwest::Client::new()
-                            .post(&url)
-                            .json(&serde_json::json!({
-                                "target": format!("channel:{ch}"),
-                                "content": msg,
-                                "bot": "notify",
-                                "source": "system",
-                            }))
-                            .send()
-                            .await;
-                    });
-                }
+                // Do not self-route notify chatter back into the same channel.
             }
         }
     }
