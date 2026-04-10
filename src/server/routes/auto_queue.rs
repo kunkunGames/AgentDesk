@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use super::AppState;
+use crate::services::provider::ProviderKind;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -2402,24 +2403,51 @@ pub async fn activate(
                         Some("consult_required") => {
                             let consult_agent_id = {
                                 let conn = state.db.separate_conn().unwrap();
-                                let provider: String = conn
+                                let provider = conn
                                     .query_row(
-                                        "SELECT COALESCE(cli_provider, 'claude') FROM agents WHERE id = ?1",
+                                        "SELECT COALESCE(provider, 'claude') FROM agents WHERE id = ?1",
                                         [&agent_id],
-                                        |row| row.get(0),
+                                        |row| row.get::<_, String>(0),
                                     )
-                                    .unwrap_or_else(|_| "claude".to_string());
-                                let counter_provider = if provider == "claude" {
-                                    "codex"
-                                } else {
-                                    "claude"
-                                };
-                                conn.query_row(
-                                    "SELECT id FROM agents WHERE cli_provider = ?1 LIMIT 1",
-                                    [counter_provider],
-                                    |row| row.get::<_, String>(0),
-                                )
-                                .unwrap_or_else(|_| agent_id.clone())
+                                    .map(|raw| ProviderKind::from_str_or_unsupported(&raw))
+                                    .unwrap_or_else(|_| {
+                                        ProviderKind::default_channel_provider()
+                                            .unwrap_or(ProviderKind::Claude)
+                                    });
+                                let mut stmt = conn
+                                    .prepare(
+                                        "SELECT id, COALESCE(provider, 'claude')
+                                         FROM agents
+                                         WHERE id != ?1
+                                         ORDER BY id ASC",
+                                    )
+                                    .unwrap();
+                                let available_agents: Vec<(String, ProviderKind)> = stmt
+                                    .query_map([&agent_id], |row| {
+                                        let provider_raw: String = row.get(1)?;
+                                        Ok((
+                                            row.get::<_, String>(0)?,
+                                            ProviderKind::from_str_or_unsupported(&provider_raw),
+                                        ))
+                                    })
+                                    .ok()
+                                    .map(|rows| rows.filter_map(|row| row.ok()).collect())
+                                    .unwrap_or_default();
+                                provider
+                                    .select_counterpart_from(
+                                        available_agents.iter().map(|(_, candidate_provider)| {
+                                            candidate_provider.clone()
+                                        }),
+                                    )
+                                    .and_then(|counterpart| {
+                                        available_agents.iter().find_map(
+                                            |(candidate_id, candidate_provider)| {
+                                                (*candidate_provider == counterpart)
+                                                    .then_some(candidate_id.clone())
+                                            },
+                                        )
+                                    })
+                                    .unwrap_or_else(|| agent_id.clone())
                             };
 
                             let dispatch_result = tokio::task::block_in_place(|| {
