@@ -2,6 +2,7 @@ mod adk_session;
 pub(crate) mod agentdesk_config;
 mod channel_mailbox;
 mod commands;
+pub(crate) mod config_audit;
 mod formatting;
 mod gateway;
 mod handoff;

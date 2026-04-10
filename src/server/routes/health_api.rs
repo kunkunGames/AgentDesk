@@ -50,6 +50,9 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         .as_ref()
         .map(|stats| stats.oldest_pending_age)
         .unwrap_or(0);
+    let config_audit_report =
+        crate::services::discord::config_audit::load_persisted_report(&state.db)
+            .and_then(|report| serde_json::to_value(report).ok());
 
     if let Some(ref registry) = state.health_registry {
         let discord_snapshot = health::build_health_snapshot(registry).await;
@@ -82,6 +85,9 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         if let Some(stats) = outbox_json {
             json["dispatch_outbox"] = stats;
         }
+        if let Some(report) = config_audit_report.clone() {
+            json["config_audit"] = report;
+        }
 
         let http_status = if status.is_http_ready() {
             StatusCode::OK
@@ -109,6 +115,9 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         });
         if let Some(stats) = outbox_json {
             json["dispatch_outbox"] = stats;
+        }
+        if let Some(report) = config_audit_report {
+            json["config_audit"] = report;
         }
         (status, Json(json)).into_response()
     }

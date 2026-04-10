@@ -329,6 +329,12 @@ enum ConfigAction {
         /// JSON value to set
         json: String,
     },
+    /// Audit config source-of-truth drift across yaml/DB/legacy files
+    Audit {
+        /// Preview migrations without writing files or syncing the DB
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -558,6 +564,7 @@ fn main() -> Result<()> {
                 return exit_for_cli(match action {
                     ConfigAction::Get => cli::client::cmd_config_get(),
                     ConfigAction::Set { json } => cli::client::cmd_config_set(&json),
+                    ConfigAction::Audit { dry_run } => cli::client::cmd_config_audit(dry_run),
                 });
             }
             Some(Commands::Api { method, path, body }) => {
@@ -619,14 +626,47 @@ fn main() -> Result<()> {
             .with_env_filter(EnvFilter::from_default_env().add_directive(directive))
             .init();
 
-        if let Some(root) = config::runtime_root() {
+        let runtime_root = config::runtime_root();
+        let legacy_scan = runtime_root
+            .as_ref()
+            .map(|root| crate::services::discord::config_audit::scan_legacy_sources(root))
+            .unwrap_or_default();
+
+        if let Some(root) = runtime_root.as_ref() {
             crate::runtime_layout::ensure_runtime_layout(&root)
                 .map_err(|error| anyhow::anyhow!("Failed to prepare runtime layout: {error}"))?;
         }
 
-        let config = config::load().context("Failed to load config")?;
-        let db = db::init(&config).context("Failed to init DB")?;
+        let loaded = if let Some(root) = runtime_root.as_ref() {
+            crate::services::discord::config_audit::load_runtime_config(root).map_err(|error| {
+                anyhow::anyhow!("Failed to load config after layout prep: {error}")
+            })?
+        } else {
+            let config = config::load().context("Failed to load config")?;
+            crate::services::discord::config_audit::LoadedRuntimeConfig {
+                config,
+                path: std::path::PathBuf::from("config/agentdesk.yaml"),
+                existed: true,
+            }
+        };
+
+        let db = db::init(&loaded.config).context("Failed to init DB")?;
         services::termination_audit::init_audit_db(db.clone());
+        let config = if let Some(root) = runtime_root.as_ref() {
+            crate::services::discord::config_audit::audit_and_reconcile(
+                root,
+                loaded.config,
+                loaded.path,
+                loaded.existed,
+                &db,
+                &legacy_scan,
+                false,
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to audit runtime config: {error}"))?
+            .config
+        } else {
+            loaded.config
+        };
 
         // Load data-driven pipeline definition (#106)
         let pipeline_path = config.policies.dir.join("default-pipeline.yaml");
