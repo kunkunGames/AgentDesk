@@ -1650,7 +1650,9 @@ async fn dispatch_complete() {
                 .method("PATCH")
                 .uri(&format!("/dispatches/{dispatch_id}"))
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"status":"completed","result":{"ok":true}}"#))
+                .body(Body::from(
+                    r#"{"status":"completed","result":{"ok":true,"agent_response_present":true}}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -2940,21 +2942,33 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let review_dispatch_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_dispatches
+             WHERE kanban_card_id = 'card-orphan-330' AND dispatch_type = 'review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     assert_eq!(
-        card_status, "review",
-        "true orphan implementation dispatch must still promote the card into review"
-    );
-    assert_eq!(
-        dispatch_status, "completed",
-        "true orphan implementation dispatch must be marked completed"
+        dispatch_status, "failed",
+        "true orphan implementation dispatch must be failed when no agent work was observed"
     );
     assert!(
         dispatch_result
             .as_deref()
             .unwrap_or("")
-            .contains("orphan_recovery"),
-        "true orphan recovery must keep the orphan_recovery completion marker"
+            .contains("orphan_recovery_rollback"),
+        "true orphan recovery must keep the rollback marker"
+    );
+    assert_ne!(
+        card_status, "review",
+        "true orphan implementation dispatch must not auto-promote the card into review"
+    );
+    assert_eq!(
+        review_dispatch_count, 0,
+        "true orphan recovery must not create a follow-up review dispatch"
     );
     assert_eq!(decision_signal, "OrphanCandidate");
     assert_eq!(chosen_action, "Resume");
@@ -3045,8 +3059,8 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
         "post-complete race guard must keep a backlogged card from reviving into review"
     );
     assert_eq!(
-        dispatch_status, "completed",
-        "the orphan implementation dispatch may still complete, but must not resurrect the card"
+        dispatch_status, "failed",
+        "the orphan implementation dispatch must fail instead of completing without work evidence"
     );
     assert_eq!(
         review_dispatch_count, 0,

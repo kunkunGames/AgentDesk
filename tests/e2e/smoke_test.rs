@@ -349,7 +349,10 @@ async fn smoke_test_full_lifecycle() {
             .patch(server.api_url(&format!("/dispatches/{dispatch_id}")))
             .json(&serde_json::json!({
                 "status": "completed",
-                "result": { "summary": "Feature X implemented successfully" },
+                "result": {
+                    "summary": "Feature X implemented successfully",
+                    "agent_response_present": true
+                },
             }))
             .send()
             .await
