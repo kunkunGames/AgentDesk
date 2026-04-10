@@ -266,6 +266,9 @@ impl DiscordSession {
     }
 
     pub(super) fn restore_provider_session(&mut self, session_id: Option<String>) {
+        if self.session_id == session_id {
+            return;
+        }
         self.session_id = session_id;
         self.memento_context_loaded = false;
         self.memento_reflected = false;
@@ -3926,7 +3929,7 @@ fn enrich_role_map_with_channel_ids() {
 mod tests {
     use super::ChannelId;
     use super::{
-        DiscordBotSettings, Intervention, InterventionMode, PendingQueueItem,
+        DiscordBotSettings, DiscordSession, Intervention, InterventionMode, PendingQueueItem,
         allows_nonlocal_session_path, channel_has_pending_soft_queue_at,
         choose_restore_channel_name, is_synthetic_thread_channel_name, load_pending_queues,
         requeue_intervention_front_persisted, save_channel_queue, save_pending_queues,
@@ -3989,6 +3992,35 @@ mod tests {
         let chosen = choose_restore_channel_name(Some("agentdesk-codex"), None, None, channel_id);
 
         assert_eq!(chosen.as_deref(), Some("agentdesk-codex"));
+    }
+
+    #[test]
+    fn restore_provider_session_preserves_memento_flags_for_same_session() {
+        let mut session = DiscordSession {
+            session_id: Some("same-session".to_string()),
+            memento_context_loaded: true,
+            memento_reflected: true,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            channel_id: None,
+            channel_name: None,
+            category_name: None,
+            remote_profile_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: 0,
+        };
+
+        session.restore_provider_session(Some("same-session".to_string()));
+        assert!(session.memento_context_loaded);
+        assert!(session.memento_reflected);
+
+        session.restore_provider_session(Some("next-session".to_string()));
+        assert_eq!(session.session_id.as_deref(), Some("next-session"));
+        assert!(!session.memento_context_loaded);
+        assert!(!session.memento_reflected);
     }
 
     #[test]
