@@ -2522,6 +2522,18 @@ mod tests {
 
         {
             let conn = db.lock().unwrap();
+            let completed_at: Option<String> = conn
+                .query_row(
+                    "SELECT completed_at FROM kanban_cards WHERE id = 'card-review-disabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                completed_at.is_some(),
+                "review-disabled completion must still fire OnCardTerminal side-effects"
+            );
+
             let review_round: i64 = conn
                 .query_row(
                     "SELECT COALESCE(review_round, 0) FROM kanban_cards WHERE id = 'card-review-disabled'",
