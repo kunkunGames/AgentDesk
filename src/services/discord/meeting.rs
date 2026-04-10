@@ -1122,17 +1122,12 @@ async fn execute_meeting_expert_prompt(
 
 fn canonical_candidate_pool<'a>(
     config: &'a MeetingConfig,
-    primary_provider: &ProviderKind,
-    reviewer_provider: &ProviderKind,
+    _primary_provider: &ProviderKind,
+    _reviewer_provider: &ProviderKind,
 ) -> Vec<&'a MeetingAgentConfig> {
-    let primary_role_id = primary_provider.as_str();
-    let reviewer_role_id = reviewer_provider.as_str();
-
-    config
-        .available_agents
-        .iter()
-        .filter(|agent| agent.role_id != primary_role_id && agent.role_id != reviewer_role_id)
-        .collect()
+    // `available_agents` is an explicit specialist list. Provider-named agents
+    // such as `qwen` and `gemini` must remain selectable as participants.
+    config.available_agents.iter().collect()
 }
 
 fn join_or_none(values: &[String]) -> String {
@@ -2646,33 +2641,31 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_candidate_pool_excludes_operator_role_ids() {
+    fn test_canonical_candidate_pool_keeps_provider_named_specialists() {
         let config = MeetingConfig {
             channel_name: "meeting-room".to_string(),
             max_rounds: 3,
             summary_agent: SummaryAgentConfig::Static("td".to_string()),
             available_agents: vec![
-                fixture_agent("claude"),
+                fixture_agent("qwen"),
+                fixture_agent("gemini"),
                 fixture_agent("td"),
-                fixture_agent("codex"),
-                fixture_agent("pd"),
             ],
             agent_registry: vec![
-                fixture_agent("claude"),
+                fixture_agent("qwen"),
+                fixture_agent("gemini"),
                 fixture_agent("td"),
-                fixture_agent("codex"),
-                fixture_agent("pd"),
             ],
         };
 
         let candidates =
-            canonical_candidate_pool(&config, &ProviderKind::Claude, &ProviderKind::Codex);
+            canonical_candidate_pool(&config, &ProviderKind::Qwen, &ProviderKind::Gemini);
         let role_ids: Vec<&str> = candidates
             .iter()
             .map(|agent| agent.role_id.as_str())
             .collect();
 
-        assert_eq!(role_ids, vec!["td", "pd"]);
+        assert_eq!(role_ids, vec!["qwen", "gemini", "td"]);
         assert!(role_ids.len() >= MIN_MEETING_PARTICIPANTS);
         assert!(role_ids.len() <= MAX_MEETING_PARTICIPANTS);
     }
