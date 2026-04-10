@@ -172,16 +172,17 @@ kanban:
 
 ### Runtime Configuration
 
-Additional settings are stored in the database (`kv_meta` table) and exposed through four distinct surfaces:
+AgentDesk keeps settings in multiple surfaces on purpose. The contract is per-surface canonical owner plus explicit precedence and restart semantics, not a single physical store. The full decision record lives in [`docs/adr-settings-precedence.md`](docs/adr-settings-precedence.md).
 
-| Surface | Storage | API | Notes |
-|---------|---------|-----|-------|
-| Company settings | `kv_meta['settings']` JSON | `GET/PUT /api/settings` | Full-replace payload; callers should send a merged object. Retired legacy keys are stripped server-side. |
-| Runtime config | `kv_meta['runtime-config']` JSON | `GET/PUT /api/settings/runtime-config` | Live numeric tuning applied without restart. |
-| Policy/config keys | Individual `kv_meta` rows | `GET/PATCH /api/settings/config` | Whitelisted review, timeout, context, Discord, and merge-automation keys. |
-| Onboarding/secrets | Dedicated onboarding keys and flows | `/api/onboarding/*` | Tokens and setup secrets stay outside the general settings form. |
+| Surface | Canonical owner | Storage / precedence | Persistence and restart semantics | API |
+|---------|------------------|----------------------|-----------------------------------|-----|
+| Company settings | General settings UI / callers that own the merged JSON | `kv_meta['settings']` only. No YAML baseline. | Persists until replaced. `PUT /api/settings` is full replace, so callers must merge hidden keys before saving. Retired legacy keys are stripped server-side. | `GET/PUT /api/settings` |
+| Runtime config | Dashboard live-runtime controls | Hardcoded defaults < `agentdesk.yaml` `runtime:` < `kv_meta['runtime-config']` override JSON | Applies immediately. On reboot, YAML-backed keys are re-applied; saved keys without YAML baselines persist unless `runtime.reset_overrides_on_restart=true`, in which case the whole surface resets to baseline. | `GET/PUT /api/settings/runtime-config` |
+| Policy/config keys | Dashboard policy controls and automation helpers | Hardcoded defaults < YAML sections (`review:`, `runtime:`, `automation:`, `kanban:`) < individual `kv_meta` rows | `PATCH` writes live overrides. YAML-backed keys are re-seeded on restart, while hardcoded-only keys keep their DB override unless the reset flag is on. `server_port` is surfaced as read-only config metadata. | `GET/PATCH /api/settings/config` |
+| Escalation routing | Dashboard escalation panel and Discord `!escalation` command | `escalation:` config baseline plus fallback owner/channel defaults, overridden by `kv_meta['escalation-settings-override']` | Override persists until changed back to defaults. When `runtime.reset_overrides_on_restart=true`, the stored escalation override is cleared on boot. | `GET/PUT /api/settings/escalation` |
+| Onboarding/secrets | Dedicated onboarding wizard | Dedicated onboarding keys and flows | Tokens and setup secrets stay outside the general settings form. | `/api/onboarding/*` |
 
-The dashboard Settings page only edits the surfaces that truthfully map to those APIs.
+The dashboard Settings page only edits the surfaces that truthfully map to those APIs, and `/api/settings/config` now returns `baseline`, `baseline_source`, `override_active`, `editable`, and `restart_behavior` metadata so operators can see whether a key is currently using baseline or a live override.
 
 ### Whitelisted policy/config keys
 
@@ -200,6 +201,12 @@ Key individual `kv_meta` entries exposed via `/api/settings/config`:
 | `in_progress_stale_min` | `120` | Timeout for stale in-progress cards |
 | `context_compact_percent` | `60` | Global context compaction threshold |
 | `kanban_manager_channel_id` | — | Discord channel for PM notifications |
+
+Representative restart behaviors:
+
+- YAML-backed keys such as `merge_strategy` or `requested_timeout_min` can be changed live, but a reboot re-seeds them from `agentdesk.yaml`.
+- Hardcoded-only keys such as `max_review_rounds` keep their live `kv_meta` override across reboot unless `runtime.reset_overrides_on_restart=true`.
+- `server_port` is visible in `/api/settings/config` for operator context, but it is read-only and sourced from server config rather than from dashboard writes.
 
 ### Environment Variables
 
@@ -324,7 +331,7 @@ AgentDesk exposes 50+ REST API endpoints. Key groups:
 | `/api/auto-queue` | Generate, activate, reorder | Automatic work queuing |
 | `/api/round-table-meetings` | Start, transcript, issues | Multi-agent meetings |
 | `/api/offices` | CRUD + agent assignment | Virtual office management |
-| `/api/settings` | Company settings + config/runtime subroutes | Platform configuration surfaces |
+| `/api/settings` | Company settings + config/runtime/escalation subroutes | Platform configuration surfaces |
 | `/api/health` | Health check | Service status |
 | `/api/onboarding` | Status, validate, complete | Setup wizard backend |
 
