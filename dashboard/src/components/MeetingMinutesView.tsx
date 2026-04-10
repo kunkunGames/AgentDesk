@@ -29,8 +29,6 @@ import MeetingProviderFlow, {
 import MarkdownContent from "./common/MarkdownContent";
 
 const STORAGE_KEY = "pcd_meeting_channel_id";
-const PRIMARY_PROVIDER_STORAGE_KEY = "pcd_meeting_primary_provider";
-const REVIEWER_PROVIDER_STORAGE_KEY = "pcd_meeting_reviewer_provider";
 const FIXED_PARTICIPANTS_STORAGE_KEY = "pcd_meeting_fixed_participants";
 const MEETING_PROVIDERS = ["claude", "codex", "gemini", "qwen"] as const;
 const PROVIDER_LABELS: Record<string, string> = {
@@ -155,7 +153,35 @@ function getMeetingIssueState(
   return result.ok ? "created" : "failed";
 }
 
-export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
+function parseStoredFixedParticipants(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FIXED_PARTICIPANTS_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((roleId): roleId is string => typeof roleId === "string" && roleId.trim().length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function pruneFixedParticipantRoleIdsForLoadedChannel(
+  previous: string[],
+  loadingChannels: boolean,
+  selectedChannel: RoundTableMeetingChannelOption | null,
+): string[] {
+  if (loadingChannels || !selectedChannel) return previous;
+  const availableExperts = selectedChannel.available_experts ?? [];
+  if (availableExperts.length === 0) return previous;
+
+  const availableRoleIds = new Set(availableExperts.map((expert) => expert.role_id));
+  const next = previous.filter((roleId) => availableRoleIds.has(roleId));
+  if (next.length === previous.length && next.every((roleId, index) => roleId === previous[index])) {
+    return previous;
+  }
+  return next;
+}
+
+export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Props) {
   const { t, locale } = useI18n();
   const [detailMeeting, setDetailMeeting] = useState<RoundTableMeeting | null>(null);
   const [creatingIssue, setCreatingIssue] = useState<string | null>(null);
@@ -188,6 +214,7 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>([]);
+  const [fixedParticipants, setFixedParticipants] = useState<string[]>(parseStoredFixedParticipants);
   const [channelQuery, setChannelQuery] = useState("");
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [channelError, setChannelError] = useState<string | null>(null);
@@ -295,10 +322,6 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
 
   const selectedChannel = meetingChannels.find((channel) => channel.channel_id === channelId) ?? null;
   const availableExperts = selectedChannel?.available_experts ?? [];
-  const availableExpertIds = new Set(availableExperts.map((expert) => expert.role_id));
-  const selectedFixedExperts = fixedParticipantRoleIds
-    .map((roleId) => availableExperts.find((expert) => expert.role_id === roleId) ?? null)
-    .filter((expert): expert is RoundTableMeetingExpertOption => expert !== null);
   const reviewerOptions = MEETING_PROVIDERS.filter(
     (provider) => provider !== primaryProvider && provider !== selectedChannel?.owner_provider,
   );
@@ -322,11 +345,18 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
   }, [selectedChannel?.channel_id]);
 
   useEffect(() => {
-    setFixedParticipantRoleIds((prev) => {
-      const filtered = prev.filter((roleId) => availableExpertIds.has(roleId));
-      return filtered.length === prev.length ? prev : filtered;
-    });
-  }, [selectedChannel?.channel_id, availableExperts.map((expert) => expert.role_id).join(",")]);
+    setFixedParticipants((previous) => (
+      pruneFixedParticipantRoleIdsForLoadedChannel(previous, loadingChannels, selectedChannel)
+    ));
+  }, [loadingChannels, selectedChannel]);
+
+  useEffect(() => {
+    if (fixedParticipants.length === 0) {
+      localStorage.removeItem(FIXED_PARTICIPANTS_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(FIXED_PARTICIPANTS_STORAGE_KEY, JSON.stringify(fixedParticipants));
+  }, [fixedParticipants]);
 
   useEffect(() => {
     if (reviewerOptions.length === 0) {
@@ -493,7 +523,11 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
         channelId.trim(),
         primaryProvider,
         reviewerProvider,
-        fixedParticipantRoleIds,
+        fixedParticipants,
+      );
+      onNotify?.(
+        result.message || t({ ko: "회의 시작 요청을 보냈습니다", en: "Meeting start requested" }),
+        "success",
       );
       setAgenda("");
       setShowStartForm(false);
@@ -504,15 +538,12 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
     }
   };
 
-  const toggleFixedParticipant = (roleId: string) => {
-    setFixedParticipantRoleIds((prev) => {
-      if (prev.includes(roleId)) {
-        return prev.filter((value) => value !== roleId);
+  const toggleFixedParticipant = (expert: RoundTableMeetingExpertOption) => {
+    setFixedParticipants((previous) => {
+      if (previous.includes(expert.role_id)) {
+        return previous.filter((roleId) => roleId !== expert.role_id);
       }
-      if (prev.length >= 5) {
-        return prev;
-      }
-      return [...prev, roleId];
+      return [...previous, expert.role_id];
     });
   };
 
@@ -980,6 +1011,59 @@ export default function MeetingMinutesView({ meetings, onRefresh }: Props) {
                   en: `Pinned ${fixedParticipantRoleIds.length}/5, multi-select enabled. The facilitator auto-selects the remaining slots.`,
                 })}
               </div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
+            <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-20 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "고정 전문가", en: "Fixed Experts" })}
+            </label>
+            <div className="flex-1 min-w-0">
+              {!selectedChannel ? (
+                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                  {t({ ko: "채널 선택 후 전문 에이전트를 고정할 수 있습니다", en: "Select a channel to pin expert agents" })}
+                </div>
+              ) : availableExperts.length === 0 ? (
+                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                  {t({ ko: "설정된 전문 에이전트 후보가 없습니다", en: "No configured expert candidates" })}
+                </div>
+              ) : (
+                <div className="flex min-w-0 flex-wrap gap-2">
+                  {availableExperts.map((expert) => {
+                    const selected = fixedParticipants.includes(expert.role_id);
+                    return (
+                      <button
+                        key={expert.role_id}
+                        type="button"
+                        onClick={() => toggleFixedParticipant(expert)}
+                        className="max-w-full rounded-full border px-3 py-1 text-left text-xs transition-colors"
+                        style={{
+                          background: selected ? "rgba(245,158,11,0.16)" : "rgba(148,163,184,0.08)",
+                          borderColor: selected ? "rgba(245,158,11,0.45)" : "var(--th-border)",
+                          color: selected ? "#fbbf24" : "var(--th-text-secondary)",
+                        }}
+                        title={`${expert.display_name} (${expert.role_id})`}
+                      >
+                        <span className="break-all font-semibold [overflow-wrap:anywhere]">
+                          {expert.display_name}
+                        </span>
+                        <span className="ml-1 font-mono opacity-75">#{expert.role_id}</span>
+                        {expert.provider_hint && (
+                          <span className="ml-1 opacity-75">{expert.provider_hint}</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {fixedParticipants.length > 0 && (
+                <div className="mt-1 text-xs break-all [overflow-wrap:anywhere]" style={{ color: "var(--th-text-muted)" }}>
+                  {t({
+                    ko: `고정됨: ${fixedParticipants.join(", ")}`,
+                    en: `Pinned: ${fixedParticipants.join(", ")}`,
+                  })}
+                </div>
+              )}
             </div>
           </div>
 

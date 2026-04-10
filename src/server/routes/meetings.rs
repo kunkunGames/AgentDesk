@@ -40,6 +40,7 @@ pub struct MeetingEntryBody {
 #[derive(Debug, Deserialize)]
 pub struct UpsertMeetingBody {
     pub id: String,
+    pub channel_id: Option<String>,
     pub agenda: Option<String>,
     pub summary: Option<String>,
     pub status: Option<String>,
@@ -68,7 +69,7 @@ pub async fn list_meetings(State(state): State<AppState>) -> (StatusCode, Json<s
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+        "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                 primary_provider, reviewer_provider, participant_names, created_at
          FROM meetings
          ORDER BY started_at DESC",
@@ -113,7 +114,7 @@ pub async fn list_meeting_channels(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let bindings = settings::list_registered_channel_bindings();
     let registry = state.health_registry.as_ref();
-    let available_experts = meeting::load_meeting_expert_options();
+    let available_experts = meeting::list_available_agent_options();
 
     let mut channels = Vec::new();
     for binding in bindings {
@@ -135,18 +136,7 @@ pub async fn list_meeting_channels(
             "channel_id": binding.channel_id.to_string(),
             "channel_name": channel_name,
             "owner_provider": binding.owner_provider.as_str(),
-            "available_experts": available_experts.iter().map(|agent| json!({
-                "role_id": agent.role_id,
-                "display_name": agent.display_name,
-                "keywords": agent.keywords,
-                "domain_summary": agent.domain_summary,
-                "strengths": agent.strengths,
-                "task_types": agent.task_types,
-                "anti_signals": agent.anti_signals,
-                "provider_hint": agent.provider_hint,
-                "metadata_missing": agent.metadata_missing,
-                "metadata_confidence": agent.metadata_confidence,
-            })).collect::<Vec<_>>(),
+            "available_experts": available_experts.clone(),
         }));
     }
 
@@ -191,7 +181,7 @@ pub async fn get_meeting(
     };
 
     match conn.query_row(
-        "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+        "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                 primary_provider, reviewer_provider, participant_names, created_at
          FROM meetings WHERE id = ?1",
         [&id],
@@ -299,7 +289,7 @@ pub async fn update_issue_repo(
 
     // Read back meeting
     match conn.query_row(
-        "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+        "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                 primary_provider, reviewer_provider, participant_names, created_at
          FROM meetings WHERE id = ?1",
         [&id],
@@ -554,7 +544,7 @@ pub async fn discard_issue(
     // Return meeting + summary for UI refresh
     let meeting = conn
         .query_row(
-            "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+            "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                     primary_provider, reviewer_provider, participant_names, created_at
              FROM meetings WHERE id = ?1",
             [&id],
@@ -604,7 +594,7 @@ pub async fn discard_all_issues(
 
     let meeting = conn
         .query_row(
-            "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+            "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                     primary_provider, reviewer_provider, participant_names, created_at
              FROM meetings WHERE id = ?1",
             [&id],
@@ -702,7 +692,7 @@ pub async fn start_meeting(
         primary_provider,
         reviewer_provider,
         agenda.to_string(),
-        fixed_participants,
+        body.fixed_participants.unwrap_or_default(),
     )
     .await
     {
@@ -784,23 +774,25 @@ pub async fn upsert_meeting(
 
     if let Err(e) = conn.execute(
         "INSERT INTO meetings (
-            id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+            id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
             primary_provider, reviewer_provider, participant_names, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         ON CONFLICT(id) DO UPDATE SET
             channel_id = COALESCE(excluded.channel_id, meetings.channel_id),
-            title = COALESCE(?13, meetings.title),
-            status = COALESCE(?14, meetings.status),
-            effective_rounds = COALESCE(?15, meetings.effective_rounds),
+            thread_id = COALESCE(excluded.thread_id, meetings.thread_id),
+            title = COALESCE(?14, meetings.title),
+            status = COALESCE(?15, meetings.status),
+            effective_rounds = COALESCE(?16, meetings.effective_rounds),
             started_at = COALESCE(meetings.started_at, excluded.started_at),
-            completed_at = COALESCE(?16, meetings.completed_at),
-            summary = COALESCE(?17, meetings.summary),
-            primary_provider = COALESCE(?18, meetings.primary_provider),
-            reviewer_provider = COALESCE(?19, meetings.reviewer_provider),
-            participant_names = COALESCE(?20, meetings.participant_names),
+            completed_at = COALESCE(?17, meetings.completed_at),
+            summary = COALESCE(?18, meetings.summary),
+            primary_provider = COALESCE(?19, meetings.primary_provider),
+            reviewer_provider = COALESCE(?20, meetings.reviewer_provider),
+            participant_names = COALESCE(?21, meetings.participant_names),
             created_at = COALESCE(meetings.created_at, excluded.created_at)",
         rusqlite::params![
             body.id,
+            body.channel_id,
             body.thread_id,
             agenda,
             status,
@@ -822,6 +814,21 @@ pub async fn upsert_meeting(
             participant_names_update_json,
         ],
     ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{e}")})),
+        );
+    }
+
+    let saved_thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM meetings WHERE id = ?1",
+            [&body.id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    if let Err(e) = persist_meeting_query_hashes(&conn, &body.id, saved_thread_id.as_deref()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("{e}")})),
@@ -936,7 +943,7 @@ pub async fn upsert_meeting(
     }
 
     match conn.query_row(
-        "SELECT id, channel_id, title, status, effective_rounds, started_at, completed_at, summary,
+        "SELECT id, channel_id, thread_id, title, status, effective_rounds, started_at, completed_at, summary,
                 primary_provider, reviewer_provider, participant_names, created_at
          FROM meetings WHERE id = ?1",
         [&body.id],
@@ -1045,29 +1052,36 @@ fn row_optional_timestamp(row: &rusqlite::Row, idx: usize) -> Option<i64> {
 }
 
 fn meeting_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
-    let title = row.get::<_, Option<String>>(2)?;
-    let effective_rounds = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+    let meeting_id = row.get::<_, String>(0)?;
+    let channel_id = row.get::<_, Option<String>>(1)?;
+    let thread_id = row.get::<_, Option<String>>(2)?;
+    let title = row.get::<_, Option<String>>(3)?;
+    let effective_rounds = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
     let participant_names = row
-        .get::<_, Option<String>>(10)?
+        .get::<_, Option<String>>(11)?
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
         .unwrap_or_default();
-    let started_at = row_optional_timestamp(row, 5).unwrap_or(0);
-    let completed_at = row_optional_timestamp(row, 6);
-    let created_at = row_optional_timestamp(row, 11).unwrap_or(started_at);
+    let started_at = row_optional_timestamp(row, 6).unwrap_or(0);
+    let completed_at = row_optional_timestamp(row, 7);
+    let created_at = row_optional_timestamp(row, 12).unwrap_or(started_at);
+    let thread_hash = thread_id.as_deref().map(thread_query_hash);
     Ok(json!({
-        "id": row.get::<_, String>(0)?,
-        "channel_id": row.get::<_, Option<String>>(1)?,
+        "id": meeting_id.clone(),
+        "channel_id": channel_id,
+        "thread_id": thread_id,
+        "meeting_hash": meeting_query_hash(&meeting_id),
+        "thread_hash": thread_hash,
         "title": title,
-        "status": row.get::<_, Option<String>>(3)?,
+        "status": row.get::<_, Option<String>>(4)?,
         "effective_rounds": effective_rounds,
         "started_at": started_at,
         "completed_at": completed_at,
-        "summary": row.get::<_, Option<String>>(7)?,
+        "summary": row.get::<_, Option<String>>(8)?,
         // alias fields for frontend compatibility
         "agenda": title,
         "total_rounds": effective_rounds,
-        "primary_provider": row.get::<_, Option<String>>(8)?,
-        "reviewer_provider": row.get::<_, Option<String>>(9)?,
+        "primary_provider": row.get::<_, Option<String>>(9)?,
+        "reviewer_provider": row.get::<_, Option<String>>(10)?,
         "participant_names": participant_names,
         "issues_created": 0,
         "proposed_issues": null,
@@ -1369,6 +1383,7 @@ mod tests {
             State(state.clone()),
             Json(UpsertMeetingBody {
                 id: "meeting-meta".to_string(),
+                channel_id: None,
                 agenda: Some("기존 안건".to_string()),
                 summary: None,
                 status: Some("in_progress".to_string()),
@@ -1389,6 +1404,7 @@ mod tests {
             State(state),
             Json(UpsertMeetingBody {
                 id: "meeting-meta".to_string(),
+                channel_id: None,
                 agenda: None,
                 summary: Some("요약 갱신".to_string()),
                 status: None,
@@ -1433,6 +1449,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_meeting_persists_query_hashes_and_returns_them() {
+        let db = test_db();
+        let state = AppState::test_state(db.clone(), test_engine(&db));
+
+        let (status, _) = upsert_meeting(
+            State(state.clone()),
+            Json(UpsertMeetingBody {
+                id: "meeting-hash".to_string(),
+                channel_id: None,
+                agenda: Some("해시 안건".to_string()),
+                summary: None,
+                status: Some("in_progress".to_string()),
+                primary_provider: Some("qwen".to_string()),
+                reviewer_provider: Some("codex".to_string()),
+                participant_names: Some(vec!["Alice".to_string()]),
+                total_rounds: Some(1),
+                started_at: Some(111),
+                completed_at: None,
+                thread_id: Some("thread-123".to_string()),
+                entries: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let expected_meeting_hash = meeting_query_hash("meeting-hash");
+        let expected_thread_hash = thread_query_hash("thread-123");
+        let (status, body) = get_meeting(State(state), Path("meeting-hash".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["meeting"]["meeting_hash"], expected_meeting_hash);
+        assert_eq!(body.0["meeting"]["thread_hash"], expected_thread_hash);
+
+        let conn = db.lock().unwrap();
+        let stored_meeting_hash: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                ["meeting_query_hash:meeting-hash"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let meeting_lookup: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                [format!("meeting_query_hash_lookup:{expected_meeting_hash}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_thread_hash: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                ["meeting_thread_hash:meeting-hash"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(stored_meeting_hash, expected_meeting_hash);
+        assert_eq!(meeting_lookup, "meeting-hash");
+        assert_eq!(stored_thread_hash, expected_thread_hash);
+    }
+
+    #[tokio::test]
     async fn upsert_meeting_preserves_existing_transcripts_and_updates_summary_without_duplication()
     {
         let db = test_db();
@@ -1442,6 +1519,7 @@ mod tests {
             State(state.clone()),
             Json(UpsertMeetingBody {
                 id: "meeting-transcript".to_string(),
+                channel_id: None,
                 agenda: Some("안건".to_string()),
                 summary: Some("기존 요약".to_string()),
                 status: Some("completed".to_string()),
@@ -1465,6 +1543,7 @@ mod tests {
             State(state),
             Json(UpsertMeetingBody {
                 id: "meeting-transcript".to_string(),
+                channel_id: None,
                 agenda: None,
                 summary: Some("새 요약".to_string()),
                 status: Some("completed".to_string()),

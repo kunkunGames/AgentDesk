@@ -248,10 +248,19 @@ fn meeting_agent_from_entry(
                 agent
                     .map(|agent| agent.keywords.clone())
                     .unwrap_or_default(),
-                default_prompt_path(role_id).unwrap_or_default(),
-                agent.map(|agent| agent.provider.clone()),
-                default_workspace(role_id),
-            ))
+                prompt_file: default_prompt_path(role_id).unwrap_or_default(),
+                domain_summary: None,
+                strengths: Vec::new(),
+                task_types: Vec::new(),
+                anti_signals: Vec::new(),
+                provider_hint: agent.map(|agent| agent.provider.clone()),
+                provider: agent.and_then(|agent| ProviderKind::from_str(&agent.provider)),
+                model: None,
+                reasoning_effort: None,
+                workspace: default_workspace(role_id),
+                peer_agents_enabled: true,
+                memory: resolve_memory_settings(None, None),
+            })
         }
         MeetingAgentEntry::Detailed(def) => {
             let agent = config.agents.iter().find(|agent| agent.id == def.role_id);
@@ -275,9 +284,21 @@ fn meeting_agent_from_entry(
                     .map(expand_tilde)
                     .or_else(|| default_prompt_path(&def.role_id))
                     .unwrap_or_default(),
-                agent.map(|agent| agent.provider.clone()),
-                default_workspace(&role_id),
-            ))
+                domain_summary: def.domain_summary.clone(),
+                strengths: def.strengths.clone(),
+                task_types: def.task_types.clone(),
+                anti_signals: def.anti_signals.clone(),
+                provider_hint: def
+                    .provider_hint
+                    .clone()
+                    .or_else(|| agent.map(|agent| agent.provider.clone())),
+                provider: agent.and_then(|agent| ProviderKind::from_str(&agent.provider)),
+                model: None,
+                reasoning_effort: None,
+                workspace: default_workspace(&def.role_id),
+                peer_agents_enabled: true,
+                memory: resolve_memory_settings(None, None),
+            })
         }
     }
 }
@@ -439,7 +460,27 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
         .collect::<Vec<_>>();
 
     let available_agents = if meeting.available_agents.is_empty() {
-        agent_registry.clone()
+        config
+            .agents
+            .iter()
+            .map(|agent| MeetingAgentConfig {
+                role_id: agent.id.clone(),
+                display_name: agent_display_name(agent),
+                keywords: agent.keywords.clone(),
+                prompt_file: default_prompt_path(&agent.id).unwrap_or_default(),
+                domain_summary: None,
+                strengths: Vec::new(),
+                task_types: Vec::new(),
+                anti_signals: Vec::new(),
+                provider_hint: Some(agent.provider.clone()),
+                provider: ProviderKind::from_str(&agent.provider),
+                model: None,
+                reasoning_effort: None,
+                workspace: default_workspace(&agent.id),
+                peer_agents_enabled: true,
+                memory: resolve_memory_settings(None, None),
+            })
+            .collect()
     } else {
         meeting
             .available_agents

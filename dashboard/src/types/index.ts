@@ -328,7 +328,7 @@ export interface RoundTableMeetingChannelOption {
   channel_id: string;
   channel_name: string;
   owner_provider: string;
-  available_experts: RoundTableMeetingExpertOption[];
+  available_experts?: RoundTableMeetingExpertOption[];
 }
 
 export interface RoundTableMeetingExpertOption {
@@ -340,8 +340,8 @@ export interface RoundTableMeetingExpertOption {
   task_types: string[];
   anti_signals: string[];
   provider_hint?: string | null;
-  metadata_missing: boolean;
-  metadata_confidence: "low" | "medium" | "high";
+  metadata_missing?: boolean;
+  metadata_confidence?: "high" | "medium" | "low";
 }
 
 export interface RoundTableMeeting {

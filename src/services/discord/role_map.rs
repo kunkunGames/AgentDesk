@@ -130,17 +130,50 @@ fn parse_meeting_agent_metadata(value: &serde_json::Value) -> Option<ParsedMeeti
         &task_types,
         &anti_signals,
     );
-    Some(ParsedMeetingAgentMetadata {
-        role_id,
-        display_name,
-        keywords,
-        domain_summary,
-        strengths,
-        task_types,
-        anti_signals,
+    let provider_raw = json_string_field(agent, &["provider"]);
+    let provider_hint = json_string_field(agent, &["provider_hint", "providerHint", "provider"]);
+    let provider = provider_raw.as_deref().and_then(ProviderKind::from_str);
+    let model = json_string_field(agent, &["model"]);
+    let reasoning_effort = json_string_field(agent, &["reasoning_effort", "reasoningEffort"]);
+    let workspace = json_string_field(agent, &["workspace"]).map(|value| expand_tilde(&value));
+    let peer_agents_enabled = agent
+        .get("peerAgents")
+        .or_else(|| agent.get("peer_agents"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let memory_override = agent.get("memory").and_then(|raw| {
+        serde_json::from_value::<MemoryConfigOverride>(raw.clone())
+            .map_err(|err| {
+                eprintln!(
+                    "  [memory] Warning: invalid meeting.available_agents memory block: {err}"
+                );
+                err
+            })
+            .ok()
+    });
+
+    Some(MeetingAgentConfig {
+        role_id: role_id.to_string(),
+        display_name: display_name.to_string(),
+        keywords: json_string_vec(agent, "keywords"),
+        prompt_file,
+        domain_summary: json_string_field(agent, &["domain_summary", "domainSummary"]),
+        strengths: json_string_vec(agent, "strengths"),
+        task_types: json_string_vec(agent, "task_types")
+            .into_iter()
+            .chain(json_string_vec(agent, "taskTypes"))
+            .collect(),
+        anti_signals: json_string_vec(agent, "anti_signals")
+            .into_iter()
+            .chain(json_string_vec(agent, "antiSignals"))
+            .collect(),
         provider_hint,
-        metadata_missing,
-        metadata_confidence,
+        provider,
+        model,
+        reasoning_effort,
+        workspace,
+        peer_agents_enabled,
+        memory: resolve_memory_settings(None, memory_override.as_ref()),
     })
 }
 

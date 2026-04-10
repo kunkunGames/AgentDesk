@@ -1,9 +1,9 @@
-use std::future::Future;
-use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::agent_protocol::StreamMessage;
-use crate::services::provider::ProviderKind;
+use crate::services::process::kill_pid_tree;
+use crate::services::provider::{CancelToken, ProviderKind};
 use crate::services::{claude, codex, gemini, qwen};
 
 pub async fn execute_simple(provider: ProviderKind, prompt: String) -> Result<String, String> {
@@ -32,213 +32,137 @@ pub async fn execute_simple(provider: ProviderKind, prompt: String) -> Result<St
     }
 }
 
-async fn await_with_timeout<T, F>(label: &str, timeout: Duration, future: F) -> Result<T, String>
-where
-    F: Future<Output = Result<T, String>>,
-{
-    match tokio::time::timeout(timeout, future).await {
-        Ok(result) => result,
-        Err(_) => Err(format!("{} timed out after {}s", label, timeout.as_secs())),
-    }
-}
-
-pub async fn execute_simple_with_timeout(
-    provider: ProviderKind,
-    prompt: String,
-    timeout: Duration,
-    label: &str,
-) -> Result<String, String> {
-    await_with_timeout(label, timeout, execute_simple(provider, prompt)).await
-}
-
-#[derive(Clone, Debug)]
-pub struct StructuredExecRequest {
-    pub working_dir: String,
-    pub system_prompt: Option<String>,
-    pub allowed_tools: Vec<String>,
-    pub model: Option<String>,
-}
-
-impl StructuredExecRequest {
-    pub fn new(working_dir: String) -> Self {
-        Self {
-            working_dir,
-            system_prompt: None,
-            allowed_tools: Vec::new(),
-            model: None,
-        }
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_structured(
     provider: ProviderKind,
     prompt: String,
-    request: StructuredExecRequest,
+    working_dir: String,
+    system_prompt: Option<String>,
+    allowed_tools: Vec<String>,
+    model: Option<String>,
+    timeout_secs: u64,
+    stage_label: &'static str,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || execute_structured_blocking(provider, prompt, request))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-}
+    let cancel_token = Arc::new(CancelToken::new());
+    let cancel_for_timeout = Arc::clone(&cancel_token);
+    let handle = tokio::task::spawn_blocking(move || {
+        let (sender, receiver) = std::sync::mpsc::channel::<StreamMessage>();
+        let system_prompt_ref = system_prompt.as_deref();
+        let allowed_tools_ref = (!allowed_tools.is_empty()).then_some(allowed_tools.as_slice());
+        let model_ref = model.as_deref();
+        let result = match provider {
+            ProviderKind::Claude => claude::execute_command_streaming(
+                &prompt,
+                None,
+                &working_dir,
+                sender.clone(),
+                system_prompt_ref,
+                allowed_tools_ref,
+                Some(Arc::clone(&cancel_token)),
+                None,
+                None,
+                None,
+                None,
+                model_ref,
+                None,
+            ),
+            ProviderKind::Codex => codex::execute_command_streaming(
+                &prompt,
+                None,
+                &working_dir,
+                sender.clone(),
+                system_prompt_ref,
+                allowed_tools_ref,
+                Some(Arc::clone(&cancel_token)),
+                None,
+                None,
+                None,
+                None,
+                model_ref,
+                None,
+            ),
+            ProviderKind::Gemini => gemini::execute_command_streaming(
+                &prompt,
+                None,
+                &working_dir,
+                sender.clone(),
+                system_prompt_ref,
+                allowed_tools_ref,
+                Some(Arc::clone(&cancel_token)),
+                None,
+                None,
+                None,
+                None,
+                model_ref,
+                None,
+            ),
+            ProviderKind::Qwen => qwen::execute_command_streaming(
+                &prompt,
+                None,
+                &working_dir,
+                sender.clone(),
+                system_prompt_ref,
+                allowed_tools_ref,
+                Some(Arc::clone(&cancel_token)),
+                None,
+                None,
+                None,
+                None,
+                model_ref,
+                None,
+            ),
+            ProviderKind::Unsupported(name) => Err(format!("Provider '{}' is not installed", name)),
+        };
+        drop(sender);
+        collect_stream_result(result, receiver)
+    });
 
-pub async fn execute_structured_with_timeout(
-    provider: ProviderKind,
-    prompt: String,
-    request: StructuredExecRequest,
-    timeout: Duration,
-    label: &str,
-) -> Result<String, String> {
-    await_with_timeout(
-        label,
-        timeout,
-        execute_structured(provider, prompt, request),
-    )
-    .await
-}
-
-fn execute_structured_blocking(
-    provider: ProviderKind,
-    prompt: String,
-    request: StructuredExecRequest,
-) -> Result<String, String> {
-    let (tx, rx) = mpsc::channel::<StreamMessage>();
-    let system_prompt = request.system_prompt.as_deref();
-    let allowed_tools = Some(request.allowed_tools.as_slice());
-    let working_dir = request.working_dir;
-    let model = request.model.as_deref();
-
-    match provider {
-        ProviderKind::Claude => claude::execute_command_streaming(
-            &prompt,
-            None,
-            &working_dir,
-            tx,
-            system_prompt,
-            allowed_tools,
-            None,
-            None,
-            None,
-            None,
-            None,
-            model,
-            None,
-        )?,
-        ProviderKind::Codex => codex::execute_command_streaming(
-            &prompt,
-            None,
-            &working_dir,
-            tx,
-            system_prompt,
-            allowed_tools,
-            None,
-            None,
-            None,
-            None,
-            None,
-            model,
-            None,
-        )?,
-        ProviderKind::Gemini => gemini::execute_command_streaming(
-            &prompt,
-            None,
-            &working_dir,
-            tx,
-            system_prompt,
-            allowed_tools,
-            None,
-            None,
-            None,
-            None,
-            None,
-            model,
-            None,
-        )?,
-        ProviderKind::Qwen => qwen::execute_command_streaming(
-            &prompt,
-            None,
-            &working_dir,
-            tx,
-            system_prompt,
-            allowed_tools,
-            None,
-            None,
-            None,
-            None,
-            None,
-            model,
-            None,
-        )?,
-        ProviderKind::Unsupported(name) => {
-            return Err(format!("Provider '{}' is not installed", name));
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), handle).await {
+        Ok(joined) => joined.map_err(|err| format!("Task join error: {err}"))?,
+        Err(_) => {
+            cancel_for_timeout.cancel_with_tmux_cleanup();
+            if let Some(pid) = cancel_for_timeout
+                .child_pid
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+            {
+                kill_pid_tree(pid);
+            }
+            Err(format!("{stage_label} timeout after {timeout_secs}s"))
         }
     }
-
-    collect_stream_output(rx)
 }
 
-fn collect_stream_output(rx: mpsc::Receiver<StreamMessage>) -> Result<String, String> {
-    let mut text_chunks = Vec::new();
-    let mut final_result: Option<String> = None;
+fn collect_stream_result(
+    provider_result: Result<(), String>,
+    receiver: std::sync::mpsc::Receiver<StreamMessage>,
+) -> Result<String, String> {
+    let mut text = String::new();
+    let mut done: Option<String> = None;
+    let mut error: Option<String> = provider_result.err();
 
-    for message in rx.try_iter() {
+    for message in receiver.try_iter() {
         match message {
-            StreamMessage::Text { content } => {
-                if !content.trim().is_empty() {
-                    text_chunks.push(content);
-                }
-            }
+            StreamMessage::Text { content } => text.push_str(&content),
             StreamMessage::Done { result, .. } => {
                 if !result.trim().is_empty() {
-                    final_result = Some(result);
+                    done = Some(result);
                 }
             }
-            StreamMessage::Error {
-                message, stderr, ..
-            } => {
-                let detail = stderr.trim();
-                return Err(if detail.is_empty() {
-                    message
-                } else {
-                    format!("{message}: {detail}")
-                });
+            StreamMessage::Error { message, .. } => {
+                error = Some(message);
             }
             _ => {}
         }
     }
 
-    let result = final_result.unwrap_or_else(|| text_chunks.join(""));
-    let trimmed = result.trim().to_string();
-    if trimmed.is_empty() {
-        Err("Empty response from provider runtime".to_string())
-    } else {
-        Ok(trimmed)
+    if let Some(result) = done {
+        return Ok(result.trim().to_string());
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::await_with_timeout;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn await_with_timeout_returns_inner_result_before_deadline() {
-        let result = await_with_timeout("selection stage", Duration::from_millis(50), async {
-            Ok::<_, String>("ok".to_string())
-        })
-        .await
-        .expect("result should succeed");
-
-        assert_eq!(result, "ok");
+    let text = text.trim().to_string();
+    if !text.is_empty() {
+        return Ok(text);
     }
-
-    #[tokio::test]
-    async fn await_with_timeout_errors_after_deadline() {
-        let error = await_with_timeout("selection stage", Duration::from_millis(10), async {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            Ok::<_, String>("late".to_string())
-        })
-        .await
-        .expect_err("timeout should fail");
-
-        assert!(error.contains("selection stage timed out after 0s"));
-    }
+    Err(error.unwrap_or_else(|| "Empty response from provider".to_string()))
 }
