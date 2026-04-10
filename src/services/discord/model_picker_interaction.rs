@@ -250,6 +250,9 @@ pub(super) async fn handle_model_picker_interaction(
                 None => "변경 사항이 없습니다. `/model`을 다시 열어 모델을 선택하세요.".to_string(),
             };
 
+            super::commands::clear_model_picker_pending(&data.shared, message_id);
+            save_model_picker_interaction(ctx, component, notice).await?;
+
             match next_override {
                 Some(Some(model)) => {
                     super::commands::update_channel_model_override(
@@ -274,12 +277,11 @@ pub(super) async fn handle_model_picker_interaction(
                 None => {}
             }
 
-            super::commands::clear_model_picker_pending(&data.shared, message_id);
-            save_model_picker_interaction(ctx, component, notice).await?;
             return Ok(());
         }
         super::commands::ModelPickerAction::Reset => {
             super::commands::clear_model_picker_pending(&data.shared, message_id);
+            save_model_picker_interaction(ctx, component, model_picker_submit_notice(None)).await?;
             super::commands::update_channel_model_override(
                 &data.shared,
                 &data.token,
@@ -288,7 +290,6 @@ pub(super) async fn handle_model_picker_interaction(
                 None,
             )
             .await;
-            save_model_picker_interaction(ctx, component, model_picker_submit_notice(None)).await?;
             return Ok(());
         }
         super::commands::ModelPickerAction::Cancel => {
