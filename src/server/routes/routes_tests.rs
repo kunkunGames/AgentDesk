@@ -7428,6 +7428,98 @@ async fn auto_queue_status_legacy_thread_falls_back_to_active_label_without_url_
 }
 
 #[tokio::test]
+async fn auto_queue_status_scopes_global_run_entries_by_repo_and_agent() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_repo(&db, "other-repo");
+    seed_agent(&db, "agent-scope-a");
+    seed_agent(&db, "agent-scope-b");
+    seed_auto_queue_card(&db, "card-scope-a", 4201, "ready", "agent-scope-a");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, repo_id,
+                github_issue_number, created_at, updated_at
+             ) VALUES (
+                'card-scope-b', 'Issue #4202', 'ready', 'medium', 'agent-scope-b', 'other-repo',
+                4202, datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, status, created_at)
+             VALUES ('run-scope-global', 'active', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, reason
+             ) VALUES (
+                'entry-scope-a', 'run-scope-global', 'card-scope-a', 'agent-scope-a',
+                'pending', 0, 0, 'scope group a'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, reason
+             ) VALUES (
+                'entry-scope-b', 'run-scope-global', 'card-scope-b', 'agent-scope-b',
+                'dispatched', 1, 1, 'scope group b'
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/auto-queue/status?repo=test-repo&agent_id=agent-scope-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["run"]["id"], "run-scope-global");
+    let entries = json["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], "entry-scope-a");
+
+    let agents = json["agents"]
+        .as_object()
+        .expect("agents must be an object");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents["agent-scope-a"]["pending"], 1);
+    assert!(agents.get("agent-scope-b").is_none());
+
+    let thread_groups = json["thread_groups"]
+        .as_object()
+        .expect("thread_groups must be an object");
+    assert_eq!(thread_groups.len(), 1);
+    assert_eq!(thread_groups["0"]["pending"], 1);
+    assert_eq!(thread_groups["0"]["status"], "pending");
+    assert_eq!(thread_groups["0"]["reason"], "scope group a");
+}
+
+#[tokio::test]
 async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() {
     let db = test_db();
     let engine = test_engine(&db);
