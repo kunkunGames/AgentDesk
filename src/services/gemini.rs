@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -26,6 +26,7 @@ const GEMINI_STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const GEMINI_STREAM_IDLE_WATCHDOG: Duration = Duration::from_secs(120);
 const GEMINI_STREAM_STARTUP_WATCHDOG: Duration = Duration::from_secs(60);
 const GEMINI_MAX_SESSION_RETRIES: usize = 1;
+const GEMINI_TRUSTED_FOLDERS_PATH: &str = ".gemini/trustedFolders.json";
 const GEMINI_MEETING_READONLY_POLICY_FILENAME: &str = "agentdesk-gemini-meeting-readonly.toml";
 const GEMINI_MEETING_READONLY_POLICY: &str = r#"
 [[rule]]
@@ -111,7 +112,8 @@ fn execute_command_simple_inner(
         .resolved_path
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let working_dir = resolve_gemini_working_dir(&current_dir.to_string_lossy())?;
     let args = build_exec_args(prompt, None, None, false)?;
     let mut command = Command::new(&gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
@@ -641,6 +643,104 @@ fn compose_gemini_prompt(
     crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
 }
 
+fn resolve_gemini_working_dir(working_dir: &str) -> Result<PathBuf, String> {
+    let requested_dir = expand_gemini_working_dir(working_dir);
+    let trusted_roots = gemini_trusted_roots();
+    select_gemini_working_dir(requested_dir, dirs::home_dir(), &trusted_roots)
+}
+
+fn expand_gemini_working_dir(raw: &str) -> PathBuf {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    }
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(stripped))
+            .unwrap_or_else(|| PathBuf::from(raw));
+    }
+    PathBuf::from(raw)
+}
+
+fn gemini_trusted_roots() -> Vec<PathBuf> {
+    let Some(path) = dirs::home_dir().map(|home| home.join(GEMINI_TRUSTED_FOLDERS_PATH)) else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(entries) = json.as_object() else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|(path, status)| gemini_trusted_root_for_entry(path, status))
+        .collect()
+}
+
+fn gemini_trusted_root_for_entry(path: &str, status: &Value) -> Option<PathBuf> {
+    match status.as_str()? {
+        "TRUST_FOLDER" => Some(normalize_gemini_path(path)),
+        "TRUST_PARENT" => {
+            let rule_path = Path::new(path);
+            let parent = rule_path.parent().unwrap_or(rule_path);
+            Some(normalize_gemini_path(parent))
+        }
+        _ => None,
+    }
+}
+
+fn gemini_trust_status_allows_root(status: &Value) -> bool {
+    matches!(status.as_str(), Some("TRUST_FOLDER") | Some("TRUST_PARENT"))
+}
+
+fn select_gemini_working_dir(
+    requested_dir: PathBuf,
+    home_dir: Option<PathBuf>,
+    trusted_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
+    if path_is_trusted_by_gemini(&requested_dir, trusted_roots) {
+        return Ok(requested_dir);
+    }
+
+    if requested_dir == Path::new("/") {
+        if let Some(home_dir) = home_dir {
+            let normalized_home = normalize_gemini_path(home_dir);
+            if path_is_trusted_by_gemini(&normalized_home, trusted_roots) {
+                return Ok(normalized_home);
+            }
+        }
+        return Err(format!(
+            "Gemini cannot use `/` as the working directory in headless mode because it is not trusted in `~/{}`. Trust `/` or switch the session to a trusted folder.",
+            GEMINI_TRUSTED_FOLDERS_PATH
+        ));
+    }
+
+    Err(format!(
+        "Gemini working directory `{}` is not trusted in `~/{}`. Switch to a trusted folder or add it to Gemini trusted folders.",
+        requested_dir.display(),
+        GEMINI_TRUSTED_FOLDERS_PATH
+    ))
+}
+
+fn path_is_trusted_by_gemini(path: &Path, trusted_roots: &[PathBuf]) -> bool {
+    let normalized = normalize_gemini_path(path);
+    trusted_roots
+        .iter()
+        .any(|root| normalized.starts_with(root))
+}
+
+fn normalize_gemini_path(path: impl AsRef<Path>) -> PathBuf {
+    std::fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf())
+}
+
 fn build_exec_args(
     prompt: &str,
     model: Option<&str>,
@@ -677,7 +777,8 @@ fn build_exec_args(
                 .to_string(),
         );
     } else {
-        args.push("-y".to_string());
+        args.push("--approval-mode".to_string());
+        args.push("yolo".to_string());
         args.push("--sandbox".to_string());
         args.push("false".to_string());
     }
@@ -876,9 +977,11 @@ mod tests {
         GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState, GeminiStreamEvent, GeminiStreamLoopResult,
         build_exec_args, build_gemini_tool_result_message, build_gemini_tool_use_message,
         collect_gemini_stream_events, execute_command_streaming, extract_gemini_error_message,
-        extract_text_from_stream_output, finalize_gemini_attempt, looks_like_uuid,
-        normalize_resume_selector, observed_session_to_resume_selector, process_gemini_stream_line,
+        extract_text_from_stream_output, finalize_gemini_attempt, gemini_trust_status_allows_root,
+        gemini_trusted_root_for_entry, looks_like_uuid, normalize_resume_selector,
+        observed_session_to_resume_selector, process_gemini_stream_line,
         remote_profile_not_supported_message, run_gemini_streaming_attempts,
+        select_gemini_working_dir,
     };
     use crate::services::agent_protocol::StreamMessage;
     use crate::services::provider::{
@@ -886,6 +989,7 @@ mod tests {
     };
     use crate::services::remote::{RemoteAuth, RemoteProfile};
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -933,6 +1037,93 @@ mod tests {
         assert!(policy.contains("toolName = \"*\""));
         assert!(!policy.contains("modes ="));
         assert!(!args.iter().any(|arg| arg == "-y"));
+    }
+
+    #[test]
+    fn build_exec_args_uses_approval_mode_yolo_without_legacy_y_flag() {
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None, false).expect("args");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--approval-mode", "yolo"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "false"]));
+        assert!(!args.iter().any(|arg| arg == "-y" || arg == "--yolo"));
+    }
+
+    #[test]
+    fn select_gemini_working_dir_keeps_trusted_descendant() {
+        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let resolved = select_gemini_working_dir(
+            PathBuf::from("/Users/kunkun/kunkunGames/agentdesk"),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            PathBuf::from("/Users/kunkun/kunkunGames/agentdesk")
+        );
+    }
+
+    #[test]
+    fn select_gemini_working_dir_falls_back_from_root_to_trusted_home() {
+        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let resolved = select_gemini_working_dir(
+            PathBuf::from("/"),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/Users/kunkun"));
+    }
+
+    #[test]
+    fn select_gemini_working_dir_rejects_untrusted_directory() {
+        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let error = select_gemini_working_dir(
+            PathBuf::from("/private/tmp/example"),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap_err();
+        assert!(error.contains("/private/tmp/example"));
+        assert!(error.contains("not trusted"));
+    }
+
+    #[test]
+    fn gemini_trust_status_accepts_folder_and_parent_entries() {
+        assert!(gemini_trust_status_allows_root(&json!("TRUST_FOLDER")));
+        assert!(gemini_trust_status_allows_root(&json!("TRUST_PARENT")));
+        assert!(!gemini_trust_status_allows_root(&json!("UNTRUSTED")));
+    }
+
+    #[test]
+    fn gemini_trusted_root_maps_trust_parent_to_rule_parent() {
+        assert_eq!(
+            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT"))
+                .unwrap(),
+            PathBuf::from("/private/tmp")
+        );
+        assert_eq!(
+            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_FOLDER"))
+                .unwrap(),
+            PathBuf::from("/private/tmp/worktree-a")
+        );
+    }
+
+    #[test]
+    fn select_gemini_working_dir_accepts_trust_parent_sibling() {
+        let trusted = vec![
+            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT"))
+                .unwrap(),
+        ];
+        let resolved = select_gemini_working_dir(
+            PathBuf::from("/private/tmp/worktree-b/project"),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/private/tmp/worktree-b/project"));
     }
 
     #[test]
