@@ -43,20 +43,28 @@ pub(super) fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()>
     let db_mf = db.clone();
     dispatch_obj.set(
         "__mark_failed_raw",
-        Function::new(ctx.clone(), move |dispatch_id: String, reason: String| -> String {
-            let conn = match db_mf.separate_conn() {
-                Ok(c) => c,
-                Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
-            };
-            match conn.execute(
-                "UPDATE task_dispatches SET status = 'failed', result = ?1, updated_at = datetime('now') \
-                 WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-                rusqlite::params![reason, dispatch_id],
-            ) {
-                Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
-                Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
-            }
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |dispatch_id: String, reason: String| -> String {
+                let conn = match db_mf.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+                };
+                let reason_json = serde_json::json!({ "reason": reason });
+                match crate::dispatch::set_dispatch_status_on_conn(
+                    &conn,
+                    &dispatch_id,
+                    "failed",
+                    Some(&reason_json),
+                    "js_dispatch_mark_failed_raw",
+                    Some(&["pending", "dispatched"]),
+                    false,
+                ) {
+                    Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
+                }
+            },
+        )?,
     )?;
 
     // __mark_completed_raw(dispatch_id, result_json) → json_string
@@ -64,20 +72,29 @@ pub(super) fn register_dispatch_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()>
     let db_mc = db.clone();
     dispatch_obj.set(
         "__mark_completed_raw",
-        Function::new(ctx.clone(), move |dispatch_id: String, result_json: String| -> String {
-            let conn = match db_mc.separate_conn() {
-                Ok(c) => c,
-                Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
-            };
-            match conn.execute(
-                "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
-                 WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-                rusqlite::params![result_json, dispatch_id],
-            ) {
-                Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
-                Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
-            }
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |dispatch_id: String, result_json: String| -> String {
+                let conn = match db_mc.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"DB: {}"}}"#, e),
+                };
+                let parsed_result = serde_json::from_str::<serde_json::Value>(&result_json)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw_result": result_json }));
+                match crate::dispatch::set_dispatch_status_on_conn(
+                    &conn,
+                    &dispatch_id,
+                    "completed",
+                    Some(&parsed_result),
+                    "js_dispatch_mark_completed_raw",
+                    Some(&["pending", "dispatched"]),
+                    true,
+                ) {
+                    Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
+                }
+            },
+        )?,
     )?;
 
     // __set_retry_count_raw(dispatch_id, count) → json_string

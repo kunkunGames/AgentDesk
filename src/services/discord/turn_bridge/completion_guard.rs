@@ -343,14 +343,16 @@ pub(in crate::services::discord) fn runtime_db_fallback_complete_with_result(
     let Ok(conn) = rusqlite::Connection::open(&db_path) else {
         return false;
     };
-    let result_json = result.to_string();
-    let changed = conn
-        .execute(
-            "UPDATE task_dispatches SET status = 'completed', result = ?1, \
-             updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-            rusqlite::params![result_json, dispatch_id],
-        )
-        .unwrap_or(0);
+    let changed = crate::dispatch::set_dispatch_status_on_conn(
+        &conn,
+        dispatch_id,
+        "completed",
+        Some(result),
+        "turn_bridge_runtime_db_fallback",
+        Some(&["pending", "dispatched"]),
+        true,
+    )
+    .unwrap_or(0);
     if changed > 0 {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
@@ -635,10 +637,15 @@ pub(in crate::services::discord) async fn fail_dispatch_with_retry(
     if let Some(root) = crate::cli::agentdesk_runtime_root() {
         let db_path = root.join("data/agentdesk.sqlite");
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            let result_json = serde_json::json!({"error": error_msg.chars().take(500).collect::<String>(), "fallback": true}).to_string();
-            let _ = conn.execute(
-                "UPDATE task_dispatches SET status = 'failed', result = ?1, updated_at = datetime('now') WHERE id = ?2 AND status = 'pending'",
-                rusqlite::params![result_json, dispatch_id],
+            let fallback_result = serde_json::json!({"error": error_msg.chars().take(500).collect::<String>(), "fallback": true});
+            let _ = crate::dispatch::set_dispatch_status_on_conn(
+                &conn,
+                dispatch_id,
+                "failed",
+                Some(&fallback_result),
+                "turn_bridge_patch_failure_fallback",
+                Some(&["pending"]),
+                false,
             );
             // Leave reconciliation marker for onTick to pick up and run hook chain
             let _ = conn.execute(
@@ -798,18 +805,22 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
             } else {
                 completion_result_with_context("turn_bridge_db_fallback", true, adk_cwd, &hints)
             };
-            let result_json = fallback_result.to_string();
-            let changed = conn.execute(
-                "UPDATE task_dispatches SET status = 'completed', \
-                 result = ?1, \
-                 updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-                rusqlite::params![result_json, dispatch_id],
-            ).unwrap_or(0);
+            let changed = crate::dispatch::set_dispatch_status_on_conn(
+                &conn,
+                dispatch_id,
+                "completed",
+                Some(&fallback_result),
+                "turn_bridge_db_fallback",
+                Some(&["pending", "dispatched"]),
+                true,
+            )
+            .unwrap_or(0);
             if changed > 0 {
                 conn.execute(
                     "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
                     rusqlite::params![format!("reconcile_dispatch:{dispatch_id}"), dispatch_id],
-                ).ok();
+                )
+                .ok();
             }
             changed > 0
         });

@@ -1752,15 +1752,29 @@ pub async fn pm_decision(
 
     // Complete any pending pm-decision dispatches (rework handles its own completion after dispatch success)
     if body.decision != "rework" {
-        if let Ok(conn) = state.db.lock() {
-            conn.execute(
-                "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
-                 WHERE kanban_card_id = ?2 AND dispatch_type = 'pm-decision' AND status = 'pending'",
-                rusqlite::params![
-                    serde_json::to_string(&json!({"decision": body.decision, "comment": body.comment})).unwrap_or_default(),
-                    body.card_id
-                ],
-            ).ok();
+        let completion_result = json!({"decision": body.decision, "comment": body.comment});
+        let pending_dispatch_ids: Vec<String> = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id FROM task_dispatches
+                         WHERE kanban_card_id = ?1 AND dispatch_type = 'pm-decision' AND status = 'pending'",
+                    )
+                    .ok()?;
+                Some(
+                    stmt.query_map([&body.card_id], |row| row.get(0))
+                        .ok()?
+                        .filter_map(|row| row.ok())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        for dispatch_id in pending_dispatch_ids {
+            crate::dispatch::mark_dispatch_completed(&state.db, &dispatch_id, &completion_result)
+                .ok();
         }
     }
     // Clear blocked_reason
@@ -1841,15 +1855,33 @@ pub async fn pm_decision(
             ) {
                 Ok(_) => {
                     // Dispatch succeeded — now complete pm-decision dispatch + transition
-                    if let Ok(conn) = state.db.lock() {
-                        conn.execute(
-                            "UPDATE task_dispatches SET status = 'completed', result = ?1, updated_at = datetime('now') \
-                             WHERE kanban_card_id = ?2 AND dispatch_type = 'pm-decision' AND status = 'pending'",
-                            rusqlite::params![
-                                serde_json::to_string(&json!({"decision": "rework", "comment": body.comment})).unwrap_or_default(),
-                                body.card_id
-                            ],
-                        ).ok();
+                    let completion_result = json!({"decision": "rework", "comment": body.comment});
+                    let pending_dispatch_ids: Vec<String> = state
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|conn| {
+                            let mut stmt = conn
+                                .prepare(
+                                    "SELECT id FROM task_dispatches
+                                     WHERE kanban_card_id = ?1 AND dispatch_type = 'pm-decision' AND status = 'pending'",
+                                )
+                                .ok()?;
+                            Some(
+                                stmt.query_map([&body.card_id], |row| row.get(0))
+                                    .ok()?
+                                    .filter_map(|row| row.ok())
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    for dispatch_id in pending_dispatch_ids {
+                        crate::dispatch::mark_dispatch_completed(
+                            &state.db,
+                            &dispatch_id,
+                            &completion_result,
+                        )
+                        .ok();
                     }
                     // Pipeline-driven: rework target from current state's review_rework gate
                     let rework_status: String = state

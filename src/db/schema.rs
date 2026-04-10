@@ -637,6 +637,27 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_ste_created_at ON session_termination_events(created_at);",
     )?;
 
+    // #436: Dispatch status transition audit trail
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dispatch_events (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispatch_id       TEXT NOT NULL REFERENCES task_dispatches(id) ON DELETE CASCADE,
+            kanban_card_id    TEXT REFERENCES kanban_cards(id) ON DELETE SET NULL,
+            dispatch_type     TEXT,
+            from_status       TEXT,
+            to_status         TEXT NOT NULL,
+            transition_source TEXT NOT NULL,
+            payload_json      TEXT,
+            created_at        DATETIME DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_dispatch_events_dispatch_id
+            ON dispatch_events(dispatch_id);
+        CREATE INDEX IF NOT EXISTS idx_dispatch_events_card_id
+            ON dispatch_events(kanban_card_id);
+        CREATE INDEX IF NOT EXISTS idx_dispatch_events_created_at
+            ON dispatch_events(created_at);",
+    )?;
+
     // #398: Runtime supervisor decision audit
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS runtime_decisions (

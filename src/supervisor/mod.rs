@@ -271,21 +271,17 @@ impl RuntimeSupervisor {
             .db
             .separate_conn()
             .map_err(|e| format!("db connection: {e}"))?;
-        conn.execute(
-            "UPDATE task_dispatches
-             SET status = 'completed',
-                 result = ?1,
-                 updated_at = datetime('now')
-             WHERE id = ?2
-               AND status IN ('pending', 'dispatched')",
-            rusqlite::params![
-                json!({
-                    "auto_completed": true,
-                    "completion_source": "orphan_recovery"
-                })
-                .to_string(),
-                dispatch_id,
-            ],
+        crate::dispatch::set_dispatch_status_on_conn(
+            &conn,
+            dispatch_id,
+            "completed",
+            Some(&json!({
+                "auto_completed": true,
+                "completion_source": "orphan_recovery"
+            })),
+            "orphan_recovery",
+            Some(&["pending", "dispatched"]),
+            true,
         )
         .map_err(|e| format!("mark dispatch completed: {e}"))
     }
@@ -295,21 +291,17 @@ impl RuntimeSupervisor {
             .db
             .separate_conn()
             .map_err(|e| format!("db connection: {e}"))?;
-        conn.execute(
-            "UPDATE task_dispatches
-             SET status = 'failed',
-                 result = ?1,
-                 updated_at = datetime('now')
-             WHERE id = ?2
-               AND status IN ('pending', 'dispatched')",
-            rusqlite::params![
-                json!({
-                    "orphan_failed": true,
-                    "completion_source": "orphan_recovery_rollback"
-                })
-                .to_string(),
-                dispatch_id,
-            ],
+        crate::dispatch::set_dispatch_status_on_conn(
+            &conn,
+            dispatch_id,
+            "failed",
+            Some(&json!({
+                "orphan_failed": true,
+                "completion_source": "orphan_recovery_rollback"
+            })),
+            "orphan_recovery_rollback",
+            Some(&["pending", "dispatched"]),
+            false,
         )
         .map_err(|e| format!("mark dispatch failed: {e}"))
     }
