@@ -1236,9 +1236,14 @@ async fn catch_up_missed_messages(
             Ok(msgs) => msgs,
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
+                let msg = e.to_string();
                 eprintln!(
                     "  [{ts}] ⚠ catch-up: failed to fetch messages for channel {channel_id}: {e}"
                 );
+                // #429: permanent errors — remove checkpoint to avoid retrying every restart
+                if msg.contains("Missing Access") || msg.contains("Unknown Channel") {
+                    let _ = fs::remove_file(&path);
+                }
                 continue;
             }
         };
@@ -1360,6 +1365,13 @@ async fn catch_up_missed_messages(
         };
         let channel_id = ChannelId::new(channel_id_raw);
 
+        {
+            let settings = shared.settings.read().await;
+            if !settings::bot_settings_allow_channel(&settings, channel_id, false) {
+                continue;
+            }
+        }
+
         match resolve_runtime_channel_binding_status(http, channel_id).await {
             RuntimeChannelBindingStatus::Owned => {}
             RuntimeChannelBindingStatus::Unowned | RuntimeChannelBindingStatus::Unknown => continue,
@@ -1373,9 +1385,13 @@ async fn catch_up_missed_messages(
             Ok(msgs) => msgs,
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
+                let msg = e.to_string();
                 eprintln!(
                     "  [{ts}] ⚠ catch-up phase2: failed to fetch recent messages for channel {channel_id}: {e}"
                 );
+                if msg.contains("Missing Access") || msg.contains("Unknown Channel") {
+                    let _ = fs::remove_file(&path);
+                }
                 continue;
             }
         };
