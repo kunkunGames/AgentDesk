@@ -1,6 +1,12 @@
+use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+
 use crate::db::{
     Db,
-    auto_queue::{self, GenerateCandidateRecord, GenerateCardFilter},
+    auto_queue::{
+        self, AutoQueueRunRecord, GenerateCandidateRecord, GenerateCardFilter, StatusEntryRecord,
+        StatusFilter,
+    },
 };
 use crate::services::service_error::{ServiceError, ServiceResult};
 
@@ -16,6 +22,13 @@ pub struct PrepareGenerateInput {
     pub issue_numbers: Option<Vec<i64>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StatusInput {
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+    pub guild_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerateCandidate {
     pub card_id: String,
@@ -25,6 +38,94 @@ pub struct GenerateCandidate {
     pub metadata: Option<String>,
     pub github_issue_number: Option<i64>,
     pub batch_phase: i64,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct AutoQueueStatusResponse {
+    pub run: Option<AutoQueueRunView>,
+    pub entries: Vec<AutoQueueStatusEntryView>,
+    pub agents: BTreeMap<String, AutoQueueStatusCounts>,
+    pub thread_groups: BTreeMap<String, AutoQueueThreadGroupView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutoQueueRunView {
+    pub id: String,
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+    pub status: String,
+    pub timeout_minutes: i64,
+    pub ai_model: Option<String>,
+    pub ai_rationale: Option<String>,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub unified_thread: bool,
+    pub unified_thread_id: Option<String>,
+    pub max_concurrent_threads: i64,
+    pub thread_group_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutoQueueStatusEntryView {
+    pub id: String,
+    pub agent_id: String,
+    pub card_id: String,
+    pub priority_rank: i64,
+    pub reason: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub dispatched_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub card_title: Option<String>,
+    pub github_issue_number: Option<i64>,
+    pub github_repo: Option<String>,
+    pub thread_group: i64,
+    pub slot_index: Option<i64>,
+    pub batch_phase: i64,
+    pub thread_links: Vec<ThreadLinkView>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct AutoQueueStatusCounts {
+    pub pending: i64,
+    pub dispatched: i64,
+    pub done: i64,
+    pub skipped: i64,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct AutoQueueThreadGroupView {
+    pub pending: i64,
+    pub dispatched: i64,
+    pub done: i64,
+    pub skipped: i64,
+    pub entries: Vec<AutoQueueThreadGroupEntryView>,
+    pub reason: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutoQueueThreadGroupEntryView {
+    pub id: String,
+    pub card_id: String,
+    pub status: String,
+    pub github_issue_number: Option<i64>,
+    pub batch_phase: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThreadLinkView {
+    pub role: String,
+    pub label: String,
+    pub channel_id: Option<String>,
+    pub thread_id: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadLinkCandidate {
+    label: String,
+    channel_id: u64,
 }
 
 impl AutoQueueService {
@@ -130,6 +231,98 @@ impl AutoQueueService {
         auto_queue::count_cards_by_status(&conn, repo, agent_id, status)
             .map_err(|error| ServiceError::internal(format!("count cards: {error}")))
     }
+
+    pub fn status(&self, input: StatusInput) -> ServiceResult<AutoQueueStatusResponse> {
+        let conn = self
+            .db
+            .read_conn()
+            .map_err(|error| ServiceError::internal(format!("{error}")))?;
+        let filter = StatusFilter {
+            repo: input.repo.clone(),
+            agent_id: input.agent_id.clone(),
+        };
+        let Some(run_id) = auto_queue::find_latest_run_id(&conn, &filter)
+            .map_err(|error| ServiceError::internal(format!("load latest run: {error}")))?
+        else {
+            return Ok(AutoQueueStatusResponse::default());
+        };
+        let Some(run) = auto_queue::get_run(&conn, &run_id)
+            .map_err(|error| ServiceError::internal(format!("load run: {error}")))?
+        else {
+            return Ok(AutoQueueStatusResponse::default());
+        };
+
+        let records = auto_queue::list_status_entries(&conn, &run_id, &filter)
+            .map_err(|error| ServiceError::internal(format!("load status entries: {error}")))?;
+
+        let mut agent_bindings_cache: HashMap<
+            String,
+            Option<crate::db::agents::AgentChannelBindings>,
+        > = HashMap::new();
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            let bindings = if let Some(cached) = agent_bindings_cache.get(&record.agent_id) {
+                cached.clone()
+            } else {
+                let loaded =
+                    crate::db::agents::load_agent_channel_bindings(&conn, &record.agent_id)
+                        .map_err(|error| {
+                            ServiceError::internal(format!("load agent channel bindings: {error}"))
+                        })?;
+                agent_bindings_cache.insert(record.agent_id.clone(), loaded.clone());
+                loaded
+            };
+            let thread_links =
+                build_entry_thread_links(&record, bindings.as_ref(), input.guild_id.as_deref());
+            entries.push(AutoQueueStatusEntryView::from_record(record, thread_links));
+        }
+
+        let mut agents = BTreeMap::<String, AutoQueueStatusCounts>::new();
+        let mut thread_groups = BTreeMap::<String, AutoQueueThreadGroupView>::new();
+        for entry in &entries {
+            increment_status_counts(
+                agents.entry(entry.agent_id.clone()).or_default(),
+                entry.status.as_str(),
+            );
+
+            let group = thread_groups
+                .entry(entry.thread_group.to_string())
+                .or_default();
+            increment_thread_group_counts(group, entry.status.as_str());
+            if group
+                .reason
+                .as_deref()
+                .map(|value| value.is_empty())
+                .unwrap_or(true)
+            {
+                group.reason = entry.reason.clone();
+            }
+            group.entries.push(AutoQueueThreadGroupEntryView {
+                id: entry.id.clone(),
+                card_id: entry.card_id.clone(),
+                status: entry.status.clone(),
+                github_issue_number: entry.github_issue_number,
+                batch_phase: entry.batch_phase,
+            });
+        }
+
+        for group in thread_groups.values_mut() {
+            group.status = if group.dispatched > 0 {
+                "active".to_string()
+            } else if group.pending > 0 {
+                "pending".to_string()
+            } else {
+                "done".to_string()
+            };
+        }
+
+        Ok(AutoQueueStatusResponse {
+            run: Some(AutoQueueRunView::from(run)),
+            entries,
+            agents,
+            thread_groups,
+        })
+    }
 }
 
 impl From<GenerateCandidateRecord> for GenerateCandidate {
@@ -142,6 +335,49 @@ impl From<GenerateCandidateRecord> for GenerateCandidate {
             metadata: record.metadata,
             github_issue_number: record.github_issue_number,
             batch_phase: 0,
+        }
+    }
+}
+
+impl From<AutoQueueRunRecord> for AutoQueueRunView {
+    fn from(record: AutoQueueRunRecord) -> Self {
+        Self {
+            id: record.id,
+            repo: record.repo,
+            agent_id: record.agent_id,
+            status: record.status,
+            timeout_minutes: record.timeout_minutes,
+            ai_model: record.ai_model,
+            ai_rationale: record.ai_rationale,
+            created_at: record.created_at,
+            completed_at: record.completed_at,
+            unified_thread: false,
+            unified_thread_id: None,
+            max_concurrent_threads: record.max_concurrent_threads,
+            thread_group_count: record.thread_group_count,
+        }
+    }
+}
+
+impl AutoQueueStatusEntryView {
+    fn from_record(record: StatusEntryRecord, thread_links: Vec<ThreadLinkView>) -> Self {
+        Self {
+            id: record.id,
+            agent_id: record.agent_id,
+            card_id: record.card_id,
+            priority_rank: record.priority_rank,
+            reason: record.reason,
+            status: record.status,
+            created_at: record.created_at,
+            dispatched_at: record.dispatched_at,
+            completed_at: record.completed_at,
+            card_title: record.card_title,
+            github_issue_number: record.github_issue_number,
+            github_repo: record.github_repo,
+            thread_group: record.thread_group,
+            slot_index: record.slot_index,
+            batch_phase: record.batch_phase,
+            thread_links,
         }
     }
 }
@@ -161,4 +397,174 @@ fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<Str
     }
 
     states
+}
+
+fn increment_status_counts(counts: &mut AutoQueueStatusCounts, status: &str) {
+    match status {
+        "pending" => counts.pending += 1,
+        "dispatched" => counts.dispatched += 1,
+        "done" => counts.done += 1,
+        "skipped" => counts.skipped += 1,
+        _ => {}
+    }
+}
+
+fn increment_thread_group_counts(group: &mut AutoQueueThreadGroupView, status: &str) {
+    match status {
+        "pending" => group.pending += 1,
+        "dispatched" => group.dispatched += 1,
+        "done" => group.done += 1,
+        "skipped" => group.skipped += 1,
+        _ => {}
+    }
+}
+
+fn build_entry_thread_links(
+    record: &StatusEntryRecord,
+    bindings: Option<&crate::db::agents::AgentChannelBindings>,
+    guild_id: Option<&str>,
+) -> Vec<ThreadLinkView> {
+    let thread_map = parse_card_thread_bindings(record.channel_thread_map.as_deref());
+    let active_thread_id = normalized_optional(record.active_thread_id.as_deref());
+    let candidates = build_thread_link_candidates(bindings);
+
+    if !thread_map.is_empty() {
+        let mut links = Vec::new();
+        let mut used_channels = BTreeMap::<u64, ()>::new();
+
+        for candidate in &candidates {
+            let Some(thread_id) = thread_map.get(&candidate.channel_id) else {
+                continue;
+            };
+            used_channels.insert(candidate.channel_id, ());
+            links.push(thread_link_view(
+                candidate.label.as_str(),
+                candidate.label.clone(),
+                Some(candidate.channel_id),
+                thread_id,
+                guild_id,
+            ));
+        }
+
+        for (channel_id, thread_id) in &thread_map {
+            if used_channels.insert(*channel_id, ()).is_none() {
+                links.push(thread_link_view(
+                    "channel",
+                    format!("channel:{channel_id}"),
+                    Some(*channel_id),
+                    thread_id,
+                    guild_id,
+                ));
+            }
+        }
+
+        return links;
+    }
+
+    active_thread_id
+        .map(|thread_id| {
+            vec![thread_link_view(
+                "active",
+                "active".to_string(),
+                None,
+                &thread_id,
+                guild_id,
+            )]
+        })
+        .unwrap_or_default()
+}
+
+fn build_thread_link_candidates(
+    bindings: Option<&crate::db::agents::AgentChannelBindings>,
+) -> Vec<ThreadLinkCandidate> {
+    let Some(bindings) = bindings else {
+        return Vec::new();
+    };
+
+    let work_channel = bindings
+        .primary_channel()
+        .as_deref()
+        .and_then(crate::server::routes::dispatches::parse_channel_id);
+    let review_channel = bindings
+        .counter_model_channel()
+        .as_deref()
+        .and_then(crate::server::routes::dispatches::parse_channel_id);
+
+    match (work_channel, review_channel) {
+        (Some(work_channel), Some(review_channel)) if work_channel == review_channel => {
+            vec![ThreadLinkCandidate {
+                label: "shared".to_string(),
+                channel_id: work_channel,
+            }]
+        }
+        (Some(work_channel), Some(review_channel)) => vec![
+            ThreadLinkCandidate {
+                label: "work".to_string(),
+                channel_id: work_channel,
+            },
+            ThreadLinkCandidate {
+                label: "review".to_string(),
+                channel_id: review_channel,
+            },
+        ],
+        (Some(work_channel), None) => vec![ThreadLinkCandidate {
+            label: "work".to_string(),
+            channel_id: work_channel,
+        }],
+        (None, Some(review_channel)) => vec![ThreadLinkCandidate {
+            label: "review".to_string(),
+            channel_id: review_channel,
+        }],
+        (None, None) => Vec::new(),
+    }
+}
+
+fn parse_card_thread_bindings(raw: Option<&str>) -> BTreeMap<u64, String> {
+    raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .map(|map| {
+            map.into_iter()
+                .filter_map(|(channel_id_raw, thread_value)| {
+                    let channel_id = channel_id_raw.parse::<u64>().ok()?;
+                    let thread_id = thread_value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| thread_value.as_u64().map(|value| value.to_string()))?;
+                    Some((channel_id, thread_id))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn thread_link_view(
+    role: &str,
+    label: String,
+    channel_id: Option<u64>,
+    thread_id: &str,
+    guild_id: Option<&str>,
+) -> ThreadLinkView {
+    let thread_id = thread_id.trim().to_string();
+    let guild_id = guild_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    ThreadLinkView {
+        role: role.to_string(),
+        label,
+        channel_id: channel_id.map(|value| value.to_string()),
+        url: guild_id
+            .map(|guild_id| format!("https://discord.com/channels/{guild_id}/{thread_id}")),
+        thread_id,
+    }
+}
+
+fn normalized_optional(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }

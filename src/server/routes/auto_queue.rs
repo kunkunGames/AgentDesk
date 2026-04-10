@@ -3265,61 +3265,16 @@ pub async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-    // Find latest run (NULL agent_id/repo matches any filter)
-    let mut run_filter = "1=1".to_string();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if let Some(ref repo) = query.repo {
-        run_filter.push_str(&format!(
-            " AND (repo = ?{} OR repo IS NULL OR repo = '')",
-            params.len() + 1
-        ));
-        params.push(Box::new(repo.clone()));
+    match state
+        .auto_queue_service()
+        .status(crate::services::auto_queue::StatusInput {
+            repo: query.repo,
+            agent_id: query.agent_id,
+            guild_id: state.config.discord.guild_id.clone(),
+        }) {
+        Ok(response) => (StatusCode::OK, Json(json!(response))),
+        Err(error) => error.into_json_response(),
     }
-    if let Some(ref agent_id) = query.agent_id {
-        run_filter.push_str(&format!(
-            " AND (agent_id = ?{} OR agent_id IS NULL OR agent_id = '')",
-            params.len() + 1
-        ));
-        params.push(Box::new(agent_id.clone()));
-    }
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let run_id: Option<String> = conn
-        .query_row(
-            &format!(
-                "SELECT id FROM auto_queue_runs WHERE {run_filter} ORDER BY created_at DESC LIMIT 1"
-            ),
-            param_refs.as_slice(),
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(run_id) = run_id else {
-        return (
-            StatusCode::OK,
-            Json(json!({ "run": null, "entries": [], "agents": {} })),
-        );
-    };
-
-    (
-        StatusCode::OK,
-        Json(queue_status_json(
-            &conn,
-            &run_id,
-            query.repo.as_deref(),
-            query.agent_id.as_deref(),
-            guild_id,
-        )),
-    )
 }
 
 /// PATCH /api/auto-queue/entries/{id}
