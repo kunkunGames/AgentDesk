@@ -256,6 +256,7 @@ fn collect_stream_output(rx: mpsc::Receiver<StreamMessage>) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::await_with_timeout;
+    use std::future;
     use std::time::Duration;
 
     #[tokio::test]
@@ -271,10 +272,11 @@ mod tests {
 
     #[tokio::test]
     async fn await_with_timeout_errors_after_deadline() {
-        let error = await_with_timeout("selection stage", Duration::from_millis(10), async {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            Ok::<_, String>("late".to_string())
-        })
+        let error = await_with_timeout(
+            "selection stage",
+            Duration::from_millis(10),
+            future::pending::<Result<String, String>>(),
+        )
         .await
         .expect_err("timeout should fail");
 
