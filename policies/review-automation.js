@@ -18,32 +18,17 @@ function notifyPmdPendingDecision(cardId, reason) {
   escalate(cardId, reason);
 }
 
-function countCompletedReviewWork(cardId) {
-  var rows = agentdesk.db.query(
-    "SELECT COUNT(*) AS completed_count FROM task_dispatches " +
-    "WHERE kanban_card_id = ? AND dispatch_type IN ('implementation', 'rework') " +
-    "AND status = 'completed'",
-    [cardId]
-  );
-  if (rows.length === 0) return 0;
-  var raw = rows[0].completed_count;
-  if (typeof raw === "number") return raw;
-  var parsed = parseInt(raw, 10);
-  return isNaN(parsed) ? 0 : parsed;
-}
-
 var reviewAutomation = {
   name: "review-automation",
   priority: 50,
 
+  // typed-facade-slice:start review-entry
   // ── Review Enter — counter-model review trigger ───────────
   onReviewEnter: function(payload) {
-    var cards = agentdesk.db.query(
-      "SELECT id, repo_id, assigned_agent_id, review_round, review_status, deferred_dod_json FROM kanban_cards WHERE id = ?",
-      [payload.card_id]
-    );
-    if (cards.length === 0) return;
-    var card = cards[0];
+    var card = agentdesk.cards.get(payload.card_id);
+    if (!card) return;
+    var entry = agentdesk.review.entryContext(card.id);
+    if (!entry) return;
     var cfg = agentdesk.pipeline.resolveForCard(card.id);
     var terminalState = agentdesk.pipeline.terminalState(cfg);
     var pendingState = agentdesk.pipeline.forceOnlyTargets(agentdesk.pipeline.nextGatedTarget(agentdesk.pipeline.kickoffState(cfg), cfg), cfg)[0];
@@ -59,10 +44,7 @@ var reviewAutomation = {
     var reviewEnabled = agentdesk.config.get("review_enabled");
     if (reviewEnabled === "false" || reviewEnabled === false) {
       agentdesk.kanban.setStatus(card.id, terminalState, true);
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = ?",
-        [card.id]
-      );
+      agentdesk.kanban.setReviewStatus(card.id, null, {blocked_reason: null});
       agentdesk.log.info("[review] Review disabled, card " + card.id + " → " + terminalState);
       return;
     }
@@ -71,10 +53,7 @@ var reviewAutomation = {
     var counterModelEnabled = agentdesk.config.get("counter_model_review_enabled");
     if (counterModelEnabled === false || counterModelEnabled === "false") {
       agentdesk.kanban.setStatus(card.id, terminalState, true);
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = ?",
-        [card.id]
-      );
+      agentdesk.kanban.setReviewStatus(card.id, null, {blocked_reason: null});
       agentdesk.log.info("[review] Counter-model disabled, card " + card.id + " → " + terminalState);
       return;
     }
@@ -82,21 +61,17 @@ var reviewAutomation = {
     // #335: Only advance review_round when new implementation/rework actually
     // finished since the previous round. Reopen loops without fresh work should
     // reuse the existing round instead of consuming it.
-    var currentRound = Number(card.review_round || 0);
-    var completedWorkCount = countCompletedReviewWork(card.id);
-    var shouldAdvanceRound = currentRound === 0 || completedWorkCount > currentRound;
-    var newRound = currentRound;
-    if (shouldAdvanceRound) {
-      newRound = currentRound + 1;
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET review_round = ?, updated_at = datetime('now') WHERE id = ? AND status != ?",
-        [newRound, card.id, terminalState]
-      );
-    } else {
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET updated_at = datetime('now') WHERE id = ? AND status != ?",
-        [card.id, terminalState]
-      );
+    var currentRound = Number(entry.current_round || 0);
+    var completedWorkCount = Number(entry.completed_work_count || 0);
+    var shouldAdvanceRound = !!entry.should_advance_round;
+    var newRound = Number(entry.next_round || currentRound);
+    agentdesk.review.recordEntry(
+      card.id,
+      shouldAdvanceRound
+        ? {review_round: newRound, exclude_status: terminalState}
+        : {exclude_status: terminalState}
+    );
+    if (!shouldAdvanceRound) {
       agentdesk.log.info(
         "[review] Reusing review round R" + currentRound + " for " + card.id +
         " (completed work dispatches=" + completedWorkCount + ")"
@@ -126,13 +101,10 @@ var reviewAutomation = {
     if (!counterChannelId) {
       // No counter-model channel → PM decision (not silent done skip)
       agentdesk.kanban.setStatus(card.id, pendingState);
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'No counter-model channel for review — PM decision needed' WHERE id = ?",
-        [card.id]
-      );
-      agentdesk.kanban.setReviewStatus(card.id, null, {suggestion_pending_at: null});
-      // #117: sync canonical review state
-      agentdesk.reviewState.sync(card.id, "idle");
+      agentdesk.kanban.setReviewStatus(card.id, null, {
+        suggestion_pending_at: null,
+        blocked_reason: "No counter-model channel for review — PM decision needed"
+      });
       agentdesk.log.info("[review] No counter channel for " + card.assigned_agent_id + " → " + pendingState);
       notifyPmdPendingDecision(card.id, "카운터모델 채널 없음 — PM 판단 필요");
       return;
@@ -155,6 +127,7 @@ var reviewAutomation = {
       agentdesk.log.warn("[review] Review dispatch failed: " + e);
     }
   },
+  // typed-facade-slice:end review-entry
 
   // ── Dispatch Completed — review/decision verdict ──────────
   onDispatchCompleted: function(payload) {
