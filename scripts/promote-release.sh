@@ -30,6 +30,15 @@ CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonc
 ALLOW_ADHOC_RELEASE_SIGN="${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-0}"
 DASHBOARD_SOURCE=""
 
+SKIP_REVIEW=false
+SKIP_HEALTH=false
+for arg in "$@"; do
+    case "$arg" in
+        --skip-review) SKIP_REVIEW=true ;;
+        --skip-health) SKIP_HEALTH=true ;;
+    esac
+done
+
 echo "═══ ADK Promote Dev → Release ═══"
 
 sign_binary_with_fallback() {
@@ -234,7 +243,7 @@ EOF
 
 # Safety check: review must be passed unless review automation is disabled
 # in runtime config, or unless --skip-review is passed explicitly.
-if [[ "${1:-}" != "--skip-review" ]]; then
+if [ "$SKIP_REVIEW" != true ]; then
     REVIEW_OVERRIDE=$(_review_gate_override_source || true)
     if [ -n "$REVIEW_OVERRIDE" ]; then
         IFS=$'\t' read -r REVIEW_OVERRIDE_RUNTIME REVIEW_OVERRIDE_KEY REVIEW_OVERRIDE_DB <<<"$REVIEW_OVERRIDE"
@@ -256,21 +265,25 @@ fi
 
 # Safety check: dev must be healthy
 DEV_PORT="${AGENTDESK_DEV_PORT:-8799}"
-echo "▸ Waiting for dev health on :${DEV_PORT}..."
-DEV_READY=false
-if wait_for_http_service_health "$PLIST_DEV" "$DEV_PORT" "$PROMOTE_HEALTH_RETRIES" "$PROMOTE_HEALTH_DELAY_SECS" 0 1; then
-    DEV_READY=true
-fi
-
-if [ "$DEV_READY" != true ]; then
-    echo "✗ Dev is not healthy after $PROMOTE_HEALTH_RETRIES attempts — aborting promotion"
-    exit 1
-fi
-
-if _health_json_reconcile_only "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then
-    echo "▸ Dev is serving (provider reconcile in progress) — proceeding"
+if [ "$SKIP_HEALTH" = true ]; then
+    echo "▸ Skipping dev health check (--skip-health)"
 else
-    echo "▸ Dev is healthy — proceeding"
+    echo "▸ Waiting for dev health on :${DEV_PORT}..."
+    DEV_READY=false
+    if wait_for_http_service_health "$PLIST_DEV" "$DEV_PORT" "$PROMOTE_HEALTH_RETRIES" "$PROMOTE_HEALTH_DELAY_SECS" 0 1; then
+        DEV_READY=true
+    fi
+
+    if [ "$DEV_READY" != true ]; then
+        echo "✗ Dev is not healthy after $PROMOTE_HEALTH_RETRIES attempts — aborting promotion"
+        exit 1
+    fi
+
+    if _health_json_reconcile_only "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then
+        echo "▸ Dev is serving (provider reconcile in progress) — proceeding"
+    else
+        echo "▸ Dev is healthy — proceeding"
+    fi
 fi
 
 if ! DASHBOARD_SOURCE=$(_resolve_dashboard_source); then
