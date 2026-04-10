@@ -1111,6 +1111,76 @@ async fn kanban_list_cards_with_filter() {
 }
 
 #[tokio::test]
+async fn kanban_list_cards_filters_to_registered_repos_unless_repo_id_is_explicit() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_repo(&db, "repo-registered");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, repo_id, title, status, priority, created_at, updated_at
+             ) VALUES (
+                'c-registered', 'repo-registered', 'Registered Card', 'ready', 'medium',
+                datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, repo_id, title, status, priority, created_at, updated_at
+             ) VALUES (
+                'c-unregistered', 'repo-unregistered', 'Unregistered Card', 'ready', 'medium',
+                datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cards = json["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], "c-registered");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards?repo_id=repo-unregistered")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cards = json["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["id"], "c-unregistered");
+}
+
+#[tokio::test]
 async fn kanban_get_card() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -7442,6 +7512,69 @@ async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() 
         backlog_status, "ready",
         "selected backlog card must be promoted before queue generation"
     );
+}
+
+#[tokio::test]
+async fn auto_queue_generate_empty_state_reports_filtered_counts() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-generate-counts");
+    seed_agent(&db, "other-agent");
+    seed_repo(&db, "test-repo");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, repo_id, github_issue_number,
+                created_at, updated_at
+            ) VALUES (
+                'card-generate-counts-backlog', 'Generate Counts Backlog', 'backlog', 'medium',
+                'agent-generate-counts', 'test-repo', 5410, datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, repo_id, github_issue_number,
+                created_at, updated_at
+            ) VALUES (
+                'card-generate-counts-other-agent', 'Other Agent Ready', 'ready', 'high',
+                'other-agent', 'test-repo', 5411, datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "agent-generate-counts",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["message"], "No dispatchable cards found");
+    assert_eq!(json["counts"]["backlog"], 1);
+    assert_eq!(json["counts"]["ready"], 0);
 }
 
 #[tokio::test]
