@@ -39,13 +39,11 @@ toolName = [
 ]
 decision = "allow"
 priority = 950
-modes = ["plan"]
 
 [[rule]]
 toolName = "*"
 decision = "deny"
 priority = 900
-modes = ["plan"]
 denyMessage = "AgentDesk meeting_readonly mode allows only filesystem read/search tools."
 "#;
 
@@ -933,6 +931,7 @@ mod tests {
         let policy = std::fs::read_to_string(policy_path).expect("policy file should exist");
         assert!(policy.contains("read_many_files"));
         assert!(policy.contains("toolName = \"*\""));
+        assert!(!policy.contains("modes ="));
         assert!(!args.iter().any(|arg| arg == "-y"));
     }
 

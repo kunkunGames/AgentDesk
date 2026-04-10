@@ -305,9 +305,13 @@ impl DiscordSession {
     }
 
     pub(super) fn restore_provider_session(&mut self, session_id: Option<String>) {
+        let same_session =
+            self.session_id.is_some() && self.session_id.as_deref() == session_id.as_deref();
         self.session_id = session_id;
-        self.memento_context_loaded = self.session_id.is_some();
-        self.memento_reflected = false;
+        if !same_session {
+            self.memento_context_loaded = false;
+            self.memento_reflected = false;
+        }
     }
 
     pub(super) fn note_memento_context_loaded(&mut self) {

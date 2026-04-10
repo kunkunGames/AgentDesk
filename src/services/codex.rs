@@ -1154,6 +1154,7 @@ mod tests {
                 "--skip-git-repo-check".to_string(),
                 "--json".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--".to_string(),
                 "hello".to_string(),
             ]
         );

@@ -2942,19 +2942,19 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
         .unwrap();
 
     assert_eq!(
-        card_status, "review",
-        "true orphan implementation dispatch must still promote the card into review"
+        card_status, "requested",
+        "true orphan implementation dispatch must roll the card back to the dispatchable preflight state"
     );
     assert_eq!(
-        dispatch_status, "completed",
-        "true orphan implementation dispatch must be marked completed"
+        dispatch_status, "failed",
+        "true orphan implementation dispatch must not be marked completed without session work"
     );
     assert!(
         dispatch_result
             .as_deref()
             .unwrap_or("")
-            .contains("orphan_recovery"),
-        "true orphan recovery must keep the orphan_recovery completion marker"
+            .contains("orphan_recovery_rollback"),
+        "true orphan recovery must keep the orphan_recovery rollback marker"
     );
     assert_eq!(decision_signal, "OrphanCandidate");
     assert_eq!(chosen_action, "Resume");
@@ -3045,8 +3045,8 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
         "post-complete race guard must keep a backlogged card from reviving into review"
     );
     assert_eq!(
-        dispatch_status, "completed",
-        "the orphan implementation dispatch may still complete, but must not resurrect the card"
+        dispatch_status, "failed",
+        "the orphan implementation dispatch may still be failed, but must not resurrect the card"
     );
     assert_eq!(
         review_dispatch_count, 0,

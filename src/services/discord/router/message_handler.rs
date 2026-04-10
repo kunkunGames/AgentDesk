@@ -701,7 +701,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
     let mut session_id =
         resolve_session_id_for_current_turn(session_id, reset_session_for_model_change);
-    let mut memento_context_loaded = if reset_session_for_model_change {
+    let memento_context_loaded = if reset_session_for_model_change {
         false
     } else {
         memento_context_loaded
@@ -724,7 +724,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
                     session.restore_provider_session(restored.clone());
                 }
-                memento_context_loaded = true;
             }
             session_id = restored;
         }
@@ -2890,6 +2889,7 @@ mod tests {
         let mut session = make_session(Some("/tmp/project".to_string()), None);
 
         session.restore_provider_session(Some("session-1".to_string()));
+        session.note_memento_context_loaded();
         assert!(should_skip_memento_recall(
             &memento,
             session.memento_context_loaded
