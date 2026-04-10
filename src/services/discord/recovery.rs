@@ -435,12 +435,16 @@ pub(super) async fn restore_inflight_turns(
                         // All retries exhausted — DB fallback via pool, then runtime-root
                         if !dispatch_completed {
                             let pool_ok = db.separate_conn().ok().map_or(false, |conn| {
-                                let changed = conn.execute(
-                                    "UPDATE task_dispatches SET status = 'completed', \
-                                     result = ?1, \
-                                     updated_at = datetime('now') WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-                                    rusqlite::params![fallback_result.to_string(), did.as_str()],
-                                ).unwrap_or(0);
+                                let changed = crate::dispatch::set_dispatch_status_on_conn(
+                                    &conn,
+                                    did.as_str(),
+                                    "completed",
+                                    Some(&fallback_result),
+                                    "recovery_db_fallback",
+                                    Some(&["pending", "dispatched"]),
+                                    true,
+                                )
+                                .unwrap_or(0);
                                 if changed > 0 {
                                     conn.execute(
                                         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",

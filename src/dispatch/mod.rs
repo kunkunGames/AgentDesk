@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::db::Db;
@@ -564,20 +565,33 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
     dispatch_id: &str,
     reason: Option<&str>,
 ) -> rusqlite::Result<usize> {
-    let cancelled = if let Some(reason) = reason {
-        conn.execute(
-            "UPDATE task_dispatches \
-             SET status = 'cancelled', result = ?2, updated_at = datetime('now') \
-             WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-            rusqlite::params![dispatch_id, json!({ "reason": reason }).to_string()],
-        )?
+    let cancel_payload = reason.map(|reason| json!({ "reason": reason }));
+    let cancelled = if let Some(payload) = cancel_payload.as_ref() {
+        set_dispatch_status_on_conn(
+            conn,
+            dispatch_id,
+            "cancelled",
+            Some(payload),
+            "cancel_dispatch",
+            Some(&["pending", "dispatched"]),
+            false,
+        )
+        .map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+        })?
     } else {
-        conn.execute(
-            "UPDATE task_dispatches \
-             SET status = 'cancelled', updated_at = datetime('now') \
-             WHERE id = ?1 AND status IN ('pending', 'dispatched')",
-            [dispatch_id],
-        )?
+        set_dispatch_status_on_conn(
+            conn,
+            dispatch_id,
+            "cancelled",
+            None,
+            "cancel_dispatch",
+            Some(&["pending", "dispatched"]),
+            false,
+        )
+        .map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+        })?
     };
 
     let dispatch_status: Option<String> = conn
@@ -613,6 +627,16 @@ pub fn cancel_active_dispatches_for_card_on_conn(
     card_id: &str,
     reason: Option<&str>,
 ) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM task_dispatches
+         WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
+    )?;
+    let live_dispatch_ids: Vec<String> = stmt
+        .query_map([card_id], |row| row.get(0))?
+        .filter_map(|row| row.ok())
+        .collect();
+    drop(stmt);
+
     conn.execute(
         "UPDATE sessions \
          SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END, \
@@ -620,28 +644,28 @@ pub fn cancel_active_dispatches_for_card_on_conn(
          WHERE active_dispatch_id IN (
              SELECT id FROM task_dispatches
              WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')
-         )",
+        )",
         [card_id],
     )?;
 
-    if let Some(reason) = reason {
-        conn.execute(
-            "UPDATE task_dispatches \
-             SET status = 'cancelled', result = ?2, updated_at = datetime('now') \
-             WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
-            rusqlite::params![
-                card_id,
-                json!({ "reason": reason, "completion_source": "force_transition" }).to_string()
-            ],
+    let cancel_payload =
+        reason.map(|reason| json!({ "reason": reason, "completion_source": "force_transition" }));
+    let mut cancelled = 0usize;
+    for dispatch_id in live_dispatch_ids {
+        cancelled += set_dispatch_status_on_conn(
+            conn,
+            &dispatch_id,
+            "cancelled",
+            cancel_payload.as_ref(),
+            "force_transition",
+            Some(&["pending", "dispatched"]),
+            false,
         )
-    } else {
-        conn.execute(
-            "UPDATE task_dispatches \
-             SET status = 'cancelled', updated_at = datetime('now') \
-             WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
-            [card_id],
-        )
+        .map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+        })?;
     }
+    Ok(cancelled)
 }
 
 fn dispatch_uses_alt_channel(dispatch_type: &str) -> bool {
@@ -1125,6 +1149,146 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
     Ok(true)
 }
 
+pub(crate) fn record_dispatch_status_event_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+    from_status: Option<&str>,
+    to_status: &str,
+    transition_source: &str,
+    payload: Option<&serde_json::Value>,
+) -> rusqlite::Result<()> {
+    let (kanban_card_id, dispatch_type): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT kanban_card_id, dispatch_type FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None));
+
+    conn.execute(
+        "INSERT INTO dispatch_events (
+            dispatch_id,
+            kanban_card_id,
+            dispatch_type,
+            from_status,
+            to_status,
+            transition_source,
+            payload_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            dispatch_id,
+            kanban_card_id,
+            dispatch_type,
+            from_status,
+            to_status,
+            transition_source,
+            payload.map(|value| value.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn set_dispatch_status_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+    to_status: &str,
+    result: Option<&serde_json::Value>,
+    transition_source: &str,
+    allowed_from: Option<&[&str]>,
+    touch_completed_at: bool,
+) -> Result<usize> {
+    let current_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current_status) = current_status else {
+        return Ok(0);
+    };
+
+    if let Some(allowed_from) = allowed_from {
+        if !allowed_from
+            .iter()
+            .any(|status| *status == current_status.as_str())
+        {
+            return Ok(0);
+        }
+    }
+
+    conn.execute_batch("SAVEPOINT dispatch_status_transition")?;
+    let update_result = (|| -> Result<usize> {
+        let changed = match (result, touch_completed_at) {
+            (Some(result), true) => conn.execute(
+                "UPDATE task_dispatches
+                 SET status = ?1,
+                     result = ?2,
+                     updated_at = datetime('now'),
+                     completed_at = CASE
+                         WHEN ?1 = 'completed' THEN COALESCE(completed_at, datetime('now'))
+                         ELSE completed_at
+                     END
+                 WHERE id = ?3 AND status = ?4",
+                rusqlite::params![to_status, result.to_string(), dispatch_id, current_status],
+            )?,
+            (Some(result), false) => conn.execute(
+                "UPDATE task_dispatches
+                 SET status = ?1,
+                     result = ?2,
+                     updated_at = datetime('now')
+                 WHERE id = ?3 AND status = ?4",
+                rusqlite::params![to_status, result.to_string(), dispatch_id, current_status],
+            )?,
+            (None, true) => conn.execute(
+                "UPDATE task_dispatches
+                 SET status = ?1,
+                     updated_at = datetime('now'),
+                     completed_at = CASE
+                         WHEN ?1 = 'completed' THEN COALESCE(completed_at, datetime('now'))
+                         ELSE completed_at
+                     END
+                 WHERE id = ?2 AND status = ?3",
+                rusqlite::params![to_status, dispatch_id, current_status],
+            )?,
+            (None, false) => conn.execute(
+                "UPDATE task_dispatches
+                 SET status = ?1,
+                     updated_at = datetime('now')
+                 WHERE id = ?2 AND status = ?3",
+                rusqlite::params![to_status, dispatch_id, current_status],
+            )?,
+        };
+
+        if changed > 0 && current_status != to_status {
+            record_dispatch_status_event_on_conn(
+                conn,
+                dispatch_id,
+                Some(current_status.as_str()),
+                to_status,
+                transition_source,
+                result,
+            )?;
+        }
+        Ok(changed)
+    })();
+
+    match update_result {
+        Ok(changed) => {
+            conn.execute_batch("RELEASE dispatch_status_transition")?;
+            Ok(changed)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO dispatch_status_transition;
+                 RELEASE dispatch_status_transition;",
+            );
+            Err(err)
+        }
+    }
+}
+
 /// #155: Insert dispatch row + apply DispatchAttached transition intents atomically.
 ///
 /// Both the `task_dispatches` INSERT and the card-state intents execute inside
@@ -1198,6 +1362,14 @@ fn apply_dispatch_attached_intents(
             }
             return Err(e.into());
         }
+        record_dispatch_status_event_on_conn(
+            conn,
+            dispatch_id,
+            None,
+            "pending",
+            "create_dispatch",
+            None,
+        )?;
         if !options.skip_outbox {
             ensure_dispatch_notify_outbox_on_conn(conn, dispatch_id, to_agent_id, card_id, title)?;
         }
@@ -1256,18 +1428,17 @@ pub fn mark_dispatch_completed(
     dispatch_id: &str,
     result: &serde_json::Value,
 ) -> Result<usize> {
-    let result_str = serde_json::to_string(result)?;
     let conn = db
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
-    let changed = conn.execute(
-        "UPDATE task_dispatches
-         SET status = 'completed',
-             result = ?1,
-             updated_at = datetime('now'),
-             completed_at = COALESCE(completed_at, datetime('now')) \
-         WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-        rusqlite::params![result_str, dispatch_id],
+    let changed = set_dispatch_status_on_conn(
+        &conn,
+        dispatch_id,
+        "completed",
+        Some(result),
+        "mark_dispatch_completed",
+        Some(&["pending", "dispatched"]),
+        true,
     )?;
     Ok(changed)
 }
@@ -1290,22 +1461,23 @@ fn complete_dispatch_inner(
     dispatch_id: &str,
     result: &serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let result_str = serde_json::to_string(result)?;
-
     let conn = db
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
 
     validate_dispatch_completion_evidence_on_conn(&conn, dispatch_id, result)?;
 
-    let changed = conn.execute(
-        "UPDATE task_dispatches
-         SET status = 'completed',
-         result = ?1,
-             updated_at = datetime('now'),
-             completed_at = COALESCE(completed_at, datetime('now')) \
-         WHERE id = ?2 AND status IN ('pending', 'dispatched')",
-        rusqlite::params![result_str, dispatch_id],
+    let changed = set_dispatch_status_on_conn(
+        &conn,
+        dispatch_id,
+        "completed",
+        Some(result),
+        result
+            .get("completion_source")
+            .and_then(|value| value.as_str())
+            .unwrap_or("complete_dispatch"),
+        Some(&["pending", "dispatched"]),
+        true,
     )?;
 
     if changed == 0 {
@@ -1694,6 +1866,26 @@ mod tests {
         .unwrap()
     }
 
+    fn load_dispatch_events(
+        conn: &rusqlite::Connection,
+        dispatch_id: &str,
+    ) -> Vec<(Option<String>, String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT from_status, to_status, transition_source
+                 FROM dispatch_events
+                 WHERE dispatch_id = ?1
+                 ORDER BY id ASC",
+            )
+            .unwrap();
+        stmt.query_map([dispatch_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .filter_map(|row| row.ok())
+        .collect()
+    }
+
     fn seed_assistant_response_for_dispatch(db: &Db, dispatch_id: &str, message: &str) {
         crate::db::session_transcripts::persist_turn(
             db,
@@ -1994,6 +2186,15 @@ mod tests {
             .unwrap();
         assert_eq!(entry_status, "pending");
         assert!(entry_dispatch_id.is_none());
+        assert_eq!(
+            load_dispatch_events(&conn, "dispatch-aq"),
+            vec![(
+                Some("dispatched".to_string()),
+                "cancelled".to_string(),
+                "cancel_dispatch".to_string()
+            )],
+            "dispatch cancellation must be audited"
+        );
     }
 
     #[test]
@@ -2083,6 +2284,11 @@ mod tests {
             count_notify_outbox(&conn, &dispatch_id),
             1,
             "core creation must atomically enqueue exactly one notify outbox row"
+        );
+        assert_eq!(
+            load_dispatch_events(&conn, &dispatch_id),
+            vec![(None, "pending".to_string(), "create_dispatch".to_string())],
+            "dispatch creation must record the initial pending event"
         );
         drop(conn);
 
@@ -2430,6 +2636,61 @@ mod tests {
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["result"]["completion_source"], "session_idle");
         assert_eq!(completed["result"]["auto_completed"], true);
+    }
+
+    #[test]
+    fn dispatch_events_capture_dispatched_and_completed_transitions() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-events", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-events",
+            "agent-1",
+            "implementation",
+            "Event trail",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        {
+            let conn = db.separate_conn().unwrap();
+            set_dispatch_status_on_conn(
+                &conn,
+                &dispatch_id,
+                "dispatched",
+                None,
+                "test_dispatch_outbox",
+                Some(&["pending"]),
+                false,
+            )
+            .unwrap();
+        }
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented");
+
+        finalize_dispatch(&db, &engine, &dispatch_id, "test_complete", None).unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        assert_eq!(
+            load_dispatch_events(&conn, &dispatch_id),
+            vec![
+                (None, "pending".to_string(), "create_dispatch".to_string()),
+                (
+                    Some("pending".to_string()),
+                    "dispatched".to_string(),
+                    "test_dispatch_outbox".to_string()
+                ),
+                (
+                    Some("dispatched".to_string()),
+                    "completed".to_string(),
+                    "test_complete".to_string()
+                ),
+            ],
+            "dispatch event log must preserve ordered status transitions"
+        );
     }
 
     // ── #173 Dedup tests ─────────────────────────────────────────────

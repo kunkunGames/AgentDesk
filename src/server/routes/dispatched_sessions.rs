@@ -1295,12 +1295,25 @@ pub(crate) async fn force_kill_session_impl(
         .ok();
 
         if let Some(ref did) = active_dispatch_id {
-            conn.execute(
-                "UPDATE task_dispatches SET status = 'failed', updated_at = datetime('now') \
-                 WHERE id = ?1 AND status NOT IN ('completed')",
-                [did],
-            )
-            .ok();
+            let current_status: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM task_dispatches WHERE id = ?1",
+                    [did],
+                    |row| row.get(0),
+                )
+                .ok();
+            if current_status.as_deref() != Some("completed") {
+                crate::dispatch::set_dispatch_status_on_conn(
+                    &conn,
+                    did,
+                    "failed",
+                    None,
+                    "force_kill_session",
+                    None,
+                    false,
+                )
+                .ok();
+            }
 
             // Prepare retry metadata from the failed dispatch (read while lock held)
             if retry {

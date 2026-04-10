@@ -184,42 +184,42 @@ impl DispatchService {
             .lock()
             .map_err(|e| ServiceError::internal(format!("{e}")))?;
 
-        let mut sets: Vec<String> = Vec::new();
-        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut idx = 1;
-
         if let Some(status) = input.status {
-            sets.push(format!("status = ?{}", idx));
-            values.push(Box::new(status));
-            idx += 1;
-        }
-
-        if let Some(result) = input.result {
+            let changed = dispatch::set_dispatch_status_on_conn(
+                &conn,
+                id,
+                &status,
+                input.result.as_ref(),
+                "api_update_dispatch",
+                None,
+                false,
+            )
+            .map_err(|error| ServiceError::internal(format!("{error}")))?;
+            if changed == 0 {
+                return Err(ServiceError::not_found("dispatch not found"));
+            }
+        } else if let Some(result) = input.result {
+            let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let result_str = serde_json::to_string(&result).unwrap_or_default();
-            sets.push(format!("result = ?{}", idx));
+            let mut sets = vec!["result = ?1".to_string()];
             values.push(Box::new(result_str));
-            idx += 1;
-        }
-
-        if sets.is_empty() {
+            sets.push("updated_at = datetime('now')".to_string());
+            values.push(Box::new(id.to_string()));
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|value| value.as_ref()).collect();
+            match conn.execute(
+                &format!(
+                    "UPDATE task_dispatches SET {} WHERE id = ?2",
+                    sets.join(", ")
+                ),
+                params_ref.as_slice(),
+            ) {
+                Ok(0) => return Err(ServiceError::not_found("dispatch not found")),
+                Ok(_) => {}
+                Err(error) => return Err(ServiceError::internal(format!("{error}"))),
+            }
+        } else {
             return Err(ServiceError::bad_request("no fields to update"));
-        }
-
-        sets.push("updated_at = datetime('now')".to_string());
-
-        let sql = format!(
-            "UPDATE task_dispatches SET {} WHERE id = ?{}",
-            sets.join(", "),
-            idx
-        );
-        values.push(Box::new(id.to_string()));
-
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            values.iter().map(|value| value.as_ref()).collect();
-        match conn.execute(&sql, params_ref.as_slice()) {
-            Ok(0) => return Err(ServiceError::not_found("dispatch not found")),
-            Ok(_) => {}
-            Err(error) => return Err(ServiceError::internal(format!("{error}"))),
         }
 
         conn.query_row(
