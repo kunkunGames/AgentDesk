@@ -81,8 +81,41 @@ struct LegacyBotSettingsEntry {
 
 fn load_legacy_bot_settings_json() -> Option<serde_json::Value> {
     let path = bot_settings_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<serde_json::Value>(&content).ok()
+    let content = fs::read_to_string(&path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+
+    // Retire the legacy file if it has no runtime-only data (channel_model_overrides).
+    // Auth fields are already in agentdesk.yaml; this file is only needed for overrides.
+    let has_runtime_data = json
+        .as_object()
+        .map(|obj| {
+            obj.values().any(|entry| {
+                entry
+                    .get("channel_model_overrides")
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|m| !m.is_empty())
+            })
+        })
+        .unwrap_or(false);
+
+    if !has_runtime_data {
+        let migrated = path.with_extension("json.migrated");
+        if let Err(e) = fs::rename(&path, &migrated) {
+            tracing::warn!(
+                "Failed to retire '{}' → '{}': {e}",
+                path.display(),
+                migrated.display()
+            );
+        } else {
+            tracing::info!(
+                "[bot-settings] Retired '{}' → '{}' (auth migrated to agentdesk.yaml)",
+                path.display(),
+                migrated.display()
+            );
+        }
+    }
+
+    Some(json)
 }
 
 fn load_legacy_bot_settings_entry(token: &str) -> LegacyBotSettingsEntry {
