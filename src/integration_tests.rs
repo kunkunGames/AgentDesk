@@ -34,6 +34,13 @@ mod tests {
         PolicyEngine::new(&config, db.clone()).unwrap()
     }
 
+    fn test_engine_with_dir(db: &db::Db, dir: &std::path::Path) -> PolicyEngine {
+        let mut config = crate::config::Config::default();
+        config.policies.dir = dir.to_path_buf();
+        config.policies.hot_reload = false;
+        PolicyEngine::new(&config, db.clone()).unwrap()
+    }
+
     struct WorktreeCommitOverrideGuard;
 
     impl WorktreeCommitOverrideGuard {
@@ -77,6 +84,32 @@ mod tests {
             match self.previous.take() {
                 Some(value) => unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) },
                 None => unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") },
+            }
+        }
+    }
+
+    struct RuntimeRootOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl RuntimeRootOverride {
+        fn new(path: &std::path::Path) -> Self {
+            let guard = repo_dir_env_lock().lock().unwrap();
+            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RuntimeRootOverride {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
             }
         }
     }
@@ -283,6 +316,95 @@ mod tests {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, value],
+        )
+        .unwrap();
+    }
+
+    fn kv_value(db: &db::Db, key: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row("SELECT value FROM kv_meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .ok()
+    }
+
+    fn relative_local_time(minutes_ago: i64) -> String {
+        (chrono::Local::now() - chrono::Duration::minutes(minutes_ago))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    fn setup_timeouts_policy_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("policies")
+            .join("timeouts.js");
+        fs::copy(&source, dir.path().join("timeouts.js")).unwrap();
+        fs::write(
+            dir.path().join("zz-timeouts-test-overrides.js"),
+            r#"
+            agentdesk.http.post = function(url, body) {
+                var countRows = agentdesk.db.query(
+                    "SELECT value FROM kv_meta WHERE key = ?1",
+                    ["test_http_count"]
+                );
+                var nextCount = countRows.length > 0
+                    ? (parseInt(countRows[0].value, 10) || 0) + 1
+                    : 1;
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_http_count", "" + nextCount]
+                );
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_http_last", JSON.stringify({ url: url, body: body })]
+                );
+                return {
+                    ok: true,
+                    new_deadline_ms: Date.now() + (((body && body.extend_secs) || 0) * 1000)
+                };
+            };
+            var rawExec = agentdesk.exec;
+            agentdesk.exec = function(cmd, args) {
+                if (cmd === "tmux" && args && args[0] === "list-panes") {
+                    return "0";
+                }
+                return rawExec(cmd, args);
+            };
+            agentdesk.registerPolicy({
+                name: "timeouts-test-overrides",
+                priority: 9999
+            });
+            "#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn write_codex_inflight(
+        runtime_root: &std::path::Path,
+        channel_id: &str,
+        started_at: &str,
+        updated_at: &str,
+        session_key: &str,
+        tmux_name: &str,
+        dispatch_id: Option<&str>,
+    ) {
+        let inflight_dir = runtime_root.join("runtime/discord_inflight/codex");
+        fs::create_dir_all(&inflight_dir).unwrap();
+        fs::write(
+            inflight_dir.join(format!("{channel_id}.json")),
+            serde_json::to_string(&json!({
+                "provider": "codex",
+                "channel_id": channel_id,
+                "channel_name": "Test Channel",
+                "tmux_session_name": tmux_name,
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "session_key": session_key,
+                "dispatch_id": dispatch_id,
+            }))
+            .unwrap(),
         )
         .unwrap();
     }
@@ -3954,5 +4076,219 @@ mod tests {
         };
         assert_eq!(entry_status, "dispatched");
         assert_eq!(entry_dispatch_id, latest_dispatch_id);
+    }
+
+    #[test]
+    fn scenario_421_deadlock_recent_output_extends_watchdog() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeRootOverride::new(runtime_root.path());
+        let policies_dir = setup_timeouts_policy_dir();
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, policies_dir.path());
+        let session_key = "host:tmux-421-recent";
+
+        seed_agent(&db);
+        set_kv(&db, "deadlock_manager_channel_id", "999");
+        set_kv(&db, "server_port", "8791");
+        set_kv(
+            &db,
+            &format!("deadlock_check:{session_key}"),
+            r#"{"count":2,"ts":0}"#,
+        );
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat, created_at) \
+                 VALUES (?1, 'agent-1', 'codex', 'working', datetime('now', '-31 minutes'), datetime('now', '-90 minutes'))",
+                [session_key],
+            )
+            .unwrap();
+        }
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(90),
+            &relative_local_time(1),
+            session_key,
+            "tmux-421-recent",
+            None,
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick30s", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            kv_value(&db, &format!("deadlock_check:{session_key}")),
+            None,
+            "recent output should clear the deadlock counter"
+        );
+        assert_eq!(kv_value(&db, "test_http_count").as_deref(), Some("1"));
+
+        let http_last: serde_json::Value =
+            serde_json::from_str(&kv_value(&db, "test_http_last").unwrap()).unwrap();
+        assert_eq!(http_last["body"]["extend_secs"], 1800);
+        assert!(
+            http_last["url"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("/api/turns/111/extend-timeout"),
+            "watchdog extension must target the inflight channel"
+        );
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "channel:999");
+        assert!(messages[0].1.contains("정상 진행 확인, +30분 연장"));
+        assert!(!messages[0].1.contains("watchdog 연장 실패"));
+    }
+
+    #[test]
+    fn scenario_421_deadlock_stale_output_only_marks_suspected_deadlock() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeRootOverride::new(runtime_root.path());
+        let policies_dir = setup_timeouts_policy_dir();
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, policies_dir.path());
+        let session_key = "host:tmux-421-stale";
+
+        seed_agent(&db);
+        set_kv(&db, "deadlock_manager_channel_id", "999");
+        set_kv(&db, "server_port", "8791");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat, created_at) \
+                 VALUES (?1, 'agent-1', 'codex', 'working', datetime('now', '-31 minutes'), datetime('now', '-90 minutes'))",
+                [session_key],
+            )
+            .unwrap();
+        }
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(90),
+            &relative_local_time(31),
+            session_key,
+            "tmux-421-stale",
+            None,
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick30s", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let counter: serde_json::Value =
+            serde_json::from_str(&kv_value(&db, &format!("deadlock_check:{session_key}")).unwrap())
+                .unwrap();
+        assert_eq!(counter["count"], 1);
+        assert!(kv_value(&db, "test_http_count").is_none());
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "channel:999");
+        assert!(messages[0].1.contains("[Deadlock 의심]"));
+        assert!(messages[0].1.contains("무응답: 30분 (연장 1/3)"));
+    }
+
+    #[test]
+    fn scenario_421_long_turn_alerts_start_at_30_minutes() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeRootOverride::new(runtime_root.path());
+        let policies_dir = setup_timeouts_policy_dir();
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, policies_dir.path());
+        let session_key = "host:tmux-421-long";
+
+        seed_agent(&db);
+        set_kv(&db, "deadlock_manager_channel_id", "999");
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(20),
+            &relative_local_time(1),
+            session_key,
+            "tmux-421-long",
+            None,
+        );
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "20-minute turn must not trigger the removed 15-minute alert tier"
+        );
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(31),
+            &relative_local_time(1),
+            session_key,
+            "tmux-421-long",
+            None,
+        );
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].1.contains("경과: 31분 (30분 단계)"));
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+        assert_eq!(
+            message_outbox_rows(&db).len(),
+            1,
+            "same tier must not alert twice"
+        );
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(61),
+            &relative_local_time(1),
+            session_key,
+            "tmux-421-long",
+            None,
+        );
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].1.contains("경과: 61분 (60분 단계)"));
+
+        write_codex_inflight(
+            runtime_root.path(),
+            "111",
+            &relative_local_time(121),
+            &relative_local_time(1),
+            session_key,
+            "tmux-421-long",
+            None,
+        );
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(messages.len(), 3);
+        assert!(messages[2].1.contains("경과: 121분 (120분 단계)"));
     }
 }
