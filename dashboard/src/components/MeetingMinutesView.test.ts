@@ -257,7 +257,7 @@ describe("getMeetingReferenceHashes", () => {
           thread_hash: "#thread-456def",
         }),
       ),
-    ).toEqual(["#meeting-123abc", "#thread-456def"]);
+    ).toEqual(["#123abc", "#456def"]);
   });
 
   it("filters out missing hashes without changing the remaining stable hash", () => {
@@ -268,6 +268,6 @@ describe("getMeetingReferenceHashes", () => {
           thread_hash: null,
         }),
       ),
-    ).toEqual(["#meeting-123abc"]);
+    ).toEqual(["#123abc"]);
   });
 });

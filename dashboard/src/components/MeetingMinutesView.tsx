@@ -25,6 +25,7 @@ import MeetingProviderFlow, {
   getProviderMeta,
   providerFlowCaption,
 } from "./MeetingProviderFlow";
+import { getDisplayMeetingReferenceHashes } from "./meetingReferenceHash";
 import MarkdownContent from "./common/MarkdownContent";
 
 const STORAGE_KEY = "pcd_meeting_channel_id";
@@ -156,9 +157,7 @@ export function pruneFixedParticipantRoleIdsForLoadedChannel(
 export function getMeetingReferenceHashes(
   meeting: Pick<RoundTableMeeting, "meeting_hash" | "thread_hash">,
 ): string[] {
-  return [meeting.meeting_hash, meeting.thread_hash].filter(
-    (hash): hash is string => Boolean(hash),
-  );
+  return getDisplayMeetingReferenceHashes(meeting);
 }
 
 export async function openMeetingDetailWithFallback(

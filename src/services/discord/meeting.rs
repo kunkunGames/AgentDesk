@@ -219,6 +219,13 @@ fn thread_query_hash(thread_id: &str) -> String {
     )
 }
 
+fn display_query_hash(hash: &str) -> String {
+    hash.strip_prefix("#meeting-")
+        .or_else(|| hash.strip_prefix("#thread-"))
+        .map(|value| format!("#{value}"))
+        .unwrap_or_else(|| hash.to_string())
+}
+
 fn clamp_max_participants(max_participants: usize) -> usize {
     max_participants.clamp(MIN_MEETING_PARTICIPANTS, DEFAULT_MAX_PARTICIPANTS)
 }
@@ -773,10 +780,20 @@ pub(crate) async fn start_meeting_with_reviewer(
     } else {
         None
     };
+    let meeting_hash_display = display_query_hash(&meeting_hash);
     let thread_hash_line = thread_hash
         .as_deref()
+        .map(display_query_hash)
         .map(|hash| format!("\n스레드 해시: {hash}"))
         .unwrap_or_default();
+
+    tracing::info!(
+        meeting_id = %meeting_id,
+        meeting_hash = %meeting_hash,
+        thread_hash = thread_hash.as_deref().unwrap_or("-"),
+        thread_channel_id = %msg_channel.get(),
+        "[meeting] query hashes assigned"
+    );
 
     rate_limit_wait(shared, msg_channel).await;
     let _ = msg_channel
@@ -785,7 +802,7 @@ pub(crate) async fn start_meeting_with_reviewer(
             CreateMessage::new().content(format!(
                 "📋 **라운드 테이블 회의 시작**\n안건: {}\n회의 해시: {}{}\n진행 프로바이더: {} / 리뷰 프로바이더: {}\n참여자 선정 중...",
                 agenda,
-                meeting_hash,
+                meeting_hash_display,
                 thread_hash_line,
                 primary_provider.display_name(),
                 reviewer_provider.display_name()
@@ -2068,28 +2085,30 @@ fn build_meeting_markdown(m: &Meeting) -> String {
         .clone()
         .unwrap_or_else(|| "_회의록이 작성되지 않았습니다._".to_string());
     let meeting_hash = meeting_query_hash(&m.id);
+    let meeting_hash_display = display_query_hash(&meeting_hash);
     let thread_id = m
         .thread_id
         .map(|id| id.to_string())
         .unwrap_or_else(|| "null".to_string());
-    let thread_hash_display = m
-        .thread_id
-        .map(|id| thread_query_hash(&id.to_string()))
+    let thread_hash = m.thread_id.map(|id| thread_query_hash(&id.to_string()));
+    let thread_hash_display = thread_hash
+        .as_deref()
+        .map(display_query_hash)
         .unwrap_or_else(|| "-".to_string());
-    let thread_hash_frontmatter = if thread_hash_display == "-" {
-        "null".to_string()
-    } else {
-        format!("\"{thread_hash_display}\"")
-    };
+    let thread_hash_frontmatter = thread_hash
+        .as_deref()
+        .map(|value| format!("\"{value}\""))
+        .unwrap_or_else(|| "null".to_string());
 
     format!(
-        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\nmeeting_hash: \"{meeting_hash}\"\nthread_id: {thread_id}\nthread_hash: {thread_hash_frontmatter}\nprimary_provider: {primary_provider}\nreviewer_provider: {reviewer_provider}\nauto_memory_write: false\nauto_memory_capture: false\nmemory_postprocessing_policy: approval_required\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여자**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n> **회의 해시**: {meeting_hash}\n> **스레드 해시**: {thread_hash_display}\n> **진행 프로바이더**: {primary_provider}\n> **리뷰 프로바이더**: {reviewer_provider}\n> **메모리 후처리**: 자동 memory write/capture 비활성화, 승인 기반만 허용\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
+        "---\ntags: [meeting, cookingheart]\ndate: {date}\nstatus: {status}\nparticipants: [{participants}]\nagenda: \"{agenda}\"\nmeeting_id: {id}\nmeeting_hash: \"{meeting_hash}\"\nthread_id: {thread_id}\nthread_hash: {thread_hash_frontmatter}\nprimary_provider: {primary_provider}\nreviewer_provider: {reviewer_provider}\nauto_memory_write: false\nauto_memory_capture: false\nmemory_postprocessing_policy: approval_required\n---\n\n# 회의록: {agenda}\n\n> **날짜**: {datetime}\n> **참여자**: {participants}\n> **라운드**: {rounds}/{max_rounds}\n> **상태**: {status}\n> **회의 해시**: {meeting_hash_display}\n> **스레드 해시**: {thread_hash_display}\n> **진행 프로바이더**: {primary_provider}\n> **리뷰 프로바이더**: {reviewer_provider}\n> **메모리 후처리**: 자동 memory write/capture 비활성화, 승인 기반만 허용\n\n---\n\n## 요약\n\n{summary}\n\n---\n\n## 전체 발언 기록\n\n{transcript}\n",
         date = date_str,
         status = status_str,
         participants = participants_inline,
         agenda = m.agenda,
         id = m.id,
         meeting_hash = meeting_hash,
+        meeting_hash_display = meeting_hash_display,
         thread_id = thread_id,
         thread_hash_frontmatter = thread_hash_frontmatter,
         thread_hash_display = thread_hash_display,
@@ -2222,8 +2241,8 @@ mod tests {
         ActiveMeetingSlot, Meeting, MeetingAgentConfig, MeetingConfig, MeetingStatus,
         MeetingUtterance, ProviderKind, ResolvedMemorySettings, SummaryAgentConfig,
         agent_metadata_card, build_meeting_markdown, build_meeting_status_payload,
-        effective_round_count, meeting_query_hash, meeting_slot_state, parse_meeting_start_text,
-        summary_agent_context, thread_query_hash,
+        display_query_hash, effective_round_count, meeting_query_hash, meeting_slot_state,
+        parse_meeting_start_text, summary_agent_context, thread_query_hash,
     };
     use serde_json::json;
 
@@ -2423,14 +2442,19 @@ mod tests {
         meeting.thread_id = Some(123);
 
         let md = build_meeting_markdown(&meeting);
+        let canonical_meeting_hash = meeting_query_hash("mtg-a");
+        let canonical_thread_hash = thread_query_hash("123");
 
-        assert!(md.contains(&format!(
-            "meeting_hash: \"{}\"",
-            meeting_query_hash("mtg-a")
-        )));
+        assert!(md.contains(&format!("meeting_hash: \"{}\"", canonical_meeting_hash)));
         assert!(md.contains("thread_id: 123"));
-        assert!(md.contains(&format!("thread_hash: \"{}\"", thread_query_hash("123"))));
-        assert!(md.contains(&format!("> **회의 해시**: {}", meeting_query_hash("mtg-a"))));
-        assert!(md.contains(&format!("> **스레드 해시**: {}", thread_query_hash("123"))));
+        assert!(md.contains(&format!("thread_hash: \"{}\"", canonical_thread_hash)));
+        assert!(md.contains(&format!(
+            "> **회의 해시**: {}",
+            display_query_hash(&canonical_meeting_hash)
+        )));
+        assert!(md.contains(&format!(
+            "> **스레드 해시**: {}",
+            display_query_hash(&canonical_thread_hash)
+        )));
     }
 }
