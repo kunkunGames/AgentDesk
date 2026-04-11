@@ -341,23 +341,24 @@ TURN_WAIT=0
 _health_busy_count() {
     local health_json
     health_json=$(curl -sf "http://127.0.0.1:${REL_PORT}/api/health" 2>/dev/null) || { echo "0"; return; }
-    local active finalizing
+    local active finalizing queue_depth
     active=$(echo "$health_json" | grep -o '"global_active":[0-9]*' | cut -d: -f2 || echo "0")
     finalizing=$(echo "$health_json" | grep -o '"global_finalizing":[0-9]*' | cut -d: -f2 || echo "0")
-    echo $(( ${active:-0} + ${finalizing:-0} ))
+    queue_depth=$(echo "$health_json" | grep -o '"queue_depth":[0-9]*' | cut -d: -f2 || echo "0")
+    echo $(( ${active:-0} + ${finalizing:-0} + ${queue_depth:-0} ))
 }
 BUSY=$(_health_busy_count)
 if [ "${BUSY}" -gt 0 ]; then
-    echo "▸ Waiting for active/finalizing turns to finish (${BUSY} busy)..."
+    echo "▸ Waiting for active/finalizing turns and queued interventions to drain (${BUSY} pending)..."
     while [ "${BUSY}" -gt 0 ] && [ "$TURN_WAIT" -lt "$TURN_WAIT_MAX" ]; do
         sleep 2
         TURN_WAIT=$((TURN_WAIT + 2))
         BUSY=$(_health_busy_count)
     done
     if [ "${BUSY}" -gt 0 ]; then
-        echo "  ⚠ ${BUSY} turn(s) still busy after ${TURN_WAIT_MAX}s — proceeding anyway"
+        echo "  ⚠ ${BUSY} pending item(s) remain after ${TURN_WAIT_MAX}s — proceeding anyway"
     else
-        echo "  ✓ All turns finished (${TURN_WAIT}s)"
+        echo "  ✓ Active turns and queued interventions drained (${TURN_WAIT}s)"
     fi
 fi
 
