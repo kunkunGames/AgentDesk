@@ -1042,6 +1042,8 @@ fn persist_meeting_query_hashes(
     thread_id: Option<&str>,
 ) -> rusqlite::Result<()> {
     let meeting_hash = meeting_query_hash(meeting_id);
+    let normalized_thread_id = thread_id.map(str::trim).filter(|value| !value.is_empty());
+    let thread_hash = normalized_thread_id.map(thread_query_hash);
     conn.execute(
         "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
         rusqlite::params![
@@ -1057,14 +1059,10 @@ fn persist_meeting_query_hashes(
         ],
     )?;
 
-    if let Some(thread_id) = thread_id.map(str::trim).filter(|value| !value.is_empty()) {
-        let thread_hash = thread_query_hash(thread_id);
+    if let (Some(thread_id), Some(thread_hash)) = (normalized_thread_id, thread_hash.as_deref()) {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params![
-                format!("meeting_thread_hash:{meeting_id}"),
-                thread_hash.clone()
-            ],
+            rusqlite::params![format!("meeting_thread_hash:{meeting_id}"), thread_hash],
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
@@ -1074,6 +1072,13 @@ fn persist_meeting_query_hashes(
             ],
         )?;
     }
+
+    tracing::info!(
+        meeting_id = %meeting_id,
+        meeting_hash = %meeting_hash,
+        thread_hash = thread_hash.as_deref().unwrap_or("-"),
+        "[meetings] persisted meeting query hashes"
+    );
 
     Ok(())
 }

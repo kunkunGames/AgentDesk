@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { RoundTableMeeting, RoundTableEntry } from "../types";
 import MeetingProviderFlow, { formatProviderFlow, providerFlowCaption } from "./MeetingProviderFlow";
+import { formatMeetingReferenceHash, getDisplayMeetingReferenceHashes } from "./meetingReferenceHash";
 import MarkdownContent from "./common/MarkdownContent";
 import { useI18n } from "../i18n";
 
@@ -36,6 +37,9 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
   const entries = meeting.entries || [];
   const rounds = new Set(entries.map((e) => e.round));
   const sortedRounds = Array.from(rounds).sort((a, b) => a - b);
+  const referenceHashes = getDisplayMeetingReferenceHashes(meeting);
+  const meetingHashDisplay = formatMeetingReferenceHash(meeting.meeting_hash);
+  const threadHashDisplay = formatMeetingReferenceHash(meeting.thread_hash);
 
   const spriteNum = (roleId: string | null) => {
     if (!roleId) return 1;
@@ -89,9 +93,7 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
                   {formatProviderFlow(meeting.primary_provider, meeting.reviewer_provider)}
                 </span>
               )}
-              {[meeting.meeting_hash, meeting.thread_hash]
-                .filter((hash): hash is string => Boolean(hash))
-                .map((hash) => (
+              {referenceHashes.map((hash) => (
                   <span
                     key={hash}
                     className="rounded-full px-2 py-0.5 font-mono text-[11px]"
@@ -139,11 +141,11 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
                 minute: "2-digit",
               })}
             />
-            {meeting.meeting_hash && (
-              <MetaCard label={t({ ko: "회의 #해시", en: "Meeting #Hash" })} value={meeting.meeting_hash} />
+            {meetingHashDisplay && (
+              <MetaCard label={t({ ko: "회의 해시", en: "Meeting Hash" })} value={meetingHashDisplay} />
             )}
-            {meeting.thread_hash && (
-              <MetaCard label={t({ ko: "스레드 #해시", en: "Thread #Hash" })} value={meeting.thread_hash} />
+            {threadHashDisplay && (
+              <MetaCard label={t({ ko: "스레드 해시", en: "Thread Hash" })} value={threadHashDisplay} />
             )}
           </div>
 
