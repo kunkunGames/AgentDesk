@@ -150,6 +150,97 @@ fn git_commit(repo_dir: &std::path::Path, message: &str) -> String {
 }
 
 #[tokio::test]
+async fn protected_domain_router_keeps_internal_and_hook_auth_exemptions() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let mut config = crate::config::Config::default();
+    config.server.auth_token = Some("secret-token".to_string());
+    let state = AppState::test_state_with_config(db, engine, config);
+    let app = protected_api_domain(
+        axum::Router::new()
+            .route(
+                "/internal/ping",
+                axum::routing::get(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/hook/session",
+                axum::routing::post(|| async { StatusCode::CREATED }),
+            )
+            .route("/settings", axum::routing::get(|| async { StatusCode::OK })),
+        state.clone(),
+    )
+    .with_state(state);
+
+    let internal_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/internal/ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(internal_response.status(), StatusCode::OK);
+
+    let hook_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hook/session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hook_response.status(), StatusCode::CREATED);
+
+    let protected_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn public_domain_router_wraps_plain_server_errors_in_app_error_json() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let state = AppState::test_state(db, engine);
+    let app = public_api_domain(axum::Router::new().route(
+        "/boom",
+        axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    ))
+    .with_state(state);
+
+    let response = app
+        .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "internal server error");
+    assert_eq!(json["code"], "internal");
+}
+
+#[tokio::test]
 async fn health_api_http_reports_observability_metrics_and_degraded_outbox_backlog() {
     let db = test_db();
     let engine = test_engine(&db);
