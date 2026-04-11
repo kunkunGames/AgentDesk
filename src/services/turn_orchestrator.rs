@@ -1279,6 +1279,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_drain_all_persists_every_mailbox_queue() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Claude;
+        let token_hash = "mailbox-restart-drain";
+        let channel_a = ChannelId::new(141);
+        let channel_b = ChannelId::new(142);
+        let registry = ChannelMailboxRegistry::default();
+        let now = Instant::now();
+
+        registry
+            .handle(channel_a)
+            .replace_queue(
+                vec![make_intervention(1, "first queued item", now)],
+                QueuePersistenceContext::new(&provider, token_hash, None),
+            )
+            .await;
+        registry
+            .handle(channel_b)
+            .replace_queue(
+                vec![
+                    make_intervention(2, "second queued item", now),
+                    make_intervention(3, "third queued item", now),
+                ],
+                QueuePersistenceContext::new(&provider, token_hash, Some(9_999)),
+            )
+            .await;
+
+        let dispatch_role_overrides = dashmap::DashMap::new();
+        dispatch_role_overrides.insert(channel_b, ChannelId::new(9_999));
+
+        let queued_total = registry
+            .restart_drain_all(&provider, token_hash, &dispatch_role_overrides)
+            .await;
+
+        assert_eq!(queued_total, 3);
+
+        let items_a = read_saved_items(tmp.path(), &provider, token_hash, channel_a);
+        assert_eq!(items_a.len(), 1);
+        assert_eq!(items_a[0].text, "first queued item");
+        assert_eq!(items_a[0].override_channel_id, None);
+
+        let items_b = read_saved_items(tmp.path(), &provider, token_hash, channel_b);
+        assert_eq!(items_b.len(), 2);
+        assert_eq!(items_b[0].text, "second queued item");
+        assert_eq!(items_b[1].text, "third queued item");
+        assert_eq!(items_b[0].override_channel_id, Some(9_999));
+        assert_eq!(items_b[1].override_channel_id, Some(9_999));
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    #[tokio::test]
     async fn cancel_active_turn_marks_token_without_clearing_turn_state() {
         let registry = ChannelMailboxRegistry::default();
         let handle = registry.handle(ChannelId::new(44));
