@@ -1,5 +1,6 @@
 use crate::db::Db;
 use crate::engine::sql_guard::detect_core_table_write;
+use crate::error::{AppError, ErrorCode};
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 
 // ── DB ops ───────────────────────────────────────────────────────
@@ -47,8 +48,9 @@ pub(super) fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             var rawGuard = agentdesk.db.__guard_raw;
 
             agentdesk.db.query = function(sql, params) {
-                var json = rawQuery(sql, JSON.stringify(params || []));
-                return JSON.parse(json);
+                var result = JSON.parse(rawQuery(sql, JSON.stringify(params || [])));
+                if (result.error) throw new Error(result.error);
+                return result;
             };
             agentdesk.db.execute = function(sql, params) {
                 var guard = JSON.parse(rawGuard(sql));
@@ -60,8 +62,9 @@ pub(super) fn register_db_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 // dispatch.create and kanban.setStatus use intent/transition model;
                 // converting db.execute to intents requires typed intents for each
                 // mutation pattern (card_review_state, kv_meta, agents, etc.).
-                var json = rawExec(sql, JSON.stringify(params || []));
-                return JSON.parse(json);
+                var result = JSON.parse(rawExec(sql, JSON.stringify(params || [])));
+                if (result.error) throw new Error(result.error);
+                return result;
             };
         })();
         undefined;
@@ -84,7 +87,11 @@ fn db_guard_raw(sql: &str, origin: &str) -> String {
 }
 
 fn db_query_raw(db: &Db, sql: &str, params_json: &str) -> String {
-    let params: Vec<serde_json::Value> = serde_json::from_str(params_json).unwrap_or_default();
+    let params: Vec<serde_json::Value> =
+        match parse_params_json(params_json, "agentdesk.db.query.parse_params", sql) {
+            Ok(params) => params,
+            Err(error_json) => return error_json,
+        };
     let bind: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
 
     // Use a separate read-only connection to avoid blocking the write Mutex.
@@ -92,12 +99,24 @@ fn db_query_raw(db: &Db, sql: &str, params_json: &str) -> String {
     // while request handlers hold the write lock.
     let conn = match db.read_conn() {
         Ok(c) => c,
-        Err(e) => return format!(r#"{{"__error":"db read: {e}"}}"#),
+        Err(e) => {
+            return AppError::internal(format!("db read: {e}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.query.read_conn")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
     };
 
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
-        Err(e) => return format!(r#"{{"__error":"prepare: {e}"}}"#),
+        Err(e) => {
+            return AppError::internal(format!("prepare: {e}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.query.prepare")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
     };
 
     let col_count = stmt.column_count();
@@ -120,11 +139,32 @@ fn db_query_raw(db: &Db, sql: &str, params_json: &str) -> String {
         Ok(serde_json::Value::Object(map))
     }) {
         Ok(r) => r,
-        Err(e) => return format!(r#"{{"__error":"query: {e}"}}"#),
+        Err(e) => {
+            return AppError::internal(format!("query: {e}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.query.query_map")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
     };
 
-    let result: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-    serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string())
+    let result: Vec<serde_json::Value> = match rows.collect::<Result<Vec<_>, _>>() {
+        Ok(result) => result,
+        Err(error) => {
+            return AppError::internal(format!("row decode: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.query.collect_rows")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
+    };
+    serde_json::to_string(&result).unwrap_or_else(|error| {
+        AppError::internal(format!("serialize query result: {error}"))
+            .with_code(ErrorCode::Policy)
+            .with_operation("agentdesk.db.query.serialize")
+            .with_context("sql", compact_sql(sql))
+            .into_policy_json_string()
+    })
 }
 
 fn db_execute_raw(db: &Db, sql: &str, params_json: &str) -> String {
@@ -132,7 +172,11 @@ fn db_execute_raw(db: &Db, sql: &str, params_json: &str) -> String {
         return serde_json::json!({ "__error": violation.error_message() }).to_string();
     }
 
-    let params: Vec<serde_json::Value> = serde_json::from_str(params_json).unwrap_or_default();
+    let params: Vec<serde_json::Value> =
+        match parse_params_json(params_json, "agentdesk.db.execute.parse_params", sql) {
+            Ok(params) => params,
+            Err(error_json) => return error_json,
+        };
     let bind: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
 
     // Use a separate read-write connection to avoid holding the main
@@ -140,7 +184,13 @@ fn db_execute_raw(db: &Db, sql: &str, params_json: &str) -> String {
     // concurrent writers via busy_timeout (5s).
     let conn = match db.separate_conn() {
         Ok(c) => c,
-        Err(e) => return format!(r#"{{"__error":"db conn: {e}"}}"#),
+        Err(e) => {
+            return AppError::internal(format!("db conn: {e}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.execute.separate_conn")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
     };
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind
@@ -150,10 +200,41 @@ fn db_execute_raw(db: &Db, sql: &str, params_json: &str) -> String {
 
     let changes = match conn.execute(sql, params_ref.as_slice()) {
         Ok(n) => n,
-        Err(e) => return format!(r#"{{"__error":"execute: {e}"}}"#),
+        Err(e) => {
+            return AppError::internal(format!("execute: {e}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("agentdesk.db.execute.execute")
+                .with_context("sql", compact_sql(sql))
+                .into_policy_json_string();
+        }
     };
 
     format!(r#"{{"changes":{changes}}}"#)
+}
+
+fn parse_params_json(
+    params_json: &str,
+    operation: &str,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    serde_json::from_str(params_json).map_err(|error| {
+        AppError::bad_request(format!("invalid params_json: {error}"))
+            .with_code(ErrorCode::Policy)
+            .with_operation(operation)
+            .with_context("sql", compact_sql(sql))
+            .into_policy_json_string()
+    })
+}
+
+fn compact_sql(sql: &str) -> String {
+    const MAX_SQL_CONTEXT_LEN: usize = 120;
+
+    let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() <= MAX_SQL_CONTEXT_LEN {
+        compact
+    } else {
+        format!("{}...", &compact[..MAX_SQL_CONTEXT_LEN])
+    }
 }
 
 fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {

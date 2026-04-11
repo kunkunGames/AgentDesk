@@ -5,7 +5,7 @@ use crate::db::{
     Db,
     kanban::{self, KanbanCardRecord, ListCardsFilter},
 };
-use crate::services::service_error::{ServiceError, ServiceResult};
+use crate::services::service_error::{ErrorCode, ServiceError, ServiceResult};
 
 #[derive(Clone)]
 pub struct KanbanService {
@@ -69,10 +69,11 @@ impl KanbanService {
     }
 
     pub fn list_cards(&self, input: ListCardsInput) -> ServiceResult<ListCardsResponse> {
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("list_cards.read_conn")
+        })?;
         let registered_repo_ids = kanban::list_registered_repo_ids(&conn).unwrap_or_default();
         let records = kanban::list_cards(
             &conn,
@@ -83,7 +84,11 @@ impl KanbanService {
             },
             &registered_repo_ids,
         )
-        .map_err(|error| ServiceError::internal(format!("list cards: {error}")))?;
+        .map_err(|error| {
+            ServiceError::internal(format!("list cards: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("list_cards.query")
+        })?;
 
         Ok(ListCardsResponse {
             cards: records.into_iter().map(KanbanCardView::from).collect(),

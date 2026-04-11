@@ -30,6 +30,12 @@ fn is_five_min_policy_tick(count: u64) -> bool {
     count != 0 && count % FIVE_MIN_POLICY_TICK_INTERVAL == 0
 }
 
+fn warn_db_execute(operation: &str, result: rusqlite::Result<usize>) {
+    if let Err(error) = result {
+        tracing::warn!("[server-db] {operation} failed: {error}");
+    }
+}
+
 pub async fn run(
     config: Config,
     db: Db,
@@ -80,14 +86,21 @@ pub async fn run(
     let batch_buffer = worker_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
 
     // Seed config defaults + store server port in kv_meta so policy JS can read them
-    if let Ok(conn) = db.lock() {
-        routes::settings::seed_config_defaults(&conn, &config);
-        // server_port is always overwritten (not INSERT OR IGNORE) to match current config
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
-            [config.server.port.to_string()],
-        )
-        .ok();
+    match db.lock() {
+        Ok(conn) => {
+            routes::settings::seed_config_defaults(&conn, &config);
+            // server_port is always overwritten (not INSERT OR IGNORE) to match current config
+            warn_db_execute(
+                "run.store_server_port",
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
+                    [config.server.port.to_string()],
+                ),
+            );
+        }
+        Err(error) => {
+            tracing::warn!("[server-db] run.lock failed while seeding config defaults: {error}");
+        }
     }
 
     let app = Router::new()
@@ -172,12 +185,21 @@ fn fire_tick_hook_by_name(engine: &PolicyEngine, db: &Db, hook_name: &str, label
 
     if let Err(e) = engine.try_fire_hook_by_name(hook_name, serde_json::json!({})) {
         tracing::warn!("[policy-tick] {} hook error: {e}", label);
-        if let Ok(conn) = db.lock() {
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'error')",
-                [&key_status],
-            )
-            .ok();
+        match db.lock() {
+            Ok(conn) => {
+                warn_db_execute(
+                    "fire_tick_hook_by_name.store_error_status",
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'error')",
+                        [&key_status],
+                    ),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[server-db] fire_tick_hook_by_name.lock failed while storing error status: {error}"
+                );
+            }
         }
     } else {
         let elapsed = start.elapsed();
@@ -186,28 +208,43 @@ fn fire_tick_hook_by_name(engine: &PolicyEngine, db: &Db, hook_name: &str, label
         } else {
             tracing::debug!("[policy-tick] {} took {}ms", label, elapsed.as_millis());
         }
-        if let Ok(conn) = db.lock() {
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![key_ms, now_ms],
-            )
-            .ok();
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'ok')",
-                [&key_status],
-            )
-            .ok();
-            // Also update legacy key for backward compat
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_ms', ?1)",
-                [&now_ms],
-            )
-            .ok();
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_status', 'ok')",
-                [],
-            )
-            .ok();
+        match db.lock() {
+            Ok(conn) => {
+                warn_db_execute(
+                    "fire_tick_hook_by_name.store_tick_ms",
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                        rusqlite::params![key_ms, now_ms],
+                    ),
+                );
+                warn_db_execute(
+                    "fire_tick_hook_by_name.store_tick_status",
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, 'ok')",
+                        [&key_status],
+                    ),
+                );
+                // Also update legacy key for backward compat
+                warn_db_execute(
+                    "fire_tick_hook_by_name.store_legacy_tick_ms",
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_ms', ?1)",
+                        [&now_ms],
+                    ),
+                );
+                warn_db_execute(
+                    "fire_tick_hook_by_name.store_legacy_tick_status",
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('last_tick_status', 'ok')",
+                        [],
+                    ),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[server-db] fire_tick_hook_by_name.lock failed while storing telemetry: {error}"
+                );
+            }
         }
     }
 
@@ -247,12 +284,21 @@ async fn rate_limit_sync_loop(db: Db) {
             Ok(buckets) => {
                 let data = serde_json::json!({ "buckets": buckets }).to_string();
                 let now = chrono::Utc::now().timestamp();
-                if let Ok(conn) = db.lock() {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
-                        rusqlite::params!["claude", data, now],
-                    )
-                    .ok();
+                match db.lock() {
+                    Ok(conn) => {
+                        warn_db_execute(
+                            "rate_limit_sync_loop.store_claude_cache",
+                            conn.execute(
+                                "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+                                rusqlite::params!["claude", data, now],
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[server-db] rate_limit_sync_loop.lock failed while storing Claude cache: {error}"
+                        );
+                    }
                 }
                 tracing::info!("[rate-limit-sync] Claude: {} buckets cached", buckets.len());
             }
@@ -274,12 +320,21 @@ async fn rate_limit_sync_loop(db: Db) {
             Ok(buckets) => {
                 let data = serde_json::json!({ "buckets": buckets }).to_string();
                 let now = chrono::Utc::now().timestamp();
-                if let Ok(conn) = db.lock() {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
-                        rusqlite::params!["codex", data, now],
-                    )
-                    .ok();
+                match db.lock() {
+                    Ok(conn) => {
+                        warn_db_execute(
+                            "rate_limit_sync_loop.store_codex_cache",
+                            conn.execute(
+                                "INSERT OR REPLACE INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+                                rusqlite::params!["codex", data, now],
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[server-db] rate_limit_sync_loop.lock failed while storing Codex cache: {error}"
+                        );
+                    }
                 }
                 tracing::info!("[rate-limit-sync] Codex: {} buckets cached", buckets.len());
             }
@@ -731,16 +786,24 @@ async fn message_outbox_loop(db: Db, port: u16) {
         let pending: Vec<(i64, String, String, String, String)> = {
             let conn = match db.lock() {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        "[outbox] db lock failed while loading pending messages: {error}"
+                    );
+                    continue;
+                }
             };
             let mut stmt = match conn.prepare(
                 "SELECT id, target, content, bot, source FROM message_outbox \
                  WHERE status = 'pending' ORDER BY id ASC LIMIT 10",
             ) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::warn!("[outbox] prepare pending messages failed: {error}");
+                    continue;
+                }
             };
-            stmt.query_map([], |row| {
+            let rows = match stmt.query_map([], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -748,10 +811,20 @@ async fn message_outbox_loop(db: Db, port: u16) {
                     row.get(3)?,
                     row.get(4)?,
                 ))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+            }) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!("[outbox] query pending messages failed: {error}");
+                    continue;
+                }
+            };
+            match rows.collect::<Result<Vec<_>, _>>() {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!("[outbox] read pending message row failed: {error}");
+                    continue;
+                }
+            }
         };
 
         if pending.is_empty() {
@@ -772,12 +845,21 @@ async fn message_outbox_loop(db: Db, port: u16) {
 
             match client.post(&url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'sent', sent_at = datetime('now') WHERE id = ?1",
-                            [id],
-                        )
-                        .ok();
+                    match db.lock() {
+                        Ok(conn) => {
+                            warn_db_execute(
+                                "outbox.mark_sent",
+                                conn.execute(
+                                    "UPDATE message_outbox SET status = 'sent', sent_at = datetime('now') WHERE id = ?1",
+                                    [id],
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "[outbox] db lock failed while marking message {id} sent: {error}"
+                            );
+                        }
                     }
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::debug!("[{ts}] [outbox] ✅ delivered msg {id} → {target}");
@@ -785,22 +867,40 @@ async fn message_outbox_loop(db: Db, port: u16) {
                 Ok(resp) => {
                     let status = resp.status();
                     let err_text = resp.text().await.unwrap_or_default();
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
-                            rusqlite::params![format!("{status}: {err_text}"), id],
-                        )
-                        .ok();
+                    match db.lock() {
+                        Ok(conn) => {
+                            warn_db_execute(
+                                "outbox.mark_failed_http",
+                                conn.execute(
+                                    "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
+                                    rusqlite::params![format!("{status}: {err_text}"), id],
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "[outbox] db lock failed while storing HTTP failure for message {id}: {error}"
+                            );
+                        }
                     }
                     tracing::warn!("[outbox] ❌ msg {id} → {target} failed: {status}");
                 }
                 Err(e) => {
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
-                            rusqlite::params![e.to_string(), id],
-                        )
-                        .ok();
+                    match db.lock() {
+                        Ok(conn) => {
+                            warn_db_execute(
+                                "outbox.mark_failed_request",
+                                conn.execute(
+                                    "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
+                                    rusqlite::params![e.to_string(), id],
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "[outbox] db lock failed while storing request failure for message {id}: {error}"
+                            );
+                        }
                     }
                     tracing::warn!("[outbox] ❌ msg {id} → {target} error: {e}");
                 }
