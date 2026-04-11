@@ -53,8 +53,17 @@ function ownerProviderBadgeStyle(provider: string) {
 interface Props {
   meetings: RoundTableMeeting[];
   onRefresh: () => void;
-  onNotify?: (message: string, type?: "info" | "success" | "warning" | "error") => void;
+  onNotify?: (message: string, type?: "info" | "success" | "warning" | "error") => string | void;
+  onUpdateNotification?: (id: string, message: string, type?: "info" | "success" | "warning" | "error") => void;
+  initialShowStartForm?: boolean;
+  initialMeetingChannels?: RoundTableMeetingChannelOption[];
+  initialChannelId?: string;
 }
+
+type MeetingNotificationType = "info" | "success" | "warning" | "error";
+type MeetingNotifier = (message: string, type?: MeetingNotificationType) => string | void;
+type MeetingNotificationUpdater = (id: string, message: string, type?: MeetingNotificationType) => void;
+type MeetingTranslator = (messages: { ko: string; en: string }) => string;
 
 function getDefaultIssueRepo(repos: GitHubRepoOption[], viewerLogin: string): string {
   return (
@@ -105,6 +114,28 @@ function parseStoredFixedParticipants(): string[] {
   }
 }
 
+export function filterMeetingExpertsByQuery(
+  experts: RoundTableMeetingExpertOption[],
+  query: string,
+): RoundTableMeetingExpertOption[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return experts;
+
+  return experts.filter((expert) => {
+    const haystacks = [
+      expert.display_name,
+      expert.role_id,
+      ...expert.keywords,
+      expert.domain_summary ?? "",
+      ...expert.strengths,
+      ...expert.task_types,
+      ...expert.anti_signals,
+      expert.provider_hint ?? "",
+    ];
+    return haystacks.some((value) => value.toLowerCase().includes(normalizedQuery));
+  });
+}
+
 export function pruneFixedParticipantRoleIdsForLoadedChannel(
   previous: string[],
   loadingChannels: boolean,
@@ -122,7 +153,98 @@ export function pruneFixedParticipantRoleIdsForLoadedChannel(
   return next;
 }
 
-export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Props) {
+export function getMeetingReferenceHashes(
+  meeting: Pick<RoundTableMeeting, "meeting_hash" | "thread_hash">,
+): string[] {
+  return [meeting.meeting_hash, meeting.thread_hash].filter(
+    (hash): hash is string => Boolean(hash),
+  );
+}
+
+export async function openMeetingDetailWithFallback(
+  meeting: RoundTableMeeting,
+  fetchMeeting: (meetingId: string) => Promise<RoundTableMeeting>,
+  logError: (message: string, error: unknown) => void = console.error,
+): Promise<RoundTableMeeting> {
+  try {
+    return await fetchMeeting(meeting.id);
+  } catch (error) {
+    logError(`Meeting detail load failed for ${meeting.id}`, error);
+    return meeting;
+  }
+}
+
+export async function submitMeetingStartRequest(options: {
+  agenda: string;
+  channelId: string;
+  primaryProvider: string;
+  reviewerProvider: string;
+  fixedParticipants: string[];
+  startMeeting: (
+    agenda: string,
+    channelId: string,
+    primaryProvider: string,
+    reviewerProvider: string,
+    fixedParticipants?: string[],
+  ) => Promise<{ ok: boolean; message?: string }>;
+  notify?: MeetingNotifier;
+  updateNotification?: MeetingNotificationUpdater;
+  t: MeetingTranslator;
+}): Promise<{ ok: boolean; message: string }> {
+  const { agenda, channelId, primaryProvider, reviewerProvider, fixedParticipants, startMeeting, notify, updateNotification, t } = options;
+  const acceptedMessage = t({
+    ko: "회의 시작 요청이 접수되었습니다",
+    en: "Meeting start request accepted",
+  });
+  const pendingNotificationId = notify?.(acceptedMessage, "info");
+
+  try {
+    const result = await startMeeting(
+      agenda,
+      channelId,
+      primaryProvider,
+      reviewerProvider,
+      fixedParticipants,
+    );
+    const successMessage = result.message || t({
+      ko: "회의 시작 요청을 보냈습니다",
+      en: "Meeting start requested",
+    });
+
+    if (typeof pendingNotificationId === "string" && updateNotification) {
+      updateNotification(pendingNotificationId, successMessage, "success");
+    } else if (successMessage !== acceptedMessage) {
+      notify?.(successMessage, "success");
+    }
+
+    return {
+      ok: result.ok,
+      message: successMessage,
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error
+      ? error.message
+      : t({ ko: "회의 시작 실패", en: "Failed to start meeting" });
+
+    if (typeof pendingNotificationId === "string" && updateNotification) {
+      updateNotification(pendingNotificationId, errorMessage, "error");
+    } else {
+      notify?.(errorMessage, "error");
+    }
+
+    throw (error instanceof Error ? error : new Error(errorMessage));
+  }
+}
+
+export default function MeetingMinutesView({
+  meetings,
+  onRefresh,
+  onNotify,
+  onUpdateNotification,
+  initialShowStartForm = false,
+  initialMeetingChannels = [],
+  initialChannelId,
+}: Props) {
   const { t, locale } = useI18n();
   const [detailMeeting, setDetailMeeting] = useState<RoundTableMeeting | null>(null);
   const [creatingIssue, setCreatingIssue] = useState<string | null>(null);
@@ -130,15 +252,16 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
   const [discardingMeetingIds, setDiscardingMeetingIds] = useState<Record<string, boolean>>({});
   const [deleting, setDeleting] = useState<string | null>(null);
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
-  const [showStartForm, setShowStartForm] = useState(false);
+  const [showStartForm, setShowStartForm] = useState(initialShowStartForm);
   const [agenda, setAgenda] = useState("");
-  const [channelId, setChannelId] = useState(() => localStorage.getItem(STORAGE_KEY) || "");
+  const [channelId, setChannelId] = useState(() => initialChannelId ?? (localStorage.getItem(STORAGE_KEY) || ""));
   const [primaryProvider, setPrimaryProvider] = useState<string>("claude");
   const [reviewerProvider, setReviewerProvider] = useState<string>("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>([]);
+  const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>(initialMeetingChannels);
   const [fixedParticipants, setFixedParticipants] = useState<string[]>(parseStoredFixedParticipants);
+  const [expertQuery, setExpertQuery] = useState("");
   const [channelQuery, setChannelQuery] = useState("");
   const [loadingChannels, setLoadingChannels] = useState(false);
   const [channelError, setChannelError] = useState<string | null>(null);
@@ -223,6 +346,7 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
   const reviewerOptions = MEETING_PROVIDERS.filter(
     (provider) => provider !== primaryProvider && provider !== selectedChannel?.owner_provider,
   );
+  const filteredExperts = filterMeetingExpertsByQuery(availableExperts, expertQuery);
   const filteredChannels = meetingChannels.filter((channel) => {
     const query = channelQuery.trim().toLowerCase();
     if (!query) return true;
@@ -237,6 +361,10 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
   useEffect(() => {
     if (!selectedChannel) return;
     setChannelQuery(`${selectedChannel.channel_name} (${selectedChannel.channel_id})`);
+  }, [selectedChannel?.channel_id]);
+
+  useEffect(() => {
+    setExpertQuery("");
   }, [selectedChannel?.channel_id]);
 
   useEffect(() => {
@@ -264,12 +392,12 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
   }, [primaryProvider, reviewerProvider, reviewerOptions.join(","), selectedChannel?.owner_provider]);
 
   const handleOpenDetail = async (m: RoundTableMeeting) => {
-    try {
-      const full = await getRoundTableMeeting(m.id);
-      setDetailMeeting(full);
-    } catch {
-      setDetailMeeting(m);
-    }
+    const full = await openMeetingDetailWithFallback(
+      m,
+      getRoundTableMeeting,
+      (message, error) => console.error(message, error),
+    );
+    setDetailMeeting(full);
   };
 
   const getSelectedRepo = (meeting: RoundTableMeeting) => {
@@ -413,17 +541,17 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
     setStarting(true);
     setStartError(null);
     try {
-      const result = await startRoundTableMeeting(
-        agenda.trim(),
-        channelId.trim(),
+      await submitMeetingStartRequest({
+        agenda: agenda.trim(),
+        channelId: channelId.trim(),
         primaryProvider,
         reviewerProvider,
         fixedParticipants,
-      );
-      onNotify?.(
-        result.message || t({ ko: "회의 시작 요청을 보냈습니다", en: "Meeting start requested" }),
-        "success",
-      );
+        startMeeting: startRoundTableMeeting,
+        notify: onNotify,
+        updateNotification: onUpdateNotification,
+        t,
+      });
       setAgenda("");
       setShowStartForm(false);
       onRefresh();
@@ -662,20 +790,19 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
             <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-20 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
               {t({ ko: "안건", en: "Agenda" })}
             </label>
-            <input
-              type="text"
+            <textarea
               value={agenda}
               onChange={(e) => setAgenda(e.target.value)}
               placeholder={t({ ko: "회의 안건을 입력하세요", en: "Enter meeting agenda" })}
-              className="flex-1 px-3 py-1.5 rounded-lg text-sm"
+              rows={3}
+              className="flex-1 min-h-[84px] resize-y rounded-lg px-3 py-2 text-sm leading-5"
               style={inputStyle}
-              onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) handleStartMeeting(); }}
             />
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
             <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-20" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "진행 모델", en: "Primary" })}
+              {t({ ko: "진행 프로바이더", en: "Primary Provider" })}
             </label>
             <select
               value={primaryProvider}
@@ -693,8 +820,8 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
             <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
               {selectedChannel
                 ? t({
-                    ko: `채널 담당 봇은 ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider} 입니다`,
-                    en: `Channel owner bot is ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider}`,
+                    ko: `채널 담당 프로바이더는 ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider} 입니다`,
+                    en: `Channel owner provider is ${PROVIDER_LABELS[selectedChannel.owner_provider] ?? selectedChannel.owner_provider}`,
                   })
                 : t({ ko: "등록된 채널을 먼저 선택하세요", en: "Select a registered channel first" })}
             </span>
@@ -702,7 +829,7 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
             <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-20" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "리뷰 모델", en: "Reviewer" })}
+              {t({ ko: "리뷰 프로바이더", en: "Reviewer Provider" })}
             </label>
             <select
               value={reviewerProvider}
@@ -713,7 +840,7 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
             >
               {reviewerOptions.length === 0 ? (
                 <option value="">
-                  {t({ ko: "선택 가능한 리뷰 모델 없음", en: "No reviewer available" })}
+                  {t({ ko: "선택 가능한 리뷰 프로바이더 없음", en: "No reviewer provider available" })}
                 </option>
               ) : (
                 reviewerOptions.map((provider) => (
@@ -726,18 +853,18 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
             <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
               {selectedChannel
                 ? t({
-                    ko: "리뷰 모델은 채널 담당 provider, 진행 모델과 달라야 합니다",
-                    en: "Reviewer must differ from channel owner provider and primary provider",
+                    ko: "리뷰 프로바이더는 채널 담당 프로바이더, 진행 프로바이더와 달라야 합니다",
+                    en: "Reviewer provider must differ from the channel owner provider and primary provider",
                   })
-                : t({ ko: "채널 선택 후 리뷰 모델을 정하세요", en: "Pick reviewer after selecting a channel" })}
+                : t({ ko: "채널 선택 후 리뷰 프로바이더를 정하세요", en: "Pick reviewer provider after selecting a channel" })}
             </span>
           </div>
 
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:gap-2">
             <label className="text-xs font-semibold uppercase tracking-widest shrink-0 sm:w-20 sm:pt-2" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "고정 전문가", en: "Fixed Experts" })}
+              {t({ ko: "고정 전문 에이전트", en: "Fixed Expert Agents" })}
             </label>
-            <div className="flex-1 min-w-0">
+            <div className="flex-1 min-w-0 space-y-2">
               {!selectedChannel ? (
                 <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
                   {t({ ko: "채널 선택 후 전문 에이전트를 고정할 수 있습니다", en: "Select a channel to pin expert agents" })}
@@ -747,39 +874,60 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
                   {t({ ko: "설정된 전문 에이전트 후보가 없습니다", en: "No configured expert candidates" })}
                 </div>
               ) : (
-                <div className="flex min-w-0 flex-wrap gap-2">
-                  {availableExperts.map((expert) => {
-                    const selected = fixedParticipants.includes(expert.role_id);
-                    return (
-                      <button
-                        key={expert.role_id}
-                        type="button"
-                        onClick={() => toggleFixedParticipant(expert)}
-                        className="max-w-full rounded-full border px-3 py-1 text-left text-xs transition-colors"
-                        style={{
-                          background: selected ? "rgba(245,158,11,0.16)" : "rgba(148,163,184,0.08)",
-                          borderColor: selected ? "rgba(245,158,11,0.45)" : "var(--th-border)",
-                          color: selected ? "#fbbf24" : "var(--th-text-secondary)",
-                        }}
-                        title={`${expert.display_name} (${expert.role_id})`}
-                      >
-                        <span className="break-all font-semibold [overflow-wrap:anywhere]">
-                          {expert.display_name}
-                        </span>
-                        <span className="ml-1 font-mono opacity-75">#{expert.role_id}</span>
-                        {expert.provider_hint && (
-                          <span className="ml-1 opacity-75">{expert.provider_hint}</span>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
+                <>
+                  <input
+                    type="text"
+                    value={expertQuery}
+                    onChange={(e) => setExpertQuery(e.target.value)}
+                    placeholder={t({ ko: "전문 에이전트 검색 후 여러 명 선택", en: "Search specialist agents and pick multiple" })}
+                    className="w-full rounded-lg px-3 py-1.5 text-sm"
+                    style={inputStyle}
+                  />
+                  {filteredExperts.length === 0 ? (
+                    <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                      {t({ ko: "조건에 맞는 전문 에이전트가 없습니다", en: "No specialist agent matches the filter" })}
+                    </div>
+                  ) : (
+                    <div
+                      className="max-h-36 overflow-y-auto rounded-xl border p-2 sm:max-h-44"
+                      style={{ background: "var(--th-bg-surface)", borderColor: "var(--th-border)" }}
+                    >
+                      <div className="flex min-w-0 flex-wrap gap-2">
+                        {filteredExperts.map((expert) => {
+                          const selected = fixedParticipants.includes(expert.role_id);
+                          return (
+                            <button
+                              key={expert.role_id}
+                              type="button"
+                              onClick={() => toggleFixedParticipant(expert)}
+                              className="max-w-full rounded-full border px-3 py-1 text-left text-xs transition-colors"
+                              style={{
+                                background: selected ? "rgba(245,158,11,0.16)" : "rgba(148,163,184,0.08)",
+                                borderColor: selected ? "rgba(245,158,11,0.45)" : "var(--th-border)",
+                                color: selected ? "#fbbf24" : "var(--th-text-secondary)",
+                              }}
+                              title={`${expert.display_name} (${expert.role_id})`}
+                            >
+                              <span className="break-all font-semibold [overflow-wrap:anywhere]">
+                                {expert.display_name}
+                              </span>
+                              <span className="ml-1 font-mono opacity-75">#{expert.role_id}</span>
+                              {expert.provider_hint && (
+                                <span className="ml-1 opacity-75">{expert.provider_hint}</span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
               {fixedParticipants.length > 0 && (
                 <div className="mt-1 text-xs break-all [overflow-wrap:anywhere]" style={{ color: "var(--th-text-muted)" }}>
                   {t({
-                    ko: `고정됨: ${fixedParticipants.join(", ")}`,
-                    en: `Pinned: ${fixedParticipants.join(", ")}`,
+                    ko: `고정 전문 에이전트: ${fixedParticipants.join(", ")}`,
+                    en: `Pinned expert agents: ${fixedParticipants.join(", ")}`,
                   })}
                 </div>
               )}
@@ -860,9 +1008,7 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify }: Pr
                         {m.total_rounds}R
                       </span>
                     )}
-                    {[m.meeting_hash, m.thread_hash]
-                      .filter((hash): hash is string => Boolean(hash))
-                      .map((hash) => (
+                    {getMeetingReferenceHashes(m).map((hash) => (
                         <span
                           key={hash}
                           className="max-w-full break-all rounded-full px-2 py-0.5 font-mono text-[11px]"

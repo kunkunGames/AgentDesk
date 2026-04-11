@@ -390,6 +390,7 @@ fi
 # Start release
 echo "▸ Starting release..."
 xattr -d com.apple.quarantine "$HOME/Library/LaunchAgents/$PLIST_REL.plist" 2>/dev/null || true
+launchctl enable "gui/$(id -u)/$PLIST_REL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
 
 # Health check (server health + dashboard availability)

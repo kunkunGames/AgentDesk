@@ -27,8 +27,48 @@ DEV_DEPLOY_TEST_MODE="${AGENTDESK_DEPLOY_DEV_TEST_MODE:-0}"
 DEV_DEPLOY_DELAY_SECS="${AGENTDESK_DEPLOY_DEV_DELAY_SECS:-2}"
 DEV_HEALTH_RETRIES="${AGENTDESK_DEPLOY_DEV_HEALTH_RETRIES:-20}"
 DEV_HEALTH_DELAY_SECS="${AGENTDESK_DEPLOY_DEV_HEALTH_DELAY_SECS:-2}"
+CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
+ALLOW_ADHOC_DEV_SIGN="${AGENTDESK_ALLOW_ADHOC_DEV_SIGN:-1}"
 
 echo "═══ ADK Dev Deploy ═══"
+
+sign_dev_binary_with_fallback() {
+    local target="$1"
+    local identity="${CODESIGN_IDENTITY:--}"
+
+    if [ -z "$identity" ]; then
+        identity="-"
+    fi
+
+    if [ "$identity" != "-" ] && command -v security >/dev/null 2>&1; then
+        if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
+            if [ "$ALLOW_ADHOC_DEV_SIGN" = "1" ]; then
+                echo "⚠ Signing identity '$identity' not found; falling back to ad-hoc signature"
+                identity="-"
+            else
+                echo "✗ Signing identity not found locally: $identity"
+                echo "  Set AGENTDESK_ALLOW_ADHOC_DEV_SIGN=1 to permit ad-hoc signing for dev deploys"
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ "$identity" = "-" ]; then
+        if [ "$ALLOW_ADHOC_DEV_SIGN" != "1" ]; then
+            echo "✗ Refusing ad-hoc dev signing without AGENTDESK_ALLOW_ADHOC_DEV_SIGN=1"
+            exit 1
+        fi
+        codesign -f -s "$identity" --identifier "com.itismyfield.agentdesk" "$target"
+    else
+        codesign -f -s "$identity" --options runtime --identifier "com.itismyfield.agentdesk" "$target"
+    fi
+
+    if ! codesign -v "$target" 2>/dev/null; then
+        echo "✗ Codesign verification failed — aborting"
+        rm -f "$target"
+        exit 1
+    fi
+}
 
 _notify_channel() {
     local content="$1"
@@ -61,7 +101,8 @@ _tail_for_summary() {
 # Source-of-truth resolution chain (_resolve_shared_credential_dir):
 #   1. $AGENTDESK_SHARED_CREDENTIAL_DIR env var  (explicit override)
 #   2. Release credential symlink target          (~/.adk/release/credential -> …)
-#   3. Hardcoded fallback                         (~/ObsidianVault/…/adk-config/credential)
+#   3. Release credential directory               (~/.adk/release/credential)
+#   4. Hardcoded fallback                         (~/ObsidianVault/…/adk-config/credential)
 #
 # _sync_dev_credentials creates (or updates) a symlink at
 # ~/.adk/dev/credential -> <shared dir>, so every dev deploy
@@ -94,6 +135,11 @@ _resolve_shared_credential_dir() {
                 return 0
             fi
         fi
+    fi
+
+    if [ -d "$release_credential" ]; then
+        printf '%s\n' "$release_credential"
+        return 0
     fi
 
     local fallback="$HOME/ObsidianVault/RemoteVault/adk-config/credential"
@@ -129,6 +175,69 @@ _sync_dev_credentials() {
 
     ln -sfn "$shared_credential_dir" "$dev_credential_dir"
     echo "▸ Linked dev credential -> $shared_credential_dir"
+}
+
+_sync_dev_runtime_bot_settings() {
+    local release_settings="$HOME/.adk/release/config/bot_settings.json"
+    local dev_settings="$ADK_DEV/config/bot_settings.json"
+    local dev_settings_migrated="$ADK_DEV/config/bot_settings.json.migrated"
+    local dev_config="$ADK_DEV/config/agentdesk.yaml"
+
+    mkdir -p "$(dirname "$dev_settings")"
+
+    if [ -f "$release_settings" ]; then
+        if [ -f "$dev_config" ] && command -v python3 >/dev/null 2>&1; then
+            if python3 - "$release_settings" "$dev_config" "$dev_settings" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+release_settings = pathlib.Path(sys.argv[1])
+dev_config = pathlib.Path(sys.argv[2])
+dev_settings = pathlib.Path(sys.argv[3])
+
+allowed_agents = []
+pattern = re.compile(r'^\s*-\s*id:\s*["\']?([^"\']+)')
+for line in dev_config.read_text().splitlines():
+    match = pattern.match(line)
+    if match:
+        allowed_agents.append(match.group(1).strip())
+
+if not allowed_agents:
+    raise SystemExit(1)
+
+data = json.loads(release_settings.read_text())
+filtered = {
+    key: value
+    for key, value in data.items()
+    if isinstance(value, dict) and value.get("agent") in set(allowed_agents)
+}
+
+if not filtered:
+    raise SystemExit(1)
+
+dev_settings.write_text(json.dumps(filtered, ensure_ascii=False, indent=2) + "\n")
+PY
+            then
+                echo "▸ Synced dev bot settings from release (filtered to dev agents)"
+                return 0
+            fi
+            echo "⚠ Failed to filter release bot settings; falling back to direct copy"
+        fi
+
+        cp "$release_settings" "$dev_settings"
+        echo "▸ Copied release bot settings to dev runtime"
+        return 0
+    fi
+
+    if [ -f "$dev_settings_migrated" ] && [ ! -f "$dev_settings" ]; then
+        cp "$dev_settings_migrated" "$dev_settings"
+        echo "▸ Restored dev bot settings from migrated backup"
+        return 0
+    fi
+
+    echo "▸ No runtime bot settings source found; leaving dev bot settings as-is"
 }
 
 _finalize_detached_helper() {
@@ -193,6 +302,8 @@ export AGENTDESK_REPO_DIR=$(printf '%q' "$REPO")
 export AGENTDESK_DEPLOY_DEV_DETACHED_CHILD=1
 export AGENTDESK_DEPLOY_DEV_LOG_PATH=$(printf '%q' "$log_path")
 export AGENTDESK_DEPLOY_DEV_TEST_MODE=$(printf '%q' "$DEV_DEPLOY_TEST_MODE")
+export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "$CODESIGN_IDENTITY")
+export AGENTDESK_ALLOW_ADHOC_DEV_SIGN=$(printf '%q' "$ALLOW_ADHOC_DEV_SIGN")
 ${AGENTDESK_SHARED_CREDENTIAL_DIR:+export AGENTDESK_SHARED_CREDENTIAL_DIR=$(printf '%q' "$AGENTDESK_SHARED_CREDENTIAL_DIR")}
 cd $(printf '%q' "$REPO")
 exec $(printf '%q' "$SCRIPT_DIR/deploy-dev.sh")${quoted_args}
@@ -252,21 +363,22 @@ chflags nouchg "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
 cp "$REPO/target/release/agentdesk" "$ADK_DEV/bin/agentdesk.new"
 chmod +x "$ADK_DEV/bin/agentdesk.new"
 xattr -d com.apple.provenance "$ADK_DEV/bin/agentdesk.new" 2>/dev/null || true
-codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$ADK_DEV/bin/agentdesk.new"
-# Verify signature before swap
-if ! codesign -v "$ADK_DEV/bin/agentdesk.new" 2>/dev/null; then
-    echo "✗ Codesign verification failed — aborting"
-    rm -f "$ADK_DEV/bin/agentdesk.new"
-    exit 1
-fi
+sign_dev_binary_with_fallback "$ADK_DEV/bin/agentdesk.new"
 mv -f "$ADK_DEV/bin/agentdesk.new" "$ADK_DEV/bin/agentdesk"
 # Lock binary to prevent unsigned overwrites
 chflags uchg "$ADK_DEV/bin/agentdesk"
 
 # 3.5. Register with macOS firewall (NOPASSWD via /etc/sudoers.d/agentdesk-firewall)
 FW=/usr/libexec/ApplicationFirewall/socketfilterfw
-sudo "$FW" --add "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
-sudo "$FW" --unblockapp "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
+FIREWALL_SKIP_LOGGED=0
+for firewall_arg in --add --unblockapp; do
+    if ! sudo -n "$FW" "$firewall_arg" "$ADK_DEV/bin/agentdesk" >/dev/null 2>&1; then
+        if [ "$FIREWALL_SKIP_LOGGED" = "0" ]; then
+            echo "▸ Skipping firewall registration (sudo -n unavailable in non-interactive deploy)"
+            FIREWALL_SKIP_LOGGED=1
+        fi
+    fi
+done
 
 # 3.6. Symlink dashboard dist
 mkdir -p "$ADK_DEV/dashboard"
@@ -292,11 +404,15 @@ rsync -a --delete "$REPO/skills/" "$DEV_SKILLS_DIR/"
 echo "▸ Syncing credentials..."
 _sync_dev_credentials
 
-# 3.10. Ensure the user-facing CLI wrapper is reachable via PATH.
+# 3.10. Keep dev runtime bot settings aligned with the release runtime.
+echo "▸ Syncing bot settings..."
+_sync_dev_runtime_bot_settings
+
+# 3.11. Ensure the user-facing CLI wrapper is reachable via PATH.
 echo "▸ Ensuring global agentdesk CLI..."
 "$SCRIPT_DIR/ensure-agentdesk-cli.sh"
 
-# 3.10. Re-apply optional local launchd env overrides before restart.
+# 3.12. Re-apply optional local launchd env overrides before restart.
 DEV_LAUNCHD_ENV_FILE="$ADK_DEV/config/launchd.env"
 if [ -f "$DEV_LAUNCHD_ENV_FILE" ]; then
     echo "▸ Syncing dev launchd env..."
@@ -305,6 +421,7 @@ fi
 
 # 4. Start dev
 echo "▸ Starting dev..."
+launchctl enable "gui/$(id -u)/$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST.plist"
 
 # 5. Health check
