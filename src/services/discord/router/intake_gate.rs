@@ -166,6 +166,9 @@ async fn handle_reaction_remove(
             }
         }
         RemovedControlReaction::StopActiveTurn => {
+            // #441: flows through cancel_text_stop_token_mailbox (mailbox_cancel_active_turn)
+            // → cancel_active_token → token.cancelled triggers turn_bridge loop exit
+            // → mailbox_finish_turn canonical cleanup
             let active_message_id = mailbox_snapshot(&data.shared, channel_id)
                 .await
                 .active_user_message_id

@@ -963,6 +963,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                         "  [{ts}] ⏰ WATCHDOG: turn timeout (~{elapsed_mins}m) for channel {}, cancelling",
                         channel_id
                     );
+                    // #441: cancel_active_token → token.cancelled triggers turn_bridge loop exit
+                    // → mailbox_finish_turn canonical cleanup
                     super::super::turn_bridge::cancel_active_token(
                         &watchdog_token,
                         true,
@@ -1837,6 +1839,9 @@ pub(super) async fn handle_text_command(
         }
 
         "!stop" => {
+            // #441: flows through cancel_text_stop_token_mailbox (mailbox_cancel_active_turn)
+            // → cancel_active_token → token.cancelled triggers turn_bridge loop exit
+            // → mailbox_finish_turn canonical cleanup
             let stop_lookup = cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
             match stop_lookup {
                 TextStopLookup::Stop(token) => {
@@ -2574,6 +2579,9 @@ Any other message is sent to {p}.
                     return Ok(true);
                 }
                 "stop" => {
+                    // #441: flows through cancel_text_stop_token_mailbox (mailbox_cancel_active_turn)
+                    // → cancel_active_token → token.cancelled triggers turn_bridge loop exit
+                    // → mailbox_finish_turn canonical cleanup
                     let stop_lookup =
                         cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
                     match stop_lookup {
