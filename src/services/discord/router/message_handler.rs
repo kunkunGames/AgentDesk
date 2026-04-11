@@ -838,6 +838,20 @@ pub(in crate::services::discord) async fn handle_text_message(
         session_id.is_some(),
         prompt_prep_duration_ms
     );
+    // Notify bot message when resuming a previous conversation
+    if session_id.is_some() {
+        if let Some(ref db) = shared.db {
+            if let Ok(conn) = db.lock() {
+                let _ = conn.execute(
+                    "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
+                    rusqlite::params![
+                        format!("channel:{}", channel_id.get()),
+                        "📋 이전 대화 컨텍스트 이어받기",
+                    ],
+                );
+            }
+        }
+    }
     // Spawn turn watchdog — cancels the turn if it exceeds the deadline.
     // The deadline is stored in cancel_token.watchdog_deadline_ms and can be
     // extended via POST /api/turns/{channel_id}/extend-timeout (up to 3h cap).
