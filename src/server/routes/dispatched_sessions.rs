@@ -1343,9 +1343,10 @@ pub async fn force_kill_session(
     force_kill_session_impl(&state, &session_key, body.retry).await
 }
 
-/// POST /api/sessions/force-kill
+/// Legacy body-based wrapper retained for compatibility tests and direct callers.
 ///
-/// Legacy body-based wrapper retained for compatibility with older policy scripts.
+/// This helper is no longer exposed as an HTTP route; use
+/// `POST /api/sessions/{session_key}/force-kill` instead.
 pub async fn force_kill_session_legacy(
     State(state): State<AppState>,
     Json(body): Json<ForceKillBody>,
