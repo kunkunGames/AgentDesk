@@ -596,12 +596,14 @@ async fn emit_escalation_with_base_url(
         (settings, summary, parent_channels, cached_thread_id)
     };
 
-    let announce_token = match crate::credential::read_bot_token("announce") {
+    let announce_token = match crate::credential::read_bot_token("notify")
+        .or_else(|| crate::credential::read_bot_token("announce"))
+    {
         Some(token) => token,
         None => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "announce bot token not found"})),
+                Json(json!({"error": "notify/announce bot token not found"})),
             );
         }
     };
