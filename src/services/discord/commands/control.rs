@@ -224,6 +224,9 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
 }
 
 /// /stop — Cancel in-progress AI request
+///
+/// #441: flows through mailbox_cancel_active_turn → cancel_active_token
+/// → token.cancelled triggers turn_bridge loop exit → mailbox_finish_turn canonical cleanup
 #[poise::command(slash_command, rename = "stop")]
 pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
