@@ -41,17 +41,7 @@ function _autoMergeWorktreeBranch(cardId) {
   var card = cards.length > 0 ? cards[0] : {};
   var repoDir = result.completed_worktree_path;
 
-  // Check if branch has commits ahead of main
-  var logResult = agentdesk.exec("git", [
-    "-C", repoDir || ".",
-    "log", "main.." + branch, "--oneline"
-  ]);
-  if (!logResult || logResult.trim() === "") {
-    agentdesk.log.info("[kanban] #401: no commits in " + branch + " — skip merge");
-    return;
-  }
-
-  // Find the main workspace repo (not the worktree)
+  // Find the main workspace repo FIRST (worktree may already be cleaned up)
   var mainRepo = agentdesk.config.get("workspace_root");
   if (!mainRepo) {
     // Fallback: derive from worktree path
@@ -62,6 +52,18 @@ function _autoMergeWorktreeBranch(cardId) {
   }
   if (!mainRepo) {
     agentdesk.log.warn("[kanban] #401: cannot determine main repo path — skip merge");
+    return;
+  }
+
+  // Check if branch has commits ahead of main (use mainRepo, worktree may be gone)
+  var gitDir = repoDir || mainRepo;
+  var logResult = agentdesk.exec("git", ["-C", gitDir, "log", "main.." + branch, "--oneline"]);
+  if ((!logResult || logResult.trim() === "" || logResult.indexOf("ERROR") === 0) && gitDir !== mainRepo) {
+    // Worktree gone — retry from main repo where branch ref still exists
+    logResult = agentdesk.exec("git", ["-C", mainRepo, "log", "main.." + branch, "--oneline"]);
+  }
+  if (!logResult || logResult.trim() === "" || logResult.indexOf("ERROR") === 0) {
+    agentdesk.log.info("[kanban] #401: no commits in " + branch + " — skip merge");
     return;
   }
 
