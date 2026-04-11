@@ -34,10 +34,6 @@ fn resolve_claude_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("claude")
 }
 
-fn get_claude_path() -> Option<String> {
-    resolve_claude_path()
-}
-
 fn build_tmux_launch_env_lines(
     exec_path: Option<&str>,
     report_channel_id: Option<u64>,
@@ -312,24 +308,10 @@ fn parse_claude_output(output: &str) -> ClaudeResponse {
     }
 }
 
-/// Check if Claude CLI is available
-#[allow(dead_code)]
-pub fn is_claude_available() -> bool {
-    #[cfg(not(unix))]
-    {
-        false
-    }
-
-    #[cfg(unix)]
-    {
-        get_claude_path().is_some()
-    }
-}
-
-/// Check if platform supports AI features
+/// Check if platform supports local AI CLI execution.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn is_ai_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Execute a simple Claude CLI call with `--print` flag (no tools, text-only response).
@@ -1922,10 +1904,10 @@ mod tests {
 
     #[test]
     fn test_is_ai_supported() {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert!(is_ai_supported());
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert!(!is_ai_supported());
     }
 
