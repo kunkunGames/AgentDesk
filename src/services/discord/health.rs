@@ -295,7 +295,14 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
             .count();
         let provider_queue_depth: usize = mailbox_snapshots
             .values()
-            .map(|snapshot| snapshot.intervention_queue.len())
+            .map(|snapshot| {
+                let mut queue = snapshot.intervention_queue.clone();
+                if super::has_soft_intervention(&mut queue) {
+                    queue.len()
+                } else {
+                    0
+                }
+            })
             .sum();
 
         let restart_pending = entry
@@ -515,6 +522,38 @@ impl TestHealthHarness {
                 text: format!("queued-{idx}"),
                 mode: super::InterventionMode::Soft,
                 created_at: Instant::now(),
+            })
+            .collect::<Vec<_>>();
+        super::mailbox_replace_queue(
+            &self.shared,
+            &ProviderKind::Claude,
+            ChannelId::new(1),
+            queue,
+        )
+        .await;
+    }
+
+    pub(crate) async fn set_queue_ages_secs(&self, ages_secs: &[u64]) {
+        super::mailbox_replace_queue(
+            &self.shared,
+            &ProviderKind::Claude,
+            ChannelId::new(1),
+            Vec::new(),
+        )
+        .await;
+        if ages_secs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let queue = ages_secs
+            .iter()
+            .enumerate()
+            .map(|(idx, age_secs)| super::Intervention {
+                author_id: serenity::UserId::new(idx as u64 + 1),
+                message_id: serenity::MessageId::new(idx as u64 + 1),
+                text: format!("queued-aged-{idx}"),
+                mode: super::InterventionMode::Soft,
+                created_at: now - std::time::Duration::from_secs(*age_secs),
             })
             .collect::<Vec<_>>();
         super::mailbox_replace_queue(
@@ -1266,6 +1305,32 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|reason| reason == "provider:claude:pending_queue_depth:3")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_ignores_expired_queue_items() {
+        let harness = TestHealthHarness::new().await;
+        let expired_age = crate::services::discord::INTERVENTION_TTL.as_secs() + 5;
+        harness
+            .set_queue_ages_secs(&[expired_age, expired_age + 10])
+            .await;
+
+        let snapshot = build_health_snapshot(&harness.registry()).await;
+        let json = serde_json::to_value(&snapshot).unwrap();
+
+        assert_eq!(snapshot.status(), HealthStatus::Healthy);
+        assert_eq!(json["queue_depth"], 0);
+        assert!(
+            !json["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| {
+                    reason.as_str().is_some_and(|value| {
+                        value.starts_with("provider:claude:pending_queue_depth:")
+                    })
+                })
         );
     }
 

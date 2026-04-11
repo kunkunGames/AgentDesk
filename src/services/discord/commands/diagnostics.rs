@@ -10,7 +10,7 @@ use super::super::inflight::load_inflight_states;
 use super::super::metrics;
 use super::super::runtime_store;
 use super::super::{
-    Context, Error, Intervention, PendingQueueItem, SharedData, check_auth,
+    Context, Error, Intervention, PendingQueueItem, SharedData, check_auth, has_soft_intervention,
     mailbox_queue_snapshots, mailbox_snapshot,
 };
 use crate::services::claude;
@@ -25,6 +25,34 @@ fn tmux_session_has_live_pane(_name: &str) -> bool {
 #[cfg(not(unix))]
 fn tmux_session_exists(_name: &str) -> bool {
     false
+}
+
+fn normalized_pending_queue(mut queue: Vec<Intervention>) -> Vec<Intervention> {
+    if has_soft_intervention(&mut queue) {
+        queue
+    } else {
+        Vec::new()
+    }
+}
+
+fn pending_queue_len(queue: &[Intervention]) -> usize {
+    normalized_pending_queue(queue.to_vec()).len()
+}
+
+fn normalize_pending_queues(
+    queues: std::collections::HashMap<ChannelId, Vec<Intervention>>,
+) -> std::collections::HashMap<ChannelId, Vec<Intervention>> {
+    queues
+        .into_iter()
+        .filter_map(|(channel_id, queue)| {
+            let queue = normalized_pending_queue(queue);
+            if queue.is_empty() {
+                None
+            } else {
+                Some((channel_id, queue))
+            }
+        })
+        .collect()
 }
 
 pub(in crate::services::discord) async fn build_health_report(
@@ -43,11 +71,11 @@ pub(in crate::services::discord) async fn build_health_report(
         .count();
     let queued_channel_count = mailbox_snapshots
         .values()
-        .filter(|snapshot| !snapshot.intervention_queue.is_empty())
+        .filter(|snapshot| pending_queue_len(&snapshot.intervention_queue) > 0)
         .count();
     let queued_total: usize = mailbox_snapshots
         .values()
-        .map(|snapshot| snapshot.intervention_queue.len())
+        .map(|snapshot| pending_queue_len(&snapshot.intervention_queue))
         .sum();
 
     let (session_path, session_id, session_channel_name, pending_uploads, session_count) = {
@@ -62,7 +90,7 @@ pub(in crate::services::discord) async fn build_health_report(
         )
     };
     let active_request = channel_snapshot.cancel_token.is_some();
-    let queued_count = channel_snapshot.intervention_queue.len();
+    let queued_count = pending_queue_len(&channel_snapshot.intervention_queue);
 
     let runtime_root = crate::cli::dcserver::agentdesk_runtime_root();
     let current_release = runtime_root
@@ -218,7 +246,7 @@ pub(in crate::services::discord) async fn build_status_report(
     };
     let active_request = channel_snapshot.cancel_token.is_some();
     let active_owner = channel_snapshot.active_request_owner;
-    let queued_count = channel_snapshot.intervention_queue.len();
+    let queued_count = pending_queue_len(&channel_snapshot.intervention_queue);
 
     let home_prefix = dirs::home_dir()
         .map(|p| p.display().to_string())
@@ -581,7 +609,7 @@ pub(in crate::services::discord) async fn build_queue_report(
     current_channel: ChannelId,
     show_all: bool,
 ) -> String {
-    let queues = mailbox_queue_snapshots(shared).await;
+    let queues = normalize_pending_queues(mailbox_queue_snapshots(shared).await);
     build_queue_report_sync(
         &queues,
         provider,
@@ -714,4 +742,55 @@ pub(in crate::services::discord) async fn cmd_debug(ctx: Context<'_>) -> Result<
     ctx.say(format!("Debug logging: **{}**", status)).await?;
     println!("  [{ts}] ▶ Debug logging toggled to {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use crate::services::discord::InterventionMode;
+    use poise::serenity_prelude::{MessageId, UserId};
+
+    fn intervention(age_secs: u64, message_id: u64, text: &str) -> Intervention {
+        Intervention {
+            author_id: UserId::new(1),
+            message_id: MessageId::new(message_id),
+            text: text.to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now() - Duration::from_secs(age_secs),
+        }
+    }
+
+    #[test]
+    fn pending_queue_len_prunes_expired_items() {
+        let queue = vec![
+            intervention(10 * 60 + 5, 1, "expired"),
+            intervention(30, 2, "fresh"),
+        ];
+
+        assert_eq!(pending_queue_len(&queue), 1);
+    }
+
+    #[test]
+    fn normalize_pending_queues_drops_channels_without_live_items() {
+        let expired_channel = ChannelId::new(1);
+        let fresh_channel = ChannelId::new(2);
+        let queues = HashMap::from([
+            (
+                expired_channel,
+                vec![intervention(10 * 60 + 1, 1, "expired-only")],
+            ),
+            (fresh_channel, vec![intervention(15, 2, "fresh")]),
+        ]);
+
+        let normalized = normalize_pending_queues(queues);
+
+        assert!(!normalized.contains_key(&expired_channel));
+        assert_eq!(
+            normalized.get(&fresh_channel).map(std::vec::Vec::len),
+            Some(1)
+        );
+    }
 }

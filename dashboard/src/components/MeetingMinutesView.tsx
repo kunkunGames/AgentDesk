@@ -55,6 +55,9 @@ interface Props {
   onRefresh: () => void;
   onNotify?: (message: string, type?: "info" | "success" | "warning" | "error") => string | void;
   onUpdateNotification?: (id: string, message: string, type?: "info" | "success" | "warning" | "error") => void;
+  initialShowStartForm?: boolean;
+  initialMeetingChannels?: RoundTableMeetingChannelOption[];
+  initialChannelId?: string;
 }
 
 type MeetingNotificationType = "info" | "success" | "warning" | "error";
@@ -233,7 +236,15 @@ export async function submitMeetingStartRequest(options: {
   }
 }
 
-export default function MeetingMinutesView({ meetings, onRefresh, onNotify, onUpdateNotification }: Props) {
+export default function MeetingMinutesView({
+  meetings,
+  onRefresh,
+  onNotify,
+  onUpdateNotification,
+  initialShowStartForm = false,
+  initialMeetingChannels = [],
+  initialChannelId,
+}: Props) {
   const { t, locale } = useI18n();
   const [detailMeeting, setDetailMeeting] = useState<RoundTableMeeting | null>(null);
   const [creatingIssue, setCreatingIssue] = useState<string | null>(null);
@@ -241,14 +252,14 @@ export default function MeetingMinutesView({ meetings, onRefresh, onNotify, onUp
   const [discardingMeetingIds, setDiscardingMeetingIds] = useState<Record<string, boolean>>({});
   const [deleting, setDeleting] = useState<string | null>(null);
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
-  const [showStartForm, setShowStartForm] = useState(false);
+  const [showStartForm, setShowStartForm] = useState(initialShowStartForm);
   const [agenda, setAgenda] = useState("");
-  const [channelId, setChannelId] = useState(() => localStorage.getItem(STORAGE_KEY) || "");
+  const [channelId, setChannelId] = useState(() => initialChannelId ?? (localStorage.getItem(STORAGE_KEY) || ""));
   const [primaryProvider, setPrimaryProvider] = useState<string>("claude");
   const [reviewerProvider, setReviewerProvider] = useState<string>("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
-  const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>([]);
+  const [meetingChannels, setMeetingChannels] = useState<RoundTableMeetingChannelOption[]>(initialMeetingChannels);
   const [fixedParticipants, setFixedParticipants] = useState<string[]>(parseStoredFixedParticipants);
   const [expertQuery, setExpertQuery] = useState("");
   const [channelQuery, setChannelQuery] = useState("");

@@ -1,8 +1,12 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { RoundTableMeeting, RoundTableMeetingChannelOption, RoundTableMeetingExpertOption } from "../types";
+import { I18nProvider } from "../i18n";
 import {
   filterMeetingExpertsByQuery,
   getMeetingReferenceHashes,
+  default as MeetingMinutesView,
   openMeetingDetailWithFallback,
   pruneFixedParticipantRoleIdsForLoadedChannel,
   submitMeetingStartRequest,
@@ -57,6 +61,44 @@ function meeting(overrides: Partial<RoundTableMeeting> = {}): RoundTableMeeting 
 
 const t = ({ ko }: { ko: string; en: string }) => ko;
 
+function installLocalStorage(values: Record<string, string> = {}) {
+  const storage = {
+    getItem: vi.fn((key: string) => values[key] ?? null),
+    setItem: vi.fn((key: string, value: string) => {
+      values[key] = value;
+    }),
+    removeItem: vi.fn((key: string) => {
+      delete values[key];
+    }),
+    clear: vi.fn(() => {
+      for (const key of Object.keys(values)) delete values[key];
+    }),
+  };
+  vi.stubGlobal("localStorage", storage);
+  return storage;
+}
+
+function renderMeetingStartFormMarkup() {
+  installLocalStorage({
+    "climpire.language": "ko",
+    "pcd_meeting_fixed_participants": "[]",
+  });
+
+  return renderToStaticMarkup(
+    createElement(
+      I18nProvider,
+      { language: "ko" },
+      createElement(MeetingMinutesView, {
+        meetings: [],
+        onRefresh: () => {},
+        initialShowStartForm: true,
+        initialChannelId: "meeting",
+        initialMeetingChannels: [channel(["qwen", "gemini"])],
+      }),
+    ),
+  );
+}
+
 describe("pruneFixedParticipantRoleIdsForLoadedChannel", () => {
   it("keeps stored fixed participants while meeting channels are loading", () => {
     const previous = ["td", "pd"];
@@ -106,6 +148,19 @@ describe("filterMeetingExpertsByQuery", () => {
     expect(filterMeetingExpertsByQuery([matched, unmatched], "gemini").map((item) => item.role_id)).toEqual(["gemini-domain"]);
     expect(filterMeetingExpertsByQuery([matched, unmatched], "architecture").map((item) => item.role_id)).toEqual(["gemini-domain"]);
     expect(filterMeetingExpertsByQuery([matched, unmatched], "spec review").map((item) => item.role_id)).toEqual(["gemini-domain"]);
+  });
+});
+
+describe("MeetingMinutesView rendered form contract", () => {
+  it("renders the meeting start form with provider terminology, multi-select expert search, and 3-row agenda input", () => {
+    const markup = renderMeetingStartFormMarkup();
+
+    expect(markup).toContain("진행 프로바이더");
+    expect(markup).toContain("리뷰 프로바이더");
+    expect(markup).toContain("고정 전문 에이전트");
+    expect(markup).toContain("placeholder=\"전문 에이전트 검색 후 여러 명 선택\"");
+    expect(markup).toContain("placeholder=\"회의 안건을 입력하세요\"");
+    expect(markup).toContain("rows=\"3\"");
   });
 });
 
