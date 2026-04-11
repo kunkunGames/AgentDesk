@@ -142,6 +142,42 @@ mod tests {
         }
     }
 
+    struct RepoAndRuntimeOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous_repo: Option<OsString>,
+        previous_root: Option<OsString>,
+    }
+
+    impl RepoAndRuntimeOverride {
+        fn new(repo_path: &std::path::Path, runtime_root: &std::path::Path) -> Self {
+            let guard = repo_dir_env_lock().lock().unwrap();
+            let previous_repo = std::env::var_os("AGENTDESK_REPO_DIR");
+            let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe {
+                std::env::set_var("AGENTDESK_REPO_DIR", repo_path);
+                std::env::set_var("AGENTDESK_ROOT_DIR", runtime_root);
+            }
+            Self {
+                _guard: guard,
+                previous_repo,
+                previous_root,
+            }
+        }
+    }
+
+    impl Drop for RepoAndRuntimeOverride {
+        fn drop(&mut self) {
+            match self.previous_repo.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") },
+            }
+            match self.previous_root.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
     fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -164,6 +200,21 @@ mod tests {
         run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
         let override_guard = RepoDirOverride::new(repo.path());
         (repo, override_guard)
+    }
+
+    fn setup_test_repo_with_runtime_root()
+    -> (tempfile::TempDir, tempfile::TempDir, RepoAndRuntimeOverride) {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+
+        let runtime_root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(runtime_root.path().join("runtime")).unwrap();
+
+        let override_guard = RepoAndRuntimeOverride::new(repo.path(), runtime_root.path());
+        (repo, runtime_root, override_guard)
     }
 
     fn seed_agent(db: &db::Db) {
@@ -1324,6 +1375,141 @@ mod tests {
                 "OnReviewEnter should create exactly 1 review dispatch"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scenario_6b_review_verdict_pass_completes_roundtrip_to_done() {
+        let (_repo, runtime_root, _env_guard) = setup_test_repo_with_runtime_root();
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-s6b", "in_progress");
+
+        let (dispatch_id, _, _) = dispatch::create_dispatch_core(
+            &db,
+            "card-s6b",
+            "agent-1",
+            "implementation",
+            "[Impl]",
+            &json!({}),
+        )
+        .unwrap();
+        seed_assistant_response_for_dispatch(&db, &dispatch_id, "implemented card-s6b");
+        dispatch::complete_dispatch(
+            &db,
+            &engine,
+            &dispatch_id,
+            &json!({"completion_source": "test_harness"}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_card_status(&db, "card-s6b"),
+            "review",
+            "implementation completion must advance the card into review first"
+        );
+
+        let (review_dispatch_id, reviewed_commit, review_provider) = {
+            let conn = db.lock().unwrap();
+            let (dispatch_id, context): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT id, context FROM task_dispatches \
+                     WHERE kanban_card_id = 'card-s6b' AND dispatch_type = 'review' \
+                     AND status IN ('pending', 'dispatched') \
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let review_context = context
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .expect("review dispatch must carry JSON context");
+            let reviewed_commit = review_context
+                .get("reviewed_commit")
+                .and_then(|field| field.as_str())
+                .map(str::to_string)
+                .expect("review dispatch must carry reviewed_commit context");
+            let review_provider = review_context
+                .get("target_provider")
+                .and_then(|field| field.as_str())
+                .map(str::to_string)
+                .expect("review dispatch must carry target_provider context");
+            (dispatch_id, reviewed_commit, review_provider)
+        };
+
+        let state = AppState::test_state(db.clone(), engine);
+        let (status, body) = crate::server::routes::review_verdict::submit_verdict(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::SubmitVerdictBody {
+                dispatch_id: review_dispatch_id.clone(),
+                overall: "pass".to_string(),
+                items: None,
+                notes: Some("characterization pass".to_string()),
+                feedback: None,
+                commit: Some(reviewed_commit.clone()),
+                provider: Some(review_provider),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "pass verdict should succeed: {body:?}"
+        );
+        assert_eq!(body.0["ok"], true);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let conn = db.lock().unwrap();
+        let (card_status, review_status, latest_dispatch_id): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, review_status, latest_dispatch_id FROM kanban_cards WHERE id = 'card-s6b'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let review_dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = ?1",
+                [&review_dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            review_dispatch_status, "completed",
+            "review verdict must complete the pending review dispatch"
+        );
+        assert_eq!(
+            card_status, "done",
+            "pass verdict must finish the full implementation -> review -> done lifecycle"
+        );
+        assert_eq!(review_status, None, "done card must clear review_status");
+        assert_eq!(
+            latest_dispatch_id.as_deref(),
+            Some(review_dispatch_id.as_str()),
+            "latest_dispatch_id should remain anchored to the completing review dispatch"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-s6b", "review"),
+            0,
+            "no active review dispatch may remain after a passing verdict"
+        );
+        assert!(
+            runtime_root
+                .path()
+                .join("runtime")
+                .join("review_passed")
+                .join(&reviewed_commit)
+                .exists(),
+            "pass verdict must stamp the reviewed commit marker in the runtime root"
+        );
     }
 
     // ── Scenario 7: dispatch uses card's effective pipeline, not global default (#134/#136) ──

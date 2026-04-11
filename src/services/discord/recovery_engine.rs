@@ -1630,6 +1630,91 @@ mod tests {
     }
 
     #[test]
+    fn persist_recovered_transcript_stores_dispatch_evidence() {
+        let db = crate::db::test_db();
+        let state = inflight::InflightTurnState {
+            version: 1,
+            provider: "codex".to_string(),
+            channel_id: 1486333430516945008,
+            channel_name: Some("adk-cdx-t1486333430516945008".to_string()),
+            request_owner_user_id: 343742347365974026,
+            user_msg_id: 1487795113240559788,
+            current_msg_id: 1487799916758827138,
+            current_msg_len: 0,
+            user_text: "릴리즈하다가 응답이 끊겼어. 이어서 설명해줘.".to_string(),
+            session_id: Some("session-1".to_string()),
+            tmux_session_name: Some("AgentDesk-codex-adk-cdx-t1486333430516945008".to_string()),
+            output_path: Some("/tmp/agentdesk-test.jsonl".to_string()),
+            input_fifo_path: Some("/tmp/agentdesk-test.input".to_string()),
+            last_offset: 123,
+            full_response: "중간까지 정리했습니다.".to_string(),
+            response_sent_offset: 0,
+            current_tool_line: None,
+            prev_tool_status: None,
+            started_at: "2026-03-29 22:00:34".to_string(),
+            updated_at: "2026-03-29 22:03:53".to_string(),
+            born_generation: 7,
+            any_tool_used: true,
+            has_post_tool_text: false,
+            session_key: Some("host:tmux-1".to_string()),
+            dispatch_id: Some("dispatch-from-state".to_string()),
+        };
+
+        assert!(persist_recovered_transcript(
+            &db,
+            &ProviderKind::Codex,
+            &state,
+            Some("dispatch-from-recovery"),
+            "  이미 확인한 내용은 여기까지입니다.  "
+        ));
+
+        let turn_id = format!("discord:{}:{}", state.channel_id, state.user_msg_id);
+        let conn = db.read_conn().unwrap();
+        let (
+            session_key,
+            channel_id,
+            provider,
+            dispatch_id,
+            user_message,
+            assistant_message,
+        ): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT session_key, channel_id, provider, dispatch_id, user_message, assistant_message \
+                 FROM session_transcripts WHERE turn_id = ?1",
+                [turn_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(session_key.as_deref(), Some("host:tmux-1"));
+        assert_eq!(channel_id.as_deref(), Some("1486333430516945008"));
+        assert_eq!(provider.as_deref(), Some("codex"));
+        assert_eq!(
+            dispatch_id.as_deref(),
+            Some("dispatch-from-recovery"),
+            "explicit recovery dispatch evidence must win over stale inflight state"
+        );
+        assert_eq!(user_message, "릴리즈하다가 응답이 끊겼어. 이어서 설명해줘.");
+        assert_eq!(assistant_message, "이미 확인한 내용은 여기까지입니다.");
+    }
+
+    #[test]
     fn missing_session_recovery_saves_handoff_for_followup_turn() {
         let _lock = super::super::runtime_store::lock_test_env();
         let temp = tempfile::TempDir::new().unwrap();
