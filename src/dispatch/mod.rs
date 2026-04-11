@@ -51,6 +51,27 @@ fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
             .is_some()
 }
 
+fn dispatch_context_worktree_target(
+    context: &serde_json::Value,
+) -> Result<Option<(String, Option<String>)>> {
+    let Some(path) = json_string_field(context, "worktree_path") else {
+        return Ok(None);
+    };
+    if !std::path::Path::new(path).is_dir() {
+        anyhow::bail!(
+            "Cannot create dispatch with explicit worktree_path '{}': path does not exist or is not a directory",
+            path
+        );
+    }
+
+    let branch = json_string_field(context, "worktree_branch")
+        .or_else(|| json_string_field(context, "branch"))
+        .map(str::to_string)
+        .or_else(|| crate::services::platform::shell::git_branch_name(path));
+
+    Ok(Some((path.to_string(), branch)))
+}
+
 fn is_card_scoped_worktree_path(path: &str, branch: Option<&str>) -> bool {
     let resolved_branch = branch
         .map(str::to_string)
@@ -879,19 +900,28 @@ fn create_dispatch_core_internal(
     let context_str = if dispatch_type == "review" {
         build_review_context(db, kanban_card_id, to_agent_id, context)?
     } else {
-        // #259: For ALL non-review dispatch types, inject worktree_path and
-        // worktree_branch so the session uses the same issue worktree as review
-        // dispatches. Without this, implementation/rework dispatches use the
-        // parent channel CWD (main repo), causing stale commit loops.
+        // #259: For ALL non-review dispatch types, prefer explicit worktree
+        // context from the caller; otherwise inject the canonical issue
+        // worktree so the session uses the right CWD instead of the repo root.
         let mut base = serde_json::to_string(context)?;
-        if let Some((wt_path, wt_branch, _)) = resolve_card_worktree(db, kanban_card_id)? {
+        let worktree_target =
+            if let Some((wt_path, wt_branch)) = dispatch_context_worktree_target(context)? {
+                Some((wt_path, wt_branch))
+            } else {
+                resolve_card_worktree(db, kanban_card_id)?
+                    .map(|(wt_path, wt_branch, _)| (wt_path, Some(wt_branch)))
+            };
+
+        if let Some((wt_path, wt_branch)) = worktree_target {
             if let Ok(mut obj) =
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
             {
                 obj.entry("worktree_path".to_string())
-                    .or_insert(json!(wt_path));
-                obj.entry("worktree_branch".to_string())
-                    .or_insert(json!(wt_branch));
+                    .or_insert(json!(wt_path.clone()));
+                if let Some(wt_branch) = wt_branch {
+                    obj.entry("worktree_branch".to_string())
+                        .or_insert(json!(wt_branch));
+                }
                 tracing::info!(
                     "[dispatch] {} dispatch for card {}: injecting worktree_path={}",
                     dispatch_type,
@@ -3059,6 +3089,39 @@ mod tests {
             dispatch_count, 0,
             "missing repo mapping must fail before INSERT"
         );
+    }
+
+    #[test]
+    fn create_dispatch_uses_explicit_worktree_context_without_repo_mapping() {
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        run_git(repo_dir, &["checkout", "-b", "wt/explicit-515"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-explicit-worktree", "review");
+        set_card_issue_number(&db, "card-explicit-worktree", 515);
+        set_card_repo_id(&db, "card-explicit-worktree", "owner/missing");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-explicit-worktree",
+            "agent-1",
+            "create-pr",
+            "Create PR",
+            &json!({
+                "worktree_path": repo_dir,
+                "worktree_branch": "wt/explicit-515",
+                "branch": "wt/explicit-515",
+            }),
+        )
+        .expect("explicit worktree context should bypass repo mapping lookup");
+
+        let ctx = &dispatch["context"];
+        assert_eq!(ctx["worktree_path"], repo_dir);
+        assert_eq!(ctx["worktree_branch"], "wt/explicit-515");
+        assert_eq!(ctx["branch"], "wt/explicit-515");
     }
 
     #[test]

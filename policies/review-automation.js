@@ -653,8 +653,15 @@ function processVerdict(cardId, verdict, result) {
           var issueNum = prCardInfo[0].github_issue_number || "?";
           try {
             agentdesk.dispatch.create(
-              cardId, agentId, "create-pr",
-              "[PR 생성] #" + issueNum + " " + prCardInfo[0].title
+              cardId,
+              agentId,
+              "create-pr",
+              "[PR 생성] #" + issueNum + " " + prCardInfo[0].title,
+              {
+                worktree_path: latestWorkTarget.worktree_path,
+                worktree_branch: latestWorkTarget.branch,
+                branch: latestWorkTarget.branch
+              }
             );
             prDispatched = true;
             agentdesk.log.info("[review] Create-PR dispatch created for tracked worktree card " + cardId);
