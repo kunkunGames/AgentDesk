@@ -1273,6 +1273,19 @@ pub(crate) async fn force_kill_session_impl(
         session_key, tmux_killed, inflight_cleared, active_dispatch_id, lifecycle.lifecycle_path
     );
 
+    // Notify bot message for force-kill visibility
+    if let Some(ref channel_id_str) = runtime_channel_id {
+        if let Ok(conn) = state.db.lock() {
+            let _ = conn.execute(
+                "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
+                rusqlite::params![
+                    format!("channel:{channel_id_str}"),
+                    format!("⚡ 세션 강제 종료: {session_key}"),
+                ],
+            );
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({
