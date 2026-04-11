@@ -11,7 +11,7 @@ use crate::db::{
         StatusFilter,
     },
 };
-use crate::services::service_error::{ServiceError, ServiceResult};
+use crate::services::service_error::{ErrorCode, ServiceError, ServiceResult};
 
 #[derive(Clone)]
 pub struct AutoQueueService {
@@ -142,10 +142,11 @@ impl AutoQueueService {
     ) -> ServiceResult<Vec<GenerateCandidate>> {
         if let Some(issue_numbers) = input.issue_numbers.as_ref().filter(|nums| !nums.is_empty()) {
             let transition_plan = {
-                let conn = self
-                    .db
-                    .read_conn()
-                    .map_err(|error| ServiceError::internal(format!("{error}")))?;
+                let conn = self.db.read_conn().map_err(|error| {
+                    ServiceError::internal(format!("{error}"))
+                        .with_code(ErrorCode::Database)
+                        .with_operation("prepare_generate_cards.read_conn.transition_plan")
+                })?;
                 crate::pipeline::ensure_loaded();
                 let backlog_cards = auto_queue::list_backlog_cards(
                     &conn,
@@ -155,7 +156,11 @@ impl AutoQueueService {
                         issue_numbers: Some(issue_numbers.clone()),
                     },
                 )
-                .map_err(|error| ServiceError::internal(format!("load backlog cards: {error}")))?;
+                .map_err(|error| {
+                    ServiceError::internal(format!("load backlog cards: {error}"))
+                        .with_code(ErrorCode::Database)
+                        .with_operation("prepare_generate_cards.list_backlog_cards")
+                })?;
 
                 let mut plan = Vec::with_capacity(backlog_cards.len());
                 for card in backlog_cards {
@@ -175,7 +180,9 @@ impl AutoQueueService {
                         return Err(ServiceError::bad_request(format!(
                             "card {} has no free path from backlog to ready/dispatchable state",
                             card.card_id
-                        )));
+                        ))
+                        .with_code(ErrorCode::AutoQueue)
+                        .with_context("card_id", &card.card_id));
                     };
                     plan.push((card.card_id, path));
                 }
@@ -194,15 +201,19 @@ impl AutoQueueService {
                         ServiceError::bad_request(format!(
                             "failed to auto-transition card {card_id} to {step}: {error}"
                         ))
+                        .with_code(ErrorCode::AutoQueue)
+                        .with_context("card_id", card_id.as_str())
+                        .with_context("target_state", step)
                     })?;
                 }
             }
         }
 
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("prepare_generate_cards.read_conn.generate_candidates")
+        })?;
         crate::pipeline::ensure_loaded();
         let enqueueable_states = crate::pipeline::try_get()
             .map(enqueueable_states_for)
@@ -216,7 +227,11 @@ impl AutoQueueService {
             },
             &enqueueable_states,
         )
-        .map_err(|error| ServiceError::internal(format!("load generate cards: {error}")))?;
+        .map_err(|error| {
+            ServiceError::internal(format!("load generate cards: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("prepare_generate_cards.list_generate_candidates")
+        })?;
 
         Ok(cards.into_iter().map(GenerateCandidate::from).collect())
     }
@@ -227,22 +242,35 @@ impl AutoQueueService {
         agent_id: Option<&str>,
         status: &str,
     ) -> ServiceResult<i64> {
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
-        auto_queue::count_cards_by_status(&conn, repo, agent_id, status)
-            .map_err(|error| ServiceError::internal(format!("count cards: {error}")))
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("count_cards_by_status.read_conn")
+                .with_context("status", status)
+        })?;
+        auto_queue::count_cards_by_status(&conn, repo, agent_id, status).map_err(|error| {
+            ServiceError::internal(format!("count cards: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("count_cards_by_status")
+                .with_context("status", status)
+        })
     }
 
     pub fn run_view(&self, run_id: &str) -> ServiceResult<Option<AutoQueueRunView>> {
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("run_view.read_conn")
+                .with_context("run_id", run_id)
+        })?;
         auto_queue::get_run(&conn, run_id)
             .map(|record| record.map(AutoQueueRunView::from))
-            .map_err(|error| ServiceError::internal(format!("load run: {error}")))
+            .map_err(|error| {
+                ServiceError::internal(format!("load run: {error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("run_view.get_run")
+                    .with_context("run_id", run_id)
+            })
     }
 
     pub fn run_json(&self, run_id: &str) -> ServiceResult<Value> {
@@ -257,12 +285,18 @@ impl AutoQueueService {
         entry_id: &str,
         guild_id: Option<&str>,
     ) -> ServiceResult<Option<AutoQueueStatusEntryView>> {
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
-        let Some(record) = auto_queue::get_status_entry(&conn, entry_id)
-            .map_err(|error| ServiceError::internal(format!("load status entry: {error}")))?
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("entry_view.read_conn")
+                .with_context("entry_id", entry_id)
+        })?;
+        let Some(record) = auto_queue::get_status_entry(&conn, entry_id).map_err(|error| {
+            ServiceError::internal(format!("load status entry: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("entry_view.get_status_entry")
+                .with_context("entry_id", entry_id)
+        })?
         else {
             return Ok(None);
         };
@@ -287,12 +321,18 @@ impl AutoQueueService {
         run_id: &str,
         input: StatusInput,
     ) -> ServiceResult<AutoQueueStatusResponse> {
-        let conn = self
-            .db
-            .read_conn()
-            .map_err(|error| ServiceError::internal(format!("{error}")))?;
-        let Some(run) = auto_queue::get_run(&conn, run_id)
-            .map_err(|error| ServiceError::internal(format!("load run: {error}")))?
+        let conn = self.db.read_conn().map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("status_for_run.read_conn")
+                .with_context("run_id", run_id)
+        })?;
+        let Some(run) = auto_queue::get_run(&conn, run_id).map_err(|error| {
+            ServiceError::internal(format!("load run: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("status_for_run.get_run")
+                .with_context("run_id", run_id)
+        })?
         else {
             return Ok(AutoQueueStatusResponse::default());
         };
@@ -304,7 +344,12 @@ impl AutoQueueService {
                 agent_id: input.agent_id.clone(),
             },
         )
-        .map_err(|error| ServiceError::internal(format!("load status entries: {error}")))?;
+        .map_err(|error| {
+            ServiceError::internal(format!("load status entries: {error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("status_for_run.list_status_entries")
+                .with_context("run_id", run_id)
+        })?;
 
         build_status_response(&conn, run, records, input.guild_id.as_deref())
     }
@@ -315,10 +360,11 @@ impl AutoQueueService {
 
     pub fn status(&self, input: StatusInput) -> ServiceResult<AutoQueueStatusResponse> {
         let run_id = {
-            let conn = self
-                .db
-                .read_conn()
-                .map_err(|error| ServiceError::internal(format!("{error}")))?;
+            let conn = self.db.read_conn().map_err(|error| {
+                ServiceError::internal(format!("{error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("status.read_conn")
+            })?;
             auto_queue::find_latest_run_id(
                 &conn,
                 &StatusFilter {
@@ -326,7 +372,11 @@ impl AutoQueueService {
                     agent_id: input.agent_id.clone(),
                 },
             )
-            .map_err(|error| ServiceError::internal(format!("load latest run: {error}")))?
+            .map_err(|error| {
+                ServiceError::internal(format!("load latest run: {error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("status.find_latest_run_id")
+            })?
         };
         let Some(run_id) = run_id else {
             return Ok(AutoQueueStatusResponse::default());
@@ -469,6 +519,9 @@ fn build_entry_view(
         let loaded = crate::db::agents::load_agent_channel_bindings(conn, &record.agent_id)
             .map_err(|error| {
                 ServiceError::internal(format!("load agent channel bindings: {error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("build_entry_view.load_agent_channel_bindings")
+                    .with_context("agent_id", &record.agent_id)
             })?;
         agent_bindings_cache.insert(record.agent_id.clone(), loaded.clone());
         loaded

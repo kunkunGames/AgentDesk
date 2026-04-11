@@ -115,6 +115,43 @@ fn test_engine_db_execute_warns_and_blocks_core_table_sql() {
 }
 
 #[test]
+fn test_engine_db_query_raw_returns_unified_error_json() {
+    let db = test_db();
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+
+        let raw: String = ctx
+            .eval(r#"agentdesk.db.__query_raw("SELECT nope FROM missing_table", "[]")"#)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["code"], "database");
+        assert_eq!(value["context"]["operation"], "agentdesk.db.query.prepare");
+
+        let err_text: String = ctx
+            .eval(
+                r#"
+                (() => {
+                    try {
+                        agentdesk.db.query("SELECT nope FROM missing_table");
+                        return "no-error";
+                    } catch (error) {
+                        return String(error);
+                    }
+                })()
+                "#,
+            )
+            .unwrap();
+        assert!(
+            err_text.contains("missing_table") || err_text.contains("no such table"),
+            "db.query should surface the database failure, got: {err_text}"
+        );
+    });
+}
+
+#[test]
 fn test_engine_log_ops() {
     let db = test_db();
     let rt = rquickjs::Runtime::new().unwrap();
