@@ -1,6 +1,13 @@
 //! GitHub issue state sync: keep kanban cards consistent with GitHub issue state.
 
 use crate::db::Db;
+use chrono::{Duration, NaiveDate, Utc};
+use std::collections::HashSet;
+
+const ISSUE_JSON_FIELDS: &str = "number,state,title,labels,body";
+const PRIMARY_FETCH_LIMIT: u32 = 100;
+const RECENTLY_CLOSED_FETCH_LIMIT: u32 = 50;
+const RECENTLY_CLOSED_LOOKBACK_DAYS: i64 = 30;
 
 /// Represents a GitHub issue as returned by `gh issue list --json`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -29,21 +36,64 @@ pub(crate) fn fetch_issues_with(
     adapter: &dyn super::GitHubAdapter,
     repo: &str,
 ) -> Result<Vec<GhIssue>, String> {
-    let output = adapter.run(&[
+    fetch_issues_with_cutoff(adapter, repo, Utc::now().date_naive())
+}
+
+fn fetch_issues_with_cutoff(
+    adapter: &dyn super::GitHubAdapter,
+    repo: &str,
+    today: NaiveDate,
+) -> Result<Vec<GhIssue>, String> {
+    let mut issues = fetch_issue_batch(adapter, repo, "all", PRIMARY_FETCH_LIMIT, None)?;
+    let recent_closed_search = recent_closed_search_query(today);
+    let recent_closed = fetch_issue_batch(
+        adapter,
+        repo,
+        "closed",
+        RECENTLY_CLOSED_FETCH_LIMIT,
+        Some(recent_closed_search.as_str()),
+    )?;
+    merge_unique_issues(&mut issues, recent_closed);
+    Ok(issues)
+}
+
+fn fetch_issue_batch(
+    adapter: &dyn super::GitHubAdapter,
+    repo: &str,
+    state: &str,
+    limit: u32,
+    search: Option<&str>,
+) -> Result<Vec<GhIssue>, String> {
+    let limit_text = limit.to_string();
+    let mut args = vec![
         "issue",
         "list",
         "--repo",
         repo,
         "--json",
-        "number,state,title,labels,body",
+        ISSUE_JSON_FIELDS,
         "--limit",
-        "100",
+        limit_text.as_str(),
         "--state",
-        "all",
-    ])?;
+        state,
+    ];
+    if let Some(search) = search {
+        args.extend(["--search", search]);
+    }
 
+    let output = adapter.run(&args)?;
     serde_json::from_str::<Vec<GhIssue>>(&output)
         .map_err(|e| format!("failed to parse gh output: {e}"))
+}
+
+fn recent_closed_search_query(today: NaiveDate) -> String {
+    let cutoff = today - Duration::days(RECENTLY_CLOSED_LOOKBACK_DAYS);
+    format!("closed:>{}", cutoff.format("%Y-%m-%d"))
+}
+
+fn merge_unique_issues(target: &mut Vec<GhIssue>, extras: Vec<GhIssue>) {
+    let mut seen: HashSet<i64> = target.iter().map(|issue| issue.number).collect();
+    target.extend(extras.into_iter().filter(|issue| seen.insert(issue.number)));
 }
 
 /// Sync GitHub issue state with kanban cards for a single repo.
@@ -219,30 +269,66 @@ mod tests {
     }
 
     #[test]
-    fn fetch_issues_routes_through_adapter_interface() {
-        let adapter = RecordingAdapter::with_sync_responses(vec![Ok(
-            r#"[{"number":5,"state":"OPEN","title":"Adapter flow","labels":[{"name":"bug"}],"body":"Body"}]"#
+    fn fetch_issues_merges_recently_closed_batch_without_duplicates() {
+        let adapter = RecordingAdapter::with_sync_responses(vec![
+            Ok(
+                r#"[
+                    {"number":105,"state":"OPEN","title":"Recent open","labels":[{"name":"bug"}],"body":"Body"},
+                    {"number":5,"state":"CLOSED","title":"Already included","labels":[],"body":null}
+                ]"#
                 .to_string(),
-        )]);
+            ),
+            Ok(
+                r#"[
+                    {"number":5,"state":"CLOSED","title":"Already included","labels":[],"body":null},
+                    {"number":210,"state":"CLOSED","title":"Old issue closed recently","labels":[],"body":null}
+                ]"#
+                .to_string(),
+            ),
+        ]);
 
-        let issues = fetch_issues_with(&adapter, "owner/repo").unwrap();
+        let issues = fetch_issues_with_cutoff(
+            &adapter,
+            "owner/repo",
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+        )
+        .unwrap();
 
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].number, 5);
+        assert_eq!(issues.len(), 3);
+        assert_eq!(
+            issues.iter().map(|issue| issue.number).collect::<Vec<_>>(),
+            vec![105, 5, 210]
+        );
         assert_eq!(
             adapter.calls(),
-            vec![vec![
-                "issue".to_string(),
-                "list".to_string(),
-                "--repo".to_string(),
-                "owner/repo".to_string(),
-                "--json".to_string(),
-                "number,state,title,labels,body".to_string(),
-                "--limit".to_string(),
-                "100".to_string(),
-                "--state".to_string(),
-                "all".to_string(),
-            ]]
+            vec![
+                vec![
+                    "issue".to_string(),
+                    "list".to_string(),
+                    "--repo".to_string(),
+                    "owner/repo".to_string(),
+                    "--json".to_string(),
+                    "number,state,title,labels,body".to_string(),
+                    "--limit".to_string(),
+                    "100".to_string(),
+                    "--state".to_string(),
+                    "all".to_string(),
+                ],
+                vec![
+                    "issue".to_string(),
+                    "list".to_string(),
+                    "--repo".to_string(),
+                    "owner/repo".to_string(),
+                    "--json".to_string(),
+                    "number,state,title,labels,body".to_string(),
+                    "--limit".to_string(),
+                    "50".to_string(),
+                    "--state".to_string(),
+                    "closed".to_string(),
+                    "--search".to_string(),
+                    "closed:>2026-03-13".to_string(),
+                ],
+            ]
         );
     }
 
@@ -359,15 +445,29 @@ mod tests {
             .unwrap();
         }
 
-        let adapter = RecordingAdapter::with_sync_responses(vec![Ok(
-            r#"[
-                {"number":7,"state":"CLOSED","title":"Already linked","labels":[],"body":"Closed body"},
-                {"number":9,"state":"OPEN","title":"New issue","labels":[{"name":"high"}],"body":"Open body"}
-            ]"#
-            .to_string(),
-        )]);
+        let adapter = RecordingAdapter::with_sync_responses(vec![
+            Ok(
+                r#"[
+                    {"number":7,"state":"CLOSED","title":"Already linked","labels":[],"body":"Closed body"},
+                    {"number":9,"state":"OPEN","title":"New issue","labels":[{"name":"high"}],"body":"Open body"}
+                ]"#
+                .to_string(),
+            ),
+            Ok(
+                r#"[
+                    {"number":7,"state":"CLOSED","title":"Already linked","labels":[],"body":"Closed body"},
+                    {"number":210,"state":"CLOSED","title":"Older issue closed recently","labels":[],"body":"Closed later"}
+                ]"#
+                .to_string(),
+            ),
+        ]);
 
-        let issues = fetch_issues_with(&adapter, "owner/repo").unwrap();
+        let issues = fetch_issues_with_cutoff(
+            &adapter,
+            "owner/repo",
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+        )
+        .unwrap();
         let triaged = crate::github::triage::triage_new_issues(&db, "owner/repo", &issues).unwrap();
         let synced =
             sync_github_issues_for_repo(&db, &test_engine(&db), "owner/repo", &issues).unwrap();
