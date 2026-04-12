@@ -21,61 +21,30 @@ export interface RankedAgent {
 
 interface DashboardHeroHeaderProps {
   companyName: string;
-  time: string;
-  date: string;
-  briefing: string;
-  reviewQueue: number;
-  numberFormatter: Intl.NumberFormat;
   t: TFunction;
 }
 
 export function DashboardHeroHeader({
   companyName,
-  time,
-  date,
-  briefing,
-  reviewQueue,
-  numberFormatter,
   t,
 }: DashboardHeroHeaderProps) {
   return (
     <div className="game-panel relative overflow-hidden p-5">
       <div className="pointer-events-none absolute inset-0 bg-[repeating-linear-gradient(0deg,transparent,transparent_2px,rgba(0,0,0,0.03)_2px,rgba(0,0,0,0.03)_4px)]" />
 
-      <div className="relative flex flex-wrap items-center justify-between gap-4">
+      <div className="relative">
         <div className="space-y-1.5">
-          <div className="flex items-center gap-3">
-            <h1 className="dashboard-title-gradient text-2xl font-black tracking-tight sm:text-3xl">{companyName}</h1>
-            <span className="flex items-center gap-1.5 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-2.5 py-0.5 text-xs font-bold uppercase tracking-widest text-emerald-300">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
-              {t({ ko: "실시간", en: "LIVE", ja: "ライブ", zh: "实时" })}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <p className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-              {t({
-                ko: "에이전트들이 실시간으로 미션을 수행 중입니다",
-                en: "Agents are executing missions in real time",
-                ja: "エージェントがリアルタイムでミッションを実行中です",
-                zh: "代理正在实时执行任务",
-              })}
-            </p>
-            <span className="font-mono text-xs tracking-tight" style={{ color: "var(--th-text-muted)" }}>{time}</span>
-          </div>
-        </div>
-
-        <div className="hidden sm:flex items-center gap-3">
-          <div className="flex flex-col gap-1">
-            <span className="rounded-md border border-surface-light bg-surface-subtle px-2 py-0.5 text-xs text-slate-400">
-              {date}
-            </span>
-            <span className="rounded-md border border-cyan-400/20 bg-cyan-500/[0.06] px-2 py-0.5 text-xs text-cyan-300">
-              {briefing}
-            </span>
-          </div>
+          <h1 className="dashboard-title-gradient text-2xl font-black tracking-tight sm:text-3xl">{companyName}</h1>
+          <p className="text-xs sm:text-sm" style={{ color: "var(--th-text-muted)" }}>
+            {t({
+              ko: "핵심 운영 상태와 토큰 흐름만 빠르게 확인합니다",
+              en: "Track only the key operations and token flow at a glance",
+              ja: "主要な運用状態とトークン推移だけを素早く確認します",
+              zh: "只快速查看关键运营状态与 Token 流向",
+            })}
+          </p>
         </div>
       </div>
-
     </div>
   );
 }
@@ -87,7 +56,7 @@ interface DashboardHudStatsProps {
 
 export function DashboardHudStats({ hudStats, numberFormatter }: DashboardHudStatsProps) {
   return (
-    <div className="grid grid-cols-4 gap-1.5 sm:gap-3">
+    <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 sm:gap-3">
       {hudStats.map((stat) => (
         <div
           key={stat.id}
