@@ -14,6 +14,7 @@ import {
   STATUS_TRANSITIONS,
   TRANSITION_STYLE,
   formatIso,
+  getCardDwellBadge,
   getCardDelayBadge,
   getCardMetadata,
   getChecklistSummary,
@@ -34,6 +35,12 @@ interface ColumnDef {
   accent: string;
 }
 
+interface CardLiveToolState {
+  agentId: string;
+  line: string;
+  updatedAt?: string | null;
+}
+
 export interface KanbanColumnProps {
   column: ColumnDef;
   columnCards: KanbanCard[];
@@ -51,6 +58,10 @@ export interface KanbanColumnProps {
   assigningIssue: boolean;
   dispatchMap: Map<string, TaskDispatch>;
   dispatches: TaskDispatch[];
+  nowMs?: number;
+  cardsById?: Map<string, KanbanCard>;
+  childCardsByParentId?: Map<string, KanbanCard[]>;
+  liveToolStateByCardId?: Map<string, CardLiveToolState>;
   repoSources: KanbanRepoSource[];
   selectedRepo: string;
   getAgentLabel: (agentId: string | null | undefined) => string;
@@ -89,6 +100,10 @@ export default function KanbanColumn({
   assigningIssue,
   dispatchMap,
   dispatches,
+  nowMs,
+  cardsById,
+  childCardsByParentId,
+  liveToolStateByCardId,
   repoSources,
   selectedRepo,
   getAgentLabel,
@@ -188,6 +203,10 @@ export default function KanbanColumn({
             dragOverCardId={dragOverCardId}
             dispatchMap={dispatchMap}
             dispatches={dispatches}
+            nowMs={nowMs}
+            cardsById={cardsById}
+            childCardsByParentId={childCardsByParentId}
+            liveToolState={liveToolStateByCardId?.get(card.id)}
             getAgentLabel={getAgentLabel}
             onCardClick={onCardClick}
             onSetDraggingCardId={onSetDraggingCardId}
@@ -331,6 +350,10 @@ interface KanbanCardArticleProps {
   dragOverCardId: string | null;
   dispatchMap: Map<string, TaskDispatch>;
   dispatches: TaskDispatch[];
+  nowMs?: number;
+  cardsById?: Map<string, KanbanCard>;
+  childCardsByParentId?: Map<string, KanbanCard[]>;
+  liveToolState?: CardLiveToolState;
   getAgentLabel: (agentId: string | null | undefined) => string;
   onCardClick: (cardId: string) => void;
   onSetDraggingCardId: (id: string | null) => void;
@@ -351,6 +374,10 @@ function KanbanCardArticle({
   dragOverCardId,
   dispatchMap,
   dispatches,
+  nowMs,
+  cardsById,
+  childCardsByParentId,
+  liveToolState,
   getAgentLabel,
   onCardClick,
   onSetDraggingCardId,
@@ -364,6 +391,15 @@ function KanbanCardArticle({
   const metadata = getCardMetadata(card);
   const checklistSummary = getChecklistSummary(card);
   const delayBadge = getCardDelayBadge(card, tr);
+  const dwellBadge = getCardDwellBadge(card, nowMs ?? Date.now(), tr);
+  const parentCard = card.parent_card_id ? cardsById?.get(card.parent_card_id) ?? null : null;
+  const childCards = childCardsByParentId?.get(card.id) ?? [];
+  const cardBorderColor = dragOverCardId === card.id
+    ? column.accent
+    : dwellBadge?.borderColor ?? "rgba(148,163,184,0.2)";
+  const cardBackgroundColor = dwellBadge
+    ? dwellBadge.backgroundColor.replace("0.18", "0.10")
+    : isReviewCard(card) ? "rgba(139,92,246,0.08)" : "var(--th-card-bg)";
 
   return (
     <article
@@ -392,10 +428,15 @@ function KanbanCardArticle({
       onClick={() => onCardClick(card.id)}
       className="rounded-2xl border p-3 cursor-pointer transition-transform hover:-translate-y-0.5"
       style={{
-        borderColor: dragOverCardId === card.id ? column.accent : "rgba(148,163,184,0.2)",
-        backgroundColor: isReviewCard(card) ? "rgba(139,92,246,0.08)" : "var(--th-card-bg)",
+        borderColor: cardBorderColor,
+        backgroundColor: cardBackgroundColor,
         borderLeft: isReviewCard(card) ? "3px solid rgba(139,92,246,0.6)" : undefined,
         opacity: draggingCardId === card.id ? 0.45 : 1,
+        boxShadow: dwellBadge?.tone === "stale"
+          ? "0 0 0 1px rgba(239,68,68,0.12)"
+          : dwellBadge?.tone === "warm"
+            ? "0 0 0 1px rgba(234,179,8,0.12)"
+            : undefined,
       }}
     >
       <div className="flex items-start justify-between gap-2">
@@ -439,6 +480,18 @@ function KanbanCardArticle({
                 {tr("리뷰", "Review")} {checklistSummary}
               </span>
             )}
+            {dwellBadge && (
+              <span
+                className="px-2 py-0.5 rounded-full text-xs border"
+                style={{
+                  color: dwellBadge.textColor,
+                  backgroundColor: dwellBadge.backgroundColor,
+                  borderColor: dwellBadge.borderColor,
+                }}
+              >
+                {dwellBadge.label} {dwellBadge.detail}
+              </span>
+            )}
             {delayBadge && (
               <span className="px-2 py-0.5 rounded-full text-xs" style={{ color: "white", backgroundColor: delayBadge.tone }}>
                 {delayBadge.label} {delayBadge.detail}
@@ -454,6 +507,28 @@ function KanbanCardArticle({
         </span>
       </div>
 
+      {liveToolState && (
+        <div
+          className="mt-2 rounded-xl border px-2.5 py-2 text-[11px]"
+          style={{
+            borderColor: "rgba(59,130,246,0.34)",
+            backgroundColor: "rgba(59,130,246,0.12)",
+            color: "#bfdbfe",
+          }}
+          title={liveToolState.line}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-semibold uppercase tracking-wide">
+              {tr("실행 도구", "Live Tool")}
+            </span>
+            <span style={{ color: "rgba(191,219,254,0.72)" }}>
+              {getAgentLabel(liveToolState.agentId)}
+            </span>
+          </div>
+          <div className="mt-1 truncate">{liveToolState.line}</div>
+        </div>
+      )}
+
       {card.description && (() => {
         const sections = parseIssueSections(card.description);
         const displayText = sections?.content ?? card.description;
@@ -463,6 +538,61 @@ function KanbanCardArticle({
           </div>
         );
       })()}
+
+      {(parentCard || childCards.length > 0) && (
+        <div
+          className="mt-2 rounded-xl border px-2.5 py-2 text-[11px] space-y-2"
+          style={{
+            borderColor: "rgba(96,165,250,0.28)",
+            backgroundColor: "rgba(30,64,175,0.1)",
+            color: "#dbeafe",
+          }}
+        >
+          {parentCard && (
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "#93c5fd" }}>
+                {tr("상위 카드", "Parent")}
+              </div>
+              <div className="mt-1 flex items-center gap-2">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ backgroundColor: COLUMN_DEFS.find((item) => item.status === parentCard.status)?.accent ?? "#93c5fd" }}
+                />
+                <span className="truncate">
+                  {parentCard.github_issue_number ? `#${parentCard.github_issue_number} ` : ""}
+                  {parentCard.title}
+                </span>
+              </div>
+            </div>
+          )}
+          {childCards.length > 0 && (
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "#93c5fd" }}>
+                {tr("하위 카드", "Children")} {childCards.length}
+              </div>
+              <div className="mt-1 space-y-1">
+                {childCards.slice(0, 3).map((child) => (
+                  <div key={child.id} className="flex items-center gap-2">
+                    <span
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: COLUMN_DEFS.find((item) => item.status === child.status)?.accent ?? "#93c5fd" }}
+                    />
+                    <span className="truncate">
+                      {child.github_issue_number ? `#${child.github_issue_number} ` : ""}
+                      {child.title}
+                    </span>
+                  </div>
+                ))}
+                {childCards.length > 3 && (
+                  <div style={{ color: "rgba(219,234,254,0.72)" }}>
+                    + {childCards.length - 3} {tr("개 더", "more")}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {card.status === "blocked" && card.blocked_reason && (
         <div className="mt-2 rounded-md px-2.5 py-2 text-xs" style={{ backgroundColor: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)", color: "#fca5a5" }}>
