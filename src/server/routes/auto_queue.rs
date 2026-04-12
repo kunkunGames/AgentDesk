@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -55,6 +55,13 @@ pub struct ActivateBody {
 pub struct StatusQuery {
     pub repo: Option<String>,
     pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +313,32 @@ pub(crate) fn cancel_with_conn(
         "released_slots": released_slots,
         "cleared_slot_sessions": cleared_slot_sessions,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct AutoQueueHistoryRun {
+    id: String,
+    repo: Option<String>,
+    agent_id: Option<String>,
+    status: String,
+    created_at: i64,
+    completed_at: Option<i64>,
+    duration_ms: i64,
+    entry_count: i64,
+    done_count: i64,
+    skipped_count: i64,
+    pending_count: i64,
+    dispatched_count: i64,
+    success_rate: f64,
+    failure_rate: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoQueueHistorySummary {
+    total_runs: usize,
+    completed_runs: usize,
+    success_rate: f64,
+    failure_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -3560,6 +3593,106 @@ pub async fn status(
         Ok(response) => (StatusCode::OK, Json(json!(response))),
         Err(error) => error.into_json_response(),
     }
+}
+
+/// GET /api/auto-queue/history
+pub async fn history(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = query.limit.unwrap_or(8).clamp(1, 20);
+    let conn = match state.db.separate_conn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    let records = match crate::db::auto_queue::list_run_history(
+        &conn,
+        &crate::db::auto_queue::StatusFilter {
+            repo: query.repo,
+            agent_id: query.agent_id,
+        },
+        limit,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("list run history: {error}")})),
+            );
+        }
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let runs: Vec<AutoQueueHistoryRun> = records
+        .into_iter()
+        .map(|record| {
+            let entry_count = record.entry_count.max(0);
+            let completed_count = record.done_count.max(0);
+            let unresolved_count = (entry_count - completed_count).max(0) as f64;
+            let total_entries = entry_count.max(1) as f64;
+            let success_rate = if entry_count > 0 {
+                completed_count as f64 / total_entries
+            } else {
+                0.0
+            };
+            let failure_rate = if entry_count > 0 {
+                unresolved_count / total_entries
+            } else {
+                0.0
+            };
+            AutoQueueHistoryRun {
+                id: record.id,
+                repo: record.repo,
+                agent_id: record.agent_id,
+                status: record.status,
+                created_at: record.created_at,
+                completed_at: record.completed_at,
+                duration_ms: record
+                    .completed_at
+                    .unwrap_or(now_ms)
+                    .saturating_sub(record.created_at),
+                entry_count,
+                done_count: record.done_count,
+                skipped_count: record.skipped_count,
+                pending_count: record.pending_count,
+                dispatched_count: record.dispatched_count,
+                success_rate,
+                failure_rate,
+            }
+        })
+        .collect();
+
+    let total_runs = runs.len();
+    let completed_runs = runs.iter().filter(|run| run.status == "completed").count();
+    let success_rate = if total_runs > 0 {
+        runs.iter().map(|run| run.success_rate).sum::<f64>() / total_runs as f64
+    } else {
+        0.0
+    };
+    let failure_rate = if total_runs > 0 {
+        runs.iter().map(|run| run.failure_rate).sum::<f64>() / total_runs as f64
+    } else {
+        0.0
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "summary": AutoQueueHistorySummary {
+                total_runs,
+                completed_runs,
+                success_rate,
+                failure_rate,
+            },
+            "runs": runs,
+        })),
+    )
 }
 
 /// PATCH /api/auto-queue/entries/{id}

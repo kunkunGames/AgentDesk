@@ -88,6 +88,7 @@ const RUN_STATUS_STYLE: Record<AutoQueueRun["status"], { bg: string; text: strin
   active: { bg: "rgba(139,92,246,0.2)", text: "#a78bfa", label: "실행 중", labelEn: "Active" },
   paused: { bg: "rgba(245,158,11,0.2)", text: "#fbbf24", label: "일시정지", labelEn: "Paused" },
   completed: { bg: "rgba(34,197,94,0.2)", text: "#4ade80", label: "완료", labelEn: "Done" },
+  cancelled: { bg: "rgba(248,113,113,0.18)", text: "#f87171", label: "취소됨", labelEn: "Cancelled" },
 };
 
 function reorderPendingIds(ids: string[], fromId: string, toId: string): string[] | null {

@@ -1,6 +1,8 @@
 import { type CSSProperties, useEffect, useMemo, useState } from "react";
-import { getTokenAnalytics } from "../../api";
+import { getKanbanCards, getTokenAnalytics } from "../../api";
 import type {
+  Agent,
+  KanbanCard,
   ReceiptSnapshotAgentShare,
   ReceiptSnapshotModelLine,
   TokenAnalyticsDailyPoint,
@@ -9,10 +11,13 @@ import type {
 } from "../../types";
 import type { TFunction } from "./model";
 import { cx, dashboardBadge, dashboardButton, dashboardCard } from "./ui";
+import TooltipLabel from "../common/TooltipLabel";
+import { buildAgentRoiRows } from "./dashboardInsights";
 
 type Period = "7d" | "30d" | "90d";
 
 interface TokenAnalyticsSectionProps {
+  agents: Agent[];
   t: TFunction;
   numberFormatter: Intl.NumberFormat;
 }
@@ -208,12 +213,15 @@ export function dailyTrendBarHeightPx(totalTokens: number, trendMax: number): nu
 }
 
 export default function TokenAnalyticsSection({
+  agents,
   t,
   numberFormatter,
 }: TokenAnalyticsSectionProps) {
   const [period, setPeriod] = useState<Period>("30d");
   const [data, setData] = useState<TokenAnalyticsResponse | null>(null);
+  const [cards, setCards] = useState<KanbanCard[]>([]);
   const [loading, setLoading] = useState(false);
+  const [cardsLoading, setCardsLoading] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -244,6 +252,29 @@ export default function TokenAnalyticsSection({
     };
   }, [period]);
 
+  useEffect(() => {
+    let mounted = true;
+
+    const loadCards = async () => {
+      if (mounted) setCardsLoading(true);
+      try {
+        const next = await getKanbanCards();
+        if (mounted) setCards(next);
+      } catch {
+        // Ignore transient dashboard fetch failures and keep previous state.
+      } finally {
+        if (mounted) setCardsLoading(false);
+      }
+    };
+
+    void loadCards();
+    const timer = setInterval(() => void loadCards(), 60_000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
+
   const segments = useMemo(() => buildModelSegments(data?.receipt.models ?? []), [data]);
   const donutBackground = useMemo(() => buildDonutBackground(segments), [segments]);
   const weekLabels = useMemo(() => buildWeekLabels(data?.heatmap ?? []), [data]);
@@ -254,6 +285,17 @@ export default function TokenAnalyticsSection({
   const topAgents = useMemo(
     () => [...(data?.receipt.agents ?? [])].sort((a, b) => b.cost - a.cost).slice(0, 8),
     [data],
+  );
+  const roiRows = useMemo(
+    () =>
+      buildAgentRoiRows({
+        cards,
+        agentShares: data?.receipt.agents ?? [],
+        agents,
+        periodStart: data?.receipt.period_start,
+        periodEnd: data?.receipt.period_end,
+      }).slice(0, 8),
+    [agents, cards, data],
   );
 
   return (
@@ -462,6 +504,13 @@ export default function TokenAnalyticsSection({
           loading={loading}
         />
       </div>
+
+      <AgentRoiCard
+        t={t}
+        rows={roiRows}
+        loading={loading || cardsLoading}
+        numberFormatter={numberFormatter}
+      />
     </section>
   );
 }
@@ -862,6 +911,124 @@ function AgentSpendCard({
                   style={{
                     width: `${Math.max(6, (agent.cost / maxCost) * 100)}%`,
                     background: "linear-gradient(90deg, #22c55e, #14b8a6)",
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentRoiCard({
+  t,
+  rows,
+  loading,
+  numberFormatter,
+}: {
+  t: TFunction;
+  rows: ReturnType<typeof buildAgentRoiRows>;
+  loading: boolean;
+  numberFormatter: Intl.NumberFormat;
+}) {
+  const maxScore = Math.max(0.01, ...rows.map((row) => row.cards_per_million_tokens));
+
+  return (
+    <div
+      className="rounded-2xl border p-4 sm:p-5"
+      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <TooltipLabel
+            text={t({
+              ko: "에이전트 ROI",
+              en: "Agent ROI",
+              ja: "エージェント ROI",
+              zh: "代理 ROI",
+            })}
+            tooltip={t({
+              ko: "선택 기간 동안 완료 카드 수를 토큰 소비량으로 나눈 값입니다. 카드 / 100만 토큰 기준으로 비교합니다.",
+              en: "Completed cards divided by token usage in the selected window. Compared as cards per 1M tokens.",
+              ja: "選択期間の完了カード数をトークン消費量で割った値です。100万トークンあたりのカード数で比較します。",
+              zh: "按所选时间窗用完成卡片数除以 Token 消耗量，并以每 100 万 Token 的完成卡片数比较。",
+            })}
+            className="text-sm font-semibold"
+          />
+          <p className="mt-1 text-xs" style={{ color: "var(--th-text-muted)" }}>
+            {t({
+              ko: "완료 카드 수와 토큰 사용량을 함께 보며 효율이 높은 담당자를 찾습니다",
+              en: "Compare completed cards against token volume to spot efficient agents",
+              ja: "完了カード数とトークン量を合わせて見て、効率の高い担当者を見つけます",
+              zh: "将完成卡片数与 Token 用量一起比较，找出效率更高的代理",
+            })}
+          </p>
+        </div>
+        <span
+          className="rounded-full px-3 py-1 text-xs font-semibold"
+          style={{ color: "#38bdf8", background: "rgba(56,189,248,0.12)" }}
+        >
+          {numberFormatter.format(rows.reduce((sum, row) => sum + row.completed_cards, 0))}{" "}
+          {t({ ko: "완료", en: "done", ja: "完了", zh: "完成" })}
+        </span>
+      </div>
+
+      {loading && rows.length === 0 ? (
+        <div className="py-10 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
+          {t({ ko: "ROI 지표를 계산하는 중입니다", en: "Calculating ROI", ja: "ROI を計算中", zh: "正在计算 ROI" })}
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="py-10 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
+          {t({ ko: "선택 기간에 계산할 ROI 데이터가 없습니다", en: "No ROI data for this window", ja: "この期間の ROI データがありません", zh: "当前时间窗暂无 ROI 数据" })}
+        </div>
+      ) : (
+        <div className="mt-4 space-y-2.5">
+          {rows.map((row, index) => (
+            <div
+              key={row.id}
+              className="rounded-xl border px-3 py-3"
+              style={{ borderColor: "rgba(255,255,255,0.06)", background: "var(--th-bg-surface)" }}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold"
+                      style={{ color: "#0f172a", background: modelColor("Codex", index) }}
+                    >
+                      {index + 1}
+                    </span>
+                    <span className="truncate text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+                      {row.label}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                    {numberFormatter.format(row.completed_cards)}{" "}
+                    {t({ ko: "카드", en: "cards", ja: "カード", zh: "卡片" })}
+                    {" · "}
+                    {formatTokens(row.tokens)} tokens
+                    {" · "}
+                    {formatCost(row.cost)}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-sm font-bold" style={{ color: "#38bdf8" }}>
+                    {row.cards_per_million_tokens.toFixed(2)}
+                  </div>
+                  <div className="text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                    {t({ ko: "카드 / 1M", en: "cards / 1M", ja: "カード / 1M", zh: "卡片 / 1M" })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-3 h-2 rounded-full bg-slate-800/50">
+                <div
+                  className="h-full rounded-full"
+                  style={{
+                    width: `${Math.max(6, (row.cards_per_million_tokens / maxScore) * 100)}%`,
+                    background: "linear-gradient(90deg, #38bdf8, #818cf8)",
                   }}
                 />
               </div>
