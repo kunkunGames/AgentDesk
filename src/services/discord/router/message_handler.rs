@@ -174,6 +174,28 @@ fn session_runtime_state_after_redirect(
     load_session_runtime_state(sessions, effective_channel_id).unwrap_or(original_state)
 }
 
+fn build_race_requeued_intervention(
+    request_owner: UserId,
+    user_msg_id: MessageId,
+    user_text: &str,
+    reply_context: Option<String>,
+    reply_to_user_message: bool,
+) -> Intervention {
+    Intervention {
+        author_id: request_owner,
+        message_id: user_msg_id,
+        source_message_ids: vec![user_msg_id],
+        text: user_text.to_string(),
+        mode: super::super::InterventionMode::Soft,
+        created_at: std::time::Instant::now(),
+        reply_context,
+        has_reply_boundary: reply_to_user_message,
+        merge_consecutive: !user_text.starts_with('!')
+            && !user_text.starts_with('/')
+            && !user_text.starts_with("DISPATCH:"),
+    }
+}
+
 pub(in crate::services::discord) async fn handle_text_message(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -735,19 +757,13 @@ pub(in crate::services::discord) async fn handle_text_message(
             shared,
             &bot_owner_provider,
             channel_id,
-            super::super::Intervention {
-                author_id: request_owner,
-                message_id: user_msg_id,
-                source_message_ids: vec![user_msg_id],
-                text: user_text.to_string(),
-                mode: super::super::InterventionMode::Soft,
-                created_at: std::time::Instant::now(),
-                reply_context: reply_context.clone(),
-                has_reply_boundary: reply_context.is_some(),
-                merge_consecutive: !user_text.starts_with('!')
-                    && !user_text.starts_with('/')
-                    && !user_text.starts_with("DISPATCH:"),
-            },
+            build_race_requeued_intervention(
+                request_owner,
+                user_msg_id,
+                user_text,
+                reply_context.clone(),
+                reply_to_user_message,
+            ),
         )
         .await;
         // Clean up: remove placeholder and reaction created before this check
@@ -2810,7 +2826,7 @@ mod tests {
     use super::super::super::DiscordSession;
     use super::*;
     use crate::services::memory::RecallResponse;
-    use poise::serenity_prelude::ChannelId;
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
     fn sample_recall() -> RecallResponse {
         RecallResponse {
@@ -3059,5 +3075,20 @@ mod tests {
         );
 
         assert_eq!(resolved, original);
+    }
+
+    #[test]
+    fn race_requeue_preserves_reply_boundary_without_reply_context() {
+        let queued = build_race_requeued_intervention(
+            UserId::new(7),
+            MessageId::new(8),
+            "hello",
+            None,
+            true,
+        );
+
+        assert!(queued.has_reply_boundary);
+        assert!(queued.reply_context.is_none());
+        assert!(queued.merge_consecutive);
     }
 }
