@@ -76,6 +76,16 @@ sign_binary_with_fallback() {
         fi
     fi
 
+    # Skip re-sign if already signed with the same identity (preserves TCC permissions)
+    if [ "$identity" != "-" ] && codesign -v "$target" 2>/dev/null; then
+        local current_authority
+        current_authority=$(codesign -dvv "$target" 2>&1 | grep "^Authority=" | head -1 || true)
+        if echo "$current_authority" | grep -qF "$identity" 2>/dev/null; then
+            echo "✓ Already signed with matching identity — skipping re-sign (TCC preserved)"
+            return 0
+        fi
+    fi
+
     if [ "$identity" = "-" ]; then
         codesign -f -s "$identity" --identifier "com.itismyfield.agentdesk" "$target"
     else
@@ -342,9 +352,9 @@ _health_busy_count() {
     local health_json
     health_json=$(curl -sf "http://127.0.0.1:${REL_PORT}/api/health" 2>/dev/null) || { echo "0"; return; }
     local active finalizing queue_depth
-    active=$(echo "$health_json" | grep -o '"global_active":[0-9]*' | cut -d: -f2 || echo "0")
-    finalizing=$(echo "$health_json" | grep -o '"global_finalizing":[0-9]*' | cut -d: -f2 || echo "0")
-    queue_depth=$(echo "$health_json" | grep -o '"queue_depth":[0-9]*' | cut -d: -f2 || echo "0")
+    active=$(echo "$health_json" | grep -o '"global_active":[0-9]*' | head -1 | cut -d: -f2)
+    finalizing=$(echo "$health_json" | grep -o '"global_finalizing":[0-9]*' | head -1 | cut -d: -f2)
+    queue_depth=$(echo "$health_json" | grep -o '"queue_depth":[0-9]*' | head -1 | cut -d: -f2)
     echo $(( ${active:-0} + ${finalizing:-0} + ${queue_depth:-0} ))
 }
 BUSY=$(_health_busy_count)
