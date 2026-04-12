@@ -227,6 +227,8 @@ pub struct StatusEntryRecord {
     pub batch_phase: i64,
     pub channel_thread_map: Option<String>,
     pub active_thread_id: Option<String>,
+    pub card_status: Option<String>,
+    pub review_round: i64,
 }
 
 pub fn find_latest_run_id(
@@ -303,9 +305,11 @@ pub fn get_status_entry(
                 CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
                 kc.title, kc.github_issue_number, kc.github_issue_url,
                 COALESCE(e.thread_group, 0), e.slot_index, COALESCE(e.batch_phase, 0),
-                kc.channel_thread_map, kc.active_thread_id
+                kc.channel_thread_map, kc.active_thread_id,
+                kc.status, COALESCE(crs.review_round, kc.review_round, 0)
          FROM auto_queue_entries e
          LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id
+         LEFT JOIN card_review_state crs ON e.kanban_card_id = crs.card_id
          WHERE e.id = ?1",
         [entry_id],
         map_status_entry_row,
@@ -325,9 +329,11 @@ pub fn list_status_entries(
                 CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
                 kc.title, kc.github_issue_number, kc.github_issue_url,
                 COALESCE(e.thread_group, 0), e.slot_index, COALESCE(e.batch_phase, 0),
-                kc.channel_thread_map, kc.active_thread_id
+                kc.channel_thread_map, kc.active_thread_id,
+                kc.status, COALESCE(crs.review_round, kc.review_round, 0)
          FROM auto_queue_entries e
          LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id
+         LEFT JOIN card_review_state crs ON e.kanban_card_id = crs.card_id
          WHERE e.run_id = ?1",
     );
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(run_id.to_string())];
@@ -1083,6 +1089,8 @@ fn map_status_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatusEntry
         batch_phase: row.get(14)?,
         channel_thread_map: row.get(15)?,
         active_thread_id: row.get(16)?,
+        card_status: row.get(17)?,
+        review_round: row.get::<_, Option<i64>>(18)?.unwrap_or(0),
     })
 }
 

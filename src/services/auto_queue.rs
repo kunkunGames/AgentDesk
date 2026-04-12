@@ -87,6 +87,9 @@ pub struct AutoQueueStatusEntryView {
     pub slot_index: Option<i64>,
     pub batch_phase: i64,
     pub thread_links: Vec<ThreadLinkView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_status: Option<String>,
+    pub review_round: i64,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -440,6 +443,8 @@ impl AutoQueueStatusEntryView {
             slot_index: record.slot_index,
             batch_phase: record.batch_phase,
             thread_links,
+            card_status: record.card_status,
+            review_round: record.review_round,
         }
     }
 }
