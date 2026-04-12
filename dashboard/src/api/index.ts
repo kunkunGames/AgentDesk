@@ -101,7 +101,6 @@ export {
 export type {
   AutoQueueThreadLink,
   AutoQueueRun,
-  AutoQueueThreadLink,
   AutoQueueStatus,
   DispatchQueueEntry,
   CronJob,
