@@ -97,6 +97,7 @@ export default function KanbanTab({
   externalStatusFocus,
   onClearSignalFocus,
 }: KanbanTabProps) {
+  const LIVE_TURN_POLL_MS = 4_000;
   const [repoSources, setRepoSources] = useState<KanbanRepoSource[]>([]);
   const [repoInput, setRepoInput] = useState("");
   const [selectedRepo, setSelectedRepo] = useState("");
@@ -151,6 +152,8 @@ export default function KanbanTab({
   const [ghComments, setGhComments] = useState<api.GitHubComment[]>([]);
   const [timelineFilter, setTimelineFilter] = useState<"review" | "pm" | "work" | "general" | null>(null);
   const [activityRefreshTick, setActivityRefreshTick] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [liveTurnsByAgentId, setLiveTurnsByAgentId] = useState<Record<string, api.AgentTurnState>>({});
   const ghCommentsCache = useRef<Map<string, { comments: api.GitHubComment[]; body: string; ts: number }>>(new Map());
   const detailRequestSeq = useRef(0);
 
@@ -314,6 +317,11 @@ export default function KanbanTab({
   }, []);
 
   useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     Promise.all([
       api.getKanbanRepoSources().catch(() => [] as KanbanRepoSource[]),
       api.getGitHubRepos().then((result) => result.repos).catch(() => [] as GitHubRepoOption[]),
@@ -400,6 +408,133 @@ export default function KanbanTab({
     return cards.filter((card) => card.github_repo === selectedRepo);
   }, [cards, selectedRepo]);
 
+  const repoCardsById = useMemo(() => new Map(repoCards.map((card) => [card.id, card])), [repoCards]);
+
+  const childCardsByParentId = useMemo(() => {
+    const grouped = new Map<string, KanbanCard[]>();
+    for (const card of repoCards) {
+      if (!card.parent_card_id) continue;
+      const siblings = grouped.get(card.parent_card_id) ?? [];
+      siblings.push(card);
+      grouped.set(card.parent_card_id, siblings);
+    }
+    for (const siblings of grouped.values()) {
+      siblings.sort((a, b) => {
+        if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+        return b.updated_at - a.updated_at;
+      });
+    }
+    return grouped;
+  }, [repoCards]);
+
+  const inProgressCardsByAgentId = useMemo(() => {
+    const grouped = new Map<string, KanbanCard[]>();
+    for (const card of repoCards) {
+      if (card.status !== "in_progress" || !card.assignee_agent_id) continue;
+      const agentCards = grouped.get(card.assignee_agent_id) ?? [];
+      agentCards.push(card);
+      grouped.set(card.assignee_agent_id, agentCards);
+    }
+    return grouped;
+  }, [repoCards]);
+
+  const liveTurnAgentIds = useMemo(
+    () => Array.from(inProgressCardsByAgentId.keys()).sort(),
+    [inProgressCardsByAgentId],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    let requestSeq = 0;
+    let scheduledRefresh: number | null = null;
+
+    const refreshLiveTurns = async () => {
+      if (liveTurnAgentIds.length === 0) {
+        setLiveTurnsByAgentId({});
+        return;
+      }
+
+      const currentRequest = ++requestSeq;
+      const results = await Promise.allSettled(
+        liveTurnAgentIds.map((agentId) => api.getAgentTurn(agentId)),
+      );
+
+      if (disposed || currentRequest !== requestSeq) return;
+
+      const next: Record<string, api.AgentTurnState> = {};
+      results.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        const turn = result.value;
+        if (turn.status === "idle") return;
+        next[liveTurnAgentIds[index]!] = turn;
+      });
+      setLiveTurnsByAgentId(next);
+    };
+
+    const scheduleRefresh = (delayMs = 150) => {
+      if (scheduledRefresh) window.clearTimeout(scheduledRefresh);
+      scheduledRefresh = window.setTimeout(() => {
+        scheduledRefresh = null;
+        void refreshLiveTurns();
+      }, delayMs);
+    };
+
+    const handleWSEvent = (event: Event) => {
+      const detail = (event as CustomEvent<import("../../types").WSEvent>).detail;
+      if (!detail) return;
+      switch (detail.type) {
+        case "connected":
+        case "agent_status":
+        case "dispatched_session_update":
+        case "task_dispatch_created":
+        case "task_dispatch_updated":
+        case "kanban_card_created":
+        case "kanban_card_updated":
+          scheduleRefresh(detail.type === "dispatched_session_update" ? 500 : 150);
+          break;
+        default:
+          break;
+      }
+    };
+
+    void refreshLiveTurns();
+    const pollTimer = window.setInterval(() => scheduleRefresh(0), LIVE_TURN_POLL_MS);
+    window.addEventListener("pcd-ws-event", handleWSEvent as EventListener);
+
+    return () => {
+      disposed = true;
+      requestSeq += 1;
+      if (scheduledRefresh) window.clearTimeout(scheduledRefresh);
+      window.clearInterval(pollTimer);
+      window.removeEventListener("pcd-ws-event", handleWSEvent as EventListener);
+    };
+  }, [LIVE_TURN_POLL_MS, liveTurnAgentIds]);
+
+  const liveToolStateByCardId = useMemo(() => {
+    const mapped = new Map<string, { agentId: string; line: string; updatedAt?: string | null }>();
+    for (const agentId of liveTurnAgentIds) {
+      const turn = liveTurnsByAgentId[agentId];
+      if (!turn) continue;
+      const line = turn.current_tool_line?.trim() || turn.prev_tool_status?.trim();
+      if (!line) continue;
+      const agentCards = inProgressCardsByAgentId.get(agentId) ?? [];
+      if (agentCards.length === 0) continue;
+
+      if (turn.active_dispatch_id) {
+        const matchedCard = agentCards.find((card) => card.latest_dispatch_id === turn.active_dispatch_id);
+        if (matchedCard) {
+          mapped.set(matchedCard.id, { agentId, line, updatedAt: turn.updated_at });
+        }
+        continue;
+      }
+
+      if (agentCards.length === 1) {
+        mapped.set(agentCards[0]!.id, { agentId, line, updatedAt: turn.updated_at });
+      }
+    }
+    return mapped;
+  }, [inProgressCardsByAgentId, liveTurnAgentIds, liveTurnsByAgentId]);
+
   // Agents that have cards in the current repo (for the per-agent dropdown)
   const repoAgentCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -458,7 +593,7 @@ export default function KanbanTab({
       if (signalStatusFilter === "requested" && card.status !== "requested") return false;
       if (
         signalStatusFilter === "stalled"
-        && !(card.status === "in_progress" && Boolean(card.started_at) && Date.now() - ((card.started_at ?? 0) < 1e12 ? (card.started_at ?? 0) * 1000 : (card.started_at ?? 0)) > STALE_IN_PROGRESS_MS)
+        && !(card.status === "in_progress" && Boolean(card.started_at) && nowMs - ((card.started_at ?? 0) < 1e12 ? (card.started_at ?? 0) * 1000 : (card.started_at ?? 0)) > STALE_IN_PROGRESS_MS)
       ) {
         return false;
       }
@@ -469,7 +604,7 @@ export default function KanbanTab({
         getAgentLabel(card.assignee_agent_id).toLowerCase().includes(needle)
       );
     });
-  }, [agentFilter, agentMap, cardTypeFilter, deptFilter, getAgentLabel, signalStatusFilter, repoCards, search, selectedAgentId, showClosed]);
+  }, [agentFilter, agentMap, cardTypeFilter, deptFilter, getAgentLabel, nowMs, signalStatusFilter, repoCards, search, selectedAgentId, showClosed]);
 
   const recentDoneCards = useMemo(() => {
     return repoCards
@@ -510,14 +645,52 @@ export default function KanbanTab({
     for (const card of filteredCards) {
       grouped.get(card.status)?.push(card);
     }
+
+    const isAncestor = (possibleAncestorId: string, card: KanbanCard): boolean => {
+      let parentId = card.parent_card_id;
+      let depthGuard = 0;
+      while (parentId && depthGuard < 12) {
+        if (parentId === possibleAncestorId) return true;
+        parentId = repoCardsById.get(parentId)?.parent_card_id ?? null;
+        depthGuard += 1;
+      }
+      return false;
+    };
+
+    const getRootCard = (card: KanbanCard): KanbanCard => {
+      let current = card;
+      let depthGuard = 0;
+      while (current.parent_card_id && depthGuard < 12) {
+        const parent = repoCardsById.get(current.parent_card_id);
+        if (!parent) break;
+        current = parent;
+        depthGuard += 1;
+      }
+      return current;
+    };
+
     for (const column of effectiveColumnDefs) {
       grouped.get(column.status)?.sort((a, b) => {
+        if (isAncestor(a.id, b)) return -1;
+        if (isAncestor(b.id, a)) return 1;
+
+        const aRoot = getRootCard(a);
+        const bRoot = getRootCard(b);
+        if (aRoot.sort_order !== bRoot.sort_order) return aRoot.sort_order - bRoot.sort_order;
+        if (aRoot.updated_at !== bRoot.updated_at) return bRoot.updated_at - aRoot.updated_at;
+
+        if (a.parent_card_id !== b.parent_card_id) {
+          if (!a.parent_card_id) return -1;
+          if (!b.parent_card_id) return 1;
+          if (a.parent_card_id < b.parent_card_id) return -1;
+          if (a.parent_card_id > b.parent_card_id) return 1;
+        }
         if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
         return b.updated_at - a.updated_at;
       });
     }
     return grouped;
-  }, [filteredCards, effectiveColumnDefs]);
+  }, [effectiveColumnDefs, filteredCards, repoCardsById]);
 
   // Include ALL cards (including terminal) to prevent done issues
   // from reappearing in the backlog when the done column is hidden.
@@ -1732,6 +1905,10 @@ export default function KanbanTab({
                           assigningIssue={assigningIssue}
                           dispatchMap={dispatchMap}
                           dispatches={dispatches}
+                          nowMs={nowMs}
+                          cardsById={repoCardsById}
+                          childCardsByParentId={childCardsByParentId}
+                          liveToolStateByCardId={liveToolStateByCardId}
                           repoSources={repoSources}
                           selectedRepo={selectedRepo}
                           getAgentLabel={getAgentLabel}
