@@ -330,11 +330,13 @@ DIST_STAGED="$ADK_REL/dashboard/dist.new"
 rm -rf "$DIST_STAGED"
 cp -r "$DASHBOARD_SOURCE" "$DIST_STAGED"
 
-# Sync agent prompt files (source-of-truth: workspace config/agents/)
+# Stage agent prompt files atomically (source-of-truth: workspace config/agents/)
 if [ -d "$REPO/config/agents" ]; then
-    echo "▸ Syncing agent prompts..."
-    mkdir -p "$ADK_REL/config/agents"
-    rsync -a "$REPO/config/agents/" "$ADK_REL/config/agents/"
+    echo "▸ Staging agent prompts..."
+    PROMPTS_STAGED="$ADK_REL/config/agents.new"
+    rm -rf "$PROMPTS_STAGED"
+    mkdir -p "$PROMPTS_STAGED"
+    rsync -a "$REPO/config/agents/" "$PROMPTS_STAGED/"
 fi
 
 # Stage managed skills before stopping release so skill sync never sees partial content.
@@ -421,6 +423,15 @@ rm -rf "$ADK_REL/skills.old"
 [ -d "$ADK_REL/skills" ] && mv "$ADK_REL/skills" "$ADK_REL/skills.old"
 mv "$SKILLS_STAGED" "$ADK_REL/skills"
 rm -rf "$ADK_REL/skills.old"
+
+if [ -d "$PROMPTS_STAGED" ]; then
+    rm -rf "$ADK_REL/config/agents.old"
+    [ -d "$ADK_REL/config/agents" ] && mv "$ADK_REL/config/agents" "$ADK_REL/config/agents.old"
+    mv "$PROMPTS_STAGED" "$ADK_REL/config/agents"
+    rm -rf "$ADK_REL/config/agents.old"
+    # Restore symlink for legacy compatibility
+    [ ! -e "$ADK_REL/config/agents/_shared.md" ] && ln -s _shared.prompt.md "$ADK_REL/config/agents/_shared.md" 2>/dev/null || true
+fi
 
 # Keep the user-facing CLI wrapper discoverable via PATH.
 echo "▸ Ensuring global agentdesk CLI..."
