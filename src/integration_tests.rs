@@ -192,6 +192,21 @@ mod tests {
         );
     }
 
+    fn run_git_output(repo_dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
         let repo = tempfile::tempdir().unwrap();
         run_git(repo.path(), &["init", "-b", "main"]);
@@ -200,6 +215,25 @@ mod tests {
         run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
         let override_guard = RepoDirOverride::new(repo.path());
         (repo, override_guard)
+    }
+
+    fn setup_test_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir, RepoDirOverride) {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+
+        let override_guard = RepoDirOverride::new(repo.path());
+        (repo, remote, override_guard)
     }
 
     fn setup_test_repo_with_mock_gh(
@@ -218,6 +252,38 @@ mod tests {
         let gh = install_mock_gh_with_lock(lock, replies);
         (
             repo,
+            RepoAndMockGhEnv {
+                _gh: gh,
+                previous_repo_dir,
+            },
+        )
+    }
+
+    fn setup_test_repo_with_origin_and_mock_gh(
+        replies: &[MockGhReply],
+    ) -> (tempfile::TempDir, tempfile::TempDir, RepoAndMockGhEnv) {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+
+        let lock = repo_dir_env_lock().lock().unwrap();
+        let previous_repo_dir = std::env::var_os("AGENTDESK_REPO_DIR");
+        unsafe { std::env::set_var("AGENTDESK_REPO_DIR", repo.path()) };
+
+        let gh = install_mock_gh_with_lock(lock, replies);
+        (
+            repo,
+            remote,
             RepoAndMockGhEnv {
                 _gh: gh,
                 previous_repo_dir,
@@ -337,6 +403,39 @@ mod tests {
                     "completed_worktree_path": repo_dir,
                     "completed_branch": completed_branch,
                     "completed_commit": reviewed_commit,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_completed_work_dispatch_target(
+        db: &db::Db,
+        dispatch_id: &str,
+        card_id: &str,
+        dispatch_type: &str,
+        worktree_path: &str,
+        branch: &str,
+        commit: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                result, created_at, updated_at, completed_at
+            ) VALUES (
+                ?1, ?2, 'agent-1', ?3, 'completed', 'Completed work',
+                ?4, datetime('now', '-5 minutes'), datetime('now', '-5 minutes'), datetime('now', '-5 minutes')
+            )",
+            rusqlite::params![
+                dispatch_id,
+                card_id,
+                dispatch_type,
+                serde_json::json!({
+                    "completed_worktree_path": worktree_path,
+                    "completed_branch": branch,
+                    "completed_commit": commit,
                 })
                 .to_string(),
             ],
@@ -3524,6 +3623,185 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocked_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_terminal_direct_merge_merges_branch_without_pr() {
+        let (repo, _remote, _repo_guard) = setup_test_repo_with_origin();
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-direct"]);
+
+        let worktree_path = worktrees_dir.join("card-211-direct");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-direct",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: direct merge path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-direct", "done", "test/repo", 211, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-direct",
+            "card-211-direct",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-direct",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-direct"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        let merged = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &feature_commit,
+                "origin/main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            merged.success(),
+            "feature commit must be reachable from origin/main after direct merge"
+        );
+        assert_eq!(get_card_status(&db, "card-211-direct"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-direct").as_deref(),
+            Some("closed")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-direct"), None);
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-direct'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_terminal_direct_merge_conflict_creates_pr_and_wait_ci() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-conflict"),
+                stdout: "https://github.com/test/repo/pull/901",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211",
+            },
+        ]);
+        fs::write(repo.path().join("conflict.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "conflict.txt"]);
+        run_git(repo.path(), &["commit", "-m", "base conflict file"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-conflict"]);
+
+        let worktree_path = worktrees_dir.join("card-211-conflict");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-conflict",
+            ],
+        );
+        fs::write(worktree_path.join("conflict.txt"), "feature version\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "conflict.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feature conflict change #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        fs::write(repo.path().join("conflict.txt"), "main version\n").unwrap();
+        run_git(repo.path(), &["add", "conflict.txt"]);
+        run_git(repo.path(), &["commit", "-m", "main conflict change"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-conflict", "done", "test/repo", 212, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-conflict",
+            "card-211-conflict",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-conflict",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-conflict"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(get_card_status(&db, "card-211-conflict"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-conflict").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-conflict"), Some(901));
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr create --repo test/repo --base main --head wt/card-211-conflict"),
+            "conflict fallback must create a PR for the tracked branch"
+        );
     }
 
     #[cfg(unix)]
