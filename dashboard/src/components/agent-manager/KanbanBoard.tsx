@@ -7,11 +7,8 @@ import {
 } from "react";
 
 import type { GitHubIssue } from "../../api";
-import type { KanbanCard, KanbanCardStatus } from "../../types";
-import KanbanColumn, {
-  BacklogIssueCard,
-  KanbanCardArticle,
-} from "./KanbanColumn";
+import type { KanbanCard, KanbanCardStatus, KanbanRepoSource, TaskDispatch } from "../../types";
+import KanbanColumn from "./KanbanColumn";
 import {
   BACKLOG_PAGE_SIZE,
   buildKanbanBacklogEntries,
@@ -21,6 +18,94 @@ import {
   QA_STATUSES,
   TERMINAL_STATUSES,
 } from "./kanban-utils";
+
+// ---------------------------------------------------------------------------
+// Stubs for read-only KanbanColumn usage (no drag-and-drop or agent features)
+// ---------------------------------------------------------------------------
+
+const emptyDispatchMap = new Map<string, TaskDispatch>();
+const emptyDispatches: TaskDispatch[] = [];
+const emptyRepoSources: KanbanRepoSource[] = [];
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const noop = (() => {}) as any;
+const noopGetAgentLabel = (_id: string | null | undefined) => "—";
+const noopResolveAgent = (_labels: Array<{ name: string; color: string }>) => null;
+
+// ---------------------------------------------------------------------------
+// Lightweight card renderers for the backlog grid
+// ---------------------------------------------------------------------------
+
+function BacklogIssueCard({
+  issue,
+  onBacklogIssueClick,
+  metaBadge,
+}: {
+  issue: GitHubIssue;
+  onBacklogIssueClick: (issue: GitHubIssue) => void;
+  metaBadge?: string;
+}) {
+  return (
+    <article
+      className="rounded-2xl border p-3 cursor-pointer transition-colors hover:border-[rgba(148,163,184,0.4)]"
+      style={{ borderColor: "rgba(148,163,184,0.2)", backgroundColor: "var(--th-card-bg)" }}
+      onClick={() => onBacklogIssueClick(issue)}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-full text-xs bg-surface-medium" style={{ color: "var(--th-text-secondary)" }}>
+              #{issue.number}
+            </span>
+            {metaBadge && (
+              <span className="px-2 py-0.5 rounded-full text-xs bg-surface-medium" style={{ color: "var(--th-text-muted)" }}>
+                {metaBadge}
+              </span>
+            )}
+          </div>
+          <h4 className="mt-2 text-sm font-semibold leading-snug" style={{ color: "var(--th-text-heading)" }}>
+            {issue.title}
+          </h4>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function KanbanCardArticle({
+  card,
+  onCardClick,
+  metaBadge,
+}: {
+  card: KanbanCard;
+  onCardClick: (cardId: string) => void;
+  metaBadge?: string;
+}) {
+  return (
+    <article
+      className="rounded-2xl border p-3 cursor-pointer transition-colors hover:border-[rgba(148,163,184,0.4)]"
+      style={{ borderColor: "rgba(148,163,184,0.2)", backgroundColor: "var(--th-card-bg)" }}
+      onClick={() => onCardClick(card.id)}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-full text-xs bg-surface-medium" style={{ color: "var(--th-text-secondary)" }}>
+              {card.github_issue_number ? `#${card.github_issue_number}` : `#${card.id.slice(0, 6)}`}
+            </span>
+            {metaBadge && (
+              <span className="px-2 py-0.5 rounded-full text-xs bg-surface-medium" style={{ color: "var(--th-text-muted)" }}>
+                {metaBadge}
+              </span>
+            )}
+          </div>
+          <h4 className="mt-2 text-sm font-semibold leading-snug" style={{ color: "var(--th-text-heading)" }}>
+            {card.title}
+          </h4>
+        </div>
+      </div>
+    </article>
+  );
+}
 
 interface ColumnDef {
   status: KanbanCardStatus;
@@ -363,11 +448,32 @@ export default function KanbanBoard({
                     backlogIssues={[]}
                     backlogCount={columnCards.length}
                     tr={tr}
+                    locale="en"
                     compactBoard={compactBoard}
                     initialLoading={initialLoading}
                     loadingIssues={false}
+                    draggingCardId={null}
+                    dragOverStatus={null}
+                    dragOverCardId={null}
+                    closingIssueNumber={null}
+                    assigningIssue={false}
+                    dispatchMap={emptyDispatchMap}
+                    dispatches={emptyDispatches}
+                    repoSources={emptyRepoSources}
+                    selectedRepo={selectedRepo}
+                    getAgentLabel={noopGetAgentLabel}
+                    resolveAgentFromLabels={noopResolveAgent}
                     onCardClick={onCardClick}
                     onBacklogIssueClick={onBacklogIssueClick}
+                    onSetDraggingCardId={noop}
+                    onSetDragOverStatus={noop}
+                    onSetDragOverCardId={noop}
+                    onDrop={noop}
+                    onCloseIssue={noop}
+                    onDirectAssignIssue={noop}
+                    onOpenAssignModal={noop}
+                    onUpdateCardStatus={noop}
+                    onSetActionError={noop}
                   />
                 );
               })}

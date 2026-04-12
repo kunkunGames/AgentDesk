@@ -156,7 +156,6 @@ export default function DashboardPageView({
       <TokenAnalyticsSection
         t={t}
         numberFormatter={numberFormatter}
-        onOpenSettings={onOpenSettings}
       />
 
       <section className="space-y-4" id="dashboard-meetings">
