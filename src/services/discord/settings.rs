@@ -998,10 +998,10 @@ pub(super) fn resolve_workspace(
 /// fallback for unrelated runtimes that happen to share a channel name.
 pub(super) fn has_configured_channel_binding(
     channel_id: ChannelId,
-    channel_name: Option<&str>,
+    _channel_name: Option<&str>,
 ) -> bool {
-    resolve_role_binding(channel_id, channel_name).is_some()
-        || resolve_workspace(channel_id, channel_name).is_some()
+    resolve_role_binding(channel_id, None).is_some()
+        || resolve_workspace(channel_id, None).is_some()
 }
 
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
@@ -2995,6 +2995,37 @@ agents:
             assert!(!super::has_configured_channel_binding(
                 ChannelId::new(1479671298497183835),
                 Some("adk-cc"),
+            ));
+        });
+    }
+
+    #[test]
+    fn test_has_configured_channel_binding_ignores_org_by_name_fallback_for_ownership() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("org.yaml"),
+                r#"
+version: 1
+name: AgentDesk
+agents:
+  codex:
+    display_name: Codex
+    provider: codex
+channels:
+  by_name:
+    enabled: true
+    mappings:
+      agentdesk-codex:
+        agent: codex
+"#,
+            )
+            .unwrap();
+
+            assert!(!super::has_configured_channel_binding(
+                ChannelId::new(1486017489027469493),
+                Some("agentdesk-codex"),
             ));
         });
     }
