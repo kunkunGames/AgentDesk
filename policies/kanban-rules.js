@@ -654,8 +654,7 @@ var rules = {
         [payload.card_id]
       );
 
-      // #401: Auto-merge worktree branch on done transition
-      _autoMergeWorktreeBranch(payload.card_id);
+      // #401: Auto-merge now handled by merge-automation.js (direct merge + PR fallback)
 
       var retrospectiveResult = agentdesk.runtime.recordCardRetrospective(
         payload.card_id,
