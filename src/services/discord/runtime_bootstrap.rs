@@ -188,9 +188,13 @@ async fn execute_handoff_turns(
             Intervention {
                 author_id: serenity::UserId::new(1), // system-generated sentinel
                 message_id: placeholder.id,
+                source_message_ids: vec![placeholder.id],
                 text: handoff_prompt,
                 mode: InterventionMode::Soft,
                 created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
             },
         )
         .await;
@@ -801,11 +805,22 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                         skipped += 1;
                                         continue;
                                     }
-                                    if existing_ids.insert(item.message_id.get()) {
+                                    let mut item_ids: Vec<u64> =
+                                        item.source_message_ids.iter().map(|id| id.get()).collect();
+                                    if item_ids.is_empty() {
+                                        item_ids.push(item.message_id.get());
+                                    } else if !item_ids.contains(&item.message_id.get()) {
+                                        item_ids.push(item.message_id.get());
+                                    }
+                                    if item_ids
+                                        .iter()
+                                        .any(|message_id| existing_ids.contains(message_id))
+                                    {
+                                        skipped += 1;
+                                    } else {
+                                        existing_ids.extend(item_ids);
                                         queue.push(item);
                                         added += 1;
-                                    } else {
-                                        skipped += 1;
                                     }
                                 }
                                 mailbox_replace_queue(
