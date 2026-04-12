@@ -87,6 +87,16 @@ src/
 │   │   │   ├── outbox.rs
 │   │   │   ├── tests.rs
 │   │   │   └── thread_reuse.rs
+│   │   ├── domains/
+│   │   │   ├── access.rs
+│   │   │   ├── admin.rs
+│   │   │   ├── agents.rs
+│   │   │   ├── integrations.rs
+│   │   │   ├── kanban.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── onboarding.rs
+│   │   │   ├── ops.rs
+│   │   │   └── reviews.rs
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
@@ -254,6 +264,7 @@ src/
 ├── integration_tests.rs
 ├── kanban.rs
 ├── launch.rs
+├── logging.rs
 ├── main.rs
 ├── pipeline.rs
 ├── receipt.rs
