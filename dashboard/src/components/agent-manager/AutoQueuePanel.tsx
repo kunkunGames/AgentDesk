@@ -61,11 +61,17 @@ const ENTRY_STATUS_STYLE: Record<
     label: "완료",
     labelEn: "Done",
   },
-  completed: {
-    bg: "rgba(34,197,94,0.22)",
-    text: "#4ade80",
-    label: "완료",
-    labelEn: "Done",
+  review: {
+    bg: "rgba(139,92,246,0.22)",
+    text: "#a78bfa",
+    label: "리뷰",
+    labelEn: "Review",
+  },
+  rework: {
+    bg: "rgba(236,72,153,0.22)",
+    text: "#f472b6",
+    label: "리뷰 반영",
+    labelEn: "Rework",
   },
   skipped: {
     bg: "rgba(107,114,128,0.18)",
@@ -135,7 +141,7 @@ function batchPhaseLabel(phase: number): string {
 }
 
 function isCompletedEntry(entry: DispatchQueueEntryType): boolean {
-  return entry.status === "done" || entry.status === "completed" || entry.status === "skipped";
+  return entry.status === "done" || entry.status === "skipped";
 }
 
 function sortEntriesForDisplay(entries: DispatchQueueEntryType[]): DispatchQueueEntryType[] {
@@ -191,8 +197,13 @@ function EntryRow({
     onMoveDown: () => void;
   };
 }) {
-  const sty = ENTRY_STATUS_STYLE[entry.status] ?? ENTRY_STATUS_STYLE.pending;
+  const effectiveDisplayStatus =
+    entry.status === "dispatched" && (entry.card_status === "review" || entry.card_status === "rework")
+      ? entry.card_status
+      : entry.status;
+  const sty = ENTRY_STATUS_STYLE[effectiveDisplayStatus] ?? ENTRY_STATUS_STYLE.pending;
   const isPending = entry.status === "pending";
+  const showReviewRound = (entry.card_status === "review" || entry.card_status === "rework") && (entry.review_round ?? 0) > 0;
 
   return (
     <div
@@ -281,6 +292,7 @@ function EntryRow({
         style={{ backgroundColor: sty.bg, color: sty.text }}
       >
         {tr(sty.label, sty.labelEn)}
+        {showReviewRound && ` R${entry.review_round}`}
       </span>
       {isPending && moveControls && (
         <div

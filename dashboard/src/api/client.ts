@@ -786,52 +786,6 @@ export async function getAgentDispatchedSessions(
   return data.sessions;
 }
 
-export interface AgentTurnToolEvent {
-  kind: "tool" | "thinking";
-  status: "running" | "success" | "error" | "info";
-  tool_name: string | null;
-  summary: string;
-  line: string;
-}
-
-export interface AgentTurnStatus {
-  agent_id: string;
-  status: "working" | "idle";
-  started_at: string | null;
-  updated_at: string | null;
-  recent_output: string | null;
-  recent_output_source: "tmux" | "inflight" | "none";
-  session_key: string | null;
-  tmux_session: string | null;
-  provider: string | null;
-  thread_channel_id: string | null;
-  active_dispatch_id: string | null;
-  last_heartbeat: string | null;
-  current_tool_line: string | null;
-  prev_tool_status: string | null;
-  tool_events: AgentTurnToolEvent[];
-  tool_count: number;
-}
-
-export interface StopAgentTurnResponse {
-  status: string;
-  agent_id: string;
-  session_key: string;
-  tmux_killed?: boolean;
-}
-
-export async function getAgentTurn(agentId: string): Promise<AgentTurnStatus> {
-  return request(`/api/agents/${agentId}/turn`);
-}
-
-export async function stopAgentTurn(
-  agentId: string,
-): Promise<StopAgentTurnResponse> {
-  return request(`/api/agents/${agentId}/turn/stop`, {
-    method: "POST",
-  });
-}
-
 export type SessionTranscriptEventKind =
   | "user"
   | "assistant"
@@ -1305,7 +1259,7 @@ export interface DispatchQueueEntry {
   card_id: string;
   priority_rank: number;
   reason: string | null;
-  status: "pending" | "dispatched" | "done" | "completed" | "skipped";
+  status: "pending" | "dispatched" | "done" | "skipped";
   created_at: number;
   dispatched_at: number | null;
   completed_at: number | null;
@@ -1314,6 +1268,8 @@ export interface DispatchQueueEntry {
   github_repo?: string | null;
   thread_group?: number;
   batch_phase?: number;
+  card_status?: string;
+  review_round?: number;
 }
 
 export interface ThreadGroupStatus {

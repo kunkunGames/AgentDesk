@@ -14,7 +14,6 @@ import type {
 import { localeName } from "../../i18n";
 import AgentAvatar from "../AgentAvatar";
 import { STATUS_DOT } from "./constants";
-import AgentLiveTurnPanel from "./AgentLiveTurnPanel";
 import TurnTranscriptPanel from "./TurnTranscriptPanel";
 import type { Translator } from "./types";
 import * as api from "../../api";
@@ -638,7 +637,6 @@ export default function AgentInfoCard({
           </button>
         </div>
 
-        <AgentLiveTurnPanel agentId={agent.id} isKo={isKo} tr={tr} />
         <TurnTranscriptPanel
           source={{
             type: "agent",
