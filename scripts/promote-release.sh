@@ -336,6 +336,13 @@ DIST_STAGED="$ADK_REL/dashboard/dist.new"
 rm -rf "$DIST_STAGED"
 cp -r "$DASHBOARD_SOURCE" "$DIST_STAGED"
 
+# Sync agent prompt files (source-of-truth: workspace config/agents/)
+if [ -d "$REPO/config/agents" ]; then
+    echo "▸ Syncing agent prompts..."
+    mkdir -p "$ADK_REL/config/agents"
+    rsync -a "$REPO/config/agents/" "$ADK_REL/config/agents/"
+fi
+
 # Stage managed skills before stopping release so skill sync never sees partial content.
 echo "▸ Staging managed skills..."
 SKILLS_STAGED="$ADK_REL/skills.new"
