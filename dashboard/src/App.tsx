@@ -37,6 +37,7 @@ import {
   Building2,
   KanbanSquare,
   LayoutDashboard,
+  Settings,
   SlidersHorizontal,
   Wifi,
   WifiOff,
@@ -428,6 +429,12 @@ function AppShell({ wsConnected, notifications, dismissNotification }: AppShellP
             label={item.label}
           />
         ))}
+        <NavBtn
+          icon={<Settings size={20} />}
+          active={view === "more" && controlTab === "settings"}
+          onClick={openSettingsView}
+          label={isKo ? "설정" : "Settings"}
+        />
         <div className="flex-1" />
         <div
           className="flex h-10 w-10 items-center justify-center rounded-lg"
