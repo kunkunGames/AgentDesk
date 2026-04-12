@@ -738,9 +738,15 @@ pub(in crate::services::discord) async fn handle_text_message(
             super::super::Intervention {
                 author_id: request_owner,
                 message_id: user_msg_id,
+                source_message_ids: vec![user_msg_id],
                 text: user_text.to_string(),
                 mode: super::super::InterventionMode::Soft,
                 created_at: std::time::Instant::now(),
+                reply_context: reply_context.clone(),
+                has_reply_boundary: reply_context.is_some(),
+                merge_consecutive: !user_text.starts_with('!')
+                    && !user_text.starts_with('/')
+                    && !user_text.starts_with("DISPATCH:"),
             },
         )
         .await;
