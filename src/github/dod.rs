@@ -94,7 +94,15 @@ pub fn render_dod_markdown(items: &[DodItem]) -> String {
 
 /// Fetch an issue body via `gh` CLI and extract DoD items.
 pub fn mirror_dod_from_issue(repo: &str, issue_number: i64) -> Result<Vec<DodItem>, String> {
-    let output = super::run_gh(&[
+    mirror_dod_from_issue_with(super::adapter(), repo, issue_number)
+}
+
+pub(crate) fn mirror_dod_from_issue_with(
+    adapter: &dyn super::GitHubAdapter,
+    repo: &str,
+    issue_number: i64,
+) -> Result<Vec<DodItem>, String> {
+    let output = adapter.run(&[
         "issue",
         "view",
         &issue_number.to_string(),
@@ -118,8 +126,17 @@ pub fn update_dod_on_github(
     issue_number: i64,
     checklist: &[DodItem],
 ) -> Result<(), String> {
+    update_dod_on_github_with(super::adapter(), repo, issue_number, checklist)
+}
+
+pub(crate) fn update_dod_on_github_with(
+    adapter: &dyn super::GitHubAdapter,
+    repo: &str,
+    issue_number: i64,
+    checklist: &[DodItem],
+) -> Result<(), String> {
     // First, fetch the current body
-    let output = super::run_gh(&[
+    let output = adapter.run(&[
         "issue",
         "view",
         &issue_number.to_string(),
@@ -135,7 +152,7 @@ pub fn update_dod_on_github(
 
     let new_body = replace_dod_section(current_body, checklist);
 
-    super::run_gh(&[
+    adapter.run(&[
         "issue",
         "edit",
         &issue_number.to_string(),
@@ -201,6 +218,54 @@ fn replace_dod_section(body: &str, items: &[DodItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct MockAdapter {
+        responses: Mutex<VecDeque<Result<String, String>>>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl MockAdapter {
+        fn new(responses: Vec<Result<String, String>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl super::super::GitHubAdapter for MockAdapter {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn run(&self, args: &[&str]) -> Result<String, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(String::new()))
+        }
+
+        fn run_async<'a>(
+            &'a self,
+            _args: Vec<String>,
+            _timeout: std::time::Duration,
+            _timeout_context: String,
+        ) -> super::super::GitHubFuture<'a, Result<String, String>> {
+            Box::pin(async { Err("unexpected async call".to_string()) })
+        }
+    }
 
     #[test]
     fn parse_dod_simple() {
@@ -306,5 +371,72 @@ Other notes
         let result = replace_dod_section(body, &items);
         assert!(result.contains("## DoD"));
         assert!(result.contains("- [ ] New check"));
+    }
+
+    #[test]
+    fn mirror_dod_routes_through_adapter_interface() {
+        let adapter = MockAdapter::new(vec![Ok(
+            "{\"body\":\"## DoD\\n- [ ] Test coverage\\n- [x] Reviewed\\n\"}".to_string(),
+        )]);
+
+        let items = mirror_dod_from_issue_with(&adapter, "owner/repo", 42).unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "Test coverage");
+        assert!(!items[0].checked);
+        assert_eq!(
+            adapter.calls(),
+            vec![vec![
+                "issue".to_string(),
+                "view".to_string(),
+                "42".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+                "--json".to_string(),
+                "body".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn update_dod_routes_through_adapter_interface() {
+        let adapter = MockAdapter::new(vec![
+            Ok("{\"body\":\"## DoD\\n- [ ] Old item\\n\\n## Notes\\nKeep me\\n\"}".to_string()),
+            Ok(String::new()),
+        ]);
+
+        update_dod_on_github_with(
+            &adapter,
+            "owner/repo",
+            7,
+            &[DodItem {
+                text: "New item".to_string(),
+                checked: true,
+            }],
+        )
+        .unwrap();
+
+        let calls = adapter.calls();
+        assert_eq!(
+            calls[0],
+            vec![
+                "issue".to_string(),
+                "view".to_string(),
+                "7".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+                "--json".to_string(),
+                "body".to_string(),
+            ]
+        );
+        assert_eq!(
+            calls[1][0..5],
+            ["issue", "edit", "7", "--repo", "owner/repo"]
+        );
+        assert_eq!(calls[1][5], "--body");
+        assert_eq!(
+            calls[1][6],
+            "## DoD\n- [x] New item\n## Notes\nKeep me\n".to_string()
+        );
     }
 }
