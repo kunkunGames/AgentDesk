@@ -153,7 +153,7 @@
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 366 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 347 |  |
 | `services::discord::formatting` | `src/services/discord/formatting.rs` | 1315 | giant-file |
-| `services::discord::gateway` | `src/services/discord/gateway.rs` | 257 |  |
+| `services::discord::gateway` | `src/services/discord/gateway.rs` | 269 |  |
 | `services::discord::handoff` | `src/services/discord/handoff.rs` | 260 |  |
 | `services::discord::health` | `src/services/discord/health.rs` | 1357 | giant-file |
 | `services::discord::inflight` | `src/services/discord/inflight.rs` | 260 |  |
