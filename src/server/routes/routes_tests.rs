@@ -8150,6 +8150,134 @@ async fn auto_queue_status_exposes_explicit_thread_links_from_configured_channel
 }
 
 #[tokio::test]
+async fn auto_queue_history_returns_recent_runs_with_summary_metrics() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_agent(&db, "agent-history");
+    seed_auto_queue_card(&db, "card-history-done", 5131, "done", "agent-history");
+    seed_auto_queue_card(&db, "card-history-skipped", 5132, "done", "agent-history");
+    seed_auto_queue_card(&db, "card-history-pending", 5133, "review", "agent-history");
+    seed_auto_queue_card(
+        &db,
+        "card-history-dispatched",
+        5134,
+        "review",
+        "agent-history",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, created_at, completed_at
+            ) VALUES (
+                'run-history-completed', 'test-repo', 'agent-history', 'completed',
+                datetime('now', '-20 minutes'), datetime('now', '-10 minutes')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, created_at
+            ) VALUES (
+                'run-history-active', 'test-repo', 'agent-history', 'active',
+                datetime('now', '-5 minutes')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank
+            ) VALUES (
+                'entry-history-done', 'run-history-completed', 'card-history-done',
+                'agent-history', 'done', 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank
+            ) VALUES (
+                'entry-history-skipped', 'run-history-completed', 'card-history-skipped',
+                'agent-history', 'skipped', 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank
+            ) VALUES (
+                'entry-history-pending', 'run-history-active', 'card-history-pending',
+                'agent-history', 'pending', 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank
+            ) VALUES (
+                'entry-history-dispatched', 'run-history-active', 'card-history-dispatched',
+                'agent-history', 'dispatched', 1
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/auto-queue/history?repo=test-repo&limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let runs = json["runs"].as_array().expect("runs must be an array");
+
+    assert_eq!(json["summary"]["total_runs"], 2);
+    assert_eq!(json["summary"]["completed_runs"], 1);
+    assert_eq!(json["summary"]["success_rate"], 0.25);
+    assert_eq!(json["summary"]["failure_rate"], 0.75);
+    assert_eq!(runs.len(), 2);
+
+    assert_eq!(runs[0]["id"], "run-history-active");
+    assert_eq!(runs[0]["status"], "active");
+    assert_eq!(runs[0]["entry_count"], 2);
+    assert_eq!(runs[0]["done_count"], 0);
+    assert_eq!(runs[0]["pending_count"], 1);
+    assert_eq!(runs[0]["dispatched_count"], 1);
+    assert_eq!(runs[0]["success_rate"], 0.0);
+    assert_eq!(runs[0]["failure_rate"], 1.0);
+    assert!(runs[0]["duration_ms"].as_i64().unwrap() >= 0);
+    assert!(runs[0]["completed_at"].is_null());
+
+    assert_eq!(runs[1]["id"], "run-history-completed");
+    assert_eq!(runs[1]["status"], "completed");
+    assert_eq!(runs[1]["entry_count"], 2);
+    assert_eq!(runs[1]["done_count"], 1);
+    assert_eq!(runs[1]["skipped_count"], 1);
+    assert_eq!(runs[1]["success_rate"], 0.5);
+    assert_eq!(runs[1]["failure_rate"], 0.5);
+    assert!(runs[1]["duration_ms"].as_i64().unwrap() > 0);
+    assert!(runs[1]["completed_at"].as_i64().unwrap() > runs[1]["created_at"].as_i64().unwrap());
+}
+
+#[tokio::test]
 async fn auto_queue_status_legacy_thread_falls_back_to_active_label_without_url_guessing() {
     let db = test_db();
     let engine = test_engine(&db);

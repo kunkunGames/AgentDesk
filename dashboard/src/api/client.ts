@@ -1326,7 +1326,7 @@ export interface AutoQueueRun {
   id: string;
   repo: string | null;
   agent_id: string | null;
-  status: "generated" | "pending" | "active" | "paused" | "completed";
+  status: "generated" | "pending" | "active" | "paused" | "completed" | "cancelled";
   ai_model: string | null;
   ai_rationale: string | null;
   timeout_minutes: number;
@@ -1391,6 +1391,35 @@ export interface AutoQueueStatus {
   thread_groups?: Record<string, ThreadGroupStatus>;
 }
 
+export interface AutoQueueHistoryRun {
+  id: string;
+  repo: string | null;
+  agent_id: string | null;
+  status: AutoQueueRun["status"] | (string & {});
+  created_at: number;
+  completed_at: number | null;
+  duration_ms: number;
+  entry_count: number;
+  done_count: number;
+  skipped_count: number;
+  pending_count: number;
+  dispatched_count: number;
+  success_rate: number;
+  failure_rate: number;
+}
+
+export interface AutoQueueHistorySummary {
+  total_runs: number;
+  completed_runs: number;
+  success_rate: number;
+  failure_rate: number;
+}
+
+export interface AutoQueueHistoryResponse {
+  summary: AutoQueueHistorySummary;
+  runs: AutoQueueHistoryRun[];
+}
+
 export async function generateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
@@ -1433,6 +1462,18 @@ export async function getAutoQueueStatus(
   if (agentId) params.set("agent_id", agentId);
   const qs = params.toString();
   return request(`/api/auto-queue/status${qs ? `?${qs}` : ""}`);
+}
+
+export async function getAutoQueueHistory(
+  limit = 8,
+  repo?: string | null,
+  agentId?: string | null,
+): Promise<AutoQueueHistoryResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (repo) params.set("repo", repo);
+  if (agentId) params.set("agent_id", agentId);
+  return request(`/api/auto-queue/history?${params.toString()}`);
 }
 
 export async function getPipelineStagesForAgent(

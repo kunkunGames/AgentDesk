@@ -467,6 +467,8 @@ export interface KanbanCard {
   review_notes: string | null;
   github_issue_number: number | null;
   github_issue_url: string | null;
+  review_round?: number;
+  metadata?: KanbanCardMetadata | null;
   metadata_json: string | null;
   pipeline_stage_id: string | null;
   review_status: string | null;

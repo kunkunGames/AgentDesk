@@ -354,6 +354,21 @@ pub struct StatusEntryRecord {
     pub review_round: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AutoQueueRunHistoryRecord {
+    pub id: String,
+    pub repo: Option<String>,
+    pub agent_id: Option<String>,
+    pub status: String,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub entry_count: i64,
+    pub done_count: i64,
+    pub skipped_count: i64,
+    pub pending_count: i64,
+    pub dispatched_count: i64,
+}
+
 pub fn find_latest_run_id(
     conn: &Connection,
     filter: &StatusFilter,
@@ -475,6 +490,69 @@ pub fn list_status_entries(
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|value| value.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(param_refs.as_slice(), map_status_entry_row)?;
+    rows.collect()
+}
+
+pub fn list_run_history(
+    conn: &Connection,
+    filter: &StatusFilter,
+    limit: usize,
+) -> rusqlite::Result<Vec<AutoQueueRunHistoryRecord>> {
+    let mut sql = String::from(
+        "SELECT r.id, r.repo, r.agent_id, r.status,
+                CAST(strftime('%s', r.created_at) AS INTEGER) * 1000,
+                CASE WHEN r.completed_at IS NOT NULL THEN CAST(strftime('%s', r.completed_at) AS INTEGER) * 1000 END,
+                COUNT(e.id),
+                COALESCE(SUM(CASE WHEN e.status = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN e.status = 'skipped' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN e.status = 'pending' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN e.status = 'dispatched' THEN 1 ELSE 0 END), 0)
+         FROM auto_queue_runs r
+         LEFT JOIN auto_queue_entries e ON e.run_id = r.id
+         LEFT JOIN kanban_cards kc ON kc.id = e.kanban_card_id
+         WHERE 1 = 1",
+    );
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+
+    if let Some(repo) = filter.repo.as_ref().filter(|value| !value.is_empty()) {
+        params.push(Box::new(repo.clone()));
+        sql.push_str(&format!(
+            " AND COALESCE(kc.repo_id, r.repo, '') = ?{}",
+            params.len()
+        ));
+    }
+    if let Some(agent_id) = filter.agent_id.as_ref().filter(|value| !value.is_empty()) {
+        params.push(Box::new(agent_id.clone()));
+        sql.push_str(&format!(
+            " AND COALESCE(e.agent_id, r.agent_id, '') = ?{}",
+            params.len()
+        ));
+    }
+
+    sql.push_str(
+        " GROUP BY r.id, r.repo, r.agent_id, r.status, r.created_at, r.completed_at
+          ORDER BY r.created_at DESC",
+    );
+    params.push(Box::new(limit as i64));
+    sql.push_str(&format!(" LIMIT ?{}", params.len()));
+
+    let param_refs: Vec<&dyn ToSql> = params.iter().map(|value| value.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(AutoQueueRunHistoryRecord {
+            id: row.get(0)?,
+            repo: row.get(1)?,
+            agent_id: row.get(2)?,
+            status: row.get(3)?,
+            created_at: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            completed_at: row.get(5)?,
+            entry_count: row.get(6)?,
+            done_count: row.get(7)?,
+            skipped_count: row.get(8)?,
+            pending_count: row.get(9)?,
+            dispatched_count: row.get(10)?,
+        })
+    })?;
     rows.collect()
 }
 

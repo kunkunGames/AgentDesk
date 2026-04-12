@@ -6,6 +6,13 @@ import { getAgentLevel, getAgentTitle } from "../agent-manager/AgentInfoCard";
 import { hasManualInterventionReason, isManualInterventionCard } from "../agent-manager/kanban-utils";
 import AgentAvatar from "../AgentAvatar";
 import { cx, dashboardBadge, dashboardButton, dashboardCard } from "./ui";
+import {
+  LONG_BLOCKED_DAYS,
+  REVIEW_DELAY_DAYS,
+  REWORK_ALERT_THRESHOLD,
+  buildBottleneckGroups,
+  type BottleneckRow,
+} from "./dashboardInsights";
 
 // ── CookingHeart Role Board Widget ──
 
@@ -452,6 +459,353 @@ function OpsCardRow({ card, t, onAction }: {
         >
           {t({ ko: "Done", en: "Done", ja: "Done", zh: "完成" })}
         </button>
+      </div>
+    </div>
+  );
+}
+
+function formatRelativeAge(days: number, t: TFunction): string {
+  if (days <= 0) return t({ ko: "오늘", en: "today", ja: "今日", zh: "今天" });
+  return t({
+    ko: `${days}일`,
+    en: `${days}d`,
+    ja: `${days}日`,
+    zh: `${days}天`,
+  });
+}
+
+function formatDurationShort(ms: number): string {
+  const totalMinutes = Math.max(0, Math.round(ms / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+// ── Bottleneck Widget ──
+
+interface BottleneckWidgetProps {
+  t: TFunction;
+}
+
+export function BottleneckWidget({ t }: BottleneckWidgetProps) {
+  const [cards, setCards] = useState<api.KanbanCard[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const load = async () => {
+      if (mounted) setLoading(true);
+      try {
+        const next = await api.getKanbanCards();
+        if (mounted) setCards(next);
+      } catch {
+        if (mounted) setCards([]);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    };
+
+    void load();
+    const timer = setInterval(() => void load(), 60_000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  const groups = useMemo(() => buildBottleneckGroups(cards), [cards]);
+  const totalAlerts =
+    groups.review_delay.length + groups.repeat_rework.length + groups.long_blocked.length;
+
+  return (
+    <div
+      className="rounded-2xl border p-4 sm:p-5"
+      style={{
+        borderColor: "var(--th-border)",
+        background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 91%, #ef4444 9%), var(--th-surface))",
+      }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+            {t({ ko: "병목 감지", en: "Bottleneck Detection", ja: "ボトルネック検知", zh: "瓶颈检测" })}
+          </h3>
+          <p className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+            {t({
+              ko: "리뷰 지연, 반복 리워크, 장기 블로킹 카드를 바로 추려냅니다",
+              en: "Pull delayed reviews, repeated reworks, and long blocks into one action board",
+              ja: "レビュー遅延、反復リワーク、長期ブロックを一つのアクションボードに集約します",
+              zh: "将审查延迟、反复返工、长期阻塞集中到一个动作面板",
+            })}
+          </p>
+        </div>
+        <span
+          className="rounded-full px-3 py-1 text-xs font-semibold"
+          style={{ color: "#fca5a5", background: "rgba(239,68,68,0.14)" }}
+        >
+          {totalAlerts} {t({ ko: "경고", en: "alerts", ja: "警告", zh: "警报" })}
+        </span>
+      </div>
+
+      {loading && totalAlerts === 0 ? (
+        <div className="py-10 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
+          {t({ ko: "운영 병목을 확인하는 중입니다", en: "Scanning bottlenecks", ja: "ボトルネックを確認中", zh: "正在扫描瓶颈" })}
+        </div>
+      ) : (
+        <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <BottleneckColumn
+            title={t({ ko: "리뷰 지연", en: "Review Delay", ja: "レビュー遅延", zh: "审查延迟" })}
+            hint={t({
+              ko: `${REVIEW_DELAY_DAYS}일 이상 review`,
+              en: `${REVIEW_DELAY_DAYS}+ days in review`,
+              ja: `${REVIEW_DELAY_DAYS}日以上 review`,
+              zh: `review 超过 ${REVIEW_DELAY_DAYS} 天`,
+            })}
+            rows={groups.review_delay}
+            emptyLabel={t({ ko: "지연된 review 카드가 없습니다", en: "No delayed review cards", ja: "遅延レビューカードはありません", zh: "暂无延迟审查卡片" })}
+            accent="#f59e0b"
+            t={t}
+          />
+          <BottleneckColumn
+            title={t({ ko: "반복 리워크", en: "Repeat Rework", ja: "反復リワーク", zh: "重复返工" })}
+            hint={t({
+              ko: `${REWORK_ALERT_THRESHOLD}회 이상 rework`,
+              en: `${REWORK_ALERT_THRESHOLD}+ reworks`,
+              ja: `${REWORK_ALERT_THRESHOLD}回以上リワーク`,
+              zh: `${REWORK_ALERT_THRESHOLD} 次以上返工`,
+            })}
+            rows={groups.repeat_rework}
+            emptyLabel={t({ ko: "반복 리워크 카드는 없습니다", en: "No repeat rework cards", ja: "反復リワークカードはありません", zh: "暂无重复返工卡片" })}
+            accent="#a78bfa"
+            t={t}
+          />
+          <BottleneckColumn
+            title={t({ ko: "장기 블로킹", en: "Long Blocked", ja: "長期ブロック", zh: "长期阻塞" })}
+            hint={t({
+              ko: `${LONG_BLOCKED_DAYS}일 이상 blocked`,
+              en: `${LONG_BLOCKED_DAYS}+ days blocked`,
+              ja: `${LONG_BLOCKED_DAYS}日以上 blocked`,
+              zh: `blocked 超过 ${LONG_BLOCKED_DAYS} 天`,
+            })}
+            rows={groups.long_blocked}
+            emptyLabel={t({ ko: "장기 블로킹 카드는 없습니다", en: "No long blocked cards", ja: "長期ブロックカードはありません", zh: "暂无长期阻塞卡片" })}
+            accent="#f87171"
+            t={t}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BottleneckColumn({
+  title,
+  hint,
+  rows,
+  emptyLabel,
+  accent,
+  t,
+}: {
+  title: string;
+  hint: string;
+  rows: BottleneckRow[];
+  emptyLabel: string;
+  accent: string;
+  t: TFunction;
+}) {
+  return (
+    <div
+      className="rounded-2xl border p-3"
+      style={{ borderColor: `${accent}33`, background: "rgba(15,23,42,0.18)" }}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+            {title}
+          </div>
+          <div className="mt-1 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+            {hint}
+          </div>
+        </div>
+        <span
+          className="rounded-full px-2 py-1 text-[11px] font-semibold"
+          style={{ color: accent, background: `${accent}1f` }}
+        >
+          {rows.length}
+        </span>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="py-8 text-center text-xs" style={{ color: "var(--th-text-muted)" }}>
+          {emptyLabel}
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          {rows.slice(0, 4).map((row) => (
+            <div
+              key={row.id}
+              className="rounded-xl border px-3 py-2"
+              style={{ borderColor: "rgba(255,255,255,0.06)", background: "var(--th-bg-surface)" }}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-medium" style={{ color: "var(--th-text)" }}>
+                    {row.title}
+                  </div>
+                  <div className="mt-1 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                    {row.repo || "global"}
+                    {row.github_issue_number ? ` · #${row.github_issue_number}` : ""}
+                  </div>
+                </div>
+                <span className="text-[11px] shrink-0" style={{ color: accent }}>
+                  {formatRelativeAge(row.age_days, t)}
+                </span>
+              </div>
+              {row.rework_count > 0 && (
+                <div className="mt-2 text-[11px]" style={{ color: accent }}>
+                  {t({ ko: "리워크", en: "Rework", ja: "リワーク", zh: "返工" })} {row.rework_count}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Auto-Queue History Widget ──
+
+interface AutoQueueHistoryWidgetProps {
+  t: TFunction;
+}
+
+export function AutoQueueHistoryWidget({ t }: AutoQueueHistoryWidgetProps) {
+  const [data, setData] = useState<api.AutoQueueHistoryResponse | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const load = async () => {
+      try {
+        const next = await api.getAutoQueueHistory(8);
+        if (mounted) setData(next);
+      } catch {
+        if (mounted) setData(null);
+      }
+    };
+
+    void load();
+    const timer = setInterval(() => void load(), 60_000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  if (!data || data.runs.length === 0) return null;
+
+  return (
+    <div
+      className="rounded-2xl border p-4"
+      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+            {t({ ko: "자동큐 실행 이력", en: "Auto-Queue History", ja: "自動キュー履歴", zh: "自动队列历史" })}
+          </h3>
+          <p className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+            {t({
+              ko: "최근 런의 성공률, 소요시간, 엔트리 규모를 한눈에 봅니다",
+              en: "Track recent run success rates, durations, and entry volume at a glance",
+              ja: "最近のランの成功率、所要時間、エントリ規模を一目で確認します",
+              zh: "一眼查看最近运行的成功率、耗时和条目规模",
+            })}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span className="rounded-full px-2 py-1" style={{ color: "#86efac", background: "rgba(34,197,94,0.12)" }}>
+            {data.summary.completed_runs}/{data.summary.total_runs} {t({ ko: "완료", en: "completed", ja: "完了", zh: "完成" })}
+          </span>
+          <span className="rounded-full px-2 py-1" style={{ color: "#38bdf8", background: "rgba(56,189,248,0.12)" }}>
+            {formatPercent(data.summary.success_rate)} {t({ ko: "성공", en: "success", ja: "成功", zh: "成功" })}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-2 max-h-80 overflow-y-auto">
+        {data.runs.map((run) => {
+          const statusColor =
+            run.status === "completed"
+              ? "#22c55e"
+              : run.status === "cancelled"
+                ? "#f87171"
+                : "#fbbf24";
+          return (
+            <div
+              key={run.id}
+              className="rounded-xl border px-3 py-3"
+              style={{ borderColor: "rgba(255,255,255,0.06)", background: "var(--th-bg-surface)" }}
+            >
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span
+                      className="rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase"
+                      style={{ color: statusColor, background: `${statusColor}1f` }}
+                    >
+                      {run.status}
+                    </span>
+                    <span className="truncate text-sm font-medium" style={{ color: "var(--th-text)" }}>
+                      {run.repo || run.agent_id || run.id}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                    {new Date(run.created_at).toLocaleString(undefined, {
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                    {" · "}
+                    {run.agent_id || "global"}
+                  </div>
+                </div>
+                <div className="text-right text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                  <div>{formatDurationShort(run.duration_ms)}</div>
+                  <div>{run.entry_count} {t({ ko: "엔트리", en: "entries", ja: "件", zh: "条目" })}</div>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] sm:grid-cols-4">
+                <MetricChip label={t({ ko: "성공", en: "Success", ja: "成功", zh: "成功" })} value={formatPercent(run.success_rate)} accent="#22c55e" />
+                <MetricChip label={t({ ko: "실패", en: "Failure", ja: "失敗", zh: "失败" })} value={formatPercent(run.failure_rate)} accent="#f87171" />
+                <MetricChip label={t({ ko: "Done", en: "Done", ja: "Done", zh: "完成" })} value={String(run.done_count)} accent="#38bdf8" />
+                <MetricChip label={t({ ko: "Skip/Pending", en: "Skip/Pending", ja: "Skip/Pending", zh: "跳过/待处理" })} value={String(run.skipped_count + run.pending_count + run.dispatched_count)} accent="#fbbf24" />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MetricChip({ label, value, accent }: { label: string; value: string; accent: string }) {
+  return (
+    <div className="rounded-xl px-2.5 py-2" style={{ background: "rgba(15,23,42,0.18)" }}>
+      <div className="text-[10px] uppercase tracking-[0.16em]" style={{ color: "var(--th-text-muted)" }}>
+        {label}
+      </div>
+      <div className="mt-1 text-sm font-semibold" style={{ color: accent }}>
+        {value}
       </div>
     </div>
   );

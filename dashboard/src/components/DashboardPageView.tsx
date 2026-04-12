@@ -16,6 +16,8 @@ import {
 } from "./dashboard/HeroSections";
 import {
   AchievementWidget,
+  AutoQueueHistoryWidget,
+  BottleneckWidget,
   CookingHeartRoleBoardWidget,
   CronTimelineWidget,
   MachineStatusWidget,
@@ -154,7 +156,10 @@ export default function DashboardPageView({
 
       <HealthWidget t={t} />
 
+      <BottleneckWidget t={t} />
+
       <TokenAnalyticsSection
+        agents={agents}
         t={t}
         numberFormatter={numberFormatter}
       />
@@ -253,7 +258,10 @@ export default function DashboardPageView({
         />
 
         <MachineStatusWidget t={t} />
-        <CronTimelineWidget t={t} />
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          <CronTimelineWidget t={t} />
+          <AutoQueueHistoryWidget t={t} />
+        </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <CookingHeartRoleBoardWidget agents={agents} t={t} isKo={language === "ko"} />
         </div>
