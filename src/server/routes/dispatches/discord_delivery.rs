@@ -10,6 +10,7 @@ use crate::db::agents::{
 use crate::db::auto_queue::{ensure_agent_slot_pool_rows, slot_has_active_dispatch};
 use crate::services::auto_queue::runtime::reset_slot_thread_bindings;
 use rusqlite::OptionalExtension;
+use std::sync::OnceLock;
 
 const SLOT_THREAD_RESET_MESSAGE_LIMIT: u64 = 500;
 const SLOT_THREAD_RESET_MAX_AGE_DAYS: i64 = 7;
@@ -37,6 +38,11 @@ fn discord_api_url(base_url: &str, path: &str) -> String {
         base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn shared_discord_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 fn resolve_dispatch_thread_owner_user_id(db: &crate::db::Db) -> Option<u64> {
@@ -324,9 +330,15 @@ pub(crate) async fn sync_dispatch_status_reaction(
 
     let token = crate::credential::read_bot_token("announce")
         .ok_or_else(|| "no announce bot token".to_string())?;
-    let client = reqwest::Client::new();
     let base_url = discord_api_base_url();
-    apply_dispatch_status_reaction_state(&client, &token, &base_url, &target, state).await
+    apply_dispatch_status_reaction_state(
+        shared_discord_http_client(),
+        &token,
+        &base_url,
+        &target,
+        state,
+    )
+    .await
 }
 
 fn thread_id_from_slot_map(thread_id_map: Option<&str>, channel_id: u64) -> Option<String> {
