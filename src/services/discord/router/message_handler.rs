@@ -65,6 +65,10 @@ fn should_skip_memento_recall(
     memory_settings.backend == settings::MemoryBackendKind::Memento && memento_context_loaded
 }
 
+fn should_add_turn_pending_reaction(dispatch_id: Option<&str>) -> bool {
+    dispatch_id.is_none()
+}
+
 async fn send_restore_notification(
     shared: &Arc<SharedData>,
     fallback_http: &Arc<serenity::Http>,
@@ -389,8 +393,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     };
 
-    // Add hourglass reaction to user's message
-    add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
+    let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
+    if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref()) {
+        add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
+    }
 
     // ── Dispatch thread auto-creation ──────────────────────────────
     // When a dispatch message arrives, create a Discord thread for
@@ -401,7 +407,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     let is_already_thread = super::super::resolve_thread_parent(&ctx.http, channel_id)
         .await
         .is_some();
-    let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
     let mut dispatch_type_str: Option<String> = None;
     // #259: Fetch dispatch metadata once before thread creation so we can extract
     // worktree_path for both thread bootstrap and the subsequent session CWD override.
@@ -2980,6 +2985,20 @@ mod tests {
         assert!(should_skip_memento_recall(&memento, true));
         assert!(!should_skip_memento_recall(&memento, false));
         assert!(!should_skip_memento_recall(&file, true));
+    }
+
+    #[test]
+    fn dispatch_turns_skip_generic_pending_reaction() {
+        let dispatch_id = crate::services::discord::adk_session::parse_dispatch_id(
+            "DISPATCH:550e8400-e29b-41d4-a716-446655440000 - Fix login bug",
+        );
+
+        assert!(!should_add_turn_pending_reaction(dispatch_id.as_deref()));
+    }
+
+    #[test]
+    fn regular_turns_keep_generic_pending_reaction() {
+        assert!(should_add_turn_pending_reaction(None));
     }
 
     #[test]
