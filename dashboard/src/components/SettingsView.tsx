@@ -289,6 +289,10 @@ const SYSTEM_CONFIG_DESCRIPTIONS: Record<string, { ko: string; en: string }> = {
     ko: "자동 머지 시 사용할 GitHub 머지 전략입니다.",
     en: "GitHub merge strategy used by merge automation.",
   },
+  merge_strategy_mode: {
+    ko: "터미널 카드에서 direct merge를 먼저 시도할지, 항상 PR을 만들지 결정합니다.",
+    en: "Chooses whether terminal cards try direct merge first or always open a PR.",
+  },
   merge_allowed_authors: {
     ko: "자동 머지를 허용할 작성자 목록입니다. 쉼표로 구분합니다.",
     en: "Comma-separated list of authors allowed for automated merge.",
@@ -412,9 +416,9 @@ const AUDIT_NOTES: AuditNote[] = [
     id: "merge-automation-surface",
     titleKo: "merge automation은 개별 정책 키 surface",
     titleEn: "Merge automation now lives on the policy-key surface",
-    descriptionKo: "`merge_automation_enabled`, `merge_strategy`, `merge_allowed_authors`는 `agentdesk.yaml`의 `automation:` baseline 위에 대시보드가 `kv_meta` runtime override를 덮는 구조입니다.",
-    descriptionEn: "`merge_automation_enabled`, `merge_strategy`, and `merge_allowed_authors` now use `agentdesk.yaml` `automation:` as the startup baseline while the dashboard writes `kv_meta` runtime overrides on top.",
-    keys: ["merge_automation_enabled", "merge_strategy", "merge_allowed_authors"],
+    descriptionKo: "`merge_automation_enabled`, `merge_strategy`, `merge_strategy_mode`, `merge_allowed_authors`는 `agentdesk.yaml`의 `automation:` baseline 위에 대시보드가 `kv_meta` runtime override를 덮는 구조입니다.",
+    descriptionEn: "`merge_automation_enabled`, `merge_strategy`, `merge_strategy_mode`, and `merge_allowed_authors` now use `agentdesk.yaml` `automation:` as the startup baseline while the dashboard writes `kv_meta` runtime overrides on top.",
+    keys: ["merge_automation_enabled", "merge_strategy", "merge_strategy_mode", "merge_allowed_authors"],
     status: "backend-contract",
   },
 ];
@@ -1409,6 +1413,25 @@ export default function SettingsView({
                                   {baselineSource && <span>{baselineSource}</span>}
                                   {restartNote && <span>{restartNote}</span>}
                                   <span>{tr("GitHub auto-merge 전략과 1:1로 대응합니다.", "Maps directly to the GitHub auto-merge strategy.")}</span>
+                                </div>
+                              </>
+                            ) : entry.key === "merge_strategy_mode" ? (
+                              <>
+                                <select
+                                  disabled={readOnly}
+                                  className="w-full rounded-2xl px-3 py-2.5 text-sm disabled:cursor-not-allowed disabled:opacity-80"
+                                  style={inputStyle}
+                                  value={String(currentValue || "direct-first")}
+                                  onChange={(event) => handleConfigEdit(entry.key, event.target.value)}
+                                >
+                                  <option value="direct-first">direct-first</option>
+                                  <option value="pr-always">pr-always</option>
+                                </select>
+                                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                                  <span>{tr(`기본값: ${defaultLabel}`, `Default: ${defaultLabel}`)}</span>
+                                  {baselineSource && <span>{baselineSource}</span>}
+                                  {restartNote && <span>{restartNote}</span>}
+                                  <span>{tr("direct-first는 기존 동작을 유지하고, pr-always는 항상 PR과 Codex 리뷰 승인을 기다립니다.", "direct-first preserves the current flow, while pr-always always opens a PR and waits for Codex approval.")}</span>
                                 </div>
                               </>
                             ) : (

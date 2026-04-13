@@ -1141,6 +1141,19 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                         "label_en": "Merge Strategy"
                     },
                     {
+                        "key": "merge_strategy_mode",
+                        "value": "pr-always",
+                        "default": "direct-first",
+                        "baseline": "direct-first",
+                        "baseline_source": "hardcoded",
+                        "override_active": true,
+                        "editable": true,
+                        "restart_behavior": "persist-live-override",
+                        "category": "automation",
+                        "label_ko": "자동 머지 경로",
+                        "label_en": "Merge Strategy Mode"
+                    },
+                    {
                         "key": "server_port",
                         "value": "8791",
                         "default": "8791",
@@ -1165,6 +1178,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_example(
             json!({
                 "merge_strategy": "merge",
+                "merge_strategy_mode": "pr-always",
                 "max_review_rounds": 5
             }),
             json!({"ok": true, "updated": 2, "rejected": []}),
