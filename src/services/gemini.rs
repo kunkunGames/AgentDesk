@@ -189,6 +189,7 @@ pub fn execute_command_streaming(
         .resolved_path
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
+    let resolved_working_dir = resolve_gemini_working_dir(working_dir)?;
     let prompt = compose_gemini_prompt(prompt, system_prompt, allowed_tools);
     let readonly_mode = is_readonly_tool_policy(allowed_tools);
     run_gemini_streaming_attempts(&sender, resume_selector, |resume_selector| {
@@ -198,7 +199,7 @@ pub fn execute_command_streaming(
             &prompt,
             model,
             resume_selector,
-            working_dir,
+            &resolved_working_dir,
             sender.clone(),
             cancel_token.clone(),
             readonly_mode,
@@ -236,7 +237,7 @@ fn execute_gemini_streaming_attempt(
     prompt: &str,
     model: Option<&str>,
     resume_selector: Option<String>,
-    working_dir: &str,
+    working_dir: &Path,
     sender: Sender<StreamMessage>,
     cancel_token: Option<Arc<CancelToken>>,
     readonly_mode: bool,
