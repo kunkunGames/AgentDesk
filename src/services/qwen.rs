@@ -1523,7 +1523,8 @@ fn build_simple_exec_args(prompt: &str) -> Vec<String> {
         prompt.to_string(),
         "--output-format".to_string(),
         "json".to_string(),
-        "-y".to_string(),
+        "--approval-mode".to_string(),
+        "yolo".to_string(),
         "--sandbox".to_string(),
         "false".to_string(),
     ]
@@ -1557,7 +1558,8 @@ pub(crate) fn build_stream_exec_args(
     args.push("--output-format".to_string());
     args.push("stream-json".to_string());
     args.push("--include-partial-messages".to_string());
-    args.push("-y".to_string());
+    args.push("--approval-mode".to_string());
+    args.push("yolo".to_string());
     args.push("--sandbox".to_string());
     args.push("false".to_string());
     args
@@ -1836,9 +1838,9 @@ fn render_qwen_value(value: &Value) -> String {
 mod tests {
     use super::{
         QWEN_CODE_SYSTEM_SETTINGS_ENV, QwenAttemptState, QwenResumeStrategy,
-        build_stream_exec_args, compose_qwen_prompt, create_system_settings_override,
-        extract_text_from_json_output, normalize_resume_strategy, process_qwen_json_event,
-        qwen_project_cache_key, resolve_allowed_core_tools,
+        build_simple_exec_args, build_stream_exec_args, compose_qwen_prompt,
+        create_system_settings_override, extract_text_from_json_output, normalize_resume_strategy,
+        process_qwen_json_event, qwen_project_cache_key, resolve_allowed_core_tools,
     };
     use crate::services::agent_protocol::StreamMessage;
     use serde_json::json;
@@ -1912,6 +1914,23 @@ mod tests {
                 .any(|pair| pair == ["--model", "qwen3-coder"])
         );
         assert!(args.contains(&"--include-partial-messages".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--approval-mode", "yolo"])
+        );
+        assert!(!args.contains(&"-y".to_string()));
+    }
+
+    #[test]
+    fn build_simple_exec_args_uses_approval_mode_yolo() {
+        let args = build_simple_exec_args("hello");
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--approval-mode", "yolo"])
+        );
+        assert!(!args.contains(&"-y".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "false"]));
     }
 
     #[test]

@@ -1967,11 +1967,12 @@ mod tests {
             &db,
             "card-review-provider",
             "agent-1",
-            &json!({ "reviewed_commit": "test-commit" }),
+            &json!({"reviewed_commit": "provider-fixture"}),
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
 
+        assert_eq!(parsed["reviewed_commit"], "provider-fixture");
         assert_eq!(parsed["from_provider"], "claude");
         assert_eq!(parsed["target_provider"], "qwen");
     }
