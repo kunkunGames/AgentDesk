@@ -571,12 +571,17 @@ pub struct AutomationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_authors: Option<String>,
 }
 
 impl AutomationConfig {
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_none() && self.strategy.is_none() && self.allowed_authors.is_none()
+        self.enabled.is_none()
+            && self.strategy.is_none()
+            && self.strategy_mode.is_none()
+            && self.allowed_authors.is_none()
     }
 }
 
@@ -1254,6 +1259,7 @@ mod tests {
         config.automation = AutomationConfig {
             enabled: Some(true),
             strategy: Some("rebase".to_string()),
+            strategy_mode: Some("pr-always".to_string()),
             allowed_authors: Some("itismyfield,octocat".to_string()),
         };
         config.escalation = EscalationConfig {
@@ -1373,6 +1379,10 @@ mod tests {
         assert!(loaded.runtime.reset_overrides_on_restart);
         assert_eq!(loaded.automation.enabled, Some(true));
         assert_eq!(loaded.automation.strategy.as_deref(), Some("rebase"));
+        assert_eq!(
+            loaded.automation.strategy_mode.as_deref(),
+            Some("pr-always")
+        );
         assert_eq!(
             loaded.automation.allowed_authors.as_deref(),
             Some("itismyfield,octocat")

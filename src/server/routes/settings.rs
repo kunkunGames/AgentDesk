@@ -142,6 +142,13 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         Some("squash"),
     ),
     (
+        "merge_strategy_mode",
+        "automation",
+        "자동 머지 경로",
+        "Merge Strategy Mode",
+        Some("direct-first"),
+    ),
+    (
         "merge_allowed_authors",
         "automation",
         "자동 머지 허용 작성자",
@@ -210,6 +217,7 @@ fn yaml_section_value(config: &crate::config::Config, key: &str) -> Option<Strin
         "pm_decision_gate_enabled" => stringified_bool(config.kanban.pm_decision_gate_enabled),
         "merge_automation_enabled" => stringified_bool(config.automation.enabled),
         "merge_strategy" => config.automation.strategy.clone(),
+        "merge_strategy_mode" => config.automation.strategy_mode.clone(),
         "merge_allowed_authors" => config.automation.allowed_authors.clone(),
         "requested_timeout_min" => stringified_number(config.runtime.requested_timeout_min),
         "in_progress_stale_min" => stringified_number(config.runtime.in_progress_stale_min),
@@ -545,6 +553,7 @@ mod tests {
         assert!(keys.contains("narrate_progress"));
         assert!(keys.contains("merge_automation_enabled"));
         assert!(keys.contains("merge_strategy"));
+        assert!(keys.contains("merge_strategy_mode"));
         assert!(keys.contains("merge_allowed_authors"));
         assert!(!keys.contains("max_chain_depth"));
         assert!(!keys.contains("context_clear_percent"));
@@ -599,6 +608,19 @@ mod tests {
             json!("reseed-from-yaml")
         );
 
+        let merge_strategy_mode = values
+            .get("merge_strategy_mode")
+            .expect("merge_strategy_mode");
+        assert_eq!(merge_strategy_mode["value"], json!("direct-first"));
+        assert_eq!(merge_strategy_mode["baseline"], json!("direct-first"));
+        assert_eq!(merge_strategy_mode["baseline_source"], json!("hardcoded"));
+        assert_eq!(merge_strategy_mode["override_active"], json!(false));
+        assert_eq!(merge_strategy_mode["editable"], json!(true));
+        assert_eq!(
+            merge_strategy_mode["restart_behavior"],
+            json!("persist-live-override")
+        );
+
         let max_review_rounds = values.get("max_review_rounds").expect("max_review_rounds");
         assert_eq!(max_review_rounds["value"], json!("7"));
         assert_eq!(max_review_rounds["baseline"], json!("3"));
@@ -628,6 +650,7 @@ mod tests {
             Json(json!({
                 "merge_automation_enabled": true,
                 "merge_strategy": "rebase",
+                "merge_strategy_mode": "pr-always",
                 "merge_allowed_authors": "itismyfield,octocat",
                 "context_compact_percent_codex": "85",
                 "context_compact_percent_claude": "75",
@@ -636,7 +659,7 @@ mod tests {
         )
         .await;
         assert_eq!(patch_status, StatusCode::OK);
-        assert_eq!(patch_body["updated"], json!(6));
+        assert_eq!(patch_body["updated"], json!(7));
         assert_eq!(patch_body["rejected"], json!([]));
 
         let (get_status, Json(get_body)) = get_config_entries(State(state)).await;
@@ -659,6 +682,7 @@ mod tests {
         assert_eq!(values.get("narrate_progress"), Some(&Some("false")));
         assert_eq!(values.get("merge_automation_enabled"), Some(&Some("true")));
         assert_eq!(values.get("merge_strategy"), Some(&Some("rebase")));
+        assert_eq!(values.get("merge_strategy_mode"), Some(&Some("pr-always")));
         assert_eq!(
             values.get("merge_allowed_authors"),
             Some(&Some("itismyfield,octocat"))

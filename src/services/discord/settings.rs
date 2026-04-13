@@ -1935,6 +1935,7 @@ memory:
                         None,
                         None,
                         None,
+                        None,
                         Some(&resolved),
                     );
 

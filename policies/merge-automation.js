@@ -2,9 +2,11 @@
 // Automates PR merging and worktree cleanup after review passes.
 //
 // Flow:
-//   1. Card reaches terminal (done) → find associated PR → enable auto-merge
-//   2. OnTick5min → detect conflicting PRs → dispatch rebase
-//   3. OnTick5min → cleanup merged worktree branches
+//   1. Card reaches terminal (done) → try direct merge from tracked worktree branch
+//   2. If direct merge conflicts → create/track PR → CI/merge automation takes over
+//   3. Existing tracked PRs in merge state → enable auto-merge
+//   4. OnTick5min → detect conflicting PRs → dispatch rebase
+//   5. OnTick5min → cleanup merged worktree branches
 //
 // PR discovery: looks up the card's worktree branch from sessions table,
 // then finds the PR by branch name via `gh pr list`.
@@ -12,6 +14,7 @@
 // Config (kv_meta):
 //   merge_automation_enabled  — "true" to enable (default: disabled)
 //   merge_strategy            — "squash" | "rebase" | "merge" (default: "squash")
+//   merge_strategy_mode       — "direct-first" | "pr-always" (default: "direct-first")
 //   merge_allowed_authors     — comma-separated GitHub usernames for auto-merge
 //                               (e.g. "itismyfield,kunkunGames,bot[bot]")
 //
@@ -39,6 +42,11 @@ var mergeAutomation = {
 
     var cardId = payload.card_id;
     var tracking = loadTrackedPrForCard(cardId);
+    if (!tracking || !tracking.pr_number || !tracking.repo_id) {
+      tryDirectMergeOrTrackPr(cardId, tracking);
+      return;
+    }
+
     if (!tracking || tracking.state !== "merge" || !tracking.pr_number || !tracking.repo_id) {
       return;
     }
@@ -72,6 +80,49 @@ function isEnabled() {
   return agentdesk.config.get("merge_automation_enabled") === "true";
 }
 
+function mergeModeStateKey(cardId) {
+  return "merge_strategy_mode:card:" + cardId;
+}
+
+function normalizeMergeStrategyMode(value) {
+  var normalized = String(value || "").trim().toLowerCase();
+  return normalized === "pr-always" ? "pr-always" : "direct-first";
+}
+
+function getConfiguredMergeStrategyMode() {
+  return normalizeMergeStrategyMode(agentdesk.config.get("merge_strategy_mode") || "direct-first");
+}
+
+function loadTrackedMergeStrategyMode(cardId) {
+  if (!cardId) return null;
+  var rows = agentdesk.db.query(
+    "SELECT value FROM kv_meta WHERE key = ? LIMIT 1",
+    [mergeModeStateKey(cardId)]
+  );
+  if (rows.length === 0 || !rows[0].value) return null;
+  return normalizeMergeStrategyMode(rows[0].value);
+}
+
+function persistTrackedMergeStrategyMode(cardId, mode) {
+  if (!cardId) return;
+  agentdesk.db.execute(
+    "INSERT OR REPLACE INTO kv_meta (key, value, expires_at) VALUES (?, ?, NULL)",
+    [mergeModeStateKey(cardId), normalizeMergeStrategyMode(mode)]
+  );
+}
+
+function clearTrackedMergeStrategyMode(cardId) {
+  if (!cardId) return;
+  agentdesk.db.execute(
+    "DELETE FROM kv_meta WHERE key = ?",
+    [mergeModeStateKey(cardId)]
+  );
+}
+
+function resolveTrackedMergeStrategyMode(cardId) {
+  return loadTrackedMergeStrategyMode(cardId) || getConfiguredMergeStrategyMode();
+}
+
 function sanitizeKvKeyPart(value) {
   return String(value || "").replace(/[^A-Za-z0-9._-]/g, "_");
 }
@@ -103,6 +154,7 @@ function extractIssueNumberFromText(text) {
 function loadCardContext(cardId) {
   var cards = agentdesk.db.query(
     "SELECT id, status, assigned_agent_id, title, github_issue_number, active_thread_id, repo_id " +
+    ", github_issue_url " +
     "FROM kanban_cards WHERE id = ?",
     [cardId]
   );
@@ -127,6 +179,599 @@ function listTrackedPrRows(whereClause, params) {
 
 function findOpenPrByTrackedBranch(repoId, branch) {
   return prTracking.findOpenPrByBranch(repoId, branch);
+}
+
+function parseJsonObject(raw) {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function firstPresent() {
+  for (var i = 0; i < arguments.length; i++) {
+    var value = arguments[i];
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string" && value.trim() === "") continue;
+    return value;
+  }
+  return null;
+}
+
+function extractRepoFromIssueUrl(url) {
+  return prTracking.extractRepoFromIssueUrl(url);
+}
+
+function extractDispatchTarget(row) {
+  var result = parseJsonObject(row && row.result);
+  var context = parseJsonObject(row && row.context);
+  var worktreePath = firstPresent(
+    result.completed_worktree_path,
+    result.worktree_path,
+    context.completed_worktree_path,
+    context.worktree_path
+  );
+  var branch = firstPresent(
+    result.completed_branch,
+    result.worktree_branch,
+    result.branch,
+    context.completed_branch,
+    context.worktree_branch,
+    context.branch
+  );
+  var headSha = firstPresent(
+    result.completed_commit,
+    result.reviewed_commit,
+    result.head_sha,
+    context.completed_commit,
+    context.reviewed_commit,
+    context.head_sha
+  );
+
+  if (!branch && worktreePath) {
+    var branchResult = agentdesk.exec("git", ["-C", worktreePath, "branch", "--show-current"]);
+    if (branchResult && branchResult.indexOf("ERROR") !== 0 && branchResult.trim()) {
+      branch = branchResult.trim();
+    }
+  }
+  if (!headSha && worktreePath) {
+    var headResult = agentdesk.exec("git", ["-C", worktreePath, "rev-parse", "HEAD"]);
+    if (headResult && headResult.indexOf("ERROR") !== 0 && headResult.trim()) {
+      headSha = headResult.trim();
+    }
+  }
+
+  if (!worktreePath && !branch && !headSha) return null;
+  return {
+    worktree_path: worktreePath,
+    branch: branch,
+    head_sha: headSha
+  };
+}
+
+function loadLatestCompletedDispatchTarget(cardId, dispatchTypes) {
+  var placeholders = dispatchTypes.map(function() { return "?"; }).join(",");
+  var rows = agentdesk.db.query(
+    "SELECT result, context FROM task_dispatches " +
+    "WHERE kanban_card_id = ? " +
+    "AND dispatch_type IN (" + placeholders + ") " +
+    "AND status = 'completed' " +
+    "ORDER BY COALESCE(completed_at, updated_at) DESC, rowid DESC LIMIT 1",
+    [cardId].concat(dispatchTypes)
+  );
+  return rows.length > 0 ? extractDispatchTarget(rows[0]) : null;
+}
+
+function loadLatestCompletedWorkTarget(cardId) {
+  return loadLatestCompletedDispatchTarget(cardId, ["implementation", "rework"])
+    || loadLatestCompletedDispatchTarget(cardId, ["review", "review-decision"]);
+}
+
+function execGitOrThrow(args) {
+  var output = agentdesk.exec("git", args);
+  if (typeof output === "string" && output.indexOf("ERROR") === 0) {
+    throw new Error(output.replace(/^ERROR:\s*/, ""));
+  }
+  return typeof output === "string" ? output : "";
+}
+
+function execGitMaybe(args) {
+  var output = agentdesk.exec("git", args);
+  if (typeof output === "string" && output.indexOf("ERROR") === 0) {
+    return null;
+  }
+  return typeof output === "string" ? output : "";
+}
+
+function parseWorktreeList(text) {
+  var entries = [];
+  var current = { path: "", branch: null };
+  var lines = String(text || "").split(/\r?\n/);
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.indexOf("worktree ") === 0) {
+      if (current.path) entries.push(current);
+      current = { path: line.substring("worktree ".length), branch: null };
+    } else if (line.indexOf("branch ") === 0) {
+      var branch = line.substring("branch ".length);
+      current.branch = branch.indexOf("refs/heads/") === 0
+        ? branch.substring("refs/heads/".length)
+        : branch;
+    } else if (!line.trim() && current.path) {
+      entries.push(current);
+      current = { path: "", branch: null };
+    }
+  }
+  if (current.path) entries.push(current);
+  return entries;
+}
+
+function maybeRestoreMergeStash(mainWorktreePath, stashCreated) {
+  if (!stashCreated) return null;
+  var output = agentdesk.exec("git", ["-C", mainWorktreePath, "stash", "pop"]);
+  if (typeof output === "string" && output.indexOf("ERROR") === 0) {
+    var err = output.replace(/^ERROR:\s*/, "").trim();
+    return err
+      ? "stash created but restore reported conflicts: " + err
+      : "stash created but restore needs manual check";
+  }
+  return "stash restored";
+}
+
+function isCherryPickConflict(errorText) {
+  return /CONFLICT|could not apply|after resolving the conflicts|merge conflict/i.test(String(errorText || ""));
+}
+
+function parsePrNumberFromOutput(output) {
+  var match = String(output || "").match(/\/pull\/(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function missingSourceResult(candidate, reason) {
+  return {
+    ok: false,
+    conflict: false,
+    missing_source: true,
+    branch: candidate.branch,
+    main_branch: null,
+    error: reason,
+    stash: null
+  };
+}
+
+function branchExistsInRepo(repoDir, branch) {
+  if (!repoDir || !branch) return false;
+  return execGitMaybe([
+    "-C",
+    repoDir,
+    "show-ref",
+    "--verify",
+    "--quiet",
+    "refs/heads/" + branch
+  ]) !== null;
+}
+
+function isMissingMergeSourceError(errorText) {
+  return /missing merge source|worktree path unavailable|tracked branch missing/i.test(String(errorText || ""));
+}
+
+function recordMissingMergeSource(cardId, candidate, tracking, errorText) {
+  var lastError = errorText || "missing merge source";
+  upsertPrTracking(
+    cardId,
+    candidate.repo_id,
+    candidate.worktree_path,
+    candidate.branch,
+    tracking ? tracking.pr_number : null,
+    candidate.head_sha,
+    "source-missing",
+    lastError
+  );
+  agentdesk.db.execute(
+    "UPDATE kanban_cards SET blocked_reason = 'merge:source_missing' WHERE id = ?",
+    [cardId]
+  );
+  agentdesk.log.warn("[merge] Card " + cardId + " merge source missing: " + lastError);
+}
+
+function resolveTerminalMergeCandidate(cardId, tracking) {
+  var card = loadCardContext(cardId);
+  if (!card) return null;
+
+  var latestWork = loadLatestCompletedWorkTarget(cardId);
+  var repoId = firstPresent(
+    tracking && tracking.repo_id,
+    card.repo_id,
+    extractRepoFromIssueUrl(card.github_issue_url)
+  );
+  var worktreePath = firstPresent(
+    tracking && tracking.worktree_path,
+    latestWork && latestWork.worktree_path
+  );
+  var branch = firstPresent(
+    tracking && tracking.branch,
+    latestWork && latestWork.branch
+  );
+  var headSha = firstPresent(
+    tracking && tracking.head_sha,
+    latestWork && latestWork.head_sha
+  );
+
+  if (!repoId || !worktreePath || !branch) {
+    return null;
+  }
+
+  return {
+    card: card,
+    repo_id: repoId,
+    worktree_path: worktreePath,
+    branch: branch,
+    head_sha: headSha
+  };
+}
+
+function resolveCanonicalRepoRoot(worktreePath) {
+  var commonDir = execGitOrThrow([
+    "-C",
+    worktreePath,
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir"
+  ]).trim();
+  return commonDir.replace(/\/\.git\/?$/, "");
+}
+
+function resolveMainWorktree(repoDir) {
+  var worktreeOutput = execGitOrThrow(["-C", repoDir, "worktree", "list", "--porcelain"]);
+  var worktrees = parseWorktreeList(worktreeOutput);
+  if (!worktrees.length) {
+    throw new Error("could not locate main worktree");
+  }
+  for (var i = 0; i < worktrees.length; i++) {
+    if (worktrees[i].branch === "main" || worktrees[i].branch === "master") {
+      return worktrees[i];
+    }
+  }
+  return worktrees[0];
+}
+
+function resolveMainBranchForCandidate(candidate) {
+  var repoDir = resolveCanonicalRepoRoot(candidate.worktree_path);
+  var mainWorktree = resolveMainWorktree(repoDir);
+  return mainWorktree.branch || "main";
+}
+
+function attemptDirectMerge(candidate) {
+  if (!candidate.worktree_path) {
+    return missingSourceResult(candidate, "missing merge source: worktree path unavailable");
+  }
+  var worktreeStatus = execGitMaybe([
+    "-C",
+    candidate.worktree_path,
+    "rev-parse",
+    "--is-inside-work-tree"
+  ]);
+  if (worktreeStatus === null) {
+    return missingSourceResult(
+      candidate,
+      "missing merge source: worktree path unavailable: " + candidate.worktree_path
+    );
+  }
+
+  var repoDir = resolveCanonicalRepoRoot(candidate.worktree_path);
+  if (!branchExistsInRepo(repoDir, candidate.branch)) {
+    return missingSourceResult(
+      candidate,
+      "missing merge source: tracked branch missing: " + candidate.branch
+    );
+  }
+  var mainWorktree = resolveMainWorktree(repoDir);
+  var mainBranch = mainWorktree.branch || "main";
+  var branchRange = mainBranch + ".." + candidate.branch;
+  var commitsOutput = execGitOrThrow([
+    "-C",
+    mainWorktree.path,
+    "rev-list",
+    "--reverse",
+    branchRange
+  ]);
+  var commits = commitsOutput
+    .split(/\r?\n/)
+    .map(function(line) { return line.trim(); })
+    .filter(function(line) { return !!line; });
+  if (commits.length === 0) {
+    return {
+      ok: true,
+      already_merged: true,
+      branch: candidate.branch,
+      main_branch: mainBranch,
+      commits: [],
+      stash: null
+    };
+  }
+
+  var hasLocalChanges = execGitOrThrow(["-C", mainWorktree.path, "status", "--porcelain"]).trim() !== "";
+  var stashCreated = false;
+  if (hasLocalChanges) {
+    execGitOrThrow([
+      "-C",
+      mainWorktree.path,
+      "stash",
+      "push",
+      "-u",
+      "-m",
+      "agentdesk merge-automation " + candidate.branch
+    ]);
+    stashCreated = true;
+  }
+
+  var cherryPickArgs = ["-C", mainWorktree.path, "cherry-pick"].concat(commits);
+  var cherryPickOutput = agentdesk.exec("git", cherryPickArgs);
+  if (typeof cherryPickOutput === "string" && cherryPickOutput.indexOf("ERROR") === 0) {
+    execGitMaybe(["-C", mainWorktree.path, "cherry-pick", "--abort"]);
+    return {
+      ok: false,
+      conflict: isCherryPickConflict(cherryPickOutput),
+      branch: candidate.branch,
+      main_branch: mainBranch,
+      error: cherryPickOutput.replace(/^ERROR:\s*/, ""),
+      stash: maybeRestoreMergeStash(mainWorktree.path, stashCreated)
+    };
+  }
+
+  try {
+    execGitOrThrow(["-C", mainWorktree.path, "push", "origin", mainBranch]);
+  } catch (e) {
+    return {
+      ok: false,
+      conflict: false,
+      branch: candidate.branch,
+      main_branch: mainBranch,
+      error: String(e),
+      stash: maybeRestoreMergeStash(mainWorktree.path, stashCreated)
+    };
+  }
+
+  return {
+    ok: true,
+    already_merged: false,
+    branch: candidate.branch,
+    main_branch: mainBranch,
+    commits: commits,
+    stash: maybeRestoreMergeStash(mainWorktree.path, stashCreated)
+  };
+}
+
+function buildTrackedPrTitle(card) {
+  var issueNum = card.github_issue_number || "?";
+  return "#" + issueNum + " " + card.title;
+}
+
+function buildTrackedPrBody(card, options) {
+  var mode = options && options.mode ? options.mode : "direct-first";
+  var mergeResult = options && options.merge_result ? options.merge_result : null;
+  var mainBranch = options && options.main_branch ? options.main_branch : "main";
+  var lines = [];
+
+  if (mode === "pr-always") {
+    lines.push("Automated PR created because `merge_strategy_mode` is set to `pr-always`.");
+  } else {
+    lines.push(
+      "Automated fallback PR after direct merge into `" + mainBranch + "` hit a cherry-pick conflict."
+    );
+  }
+  lines.push("");
+  lines.push("Card: `" + card.id + "`");
+  if (card.github_issue_url) {
+    lines.push("Issue: " + card.github_issue_url);
+  }
+  if (mode === "pr-always") {
+    lines.push("");
+    lines.push("Merge path: wait for CI + Codex review approval before auto-merge.");
+  } else if (mergeResult && mergeResult.error) {
+    lines.push("");
+    lines.push("Conflict summary:");
+    lines.push(summarizeInlineText(mergeResult.error));
+  }
+  return lines.join("\n");
+}
+
+function createOrLocateTrackedPr(candidate, options) {
+  var existing = findOpenPrByTrackedBranch(candidate.repo_id, candidate.branch);
+  if (existing) return existing;
+
+  execGitOrThrow(["-C", candidate.worktree_path, "push", "-u", "origin", candidate.branch]);
+
+  var createOutput = agentdesk.exec("gh", [
+    "pr", "create",
+    "--repo", candidate.repo_id,
+    "--base", (options && options.main_branch) || "main",
+    "--head", candidate.branch,
+    "--title", buildTrackedPrTitle(candidate.card),
+    "--body", buildTrackedPrBody(candidate.card, options || {})
+  ]);
+  if (typeof createOutput === "string" && createOutput.indexOf("ERROR") === 0) {
+    if (/already exists/i.test(createOutput)) {
+      return findOpenPrByTrackedBranch(candidate.repo_id, candidate.branch);
+    }
+    throw new Error(createOutput.replace(/^ERROR:\s*/, ""));
+  }
+
+  var prNumber = parsePrNumberFromOutput(createOutput);
+  if (prNumber) {
+    return {
+      number: prNumber,
+      branch: candidate.branch,
+      sha: candidate.head_sha,
+      repo: candidate.repo_id
+    };
+  }
+
+  return findOpenPrByTrackedBranch(candidate.repo_id, candidate.branch);
+}
+
+function tryDirectMergeOrTrackPr(cardId, tracking) {
+  var candidate = resolveTerminalMergeCandidate(cardId, tracking);
+  if (!candidate) {
+    return;
+  }
+
+  var mergeMode = resolveTrackedMergeStrategyMode(cardId);
+  persistTrackedMergeStrategyMode(cardId, mergeMode);
+
+  if (mergeMode === "pr-always") {
+    try {
+      var trackedPr = createOrLocateTrackedPr(candidate, {
+        mode: mergeMode,
+        main_branch: resolveMainBranchForCandidate(candidate)
+      });
+      if (!trackedPr || !trackedPr.number) {
+        throw new Error("no open PR found for branch " + candidate.branch);
+      }
+
+      var trackedHeadSha = getCurrentPrHeadSha(trackedPr.number, candidate.repo_id) || trackedPr.sha || candidate.head_sha;
+      upsertPrTracking(
+        cardId,
+        candidate.repo_id,
+        candidate.worktree_path,
+        trackedPr.branch || candidate.branch,
+        trackedPr.number,
+        trackedHeadSha,
+        "wait-ci",
+        null
+      );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
+        [cardId]
+      );
+      agentdesk.log.info("[merge] Card " + cardId + " is in pr-always mode — PR #" + trackedPr.number + " is now tracked for CI");
+    } catch (e) {
+      agentdesk.log.warn("[merge] PR creation failed for pr-always card " + cardId + ": " + e);
+      upsertPrTracking(
+        cardId,
+        candidate.repo_id,
+        candidate.worktree_path,
+        candidate.branch,
+        tracking ? tracking.pr_number : null,
+        candidate.head_sha,
+        "create-pr",
+        String(e)
+      );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = ?",
+        [cardId]
+      );
+    }
+    return;
+  }
+
+  var mergeResult = null;
+  try {
+    mergeResult = attemptDirectMerge(candidate);
+  } catch (e) {
+    if (isMissingMergeSourceError(e)) {
+      recordMissingMergeSource(cardId, candidate, tracking, String(e));
+      return;
+    }
+    agentdesk.log.warn("[merge] Direct merge setup failed for card " + cardId + ": " + e);
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      candidate.branch,
+      tracking ? tracking.pr_number : null,
+      candidate.head_sha,
+      tracking && tracking.state ? tracking.state : "create-pr",
+      String(e)
+    );
+    return;
+  }
+
+  if (mergeResult.ok) {
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      candidate.branch,
+      null,
+      candidate.head_sha,
+      "closed",
+      null
+    );
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = ?",
+      [cardId]
+    );
+    clearTrackedMergeStrategyMode(cardId);
+    agentdesk.log.info("[merge] Card " + cardId + " direct-merged " + candidate.branch + " into " + mergeResult.main_branch);
+    return;
+  }
+
+  if (mergeResult.missing_source) {
+    recordMissingMergeSource(cardId, candidate, tracking, mergeResult.error);
+    return;
+  }
+
+  if (!mergeResult.conflict) {
+    agentdesk.log.warn("[merge] Direct merge failed for card " + cardId + ": " + mergeResult.error);
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      candidate.branch,
+      tracking ? tracking.pr_number : null,
+      candidate.head_sha,
+      tracking && tracking.state ? tracking.state : "create-pr",
+      mergeResult.error
+    );
+    return;
+  }
+
+  try {
+    var pr = createOrLocateTrackedPr(candidate, {
+      mode: mergeMode,
+      main_branch: mergeResult.main_branch,
+      merge_result: mergeResult
+    });
+    if (!pr || !pr.number) {
+      throw new Error("no open PR found after conflict fallback for branch " + candidate.branch);
+    }
+
+    var headSha = getCurrentPrHeadSha(pr.number, candidate.repo_id) || pr.sha || candidate.head_sha;
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      pr.branch || candidate.branch,
+      pr.number,
+      headSha,
+      "wait-ci",
+      null
+    );
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
+      [cardId]
+    );
+    agentdesk.log.info("[merge] Card " + cardId + " hit direct-merge conflict — PR #" + pr.number + " is now tracked for CI");
+  } catch (e) {
+    agentdesk.log.warn("[merge] Conflict fallback PR creation failed for card " + cardId + ": " + e);
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      candidate.branch,
+      tracking ? tracking.pr_number : null,
+      candidate.head_sha,
+      "create-pr",
+      String(e)
+    );
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = ?",
+      [cardId]
+    );
+  }
 }
 
 function getCurrentPrHeadSha(prNumber, repo) {
@@ -380,6 +1025,10 @@ function buildCodexReviewSnapshot(repo, prNumber) {
   };
 }
 
+function isCodexReviewApproved(snapshot) {
+  return !!snapshot && String(snapshot.latestState || "").toUpperCase() === "APPROVED";
+}
+
 function codexReviewDedupKey(repo, prNumber, reviewId) {
   return "codex_review_processed:" +
     sanitizeKvKeyPart(repo) + ":" +
@@ -562,7 +1211,7 @@ function processCodexBlockingReview(card, pr, snapshot) {
 }
 
 function processCodexPassReview(card, pr, snapshot) {
-  if (!card || snapshot.hasBlocking) return;
+  if (!card || snapshot.hasBlocking || !isCodexReviewApproved(snapshot)) return;
   notifyCodexReview(card, pr, snapshot, "pass", false, false);
 }
 
@@ -662,6 +1311,27 @@ function enableAutoMerge(prNumber, repo, trackingKey) {
         notifyCodexReview(card, { number: prNumber, repo: repo }, snapshot, "merge-guard", false, true);
       }
       agentdesk.kv.set(guardKey, "true", CODEX_NOTIFICATION_TTL_SECONDS);
+    }
+    return false;
+  }
+
+  var trackedMode = tracking ? resolveTrackedMergeStrategyMode(tracking.card_id) : "direct-first";
+  if (trackedMode === "pr-always" && !isCodexReviewApproved(snapshot)) {
+    var approvalReason = snapshot
+      ? "waiting for Codex Cloud review approval (" + (snapshot.latestState || "pending") + ")"
+      : "waiting for Codex Cloud review approval";
+    agentdesk.log.info("[merge] PR #" + prNumber + " is waiting for Codex approval before auto-merge");
+    if (tracking) {
+      upsertPrTracking(
+        tracking.card_id,
+        tracking.repo_id,
+        tracking.worktree_path,
+        tracking.branch,
+        tracking.pr_number,
+        currentSha || tracking.head_sha,
+        tracking.state || "merge",
+        approvalReason
+      );
     }
     return false;
   }
@@ -938,6 +1608,7 @@ function cleanupMergedWorktrees() {
         "closed",
         null
       );
+      clearTrackedMergeStrategyMode(row.card_id);
       agentdesk.kv.delete("merge_pending:" + row.card_id);
       agentdesk.kv.delete("merge_failed:" + row.card_id);
       agentdesk.kv.delete("merge_blocked:" + row.card_id);

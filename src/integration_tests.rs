@@ -192,6 +192,21 @@ mod tests {
         );
     }
 
+    fn run_git_output(repo_dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
         let repo = tempfile::tempdir().unwrap();
         run_git(repo.path(), &["init", "-b", "main"]);
@@ -200,6 +215,80 @@ mod tests {
         run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
         let override_guard = RepoDirOverride::new(repo.path());
         (repo, override_guard)
+    }
+
+    fn setup_test_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir, RepoDirOverride) {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+
+        let override_guard = RepoDirOverride::new(repo.path());
+        (repo, remote, override_guard)
+    }
+
+    fn setup_test_repo_with_mock_gh(
+        replies: &[MockGhReply],
+    ) -> (tempfile::TempDir, RepoAndMockGhEnv) {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+
+        let lock = repo_dir_env_lock().lock().unwrap();
+        let previous_repo_dir = std::env::var_os("AGENTDESK_REPO_DIR");
+        unsafe { std::env::set_var("AGENTDESK_REPO_DIR", repo.path()) };
+
+        let gh = install_mock_gh_with_lock(lock, replies);
+        (
+            repo,
+            RepoAndMockGhEnv {
+                _gh: gh,
+                previous_repo_dir,
+            },
+        )
+    }
+
+    fn setup_test_repo_with_origin_and_mock_gh(
+        replies: &[MockGhReply],
+    ) -> (tempfile::TempDir, tempfile::TempDir, RepoAndMockGhEnv) {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+
+        let lock = repo_dir_env_lock().lock().unwrap();
+        let previous_repo_dir = std::env::var_os("AGENTDESK_REPO_DIR");
+        unsafe { std::env::set_var("AGENTDESK_REPO_DIR", repo.path()) };
+
+        let gh = install_mock_gh_with_lock(lock, replies);
+        (
+            repo,
+            remote,
+            RepoAndMockGhEnv {
+                _gh: gh,
+                previous_repo_dir,
+            },
+        )
     }
 
     fn setup_test_repo_with_runtime_root()
@@ -273,6 +362,8 @@ mod tests {
                 dispatch_id: Some(dispatch_id),
                 user_message: "Implement the task",
                 assistant_message: message,
+                events: &[],
+                duration_ms: None,
             },
         )
         .unwrap();
@@ -319,6 +410,39 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_completed_work_dispatch_target(
+        db: &db::Db,
+        dispatch_id: &str,
+        card_id: &str,
+        dispatch_type: &str,
+        worktree_path: &str,
+        branch: &str,
+        commit: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                result, created_at, updated_at, completed_at
+            ) VALUES (
+                ?1, ?2, 'agent-1', ?3, 'completed', 'Completed work',
+                ?4, datetime('now', '-5 minutes'), datetime('now', '-5 minutes'), datetime('now', '-5 minutes')
+            )",
+            rusqlite::params![
+                dispatch_id,
+                card_id,
+                dispatch_type,
+                serde_json::json!({
+                    "completed_worktree_path": worktree_path,
+                    "completed_branch": branch,
+                    "completed_commit": commit,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
     fn seed_completed_review_dispatch(
         db: &db::Db,
         dispatch_id: &str,
@@ -339,6 +463,43 @@ mod tests {
                 card_id,
                 serde_json::json!({
                     "verdict": verdict,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_completed_review_dispatch_with_context(
+        db: &db::Db,
+        dispatch_id: &str,
+        card_id: &str,
+        verdict: &str,
+        worktree_path: &str,
+        branch: &str,
+        commit: &str,
+    ) {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                result, context, created_at, updated_at, completed_at
+            ) VALUES (
+                ?1, ?2, 'agent-1', 'review', 'completed', 'Completed review',
+                ?3, ?4, datetime('now', '-1 minutes'), datetime('now', '-1 minutes'), datetime('now', '-1 minutes')
+            )",
+            rusqlite::params![
+                dispatch_id,
+                card_id,
+                serde_json::json!({
+                    "verdict": verdict,
+                })
+                .to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": worktree_path,
+                    "completed_branch": branch,
+                    "reviewed_commit": commit,
+                    "head_sha": commit,
                 })
                 .to_string(),
             ],
@@ -407,6 +568,25 @@ mod tests {
         .ok()
     }
 
+    fn escalation_pending_reasons(db: &db::Db, card_id: &str) -> Vec<String> {
+        kv_value(db, &format!("pm_pending:{card_id}"))
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value["reasons"].as_array().map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    fn escalation_last_request(db: &db::Db) -> serde_json::Value {
+        let raw = kv_value(db, "test_http_last").expect("test_http_last must exist");
+        serde_json::from_str(&raw).expect("test_http_last must be valid JSON")
+    }
+
     fn relative_local_time(minutes_ago: i64) -> String {
         (chrono::Local::now() - chrono::Duration::minutes(minutes_ago))
             .format("%Y-%m-%d %H:%M:%S")
@@ -458,6 +638,103 @@ mod tests {
             };
             agentdesk.registerPolicy({
                 name: "timeouts-test-overrides",
+                priority: 9999
+            });
+            "#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn setup_escalation_policy_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("policies")
+            .join("00-escalation.js");
+        fs::copy(&source, dir.path().join("00-escalation.js")).unwrap();
+        fs::write(
+            dir.path().join("zz-escalation-test-overrides.js"),
+            r#"
+            agentdesk.http.post = function(url, body) {
+                var countRows = agentdesk.db.query(
+                    "SELECT value FROM kv_meta WHERE key = ?1",
+                    ["test_http_count"]
+                );
+                var nextCount = countRows.length > 0
+                    ? (parseInt(countRows[0].value, 10) || 0) + 1
+                    : 1;
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_http_count", "" + nextCount]
+                );
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_http_last", JSON.stringify({ url: url, body: body })]
+                );
+                return { ok: true };
+            };
+            agentdesk.registerPolicy({
+                name: "escalation-test-overrides",
+                priority: 9999
+            });
+            "#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn setup_auto_queue_activate_spy_policy_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+
+        for entry in fs::read_dir(&source_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+                continue;
+            }
+            fs::copy(&path, dir.path().join(entry.file_name())).unwrap();
+        }
+
+        fs::write(
+            dir.path().join("zz-auto-queue-activate-spy.js"),
+            r#"
+            var rawActivate = agentdesk.autoQueue.activate;
+            agentdesk.autoQueue.activate = function(runIdOrBody, threadGroup) {
+                var body;
+                if (runIdOrBody && typeof runIdOrBody === "object" && !Array.isArray(runIdOrBody)) {
+                    body = Object.assign({}, runIdOrBody);
+                } else {
+                    body = {
+                        run_id: runIdOrBody || null,
+                        active_only: true
+                    };
+                    if (threadGroup !== null && threadGroup !== undefined) {
+                        body.thread_group = threadGroup;
+                    }
+                }
+                if (body.active_only === undefined) {
+                    body.active_only = true;
+                }
+                var countRows = agentdesk.db.query(
+                    "SELECT value FROM kv_meta WHERE key = ?1",
+                    ["test_auto_queue_activate_count"]
+                );
+                var nextCount = countRows.length > 0
+                    ? (parseInt(countRows[0].value, 10) || 0) + 1
+                    : 1;
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_auto_queue_activate_count", "" + nextCount]
+                );
+                agentdesk.db.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    ["test_auto_queue_activate_last", JSON.stringify(body)]
+                );
+                return rawActivate(body);
+            };
+            agentdesk.registerPolicy({
+                name: "auto-queue-activate-spy",
                 priority: 9999
             });
             "#,
@@ -605,11 +882,26 @@ mod tests {
         log_path: PathBuf,
     }
 
+    struct RepoAndMockGhEnv {
+        _gh: MockGhEnv,
+        previous_repo_dir: Option<OsString>,
+    }
+
     struct MockGhReply {
         key: &'static str,
         contains: Option<&'static str>,
         stdout: &'static str,
     }
+
+    impl Drop for RepoAndMockGhEnv {
+        fn drop(&mut self) {
+            match self.previous_repo_dir.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") },
+            }
+        }
+    }
+
     impl Drop for MockGhEnv {
         fn drop(&mut self) {
             if let Some(old_path) = &self.old_path {
@@ -693,8 +985,10 @@ mod tests {
         (wrapper, script)
     }
 
-    fn install_mock_gh(replies: &[MockGhReply]) -> MockGhEnv {
-        let lock = crate::services::discord::runtime_store::lock_test_env();
+    fn install_mock_gh_with_lock(
+        lock: std::sync::MutexGuard<'static, ()>,
+        replies: &[MockGhReply],
+    ) -> MockGhEnv {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("gh.log");
         #[cfg(unix)]
@@ -762,6 +1056,11 @@ mod tests {
         }
     }
 
+    fn install_mock_gh(replies: &[MockGhReply]) -> MockGhEnv {
+        let lock = crate::services::discord::runtime_store::lock_test_env();
+        install_mock_gh_with_lock(lock, replies)
+    }
+
     fn gh_log(env: &MockGhEnv) -> String {
         fs::read_to_string(&env.log_path).unwrap_or_default()
     }
@@ -798,6 +1097,14 @@ mod tests {
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 dispatched_at   DATETIME,
                 completed_at    DATETIME
+            );
+            CREATE TABLE IF NOT EXISTS auto_queue_entry_dispatch_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id        TEXT NOT NULL,
+                dispatch_id     TEXT NOT NULL,
+                trigger_source  TEXT,
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entry_id, dispatch_id)
             );",
         )
         .unwrap();
@@ -846,6 +1153,7 @@ mod tests {
             axum::Json(
                 crate::server::routes::dispatched_sessions::HookSessionBody {
                     session_key: "test-session".to_string(),
+                    agent_id: None,
                     status: Some("idle".to_string()),
                     provider: Some("claude".to_string()),
                     session_info: None,
@@ -1192,6 +1500,154 @@ mod tests {
         );
     }
 
+    #[test]
+    fn escalation_flush_bundles_suppressed_reasons_and_renotifies_after_cooldown() {
+        let db = test_db();
+        let policy_dir = setup_escalation_policy_dir();
+        let engine = test_engine_with_dir(&db, policy_dir.path());
+        seed_agent(&db);
+        seed_card(&db, "card-escalation", "pending_decision");
+        set_config_key(&db, "server_port", json!(8791));
+
+        engine
+            .eval_js::<String>(
+                r#"(() => { escalate("card-escalation", "reason-a"); flushEscalations(); return "ok"; })()"#,
+            )
+            .unwrap();
+        assert_eq!(kv_value(&db, "test_http_count").as_deref(), Some("1"));
+        assert_eq!(
+            escalation_pending_reasons(&db, "card-escalation"),
+            Vec::<String>::new()
+        );
+
+        engine
+            .eval_js::<String>(
+                r#"(() => { escalate("card-escalation", "reason-a"); flushEscalations(); return "ok"; })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            kv_value(&db, "test_http_count").as_deref(),
+            Some("1"),
+            "same-card alert must be suppressed during cooldown"
+        );
+        assert_eq!(
+            escalation_pending_reasons(&db, "card-escalation"),
+            vec!["reason-a".to_string()]
+        );
+
+        engine
+            .eval_js::<String>(
+                r#"(() => { escalate("card-escalation", "reason-b"); flushEscalations(); return "ok"; })()"#,
+            )
+            .unwrap();
+        assert_eq!(kv_value(&db, "test_http_count").as_deref(), Some("1"));
+        assert_eq!(
+            escalation_pending_reasons(&db, "card-escalation"),
+            vec!["reason-a".to_string(), "reason-b".to_string()]
+        );
+
+        let stale_sent_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            - 601;
+        set_kv(
+            &db,
+            "pm_decision_sent:card-escalation",
+            &json!({
+                "sent_at": stale_sent_at,
+                "status": "pending_decision"
+            })
+            .to_string(),
+        );
+
+        engine
+            .eval_js::<String>(r#"(() => { flushEscalations(); return "ok"; })()"#)
+            .unwrap();
+        assert_eq!(kv_value(&db, "test_http_count").as_deref(), Some("2"));
+        assert!(
+            kv_value(&db, "pm_pending:card-escalation").is_none(),
+            "successful resend must clear the pending bundle"
+        );
+
+        let last_request = escalation_last_request(&db);
+        let reasons = last_request["body"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, vec!["reason-a", "reason-b"]);
+    }
+
+    #[test]
+    fn entering_force_only_state_preserves_pending_escalation_bundle() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-force-enter", "requested");
+        set_kv(
+            &db,
+            "pm_pending:card-force-enter",
+            r#"{"title":"Test Card","reasons":["new pending decision"]}"#,
+        );
+        set_kv(
+            &db,
+            "pm_decision_sent:card-force-enter",
+            r#"{"sent_at":123,"status":"requested"}"#,
+        );
+
+        kanban::transition_status_with_opts(
+            &db,
+            &engine,
+            "card-force-enter",
+            "pending_decision",
+            "test",
+            true,
+        )
+        .unwrap();
+
+        assert!(kv_value(&db, "pm_pending:card-force-enter").is_some());
+        assert!(kv_value(&db, "pm_decision_sent:card-force-enter").is_some());
+    }
+
+    #[test]
+    fn leaving_force_only_state_clears_escalation_cooldown_keys() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-force-leave", "pending_decision");
+        set_kv(
+            &db,
+            "pm_pending:card-force-leave",
+            r#"{"title":"Test Card","reasons":["awaiting PM"]}"#,
+        );
+        set_kv(
+            &db,
+            "pm_decision_sent:card-force-leave",
+            r#"{"sent_at":123,"status":"pending_decision"}"#,
+        );
+
+        kanban::transition_status_with_opts(
+            &db,
+            &engine,
+            "card-force-leave",
+            "requested",
+            "test",
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            kv_value(&db, "pm_pending:card-force-leave").is_none(),
+            "resolving a force-only state must clear pending escalation bundle"
+        );
+        assert!(
+            kv_value(&db, "pm_decision_sent:card-force-leave").is_none(),
+            "resolving a force-only state must clear resend cooldown"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_queue_on_tick_dispatches_ready_card_via_requested_preflight() {
         let db = test_db();
@@ -1279,6 +1735,319 @@ mod tests {
         assert_eq!(
             card_status, "in_progress",
             "ready card must advance through requested preflight to in_progress"
+        );
+    }
+
+    #[test]
+    fn auto_queue_activate_concurrent_calls_dispatch_once() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at) \
+                 VALUES ('card-aq-concurrent', 'AQ Concurrent', 'ready', 'agent-1', 'repo-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-aq-concurrent', 'repo-1', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, created_at) \
+                 VALUES ('entry-aq-concurrent', 'run-aq-concurrent', 'card-aq-concurrent', 'agent-1', 'pending', 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let deps = crate::server::routes::auto_queue::AutoQueueActivateDeps::for_bridge(
+            db.clone(),
+            engine.clone(),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let make_worker = || {
+            let deps = deps.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                crate::server::routes::auto_queue::activate_with_deps(
+                    &deps,
+                    crate::server::routes::auto_queue::ActivateBody {
+                        run_id: Some("run-aq-concurrent".to_string()),
+                        repo: None,
+                        agent_id: None,
+                        thread_group: None,
+                        unified_thread: None,
+                        active_only: Some(true),
+                    },
+                )
+            })
+        };
+
+        let first_handle = make_worker();
+        let second_handle = make_worker();
+        let first = first_handle.join().unwrap();
+        let second = second_handle.join().unwrap();
+        assert_eq!(first.0, axum::http::StatusCode::OK);
+        assert_eq!(second.0, axum::http::StatusCode::OK);
+
+        let total_dispatched =
+            first.1.0["count"].as_u64().unwrap_or(0) + second.1.0["count"].as_u64().unwrap_or(0);
+        assert_eq!(
+            total_dispatched, 1,
+            "concurrent activate must reserve and dispatch the entry exactly once"
+        );
+
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-aq-concurrent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-aq-concurrent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (card_status, latest_dispatch_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, latest_dispatch_id FROM kanban_cards WHERE id = 'card-aq-concurrent'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let dispatch_status: Option<String> =
+            latest_dispatch_id.as_deref().and_then(|dispatch_id| {
+                conn.query_row(
+                    "SELECT status FROM task_dispatches WHERE id = ?1",
+                    [dispatch_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+        let entry_dispatch_id: Option<String> = conn
+            .query_row(
+                "SELECT dispatch_id FROM auto_queue_entries WHERE id = 'entry-aq-concurrent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_count, 1, "only one dispatch row must be created");
+        assert_eq!(
+            card_status, "in_progress",
+            "concurrent activate must leave the card on the active implementation path"
+        );
+        assert_eq!(
+            dispatch_status.as_deref(),
+            Some("pending"),
+            "the surviving dispatch must remain pending after concurrent activation"
+        );
+        assert_eq!(
+            entry_status, "dispatched",
+            "the shared entry must remain dispatched after the winning activate call"
+        );
+        assert_eq!(
+            entry_dispatch_id, latest_dispatch_id,
+            "recovered concurrent activate must keep the entry attached to the surviving dispatch"
+        );
+    }
+
+    #[test]
+    fn auto_queue_activate_reverts_reservation_when_latest_dispatch_is_only_historical() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-aq-stale-latest", "in_progress");
+        seed_dispatch(
+            &db,
+            "dispatch-aq-stale-latest",
+            "card-aq-stale-latest",
+            "implementation",
+            "completed",
+        );
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-aq-stale-latest', 'repo-1', 'agent-missing', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, created_at) \
+                 VALUES ('entry-aq-stale-latest', 'run-aq-stale-latest', 'card-aq-stale-latest', 'agent-missing', 'pending', 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let deps = crate::server::routes::auto_queue::AutoQueueActivateDeps::for_bridge(
+            db.clone(),
+            engine.clone(),
+        );
+        let result = crate::server::routes::auto_queue::activate_with_deps(
+            &deps,
+            crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-aq-stale-latest".to_string()),
+                repo: None,
+                agent_id: None,
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            },
+        );
+        assert_eq!(result.0, axum::http::StatusCode::OK);
+        assert_eq!(
+            result.1.0["count"].as_u64().unwrap_or(0),
+            0,
+            "failed activate should not report a dispatch when reservation is reverted"
+        );
+
+        let conn = db.lock().unwrap();
+        let (entry_status, entry_dispatch_id, slot_index): (String, Option<String>, Option<i64>) =
+            conn.query_row(
+                "SELECT status, dispatch_id, slot_index
+                 FROM auto_queue_entries
+                 WHERE id = 'entry-aq-stale-latest'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let latest_dispatch_id: Option<String> = conn
+            .query_row(
+                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = 'card-aq-stale-latest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let latest_dispatch_status: Option<String> =
+            latest_dispatch_id.as_deref().and_then(|dispatch_id| {
+                conn.query_row(
+                    "SELECT status FROM task_dispatches WHERE id = ?1",
+                    [dispatch_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+        let transition_source: String = conn
+            .query_row(
+                "SELECT trigger_source
+                 FROM auto_queue_entry_transitions
+                 WHERE entry_id = 'entry-aq-stale-latest'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-aq-stale-latest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            entry_status, "pending",
+            "historical latest_dispatch_id must not keep the reservation after create_dispatch fails"
+        );
+        assert!(
+            entry_dispatch_id.is_none(),
+            "reverted reservation must clear any transient dispatch attachment"
+        );
+        assert!(
+            slot_index.is_none(),
+            "reverted reservation must release the slot assignment"
+        );
+        assert_eq!(
+            latest_dispatch_id.as_deref(),
+            Some("dispatch-aq-stale-latest"),
+            "activate recovery must not rewrite the historical latest dispatch pointer"
+        );
+        assert_eq!(
+            latest_dispatch_status.as_deref(),
+            Some("completed"),
+            "regression coverage requires the retained latest dispatch to be non-active"
+        );
+        assert_eq!(
+            transition_source, "activate_dispatch_reserve_revert",
+            "failed create_dispatch must explicitly revert the reserved entry"
+        );
+        assert_eq!(
+            dispatch_count, 1,
+            "create_dispatch failure must not insert a replacement dispatch row"
+        );
+    }
+
+    #[test]
+    fn auto_queue_on_tick_recovers_orphan_dispatched_entry_to_pending() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-aq-orphan", "in_progress");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-aq-orphan', 'repo-1', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-aq-orphan', 'run-aq-orphan', 'card-aq-orphan', 'agent-1', 'dispatched', 0, datetime('now', '-5 minutes'), datetime('now', '-5 minutes'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", json!({}))
+            .unwrap();
+
+        let conn = db.lock().unwrap();
+        let (status, dispatch_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_id FROM auto_queue_entries WHERE id = 'entry-aq-orphan'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let transition_source: String = conn
+            .query_row(
+                "SELECT trigger_source FROM auto_queue_entry_transitions \
+                 WHERE entry_id = 'entry-aq-orphan' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert!(
+            dispatch_id.is_none(),
+            "orphan recovery must not invent a replacement dispatch id"
+        );
+        assert_eq!(
+            transition_source, "tick_recovery",
+            "orphan recovery should record the periodic recovery source"
         );
     }
 
@@ -2203,7 +2972,7 @@ mod tests {
             sql: "INSERT INTO card_review_state (card_id, state, updated_at) VALUES ('card-158b', 'idle', datetime('now'))".to_string(),
             params: vec![],
         };
-        let result = crate::engine::intent::execute_intents(&db, vec![insert_intent]);
+        let result = crate::engine::intent::execute_intents(&db, None, vec![insert_intent]);
         assert_eq!(
             result.errors, 1,
             "INSERT into card_review_state via ExecuteSQL must be rejected"
@@ -2214,7 +2983,8 @@ mod tests {
             sql: "INSERT OR REPLACE INTO card_review_state (card_id, state, updated_at) VALUES ('card-158b', 'idle', datetime('now'))".to_string(),
             params: vec![],
         };
-        let result_replace = crate::engine::intent::execute_intents(&db, vec![replace_intent]);
+        let result_replace =
+            crate::engine::intent::execute_intents(&db, None, vec![replace_intent]);
         assert_eq!(
             result_replace.errors, 1,
             "INSERT OR REPLACE into card_review_state via ExecuteSQL must be rejected"
@@ -2226,7 +2996,7 @@ mod tests {
             params: vec![],
         };
         let result_replace_into =
-            crate::engine::intent::execute_intents(&db, vec![replace_into_intent]);
+            crate::engine::intent::execute_intents(&db, None, vec![replace_into_intent]);
         assert_eq!(
             result_replace_into.errors, 1,
             "REPLACE INTO card_review_state via ExecuteSQL must be rejected"
@@ -2238,7 +3008,7 @@ mod tests {
                 .to_string(),
             params: vec![],
         };
-        let result2 = crate::engine::intent::execute_intents(&db, vec![update_intent]);
+        let result2 = crate::engine::intent::execute_intents(&db, None, vec![update_intent]);
         assert_eq!(
             result2.errors, 1,
             "UPDATE card_review_state via ExecuteSQL must be rejected"
@@ -2249,7 +3019,7 @@ mod tests {
             sql: "DELETE FROM card_review_state WHERE card_id = 'card-158b'".to_string(),
             params: vec![],
         };
-        let result3 = crate::engine::intent::execute_intents(&db, vec![delete_intent]);
+        let result3 = crate::engine::intent::execute_intents(&db, None, vec![delete_intent]);
         assert_eq!(
             result3.errors, 1,
             "DELETE from card_review_state via ExecuteSQL must be rejected"
@@ -2778,6 +3548,220 @@ mod tests {
         assert_eq!(phase_gate_json["status"], "pending");
         assert_eq!(phase_gate_json["batch_phase"], 1);
         assert_eq!(phase_gate_json["next_phase"], 2);
+    }
+
+    #[tokio::test]
+    async fn auto_queue_phase_gate_blocks_resume_then_completes_final_run_on_pass() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-phase-final", "done");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-phase-final', 'test/repo', 'agent-1', 'paused', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let phase_gate_dispatch = dispatch::create_dispatch(
+            &db,
+            &engine,
+            "card-phase-final",
+            "agent-1",
+            "phase-gate",
+            "[phase-gate P2] Final",
+            &json!({
+                "auto_queue": true,
+                "sidecar_dispatch": true,
+                "phase_gate": {
+                    "run_id": "run-phase-final",
+                    "batch_phase": 2,
+                    "next_phase": serde_json::Value::Null,
+                    "final_phase": true,
+                    "pass_verdict": "phase_gate_passed",
+                    "expected_gate_count": 1
+                }
+            }),
+        )
+        .expect("phase gate dispatch should be created");
+        let phase_gate_dispatch_id = phase_gate_dispatch["id"].as_str().unwrap().to_string();
+        set_kv(
+            &db,
+            "aq_phase_gate:run-phase-final:2",
+            &json!({
+                "run_id": "run-phase-final",
+                "batch_phase": 2,
+                "next_phase": serde_json::Value::Null,
+                "final_phase": true,
+                "anchor_card_id": "card-phase-final",
+                "status": "pending",
+                "dispatch_ids": [phase_gate_dispatch_id.clone()],
+                "created_at": "2026-04-13T00:00:00Z"
+            })
+            .to_string(),
+        );
+
+        let state = AppState::test_state(db.clone(), engine.clone());
+        let (resume_status, resume_body) =
+            crate::server::routes::auto_queue::resume_run(axum::extract::State(state)).await;
+        assert_eq!(resume_status, axum::http::StatusCode::OK);
+        assert_eq!(resume_body.0["resumed_runs"].as_u64(), Some(0));
+        assert_eq!(resume_body.0["blocked_runs"].as_u64(), Some(1));
+        assert_eq!(
+            kv_value(&db, "aq_phase_gate:run-phase-final:2").is_some(),
+            true,
+            "resume must leave the blocking phase gate untouched"
+        );
+
+        let completed = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            &phase_gate_dispatch_id,
+            &json!({
+                "verdict": "phase_gate_passed",
+                "summary": "phase gate approved"
+            }),
+        )
+        .expect("phase gate completion should succeed");
+        assert_eq!(completed["status"], "completed");
+
+        let run_status: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-phase-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            run_status, "completed",
+            "final phase-gate pass should resume and complete the paused run"
+        );
+        assert!(
+            kv_value(&db, "aq_phase_gate:run-phase-final:2").is_none(),
+            "successful gate completion must clear the persisted phase gate state"
+        );
+    }
+
+    #[test]
+    fn auto_queue_cancel_releases_slots_and_clears_linked_sessions() {
+        let db = test_db();
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-cancel-live", "in_progress");
+        seed_card(&db, "card-cancel-pending", "ready");
+        seed_dispatch(
+            &db,
+            "dispatch-cancel-live",
+            "card-cancel-live",
+            "implementation",
+            "dispatched",
+        );
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-cancel-cleanup', 'repo-1', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-cancel-live', 'run-cancel-cleanup', 'card-cancel-live', 'agent-1', 'dispatched', 'dispatch-cancel-live', 0, 0, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, slot_index, priority_rank, created_at) \
+                 VALUES ('entry-cancel-pending', 'run-cancel-cleanup', 'card-cancel-pending', 'agent-1', 'pending', 0, 1, datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_slots (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map) \
+                 VALUES ('agent-1', 0, 'run-cancel-cleanup', 0, '{\"main\":\"9001\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, thread_channel_id, active_dispatch_id, last_heartbeat) \
+                 VALUES ('test-slot-session', 'agent-1', 'codex', 'working', '9001', 'dispatch-cancel-live', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = db.separate_conn().expect("separate conn");
+        let body = crate::server::routes::auto_queue::cancel_with_conn(None, &conn);
+        assert_eq!(body["cancelled_runs"].as_u64(), Some(1));
+        assert_eq!(body["cancelled_dispatches"].as_u64(), Some(1));
+        assert_eq!(body["cancelled_entries"].as_u64(), Some(2));
+        assert_eq!(body["released_slots"].as_u64(), Some(1));
+        assert_eq!(body["cleared_slot_sessions"].as_u64(), Some(1));
+        drop(conn);
+
+        let conn = db.lock().unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-cancel-cleanup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry_statuses: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT id, status FROM auto_queue_entries WHERE run_id = 'run-cancel-cleanup' ORDER BY id ASC",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let (assigned_run_id, assigned_thread_group): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT assigned_run_id, assigned_thread_group FROM auto_queue_slots \
+                 WHERE agent_id = 'agent-1' AND slot_index = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (session_status, active_dispatch_id, session_info): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, active_dispatch_id, session_info FROM sessions WHERE session_key = 'test-slot-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'dispatch-cancel-live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(run_status, "cancelled");
+        assert_eq!(
+            entry_statuses,
+            vec![
+                ("entry-cancel-live".to_string(), "skipped".to_string()),
+                ("entry-cancel-pending".to_string(), "skipped".to_string()),
+            ],
+            "cancel should skip both in-flight and pending entries after cleanup"
+        );
+        assert_eq!(dispatch_status, "cancelled");
+        assert!(assigned_run_id.is_none());
+        assert!(assigned_thread_group.is_none());
+        assert_eq!(session_status, "idle");
+        assert!(active_dispatch_id.is_none());
+        assert_eq!(session_info.as_deref(), Some("Slot thread reset"));
     }
 
     #[test]
@@ -3309,6 +4293,211 @@ mod tests {
     }
 
     #[test]
+    fn scenario_547_implementation_noop_completion_triggers_auto_queue_activate_for_follow_up_entry()
+     {
+        let policies_dir = setup_auto_queue_activate_spy_policy_dir();
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, policies_dir.path());
+        seed_agent(&db);
+        set_kv(&db, "server_port", "8791");
+        seed_card(&db, "card-547-noop", "in_progress");
+        seed_card(&db, "card-547-next", "ready");
+        seed_dispatch(
+            &db,
+            "impl-547-noop",
+            "card-547-noop",
+            "implementation",
+            "pending",
+        );
+
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status) VALUES ('run-547', 'repo', 'agent-1', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at, thread_group, batch_phase) \
+             VALUES ('entry-547-noop', 'run-547', 'card-547-noop', 'agent-1', 'dispatched', 'impl-547-noop', datetime('now'), 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase) \
+             VALUES ('entry-547-next', 'run-547', 'card-547-next', 'agent-1', 'pending', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-547-noop",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "work_outcome": "noop",
+                "completed_without_changes": true,
+                "card_status_target": "ready",
+                "notes": "already implemented"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(get_card_status(&db, "card-547-noop"), "ready");
+
+        let conn = db.lock().unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-547-noop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            entry_status, "done",
+            "#547: noop completion must close the active auto-queue entry before continuing"
+        );
+
+        assert_eq!(
+            kv_value(&db, "test_auto_queue_activate_count").as_deref(),
+            Some("1"),
+            "#547: noop completion must trigger exactly one auto-queue activate call"
+        );
+
+        let activate_payload = kv_value(&db, "test_auto_queue_activate_last")
+            .expect("activate payload should be recorded");
+        let activate_json: serde_json::Value = serde_json::from_str(&activate_payload).unwrap();
+        assert_eq!(activate_json["run_id"], "run-547");
+        assert_eq!(activate_json["thread_group"], 0);
+        assert_eq!(activate_json["active_only"], true);
+
+        let next_entry_status: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-547-next'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            next_entry_status, "dispatched",
+            "#547: deferred activate must still dispatch the next queued entry"
+        );
+    }
+
+    #[test]
+    fn scenario_547_implementation_noop_completion_creates_phase_gate_for_multi_phase_run() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-547-phase-1", "in_progress");
+        seed_card(&db, "card-547-phase-2", "ready");
+        seed_dispatch(
+            &db,
+            "impl-547-phase-1",
+            "card-547-phase-1",
+            "implementation",
+            "pending",
+        );
+
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+             VALUES ('run-547-phase', 'test/repo', 'agent-1', 'active', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at, batch_phase, created_at) \
+             VALUES ('entry-547-phase-1', 'run-547-phase', 'card-547-phase-1', 'agent-1', 'dispatched', 'impl-547-phase-1', datetime('now'), 1, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, batch_phase, created_at) \
+             VALUES ('entry-547-phase-2', 'run-547-phase', 'card-547-phase-2', 'agent-1', 'pending', 2, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-547-phase-1",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "work_outcome": "noop",
+                "completed_without_changes": true,
+                "card_status_target": "ready",
+                "notes": "already implemented"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(get_card_status(&db, "card-547-phase-1"), "ready");
+
+        let conn = db.lock().unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-547-phase-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-547-phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let phase_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-547-phase-1' \
+                   AND dispatch_type = 'phase-gate' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let phase_gate_state: String = conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = 'aq_phase_gate:run-547-phase:1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let phase_gate_json: serde_json::Value = serde_json::from_str(&phase_gate_state).unwrap();
+        assert_eq!(entry_status, "done");
+        assert_eq!(
+            run_status, "paused",
+            "#547: noop completion must still pause multi-phase runs for a gate"
+        );
+        assert_eq!(
+            phase_gate_count, 1,
+            "#547: noop completion must create a phase-gate dispatch when the phase finishes"
+        );
+        assert_eq!(phase_gate_json["status"], "pending");
+        assert_eq!(phase_gate_json["batch_phase"], 1);
+        assert_eq!(phase_gate_json["next_phase"], 2);
+    }
+
+    #[test]
     fn scenario_211_review_pass_seeds_pr_tracking_and_create_pr_dispatch() {
         let (repo, _repo_guard) = setup_test_repo();
         run_git(repo.path(), &["checkout", "-b", "wt/card-211-review"]);
@@ -3352,6 +4541,60 @@ mod tests {
         assert_eq!(
             pr_tracking_branch(&db, "card-211-review").as_deref(),
             Some("wt/card-211-review")
+        );
+    }
+
+    #[test]
+    fn scenario_558_review_pass_falls_back_to_review_context_target() {
+        let (repo, _repo_guard) = setup_test_repo();
+        run_git(
+            repo.path(),
+            &["checkout", "-b", "wt/card-558-review-fallback"],
+        );
+        let head = run_git_output(repo.path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-558-review-fallback",
+            "review",
+            "test/repo",
+            558,
+            Some("123456789012345679"),
+        );
+        seed_completed_review_dispatch_with_context(
+            &db,
+            "review-558-pass",
+            "card-558-review-fallback",
+            "pass",
+            repo.path().to_str().unwrap(),
+            "wt/card-558-review-fallback",
+            &head,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnReviewVerdict",
+                serde_json::json!({"card_id": "card-558-review-fallback", "verdict": "pass"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-558-review-fallback", "create-pr"),
+            1,
+            "#558: review pass should still seed create-pr from review context"
+        );
+        assert_eq!(
+            pr_tracking_state(&db, "card-558-review-fallback").as_deref(),
+            Some("create-pr")
+        );
+        assert_eq!(
+            pr_tracking_branch(&db, "card-558-review-fallback").as_deref(),
+            Some("wt/card-558-review-fallback")
         );
     }
 
@@ -3477,6 +4720,534 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocked_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_terminal_direct_merge_merges_branch_without_pr() {
+        let (repo, _remote, _repo_guard) = setup_test_repo_with_origin();
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-direct"]);
+
+        let worktree_path = worktrees_dir.join("card-211-direct");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-direct",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: direct merge path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-direct", "done", "test/repo", 211, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-direct",
+            "card-211-direct",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-direct",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-direct"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        let merged = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &feature_commit,
+                "origin/main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            merged.success(),
+            "feature commit must be reachable from origin/main after direct merge"
+        );
+        assert_eq!(get_card_status(&db, "card-211-direct"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-direct").as_deref(),
+            Some("closed")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-direct"), None);
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-direct'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_pr_always_creates_pr_without_direct_merge_and_waits_for_codex_approval() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-pr-always"),
+                stdout: "https://github.com/test/repo/pull/902",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-pr-always",
+            },
+            MockGhReply {
+                key: "run:list",
+                contains: Some("--branch wt/card-211-pr-always"),
+                stdout: "[{\"databaseId\":722,\"status\":\"completed\",\"conclusion\":\"success\",\"headSha\":\"feature-sha-211-pr-always\",\"event\":\"pull_request\"}]",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json author"),
+                stdout: "itismyfield",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/902/reviews",
+                contains: None,
+                stdout: "[]",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-pr-always"]);
+
+        let worktree_path = worktrees_dir.join("card-211-pr-always");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-pr-always",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: pr-always path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-pr-always", "done", "test/repo", 215, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(&db, "merge_strategy_mode", "pr-always");
+        set_kv(&db, "merge_allowed_authors", "itismyfield");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-pr-always",
+            "card-211-pr-always",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-pr-always",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-pr-always"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        let merged = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &feature_commit,
+                "origin/main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            !merged.success(),
+            "pr-always must skip direct merge and leave the feature commit out of origin/main"
+        );
+
+        assert_eq!(get_card_status(&db, "card-211-pr-always"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-pr-always"), Some(902));
+        assert_eq!(
+            kv_value(&db, "merge_strategy_mode:card:card-211-pr-always").as_deref(),
+            Some("pr-always")
+        );
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-pr-always'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        set_kv(&db, "merge_strategy_mode", "direct-first");
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("merge")
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("merge")
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr create --repo test/repo --base main --head wt/card-211-pr-always"),
+            "pr-always must create a PR for the tracked branch"
+        );
+        assert!(
+            !log.contains("pr merge 902"),
+            "pr-always must wait for Codex approval even if the global mode changes later"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_pr_always_merges_after_codex_approval_even_if_setting_toggles() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-pr-approved"),
+                stdout: "https://github.com/test/repo/pull/903",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-pr-approved",
+            },
+            MockGhReply {
+                key: "run:list",
+                contains: Some("--branch wt/card-211-pr-approved"),
+                stdout: "[{\"databaseId\":723,\"status\":\"completed\",\"conclusion\":\"success\",\"headSha\":\"feature-sha-211-pr-approved\",\"event\":\"pull_request\"}]",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json author"),
+                stdout: "itismyfield",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/903/reviews",
+                contains: None,
+                stdout: "[{\"id\":9004,\"state\":\"APPROVED\",\"body\":\"LGTM\",\"submitted_at\":\"2026-04-13T02:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
+            },
+            MockGhReply {
+                key: "pr:merge",
+                contains: Some("903"),
+                stdout: "merged",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-pr-approved"]);
+
+        let worktree_path = worktrees_dir.join("card-211-pr-approved");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-pr-approved",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "approved\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: pr-always approval path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-pr-approved", "done", "test/repo", 216, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(&db, "merge_strategy_mode", "pr-always");
+        set_kv(&db, "merge_allowed_authors", "itismyfield");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-pr-approved",
+            "card-211-pr-approved",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-pr-approved",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-pr-approved"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        set_kv(&db, "merge_strategy_mode", "direct-first");
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-approved").as_deref(),
+            Some("post-merge-cleanup")
+        );
+        assert_eq!(
+            kv_value(&db, "merge_pending:card-211-pr-approved").as_deref(),
+            Some("903")
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr merge 903 --auto --squash --repo test/repo"),
+            "approved pr-always cards must enable auto-merge even after the global mode toggles"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_terminal_direct_merge_conflict_creates_pr_and_wait_ci() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-conflict"),
+                stdout: "https://github.com/test/repo/pull/901",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211",
+            },
+        ]);
+        fs::write(repo.path().join("conflict.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "conflict.txt"]);
+        run_git(repo.path(), &["commit", "-m", "base conflict file"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-conflict"]);
+
+        let worktree_path = worktrees_dir.join("card-211-conflict");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-conflict",
+            ],
+        );
+        fs::write(worktree_path.join("conflict.txt"), "feature version\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "conflict.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feature conflict change #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        fs::write(repo.path().join("conflict.txt"), "main version\n").unwrap();
+        run_git(repo.path(), &["add", "conflict.txt"]);
+        run_git(repo.path(), &["commit", "-m", "main conflict change"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-conflict", "done", "test/repo", 212, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-conflict",
+            "card-211-conflict",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-conflict",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-conflict"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(get_card_status(&db, "card-211-conflict"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-conflict").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-conflict"), Some(901));
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr create --repo test/repo --base main --head wt/card-211-conflict"),
+            "conflict fallback must create a PR for the tracked branch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_558_missing_merge_source_does_not_create_conflict_pr() {
+        let (repo, _remote, repo_env) = setup_test_repo_with_origin_and_mock_gh(&[]);
+        let gh = &repo_env._gh;
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-558-missing"]);
+
+        let worktree_path = worktrees_dir.join("card-558-missing");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-558-missing",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: missing merge source #558"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "remove",
+                worktree_path.to_str().unwrap(),
+                "--force",
+            ],
+        );
+        run_git(repo.path(), &["branch", "-D", "wt/card-558-missing"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-558-missing", "done", "test/repo", 559, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-558-missing",
+            "card-558-missing",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-558-missing",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-558-missing"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-558-missing").as_deref(),
+            Some("source-missing")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-558-missing"), None);
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-558-missing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("merge:source_missing"));
+        drop(conn);
+
+        let log = gh_log(gh);
+        assert!(
+            !log.contains("pr create "),
+            "#558: missing merge source must not fall back to PR creation"
+        );
     }
 
     #[cfg(unix)]
@@ -3618,7 +5389,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_creates_codex_rework_and_dedups_review() {
-        let _gh = install_mock_gh(&[
+        let (repo, _env) = setup_test_repo_with_mock_gh(&[
             MockGhReply {
                 key: "pr:list",
                 contains: Some("--state merged"),
@@ -3640,6 +5411,10 @@ mod tests {
                 stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-1\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-1\",\"body\":\"P1 force-transition leaves dispatch alive\",\"path\":\"src/server/routes/github.rs\",\"line\":77,\"url\":\"https://example.com/comment-1\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9001\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
             },
         ]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:test/repo.git"],
+        );
 
         let db = test_db();
         let engine = test_engine(&db);
@@ -4009,17 +5784,21 @@ mod tests {
         assert_eq!(metadata["preflight_status"], "clear");
         assert_eq!(metadata["deps"], "#42");
 
-        let (dispatch_type, dispatch_status): (String, String) = {
+        let (dispatch_type, dispatch_status, parent_dispatch_id): (String, String, Option<String>) = {
             let conn = db.lock().unwrap();
             conn.query_row(
-                "SELECT dispatch_type, status FROM task_dispatches WHERE id = ?1",
+                "SELECT dispatch_type, status, parent_dispatch_id FROM task_dispatches WHERE id = ?1",
                 rusqlite::params![latest_dispatch_id.clone()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap()
         };
         assert_eq!(dispatch_type, "implementation");
         assert_eq!(dispatch_status, "pending");
+        assert_eq!(
+            parent_dispatch_id.as_deref(),
+            Some(consultation_id.as_str())
+        );
 
         let (entry_status, entry_dispatch_id): (String, String) = {
             let conn = db.lock().unwrap();
@@ -4032,6 +5811,23 @@ mod tests {
         };
         assert_eq!(entry_status, "dispatched");
         assert_eq!(entry_dispatch_id, latest_dispatch_id);
+
+        let history: Vec<String> = {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT dispatch_id
+                     FROM auto_queue_entry_dispatch_history
+                     WHERE entry_id = 'entry-consult-clear'
+                     ORDER BY id ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|row| row.ok())
+                .collect()
+        };
+        assert_eq!(history, vec![consultation_id, latest_dispatch_id]);
     }
 
     #[cfg(unix)]

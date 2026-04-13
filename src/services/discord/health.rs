@@ -491,6 +491,7 @@ pub async fn hard_stop_runtime_turn(
                 removed_token: None,
                 has_pending: false,
                 mailbox_online: false,
+                queue_exit_events: Vec::new(),
             }
         };
         let runtime_session_cleared = apply_runtime_hard_stop_cleanup(
@@ -831,6 +832,7 @@ impl TestHealthHarness {
             api_port: 8791,
             db: None,
             engine: None,
+            health_registry: Arc::downgrade(&registry),
             known_slash_commands: tokio::sync::OnceCell::new(),
         });
         super::mark_reconcile_complete(&shared);
@@ -889,9 +891,13 @@ impl TestHealthHarness {
             .map(|idx| super::Intervention {
                 author_id: serenity::UserId::new(idx as u64 + 1),
                 message_id: serenity::MessageId::new(idx as u64 + 1),
+                source_message_ids: vec![serenity::MessageId::new(idx as u64 + 1)],
                 text: format!("queued-{idx}"),
                 mode: super::InterventionMode::Soft,
                 created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
             })
             .collect::<Vec<_>>();
         super::mailbox_replace_queue(&self.shared, &provider, ChannelId::new(channel_id), queue)
@@ -985,9 +991,13 @@ impl TestHealthHarness {
             .map(|(message_id, text)| super::Intervention {
                 author_id: serenity::UserId::new(1),
                 message_id: serenity::MessageId::new(*message_id),
+                source_message_ids: vec![serenity::MessageId::new(*message_id)],
                 text: (*text).to_string(),
                 mode: super::InterventionMode::Soft,
                 created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
             })
             .collect::<Vec<_>>();
         super::mailbox_replace_queue(
@@ -1854,5 +1864,17 @@ mod tests {
                 .await,
             "fallback cleanup should clear the active turn",
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_bot_http_reports_missing_notify_bot_token() {
+        let harness = TestHealthHarness::new().await;
+
+        let err = resolve_bot_http(harness.registry().as_ref(), "notify")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, "503 Service Unavailable");
+        assert!(err.1.contains("notify bot not configured"));
     }
 }

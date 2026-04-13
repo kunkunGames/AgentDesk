@@ -65,17 +65,80 @@ fn should_skip_memento_recall(
     memory_settings.backend == settings::MemoryBackendKind::Memento && memento_context_loaded
 }
 
+fn should_add_turn_pending_reaction(dispatch_id: Option<&str>) -> bool {
+    dispatch_id.is_none()
+}
+
+async fn send_restore_notification(
+    shared: &Arc<SharedData>,
+    fallback_http: &Arc<serenity::Http>,
+    channel_id: ChannelId,
+    provider: &ProviderKind,
+    restored_session_id: Option<&str>,
+) {
+    let sid_full = restored_session_id.unwrap_or("?");
+    let sid_short: String = sid_full.chars().take(8).collect();
+    let restore_msg = format!(
+        "📋 세션 복원: {} (session: {})",
+        provider.as_str(),
+        sid_short
+    );
+
+    if let Some(registry) = shared.health_registry() {
+        match super::super::health::resolve_bot_http(registry.as_ref(), "notify").await {
+            Ok(notify_http) => match channel_id.say(&*notify_http, &restore_msg).await {
+                Ok(_) => return,
+                Err(err) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ Restore notify send failed in channel {}: {} — falling back to provider bot",
+                        channel_id,
+                        err
+                    );
+                }
+            },
+            Err((status, body)) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ Restore notify bot unavailable in channel {}: {} {} — falling back to provider bot",
+                    channel_id,
+                    status,
+                    body
+                );
+            }
+        }
+    } else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ Restore notify bot unavailable in channel {}: health registry dropped — falling back to provider bot",
+            channel_id
+        );
+    }
+
+    if let Err(err) = channel_id.say(fallback_http, &restore_msg).await {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ Restore fallback send failed in channel {}: {}",
+            channel_id,
+            err
+        );
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DispatchContextHints {
     worktree_path: Option<String>,
     force_new_session: bool,
 }
 
-fn parse_dispatch_context_hints(dispatch_context: Option<&str>) -> DispatchContextHints {
-    let Some(raw) = dispatch_context else {
-        return DispatchContextHints::default();
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+fn parse_dispatch_context_hints(
+    dispatch_context: Option<&str>,
+    dispatch_type: Option<&str>,
+) -> DispatchContextHints {
+    let parsed =
+        dispatch_context.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let default_force_new_session =
+        crate::dispatch::dispatch_type_force_new_session_default(dispatch_type).unwrap_or(false);
     DispatchContextHints {
         worktree_path: parsed
             .as_ref()
@@ -87,7 +150,55 @@ fn parse_dispatch_context_hints(dispatch_context: Option<&str>) -> DispatchConte
             .as_ref()
             .and_then(|v| v.get("force_new_session"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+            .unwrap_or(default_force_new_session),
+    }
+}
+
+fn load_session_runtime_state(
+    sessions: &mut std::collections::HashMap<ChannelId, DiscordSession>,
+    channel_id: ChannelId,
+) -> Option<(Option<String>, bool, String)> {
+    sessions.get_mut(&channel_id).and_then(|session| {
+        let current_path = session.validated_path(channel_id)?;
+        Some((
+            session.session_id.clone(),
+            session.memento_context_loaded,
+            current_path,
+        ))
+    })
+}
+
+fn session_runtime_state_after_redirect(
+    sessions: &mut std::collections::HashMap<ChannelId, DiscordSession>,
+    original_channel_id: ChannelId,
+    effective_channel_id: ChannelId,
+    original_state: (Option<String>, bool, String),
+) -> (Option<String>, bool, String) {
+    if effective_channel_id == original_channel_id {
+        return original_state;
+    }
+
+    load_session_runtime_state(sessions, effective_channel_id).unwrap_or(original_state)
+}
+
+fn build_race_requeued_intervention(
+    request_owner: UserId,
+    user_msg_id: MessageId,
+    user_text: &str,
+    reply_context: Option<String>,
+    reply_to_user_message: bool,
+    merge_consecutive: bool,
+) -> Intervention {
+    Intervention {
+        author_id: request_owner,
+        message_id: user_msg_id,
+        source_message_ids: vec![user_msg_id],
+        text: user_text.to_string(),
+        mode: super::super::InterventionMode::Soft,
+        created_at: std::time::Instant::now(),
+        reply_context,
+        has_reply_boundary: reply_to_user_message,
+        merge_consecutive,
     }
 }
 
@@ -103,19 +214,14 @@ pub(in crate::services::discord) async fn handle_text_message(
     reply_to_user_message: bool,
     defer_watcher_resume: bool,
     wait_for_completion: bool,
+    merge_consecutive: bool,
     reply_context: Option<String>,
 ) -> Result<(), Error> {
+    let original_channel_id = channel_id;
     // Get session info, allowed tools, and pending uploads
     let (session_info, provider, allowed_tools, pending_uploads) = {
         let mut data = shared.core.lock().await;
-        let info = data.sessions.get_mut(&channel_id).and_then(|session| {
-            let current_path = session.validated_path(channel_id)?;
-            Some((
-                session.session_id.clone(),
-                session.memento_context_loaded,
-                current_path,
-            ))
-        });
+        let info = load_session_runtime_state(&mut data.sessions, channel_id);
         let uploads = data
             .sessions
             .get_mut(&channel_id)
@@ -290,8 +396,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     };
 
-    // Add hourglass reaction to user's message
-    add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
+    let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
+    if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref()) {
+        add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
+    }
 
     // ── Dispatch thread auto-creation ──────────────────────────────
     // When a dispatch message arrives, create a Discord thread for
@@ -302,8 +410,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     let is_already_thread = super::super::resolve_thread_parent(&ctx.http, channel_id)
         .await
         .is_some();
-    let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
-    let mut dispatch_type_str: Option<String> = None;
     // #259: Fetch dispatch metadata once before thread creation so we can extract
     // worktree_path for both thread bootstrap and the subsequent session CWD override.
     let dispatch_info_cached = if let Some(ref did) = dispatch_id_for_thread {
@@ -313,10 +419,14 @@ pub(in crate::services::discord) async fn handle_text_message(
     };
     // #259: Prefer card-bound worktree over parent channel CWD for dispatch sessions.
     // All dispatch types now inject worktree_path into context via resolve_card_worktree().
+    let mut dispatch_type_str = dispatch_info_cached
+        .as_ref()
+        .and_then(|info| info.dispatch_type.clone());
     let dispatch_context_hints = parse_dispatch_context_hints(
         dispatch_info_cached
             .as_ref()
             .and_then(|info| info.context.as_deref()),
+        dispatch_type_str.as_deref(),
     );
     let dispatch_worktree_path = dispatch_context_hints.worktree_path.clone();
     let dispatch_force_new_session = dispatch_context_hints.force_new_session;
@@ -340,7 +450,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     let channel_id = if let Some(ref did) = dispatch_id_for_thread {
         // Use cached dispatch metadata for thread reuse and cross-channel role override
         let dispatch_info = &dispatch_info_cached;
-        dispatch_type_str = dispatch_info.as_ref().and_then(|i| i.dispatch_type.clone());
         let is_counter_model_dispatch =
             crate::server::routes::dispatches::use_counter_model_channel(
                 dispatch_type_str.as_deref(),
@@ -491,6 +600,34 @@ pub(in crate::services::discord) async fn handle_text_message(
     } else {
         channel_id
     };
+    let active_dispatch_id_for_prompt =
+        super::super::adk_session::lookup_pending_dispatch_for_thread(
+            shared.api_port,
+            channel_id.get(),
+        )
+        .await
+        .or_else(|| dispatch_id_for_thread.clone());
+    let active_dispatch_info = match active_dispatch_id_for_prompt.as_deref() {
+        Some(did) if dispatch_id_for_thread.as_deref() == Some(did) => dispatch_info_cached.clone(),
+        Some(did) => super::lookup_dispatch_info(shared.api_port, did).await,
+        None => None,
+    };
+    if let Some(active_dispatch_type) = active_dispatch_info
+        .as_ref()
+        .and_then(|info| info.dispatch_type.clone())
+    {
+        dispatch_type_str = Some(active_dispatch_type);
+    }
+
+    let (mut session_id, mut memento_context_loaded, current_path) = {
+        let mut data = shared.core.lock().await;
+        session_runtime_state_after_redirect(
+            &mut data.sessions,
+            original_channel_id,
+            channel_id,
+            (session_id, memento_context_loaded, current_path),
+        )
+    };
 
     // #259: Override current_path with the pre-computed dispatch worktree path.
     // Also update the in-memory session so the worktree sticks for subsequent turns.
@@ -503,7 +640,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     } else {
         current_path
     };
-    let (mut session_id, mut memento_context_loaded) = (session_id, memento_context_loaded);
     if dispatch_force_new_session {
         let mut data = shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
@@ -519,20 +655,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
         }
     }
-
-    // Send placeholder message
-    rate_limit_wait(shared, channel_id).await;
-    let placeholder = channel_id
-        .send_message(&ctx.http, {
-            let builder = CreateMessage::new().content("...");
-            if reply_to_user_message && dispatch_id_for_thread.is_none() {
-                builder.reference_message((channel_id, user_msg_id))
-            } else {
-                builder
-            }
-        })
-        .await?;
-    let placeholder_msg_id = placeholder.id;
 
     // Sanitize input
     let sanitized_input = ai_screen::sanitize_user_input(user_text);
@@ -567,7 +689,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Derive dispatch prompt profile before memory recall so ReviewLite can
     // skip heavy memory work consistently across local/mem0 backends.
     let dispatch_profile = DispatchProfile::from_dispatch_type(
-        dispatch_id_for_thread
+        active_dispatch_id_for_prompt
             .as_ref()
             .and_then(|_| dispatch_type_str.as_deref()),
     );
@@ -616,19 +738,33 @@ pub(in crate::services::discord) async fn handle_text_message(
                     session.restore_provider_session(restored.clone());
                 }
                 memento_context_loaded = true;
-                // Notify: session restored — send immediately (before agent response)
-                let sid_full = restored.as_deref().unwrap_or("?");
-                let sid_short: String = sid_full.chars().take(8).collect();
-                let restore_msg = format!(
-                    "📋 세션 복원: {} (session: {})",
-                    provider.as_str(),
-                    sid_short
-                );
-                let _ = channel_id.say(&ctx.http, &restore_msg).await;
+                // Notify: session restored — send before placeholder so it appears first
+                send_restore_notification(
+                    shared,
+                    &ctx.http,
+                    channel_id,
+                    &provider,
+                    restored.as_deref(),
+                )
+                .await;
             }
             session_id = restored;
         }
     }
+
+    // Send placeholder message (after restore notification so restore appears first)
+    rate_limit_wait(shared, channel_id).await;
+    let placeholder = channel_id
+        .send_message(&ctx.http, {
+            let builder = CreateMessage::new().content("...");
+            if reply_to_user_message && dispatch_id_for_thread.is_none() {
+                builder.reference_message((channel_id, user_msg_id))
+            } else {
+                builder
+            }
+        })
+        .await?;
+    let placeholder_msg_id = placeholder.id;
 
     // Create cancel token — with second check to close the TOCTOU race window.
     // Multiple messages can pass the initial cancel_tokens check (line 169) concurrently
@@ -649,13 +785,14 @@ pub(in crate::services::discord) async fn handle_text_message(
             shared,
             &bot_owner_provider,
             channel_id,
-            super::super::Intervention {
-                author_id: request_owner,
-                message_id: user_msg_id,
-                text: user_text.to_string(),
-                mode: super::super::InterventionMode::Soft,
-                created_at: std::time::Instant::now(),
-            },
+            build_race_requeued_intervention(
+                request_owner,
+                user_msg_id,
+                user_text,
+                reply_context.clone(),
+                reply_to_user_message,
+                merge_consecutive,
+            ),
         )
         .await;
         let _ = channel_id
@@ -771,12 +908,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }
-    // Re-inject formatting + compaction reminder for interactive follow-up
-    // turns. System prompt is only sent at session creation; after context
-    // compaction these rules can be lost.
-    if session_id.is_some() {
-        context_chunks.push(super::super::prompt_builder::build_followup_turn_system_reminder());
-    }
     if let Some(knowledge) = memory_injection_plan.shared_knowledge_for_context {
         context_chunks.push(knowledge.to_string());
     }
@@ -851,6 +982,14 @@ pub(in crate::services::discord) async fn handle_text_message(
     let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
     let narrate_progress = settings::load_narrate_progress(shared.db.as_ref());
+    let current_task_context = active_dispatch_info.as_ref().map(|info| {
+        super::super::prompt_builder::CurrentTaskContext {
+            card_title: info.card_title.as_deref(),
+            github_issue_url: info.github_issue_url.as_deref(),
+            issue_body: info.issue_body.as_deref(),
+            deferred_dod: info.deferred_dod.as_ref(),
+        }
+    });
 
     let system_prompt_owned = build_system_prompt(
         &discord_context,
@@ -864,6 +1003,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         reply_to_user_message,
         dispatch_profile,
         dispatch_type_str.as_deref(),
+        current_task_context.as_ref(),
         sak_for_system,
         longterm_catalog_for_prompt,
         Some(&memory_settings),
@@ -1107,6 +1247,9 @@ pub(in crate::services::discord) async fn handle_text_message(
         Some(&current_path),
         dispatch_id.as_deref(),
         adk_thread_channel_id,
+        role_binding
+            .as_ref()
+            .map(|binding| binding.role_id.as_str()),
         shared.api_port,
     )
     .await;
@@ -2752,6 +2895,7 @@ Any other message is sent to {p}.
                 false,
                 false,
                 false,
+                false,
                 None,
             )
             .await?;
@@ -2776,6 +2920,7 @@ mod tests {
     use super::super::super::DiscordSession;
     use super::*;
     use crate::services::memory::RecallResponse;
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
     fn sample_recall() -> RecallResponse {
         RecallResponse {
@@ -3074,6 +3219,20 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_turns_skip_generic_pending_reaction() {
+        let dispatch_id = crate::services::discord::adk_session::parse_dispatch_id(
+            "DISPATCH:550e8400-e29b-41d4-a716-446655440000 - Fix login bug",
+        );
+
+        assert!(!should_add_turn_pending_reaction(dispatch_id.as_deref()));
+    }
+
+    #[test]
+    fn regular_turns_keep_generic_pending_reaction() {
+        assert!(should_add_turn_pending_reaction(None));
+    }
+
+    #[test]
     fn clear_resets_memento_skip_so_next_turn_can_reload_context() {
         let memento = settings::ResolvedMemorySettings {
             backend: settings::MemoryBackendKind::Memento,
@@ -3104,7 +3263,7 @@ mod tests {
         })
         .to_string();
 
-        let hints = parse_dispatch_context_hints(Some(&raw));
+        let hints = parse_dispatch_context_hints(Some(&raw), Some("review-decision"));
 
         assert_eq!(hints.worktree_path.as_deref(), temp.path().to_str());
         assert!(hints.force_new_session);
@@ -3112,11 +3271,118 @@ mod tests {
 
     #[test]
     fn parse_dispatch_context_hints_ignores_missing_path_but_keeps_reset_flag() {
-        let hints = parse_dispatch_context_hints(Some(
-            r#"{"worktree_path":"/definitely/missing","force_new_session":true}"#,
-        ));
+        let hints = parse_dispatch_context_hints(
+            Some(r#"{"worktree_path":"/definitely/missing","force_new_session":true}"#),
+            Some("review-decision"),
+        );
 
         assert!(hints.worktree_path.is_none());
         assert!(hints.force_new_session);
+    }
+
+    #[test]
+    fn parse_dispatch_context_hints_defaults_fresh_session_for_work_dispatches() {
+        let implementation = parse_dispatch_context_hints(None, Some("implementation"));
+        let review = parse_dispatch_context_hints(None, Some("review"));
+        let rework = parse_dispatch_context_hints(None, Some("rework"));
+
+        assert!(implementation.force_new_session);
+        assert!(review.force_new_session);
+        assert!(rework.force_new_session);
+    }
+
+    #[test]
+    fn parse_dispatch_context_hints_defaults_warm_resume_for_review_decision() {
+        let hints = parse_dispatch_context_hints(None, Some("review-decision"));
+        assert!(!hints.force_new_session);
+    }
+
+    #[test]
+    fn parse_dispatch_context_hints_respects_explicit_override_over_dispatch_type_default() {
+        let hints =
+            parse_dispatch_context_hints(Some(r#"{"force_new_session":false}"#), Some("rework"));
+        assert!(!hints.force_new_session);
+    }
+
+    #[test]
+    fn session_runtime_state_after_redirect_prefers_reused_thread_state() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        let thread_dir = tempfile::tempdir().unwrap();
+        let parent_channel_id = ChannelId::new(100);
+        let thread_channel_id = ChannelId::new(200);
+
+        let mut sessions = std::collections::HashMap::new();
+        let mut parent = make_session(Some(parent_dir.path().to_str().unwrap().to_string()), None);
+        parent.restore_provider_session(Some("parent-session".to_string()));
+        sessions.insert(parent_channel_id, parent);
+
+        let thread = make_session(Some(thread_dir.path().to_str().unwrap().to_string()), None);
+        sessions.insert(thread_channel_id, thread);
+
+        let resolved = session_runtime_state_after_redirect(
+            &mut sessions,
+            parent_channel_id,
+            thread_channel_id,
+            (
+                Some("parent-session".to_string()),
+                true,
+                parent_dir.path().to_str().unwrap().to_string(),
+            ),
+        );
+
+        assert_eq!(resolved.0, None);
+        assert!(!resolved.1);
+        assert_eq!(resolved.2, thread_dir.path().to_str().unwrap());
+    }
+
+    #[test]
+    fn session_runtime_state_after_redirect_keeps_original_state_when_channel_unchanged() {
+        let channel_id = ChannelId::new(100);
+        let dir = tempfile::tempdir().unwrap();
+        let original = (
+            Some("session-1".to_string()),
+            true,
+            dir.path().to_str().unwrap().to_string(),
+        );
+
+        let resolved = session_runtime_state_after_redirect(
+            &mut std::collections::HashMap::new(),
+            channel_id,
+            channel_id,
+            original.clone(),
+        );
+
+        assert_eq!(resolved, original);
+    }
+
+    #[test]
+    fn race_requeue_preserves_reply_boundary_without_reply_context() {
+        let queued = build_race_requeued_intervention(
+            UserId::new(7),
+            MessageId::new(8),
+            "hello",
+            None,
+            true,
+            true,
+        );
+
+        assert!(queued.has_reply_boundary);
+        assert!(queued.reply_context.is_none());
+        assert!(queued.merge_consecutive);
+    }
+
+    #[test]
+    fn race_requeue_preserves_non_mergeable_turns() {
+        let queued = build_race_requeued_intervention(
+            UserId::new(7),
+            MessageId::new(8),
+            "hello",
+            None,
+            false,
+            false,
+        );
+
+        assert!(!queued.has_reply_boundary);
+        assert!(!queued.merge_consecutive);
     }
 }

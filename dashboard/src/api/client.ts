@@ -527,15 +527,20 @@ export async function getStalledCards(): Promise<KanbanCard[]> {
 }
 
 export async function bulkKanbanAction(
-  action: "pass" | "reset" | "cancel",
+  action: "pass" | "reset" | "cancel" | "transition",
   card_ids: string[],
+  targetStatus?: string,
 ): Promise<{
   action: string;
   results: Array<{ id: string; ok: boolean; error?: string }>;
 }> {
   return request("/api/kanban-cards/bulk-action", {
     method: "POST",
-    body: JSON.stringify({ action, card_ids }),
+    body: JSON.stringify({
+      action,
+      card_ids,
+      target_status: targetStatus,
+    }),
   });
 }
 
@@ -669,6 +674,8 @@ export interface PipelineStageInput {
   max_retries?: number;
   skip_condition?: string | null;
   parallel_with?: string | null;
+  applies_to_agent_id?: string | null;
+  trigger_after?: "ready" | "review_pass";
 }
 
 export async function getPipelineStages(
@@ -703,6 +710,16 @@ export async function getCardPipelineStatus(cardId: string): Promise<{
   current_stage: import("../types").PipelineStage | null;
 }> {
   return request(`/api/pipeline/cards/${cardId}`);
+}
+
+export async function getCardTranscripts(
+  cardId: string,
+  limit = 10,
+): Promise<SessionTranscript[]> {
+  const data = await request<{ transcripts: SessionTranscript[] }>(
+    `/api/pipeline/cards/${cardId}/transcripts?limit=${limit}`,
+  );
+  return data.transcripts;
 }
 
 export async function getTaskDispatches(filters?: {
@@ -787,21 +804,70 @@ export async function getAgentDispatchedSessions(
   return data.sessions;
 }
 
+export type SessionTranscriptEventKind =
+  | "user"
+  | "assistant"
+  | "thinking"
+  | "tool_use"
+  | "tool_result"
+  | "result"
+  | "error"
+  | "task"
+  | "system";
+
+export interface SessionTranscriptEvent {
+  kind: SessionTranscriptEventKind;
+  tool_name?: string | null;
+  summary?: string | null;
+  content: string;
+  status?: string | null;
+  is_error: boolean;
+}
+
+export interface SessionTranscript {
+  id: number;
+  turn_id: string;
+  session_key: string | null;
+  channel_id: string | null;
+  agent_id: string | null;
+  provider: string | null;
+  dispatch_id: string | null;
+  kanban_card_id: string | null;
+  dispatch_title: string | null;
+  card_title: string | null;
+  github_issue_number: number | null;
+  user_message: string;
+  assistant_message: string;
+  events: SessionTranscriptEvent[];
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export async function getAgentTranscripts(
+  agentId: string,
+  limit = 8,
+): Promise<SessionTranscript[]> {
+  const data = await request<{ transcripts: SessionTranscript[] }>(
+    `/api/agents/${agentId}/transcripts?limit=${limit}`,
+  );
+  return data.transcripts;
+}
+
 export interface AgentTurnToolEvent {
-  kind: "tool" | "thinking";
-  status: "running" | "success" | "error" | "info";
-  tool_name: string | null;
+  kind: "thinking" | "tool";
+  status: "info" | "running" | "success" | "error";
+  tool_name?: string | null;
   summary: string;
   line: string;
 }
 
-export interface AgentTurnStatus {
+export interface AgentTurnState {
   agent_id: string;
-  status: "working" | "idle";
+  status: string;
   started_at: string | null;
   updated_at: string | null;
   recent_output: string | null;
-  recent_output_source: "tmux" | "inflight" | "none";
+  recent_output_source: string;
   session_key: string | null;
   tmux_session: string | null;
   provider: string | null;
@@ -814,23 +880,10 @@ export interface AgentTurnStatus {
   tool_count: number;
 }
 
-export interface StopAgentTurnResponse {
-  status: string;
-  agent_id: string;
-  session_key: string;
-  tmux_killed?: boolean;
-}
-
-export async function getAgentTurn(agentId: string): Promise<AgentTurnStatus> {
-  return request(`/api/agents/${agentId}/turn`);
-}
-
-export async function stopAgentTurn(
+export async function getAgentTurn(
   agentId: string,
-): Promise<StopAgentTurnResponse> {
-  return request(`/api/agents/${agentId}/turn/stop`, {
-    method: "POST",
-  });
+): Promise<AgentTurnState> {
+  return request(`/api/agents/${agentId}/turn`);
 }
 
 // ── Agent Skills ──
@@ -891,6 +944,20 @@ export async function getDiscordBindings(): Promise<DiscordBinding[]> {
     "/api/discord-bindings",
   );
   return data.bindings;
+}
+
+export interface DiscordChannelInfo {
+  id: string;
+  guild_id?: string | null;
+  name?: string | null;
+  parent_id?: string | null;
+  type?: number | null;
+}
+
+export async function getDiscordChannelInfo(
+  channelId: string,
+): Promise<DiscordChannelInfo> {
+  return request(`/api/discord/channels/${channelId}`);
 }
 
 export interface GitHubRepoOption {
@@ -1269,13 +1336,21 @@ export interface AutoQueueRun {
   thread_group_count?: number;
 }
 
+export interface AutoQueueThreadLink {
+  role: string;
+  label: string;
+  channel_id?: string | null;
+  thread_id: string;
+  url?: string | null;
+}
+
 export interface DispatchQueueEntry {
   id: string;
   agent_id: string;
   card_id: string;
   priority_rank: number;
   reason: string | null;
-  status: "pending" | "dispatched" | "done" | "completed" | "skipped";
+  status: "pending" | "dispatched" | "done" | "skipped";
   created_at: number;
   dispatched_at: number | null;
   completed_at: number | null;
@@ -1284,6 +1359,9 @@ export interface DispatchQueueEntry {
   github_repo?: string | null;
   thread_group?: number;
   batch_phase?: number;
+  thread_links?: AutoQueueThreadLink[];
+  card_status?: string;
+  review_round?: number;
 }
 
 export interface ThreadGroupStatus {

@@ -31,24 +31,48 @@ export const COLUMN_DEFS: Array<{
   { status: "done", labelKo: "완료", labelEn: "Done", accent: "#22c55e" },
 ];
 
+export const BOARD_COLUMN_DEFS: Array<{
+  status: KanbanCardStatus;
+  labelKo: string;
+  labelEn: string;
+  accent: string;
+}> = [
+  { status: "backlog", labelKo: "백로그", labelEn: "Backlog", accent: "#64748b" },
+  { status: "ready", labelKo: "준비됨", labelEn: "Ready", accent: "#0ea5e9" },
+  { status: "requested", labelKo: "요청됨", labelEn: "Requested", accent: "#8b5cf6" },
+  { status: "in_progress", labelKo: "진행 중", labelEn: "In Progress", accent: "#f59e0b" },
+  { status: "review", labelKo: "검토", labelEn: "Review", accent: "#14b8a6" },
+  { status: "qa_pending", labelKo: "QA 대기", labelEn: "QA Pending", accent: "#e879f9" },
+  { status: "qa_in_progress", labelKo: "QA 진행", labelEn: "QA In Progress", accent: "#c084fc" },
+  { status: "qa_failed", labelKo: "QA 실패", labelEn: "QA Failed", accent: "#fb7185" },
+  { status: "done", labelKo: "완료 일감", labelEn: "Completed Work", accent: "#22c55e" },
+];
+
 export const TERMINAL_STATUSES = new Set<KanbanCardStatus>(["done"]);
 export const QA_STATUSES = new Set<KanbanCardStatus>(["qa_pending", "qa_in_progress", "qa_failed"]);
 export const PRIORITY_OPTIONS: KanbanCardPriority[] = ["low", "medium", "high", "urgent"];
 export const REVIEW_DISPATCH_TYPES = new Set(["review", "review-decision"]);
 
 /** Quick-transition targets per status. Order = button order (primary first). */
+export function isManualStatusTransitionAllowed(
+  from: KanbanCardStatus,
+  to: KanbanCardStatus,
+): boolean {
+  return (from === "backlog" && to === "ready") || (from !== to && to === "backlog");
+}
+
 export const STATUS_TRANSITIONS: Record<KanbanCardStatus, KanbanCardStatus[]> = {
   backlog: ["ready"],
   ready: ["backlog"],
-  requested: ["ready", "in_progress"],
-  in_progress: ["review", "blocked"],
-  review: ["done", "in_progress"],
-  blocked: ["in_progress"],
+  requested: ["backlog"],
+  in_progress: ["backlog"],
+  review: ["backlog"],
+  blocked: ["backlog"],
   done: ["backlog"],
-  qa_pending: ["qa_in_progress", "done"],
-  qa_in_progress: ["done", "qa_failed"],
-  qa_failed: ["ready"],
-  pending_decision: ["review", "blocked", "in_progress"],
+  qa_pending: ["backlog"],
+  qa_in_progress: ["backlog"],
+  qa_failed: ["backlog"],
+  pending_decision: ["backlog"],
 };
 
 export const TRANSITION_STYLE: Record<string, { bg: string; text: string }> = {
@@ -70,12 +94,27 @@ export const TRANSITION_STYLE: Record<string, { bg: string; text: string }> = {
 export const REQUEST_TIMEOUT_MS = 45 * 60 * 1000;
 export const IN_PROGRESS_STALE_MS = 60 * 60 * 1000;
 
+export interface CardDwellBadge {
+  label: string;
+  detail: string;
+  tone: "fresh" | "warm" | "stale";
+  textColor: string;
+  backgroundColor: string;
+  borderColor: string;
+}
+
 // ---------------------------------------------------------------------------
 // Pure functions
 // ---------------------------------------------------------------------------
 
 export function isReviewCard(card: KanbanCard): boolean {
   return !!(card.latest_dispatch_type && REVIEW_DISPATCH_TYPES.has(card.latest_dispatch_type));
+}
+
+export function getBoardColumnStatus(status: KanbanCardStatus): KanbanCardStatus {
+  if (status === "blocked") return "in_progress";
+  if (status === "pending_decision") return "review";
+  return status;
 }
 
 export function priorityLabel(priority: KanbanCardPriority, tr: (ko: string, en: string) => string): string {
@@ -91,23 +130,35 @@ export function priorityLabel(priority: KanbanCardPriority, tr: (ko: string, en:
   }
 }
 
-export function formatTs(value: number | null | undefined, locale: UiLanguage): string {
-  if (!value) return "-";
+export function coerceTimestampMs(value: string | number | null | undefined): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric < 1e12 ? numeric * 1000 : numeric;
+  }
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+export function formatTs(value: string | number | null | undefined, locale: UiLanguage): string {
+  const ts = coerceTimestampMs(value);
+  if (!ts) return "-";
   return new Intl.DateTimeFormat(locale, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(value);
+  }).format(ts);
 }
 
 export function formatIso(value: string | number | null | undefined, locale: UiLanguage): string {
-  if (value == null) return "-";
-  if (typeof value === "number") return value ? formatTs(value, locale) : "-";
-  if (!value) return "-";
-  const parsed = new Date(value).getTime();
-  if (Number.isNaN(parsed)) return value;
-  return formatTs(parsed, locale);
+  if (value == null || value === "") return "-";
+  const ts = coerceTimestampMs(value);
+  if (ts != null) return formatTs(ts, locale);
+  return typeof value === "string" ? value : "-";
 }
 
 export function createChecklistItem(label: string, index = 0): KanbanReviewChecklistItem {
@@ -169,6 +220,91 @@ export function formatAgeLabel(ms: number, tr: (ko: string, en: string) => strin
   }
   const days = Math.round(hours / 24);
   return tr(`${days}일`, `${days}d`);
+}
+
+function dwellThresholdsForStatus(status: KanbanCardStatus): { warmMs: number; staleMs: number } {
+  switch (status) {
+    case "requested":
+      return { warmMs: 15 * 60 * 1000, staleMs: REQUEST_TIMEOUT_MS };
+    case "in_progress":
+      return { warmMs: 90 * 60 * 1000, staleMs: 4 * 60 * 60 * 1000 };
+    case "review":
+    case "pending_decision":
+      return { warmMs: 45 * 60 * 1000, staleMs: 2 * 60 * 60 * 1000 };
+    case "blocked":
+      return { warmMs: 30 * 60 * 1000, staleMs: 90 * 60 * 1000 };
+    case "qa_pending":
+    case "qa_in_progress":
+    case "qa_failed":
+      return { warmMs: 60 * 60 * 1000, staleMs: 3 * 60 * 60 * 1000 };
+    case "backlog":
+    case "ready":
+    case "done":
+      return { warmMs: 12 * 60 * 60 * 1000, staleMs: 36 * 60 * 60 * 1000 };
+    default:
+      return { warmMs: 60 * 60 * 1000, staleMs: 3 * 60 * 60 * 1000 };
+  }
+}
+
+export function getCardStateEnteredAt(card: KanbanCard): number | null {
+  switch (card.status) {
+    case "requested":
+      return coerceTimestampMs(card.requested_at ?? card.updated_at ?? card.created_at);
+    case "in_progress":
+      return coerceTimestampMs(card.started_at ?? card.updated_at ?? card.created_at);
+    case "review":
+    case "pending_decision":
+      return coerceTimestampMs(card.review_entered_at ?? card.updated_at ?? card.started_at ?? card.created_at);
+    case "done":
+      return coerceTimestampMs(card.completed_at ?? card.updated_at ?? card.created_at);
+    case "blocked":
+    case "qa_pending":
+    case "qa_in_progress":
+    case "qa_failed":
+    case "ready":
+    case "backlog":
+    default:
+      return coerceTimestampMs(card.updated_at ?? card.created_at);
+  }
+}
+
+export function getCardDwellBadge(
+  card: KanbanCard,
+  now: number,
+  tr: (ko: string, en: string) => string,
+): CardDwellBadge | null {
+  const enteredAt = getCardStateEnteredAt(card);
+  if (enteredAt == null) return null;
+  const elapsed = Math.max(0, now - enteredAt);
+  const { warmMs, staleMs } = dwellThresholdsForStatus(card.status);
+  if (elapsed >= staleMs) {
+    return {
+      label: tr("체류", "Dwell"),
+      detail: formatAgeLabel(elapsed, tr),
+      tone: "stale",
+      textColor: "#fca5a5",
+      backgroundColor: "rgba(239,68,68,0.18)",
+      borderColor: "rgba(239,68,68,0.38)",
+    };
+  }
+  if (elapsed >= warmMs) {
+    return {
+      label: tr("체류", "Dwell"),
+      detail: formatAgeLabel(elapsed, tr),
+      tone: "warm",
+      textColor: "#fde68a",
+      backgroundColor: "rgba(234,179,8,0.18)",
+      borderColor: "rgba(234,179,8,0.34)",
+    };
+  }
+  return {
+    label: tr("체류", "Dwell"),
+    detail: formatAgeLabel(elapsed, tr),
+    tone: "fresh",
+    textColor: "#86efac",
+    backgroundColor: "rgba(34,197,94,0.18)",
+    borderColor: "rgba(34,197,94,0.32)",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +388,49 @@ export interface ParsedGitHubComment {
   author: string;
   body: string;
 }
+
+export interface CoalescedGitHubTimelineItem {
+  id: string;
+  kind: GitHubTimelineKind;
+  status: GitHubTimelineStatus;
+  author: string;
+  createdAt: string;
+  updatedAt: string;
+  entries: ParsedGitHubComment[];
+  coalesced: boolean;
+  highlights: string[];
+}
+
+const TIMELINE_COALESCE_WINDOW_MS = 2 * 60_000;
+
+const TIMELINE_COALESCE_INCLUDE_PATTERNS = [
+  /상태.*(변경|전환|업데이트)/u,
+  /(변경|전환|업데이트).*(상태|메타데이터|우선순위|라벨|체크리스트|태그)/u,
+  /메타데이터.*(변경|수정|업데이트)/u,
+  /우선순위.*(변경|수정|업데이트)/u,
+  /라벨.*(변경|수정|업데이트)/u,
+  /체크리스트.*(변경|수정|업데이트)/u,
+  /\bstatus\b.*(changed|updated|set)/i,
+  /\bmetadata\b.*(changed|updated|set)/i,
+  /\bpriority\b.*(changed|updated|set)/i,
+  /\blabels?\b.*(changed|updated|set)/i,
+  /\bchecklist\b.*(changed|updated|set)/i,
+];
+
+const TIMELINE_COALESCE_EXCLUDE_PATTERNS = [
+  /에이전트.*할당/u,
+  /담당자.*변경/u,
+  /담당 에이전트/u,
+  /할당 변경/u,
+  /assignee/i,
+  /assigned agent/i,
+  /assignment/i,
+  /리뷰 결정/u,
+  /review decision/i,
+  /pm 결정/u,
+  /pm decision/i,
+  /verdict/i,
+];
 
 function cleanMarkdownLine(line: string): string {
   return line
@@ -386,6 +565,45 @@ function matchesAny(text: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(text));
 }
 
+function timelineCoalescingText(entry: ParsedGitHubComment): string {
+  return [entry.title, entry.summary ?? "", entry.body].join("\n");
+}
+
+function isTimelineCoalesceEligible(entry: ParsedGitHubComment): boolean {
+  if (entry.kind !== "general") return false;
+  const text = timelineCoalescingText(entry);
+  if (matchesAny(text, TIMELINE_COALESCE_EXCLUDE_PATTERNS)) return false;
+  return matchesAny(text, TIMELINE_COALESCE_INCLUDE_PATTERNS);
+}
+
+function buildCoalescedTimelineItem(
+  entries: ParsedGitHubComment[],
+  index: number,
+): CoalescedGitHubTimelineItem {
+  const first = entries[0];
+  const last = entries[entries.length - 1];
+  const highlights = Array.from(
+    new Set(
+      entries
+        .flatMap((entry) => [entry.title, entry.summary ?? ""])
+        .map((value) => cleanMarkdownLine(value))
+        .filter(Boolean),
+    ),
+  ).slice(0, 3);
+
+  return {
+    id: `${first.author}-${first.createdAt}-${index}`,
+    kind: first.kind,
+    status: first.status,
+    author: first.author,
+    createdAt: first.createdAt,
+    updatedAt: last.createdAt,
+    entries,
+    coalesced: entries.length > 1,
+    highlights,
+  };
+}
+
 export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGitHubComment[] {
   return comments.flatMap<ParsedGitHubComment>((comment) => {
     const body = comment.body.trim();
@@ -497,6 +715,54 @@ export function parseGitHubCommentTimeline(comments: GitHubComment[]): ParsedGit
   });
 }
 
+export function coalesceGitHubCommentTimeline(
+  entries: ParsedGitHubComment[],
+): CoalescedGitHubTimelineItem[] {
+  const groups: ParsedGitHubComment[][] = [];
+  let currentGroup: ParsedGitHubComment[] = [];
+  let groupStartMs = Number.NaN;
+
+  const flushGroup = () => {
+    if (currentGroup.length === 0) return;
+    groups.push(currentGroup);
+    currentGroup = [];
+    groupStartMs = Number.NaN;
+  };
+
+  for (const entry of entries) {
+    const entryTs = Date.parse(entry.createdAt);
+    const eligible = Number.isFinite(entryTs) && isTimelineCoalesceEligible(entry);
+
+    if (!eligible) {
+      flushGroup();
+      groups.push([entry]);
+      continue;
+    }
+
+    if (currentGroup.length === 0) {
+      currentGroup = [entry];
+      groupStartMs = entryTs;
+      continue;
+    }
+
+    const sameAuthor = currentGroup[0]?.author === entry.author;
+    const withinWindow = entryTs - groupStartMs <= TIMELINE_COALESCE_WINDOW_MS;
+
+    if (sameAuthor && withinWindow) {
+      currentGroup.push(entry);
+      continue;
+    }
+
+    flushGroup();
+    currentGroup = [entry];
+    groupStartMs = entryTs;
+  }
+
+  flushGroup();
+
+  return groups.map((group, index) => buildCoalescedTimelineItem(group, index));
+}
+
 // ---------------------------------------------------------------------------
 // Editor state
 // ---------------------------------------------------------------------------
@@ -558,15 +824,17 @@ export function getCardDelayBadge(
   tr: (ko: string, en: string) => string,
 ): { label: string; tone: string; detail: string } | null {
   const now = Date.now();
-  if (card.status === "requested" && card.requested_at) {
-    const age = now - card.requested_at;
-    if (age >= REQUEST_TIMEOUT_MS) {
+  if (card.status === "requested") {
+    const requestedAt = coerceTimestampMs(card.requested_at);
+    const age = requestedAt == null ? null : now - requestedAt;
+    if (age != null && age >= REQUEST_TIMEOUT_MS) {
       return { label: tr("수락 지연", "Ack delay"), tone: "#f97316", detail: formatAgeLabel(age, tr) };
     }
   }
-  if (card.status === "in_progress" && card.started_at) {
-    const age = now - card.started_at;
-    if (age >= IN_PROGRESS_STALE_MS) {
+  if (card.status === "in_progress") {
+    const startedAt = coerceTimestampMs(card.started_at);
+    const age = startedAt == null ? null : now - startedAt;
+    if (age != null && age >= IN_PROGRESS_STALE_MS) {
       return { label: tr("정체", "Stalled"), tone: "#f59e0b", detail: formatAgeLabel(age, tr) };
     }
   }

@@ -647,6 +647,49 @@ pub(crate) fn tmux_session_ready_for_input(_tmux_session_name: &str) -> bool {
     false
 }
 
+const READY_FOR_INPUT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const READY_FOR_INPUT_IDLE_MIN_PROBES: u32 = 3;
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ReadyForInputIdleTracker {
+    first_ready_at: Option<std::time::Instant>,
+    consecutive_ready_probes: u32,
+}
+
+impl ReadyForInputIdleTracker {
+    pub(crate) fn record_output(&mut self) {
+        self.reset();
+    }
+
+    pub(crate) fn observe_idle(
+        &mut self,
+        output_ever_grew: bool,
+        ready_for_input: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        if !output_ever_grew || !ready_for_input {
+            self.reset();
+            return false;
+        }
+
+        if self.first_ready_at.is_none() {
+            self.first_ready_at = Some(now);
+        }
+        self.consecutive_ready_probes += 1;
+
+        now.duration_since(
+            self.first_ready_at
+                .expect("first_ready_at set above before elapsed check"),
+        ) >= READY_FOR_INPUT_IDLE_TIMEOUT
+            && self.consecutive_ready_probes >= READY_FOR_INPUT_IDLE_MIN_PROBES
+    }
+
+    fn reset(&mut self) {
+        self.first_ready_at = None;
+        self.consecutive_ready_probes = 0;
+    }
+}
+
 pub fn fold_read_output_result<T>(
     read_result: ReadOutputResult,
     on_ready: impl FnOnce(u64) -> T,
@@ -741,8 +784,7 @@ where
     let mut partial_line = String::new();
     let mut buf = [0u8; 8192];
     let mut no_data_count: u32 = 0;
-    let mut consecutive_ready_count: u32 = 0;
-    let mut first_ready_at: Option<Instant> = None;
+    let mut ready_for_input_tracker = ReadyForInputIdleTracker::default();
 
     loop {
         if cancel_requested(cancel_token.as_deref()) {
@@ -770,28 +812,23 @@ where
                         .unwrap_or(current_offset);
                     let has_new_bytes = file_len > current_offset;
                     let output_ever_grew = current_offset > start_offset;
-                    if !has_new_bytes && output_ever_grew && is_ready_for_input() {
-                        if first_ready_at.is_none() {
-                            first_ready_at = Some(Instant::now());
-                        }
-                        consecutive_ready_count += 1;
-                        let ready_elapsed = first_ready_at
-                            .expect("first_ready_at set above before elapsed check")
-                            .elapsed();
-                        if ready_elapsed >= Duration::from_secs(15) && consecutive_ready_count >= 3
-                        {
-                            if !emit_synthetic_done(state) {
-                                return Ok(ReadOutputResult::Cancelled {
-                                    offset: current_offset,
-                                });
-                            }
-                            return Ok(ReadOutputResult::Completed {
+                    if !has_new_bytes
+                        && ready_for_input_tracker.observe_idle(
+                            output_ever_grew,
+                            is_ready_for_input(),
+                            Instant::now(),
+                        )
+                    {
+                        if !emit_synthetic_done(state) {
+                            return Ok(ReadOutputResult::Cancelled {
                                 offset: current_offset,
                             });
                         }
-                    } else {
-                        consecutive_ready_count = 0;
-                        first_ready_at = None;
+                        return Ok(ReadOutputResult::Completed {
+                            offset: current_offset,
+                        });
+                    } else if has_new_bytes {
+                        ready_for_input_tracker.record_output();
                     }
                 }
 
@@ -806,8 +843,7 @@ where
             }
             Ok(n) => {
                 no_data_count = 0;
-                consecutive_ready_count = 0;
-                first_ready_at = None;
+                ready_for_input_tracker.record_output();
                 current_offset += n as u64;
                 emit_output_offset(current_offset);
                 partial_line.push_str(&String::from_utf8_lossy(&buf[..n]));
@@ -1752,6 +1788,35 @@ mod tests {
             }
         );
         assert_eq!(state.lines, vec!["partial".to_string()]);
+    }
+
+    #[test]
+    fn test_ready_for_input_idle_tracker_requires_stable_prompt_after_output() {
+        let mut tracker = super::ReadyForInputIdleTracker::default();
+        let start = std::time::Instant::now();
+
+        assert!(!tracker.observe_idle(false, true, start));
+
+        tracker.record_output();
+        assert!(!tracker.observe_idle(true, true, start));
+        assert!(!tracker.observe_idle(true, true, start + std::time::Duration::from_secs(10)));
+        assert!(tracker.observe_idle(true, true, start + std::time::Duration::from_secs(16)));
+    }
+
+    #[test]
+    fn test_ready_for_input_idle_tracker_resets_when_output_resumes_or_prompt_disappears() {
+        let mut tracker = super::ReadyForInputIdleTracker::default();
+        let start = std::time::Instant::now();
+
+        tracker.record_output();
+        assert!(!tracker.observe_idle(true, true, start));
+        assert!(!tracker.observe_idle(true, false, start + std::time::Duration::from_secs(8)));
+        assert!(!tracker.observe_idle(true, true, start + std::time::Duration::from_secs(16)));
+
+        tracker.record_output();
+        assert!(!tracker.observe_idle(true, true, start + std::time::Duration::from_secs(17)));
+        assert!(!tracker.observe_idle(true, true, start + std::time::Duration::from_secs(25)));
+        assert!(tracker.observe_idle(true, true, start + std::time::Duration::from_secs(33)));
     }
 
     #[cfg(unix)]

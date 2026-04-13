@@ -64,7 +64,7 @@ use adk_session::{
 };
 use formatting::{
     BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_skills_notice,
-    format_tool_input, normalize_empty_lines, send_long_message_raw, truncate_str,
+    format_tool_input, send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
@@ -91,8 +91,9 @@ pub(crate) use runtime_bootstrap::RunBotContext;
 pub(crate) use runtime_bootstrap::run_bot;
 
 use crate::services::turn_orchestrator::{
-    CancelActiveTurnResult, ChannelMailboxSnapshot, ClearChannelResult, FinishTurnResult,
-    QueuePersistenceContext, RecoveryKickoffResult, load_pending_queues,
+    CancelActiveTurnResult, CancelQueuedMessageResult, ChannelMailboxSnapshot, ClearChannelResult,
+    FinishTurnResult, QueueExitEvent, QueueExitKind, QueuePersistenceContext,
+    RecoveryKickoffResult, RequeueInterventionResult, TakeNextSoftResult, load_pending_queues,
     warn_legacy_pending_queue_files,
 };
 pub(super) use crate::services::turn_orchestrator::{
@@ -155,11 +156,15 @@ pub(in crate::services::discord) fn should_phase2_recover_message(
 pub(in crate::services::discord) fn recovery_known_message_ids(
     snapshot: &ChannelMailboxSnapshot,
 ) -> std::collections::HashSet<u64> {
-    let mut ids = snapshot
-        .intervention_queue
-        .iter()
-        .map(|item| item.message_id.get())
-        .collect::<std::collections::HashSet<_>>();
+    let mut ids = std::collections::HashSet::new();
+    for item in &snapshot.intervention_queue {
+        ids.insert(item.message_id.get());
+        ids.extend(
+            item.source_message_ids
+                .iter()
+                .map(|message_id| message_id.get()),
+        );
+    }
     if let Some(active_id) = snapshot.active_user_message_id {
         ids.insert(active_id.get());
     }
@@ -451,6 +456,9 @@ pub(super) struct SharedData {
     pub(super) db: Option<crate::db::Db>,
     /// Shared policy engine for direct dispatch finalization.
     pub(super) engine: Option<crate::engine::PolicyEngine>,
+    /// Weak reference to the process-wide health registry so turn handlers can
+    /// reach dedicated Discord bot HTTP clients without creating an Arc cycle.
+    pub(super) health_registry: std::sync::Weak<health::HealthRegistry>,
     /// Set of registered slash command names (populated at framework setup).
     /// Used by the router to distinguish known slash commands from arbitrary
     /// `/`-prefixed user text that should fall through to the AI provider.
@@ -460,6 +468,10 @@ pub(super) struct SharedData {
 impl SharedData {
     fn mailbox(&self, channel_id: ChannelId) -> ChannelMailboxHandle {
         self.mailboxes.handle(channel_id)
+    }
+
+    fn health_registry(&self) -> Option<Arc<health::HealthRegistry>> {
+        self.health_registry.upgrade()
     }
 }
 
@@ -556,13 +568,59 @@ async fn mailbox_enqueue_intervention(
     channel_id: ChannelId,
     intervention: Intervention,
 ) -> bool {
-    shared
+    let result = shared
         .mailbox(channel_id)
         .enqueue(
             intervention,
             queue_persistence_context(shared, provider, channel_id),
         )
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result.enqueued
+}
+
+fn queue_exit_feedback_emoji(kind: QueueExitKind) -> char {
+    match kind {
+        QueueExitKind::Cancelled => '🚫',
+        QueueExitKind::Expired => '⌛',
+        QueueExitKind::Superseded => '⏏',
+    }
+}
+
+async fn apply_queue_exit_feedback(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    queue_exit_events: &[QueueExitEvent],
+) {
+    let queue_exit_events: Vec<&QueueExitEvent> = queue_exit_events
+        .iter()
+        .filter(|event| event.intervention.author_id.get() > 1)
+        .collect();
+    if queue_exit_events.is_empty() {
+        return;
+    }
+
+    let Some(ctx) = shared.cached_serenity_ctx.get() else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] ⚠ QUEUE-FEEDBACK: skipped {} queue exit reaction(s) in channel {} (cached ctx missing)",
+            queue_exit_events.len(),
+            channel_id
+        );
+        return;
+    };
+
+    for event in queue_exit_events {
+        formatting::remove_reaction_raw(&ctx.http, channel_id, event.intervention.message_id, '📬')
+            .await;
+        formatting::add_reaction_raw(
+            &ctx.http,
+            channel_id,
+            event.intervention.message_id,
+            queue_exit_feedback_emoji(event.kind),
+        )
+        .await;
+    }
 }
 
 async fn enqueue_internal_followup(
@@ -580,9 +638,13 @@ async fn enqueue_internal_followup(
         Intervention {
             author_id: UserId::new(1),
             message_id: reply_message_id,
+            source_message_ids: vec![reply_message_id],
             text: text.into(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
         },
     )
     .await;
@@ -599,10 +661,12 @@ async fn mailbox_has_pending_soft_queue(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> HasPendingSoftQueueResult {
-    shared
+    let result = shared
         .mailbox(channel_id)
         .has_pending_soft_queue(queue_persistence_context(shared, provider, channel_id))
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result
 }
 
 async fn mailbox_take_next_soft_intervention(
@@ -610,10 +674,14 @@ async fn mailbox_take_next_soft_intervention(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<(Intervention, bool)> {
-    shared
+    let result: TakeNextSoftResult = shared
         .mailbox(channel_id)
         .take_next_soft(queue_persistence_context(shared, provider, channel_id))
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result
+        .intervention
+        .map(|intervention| (intervention, result.has_more))
 }
 
 async fn mailbox_requeue_intervention_front(
@@ -622,13 +690,14 @@ async fn mailbox_requeue_intervention_front(
     channel_id: ChannelId,
     intervention: Intervention,
 ) {
-    shared
+    let result: RequeueInterventionResult = shared
         .mailbox(channel_id)
         .requeue_front(
             intervention,
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
 }
 
 async fn mailbox_cancel_soft_intervention(
@@ -637,13 +706,15 @@ async fn mailbox_cancel_soft_intervention(
     channel_id: ChannelId,
     message_id: MessageId,
 ) -> Option<Intervention> {
-    shared
+    let result: CancelQueuedMessageResult = shared
         .mailbox(channel_id)
         .cancel_queued_message(
             message_id,
             queue_persistence_context(shared, provider, channel_id),
         )
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result.removed
 }
 
 async fn mailbox_finish_turn(
@@ -651,10 +722,12 @@ async fn mailbox_finish_turn(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> FinishTurnResult {
-    shared
+    let result = shared
         .mailbox(channel_id)
         .finish_turn(queue_persistence_context(shared, provider, channel_id))
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result
 }
 
 async fn mailbox_clear_channel(
@@ -662,10 +735,12 @@ async fn mailbox_clear_channel(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> ClearChannelResult {
-    shared
+    let result = shared
         .mailbox(channel_id)
         .clear(queue_persistence_context(shared, provider, channel_id))
-        .await
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result
 }
 
 async fn mailbox_replace_queue(
@@ -905,9 +980,16 @@ async fn catch_up_missed_messages(
                 Intervention {
                     author_id: msg.author.id,
                     message_id: msg.id,
+                    source_message_ids: vec![msg.id],
                     text: text.to_string(),
                     mode: InterventionMode::Soft,
                     created_at: now,
+                    reply_context: None,
+                    has_reply_boundary: msg.message_reference.is_some(),
+                    merge_consecutive: !msg.author.bot
+                        && !text.starts_with('!')
+                        && !text.starts_with('/')
+                        && !text.starts_with("DISPATCH:"),
                 },
             )
             .await;
@@ -1058,9 +1140,16 @@ async fn catch_up_missed_messages(
                 Intervention {
                     author_id: msg.author.id,
                     message_id: msg.id,
+                    source_message_ids: vec![msg.id],
                     text: text.to_string(),
                     mode: InterventionMode::Soft,
                     created_at: now,
+                    reply_context: None,
+                    has_reply_boundary: msg.message_reference.is_some(),
+                    merge_consecutive: !msg.author.bot
+                        && !text.starts_with('!')
+                        && !text.starts_with('/')
+                        && !text.starts_with("DISPATCH:"),
                 },
             )
             .await;
@@ -1175,7 +1264,8 @@ pub(super) async fn kickoff_idle_queues(
             true,     // reply_to_user_message
             has_more, // defer_watcher_resume
             false,    // wait_for_completion — don't block, let channels run concurrently
-            None,     // reply_context
+            intervention.merge_consecutive,
+            None, // reply_context
         )
         .await
         {
@@ -1739,14 +1829,19 @@ mod tests {
             intervention_queue: vec![Intervention {
                 author_id: UserId::new(42),
                 message_id: MessageId::new(100),
+                source_message_ids: vec![MessageId::new(90), MessageId::new(100)],
                 text: "queued".to_string(),
                 mode: InterventionMode::Soft,
                 created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
             }],
             ..Default::default()
         };
 
         let existing = recovery_known_message_ids(&snapshot);
+        assert!(existing.contains(&90));
         assert!(existing.contains(&100));
         assert!(existing.contains(&200));
         assert!(!should_phase2_recover_message(200, None, &existing));

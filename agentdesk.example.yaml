@@ -103,6 +103,7 @@ runtime:
 automation:
   enabled: false
   strategy: "squash"
+  strategy_mode: "direct-first"
   allowed_authors: "itismyfield,octocat"
 
 # Dashboard edits still write runtime overrides into kv_meta.

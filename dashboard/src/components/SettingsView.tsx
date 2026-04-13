@@ -289,6 +289,10 @@ const SYSTEM_CONFIG_DESCRIPTIONS: Record<string, { ko: string; en: string }> = {
     ko: "자동 머지 시 사용할 GitHub 머지 전략입니다.",
     en: "GitHub merge strategy used by merge automation.",
   },
+  merge_strategy_mode: {
+    ko: "터미널 카드에서 direct merge를 먼저 시도할지, 항상 PR을 만들지 결정합니다.",
+    en: "Chooses whether terminal cards try direct merge first or always open a PR.",
+  },
   merge_allowed_authors: {
     ko: "자동 머지를 허용할 작성자 목록입니다. 쉼표로 구분합니다.",
     en: "Comma-separated list of authors allowed for automated merge.",
@@ -412,9 +416,9 @@ const AUDIT_NOTES: AuditNote[] = [
     id: "merge-automation-surface",
     titleKo: "merge automation은 개별 정책 키 surface",
     titleEn: "Merge automation now lives on the policy-key surface",
-    descriptionKo: "`merge_automation_enabled`, `merge_strategy`, `merge_allowed_authors`는 `agentdesk.yaml`의 `automation:` baseline 위에 대시보드가 `kv_meta` runtime override를 덮는 구조입니다.",
-    descriptionEn: "`merge_automation_enabled`, `merge_strategy`, and `merge_allowed_authors` now use `agentdesk.yaml` `automation:` as the startup baseline while the dashboard writes `kv_meta` runtime overrides on top.",
-    keys: ["merge_automation_enabled", "merge_strategy", "merge_allowed_authors"],
+    descriptionKo: "`merge_automation_enabled`, `merge_strategy`, `merge_strategy_mode`, `merge_allowed_authors`는 `agentdesk.yaml`의 `automation:` baseline 위에 대시보드가 `kv_meta` runtime override를 덮는 구조입니다.",
+    descriptionEn: "`merge_automation_enabled`, `merge_strategy`, `merge_strategy_mode`, and `merge_allowed_authors` now use `agentdesk.yaml` `automation:` as the startup baseline while the dashboard writes `kv_meta` runtime overrides on top.",
+    keys: ["merge_automation_enabled", "merge_strategy", "merge_strategy_mode", "merge_allowed_authors"],
     status: "backend-contract",
   },
 ];
@@ -529,26 +533,26 @@ interface SectionHeadingProps {
 
 function SectionHeading({ eyebrow, title, description, badge }: SectionHeadingProps) {
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0">
+    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-center gap-2 min-w-0">
         <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--th-text-muted)" }}>
           {eyebrow}
         </div>
-        <h3 className="mt-1 text-xl font-semibold tracking-tight" style={{ color: "var(--th-text)" }}>
+        <h3 className="text-base font-semibold tracking-tight" style={{ color: "var(--th-text)" }}>
           {title}
         </h3>
-        <p className="mt-2 max-w-3xl text-sm leading-6" style={{ color: "var(--th-text-muted)" }}>
-          {description}
-        </p>
-      </div>
-      {badge && (
-        <span
-          className="inline-flex shrink-0 items-center rounded-full border px-3 py-1 text-[11px] font-medium"
-          style={{ borderColor: "rgba(99,102,241,0.32)", background: "rgba(99,102,241,0.12)", color: "#c7d2fe" }}
-        >
-          {badge}
+        <span className="cursor-help text-xs" style={{ color: "var(--th-text-muted)" }} title={description}>
+          ⓘ
         </span>
-      )}
+        {badge && (
+          <span
+            className="inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-[10px] font-medium"
+            style={{ borderColor: "rgba(99,102,241,0.32)", background: "rgba(99,102,241,0.12)", color: "#c7d2fe" }}
+          >
+            {badge}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -616,16 +620,16 @@ interface InputCardProps {
 function InputCard({ label, description, children }: InputCardProps) {
   return (
     <div
-      className="rounded-2xl border p-4"
+      className="rounded-2xl border p-3"
       style={{ borderColor: "rgba(148,163,184,0.18)", background: "rgba(15,23,42,0.28)" }}
     >
-      <label className="block text-sm font-medium" style={{ color: "var(--th-text)" }}>
+      <label className="flex items-center gap-1.5 text-sm font-medium" style={{ color: "var(--th-text)" }}>
         {label}
+        <span className="cursor-help text-xs" style={{ color: "var(--th-text-muted)" }} title={description}>
+          ⓘ
+        </span>
       </label>
-      <p className="mt-1 text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>
-        {description}
-      </p>
-      <div className="mt-3">{children}</div>
+      <div className="mt-2">{children}</div>
     </div>
   );
 }
@@ -834,62 +838,14 @@ export default function SettingsView({
       className="mx-auto h-full max-w-5xl min-w-0 space-y-6 overflow-x-hidden overflow-y-auto px-4 py-5 pb-40 sm:px-6"
       style={{ paddingBottom: "max(10rem, calc(10rem + env(safe-area-inset-bottom)))" }}
     >
-      <section
-        className="rounded-[28px] border p-5 sm:p-6"
-        style={{
-          borderColor: "rgba(99,102,241,0.22)",
-          background: "radial-gradient(circle at top left, rgba(99,102,241,0.22), rgba(15,23,42,0.9) 48%, rgba(15,23,42,0.75) 100%)",
-        }}
-      >
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-          <div className="min-w-0">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.22em]" style={{ color: "#c7d2fe" }}>
-              {tr("설정 제어실", "Settings Control Room")}
-            </div>
-            <h2 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl" style={{ color: "var(--th-text)" }}>
-              {tr("AgentDesk 설정창 재정렬", "Reframing AgentDesk settings")}
-            </h2>
-            <p className="mt-3 max-w-3xl text-sm leading-6" style={{ color: "rgba(226,232,240,0.82)" }}>
-              {tr(
-                "설정은 단순 입력 폼이 아니라 저장 위치와 적용 범위를 이해해야 안전하게 다룰 수 있습니다. 이 화면은 회사 설정, 즉시 반영 런타임 설정, 개별 정책 키, 별도 관리 surface를 분리해서 보여줍니다.",
-                "Settings are safe only when their storage surface and effect scope are visible. This view separates company settings, live runtime tuning, individual policy keys, and surfaces managed elsewhere.",
-              )}
-            </p>
-          </div>
-          <div
-            className="rounded-2xl border px-4 py-3 text-sm"
-            style={{ borderColor: "rgba(148,163,184,0.2)", background: "rgba(15,23,42,0.38)", color: "var(--th-text-secondary)" }}
-          >
-            {tr("현재 일반 설정 저장은 merged object로 수행되어 hidden JSON key를 보존합니다.", "General settings now save as a merged object so hidden JSON keys stay intact.")}
-          </div>
-        </div>
-
-        <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <SummaryCard
-            label={tr("회사 설정", "Company Settings")}
-            value="4"
-            description={tr("이 화면에서 직접 편집하는 브랜드/언어/테마 설정", "Brand, language, and theme controls edited directly here")}
-          />
-          <SummaryCard
-            label={tr("런타임 튜닝", "Live Runtime")}
-            value={String(runtimeFieldCount)}
-            description={tr("재시작 없이 즉시 반영되는 운영 숫자 설정", "Operational tuning values that apply without restart")}
-            accent="#22c55e"
-          />
-          <SummaryCard
-            label={tr("정책 키", "Policy Keys")}
-            value={String(configEntries.length)}
-            description={tr("YAML baseline 위에 `kv_meta` override로 동작하는 파이프라인 정책", "Pipeline policy keys layered as YAML baselines with `kv_meta` overrides")}
-            accent="#f59e0b"
-          />
-          <SummaryCard
-            label={tr("정리 대상", "Audit Findings")}
-            value={String(AUDIT_NOTES.length)}
-            description={tr("별도 관리/읽기 전용/계약 명시로 남긴 설정 메모", "Settings notes kept as managed-elsewhere, read-only, or contract clarifications")}
-            accent="#fb7185"
-          />
-        </div>
-      </section>
+      <div className="flex items-center gap-3">
+        <h2 className="text-lg font-semibold tracking-tight" style={{ color: "var(--th-text)" }}>
+          {tr("설정", "Settings")}
+        </h2>
+        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+          {tr(`회사 ${4} · 런타임 ${runtimeFieldCount} · 정책 ${configEntries.length}`, `Company ${4} · Runtime ${runtimeFieldCount} · Policy ${configEntries.length}`)}
+        </span>
+      </div>
 
       <section className="rounded-[28px] border p-5 sm:p-6" style={sectionStyle}>
         <SectionHeading
@@ -1457,6 +1413,25 @@ export default function SettingsView({
                                   {baselineSource && <span>{baselineSource}</span>}
                                   {restartNote && <span>{restartNote}</span>}
                                   <span>{tr("GitHub auto-merge 전략과 1:1로 대응합니다.", "Maps directly to the GitHub auto-merge strategy.")}</span>
+                                </div>
+                              </>
+                            ) : entry.key === "merge_strategy_mode" ? (
+                              <>
+                                <select
+                                  disabled={readOnly}
+                                  className="w-full rounded-2xl px-3 py-2.5 text-sm disabled:cursor-not-allowed disabled:opacity-80"
+                                  style={inputStyle}
+                                  value={String(currentValue || "direct-first")}
+                                  onChange={(event) => handleConfigEdit(entry.key, event.target.value)}
+                                >
+                                  <option value="direct-first">direct-first</option>
+                                  <option value="pr-always">pr-always</option>
+                                </select>
+                                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                                  <span>{tr(`기본값: ${defaultLabel}`, `Default: ${defaultLabel}`)}</span>
+                                  {baselineSource && <span>{baselineSource}</span>}
+                                  {restartNote && <span>{restartNote}</span>}
+                                  <span>{tr("direct-first는 기존 동작을 유지하고, pr-always는 항상 PR과 Codex 리뷰 승인을 기다립니다.", "direct-first preserves the current flow, while pr-always always opens a PR and waits for Codex approval.")}</span>
                                 </div>
                               </>
                             ) : (

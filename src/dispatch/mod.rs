@@ -40,6 +40,38 @@ fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a 
         .filter(|s| !s.is_empty())
 }
 
+pub(crate) fn dispatch_type_force_new_session_default(dispatch_type: Option<&str>) -> Option<bool> {
+    match dispatch_type {
+        Some("implementation") | Some("review") | Some("rework") => Some(true),
+        Some("review-decision") => Some(false),
+        _ => None,
+    }
+}
+
+fn dispatch_context_with_session_strategy(
+    dispatch_type: &str,
+    context: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(default_force_new_session) =
+        dispatch_type_force_new_session_default(Some(dispatch_type))
+    else {
+        return context.clone();
+    };
+
+    let mut context = if context.is_object() {
+        context.clone()
+    } else {
+        json!({})
+    };
+
+    if let Some(obj) = context.as_object_mut() {
+        obj.entry("force_new_session".to_string())
+            .or_insert(json!(default_force_new_session));
+    }
+
+    context
+}
+
 fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
     context
         .get("sidecar_dispatch")
@@ -70,6 +102,45 @@ fn dispatch_context_worktree_target(
         .or_else(|| crate::services::platform::shell::git_branch_name(path));
 
     Ok(Some((path.to_string(), branch)))
+}
+
+fn resolve_parent_dispatch_context(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+    context: &serde_json::Value,
+) -> Result<(Option<String>, i64)> {
+    let Some(parent_dispatch_id) =
+        json_string_field(context, "parent_dispatch_id").filter(|value| !value.is_empty())
+    else {
+        return Ok((None, 0));
+    };
+
+    let Some((parent_card_id, parent_chain_depth)) = conn
+        .query_row(
+            "SELECT kanban_card_id, COALESCE(chain_depth, 0)
+             FROM task_dispatches
+             WHERE id = ?1",
+            [parent_dispatch_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    else {
+        anyhow::bail!(
+            "Cannot create dispatch for card {}: parent_dispatch_id '{}' not found",
+            card_id,
+            parent_dispatch_id
+        );
+    };
+
+    if parent_card_id.as_deref() != Some(card_id) {
+        anyhow::bail!(
+            "Cannot create dispatch for card {}: parent_dispatch_id '{}' belongs to a different card",
+            card_id,
+            parent_dispatch_id
+        );
+    }
+
+    Ok((Some(parent_dispatch_id.to_string()), parent_chain_depth + 1))
 }
 
 fn is_card_scoped_worktree_path(path: &str, branch: Option<&str>) -> bool {
@@ -346,6 +417,53 @@ fn apply_review_target_context(
     }
 }
 
+pub(crate) const REVIEW_QUALITY_SCOPE_REMINDER: &str =
+    "기존 DoD/기능 검증과 함께 아래 품질 항목도 반드시 확인하세요.";
+pub(crate) const REVIEW_VERDICT_IMPROVE_GUIDANCE: &str = "기능이 맞더라도 아래 품질 항목에서 실제 문제가 하나라도 보이면 `VERDICT: improve`로 판정하세요.";
+pub(crate) const REVIEW_QUALITY_CHECKLIST: [&str; 5] = [
+    "race condition / 동시성 이슈: 공유 상태 경쟁, TOCTOU, 중복 처리, 순서 역전",
+    "에러 핸들링 누락: unwrap/panic, 빈 catch, 실패·timeout·retry 누락",
+    "edge case: null/빈 배열, 타임아웃, 네트워크 실패, 재시도 후 중복 상태",
+    "리소스 정리 누락: drop, cleanup, stash/worktree/session restore 정리 여부",
+    "기존 코드와의 경로 충돌: 같은 상태를 여러 곳에서 수정하거나 기존 자동화와 상충",
+];
+
+fn inject_review_quality_context(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.entry("review_quality_scope_reminder".to_string())
+        .or_insert_with(|| json!(REVIEW_QUALITY_SCOPE_REMINDER));
+    obj.entry("review_verdict_guidance".to_string())
+        .or_insert_with(|| json!(REVIEW_VERDICT_IMPROVE_GUIDANCE));
+    obj.entry("review_quality_checklist".to_string())
+        .or_insert_with(|| json!(REVIEW_QUALITY_CHECKLIST));
+}
+
+fn inject_review_merge_base_context(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if obj.contains_key("merge_base") {
+        return;
+    }
+
+    let path = obj
+        .get("worktree_path")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let branch = obj
+        .get("branch")
+        .and_then(|value| value.as_str())
+        .or_else(|| obj.get("worktree_branch").and_then(|value| value.as_str()))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (Some(path), Some(branch)) = (path, branch) else {
+        return;
+    };
+
+    if let Some(merge_base) =
+        crate::services::platform::shell::git_merge_base(&path, "main", &branch)
+    {
+        obj.insert("merge_base".to_string(), json!(merge_base));
+    }
+}
+
 /// Resolve the canonical worktree for a card's GitHub issue.
 ///
 /// Looks up the card's `github_issue_number`, then searches for an active
@@ -446,11 +564,7 @@ fn build_review_context(
     to_agent_id: &str,
     context: &serde_json::Value,
 ) -> Result<String> {
-    let mut ctx_val = if context.is_object() {
-        context.clone()
-    } else {
-        json!({})
-    };
+    let mut ctx_val = dispatch_context_with_session_strategy("review", context);
     if let Some(obj) = ctx_val.as_object_mut() {
         if !obj.contains_key("reviewed_commit") {
             // Prefer the actual target used by the latest completed work dispatch
@@ -532,6 +646,9 @@ fn build_review_context(
                 }
             }
         }
+
+        inject_review_merge_base_context(obj);
+        inject_review_quality_context(obj);
 
         // Inject from_provider/target_provider for cross-provider review validation
         if !obj.contains_key("from_provider") || !obj.contains_key("target_provider") {
@@ -620,13 +737,30 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
         dispatch_status.as_deref(),
         Some("cancelled") | Some("failed")
     ) {
-        conn.execute(
-            "UPDATE auto_queue_entries \
-             SET status = 'pending', dispatch_id = NULL, dispatched_at = NULL, completed_at = NULL \
+        let mut stmt = conn.prepare(
+            "SELECT id FROM auto_queue_entries
              WHERE dispatch_id = ?1 AND status IN ('pending', 'dispatched')",
-            [dispatch_id],
-        )
-        .ok();
+        )?;
+        let entry_ids: Vec<String> = stmt
+            .query_map([dispatch_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for entry_id in entry_ids {
+            crate::db::auto_queue::update_entry_status_on_conn(
+                conn,
+                &entry_id,
+                crate::db::auto_queue::ENTRY_STATUS_PENDING,
+                "dispatch_cancel",
+                &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+            )
+            .map_err(|error| match error {
+                crate::db::auto_queue::EntryStatusUpdateError::Sql(sql) => sql,
+                other => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    other.to_string(),
+                ))),
+            })?;
+        }
     }
 
     Ok(cancelled)
@@ -879,20 +1013,31 @@ fn create_dispatch_core_internal(
         }
     }
 
+    let (parent_dispatch_id, chain_depth) =
+        resolve_parent_dispatch_context(&conn, kanban_card_id, context)?;
+
+    let context_with_session_strategy =
+        dispatch_context_with_session_strategy(dispatch_type, context);
     let context_str = if dispatch_type == "review" {
-        build_review_context(db, kanban_card_id, to_agent_id, context)?
+        build_review_context(
+            db,
+            kanban_card_id,
+            to_agent_id,
+            &context_with_session_strategy,
+        )?
     } else {
         // #259: For ALL non-review dispatch types, prefer explicit worktree
         // context from the caller; otherwise inject the canonical issue
         // worktree so the session uses the right CWD instead of the repo root.
-        let mut base = serde_json::to_string(context)?;
-        let worktree_target =
-            if let Some((wt_path, wt_branch)) = dispatch_context_worktree_target(context)? {
-                Some((wt_path, wt_branch))
-            } else {
-                resolve_card_worktree(db, kanban_card_id)?
-                    .map(|(wt_path, wt_branch, _)| (wt_path, Some(wt_branch)))
-            };
+        let mut base = serde_json::to_string(&context_with_session_strategy)?;
+        let worktree_target = if let Some((wt_path, wt_branch)) =
+            dispatch_context_worktree_target(&context_with_session_strategy)?
+        {
+            Some((wt_path, wt_branch))
+        } else {
+            resolve_card_worktree(db, kanban_card_id)?
+                .map(|(wt_path, wt_branch, _)| (wt_path, Some(wt_branch)))
+        };
 
         if let Some((wt_path, wt_branch)) = worktree_target {
             if let Ok(mut obj) =
@@ -959,6 +1104,8 @@ fn create_dispatch_core_internal(
         &effective,
         title,
         &context_str,
+        parent_dispatch_id.as_deref(),
+        chain_depth,
         options,
     )?;
 
@@ -1184,6 +1331,36 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
     Ok(true)
 }
 
+/// Ensure a pending status-reaction outbox row exists for a dispatch.
+///
+/// At most one in-flight status sync is needed: when the worker drains it, the
+/// Discord side-effect reads the latest dispatch status from `task_dispatches`.
+/// Once an older row is already `done` or `failed`, a later transition should
+/// enqueue a fresh row.
+pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+) -> rusqlite::Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM dispatch_outbox
+         WHERE dispatch_id = ?1
+           AND action = 'status_reaction'
+           AND status IN ('pending', 'processing')",
+        [dispatch_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+
+    conn.execute(
+        "INSERT INTO dispatch_outbox (dispatch_id, action) VALUES (?1, 'status_reaction')",
+        [dispatch_id],
+    )?;
+    Ok(true)
+}
+
 pub(crate) fn record_dispatch_status_event_on_conn(
     conn: &rusqlite::Connection,
     dispatch_id: &str,
@@ -1305,6 +1482,13 @@ pub(crate) fn set_dispatch_status_on_conn(
                 transition_source,
                 result,
             )?;
+
+            if matches!(
+                to_status,
+                "dispatched" | "completed" | "failed" | "cancelled"
+            ) {
+                ensure_dispatch_status_reaction_outbox_on_conn(conn, dispatch_id)?;
+            }
         }
         Ok(changed)
     })();
@@ -1340,6 +1524,8 @@ fn apply_dispatch_attached_intents(
     effective: &crate::pipeline::PipelineConfig,
     title: &str,
     context_str: &str,
+    parent_dispatch_id: Option<&str>,
+    chain_depth: i64,
     options: DispatchCreateOptions,
 ) -> Result<()> {
     use crate::engine::transition::{
@@ -1390,9 +1576,21 @@ fn apply_dispatch_attached_intents(
     let exec_result = (|| -> anyhow::Result<()> {
         // Insert dispatch row inside the transaction (#155 review fix)
         if let Err(e) = conn.execute(
-            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, datetime('now'), datetime('now'))",
-            rusqlite::params![dispatch_id, card_id, to_agent_id, dispatch_type, title, context_str],
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context,
+                parent_dispatch_id, chain_depth, created_at, updated_at
+            )
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
+            rusqlite::params![
+                dispatch_id,
+                card_id,
+                to_agent_id,
+                dispatch_type,
+                title,
+                context_str,
+                parent_dispatch_id,
+                chain_depth
+            ],
         ) {
             if dispatch_type == "review-decision"
                 && e.to_string().contains("UNIQUE constraint failed")
@@ -1903,6 +2101,15 @@ mod tests {
         .unwrap()
     }
 
+    fn count_status_reaction_outbox(conn: &rusqlite::Connection, dispatch_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'status_reaction'",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     fn load_dispatch_events(
         conn: &rusqlite::Connection,
         dispatch_id: &str,
@@ -1935,6 +2142,8 @@ mod tests {
                 dispatch_id: Some(dispatch_id),
                 user_message: "Implement the task",
                 assistant_message: message,
+                events: &[],
+                duration_ms: None,
             },
         )
         .unwrap();
@@ -2173,6 +2382,14 @@ mod tests {
                 dispatch_id TEXT,
                 dispatched_at DATETIME,
                 completed_at DATETIME
+            );
+            CREATE TABLE IF NOT EXISTS auto_queue_entry_dispatch_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id TEXT NOT NULL,
+                dispatch_id TEXT NOT NULL,
+                trigger_source TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entry_id, dispatch_id)
             );",
         )
         .unwrap();
@@ -2391,6 +2608,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full_dispatch["status"], "pending");
+    }
+
+    #[test]
+    fn dispatch_type_force_new_session_defaults_split_by_dispatch_type() {
+        assert_eq!(
+            dispatch_type_force_new_session_default(Some("implementation")),
+            Some(true)
+        );
+        assert_eq!(
+            dispatch_type_force_new_session_default(Some("review")),
+            Some(true)
+        );
+        assert_eq!(
+            dispatch_type_force_new_session_default(Some("rework")),
+            Some(true)
+        );
+        assert_eq!(
+            dispatch_type_force_new_session_default(Some("review-decision")),
+            Some(false)
+        );
+        assert_eq!(
+            dispatch_type_force_new_session_default(Some("consultation")),
+            None
+        );
+        assert_eq!(dispatch_type_force_new_session_default(None), None);
+    }
+
+    #[test]
+    fn create_dispatch_core_injects_fresh_session_default_for_implementation() {
+        let db = test_db();
+        seed_card(&db, "card-session-default", "ready");
+
+        let (dispatch_id, _, _) = create_dispatch_core(
+            &db,
+            "card-session-default",
+            "agent-1",
+            "implementation",
+            "Fresh implementation",
+            &json!({"key": "value"}),
+        )
+        .unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        let context: String = conn
+            .query_row(
+                "SELECT context FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_json: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(context_json["force_new_session"], true);
+        assert_eq!(context_json["key"], "value");
+    }
+
+    #[test]
+    fn create_dispatch_core_keeps_explicit_session_override() {
+        let db = test_db();
+        seed_card(&db, "card-session-override", "ready");
+
+        let (dispatch_id, _, _) = create_dispatch_core(
+            &db,
+            "card-session-override",
+            "agent-1",
+            "implementation",
+            "Warm override",
+            &json!({"force_new_session": false}),
+        )
+        .unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        let context: String = conn
+            .query_row(
+                "SELECT context FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_json: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(context_json["force_new_session"], false);
+    }
+
+    #[test]
+    fn create_dispatch_core_injects_warm_resume_default_for_review_decision() {
+        let db = test_db();
+        seed_card(&db, "card-session-review-decision", "review");
+
+        let (dispatch_id, _, _) = create_dispatch_core(
+            &db,
+            "card-session-review-decision",
+            "agent-1",
+            "review-decision",
+            "Warm review decision",
+            &json!({"verdict": "improve"}),
+        )
+        .unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        let context: String = conn
+            .query_row(
+                "SELECT context FROM task_dispatches WHERE id = ?1",
+                [&dispatch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let context_json: serde_json::Value = serde_json::from_str(&context).unwrap();
+        assert_eq!(context_json["force_new_session"], false);
+        assert_eq!(context_json["verdict"], "improve");
     }
 
     #[test]
@@ -2779,6 +3104,80 @@ mod tests {
                 ),
             ],
             "dispatch event log must preserve ordered status transitions"
+        );
+    }
+
+    #[test]
+    fn dispatch_status_transitions_enqueue_status_reaction_outbox_entries() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-reaction-outbox", "ready");
+
+        let dispatch = create_dispatch(
+            &db,
+            &engine,
+            "card-reaction-outbox",
+            "agent-1",
+            "implementation",
+            "Reaction trail",
+            &json!({}),
+        )
+        .unwrap();
+        let dispatch_id = dispatch["id"].as_str().unwrap().to_string();
+
+        {
+            let conn = db.separate_conn().unwrap();
+            set_dispatch_status_on_conn(
+                &conn,
+                &dispatch_id,
+                "dispatched",
+                None,
+                "test_dispatch_outbox",
+                Some(&["pending"]),
+                false,
+            )
+            .unwrap();
+        }
+
+        let conn = db.separate_conn().unwrap();
+        assert_eq!(count_status_reaction_outbox(&conn, &dispatch_id), 1);
+
+        conn.execute(
+            "UPDATE dispatch_outbox
+             SET status = 'done', processed_at = datetime('now')
+             WHERE dispatch_id = ?1 AND action = 'status_reaction'",
+            [&dispatch_id],
+        )
+        .unwrap();
+
+        set_dispatch_status_on_conn(
+            &conn,
+            &dispatch_id,
+            "completed",
+            Some(&json!({"completion_source":"test_complete"})),
+            "test_complete",
+            Some(&["dispatched"]),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(count_status_reaction_outbox(&conn, &dispatch_id), 2);
+
+        set_dispatch_status_on_conn(
+            &conn,
+            &dispatch_id,
+            "completed",
+            Some(&json!({"completion_source":"test_complete"})),
+            "test_complete_duplicate",
+            Some(&["completed"]),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            count_status_reaction_outbox(&conn, &dispatch_id),
+            2,
+            "duplicate terminal transition must not enqueue extra status sync work"
         );
     }
 
@@ -3183,6 +3582,52 @@ mod tests {
     }
 
     #[test]
+    fn review_context_includes_merge_base_for_branch_review() {
+        let db = test_db();
+        seed_card(&db, "card-review-merge-base", "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let fork_point = crate::services::platform::git_head_commit(repo_dir).unwrap();
+        let wt_dir = repo.path().join("wt-542");
+        let wt_path = wt_dir.to_str().unwrap();
+
+        run_git(repo_dir, &["worktree", "add", wt_path, "-b", "wt/fix-542"]);
+        let reviewed_commit = git_commit(wt_path, "fix: branch-only review target");
+        let main_commit = git_commit(repo_dir, "chore: main advanced after fork");
+        assert_ne!(fork_point, main_commit);
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-merge-base', 'card-review-merge-base', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": wt_path,
+                    "completed_branch": "wt/fix-542",
+                    "completed_commit": reviewed_commit.clone(),
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-merge-base", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+
+        assert_eq!(parsed["reviewed_commit"], reviewed_commit);
+        assert_eq!(parsed["branch"], "wt/fix-542");
+        assert_eq!(parsed["merge_base"], fork_point);
+    }
+
+    #[test]
     fn review_context_accepts_latest_work_dispatch_commit_for_same_issue() {
         let db = test_db();
         seed_card(&db, "card-review-match", "review");
@@ -3376,5 +3821,63 @@ mod tests {
                 .contains("repo-root HEAD fallback is unsafe while tracked changes exist"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn review_context_includes_quality_checklist_and_verdict_guidance() {
+        let db = test_db();
+        seed_card(&db, "card-review-quality", "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let completed_commit = crate::services::platform::git_head_commit(repo_dir).unwrap();
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-quality', 'card-review-quality', 'agent-1', 'implementation', 'completed',
+                'Done', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": repo_dir,
+                    "completed_branch": "main",
+                    "completed_commit": completed_commit,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            build_review_context(&db, "card-review-quality", "agent-1", &json!({})).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        let checklist = parsed["review_quality_checklist"]
+            .as_array()
+            .expect("checklist array must exist");
+
+        assert_eq!(
+            parsed["review_quality_scope_reminder"],
+            REVIEW_QUALITY_SCOPE_REMINDER
+        );
+        assert_eq!(
+            parsed["review_verdict_guidance"],
+            REVIEW_VERDICT_IMPROVE_GUIDANCE
+        );
+        assert_eq!(checklist.len(), REVIEW_QUALITY_CHECKLIST.len());
+        assert!(checklist.iter().any(|item| {
+            item.as_str()
+                .unwrap_or_default()
+                .contains("race condition / 동시성 이슈")
+        }));
+        assert!(checklist.iter().any(|item| {
+            item.as_str()
+                .unwrap_or_default()
+                .contains("에러 핸들링 누락")
+        }));
     }
 }

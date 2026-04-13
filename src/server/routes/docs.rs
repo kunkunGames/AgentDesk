@@ -126,6 +126,31 @@ fn body_param(kind: &'static str, required: bool, description: &'static str) -> 
     }
 }
 
+fn header_param(required: bool, description: &'static str) -> ParamDoc {
+    ParamDoc {
+        location: "header",
+        kind: "string",
+        required,
+        description,
+        enum_values: None,
+        default: None,
+    }
+}
+
+fn explicit_bearer_header_param() -> ParamDoc {
+    header_param(
+        true,
+        "Explicit Authorization: Bearer <token> header. Same-origin auth bypass is not accepted for this PMD-only endpoint.",
+    )
+}
+
+fn kanban_manager_channel_header_param() -> ParamDoc {
+    header_param(
+        true,
+        "X-Channel-Id must match the current kanban_manager_channel_id. Discover that value via GET /api/settings/config before calling this endpoint.",
+    )
+}
+
 fn category_description(category: &str) -> &'static str {
     match category {
         "api-friction" => {
@@ -275,6 +300,12 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "/api/agents/{id}/turn/stop",
             "agents",
             "Stop the active turn for agent",
+        ),
+        ep(
+            "GET",
+            "/api/agents/{id}/transcripts",
+            "agents",
+            "List recent completed turn transcripts for agent",
         ),
         ep(
             "GET",
@@ -486,6 +517,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
+            ("authorization", explicit_bearer_header_param()),
+            ("x-channel-id", kanban_manager_channel_header_param()),
             (
                 "reason",
                 body_param("string", false, "Why the rereview is needed"),
@@ -502,6 +535,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "Batch rereview by GitHub issue number",
         )
         .with_params([
+            ("authorization", explicit_bearer_header_param()),
+            ("x-channel-id", kanban_manager_channel_header_param()),
             (
                 "issues",
                 body_param("number[]", true, "GitHub issue numbers to rereview"),
@@ -522,6 +557,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "Force-transition multiple cards",
         )
         .with_params([
+            ("authorization", explicit_bearer_header_param()),
+            ("x-channel-id", kanban_manager_channel_header_param()),
             (
                 "issue_numbers",
                 body_param("number[]", false, "GitHub issue numbers to resolve into cards"),
@@ -553,6 +590,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
+            ("authorization", explicit_bearer_header_param()),
+            ("x-channel-id", kanban_manager_channel_header_param()),
             (
                 "review_status",
                 body_param("string", false, "Optional review status to set after reopen"),
@@ -584,6 +623,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
+            ("authorization", explicit_bearer_header_param()),
+            ("x-channel-id", kanban_manager_channel_header_param()),
             ("status", body_param("string", true, "Target pipeline status")),
             (
                 "cancel_dispatches",
@@ -885,6 +926,12 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "GET",
+            "/api/pipeline/cards/{cardId}/transcripts",
+            "pipeline",
+            "List completed turn transcripts linked to card dispatches",
+        ),
+        ep(
+            "GET",
             "/api/pipeline/config/default",
             "pipeline",
             "Get default pipeline config",
@@ -1094,6 +1141,19 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                         "label_en": "Merge Strategy"
                     },
                     {
+                        "key": "merge_strategy_mode",
+                        "value": "pr-always",
+                        "default": "direct-first",
+                        "baseline": "direct-first",
+                        "baseline_source": "hardcoded",
+                        "override_active": true,
+                        "editable": true,
+                        "restart_behavior": "persist-live-override",
+                        "category": "automation",
+                        "label_ko": "자동 머지 경로",
+                        "label_en": "Merge Strategy Mode"
+                    },
+                    {
                         "key": "server_port",
                         "value": "8791",
                         "default": "8791",
@@ -1118,6 +1178,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_example(
             json!({
                 "merge_strategy": "merge",
+                "merge_strategy_mode": "pr-always",
                 "max_review_rounds": 5
             }),
             json!({"ok": true, "updated": 2, "rejected": []}),

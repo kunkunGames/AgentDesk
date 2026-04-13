@@ -1,12 +1,60 @@
 import { describe, expect, it } from "vitest";
 import type { GitHubComment } from "../../api";
-import { parseGitHubCommentTimeline } from "./kanban-utils";
+import type { KanbanCard } from "../../types";
+import {
+  coalesceGitHubCommentTimeline,
+  getCardDwellBadge,
+  getCardStateEnteredAt,
+  parseGitHubCommentTimeline,
+} from "./kanban-utils";
 
-function makeComment(body: string, author = "itismyfield"): GitHubComment {
+function makeComment(
+  body: string,
+  author = "itismyfield",
+  createdAt = "2026-03-23T09:00:00Z",
+): GitHubComment {
   return {
     author: { login: author },
     body,
-    createdAt: "2026-03-23T09:00:00Z",
+    createdAt,
+  };
+}
+
+function makeCard(overrides: Partial<KanbanCard> = {}): KanbanCard {
+  return {
+    id: "card-1",
+    title: "Test card",
+    description: null,
+    status: "in_progress",
+    github_repo: "itismyfield/AgentDesk",
+    owner_agent_id: null,
+    requester_agent_id: null,
+    assignee_agent_id: "agent-1",
+    parent_card_id: null,
+    latest_dispatch_id: "dispatch-1",
+    sort_order: 10,
+    priority: "medium",
+    depth: 0,
+    blocked_reason: null,
+    review_notes: null,
+    github_issue_number: 540,
+    github_issue_url: null,
+    metadata_json: null,
+    pipeline_stage_id: null,
+    review_status: null,
+    created_at: 1_710_000_000_000,
+    updated_at: 1_710_000_000_000,
+    started_at: 1_710_000_000_000,
+    requested_at: 1_709_999_700_000,
+    review_entered_at: null,
+    completed_at: null,
+    latest_dispatch_status: "in_progress",
+    latest_dispatch_title: "dispatch",
+    latest_dispatch_type: "implementation",
+    latest_dispatch_result_summary: null,
+    latest_dispatch_chain_depth: 0,
+    child_count: 0,
+    ...overrides,
   };
 }
 
@@ -279,6 +327,102 @@ assign_issue 경로가 description을 metadata에만 저장합니다.
       kind: "work",
       status: "completed",
       title: "#53 작업 완료",
+    });
+  });
+});
+
+describe("coalesceGitHubCommentTimeline", () => {
+  it("같은 작성자의 연속 일반 변경 이벤트를 2분 윈도우로 합산한다", () => {
+    const parsed = parseGitHubCommentTimeline([
+      makeComment("상태 변경: ready → in_progress", "alice", "2026-03-23T09:00:00Z"),
+      makeComment("메타데이터 업데이트: priority=high", "alice", "2026-03-23T09:01:10Z"),
+      makeComment("라벨 변경: bug, urgent", "alice", "2026-03-23T09:01:40Z"),
+    ]);
+
+    const coalesced = coalesceGitHubCommentTimeline(parsed);
+
+    expect(coalesced).toHaveLength(1);
+    expect(coalesced[0]).toMatchObject({
+      author: "alice",
+      coalesced: true,
+    });
+    expect(coalesced[0]?.entries).toHaveLength(3);
+  });
+
+  it("에이전트 할당 변경 같은 중요 이벤트는 합산하지 않는다", () => {
+    const parsed = parseGitHubCommentTimeline([
+      makeComment("상태 변경: ready → in_progress", "alice", "2026-03-23T09:00:00Z"),
+      makeComment("에이전트 할당 변경: alice → bob", "alice", "2026-03-23T09:00:40Z"),
+      makeComment("메타데이터 업데이트: priority=high", "alice", "2026-03-23T09:01:20Z"),
+    ]);
+
+    const coalesced = coalesceGitHubCommentTimeline(parsed);
+
+    expect(coalesced).toHaveLength(3);
+    expect(coalesced.every((entry) => !entry.coalesced)).toBe(true);
+  });
+
+  it("2분 윈도우를 넘기면 같은 작성자여도 새 그룹으로 분리한다", () => {
+    const parsed = parseGitHubCommentTimeline([
+      makeComment("상태 변경: ready → in_progress", "alice", "2026-03-23T09:00:00Z"),
+      makeComment("메타데이터 업데이트: priority=high", "alice", "2026-03-23T09:02:30Z"),
+    ]);
+
+    const coalesced = coalesceGitHubCommentTimeline(parsed);
+
+    expect(coalesced).toHaveLength(2);
+    expect(coalesced.every((entry) => !entry.coalesced)).toBe(true);
+  });
+});
+
+describe("getCardStateEnteredAt", () => {
+  it("review 상태에서는 review_entered_at 문자열을 우선 사용한다", () => {
+    const card = makeCard({
+      status: "review",
+      started_at: 1_710_000_000_000,
+      updated_at: 1_710_000_600_000,
+      review_entered_at: "2026-04-13T00:15:00Z",
+    });
+
+    expect(getCardStateEnteredAt(card)).toBe(new Date("2026-04-13T00:15:00Z").getTime());
+  });
+});
+
+describe("getCardDwellBadge", () => {
+  const tr = (ko: string, _en: string) => ko;
+
+  it("requested 카드는 15분 이후 warm 톤으로 바뀐다", () => {
+    const enteredAt = Date.UTC(2026, 3, 13, 0, 0, 0);
+    const card = makeCard({
+      status: "requested",
+      requested_at: enteredAt,
+      updated_at: enteredAt,
+      started_at: null,
+    });
+
+    const badge = getCardDwellBadge(card, enteredAt + 16 * 60_000, tr);
+
+    expect(badge).toMatchObject({
+      label: "체류",
+      tone: "warm",
+      detail: "16분",
+    });
+  });
+
+  it("review 카드는 review_entered_at 기준으로 stale 판정한다", () => {
+    const enteredAt = Date.UTC(2026, 3, 13, 0, 0, 0);
+    const card = makeCard({
+      status: "review",
+      started_at: enteredAt - 3 * 60 * 60_000,
+      updated_at: enteredAt - 30 * 60_000,
+      review_entered_at: new Date(enteredAt).toISOString(),
+    });
+
+    const badge = getCardDwellBadge(card, enteredAt + 121 * 60_000, tr);
+
+    expect(badge).toMatchObject({
+      tone: "stale",
+      detail: "2시간",
     });
   });
 });

@@ -68,11 +68,12 @@ function _autoMergeWorktreeBranch(cardId) {
   }
 
   // Try merge
-  agentdesk.log.info("[kanban] #401: merging " + branch + " into main");
+  agentdesk.log.warn("[kanban] #401: merging " + branch + " into main (mainRepo=" + mainRepo + ", repoDir=" + repoDir + ")");
   var mergeResult = agentdesk.exec("git", [
     "-C", mainRepo,
     "merge", branch, "--no-edit"
   ]);
+  agentdesk.log.warn("[kanban] #401: merge result for " + branch + ": " + JSON.stringify(mergeResult));
 
   if (mergeResult && mergeResult.indexOf("CONFLICT") >= 0) {
     // Abort failed merge
@@ -152,6 +153,20 @@ function _mergeCardMetadata(cardId, patch) {
     [JSON.stringify(meta), cardId]
   );
   return meta;
+}
+
+function _findAutoQueueEntriesByDispatch(dispatchId, liveOnly) {
+  var statusClause = liveOnly
+    ? "e.status IN ('pending', 'dispatched')"
+    : "e.status = 'dispatched'";
+  return agentdesk.db.query(
+    "SELECT DISTINCT e.id, e.agent_id FROM auto_queue_entries e " +
+    "LEFT JOIN auto_queue_entry_dispatch_history h " +
+    "  ON h.entry_id = e.id AND h.dispatch_id = ? " +
+    "WHERE " + statusClause + " " +
+    "  AND (e.dispatch_id = ? OR h.dispatch_id IS NOT NULL)",
+    [dispatchId, dispatchId]
+  );
 }
 
 function _runPreflight(cardId) {
@@ -375,7 +390,7 @@ var rules = {
     if (!dispatch.kanban_card_id) return;
 
     var cards = agentdesk.db.query(
-      "SELECT id, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
+      "SELECT id, title, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
       [dispatch.kanban_card_id]
     );
     if (cards.length === 0) return;
@@ -412,22 +427,26 @@ var rules = {
           "UPDATE kanban_cards SET metadata = ? WHERE id = ?",
           [JSON.stringify(meta), dispatch.kanban_card_id]
         );
-        var aqEntries = agentdesk.db.query(
-          "SELECT id, agent_id FROM auto_queue_entries WHERE dispatch_id = ? AND status = 'dispatched' LIMIT 1",
-          [dispatch.id]
-        );
+        var aqEntries = _findAutoQueueEntriesByDispatch(dispatch.id, false);
         if (aqEntries.length > 0) {
           try {
             var nextDispatchId = agentdesk.dispatch.create(
               dispatch.kanban_card_id,
               aqEntries[0].agent_id,
               "implementation",
-              card.title || "Implementation"
+              card.title || "Implementation",
+              {
+                auto_queue: true,
+                entry_id: aqEntries[0].id,
+                parent_dispatch_id: dispatch.id
+              }
             );
             if (nextDispatchId) {
-              agentdesk.db.execute(
-                "UPDATE auto_queue_entries SET dispatch_id = ?, dispatched_at = datetime('now'), completed_at = NULL WHERE id = ? AND status = 'dispatched'",
-                [nextDispatchId, aqEntries[0].id]
+              agentdesk.autoQueue.updateEntryStatus(
+                aqEntries[0].id,
+                "dispatched",
+                "consultation_resume",
+                { dispatchId: nextDispatchId }
               );
               agentdesk.log.info("[preflight] Consultation resolved for " + dispatch.kanban_card_id + " — resumed implementation dispatch " + nextDispatchId);
             }
@@ -462,10 +481,14 @@ var rules = {
         "UPDATE kanban_cards SET metadata = ?, blocked_reason = NULL WHERE id = ?",
         [JSON.stringify(noopMeta), dispatch.kanban_card_id]
       );
-      agentdesk.db.execute(
-        "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') WHERE dispatch_id = ? AND status IN ('pending', 'dispatched')",
-        [dispatch.id]
-      );
+      var noopEntries = _findAutoQueueEntriesByDispatch(dispatch.id, true);
+      for (var ne = 0; ne < noopEntries.length; ne++) {
+        agentdesk.autoQueue.updateEntryStatus(
+          noopEntries[ne].id,
+          "done",
+          "dispatch_noop"
+        );
+      }
       agentdesk.kanban.setReviewStatus(card.id, null, {suggestion_pending_at: null, awaiting_dod_at: null});
       agentdesk.reviewState.sync(card.id, "idle");
       agentdesk.kanban.setStatus(card.id, noopCardStatusTarget, true);
@@ -593,10 +616,17 @@ var rules = {
         // Move to done without implementation dispatch
         agentdesk.kanban.setStatus(payload.card_id, "done", true); // force
         // Clean up any auto-queue entries so the run doesn't stall
-        agentdesk.db.execute(
-          "UPDATE auto_queue_entries SET status = 'skipped' WHERE kanban_card_id = ? AND status = 'pending'",
+        var pendingEntries = agentdesk.db.query(
+          "SELECT id FROM auto_queue_entries WHERE kanban_card_id = ? AND status = 'pending'",
           [payload.card_id]
         );
+        for (var pi = 0; pi < pendingEntries.length; pi++) {
+          agentdesk.autoQueue.updateEntryStatus(
+            pendingEntries[pi].id,
+            "skipped",
+            "preflight_invalid"
+          );
+        }
         agentdesk.log.info("[preflight] Card " + payload.card_id + " → done (" + preflight.status + "): " + preflight.summary);
       } else if (preflight.status === "consult_required") {
         // Store consultation status — auto-queue tick will handle consultation dispatch creation
@@ -637,8 +667,7 @@ var rules = {
         [payload.card_id]
       );
 
-      // #401: Auto-merge worktree branch on done transition
-      _autoMergeWorktreeBranch(payload.card_id);
+      // #401: Auto-merge now handled by merge-automation.js (direct merge + PR fallback)
 
       var retrospectiveResult = agentdesk.runtime.recordCardRetrospective(
         payload.card_id,
