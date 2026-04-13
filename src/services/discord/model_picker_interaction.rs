@@ -10,6 +10,17 @@ pub(super) fn build_model_picker_close_response() -> serenity::CreateInteraction
     serenity::CreateInteractionResponse::Acknowledge
 }
 
+pub(super) fn build_model_picker_saved_response(
+    content: impl Into<String>,
+) -> serenity::CreateInteractionResponse {
+    serenity::CreateInteractionResponse::UpdateMessage(
+        serenity::CreateInteractionResponseMessage::new()
+            .content(content)
+            .embeds(Vec::new())
+            .components(Vec::new()),
+    )
+}
+
 async fn close_model_picker_interaction(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
