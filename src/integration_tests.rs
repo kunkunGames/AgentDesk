@@ -4807,6 +4807,270 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scenario_211_pr_always_creates_pr_without_direct_merge_and_waits_for_codex_approval() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-pr-always"),
+                stdout: "https://github.com/test/repo/pull/902",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-pr-always",
+            },
+            MockGhReply {
+                key: "run:list",
+                contains: Some("--branch wt/card-211-pr-always"),
+                stdout: "[{\"databaseId\":722,\"status\":\"completed\",\"conclusion\":\"success\",\"headSha\":\"feature-sha-211-pr-always\",\"event\":\"pull_request\"}]",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json author"),
+                stdout: "itismyfield",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/902/reviews",
+                contains: None,
+                stdout: "[]",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-pr-always"]);
+
+        let worktree_path = worktrees_dir.join("card-211-pr-always");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-pr-always",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: pr-always path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-pr-always", "done", "test/repo", 215, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(&db, "merge_strategy_mode", "pr-always");
+        set_kv(&db, "merge_allowed_authors", "itismyfield");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-pr-always",
+            "card-211-pr-always",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-pr-always",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-pr-always"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        let merged = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &feature_commit,
+                "origin/main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            !merged.success(),
+            "pr-always must skip direct merge and leave the feature commit out of origin/main"
+        );
+
+        assert_eq!(get_card_status(&db, "card-211-pr-always"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(pr_tracking_pr_number(&db, "card-211-pr-always"), Some(902));
+        assert_eq!(
+            kv_value(&db, "merge_strategy_mode:card:card-211-pr-always").as_deref(),
+            Some("pr-always")
+        );
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-pr-always'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        set_kv(&db, "merge_strategy_mode", "direct-first");
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("merge")
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-always").as_deref(),
+            Some("merge")
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr create --repo test/repo --base main --head wt/card-211-pr-always"),
+            "pr-always must create a PR for the tracked branch"
+        );
+        assert!(
+            !log.contains("pr merge 902"),
+            "pr-always must wait for Codex approval even if the global mode changes later"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_pr_always_merges_after_codex_approval_even_if_setting_toggles() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-pr-approved"),
+                stdout: "https://github.com/test/repo/pull/903",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-pr-approved",
+            },
+            MockGhReply {
+                key: "run:list",
+                contains: Some("--branch wt/card-211-pr-approved"),
+                stdout: "[{\"databaseId\":723,\"status\":\"completed\",\"conclusion\":\"success\",\"headSha\":\"feature-sha-211-pr-approved\",\"event\":\"pull_request\"}]",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json author"),
+                stdout: "itismyfield",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/903/reviews",
+                contains: None,
+                stdout: "[{\"id\":9004,\"state\":\"APPROVED\",\"body\":\"LGTM\",\"submitted_at\":\"2026-04-13T02:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
+            },
+            MockGhReply {
+                key: "pr:merge",
+                contains: Some("903"),
+                stdout: "merged",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-pr-approved"]);
+
+        let worktree_path = worktrees_dir.join("card-211-pr-approved");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-pr-approved",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "approved\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: pr-always approval path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-211-pr-approved", "done", "test/repo", 216, None);
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(&db, "merge_strategy_mode", "pr-always");
+        set_kv(&db, "merge_allowed_authors", "itismyfield");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-pr-approved",
+            "card-211-pr-approved",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-pr-approved",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-pr-approved"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        set_kv(&db, "merge_strategy_mode", "direct-first");
+
+        engine
+            .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-pr-approved").as_deref(),
+            Some("post-merge-cleanup")
+        );
+        assert_eq!(
+            kv_value(&db, "merge_pending:card-211-pr-approved").as_deref(),
+            Some("903")
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr merge 903 --auto --squash --repo test/repo"),
+            "approved pr-always cards must enable auto-merge even after the global mode toggles"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scenario_211_terminal_direct_merge_conflict_creates_pr_and_wait_ci() {
         let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
             MockGhReply {
