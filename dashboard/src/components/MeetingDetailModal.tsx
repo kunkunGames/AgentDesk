@@ -1,9 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { RoundTableMeeting, RoundTableEntry } from "../types";
-import MeetingProviderFlow, {
-  formatProviderFlow,
-  providerFlowCaption,
-} from "./MeetingProviderFlow";
+import { formatProviderFlow } from "./MeetingProviderFlow";
 import {
   formatMeetingReferenceHash,
   getDisplayMeetingReferenceHashes,
@@ -149,31 +146,6 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
 
         {/* Body */}
         <div className="flex-1 overflow-auto p-3 sm:p-5 space-y-4">
-          {(meeting.primary_provider || meeting.reviewer_provider) && (
-            <div
-              className="rounded-2xl p-4 space-y-2"
-              style={{
-                background: "rgba(148,163,184,0.08)",
-                border: "1px solid rgba(148,163,184,0.14)",
-              }}
-            >
-              <MeetingProviderFlow
-                primaryProvider={meeting.primary_provider}
-                reviewerProvider={meeting.reviewer_provider}
-              />
-              <div
-                className="text-xs"
-                style={{ color: "var(--th-text-muted)" }}
-              >
-                {providerFlowCaption(
-                  meeting.primary_provider,
-                  meeting.reviewer_provider,
-                  t,
-                )}
-              </div>
-            </div>
-          )}
-
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <MetaCard
               label={t({ ko: "상태", en: "Status" })}
@@ -245,18 +217,6 @@ export default function MeetingDetailModal({ meeting, onClose }: Props) {
                 >
                   Summary
                 </div>
-                {(meeting.primary_provider || meeting.reviewer_provider) && (
-                  <div
-                    className="text-xs"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {providerFlowCaption(
-                      meeting.primary_provider,
-                      meeting.reviewer_provider,
-                      t,
-                    )}
-                  </div>
-                )}
               </div>
               <MarkdownContent content={meeting.summary} className="text-sm" />
             </div>

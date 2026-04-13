@@ -30,7 +30,6 @@ import {
 import MeetingDetailModal from "./MeetingDetailModal";
 import MeetingProviderFlow, {
   getProviderMeta,
-  providerFlowCaption,
 } from "./MeetingProviderFlow";
 import {
   formatMeetingReferenceHash,
@@ -139,6 +138,12 @@ function getMeetingIssueState(
   if (!result) return "pending";
   if (result.discarded) return "discarded";
   return result.ok ? "created" : "failed";
+}
+
+function normalizeSelectionReason(reason: string | null | undefined): string {
+  const trimmed = (reason ?? "").trim();
+  if (!trimmed) return "";
+  return trimmed.replace(/^선정 사유:\s*/u, "").trim();
 }
 
 function parseStoredFixedParticipants(): string[] {
@@ -1336,6 +1341,7 @@ export default function MeetingMinutesView({
             !isSavingRepo;
           const meetingHashDisplay = formatMeetingReferenceHash(m.meeting_hash);
           const threadHashDisplay = formatMeetingReferenceHash(m.thread_hash);
+          const selectionReason = normalizeSelectionReason(m.selection_reason);
 
           return (
             <div
@@ -1378,18 +1384,6 @@ export default function MeetingMinutesView({
                         {m.total_rounds}R
                       </span>
                     )}
-                    {getMeetingReferenceHashes(m).map((hash) => (
-                      <span
-                        key={hash}
-                        className="max-w-full break-all rounded-full px-2 py-0.5 font-mono text-[11px]"
-                        style={{
-                          background: "rgba(148,163,184,0.12)",
-                          color: "var(--th-text-muted)",
-                        }}
-                      >
-                        {hash}
-                      </span>
-                    ))}
                   </div>
                 </div>
                 <button
@@ -1467,7 +1461,7 @@ export default function MeetingMinutesView({
                 ))}
               </div>
 
-              {m.selection_reason && (
+              {selectionReason && (
                 <div
                   className="min-w-0 rounded-xl px-3 py-2 text-xs"
                   style={{
@@ -1485,27 +1479,8 @@ export default function MeetingMinutesView({
                     className="break-words [overflow-wrap:anywhere]"
                     style={{ color: "var(--th-text-muted)" }}
                   >
-                    {m.selection_reason}
+                    {selectionReason}
                   </span>
-                </div>
-              )}
-
-              {(m.primary_provider || m.reviewer_provider) && (
-                <div className="min-w-0 space-y-1.5 overflow-hidden">
-                  <MeetingProviderFlow
-                    primaryProvider={m.primary_provider}
-                    reviewerProvider={m.reviewer_provider}
-                  />
-                  <div
-                    className="break-words text-xs [overflow-wrap:anywhere]"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {providerFlowCaption(
-                      m.primary_provider,
-                      m.reviewer_provider,
-                      t,
-                    )}
-                  </div>
                 </div>
               )}
 
@@ -1538,18 +1513,6 @@ export default function MeetingMinutesView({
                       >
                         {t({ ko: "PMD 요약", en: "PMD Summary" })}
                       </div>
-                      {(m.primary_provider || m.reviewer_provider) && (
-                        <div
-                          className="min-w-0 break-words text-xs [overflow-wrap:anywhere]"
-                          style={{ color: "var(--th-text-muted)" }}
-                        >
-                          {providerFlowCaption(
-                            m.primary_provider,
-                            m.reviewer_provider,
-                            t,
-                          )}
-                        </div>
-                      )}
                     </div>
                     <MarkdownContent content={m.summary} />
                   </div>

@@ -6,6 +6,7 @@ use axum::{
 use poise::serenity_prelude::ChannelId;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 
 use super::AppState;
 use crate::services::discord::{health, meeting, settings};
@@ -55,6 +56,480 @@ pub struct UpsertMeetingBody {
     pub entries: Option<Vec<MeetingEntryBody>>,
 }
 
+fn normalize_selection_reason(value: &str) -> Option<String> {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = compact.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed
+        .strip_prefix("선정 사유:")
+        .map(str::trim)
+        .filter(|inner| !inner.is_empty())
+        .unwrap_or(trimmed);
+
+    Some(normalized.to_string())
+}
+
+fn selection_reason_needs_fallback(value: Option<&str>) -> bool {
+    let Some(reason) = value.and_then(normalize_selection_reason) else {
+        return true;
+    };
+
+    let compact = reason.split_whitespace().collect::<String>();
+    compact.contains("안건적합도와후보메타데이터적합도")
+        || compact.contains("고정전문에이전트조건을함께반영")
+        || compact.contains("커버리지를우선해자동구성했어")
+        || compact.contains("자동구성했어")
+        || (reason.starts_with("안건의 ")
+            && reason.contains("축을 기준으로")
+            && reason.contains("조합으로 정리했어"))
+        || (!reason.contains('(') && reason.chars().count() <= 48)
+}
+
+fn tokenize_selection_reason_text(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            if current.chars().count() >= 2 {
+                tokens.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+
+    if current.chars().count() >= 2 {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn compact_reason_fragment(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
+    let compact: String = chars.by_ref().take(24).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
+    }
+}
+
+fn clean_reason_signal_fragment(value: &str) -> Option<String> {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut trimmed = compact.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for prefix in ["BLOCKED.", "BLOCKED:", "CONSENSUS:", "이견:", "합의:"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            trimmed = rest.trim();
+        }
+    }
+
+    trimmed = trimmed.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '“' | '”'));
+    trimmed = trimmed.trim_start_matches(|ch: char| !ch.is_alphanumeric());
+    trimmed = trimmed.trim_end_matches(|ch: char| !ch.is_alphanumeric());
+
+    if trimmed.chars().count() < 3 {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn transcript_signal_candidates_from_content(content: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut push_value = |value: &str| {
+        let Some(cleaned) = clean_reason_signal_fragment(value) else {
+            return;
+        };
+        let key = cleaned.to_lowercase();
+        if seen.insert(key) {
+            candidates.push(cleaned);
+        }
+    };
+
+    let mut in_backticks = false;
+    let mut backtick_buffer = String::new();
+    for ch in content.chars() {
+        if ch == '`' {
+            if in_backticks {
+                push_value(&backtick_buffer);
+                backtick_buffer.clear();
+            }
+            in_backticks = !in_backticks;
+            continue;
+        }
+        if in_backticks {
+            backtick_buffer.push(ch);
+        }
+    }
+
+    for fragment in content.split(|ch| ['\n', '.', '!', '?', ',', ';', ':'].contains(&ch)) {
+        push_value(fragment);
+    }
+
+    candidates
+}
+
+fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn selection_signal_candidates_from_expert(expert: &serde_json::Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    let mut push_value = |value: &str| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = trimmed.to_lowercase();
+        if seen.insert(key) {
+            candidates.push(trimmed.to_string());
+        }
+    };
+
+    for value in json_string_array(expert.get("task_types")) {
+        push_value(&value);
+    }
+    for value in json_string_array(expert.get("strengths")) {
+        push_value(&value);
+    }
+    for value in json_string_array(expert.get("keywords")) {
+        push_value(&value);
+    }
+    if let Some(summary) = expert
+        .get("domain_summary")
+        .and_then(|value| value.as_str())
+    {
+        for fragment in summary.split(|ch| ['.', '\n', ',', ';', '·', '/', '|'].contains(&ch)) {
+            push_value(fragment);
+        }
+    }
+
+    candidates
+}
+
+fn score_signal_against_agenda(
+    signal: &str,
+    agenda_lower: &str,
+    agenda_tokens: &HashSet<String>,
+) -> usize {
+    if agenda_lower.is_empty() {
+        return 0;
+    }
+
+    let signal_lower = signal.trim().to_lowercase();
+    if signal_lower.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0;
+    if agenda_lower.contains(&signal_lower) || signal_lower.contains(agenda_lower) {
+        score += 6;
+    }
+
+    let matched_tokens = tokenize_selection_reason_text(&signal_lower)
+        .into_iter()
+        .filter(|token| agenda_tokens.contains(token))
+        .count();
+
+    score + matched_tokens * 3
+}
+
+fn score_signal_for_reason(
+    signal: &str,
+    agenda_lower: &str,
+    agenda_tokens: &HashSet<String>,
+) -> usize {
+    let trimmed = signal.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let mut score = score_signal_against_agenda(trimmed, agenda_lower, agenda_tokens);
+    let length = trimmed.chars().count();
+
+    if (4..=36).contains(&length) {
+        score += 2;
+    }
+    if trimmed.chars().any(|ch| ch.is_ascii_digit()) {
+        score += 3;
+    }
+    if trimmed.chars().any(|ch| ch.is_ascii_uppercase()) {
+        score += 1;
+    }
+    if trimmed.contains("Top") || trimmed.contains("TOP") {
+        score += 2;
+    }
+    if trimmed.split_whitespace().count() <= 7 {
+        score += 1;
+    }
+
+    score
+}
+
+fn build_expert_reason_clause(
+    expert: Option<&serde_json::Value>,
+    transcript_signals: &[String],
+    agenda_lower: &str,
+    agenda_tokens: &HashSet<String>,
+    fallback_label: &str,
+) -> (usize, String, Option<String>) {
+    let display_name = expert
+        .and_then(|value| value.get("display_name"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_label);
+
+    let mut signal_candidates = Vec::new();
+    let mut seen_signals = HashSet::new();
+    let mut push_signal = |signal: String| {
+        let trimmed = signal.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let key = trimmed.to_lowercase();
+        if seen_signals.insert(key) {
+            signal_candidates.push(trimmed.to_string());
+        }
+    };
+
+    if let Some(expert) = expert {
+        for signal in selection_signal_candidates_from_expert(expert) {
+            push_signal(signal);
+        }
+    }
+    for signal in transcript_signals {
+        push_signal(signal.clone());
+    }
+
+    let mut scored_signals: Vec<(usize, String)> = signal_candidates
+        .iter()
+        .cloned()
+        .map(|signal| {
+            (
+                score_signal_for_reason(&signal, agenda_lower, agenda_tokens),
+                signal,
+            )
+        })
+        .collect();
+
+    scored_signals.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.chars().count().cmp(&b.1.chars().count()))
+    });
+
+    let mut detail_parts = Vec::new();
+    let mut detail_seen = HashSet::new();
+    let mut best_score = 0;
+    for (score, signal) in scored_signals {
+        if score == 0 {
+            continue;
+        }
+        if best_score == 0 {
+            best_score = score;
+        }
+        let compact = compact_reason_fragment(&signal);
+        let key = compact.to_lowercase();
+        if detail_seen.insert(key) {
+            detail_parts.push(compact);
+        }
+        if detail_parts.len() >= 2 {
+            break;
+        }
+    }
+
+    if detail_parts.is_empty() {
+        if let Some(fallback) = signal_candidates.first().cloned() {
+            detail_parts.push(compact_reason_fragment(&fallback));
+        }
+    }
+
+    let focus = detail_parts.first().cloned();
+    let clause = if detail_parts.is_empty() {
+        display_name.to_string()
+    } else {
+        format!("{display_name}({})", detail_parts.join("·"))
+    };
+
+    (best_score, clause, focus)
+}
+
+fn derive_selection_reason_from_meeting_data(
+    agenda: &str,
+    participant_count: usize,
+    transcripts: &[serde_json::Value],
+    experts: &[serde_json::Value],
+) -> Option<String> {
+    let agenda_compact = compact_reason_fragment(agenda);
+    let agenda_lower = agenda.trim().to_lowercase();
+    let agenda_tokens: HashSet<String> =
+        tokenize_selection_reason_text(agenda).into_iter().collect();
+
+    let mut role_ids = Vec::new();
+    let mut seen_role_ids = HashSet::new();
+    let mut transcript_signals_by_role: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in transcripts {
+        if entry
+            .get("is_summary")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(role_id) = entry
+            .get("speaker_agent_id")
+            .or_else(|| entry.get("speaker_role_id"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let role_id = role_id.to_string();
+        if seen_role_ids.insert(role_id.clone()) {
+            role_ids.push(role_id.clone());
+        }
+        if let Some(content) = entry.get("content").and_then(|value| value.as_str()) {
+            let signals = transcript_signals_by_role.entry(role_id).or_default();
+            let mut seen_signals: HashSet<String> =
+                signals.iter().map(|value| value.to_lowercase()).collect();
+            for signal in transcript_signal_candidates_from_content(content) {
+                let key = signal.to_lowercase();
+                if seen_signals.insert(key) {
+                    signals.push(signal);
+                }
+            }
+        }
+    }
+
+    if role_ids.is_empty() {
+        return None;
+    }
+
+    let experts_by_id: HashMap<&str, &serde_json::Value> = experts
+        .iter()
+        .filter_map(|expert| {
+            expert
+                .get("role_id")
+                .and_then(|value| value.as_str())
+                .map(|role_id| (role_id, expert))
+        })
+        .collect();
+
+    let mut participant_clauses = Vec::new();
+    let mut focus_labels = Vec::new();
+    let mut seen_focus = HashSet::new();
+    for role_id in &role_ids {
+        let transcript_signals = transcript_signals_by_role
+            .get(role_id)
+            .cloned()
+            .unwrap_or_default();
+        let (score, clause, focus) = build_expert_reason_clause(
+            experts_by_id.get(role_id.as_str()).copied(),
+            &transcript_signals,
+            &agenda_lower,
+            &agenda_tokens,
+            role_id,
+        );
+        if let Some(label) = focus {
+            let key = label.to_lowercase();
+            if seen_focus.insert(key) {
+                focus_labels.push(label);
+            }
+        }
+        participant_clauses.push((score, clause));
+    }
+
+    participant_clauses.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut roster_labels: Vec<String> = participant_clauses
+        .iter()
+        .take(2)
+        .map(|(_, clause)| clause.clone())
+        .collect();
+    if participant_clauses.len() > roster_labels.len() {
+        roster_labels.push(format!(
+            "외 {}명",
+            participant_clauses.len() - roster_labels.len()
+        ));
+    }
+
+    let focus = if !focus_labels.is_empty() {
+        focus_labels
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    } else if !agenda_compact.is_empty() {
+        agenda_compact.clone()
+    } else {
+        "핵심 전문성".to_string()
+    };
+
+    let roster = if roster_labels.is_empty() {
+        "선정된 전문가들".to_string()
+    } else {
+        roster_labels.join(", ")
+    };
+
+    let count = participant_count.max(role_ids.len());
+    Some(format!(
+        "안건인 {agenda_compact}에 맞춰 {roster}를 묶었고, 회의 기록에선 {focus}가 반복돼 총 {count}명 조합으로 정리했어."
+    ))
+}
+
+fn apply_selection_reason_fallback(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    transcripts: &[serde_json::Value],
+) {
+    let existing = obj.get("selection_reason").and_then(|value| value.as_str());
+    if !selection_reason_needs_fallback(existing) {
+        return;
+    }
+
+    let agenda = obj
+        .get("agenda")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let participant_count = obj
+        .get("participant_names")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let experts = meeting::list_available_agent_options();
+
+    if let Some(derived) =
+        derive_selection_reason_from_meeting_data(agenda, participant_count, transcripts, &experts)
+    {
+        obj.insert("selection_reason".to_string(), json!(derived));
+    }
+}
+
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/round-table-meetings
@@ -101,8 +576,9 @@ pub async fn list_meetings(State(state): State<AppState>) -> (StatusCode, Json<s
             let transcripts = load_transcripts(&conn, &mid);
             let obj = meeting.as_object_mut().unwrap();
             obj.insert("transcripts".to_string(), json!(&transcripts));
-            obj.insert("entries".to_string(), json!(transcripts));
+            obj.insert("entries".to_string(), json!(&transcripts));
             enrich_meeting_with_issue_data(&conn, &mid, obj);
+            apply_selection_reason_fallback(obj, &transcripts);
         }
     }
 
@@ -192,8 +668,9 @@ pub async fn get_meeting(
             let transcripts = load_transcripts(&conn, &id);
             let obj = meeting.as_object_mut().unwrap();
             obj.insert("transcripts".to_string(), json!(&transcripts));
-            obj.insert("entries".to_string(), json!(transcripts));
+            obj.insert("entries".to_string(), json!(&transcripts));
             enrich_meeting_with_issue_data(&conn, &id, obj);
+            apply_selection_reason_fallback(obj, &transcripts);
             (StatusCode::OK, Json(json!({"meeting": meeting})))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => (
@@ -752,15 +1229,10 @@ pub async fn upsert_meeting(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let selection_reason = body.selection_reason.as_deref().and_then(|value| {
-        let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-        let trimmed = compact.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
+    let selection_reason = body
+        .selection_reason
+        .as_deref()
+        .and_then(normalize_selection_reason);
 
     let conn = match state.db.lock() {
         Ok(c) => c,
@@ -956,8 +1428,9 @@ pub async fn upsert_meeting(
             let transcripts = load_transcripts(&conn, &body.id);
             let obj = meeting.as_object_mut().unwrap();
             obj.insert("transcripts".to_string(), json!(&transcripts));
-            obj.insert("entries".to_string(), json!(transcripts));
+            obj.insert("entries".to_string(), json!(&transcripts));
             enrich_meeting_with_issue_data(&conn, &body.id, obj);
+            apply_selection_reason_fallback(obj, &transcripts);
             (
                 StatusCode::OK,
                 Json(json!({"ok": true, "meeting": meeting})),
@@ -1136,6 +1609,10 @@ fn meeting_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Valu
     let completed_at = row_optional_timestamp(row, 7);
     let created_at = row_optional_timestamp(row, 13).unwrap_or(started_at);
     let thread_hash = thread_id.as_deref().map(thread_query_hash);
+    let selection_reason = row
+        .get::<_, Option<String>>(12)?
+        .as_deref()
+        .and_then(normalize_selection_reason);
     Ok(json!({
         "id": meeting_id.clone(),
         "channel_id": channel_id,
@@ -1148,7 +1625,7 @@ fn meeting_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Valu
         "started_at": started_at,
         "completed_at": completed_at,
         "summary": row.get::<_, Option<String>>(8)?,
-        "selection_reason": row.get::<_, Option<String>>(12)?,
+        "selection_reason": selection_reason,
         // alias fields for frontend compatibility
         "agenda": title,
         "total_rounds": effective_rounds,

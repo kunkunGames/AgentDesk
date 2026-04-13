@@ -243,15 +243,32 @@ describe("MeetingMinutesView rendered meeting cards", () => {
     expect(markup).toContain("스레드 해시 :");
     expect(markup).toContain("#aaaaaa");
     expect(markup).toContain("#bbbbbb");
+    expect(markup.match(/#aaaaaa/g) ?? []).toHaveLength(1);
+    expect(markup.match(/#bbbbbb/g) ?? []).toHaveLength(1);
   });
 
   it("renders the compact participant selection reason on dashboard cards", () => {
-    const markup = renderMeetingListMarkup([meeting()]);
+    const markup = renderMeetingListMarkup([
+      meeting({
+        selection_reason:
+          "선정 사유: 안건 대응에 필요한 핵심 전문성을 가장 넓게 커버하는 조합으로 선정",
+      }),
+    ]);
 
     expect(markup).toContain("선정 사유:");
     expect(markup).toContain(
       "안건 대응에 필요한 핵심 전문성을 가장 넓게 커버하는 조합으로 선정",
     );
+    expect(markup.match(/선정 사유:/g) ?? []).toHaveLength(1);
+  });
+
+  it("keeps provider flow labels only in the top row of meeting cards", () => {
+    const markup = renderMeetingListMarkup([meeting()]);
+
+    expect(markup.match(/초안\/최종/g) ?? []).toHaveLength(1);
+    expect(markup.match(/비판 검토/g) ?? []).toHaveLength(1);
+    expect(markup).not.toContain("초안/최종:");
+    expect(markup).not.toContain("비판 검토:");
   });
 });
 
