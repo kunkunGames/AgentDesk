@@ -2704,15 +2704,11 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 &provider,
                 &tmux_name,
             );
-            let db_cwd = shared
-                .db
-                .as_ref()
-                .and_then(|db| {
-                    db.lock()
-                        .ok()
-                        .and_then(|conn| load_restored_session_cwd_from_conn(&conn, &session_keys))
-                })
-                .unwrap_or(None);
+            let db_cwd = shared.db.as_ref().and_then(|db| {
+                db.lock()
+                    .ok()
+                    .and_then(|conn| load_restored_session_cwd_from_conn(&conn, &session_keys))
+            });
 
             let session =
                 data.sessions
