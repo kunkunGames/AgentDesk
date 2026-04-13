@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -7,10 +8,12 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
-use crate::services::process::kill_child_tree;
+use crate::services::process::{
+    configure_child_process_group, kill_child_tree, wait_with_output_timeout,
+};
 use crate::services::provider::{
     CancelToken, ProviderKind, StreamAttemptFailure, StreamAttemptResult, StreamFinalState,
-    cancel_requested, register_child_pid, run_retrying_stream_attempts,
+    cancel_requested, is_readonly_tool_policy, register_child_pid, run_retrying_stream_attempts,
 };
 use crate::services::remote::RemoteProfile;
 
@@ -23,6 +26,26 @@ const GEMINI_STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const GEMINI_STREAM_IDLE_WATCHDOG: Duration = Duration::from_secs(120);
 const GEMINI_STREAM_STARTUP_WATCHDOG: Duration = Duration::from_secs(60);
 const GEMINI_MAX_SESSION_RETRIES: usize = 1;
+const GEMINI_MEETING_READONLY_POLICY_FILENAME: &str = "agentdesk-gemini-meeting-readonly.toml";
+const GEMINI_MEETING_READONLY_POLICY: &str = r#"
+[[rule]]
+toolName = [
+  "glob",
+  "grep",
+  "grep_search",
+  "list_directory",
+  "read_file",
+  "read_many_files"
+]
+decision = "allow"
+priority = 950
+
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 900
+denyMessage = "AgentDesk meeting_readonly mode allows only filesystem read/search tools."
+"#;
 
 #[derive(Debug)]
 enum GeminiStreamEvent {
@@ -68,22 +91,47 @@ fn resolve_gemini_binary() -> crate::services::platform::BinaryResolution {
 }
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
+    execute_command_simple_inner(prompt, None)
+}
+
+pub fn execute_command_simple_with_timeout(
+    prompt: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    execute_command_simple_inner(prompt, Some((timeout, label)))
+}
+
+fn execute_command_simple_inner(
+    prompt: &str,
+    timeout: Option<(Duration, &str)>,
+) -> Result<String, String> {
     let resolution = resolve_gemini_binary();
     let gemini_bin = resolution
         .resolved_path
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let args = build_exec_args(prompt, None, None, false)?;
     let mut command = Command::new(&gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    let output = command
-        .args(build_exec_args(prompt, None, None))
+    command
+        .args(args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to start Gemini: {}", e))?;
+        .stderr(Stdio::piped());
+    let output = if let Some((timeout, label)) = timeout {
+        configure_child_process_group(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|e| format!("Failed to start Gemini: {}", e))?;
+        wait_with_output_timeout(child, timeout, label)?
+    } else {
+        command
+            .output()
+            .map_err(|e| format!("Failed to start Gemini: {}", e))?
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -135,6 +183,7 @@ pub fn execute_command_streaming(
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
     let prompt = compose_gemini_prompt(prompt, system_prompt, allowed_tools);
+    let readonly_mode = is_readonly_tool_policy(allowed_tools);
     run_gemini_streaming_attempts(&sender, resume_selector, |resume_selector| {
         execute_gemini_streaming_attempt(
             &gemini_bin,
@@ -145,6 +194,7 @@ pub fn execute_command_streaming(
             working_dir,
             sender.clone(),
             cancel_token.clone(),
+            readonly_mode,
         )
     })
 }
@@ -182,11 +232,14 @@ fn execute_gemini_streaming_attempt(
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<Arc<CancelToken>>,
+    readonly_mode: bool,
 ) -> Result<StreamAttemptResult, String> {
     let mut command = Command::new(gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, resolution);
+    configure_child_process_group(&mut command);
+    let args = build_exec_args(prompt, model, resume_selector.as_deref(), readonly_mode)?;
     let mut child = command
-        .args(build_exec_args(prompt, model, resume_selector.as_deref()))
+        .args(args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -195,6 +248,10 @@ fn execute_gemini_streaming_attempt(
         .map_err(|e| format!("Failed to start Gemini: {}", e))?;
 
     register_child_pid(cancel_token.as_deref(), child.id());
+    if cancel_requested(cancel_token.as_deref()) {
+        kill_child_tree(&mut child);
+        return Ok(StreamAttemptResult::Cancelled);
+    }
 
     let stdout = child
         .stdout
@@ -584,7 +641,12 @@ fn compose_gemini_prompt(
     crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
 }
 
-fn build_exec_args(prompt: &str, model: Option<&str>, session_id: Option<&str>) -> Vec<String> {
+fn build_exec_args(
+    prompt: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    readonly_mode: bool,
+) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
     if session_id.is_none() {
@@ -603,10 +665,35 @@ fn build_exec_args(prompt: &str, model: Option<&str>, session_id: Option<&str>) 
     args.push(prompt.to_string());
     args.push("--output-format".to_string());
     args.push("stream-json".to_string());
-    args.push("-y".to_string());
-    args.push("--sandbox".to_string());
-    args.push("false".to_string());
-    args
+    if readonly_mode {
+        args.push("--sandbox".to_string());
+        args.push("true".to_string());
+        args.push("--approval-mode".to_string());
+        args.push("default".to_string());
+        args.push("--admin-policy".to_string());
+        args.push(
+            ensure_gemini_meeting_readonly_policy_file()?
+                .to_string_lossy()
+                .to_string(),
+        );
+    } else {
+        args.push("-y".to_string());
+        args.push("--sandbox".to_string());
+        args.push("false".to_string());
+    }
+    Ok(args)
+}
+
+fn ensure_gemini_meeting_readonly_policy_file() -> Result<PathBuf, String> {
+    let path = std::env::temp_dir().join(GEMINI_MEETING_READONLY_POLICY_FILENAME);
+    fs::write(&path, GEMINI_MEETING_READONLY_POLICY).map_err(|error| {
+        format!(
+            "Failed to write Gemini meeting read-only admin policy at {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    Ok(path)
 }
 
 fn normalize_resume_selector(session_id: Option<&str>) -> Result<Option<String>, String> {
@@ -785,9 +872,9 @@ fn render_gemini_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GEMINI_INVALID_RESUME_SELECTOR_MESSAGE, GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState,
-        GeminiStreamEvent, GeminiStreamLoopResult, build_exec_args,
-        build_gemini_tool_result_message, build_gemini_tool_use_message,
+        GEMINI_INVALID_RESUME_SELECTOR_MESSAGE, GEMINI_MEETING_READONLY_POLICY_FILENAME,
+        GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState, GeminiStreamEvent, GeminiStreamLoopResult,
+        build_exec_args, build_gemini_tool_result_message, build_gemini_tool_use_message,
         collect_gemini_stream_events, execute_command_streaming, extract_gemini_error_message,
         extract_text_from_stream_output, finalize_gemini_attempt, looks_like_uuid,
         normalize_resume_selector, observed_session_to_resume_selector, process_gemini_stream_line,
@@ -806,7 +893,8 @@ mod tests {
 
     #[test]
     fn build_exec_args_includes_resume_when_session_present() {
-        let args = build_exec_args("hello", Some("gemini-2.5-flash"), Some("latest"));
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), Some("latest"), false)
+            .expect("args");
         assert!(args.windows(2).any(|pair| pair == ["--resume", "latest"]));
         assert!(args.windows(2).any(|pair| pair == ["-p", "hello"]));
         assert!(
@@ -818,12 +906,33 @@ mod tests {
 
     #[test]
     fn build_exec_args_includes_model_for_fresh_session() {
-        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None);
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None, false).expect("args");
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-m", "gemini-2.5-flash"])
         );
         assert!(!args.iter().any(|arg| arg == "--resume"));
+    }
+
+    #[test]
+    fn build_exec_args_uses_default_mode_with_admin_policy_for_readonly_sessions() {
+        let args = build_exec_args("hello", Some("gemini-2.5-flash"), None, true).expect("args");
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "true"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--approval-mode", "default"])
+        );
+        let policy_path = args
+            .windows(2)
+            .find(|pair| pair[0] == "--admin-policy")
+            .map(|pair| pair[1].clone())
+            .expect("readonly Gemini must pass an admin policy");
+        assert!(policy_path.ends_with(GEMINI_MEETING_READONLY_POLICY_FILENAME));
+        let policy = std::fs::read_to_string(policy_path).expect("policy file should exist");
+        assert!(policy.contains("read_many_files"));
+        assert!(policy.contains("toolName = \"*\""));
+        assert!(!policy.contains("modes ="));
+        assert!(!args.iter().any(|arg| arg == "-y"));
     }
 
     #[test]

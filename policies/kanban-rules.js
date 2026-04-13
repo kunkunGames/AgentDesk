@@ -11,6 +11,92 @@
 
 // ── Helpers ──────────────────────────────────────────────────
 
+// #401: Auto-merge worktree branch into main on card done.
+// Finds the most recent completed dispatch for the card, extracts
+// completed_branch from the result, and merges it into main.
+// On conflict, creates a PR as fallback.
+function _autoMergeWorktreeBranch(cardId) {
+  var dispatches = agentdesk.db.query(
+    "SELECT result FROM task_dispatches " +
+    "WHERE kanban_card_id = ? AND status = 'completed' AND result IS NOT NULL " +
+    "ORDER BY completed_at DESC LIMIT 1",
+    [cardId]
+  );
+  if (dispatches.length === 0) return;
+
+  var result;
+  try { result = JSON.parse(dispatches[0].result); } catch(e) { return; }
+
+  var branch = result.completed_branch;
+  if (!branch) return;
+
+  // Skip non-worktree branches (e.g. main, feat/*)
+  if (branch === "main" || branch === "master") return;
+
+  // Get card info for PR title
+  var cards = agentdesk.db.query(
+    "SELECT title, github_issue_number, repo_id FROM kanban_cards WHERE id = ?",
+    [cardId]
+  );
+  var card = cards.length > 0 ? cards[0] : {};
+  var repoDir = result.completed_worktree_path;
+
+  // Check if branch has commits ahead of main
+  var logResult = agentdesk.exec("git", [
+    "-C", repoDir || ".",
+    "log", "main.." + branch, "--oneline"
+  ]);
+  if (!logResult || logResult.trim() === "") {
+    agentdesk.log.info("[kanban] #401: no commits in " + branch + " — skip merge");
+    return;
+  }
+
+  // Find the main workspace repo (not the worktree)
+  var mainRepo = agentdesk.config.get("workspace_root");
+  if (!mainRepo) {
+    // Fallback: derive from worktree path
+    var wtIdx = (repoDir || "").indexOf("/worktrees/");
+    if (wtIdx > 0) {
+      mainRepo = repoDir.substring(0, wtIdx) + "/workspaces/agentdesk";
+    }
+  }
+  if (!mainRepo) {
+    agentdesk.log.warn("[kanban] #401: cannot determine main repo path — skip merge");
+    return;
+  }
+
+  // Try merge
+  agentdesk.log.info("[kanban] #401: merging " + branch + " into main");
+  var mergeResult = agentdesk.exec("git", [
+    "-C", mainRepo,
+    "merge", branch, "--no-edit"
+  ]);
+
+  if (mergeResult && mergeResult.indexOf("CONFLICT") >= 0) {
+    // Abort failed merge
+    agentdesk.exec("git", ["-C", mainRepo, "merge", "--abort"]);
+    agentdesk.log.warn("[kanban] #401: merge conflict on " + branch + " — creating PR");
+
+    // Push branch and create PR
+    agentdesk.exec("git", ["-C", mainRepo, "push", "origin", branch]);
+    var issueNum = card.github_issue_number || "";
+    var repo = card.repo_id || "";
+    if (repo) {
+      agentdesk.exec("gh", [
+        "pr", "create",
+        "--repo", repo,
+        "--head", branch,
+        "--title", "#" + issueNum + " " + (card.title || branch),
+        "--body", "Auto-generated PR from worktree merge conflict.\n\nResolve conflicts and merge manually."
+      ]);
+    }
+  } else {
+    agentdesk.log.info("[kanban] #401: merged " + branch + " into main successfully");
+    // Push main
+    agentdesk.exec("git", ["-C", mainRepo, "push", "origin", "main"]);
+  }
+}
+
 function sendDiscordNotification(target, content, bot) {
   agentdesk.message.queue(target, content, bot || "announce", "system");
 }
@@ -137,6 +223,21 @@ var rules = {
   onSessionStatusChange: function(payload) {
     // Require dispatch_id — sessions without an active dispatch cannot drive card transitions
     if (!payload.dispatch_id) return;
+
+    // Boot grace period: 서버 부팅 후 10분간 세션 상태 변경으로 인한 카드 전환 유예.
+    // 재시작 직후 세션이 disconnected/idle로 보고되면서 진행 중인 카드가 오판되는 것을 방지.
+    if (payload.status !== "working") {
+      var bootRows = agentdesk.db.query(
+        "SELECT value FROM kv_meta WHERE key = 'server_boot_at'"
+      );
+      if (bootRows.length > 0) {
+        var bootAt = new Date(bootRows[0].value + "Z");
+        var bootElapsedMin = (Date.now() - bootAt.getTime()) / 60000;
+        if (bootElapsedMin < 10) {
+          return;
+        }
+      }
+    }
 
     var cards = agentdesk.db.query(
       "SELECT id, status FROM kanban_cards WHERE latest_dispatch_id = ?",
@@ -536,6 +637,9 @@ var rules = {
         "UPDATE kanban_cards SET completed_at = datetime('now') WHERE id = ? AND completed_at IS NULL",
         [payload.card_id]
       );
+
+      // #401: Auto-merge worktree branch on done transition
+      _autoMergeWorktreeBranch(payload.card_id);
     }
   }
 };

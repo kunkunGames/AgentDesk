@@ -327,6 +327,47 @@ export async function saveRuntimeConfig(
   });
 }
 
+// ── Runtime Health ──
+
+export interface HealthProviderStatus {
+  name: string;
+  connected: boolean;
+  active_turns: number;
+  queue_depth: number;
+  sessions: number;
+  restart_pending: boolean;
+  last_turn_at: string | null;
+}
+
+export interface HealthDispatchOutboxStats {
+  pending: number;
+  retrying: number;
+  permanent_failures: number;
+  oldest_pending_age: number;
+}
+
+export interface HealthResponse {
+  status: "healthy" | "degraded" | "unhealthy" | string;
+  version?: string;
+  uptime_secs?: number;
+  global_active?: number;
+  global_finalizing?: number;
+  deferred_hooks?: number;
+  queue_depth?: number;
+  watcher_count?: number;
+  recovery_duration?: number;
+  degraded_reasons?: string[];
+  providers?: HealthProviderStatus[];
+  db?: boolean;
+  dashboard?: boolean;
+  outbox_age?: number;
+  dispatch_outbox?: HealthDispatchOutboxStats;
+}
+
+export async function getHealth(): Promise<HealthResponse> {
+  return request("/api/health");
+}
+
 // ── Dispatches ──
 
 export async function createDispatch(body: {
@@ -1008,7 +1049,10 @@ export async function getRoundTableMeetings(): Promise<RoundTableMeeting[]> {
 export async function getRoundTableMeeting(
   id: string,
 ): Promise<RoundTableMeeting> {
-  return request(`/api/round-table-meetings/${id}`);
+  const data = await request<{ meeting: RoundTableMeeting }>(
+    `/api/round-table-meetings/${id}`,
+  );
+  return data.meeting;
 }
 
 export async function getRoundTableMeetingChannels(): Promise<
@@ -1101,6 +1145,7 @@ export async function startRoundTableMeeting(
   channelId: string,
   primaryProvider: string,
   reviewerProvider: string,
+  fixedParticipants: string[] = [],
 ): Promise<{ ok: boolean; message?: string }> {
   return request("/api/round-table-meetings/start", {
     method: "POST",
@@ -1109,6 +1154,7 @@ export async function startRoundTableMeeting(
       channel_id: channelId,
       primary_provider: primaryProvider,
       reviewer_provider: reviewerProvider,
+      fixed_participants: fixedParticipants,
     }),
   });
 }
@@ -1137,7 +1183,6 @@ export interface AutoQueueRun {
   created_at: number;
   completed_at: number | null;
   max_concurrent_threads?: number;
-  max_concurrent_per_agent?: number;
   thread_group_count?: number;
 }
 
@@ -1155,6 +1200,7 @@ export interface DispatchQueueEntry {
   github_issue_number?: number | null;
   github_repo?: string | null;
   thread_group?: number;
+  batch_phase?: number;
 }
 
 export interface ThreadGroupStatus {
@@ -1196,21 +1242,21 @@ export async function generateAutoQueue(
   run: AutoQueueRun;
   entries: DispatchQueueEntry[];
 }> {
+  const body: Record<string, unknown> = {
+    repo: repo ?? null,
+    agent_id: agentId ?? null,
+    mode: mode ?? "priority-sort",
+    parallel: mode === "similarity-aware" || undefined,
+  };
   return request("/api/auto-queue/generate", {
     method: "POST",
-    body: JSON.stringify({
-      repo: repo ?? null,
-      agent_id: agentId ?? null,
-      mode: mode ?? "priority-sort",
-      parallel: mode === "similarity-aware" || undefined,
-    }),
+    body: JSON.stringify(body),
   });
 }
 
 export async function activateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
-  unifiedThread?: boolean,
 ): Promise<{
   dispatched: KanbanCard[];
   count: number;
@@ -1218,7 +1264,6 @@ export async function activateAutoQueue(
   const body: Record<string, unknown> = {};
   if (repo) body.repo = repo;
   if (agentId) body.agent_id = agentId;
-  if (unifiedThread !== undefined) body.unified_thread = unifiedThread;
   return request("/api/auto-queue/activate", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1254,11 +1299,9 @@ export async function skipAutoQueueEntry(id: string): Promise<{ ok: boolean }> {
 export async function updateAutoQueueRun(
   id: string,
   status?: "paused" | "active" | "completed",
-  unified_thread?: boolean,
 ): Promise<{ ok: boolean }> {
   const body: Record<string, unknown> = {};
   if (status !== undefined) body.status = status;
-  if (unified_thread !== undefined) body.unified_thread = unified_thread;
   return request(`/api/auto-queue/runs/${id}`, {
     method: "PATCH",
     body: JSON.stringify(body),

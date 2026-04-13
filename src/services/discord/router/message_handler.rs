@@ -1,3 +1,4 @@
+use super::super::gateway::{DiscordGateway, LiveDiscordTurnContext};
 use super::super::*;
 use crate::services::memory::{
     RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
@@ -161,6 +162,13 @@ fn build_memory_injection_plan<'a>(
     }
 }
 
+fn should_skip_memento_recall(
+    memory_settings: &settings::ResolvedMemorySettings,
+    memento_context_loaded: bool,
+) -> bool {
+    memory_settings.backend == settings::MemoryBackendKind::Memento && memento_context_loaded
+}
+
 pub(in crate::services::discord) async fn handle_text_message(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -180,7 +188,11 @@ pub(in crate::services::discord) async fn handle_text_message(
         let mut data = shared.core.lock().await;
         let info = data.sessions.get_mut(&channel_id).and_then(|session| {
             let current_path = session.validated_path(channel_id)?;
-            Some((session.session_id.clone(), current_path))
+            Some((
+                session.session_id.clone(),
+                session.memento_context_loaded,
+                current_path,
+            ))
         });
         let uploads = data
             .sessions
@@ -200,7 +212,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         )
     };
 
-    let (session_id, current_path) = match session_info {
+    let (session_id, memento_context_loaded, current_path) = match session_info {
         Some(info) => info,
         None => {
             // Try auto-start from role_map workspace
@@ -257,8 +269,14 @@ pub(in crate::services::discord) async fn handle_text_message(
 
                     // Check worktree: always use worktree for thread sessions,
                     // or when conflict detected with another session on same path.
+                    // Use both dispatch_thread_parents (for reused threads) AND Discord API
+                    // thread detection (for first-turn in newly created threads where
+                    // dispatch_thread_parents hasn't been populated yet).
                     let wt_info = {
-                        let is_thread = shared.dispatch_thread_parents.contains_key(&channel_id);
+                        let is_thread = shared.dispatch_thread_parents.contains_key(&channel_id)
+                            || super::super::resolve_thread_parent(&ctx.http, channel_id)
+                                .await
+                                .is_some();
                         let data = shared.core.lock().await;
                         let conflict =
                             detect_worktree_conflict(&data.sessions, &canonical, channel_id);
@@ -301,6 +319,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                                 .entry(channel_id)
                                 .or_insert_with(|| DiscordSession {
                                     session_id: None,
+                                    memento_context_loaded: false,
+                                    memento_reflected: false,
                                     current_path: None,
                                     history: Vec::new(),
                                     pending_uploads: Vec::new(),
@@ -323,13 +343,14 @@ pub(in crate::services::discord) async fn handle_text_message(
                     }
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] ▶ Auto-started session from workspace: {eff_path}");
-                    let sid = {
+                    let session_state = {
                         let data = shared.core.lock().await;
                         data.sessions
                             .get(&channel_id)
-                            .and_then(|s| s.session_id.clone())
+                            .map(|s| (s.session_id.clone(), s.memento_context_loaded))
+                            .unwrap_or((None, false))
                     };
-                    (sid, eff_path)
+                    (session_state.0, session_state.1, eff_path)
                 } else {
                     rate_limit_wait(shared, channel_id).await;
                     let _ = channel_id
@@ -411,6 +432,14 @@ pub(in crate::services::discord) async fn handle_text_message(
             .map(ChannelId::new);
 
         if is_already_thread {
+            // Ensure thread is accessible (unarchive if needed) before proceeding
+            if !super::verify_thread_accessible(ctx, channel_id).await {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{ts}] ⚠ Dispatch {did} thread {channel_id} is not accessible (archived/locked), skipping"
+                );
+                return Ok(());
+            }
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!(
                 "  [{ts}] 🧵 Dispatch {did} arrived in existing thread, skipping thread creation"
@@ -604,7 +633,53 @@ pub(in crate::services::discord) async fn handle_text_message(
             .and_then(|_| dispatch_type_str.as_deref()),
     );
 
-    super::super::commands::reset_provider_session_if_pending(
+    // Claim the turn before consuming one-shot state such as model reset flags.
+    // If another message already won the channel, this message must be queued
+    // without stealing the next admitted turn's reset.
+    let cancel_token = Arc::new(CancelToken::new());
+    let started = super::super::mailbox_try_start_turn(
+        shared,
+        channel_id,
+        cancel_token.clone(),
+        request_owner,
+        user_msg_id,
+    )
+    .await;
+    if !started {
+        let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
+        let _ = super::super::mailbox_enqueue_intervention(
+            shared,
+            &bot_owner_provider,
+            channel_id,
+            super::super::Intervention {
+                author_id: request_owner,
+                message_id: user_msg_id,
+                text: user_text.to_string(),
+                mode: super::super::InterventionMode::Soft,
+                created_at: std::time::Instant::now(),
+            },
+        )
+        .await;
+        let _ = channel_id
+            .delete_message(&ctx.http, placeholder_msg_id)
+            .await;
+        super::super::formatting::remove_reaction_raw(&ctx.http, channel_id, user_msg_id, '⏳')
+            .await;
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!(
+            "  [{ts}] 🔀 RACE: message queued (another turn won), channel {}",
+            channel_id
+        );
+        return Ok(());
+    }
+    shared
+        .global_active
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .turn_start_times
+        .insert(channel_id, std::time::Instant::now());
+
+    let reset_session_for_model_change = super::super::commands::reset_provider_session_if_pending(
         &ctx.http, shared, &provider, channel_id,
     )
     .await;
@@ -624,8 +699,14 @@ pub(in crate::services::discord) async fn handle_text_message(
         (channel_name, tmux_session_name)
     };
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
-    let mut session_id = session_id;
-    if session_id.is_none() {
+    let mut session_id =
+        resolve_session_id_for_current_turn(session_id, reset_session_for_model_change);
+    let memento_context_loaded = if reset_session_for_model_change {
+        false
+    } else {
+        memento_context_loaded
+    };
+    if session_id.is_none() && !reset_session_for_model_change {
         if let Some(ref key) = adk_session_key {
             let restored = super::super::adk_session::fetch_provider_session_id(
                 key,
@@ -641,84 +722,34 @@ pub(in crate::services::discord) async fn handle_text_message(
                 );
                 let mut data = shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    session.session_id = restored.clone();
+                    session.restore_provider_session(restored.clone());
                 }
             }
             session_id = restored;
         }
     }
 
-    // Create cancel token — with second check to close the TOCTOU race window.
-    // Multiple messages can pass the initial cancel_tokens check (line 169) concurrently
-    // because the async gap between check and insert allows interleaving.
-    // If another message won the race, queue ourselves and clean up.
-    let cancel_token = Arc::new(CancelToken::new());
-    {
+    let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
+    let memory_recall = if should_skip_memento_recall(&memory_settings, memento_context_loaded) {
+        RecallResponse::default()
+    } else {
+        memory_backend
+            .recall(RecallRequest {
+                provider: provider.clone(),
+                role_id: resolve_memory_role_id(role_binding.as_ref()),
+                channel_id: channel_id.get(),
+                session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
+                dispatch_profile,
+                user_text: user_text.to_string(),
+            })
+            .await
+    };
+    if memory_settings.backend == settings::MemoryBackendKind::Memento && !memento_context_loaded {
         let mut data = shared.core.lock().await;
-        if data.cancel_tokens.contains_key(&channel_id) {
-            // Race lost — another message already started a turn.
-            // Queue this message as an intervention instead.
-            let queue = data.intervention_queue.entry(channel_id).or_default();
-            super::super::enqueue_intervention(
-                queue,
-                super::super::Intervention {
-                    author_id: request_owner,
-                    message_id: user_msg_id,
-                    text: user_text.to_string(),
-                    mode: super::super::InterventionMode::Soft,
-                    created_at: std::time::Instant::now(),
-                },
-            );
-            // Write-through: persist this channel's queue to disk
-            if let Some(q) = data.intervention_queue.get(&channel_id) {
-                let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
-                super::super::save_channel_queue(
-                    &bot_owner_provider,
-                    &shared.token_hash,
-                    channel_id,
-                    q,
-                    shared
-                        .dispatch_role_overrides
-                        .get(&channel_id)
-                        .map(|r| r.value().get()),
-                );
-            }
-            drop(data);
-            // Clean up: remove placeholder and reaction created before this check
-            let _ = channel_id
-                .delete_message(&ctx.http, placeholder_msg_id)
-                .await;
-            super::super::formatting::remove_reaction_raw(&ctx.http, channel_id, user_msg_id, '⏳')
-                .await;
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
-                "  [{ts}] 🔀 RACE: message queued (another turn won), channel {}",
-                channel_id
-            );
-            return Ok(());
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            session.note_memento_context_loaded();
         }
-        shared
-            .global_active
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        data.cancel_tokens.insert(channel_id, cancel_token.clone());
-        data.active_request_owner.insert(channel_id, request_owner);
     }
-    shared
-        .turn_start_times
-        .insert(channel_id, std::time::Instant::now());
-
-    let memory_settings = settings::memory_settings_for_binding(role_binding.as_ref());
-    let memory_backend = build_memory_backend(&memory_settings);
-    let memory_recall = memory_backend
-        .recall(RecallRequest {
-            provider: provider.clone(),
-            role_id: resolve_memory_role_id(role_binding.as_ref()),
-            channel_id: channel_id.get(),
-            session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
-            dispatch_profile,
-            user_text: user_text.to_string(),
-        })
-        .await;
     for warning in &memory_recall.warnings {
         let ts = chrono::Local::now().format("%H:%M:%S");
         eprintln!(
@@ -837,6 +868,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         dispatch_type_str.as_deref(),
         sak_for_system,
         longterm_catalog_for_prompt,
+        Some(&memory_settings),
     );
     if sak_for_system.is_some() {
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -903,13 +935,13 @@ pub(in crate::services::discord) async fn handle_text_message(
                     .cancelled
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num);
+                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num).await;
                     return;
                 }
 
                 // Check for API-based deadline extension
                 if let Some(new_deadline) =
-                    super::super::take_watchdog_deadline_override(watchdog_channel_id_num)
+                    super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
                     let max_dl = watchdog_token
                         .watchdog_max_deadline_ms
@@ -983,14 +1015,10 @@ pub(in crate::services::discord) async fn handle_text_message(
 
                 // Deadline reached — fire watchdog
                 // Verify this watchdog's token is still the CURRENT active token for this channel.
-                let is_current_token = {
-                    let data = watchdog_shared.core.lock().await;
-                    data.cancel_tokens
-                        .get(&channel_id)
-                        .map_or(false, |current| {
-                            std::sync::Arc::ptr_eq(&watchdog_token, current)
-                        })
-                };
+                let is_current_token =
+                    super::super::mailbox_cancel_token(&watchdog_shared, channel_id)
+                        .await
+                        .is_some_and(|current| std::sync::Arc::ptr_eq(&watchdog_token, &current));
                 if is_current_token {
                     let elapsed_mins =
                         (now - (current_deadline - timeout.as_millis() as i64)) / 1000 / 60;
@@ -1006,12 +1034,13 @@ pub(in crate::services::discord) async fn handle_text_message(
                     );
 
                     // Notify Discord
-                    let has_queued = {
-                        let mut data = watchdog_shared.core.lock().await;
-                        data.intervention_queue
-                            .get_mut(&channel_id)
-                            .map_or(false, |q| super::super::has_soft_intervention(q))
-                    };
+                    let has_queued = super::super::mailbox_has_pending_soft_queue(
+                        &watchdog_shared,
+                        &watchdog_provider,
+                        channel_id,
+                    )
+                    .await
+                    .has_pending;
                     let msg = if has_queued {
                         format!(
                             "⚠️ 턴이 {elapsed_mins}분 타임아웃으로 자동 중단되었습니다. 대기 중인 메시지로 다음 턴을 시작합니다.",
@@ -1316,25 +1345,32 @@ pub(in crate::services::discord) async fn handle_text_message(
     });
 
     spawn_turn_bridge(
-        ctx.http.clone(),
         shared.clone(),
         cancel_token.clone(),
         rx,
         TurnBridgeContext {
-            provider,
+            provider: provider.clone(),
+            gateway: Arc::new(DiscordGateway::new(
+                ctx.http.clone(),
+                shared.clone(),
+                provider.clone(),
+                Some(LiveDiscordTurnContext {
+                    ctx: ctx.clone(),
+                    token: token.to_string(),
+                    request_owner,
+                }),
+            )),
             channel_id,
             user_msg_id,
             user_text_owned: user_text.to_string(),
             request_owner_name: request_owner_name.to_string(),
-            request_owner: Some(request_owner),
-            serenity_ctx: Some(ctx.clone()),
-            token: Some(token.to_string()),
             role_binding: role_binding.clone(),
             adk_session_key,
             adk_session_name,
             adk_session_info: Some(adk_session_info),
             adk_cwd: Some(current_path.clone()),
             dispatch_id,
+            memory_recall_usage: memory_recall.token_usage,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
             full_response: String::new(),
@@ -1530,12 +1566,37 @@ pub(super) enum TextStopLookup {
     Stop(Arc<CancelToken>),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn lookup_text_stop_token(
     cancel_tokens: &std::collections::HashMap<serenity::ChannelId, Arc<CancelToken>>,
     channel_id: serenity::ChannelId,
 ) -> TextStopLookup {
     match cancel_tokens.get(&channel_id).cloned() {
         Some(token) if cancel_requested(Some(token.as_ref())) => TextStopLookup::AlreadyStopping,
+        Some(token) => TextStopLookup::Stop(token),
+        None => TextStopLookup::NoActiveTurn,
+    }
+}
+
+#[allow(dead_code)]
+pub(super) async fn lookup_text_stop_token_mailbox(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> TextStopLookup {
+    match super::super::mailbox_cancel_token(shared, channel_id).await {
+        Some(token) if cancel_requested(Some(token.as_ref())) => TextStopLookup::AlreadyStopping,
+        Some(token) => TextStopLookup::Stop(token),
+        None => TextStopLookup::NoActiveTurn,
+    }
+}
+
+pub(super) async fn cancel_text_stop_token_mailbox(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> TextStopLookup {
+    let result = super::super::mailbox_cancel_active_turn(shared, channel_id).await;
+    match result.token {
+        Some(_) if result.already_stopping => TextStopLookup::AlreadyStopping,
         Some(token) => TextStopLookup::Stop(token),
         None => TextStopLookup::NoActiveTurn,
     }
@@ -1616,6 +1677,8 @@ pub(super) async fn handle_text_command(
                     .entry(channel_id)
                     .or_insert_with(|| DiscordSession {
                         session_id: None,
+                        memento_context_loaded: false,
+                        memento_reflected: false,
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
@@ -1774,10 +1837,7 @@ pub(super) async fn handle_text_command(
         }
 
         "!stop" => {
-            let stop_lookup = {
-                let d = data.shared.core.lock().await;
-                lookup_text_stop_token(&d.cancel_tokens, channel_id)
-            };
+            let stop_lookup = cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
             match stop_lookup {
                 TextStopLookup::Stop(token) => {
                     super::super::turn_bridge::cancel_active_token(&token, true, "!stop");
@@ -2380,10 +2440,8 @@ Any other message is sent to {p}.
                     return Ok(true);
                 }
                 "stop" => {
-                    let stop_lookup = {
-                        let d = data.shared.core.lock().await;
-                        lookup_text_stop_token(&d.cancel_tokens, channel_id)
-                    };
+                    let stop_lookup =
+                        cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
                     match stop_lookup {
                         TextStopLookup::Stop(token) => {
                             super::super::turn_bridge::cancel_active_token(
@@ -2462,15 +2520,11 @@ Any other message is sent to {p}.
             }
 
             // Block if AI is in progress
-            {
-                let d = data.shared.core.lock().await;
-                if d.cancel_tokens.contains_key(&channel_id) {
-                    drop(d);
-                    let _ = msg
-                        .reply(&ctx.http, "AI request in progress. Use `!stop` to cancel.")
-                        .await;
-                    return Ok(true);
-                }
+            if super::super::mailbox_has_active_turn(&data.shared, channel_id).await {
+                let _ = msg
+                    .reply(&ctx.http, "AI request in progress. Use `!stop` to cancel.")
+                    .await;
+                return Ok(true);
             }
 
             // Build the prompt
@@ -2519,6 +2573,13 @@ Any other message is sent to {p}.
     Ok(false)
 }
 
+fn resolve_session_id_for_current_turn(
+    session_id: Option<String>,
+    reset_applied: bool,
+) -> Option<String> {
+    if reset_applied { None } else { session_id }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::DiscordSession;
@@ -2531,6 +2592,8 @@ mod tests {
             longterm_catalog: Some("- notes.md".to_string()),
             external_recall: Some("[External Recall]".to_string()),
             warnings: Vec::new(),
+            token_usage: crate::services::memory::TokenUsage::default(),
+            memento_context_loaded: false,
         }
     }
 
@@ -2540,6 +2603,8 @@ mod tests {
     ) -> DiscordSession {
         DiscordSession {
             session_id: None,
+            memento_context_loaded: false,
+            memento_reflected: false,
             current_path,
             history: Vec::new(),
             pending_uploads: Vec::new(),
@@ -2552,6 +2617,50 @@ mod tests {
             worktree: None,
             born_generation: 0,
         }
+    }
+
+    fn make_shared_data_for_tests() -> Arc<SharedData> {
+        Arc::new(SharedData {
+            core: tokio::sync::Mutex::new(CoreState {
+                sessions: std::collections::HashMap::new(),
+                active_meetings: std::collections::HashMap::new(),
+            }),
+            mailboxes: ChannelMailboxRegistry::default(),
+            settings: tokio::sync::RwLock::new(DiscordBotSettings::default()),
+            api_timestamps: dashmap::DashMap::new(),
+            skills_cache: tokio::sync::RwLock::new(Vec::new()),
+            tmux_watchers: dashmap::DashMap::new(),
+            recovering_channels: dashmap::DashMap::new(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_generation: 0,
+            restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
+            recovery_started_at: std::time::Instant::now(),
+            recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
+            global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+            intake_dedup: dashmap::DashMap::new(),
+            dispatch_thread_parents: dashmap::DashMap::new(),
+            bot_connected: std::sync::atomic::AtomicBool::new(false),
+            last_turn_at: std::sync::Mutex::new(None),
+            model_overrides: dashmap::DashMap::new(),
+            model_session_reset_pending: dashmap::DashSet::new(),
+            model_picker_pending: dashmap::DashMap::new(),
+            dispatch_role_overrides: dashmap::DashMap::new(),
+            last_message_ids: dashmap::DashMap::new(),
+            turn_start_times: dashmap::DashMap::new(),
+            cached_serenity_ctx: tokio::sync::OnceCell::new(),
+            cached_bot_token: tokio::sync::OnceCell::new(),
+            token_hash: "test-token-hash".to_string(),
+            api_port: 9,
+            db: None,
+            engine: None,
+            known_slash_commands: tokio::sync::OnceCell::new(),
+        })
     }
 
     #[test]
@@ -2651,6 +2760,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_session_id_for_current_turn_drops_resume_after_model_reset() {
+        assert_eq!(
+            resolve_session_id_for_current_turn(Some("session-123".to_string()), true),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_for_current_turn_keeps_existing_session_when_not_reset() {
+        assert_eq!(
+            resolve_session_id_for_current_turn(Some("session-123".to_string()), false),
+            Some("session-123".to_string())
+        );
+    }
+
+    #[test]
+    fn memory_injection_plan_treats_model_reset_as_fresh_turn() {
+        let recall = sample_recall();
+        let session_id = resolve_session_id_for_current_turn(Some("session-123".to_string()), true);
+        let plan = build_memory_injection_plan(
+            &ProviderKind::Codex,
+            session_id.is_some(),
+            DispatchProfile::Full,
+            &recall,
+        );
+
+        assert_eq!(
+            plan.shared_knowledge_for_context,
+            Some("[Shared Knowledge]")
+        );
+        assert_eq!(plan.external_recall_for_context, Some("[External Recall]"));
+    }
+
+    #[test]
     fn session_path_is_usable_for_existing_local_path() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = make_session(Some(dir.path().to_str().unwrap().to_string()), None);
@@ -2722,5 +2865,40 @@ mod tests {
             build_review_bypass_context_hint("2명만 직접 머지 가능하게 해줘"),
             None
         );
+    }
+
+    #[test]
+    fn memento_recall_skip_only_triggers_for_loaded_memento_sessions() {
+        let memento = settings::ResolvedMemorySettings {
+            backend: settings::MemoryBackendKind::Memento,
+            ..settings::ResolvedMemorySettings::default()
+        };
+        let file = settings::ResolvedMemorySettings::default();
+
+        assert!(should_skip_memento_recall(&memento, true));
+        assert!(!should_skip_memento_recall(&memento, false));
+        assert!(!should_skip_memento_recall(&file, true));
+    }
+
+    #[test]
+    fn clear_resets_memento_skip_so_next_turn_can_reload_context() {
+        let memento = settings::ResolvedMemorySettings {
+            backend: settings::MemoryBackendKind::Memento,
+            ..settings::ResolvedMemorySettings::default()
+        };
+        let mut session = make_session(Some("/tmp/project".to_string()), None);
+
+        session.restore_provider_session(Some("session-1".to_string()));
+        session.note_memento_context_loaded();
+        assert!(should_skip_memento_recall(
+            &memento,
+            session.memento_context_loaded
+        ));
+
+        session.clear_provider_session();
+        assert!(!should_skip_memento_recall(
+            &memento,
+            session.memento_context_loaded
+        ));
     }
 }

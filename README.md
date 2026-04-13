@@ -25,8 +25,8 @@ git clone https://github.com/itismyfield/AgentDesk.git
 cd AgentDesk
 cargo build --release
 
-# Build the dashboard
-cd dashboard && npm install && npm run build && cd ..
+# Verify the dashboard with the same command CI uses (Node >=22)
+./scripts/verify-dashboard.sh
 
 # Initialize
 ./target/release/agentdesk --init
@@ -148,6 +148,17 @@ github:
   repos:
     - "owner/repo-name"
   sync_interval_minutes: 10
+
+memory:
+  backend: auto
+  file:
+    sak_path: "memories/shared-agent-knowledge/shared_knowledge.md"
+    sam_path: "memories/shared-agent-memory"
+    ltm_root: "memories/long-term"
+    auto_memory_root: "~/.claude/projects/*{workspace}*/memory/"
+  mcp:
+    endpoint: "http://127.0.0.1:8765"
+    access_key_env: "MEMENTO_API_KEY"
 
 policies:
   dir: "./policies"

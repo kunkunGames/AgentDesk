@@ -4,18 +4,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use crate::services::agent_protocol::StreamMessage;
-use crate::services::claude::{self, read_output_file_until_result};
+use crate::services::claude;
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
-use crate::services::process::{kill_child_tree, shell_escape};
+use crate::services::process::{
+    configure_child_process_group, kill_child_tree, shell_escape, wait_with_output_timeout,
+};
 use crate::services::provider::{
     CancelToken, FollowupResult, ProviderKind, SessionProbe, cancel_requested,
-    fold_read_output_result, register_child_pid,
+    fold_read_output_result, is_readonly_tool_policy, register_child_pid,
 };
 use crate::services::remote::RemoteProfile;
+use crate::services::session_backend::{
+    insert_process_session, process_session_is_alive, process_session_probe,
+    read_output_file_until_result, remove_process_session, send_process_session_input,
+};
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
     record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
@@ -76,24 +83,48 @@ fn build_tmux_launch_env_lines(
 use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
+    execute_command_simple_inner(prompt, None)
+}
+
+pub fn execute_command_simple_with_timeout(
+    prompt: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<String, String> {
+    execute_command_simple_inner(prompt, Some((timeout, label)))
+}
+
+fn execute_command_simple_inner(
+    prompt: &str,
+    timeout: Option<(Duration, &str)>,
+) -> Result<String, String> {
     let resolution = resolve_codex_binary();
     let codex_bin = resolution
         .resolved_path
         .clone()
         .ok_or_else(|| "Codex CLI not found".to_string())?;
-    let args = base_exec_args(None, prompt, None);
+    let args = base_exec_args(None, prompt, None, false);
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let mut command = Command::new(&codex_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    let output = command
+    command
         .args(&args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to start Codex: {}", e))?;
+        .stderr(Stdio::piped());
+    let output = if let Some((timeout, label)) = timeout {
+        configure_child_process_group(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|e| format!("Failed to start Codex: {}", e))?;
+        wait_with_output_timeout(child, timeout, label)?
+    } else {
+        command
+            .output()
+            .map_err(|e| format!("Failed to start Codex: {}", e))?
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -158,6 +189,7 @@ pub fn execute_command_streaming(
     model: Option<&str>,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
+    let readonly_mode = is_readonly_tool_policy(allowed_tools);
     let prompt = compose_codex_prompt(prompt, system_prompt, allowed_tools);
 
     if let Some(profile) = remote_profile {
@@ -202,6 +234,7 @@ pub fn execute_command_streaming(
             return execute_streaming_local_tmux(
                 &prompt,
                 model,
+                session_id,
                 working_dir,
                 sender,
                 cancel_token,
@@ -215,6 +248,7 @@ pub fn execute_command_streaming(
         return execute_streaming_local_process_codex(
             &prompt,
             model,
+            session_id,
             working_dir,
             sender,
             cancel_token,
@@ -232,6 +266,7 @@ pub fn execute_command_streaming(
         cancel_token,
         report_channel_id,
         report_provider,
+        readonly_mode,
         compact_token_limit,
     )
 }
@@ -253,6 +288,7 @@ fn execute_streaming_direct(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    readonly_mode: bool,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
     let resolution = resolve_codex_binary();
@@ -260,7 +296,7 @@ fn execute_streaming_direct(
         .resolved_path
         .clone()
         .ok_or_else(|| "Codex CLI not found".to_string())?;
-    let mut args = base_exec_args(session_id, prompt, model);
+    let mut args = base_exec_args(session_id, prompt, model, readonly_mode);
     if let Some(limit) = compact_token_limit.filter(|&l| l > 0) {
         // Insert -c config before the "exec" subcommand.
         let exec_pos = args.iter().position(|a| a == "exec").unwrap_or(0);
@@ -392,6 +428,7 @@ fn execute_streaming_remote_tmux(
 fn execute_streaming_local_tmux(
     prompt: &str,
     model: Option<&str>,
+    session_id: Option<&str>,
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
@@ -490,7 +527,7 @@ fn execute_streaming_local_tmux(
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \
         --cwd {wd} \\\n  \
-        --codex-bin {codex_bin}{model_arg}{effort_arg}{compact_arg}\n",
+        --codex-bin {codex_bin}{model_arg}{effort_arg}{resume_arg}{compact_arg}\n",
         env = env_lines,
         exe = shell_escape(&exe.display().to_string()),
         output = shell_escape(&output_path),
@@ -511,6 +548,11 @@ fn execute_streaming_local_tmux(
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(|v| format!(" \\\n  --reasoning-effort {}", shell_escape(&v)))
+            .unwrap_or_default(),
+        resume_arg = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" \\\n  --resume-session-id {}", shell_escape(value)))
             .unwrap_or_default(),
     );
 
@@ -645,15 +687,14 @@ fn send_followup_to_tmux(
 fn execute_streaming_local_process_codex(
     prompt: &str,
     model: Option<&str>,
+    session_id: Option<&str>,
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
-    use crate::services::session_backend::{
-        ProcessBackend, SessionBackend, SessionConfig, SessionHandle,
-    };
+    use crate::services::session_backend::{ProcessBackend, SessionBackend, SessionConfig};
 
     let output_path = format!(
         "{}/agentdesk-{}.jsonl",
@@ -667,71 +708,46 @@ fn execute_streaming_local_process_codex(
     );
 
     // Check for existing process session
-    {
-        let handles = claude::PROCESS_HANDLES.lock().unwrap();
-        if let Some(handle) = handles.get(session_name) {
-            let backend = ProcessBackend::new();
-            if backend.is_alive(handle) {
-                drop(handles);
-                // Snapshot file length BEFORE sending input to avoid race:
-                // Codex wrapper appends JSONL immediately on stdin, so a fast
-                // response could be written before we read the offset.
-                let start_offset = std::fs::metadata(&output_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+    if process_session_is_alive(session_name) {
+        // Snapshot file length BEFORE sending input to avoid race:
+        // Codex wrapper appends JSONL immediately on stdin, so a fast
+        // response could be written before we read the offset.
+        let start_offset = std::fs::metadata(&output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
-                // For codex follow-up, encode prompt in the expected format
-                let encoded = format!(
-                    "{}{}",
-                    TMUX_PROMPT_B64_PREFIX,
-                    BASE64_STANDARD.encode(prompt.as_bytes())
-                );
-                let handles2 = claude::PROCESS_HANDLES.lock().unwrap();
-                if let Some(handle) = handles2.get(session_name) {
-                    backend.send_input(handle, &encoded)?;
-                }
-                drop(handles2);
-                let read_result = read_output_file_until_result(
-                    &output_path,
-                    start_offset,
-                    sender.clone(),
-                    cancel_token,
-                    SessionProbe::process({
-                        let session_name = session_name.to_string();
-                        move || {
-                            let handles = claude::PROCESS_HANDLES.lock().unwrap();
-                            if let Some(handle) = handles.get(&session_name) {
-                                use crate::services::session_backend::{
-                                    ProcessBackend, SessionBackend,
-                                };
-                                ProcessBackend::new().is_alive(handle)
-                            } else {
-                                false
-                            }
-                        }
-                    }),
-                )?;
+        let encoded = format!(
+            "{}{}",
+            TMUX_PROMPT_B64_PREFIX,
+            BASE64_STANDARD.encode(prompt.as_bytes())
+        );
+        send_process_session_input(session_name, &encoded)?;
+        let read_result = read_output_file_until_result(
+            &output_path,
+            start_offset,
+            sender.clone(),
+            cancel_token,
+            process_session_probe(session_name),
+        )?;
 
-                fold_read_output_result(
-                    read_result,
-                    |offset| {
-                        let _ = sender.send(StreamMessage::ProcessReady {
-                            output_path: output_path.to_string(),
-                            session_name: session_name.to_string(),
-                            last_offset: offset,
-                        });
-                    },
-                    |_| {
-                        let _ = sender.send(StreamMessage::Done {
-                            result: "⚠ 세션이 종료되었습니다.".to_string(),
-                            session_id: None,
-                        });
-                        claude::PROCESS_HANDLES.lock().unwrap().remove(session_name);
-                    },
-                );
-                return Ok(());
-            }
-        }
+        fold_read_output_result(
+            read_result,
+            |offset| {
+                let _ = sender.send(StreamMessage::ProcessReady {
+                    output_path: output_path.to_string(),
+                    session_name: session_name.to_string(),
+                    last_offset: offset,
+                });
+            },
+            |_| {
+                let _ = sender.send(StreamMessage::Done {
+                    result: "⚠ 세션이 종료되었습니다.".to_string(),
+                    session_id: None,
+                });
+                remove_process_session(session_name);
+            },
+        );
+        return Ok(());
     }
 
     // Clean up and create new session
@@ -767,6 +783,10 @@ fn execute_streaming_local_process_codex(
                     args.push(effort);
                 }
             }
+            if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
+                args.push("--resume-session-id".to_string());
+                args.push(session_id.to_string());
+            }
             if let Some(limit) = compact_token_limit.filter(|&l| l > 0) {
                 args.push("--compact-token-limit".to_string());
                 args.push(limit.to_string());
@@ -783,33 +803,18 @@ fn execute_streaming_local_process_codex(
     let backend = ProcessBackend::new();
     let handle = backend.create_session(&config)?;
 
-    let SessionHandle::Process { pid, .. } = &handle;
     if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(*pid);
+        *token.child_pid.lock().unwrap() = Some(handle.pid());
     }
 
-    claude::PROCESS_HANDLES
-        .lock()
-        .unwrap()
-        .insert(session_name.to_string(), handle);
+    insert_process_session(session_name.to_string(), handle);
 
     let read_result = read_output_file_until_result(
         &output_path,
         0,
         sender.clone(),
         cancel_token,
-        SessionProbe::process({
-            let session_name = session_name.to_string();
-            move || {
-                let handles = claude::PROCESS_HANDLES.lock().unwrap();
-                if let Some(handle) = handles.get(&session_name) {
-                    use crate::services::session_backend::{ProcessBackend, SessionBackend};
-                    ProcessBackend::new().is_alive(handle)
-                } else {
-                    false
-                }
-            }
-        }),
+        process_session_probe(session_name),
     )?;
 
     fold_read_output_result(
@@ -826,14 +831,19 @@ fn execute_streaming_local_process_codex(
                 result: "⚠ 프로세스가 종료되었습니다.".to_string(),
                 session_id: None,
             });
-            claude::PROCESS_HANDLES.lock().unwrap().remove(session_name);
+            remove_process_session(session_name);
         },
     );
 
     Ok(())
 }
 
-fn base_exec_args(session_id: Option<&str>, prompt: &str, model: Option<&str>) -> Vec<String> {
+fn base_exec_args(
+    session_id: Option<&str>,
+    prompt: &str,
+    model: Option<&str>,
+    readonly_mode: bool,
+) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
         args.push("-c".to_string());
@@ -846,12 +856,13 @@ fn base_exec_args(session_id: Option<&str>, prompt: &str, model: Option<&str>) -
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
     }
-    args.extend([
-        "--skip-git-repo-check".to_string(),
-        "--json".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-        prompt.to_string(),
-    ]);
+    args.extend(["--skip-git-repo-check".to_string(), "--json".to_string()]);
+    if readonly_mode {
+        args.extend(["--sandbox".to_string(), "read-only".to_string()]);
+    } else {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    args.extend(["--".to_string(), prompt.to_string()]);
     args
 }
 
@@ -1142,7 +1153,7 @@ mod tests {
 
     #[test]
     fn test_base_exec_args_includes_model_before_exec() {
-        let args = base_exec_args(None, "hello", Some("gpt-5-codex"));
+        let args = base_exec_args(None, "- starts like option", Some("gpt-5-codex"), false);
         assert!(args.starts_with(&[
             "-c".to_string(),
             r#"model_reasoning_effort="high""#.to_string(),
@@ -1150,6 +1161,52 @@ mod tests {
             "gpt-5-codex".to_string()
         ]));
         assert!(args.iter().any(|arg| arg == "exec"));
+        let separator_index = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("prompt separator should be present");
+        assert_eq!(
+            args.get(separator_index + 1).map(String::as_str),
+            Some("- starts like option")
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--skip-git-repo-check")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_base_exec_args_includes_resume_before_flags() {
+        let args = base_exec_args(Some("thread-123"), "hello", None, false);
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "thread-123".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--json".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_base_exec_args_uses_readonly_sandbox_when_requested() {
+        let args = base_exec_args(None, "readonly", None, true);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"])
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
     }
 
     // ========== FollowupResult tests ==========

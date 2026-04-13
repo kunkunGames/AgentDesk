@@ -1,5 +1,9 @@
+use super::gateway::DiscordGateway;
 use super::handoff::{HandoffRecord, save_handoff};
-use super::settings::{resolve_role_binding, validate_bot_channel_routing_with_provider_channel};
+use super::settings::{
+    load_last_remote_profile, load_last_session_path, resolve_role_binding,
+    validate_bot_channel_routing_with_provider_channel,
+};
 use super::turn_bridge::stale_inflight_message;
 use super::*;
 #[cfg(unix)]
@@ -512,6 +516,8 @@ pub(super) async fn restore_inflight_turns(
                             .entry(channel_id)
                             .or_insert_with(|| DiscordSession {
                                 session_id: state.session_id.clone(),
+                                memento_context_loaded: false,
+                                memento_reflected: false,
                                 current_path: None,
                                 history: Vec::new(),
                                 pending_uploads: Vec::new(),
@@ -993,15 +999,24 @@ pub(super) async fn restore_inflight_turns(
                 .map(|(_, ch)| ch)
             });
             {
-                let channel_key = channel_id.get().to_string();
-                let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
-                let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
+                let last_path = load_last_session_path(
+                    shared.db.as_ref(),
+                    &shared.token_hash,
+                    channel_id.get(),
+                );
+                let saved_remote = load_last_remote_profile(
+                    shared.db.as_ref(),
+                    &shared.token_hash,
+                    channel_id.get(),
+                );
                 let mut data = shared.core.lock().await;
                 let session = data
                     .sessions
                     .entry(channel_id)
                     .or_insert_with(|| DiscordSession {
                         session_id: state.session_id.clone(),
+                        memento_context_loaded: false,
+                        memento_reflected: false,
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
@@ -1094,9 +1109,10 @@ pub(super) async fn restore_inflight_turns(
             .recovering_channels
             .insert(channel_id, std::time::Instant::now());
 
-        let channel_key = channel_id.get().to_string();
-        let last_path = settings_snapshot.last_sessions.get(&channel_key).cloned();
-        let saved_remote = settings_snapshot.last_remotes.get(&channel_key).cloned();
+        let last_path =
+            load_last_session_path(shared.db.as_ref(), &shared.token_hash, channel_id.get());
+        let saved_remote =
+            load_last_remote_profile(shared.db.as_ref(), &shared.token_hash, channel_id.get());
 
         let cancel_token = Arc::new(CancelToken::new());
         if let Ok(mut guard) = cancel_token.tmux_session.lock() {
@@ -1110,6 +1126,8 @@ pub(super) async fn restore_inflight_turns(
                 .entry(channel_id)
                 .or_insert_with(|| DiscordSession {
                     session_id: state.session_id.clone(),
+                    memento_context_loaded: false,
+                    memento_reflected: false,
                     current_path: None,
                     history: Vec::new(),
                     pending_uploads: Vec::new(),
@@ -1134,15 +1152,16 @@ pub(super) async fn restore_inflight_turns(
             if session.remote_profile_name.is_none() {
                 session.remote_profile_name = saved_remote;
             }
-            if !data.cancel_tokens.contains_key(&channel_id) {
-                shared
-                    .global_active
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            data.cancel_tokens.insert(channel_id, cancel_token.clone());
-            data.active_request_owner
-                .insert(channel_id, UserId::new(state.request_owner_user_id));
         }
+
+        mailbox_recovery_kickoff(
+            shared,
+            channel_id,
+            cancel_token.clone(),
+            UserId::new(state.request_owner_user_id),
+            MessageId::new(state.user_msg_id),
+        )
+        .await;
 
         let adk_session_key = build_adk_session_key(shared, channel_id, provider).await;
         let adk_session_name = channel_name.clone();
@@ -1182,7 +1201,7 @@ pub(super) async fn restore_inflight_turns(
         let recovery_session_id = state.session_id.clone();
         let retry_channel_id = channel_id.get();
         std::thread::spawn(move || {
-            match claude::read_output_file_until_result(
+            match crate::services::session_backend::read_output_file_until_result(
                 &output_for_reader,
                 start_offset,
                 tx.clone(),
@@ -1253,25 +1272,28 @@ pub(super) async fn restore_inflight_turns(
         let role_binding = resolve_role_binding(channel_id, channel_name.as_deref());
 
         spawn_turn_bridge(
-            http.clone(),
             shared.clone(),
             cancel_token,
             rx,
             TurnBridgeContext {
                 provider: provider.clone(),
+                gateway: Arc::new(DiscordGateway::new(
+                    http.clone(),
+                    shared.clone(),
+                    provider.clone(),
+                    None,
+                )),
                 channel_id,
                 user_msg_id,
                 user_text_owned: state.user_text.clone(),
                 request_owner_name: String::new(),
-                request_owner: None,
-                serenity_ctx: None,
-                token: None,
                 role_binding,
                 adk_session_key,
                 adk_session_name,
                 adk_session_info: Some(adk_session_info),
                 adk_cwd: last_path.clone(),
                 dispatch_id: recovery_dispatch_id,
+                memory_recall_usage: crate::services::memory::TokenUsage::default(),
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),
@@ -1519,6 +1541,7 @@ mod tests {
             full_response: "중간까지 정리했습니다.".to_string(),
             response_sent_offset: 0,
             current_tool_line: None,
+            prev_tool_status: None,
             started_at: "2026-03-29 22:00:34".to_string(),
             updated_at: "2026-03-29 22:03:53".to_string(),
             born_generation: 7,

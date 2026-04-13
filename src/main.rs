@@ -15,6 +15,7 @@ pub(crate) mod runtime;
 pub(crate) mod runtime_layout;
 mod server;
 mod services;
+pub(crate) mod supervisor;
 mod ui;
 mod utils;
 
@@ -41,7 +42,7 @@ struct Cli {
 enum Commands {
     /// Start Discord bot server(s)
     Dcserver {
-        /// Bot token (defaults to bot_settings.json or AGENTDESK_TOKEN env)
+        /// Bot token (defaults to configured Discord bots or AGENTDESK_TOKEN env)
         token: Option<String>,
     },
     /// Run the initial setup wizard
@@ -79,7 +80,7 @@ enum Commands {
         /// Message text
         #[arg(long)]
         message: String,
-        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or bot_settings.json)
+        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or configured Discord bots)
         #[arg(long)]
         key: Option<String>,
     },
@@ -91,7 +92,7 @@ enum Commands {
         /// Message text
         #[arg(long)]
         message: String,
-        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or bot_settings.json)
+        /// Authentication key hash (optional; falls back to AGENTDESK_TOKEN or configured Discord bots)
         #[arg(long)]
         key: Option<String>,
     },
@@ -138,6 +139,9 @@ enum Commands {
         /// Optional reasoning effort (low, normal, high, xhigh)
         #[arg(long)]
         reasoning_effort: Option<String>,
+        /// Optional resume session id for the first turn
+        #[arg(long)]
+        resume_session_id: Option<String>,
         /// Working directory (defaults to ".")
         #[arg(long, default_value = ".")]
         cwd: String,
@@ -224,7 +228,7 @@ enum Commands {
     },
     /// Show auto-queue status with thread links
     Queue,
-    /// Build + deploy dev + promote to release
+    /// Build the workspace for release and promote directly to release
     Deploy,
     /// List agents and their status
     Agents,
@@ -420,6 +424,7 @@ fn main() -> Result<()> {
                 codex_bin,
                 codex_model,
                 reasoning_effort,
+                resume_session_id,
                 cwd,
                 input_mode,
                 compact_token_limit,
@@ -436,6 +441,7 @@ fn main() -> Result<()> {
                     &codex_bin,
                     codex_model.as_deref(),
                     reasoning_effort.as_deref(),
+                    resume_session_id.as_deref(),
                     mode,
                     compact_token_limit,
                 );
@@ -586,6 +592,11 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env().add_directive(directive))
             .init();
+
+        if let Some(root) = config::runtime_root() {
+            crate::runtime_layout::ensure_runtime_layout(&root)
+                .map_err(|error| anyhow::anyhow!("Failed to prepare runtime layout: {error}"))?;
+        }
 
         let config = config::load().context("Failed to load config")?;
         let db = db::init(&config).context("Failed to init DB")?;

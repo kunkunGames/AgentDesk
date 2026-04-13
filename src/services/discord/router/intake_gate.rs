@@ -26,6 +26,36 @@ fn should_skip_human_slash_message(
     known_slash_commands.is_some_and(|set| set.contains(command_name))
 }
 
+fn build_soft_intervention(
+    author_id: serenity::UserId,
+    message_id: serenity::MessageId,
+    text: &str,
+) -> Intervention {
+    Intervention {
+        author_id,
+        message_id,
+        text: text.to_string(),
+        mode: InterventionMode::Soft,
+        created_at: Instant::now(),
+    }
+}
+
+async fn enqueue_soft_intervention(
+    data: &Data,
+    channel_id: serenity::ChannelId,
+    author_id: serenity::UserId,
+    message_id: serenity::MessageId,
+    text: &str,
+) -> bool {
+    mailbox_enqueue_intervention(
+        &data.shared,
+        &data.provider,
+        channel_id,
+        build_soft_intervention(author_id, message_id, text),
+    )
+    .await
+}
+
 pub(super) fn is_model_picker_component_custom_id(
     custom_id: &str,
     fallback_channel_id: serenity::ChannelId,
@@ -147,7 +177,10 @@ pub(in crate::services::discord) async fn handle_event(
                 return Ok(());
             }
 
-            // Ignore bot messages, unless the bot is in the allowed_bot_ids list
+            // Ignore bot messages, unless the bot is in the allowed_bot_ids list.
+            // Some utility bot deliveries are identified by explicit author ID even
+            // when Discord does not mark the sender as `bot`, so a second text-level
+            // gate runs later once we have the full message content.
             if new_message.author.bot {
                 let allowed = {
                     let settings = data.shared.settings.read().await;
@@ -207,6 +240,9 @@ pub(in crate::services::discord) async fn handle_event(
             {
                 return Ok(());
             }
+            // Allow unbound channels for the owner (direct Claude Code usage).
+            // Only skip channels that are explicitly bound to a different provider.
+            // Unowned channels fall through to normal handling.
 
             // #189: Generic DM reply tracking — consume pending entry if present.
             // The message always falls through to normal handling so the agent
@@ -218,11 +254,25 @@ pub(in crate::services::discord) async fn handle_event(
                 }
             }
 
+            let is_allowed_bot_sender = settings_snapshot.allowed_bot_ids.contains(&user_id.get());
+            if is_allowed_bot_sender
+                && !super::super::is_allowed_turn_sender(
+                    &settings_snapshot.allowed_bot_ids,
+                    user_id.get(),
+                    new_message.author.bot,
+                    text,
+                )
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏭ BOT-INTAKE: skipping non-turn bot message {} in channel {}",
+                    new_message.id, channel_id
+                );
+                return Ok(());
+            }
+
             // Auth check (allowed bots bypass auth)
-            let is_allowed_bot = new_message.author.bot && {
-                let settings = data.shared.settings.read().await;
-                settings.allowed_bot_ids.contains(&user_id.get())
-            };
+            let is_allowed_bot = is_allowed_bot_sender;
             if !is_allowed_bot && !check_auth(user_id, user_name, &data.shared, &data.token).await {
                 return Ok(());
             }
@@ -289,7 +339,7 @@ pub(in crate::services::discord) async fn handle_event(
             // ── Intake-level dedup guard ──────────────────────────────────
             // Prevents the same bot dispatch from starting two parallel turns
             // when Discord delivers the message twice in rapid succession.
-            if new_message.author.bot {
+            if is_allowed_bot {
                 let dedup_key =
                     if let Some(dispatch_id) = super::super::adk_session::parse_dispatch_id(text) {
                         // Same dispatch_id = genuine duplicate (Discord retry)
@@ -341,44 +391,25 @@ pub(in crate::services::discord) async fn handle_event(
             // to the parent channel are queued so they don't start a parallel
             // turn (the thread's cancel_token is keyed by thread_id, leaving
             // the parent channel "unlocked").
-            if new_message.author.bot {
-                if let Some(thread_id) = data.shared.dispatch_thread_parents.get(&channel_id) {
+            if is_allowed_bot {
+                if let Some(thread_id_ref) = data.shared.dispatch_thread_parents.get(&channel_id) {
+                    let thread_id = *thread_id_ref.value();
                     // Thread still has an active turn?
-                    let thread_active = {
-                        let d = data.shared.core.lock().await;
-                        d.cancel_tokens.contains_key(thread_id.value())
-                    };
+                    let thread_active = mailbox_has_active_turn(&data.shared, thread_id).await;
                     if thread_active {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!(
                             "  [{ts}] 🔀 THREAD-GUARD: bot message to parent {} queued (dispatch thread {} active)",
-                            channel_id, *thread_id
+                            channel_id, thread_id
                         );
-                        let mut d = data.shared.core.lock().await;
-                        let queue = d.intervention_queue.entry(channel_id).or_default();
-                        enqueue_intervention(
-                            queue,
-                            Intervention {
-                                author_id: user_id,
-                                message_id: new_message.id,
-                                text: text.to_string(),
-                                mode: InterventionMode::Soft,
-                                created_at: Instant::now(),
-                            },
-                        );
-                        if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(
-                                &data.provider,
-                                &data.shared.token_hash,
-                                channel_id,
-                                q,
-                                data.shared
-                                    .dispatch_role_overrides
-                                    .get(&channel_id)
-                                    .map(|r| r.value().get()),
-                            );
-                        }
-                        drop(d);
+                        let _ = enqueue_soft_intervention(
+                            data,
+                            channel_id,
+                            user_id,
+                            new_message.id,
+                            text,
+                        )
+                        .await;
                         add_reaction(ctx, channel_id, new_message.id, '📬').await;
                         data.shared
                             .last_message_ids
@@ -397,37 +428,10 @@ pub(in crate::services::discord) async fn handle_event(
             // of starting a parallel turn that would stomp the current
             // placeholder.
             if text.starts_with("DISPATCH:") {
-                let mut d = data.shared.core.lock().await;
-                if d.cancel_tokens.contains_key(&channel_id) {
-                    let inserted = {
-                        let queue = d.intervention_queue.entry(channel_id).or_default();
-                        enqueue_intervention(
-                            queue,
-                            Intervention {
-                                author_id: user_id,
-                                message_id: new_message.id,
-                                text: text.to_string(),
-                                mode: InterventionMode::Soft,
-                                created_at: Instant::now(),
-                            },
-                        )
-                    };
-                    if inserted {
-                        if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(
-                                &data.provider,
-                                &data.shared.token_hash,
-                                channel_id,
-                                q,
-                                data.shared
-                                    .dispatch_role_overrides
-                                    .get(&channel_id)
-                                    .map(|r| r.value().get()),
-                            );
-                        }
-                    }
-                    drop(d);
-
+                if mailbox_has_active_turn(&data.shared, channel_id).await {
+                    let _ =
+                        enqueue_soft_intervention(data, channel_id, user_id, new_message.id, text)
+                            .await;
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!(
                         "  [{ts}] 📬 DISPATCH-GUARD: queued dispatch message in channel {} (active turn in progress)",
@@ -439,78 +443,44 @@ pub(in crate::services::discord) async fn handle_event(
                         .insert(channel_id, new_message.id.get());
                     return Ok(());
                 }
-                drop(d);
                 // No active turn — fall through to normal processing below
             }
 
             // Queue messages while AI is in progress (executed as next turn after current finishes)
-            {
-                let mut d = data.shared.core.lock().await;
-                if d.cancel_tokens.contains_key(&channel_id) {
-                    let inserted = {
-                        let queue = d.intervention_queue.entry(channel_id).or_default();
-                        enqueue_intervention(
-                            queue,
-                            Intervention {
-                                author_id: user_id,
-                                message_id: new_message.id,
-                                text: text.to_string(),
-                                mode: InterventionMode::Soft,
-                                created_at: Instant::now(),
-                            },
-                        )
-                    };
+            if mailbox_has_active_turn(&data.shared, channel_id).await {
+                let inserted =
+                    enqueue_soft_intervention(data, channel_id, user_id, new_message.id, text)
+                        .await;
+                let is_shutting_down = data
+                    .shared
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Relaxed);
 
-                    // Write-through: persist this channel's queue to disk immediately
-                    // so it survives SIGKILL, OOM kill, or crash.
-                    if inserted {
-                        if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(
-                                &data.provider,
-                                &data.shared.token_hash,
-                                channel_id,
-                                q,
-                                data.shared
-                                    .dispatch_role_overrides
-                                    .get(&channel_id)
-                                    .map(|r| r.value().get()),
-                            );
-                        }
-                    }
-
-                    let is_shutting_down = data
-                        .shared
-                        .shutting_down
-                        .load(std::sync::atomic::Ordering::Relaxed);
-
-                    drop(d);
-
-                    if !inserted {
-                        rate_limit_wait(&data.shared, channel_id).await;
-                        let _ = channel_id
-                            .say(&ctx.http, "↪ 같은 메시지가 방금 이미 큐잉되어서 무시했어.")
-                            .await;
-                        return Ok(());
-                    }
-
-                    // React with 📬 to indicate message is queued
-                    add_reaction(ctx, channel_id, new_message.id, '📬').await;
-
-                    // Checkpoint: message successfully queued
-                    data.shared
-                        .last_message_ids
-                        .insert(channel_id, new_message.id.get());
-                    if is_shutting_down {
-                        let ids: std::collections::HashMap<u64, u64> = data
-                            .shared
-                            .last_message_ids
-                            .iter()
-                            .map(|entry| (entry.key().get(), *entry.value()))
-                            .collect();
-                        runtime_store::save_all_last_message_ids(data.provider.as_str(), &ids);
-                    }
+                if !inserted {
+                    rate_limit_wait(&data.shared, channel_id).await;
+                    let _ = channel_id
+                        .say(&ctx.http, "↪ 같은 메시지가 방금 이미 큐잉되어서 무시했어.")
+                        .await;
                     return Ok(());
                 }
+
+                // React with 📬 to indicate message is queued
+                add_reaction(ctx, channel_id, new_message.id, '📬').await;
+
+                // Checkpoint: message successfully queued
+                data.shared
+                    .last_message_ids
+                    .insert(channel_id, new_message.id.get());
+                if is_shutting_down {
+                    let ids: std::collections::HashMap<u64, u64> = data
+                        .shared
+                        .last_message_ids
+                        .iter()
+                        .map(|entry| (entry.key().get(), *entry.value()))
+                        .collect();
+                    runtime_store::save_all_last_message_ids(data.provider.as_str(), &ids);
+                }
+                return Ok(());
             }
 
             // Reconcile gate (#122): until startup recovery is complete, queue messages.
@@ -519,32 +489,8 @@ pub(in crate::services::discord) async fn handle_event(
                 .reconcile_done
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let mut d = data.shared.core.lock().await;
-                let queue = d.intervention_queue.entry(channel_id).or_default();
-                enqueue_intervention(
-                    queue,
-                    Intervention {
-                        author_id: user_id,
-                        message_id: new_message.id,
-                        text: text.to_string(),
-                        mode: InterventionMode::Soft,
-                        created_at: Instant::now(),
-                    },
-                );
-                // Write-through: persist queue to disk (matches drain-mode contract)
-                if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(
-                        &data.provider,
-                        &data.shared.token_hash,
-                        channel_id,
-                        q,
-                        data.shared
-                            .dispatch_role_overrides
-                            .get(&channel_id)
-                            .map(|r| r.value().get()),
-                    );
-                }
-                drop(d);
+                let _ = enqueue_soft_intervention(data, channel_id, user_id, new_message.id, text)
+                    .await;
                 // Checkpoint: track last processed message
                 data.shared
                     .last_message_ids
@@ -565,33 +511,8 @@ pub(in crate::services::discord) async fn handle_event(
                     .shutting_down
                     .load(std::sync::atomic::Ordering::Relaxed);
 
-                let mut d = data.shared.core.lock().await;
-                let queue = d.intervention_queue.entry(channel_id).or_default();
-                enqueue_intervention(
-                    queue,
-                    Intervention {
-                        author_id: user_id,
-                        message_id: new_message.id,
-                        text: text.to_string(),
-                        mode: InterventionMode::Soft,
-                        created_at: Instant::now(),
-                    },
-                );
-
-                // Write-through: persist this channel's queue to disk immediately
-                if let Some(q) = d.intervention_queue.get(&channel_id) {
-                    save_channel_queue(
-                        &data.provider,
-                        &data.shared.token_hash,
-                        channel_id,
-                        q,
-                        data.shared
-                            .dispatch_role_overrides
-                            .get(&channel_id)
-                            .map(|r| r.value().get()),
-                    );
-                }
-                drop(d);
+                let _ = enqueue_soft_intervention(data, channel_id, user_id, new_message.id, text)
+                    .await;
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!(
@@ -633,47 +554,18 @@ pub(in crate::services::discord) async fn handle_event(
             // them and re-triggering idle queue kickoff instead of letting this turn
             // jump ahead.
             let queued_behind_idle_backlog = {
-                let mut d = data.shared.core.lock().await;
-                let has_pending_soft = d
-                    .intervention_queue
-                    .get(&channel_id)
-                    .map(|queue| {
-                        queue
-                            .iter()
-                            .any(|item| matches!(item.mode, InterventionMode::Soft))
-                    })
-                    .unwrap_or(false);
-                if d.cancel_tokens.contains_key(&channel_id) || !has_pending_soft {
+                let has_active_turn = mailbox_has_active_turn(&data.shared, channel_id).await;
+                let has_pending_backlog =
+                    mailbox_has_pending_soft_queue(&data.shared, &data.provider, channel_id)
+                        .await
+                        .has_pending;
+                if has_active_turn || !has_pending_backlog {
                     None
                 } else {
-                    let inserted = {
-                        let queue = d.intervention_queue.entry(channel_id).or_default();
-                        enqueue_intervention(
-                            queue,
-                            Intervention {
-                                author_id: user_id,
-                                message_id: new_message.id,
-                                text: text.to_string(),
-                                mode: InterventionMode::Soft,
-                                created_at: Instant::now(),
-                            },
-                        )
-                    };
-                    if inserted {
-                        if let Some(q) = d.intervention_queue.get(&channel_id) {
-                            save_channel_queue(
-                                &data.provider,
-                                &data.shared.token_hash,
-                                channel_id,
-                                q,
-                                data.shared
-                                    .dispatch_role_overrides
-                                    .get(&channel_id)
-                                    .map(|r| r.value().get()),
-                            );
-                        }
-                    }
-                    Some(inserted)
+                    Some(
+                        enqueue_soft_intervention(data, channel_id, user_id, new_message.id, text)
+                            .await,
+                    )
                 }
             };
             if let Some(inserted) = queued_behind_idle_backlog {

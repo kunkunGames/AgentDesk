@@ -685,34 +685,6 @@ fn create_dispatch_core_internal(
     context: &serde_json::Value,
     options: DispatchCreateOptions,
 ) -> Result<(String, String, bool)> {
-    let context_str = if dispatch_type == "review" {
-        build_review_context(db, kanban_card_id, to_agent_id, context)?
-    } else {
-        // #259: For ALL non-review dispatch types, inject worktree_path and
-        // worktree_branch so the session uses the same issue worktree as review
-        // dispatches. Without this, implementation/rework dispatches use the
-        // parent channel CWD (main repo), causing stale commit loops.
-        let mut base = serde_json::to_string(context)?;
-        if let Some((wt_path, wt_branch, _)) = resolve_card_worktree(db, kanban_card_id) {
-            if let Ok(mut obj) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
-            {
-                obj.entry("worktree_path".to_string())
-                    .or_insert(json!(wt_path));
-                obj.entry("worktree_branch".to_string())
-                    .or_insert(json!(wt_branch));
-                tracing::info!(
-                    "[dispatch] {} dispatch for card {}: injecting worktree_path={}",
-                    dispatch_type,
-                    kanban_card_id,
-                    wt_path
-                );
-                base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
-            }
-        }
-        base
-    };
-
     // Use separate_conn to avoid blocking request handlers while
     // engine/onTick holds the main DB Mutex via QuickJS.
     let conn = db
@@ -781,6 +753,34 @@ fn create_dispatch_core_internal(
             return Ok((eid, old_status, true));
         }
     }
+
+    let context_str = if dispatch_type == "review" {
+        build_review_context(db, kanban_card_id, to_agent_id, context)?
+    } else {
+        // #259: For ALL non-review dispatch types, inject worktree_path and
+        // worktree_branch so the session uses the same issue worktree as review
+        // dispatches. Without this, implementation/rework dispatches use the
+        // parent channel CWD (main repo), causing stale commit loops.
+        let mut base = serde_json::to_string(context)?;
+        if let Some((wt_path, wt_branch, _)) = resolve_card_worktree(db, kanban_card_id) {
+            if let Ok(mut obj) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
+            {
+                obj.entry("worktree_path".to_string())
+                    .or_insert(json!(wt_path));
+                obj.entry("worktree_branch".to_string())
+                    .or_insert(json!(wt_branch));
+                tracing::info!(
+                    "[dispatch] {} dispatch for card {}: injecting worktree_path={}",
+                    dispatch_type,
+                    kanban_card_id,
+                    wt_path
+                );
+                base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
+            }
+        }
+        base
+    };
 
     let is_review_type = dispatch_type == "review"
         || dispatch_type == "review-decision"
@@ -1374,18 +1374,6 @@ pub fn query_dispatch_row(
     .map_err(|e| anyhow::anyhow!("Dispatch query error: {e}"))
 }
 
-/// Check whether a dispatch belongs to an active unified-thread auto-queue run.
-///
-/// Returns `true` when:
-/// - The dispatch's kanban card is part of an active/paused auto-queue run
-/// - That run has `unified_thread_id IS NOT NULL`
-/// - The run still has pending or dispatched entries remaining
-///
-/// When `true`, callers should **not** tear down the tmux session because the
-/// same thread will be reused for subsequent queue entries.
-///
-/// Uses a standalone `rusqlite::Connection` opened from the runtime DB path
-/// to avoid lock contention with the main `Db` mutex.
 pub fn is_unified_thread_active(dispatch_id: &str) -> bool {
     let root = match crate::cli::agentdesk_runtime_root() {
         Some(r) => r,
@@ -1396,8 +1384,6 @@ pub fn is_unified_thread_active(dispatch_id: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    // #145: Direct dispatch→entry→run lookup via auto_queue_entries.dispatch_id.
-    // Eliminates kanban_card_id-based ambiguity when the same card is re-queued.
     let result: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 \
@@ -1443,12 +1429,6 @@ pub fn is_unified_thread_active(dispatch_id: &str) -> bool {
     result || slot_result
 }
 
-/// Check whether a thread channel belongs to an active unified-thread auto-queue run.
-///
-/// Looks up `auto_queue_runs` by `unified_thread_channel_id` matching the
-/// given Discord channel ID. Also searches within `unified_thread_id` JSON
-/// for parallel runs where each group has its own thread (#140).
-/// Returns `true` when a matching active/paused run still has pending or dispatched entries.
 pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
     let root = match crate::cli::agentdesk_runtime_root() {
         Some(r) => r,
@@ -1483,7 +1463,6 @@ pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
             return true;
         }
     }
-    // Check scalar unified_thread_channel_id (covers non-parallel and last-written parallel)
     let scalar_match: bool = conn
         .query_row(
             "SELECT COUNT(*) > 0 \
@@ -1500,8 +1479,6 @@ pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
     if scalar_match {
         return true;
     }
-    // #140: Also search within unified_thread_id JSON for parallel runs.
-    // Thread IDs stored as quoted string values, so searching for '"thread_id"' is safe.
     conn.query_row(
         "SELECT COUNT(*) > 0 \
          FROM auto_queue_entries e \
@@ -1518,6 +1495,7 @@ pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {
 
 /// Extract thread channel ID from a channel name's `-t{15+digit}` suffix.
 /// Pure parsing — no DB access. Used by both production guards and tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_thread_channel_id(channel_name: &str) -> Option<u64> {
     let pos = channel_name.rfind("-t")?;
     let suffix = &channel_name[pos + 2..];
@@ -1539,8 +1517,6 @@ pub fn is_unified_thread_channel_name_active(channel_name: &str) -> bool {
     is_unified_thread_channel_active(thread_channel_id)
 }
 
-/// Drain `kill_unified_thread:*` kv_meta entries and return the channel names to kill.
-/// Each entry is consumed (deleted from DB) on read.
 pub fn drain_unified_thread_kill_signals() -> Vec<String> {
     let root = match crate::cli::agentdesk_runtime_root() {
         Some(r) => r,
@@ -1987,8 +1963,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let context =
-            build_review_context(&db, "card-review-provider", "agent-1", &json!({})).unwrap();
+        let context = build_review_context(
+            &db,
+            "card-review-provider",
+            "agent-1",
+            &json!({ "reviewed_commit": "test-commit" }),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
 
         assert_eq!(parsed["from_provider"], "claude");

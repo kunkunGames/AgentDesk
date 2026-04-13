@@ -39,6 +39,11 @@ pub(super) struct AgentDef {
     pub display_name: String,
     pub prompt_file: Option<String>,
     pub keywords: Option<Vec<String>>,
+    pub domain_summary: Option<String>,
+    pub strengths: Option<Vec<String>>,
+    pub task_types: Option<Vec<String>>,
+    pub anti_signals: Option<Vec<String>>,
+    pub provider_hint: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub workspace: Option<String>,
@@ -74,6 +79,7 @@ pub(super) struct ChannelsByName {
 pub(super) struct MeetingDef {
     pub channel_name: String,
     pub max_rounds: Option<u32>,
+    pub max_participants: Option<usize>,
     pub summary_agent: Option<SummaryAgentDef>,
     /// Explicit list of agent role_ids eligible for meetings.
     /// When omitted, all agents in the schema are eligible.
@@ -229,19 +235,20 @@ pub(super) fn resolve_workspace(
 
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     let schema = load_org_schema()?;
-    // Explicit shared_prompt > auto-derived from prompts_root/_shared.md
+    // Explicit shared_prompt > auto-derived from prompts_root/agents/_shared.prompt.md
     schema
         .shared_prompt
         .as_deref()
         .map(expand_tilde)
         .or_else(|| {
             let root = expand_tilde(schema.prompts_root.as_deref()?);
-            let path = format!("{}/_shared.md", root);
-            if std::path::Path::new(&path).exists() {
-                Some(path)
-            } else {
-                None
+            let root = std::path::Path::new(&root);
+            let canonical = root.join("agents").join("_shared.prompt.md");
+            if canonical.exists() {
+                return Some(canonical.display().to_string());
             }
+            let legacy = root.join("_shared.md");
+            legacy.exists().then(|| legacy.display().to_string())
         })
 }
 
@@ -298,9 +305,10 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
     };
 
     let prompts_root = schema.prompts_root.as_deref().map(expand_tilde);
-    // Use explicit meeting.available_agents if set, otherwise all agents
+    // Use explicit meeting.available_agents as-is when present. Only absence
+    // falls back to the full registry.
     let eligible_agents: Box<dyn Iterator<Item = (&String, &AgentDef)>> =
-        if let Some(ref explicit_list) = meeting_def.available_agents {
+        if let Some(explicit_list) = meeting_def.available_agents.as_ref() {
             Box::new(
                 schema
                     .agents
@@ -327,7 +335,17 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
                 display_name: def.display_name.clone(),
                 keywords: def.keywords.clone().unwrap_or_default(),
                 prompt_file,
+                domain_summary: def.domain_summary.clone(),
+                strengths: def.strengths.clone().unwrap_or_default(),
+                task_types: def.task_types.clone().unwrap_or_default(),
+                anti_signals: def.anti_signals.clone().unwrap_or_default(),
+                provider_hint: def.provider_hint.clone().or_else(|| def.provider.clone()),
                 provider: def.provider.as_deref().and_then(ProviderKind::from_str),
+                model: def.model.clone(),
+                reasoning_effort: None,
+                workspace: def.workspace.as_deref().map(expand_tilde),
+                peer_agents_enabled: def.peer_agents.unwrap_or(true),
+                memory: resolve_memory_settings(def.memory.as_ref(), None),
             }
         })
         .collect();
@@ -335,6 +353,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
     Some(MeetingConfig {
         channel_name: meeting_def.channel_name.clone(),
         max_rounds: meeting_def.max_rounds.unwrap_or(3),
+        max_participants: meeting_def.max_participants.unwrap_or(5),
         summary_agent,
         available_agents,
     })
@@ -442,6 +461,41 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    struct Mem0EnvGuard {
+        prev_api_key: Option<std::ffi::OsString>,
+        prev_base_url: Option<std::ffi::OsString>,
+    }
+
+    impl Mem0EnvGuard {
+        fn install() -> Self {
+            crate::services::memory::reset_backend_health_for_tests();
+            let prev_api_key = std::env::var_os("MEM0_API_KEY");
+            let prev_base_url = std::env::var_os("MEM0_BASE_URL");
+            unsafe {
+                std::env::set_var("MEM0_API_KEY", "test-key");
+                std::env::set_var("MEM0_BASE_URL", "http://mem0.local");
+            }
+            Self {
+                prev_api_key,
+                prev_base_url,
+            }
+        }
+    }
+
+    impl Drop for Mem0EnvGuard {
+        fn drop(&mut self) {
+            match self.prev_api_key.take() {
+                Some(value) => unsafe { std::env::set_var("MEM0_API_KEY", value) },
+                None => unsafe { std::env::remove_var("MEM0_API_KEY") },
+            }
+            match self.prev_base_url.take() {
+                Some(value) => unsafe { std::env::set_var("MEM0_BASE_URL", value) },
+                None => unsafe { std::env::remove_var("MEM0_BASE_URL") },
+            }
+            crate::services::memory::reset_backend_health_for_tests();
+        }
+    }
 
     fn with_temp_root<F>(f: F)
     where
@@ -581,6 +635,7 @@ channels:
     #[test]
     fn test_channel_binding_memory_overrides_agent_memory_defaults() {
         with_temp_root(|temp_home: &TempDir| {
+            let _mem0_env = Mem0EnvGuard::install();
             write_org_yaml(
                 temp_home.path(),
                 r#"
@@ -695,6 +750,11 @@ agents:
   td:
     display_name: "TD"
     keywords: ["code"]
+    domain_summary: "Architecture and implementation review"
+    strengths: ["system design", "performance"]
+    task_types: ["architecture"]
+    anti_signals: ["marketing"]
+    provider_hint: "codex"
   pd:
     display_name: "PD"
     keywords: ["product"]
@@ -703,6 +763,7 @@ agents:
     keywords: ["test"]
 meeting:
   channel_name: "meeting"
+  max_participants: 4
   summary_agent: "td"
   available_agents: ["td", "pd"]
 channels:
@@ -726,6 +787,47 @@ channels:
                 "qad should NOT be in available_agents"
             );
             assert_eq!(config.available_agents.len(), 2);
+            assert_eq!(config.max_participants, 4);
+            let td = config
+                .available_agents
+                .iter()
+                .find(|agent| agent.role_id == "td")
+                .expect("td metadata");
+            assert_eq!(
+                td.domain_summary.as_deref(),
+                Some("Architecture and implementation review")
+            );
+            assert_eq!(
+                td.strengths,
+                vec!["system design".to_string(), "performance".to_string()]
+            );
+            assert_eq!(td.task_types, vec!["architecture".to_string()]);
+            assert_eq!(td.anti_signals, vec!["marketing".to_string()]);
+            assert_eq!(td.provider_hint.as_deref(), Some("codex"));
+        });
+    }
+
+    #[test]
+    fn test_meeting_empty_available_agents_stays_empty() {
+        with_temp_root(|temp_home: &TempDir| {
+            write_org_yaml(
+                temp_home.path(),
+                r#"
+version: 1
+agents:
+  td:
+    display_name: "TD"
+  pd:
+    display_name: "PD"
+meeting:
+  channel_name: "meeting"
+  summary_agent: "td"
+  available_agents: []
+"#,
+            );
+
+            let config = load_meeting_config().expect("meeting config should load");
+            assert!(config.available_agents.is_empty());
         });
     }
 
@@ -756,6 +858,34 @@ channels:
                 "Expected auto-derived prompt path, got: {}",
                 binding.prompt_file
             );
+        });
+    }
+
+    #[test]
+    fn test_shared_prompt_auto_derive_prefers_canonical_agents_path() {
+        with_temp_root(|temp_home: &TempDir| {
+            let canonical = temp_home
+                .path()
+                .join(".adk")
+                .join("config")
+                .join("agents")
+                .join("_shared.prompt.md");
+            fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+            fs::write(&canonical, "# shared").unwrap();
+            let prompts_root = temp_home.path().join(".adk").join("config");
+            let prompts_root_yaml = prompts_root.display().to_string().replace('\\', "/");
+            let yaml = format!(
+                r#"
+version: 1
+prompts_root: "{}"
+agents: {{}}
+"#,
+                prompts_root_yaml
+            );
+            write_org_yaml(temp_home.path(), &yaml);
+
+            let shared = load_shared_prompt_path().expect("shared prompt path");
+            assert_eq!(std::path::Path::new(&shared), canonical);
         });
     }
 

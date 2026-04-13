@@ -13,6 +13,7 @@ use crate::services::agent_protocol::DEFAULT_ALLOWED_TOOLS;
 use crate::services::provider::ProviderKind;
 
 use super::DiscordBotSettings;
+use super::agentdesk_config;
 use super::formatting::normalize_allowed_tools;
 use super::org_schema;
 use super::role_map::{
@@ -64,6 +65,372 @@ fn find_bot_settings_entry<'a>(
             .map(|value| value == token)
             .unwrap_or(false)
     })
+}
+
+#[derive(Clone, Debug, Default)]
+struct LegacyBotSettingsEntry {
+    agent: Option<String>,
+    provider: Option<ProviderKind>,
+    allowed_tools: Option<Vec<String>>,
+    allowed_channel_ids: Vec<u64>,
+    channel_model_overrides: std::collections::HashMap<String, String>,
+    owner_user_id: Option<u64>,
+    allowed_user_ids: Vec<u64>,
+    allow_all_users: Option<bool>,
+    allowed_bot_ids: Vec<u64>,
+}
+
+fn load_legacy_bot_settings_json() -> Option<serde_json::Value> {
+    let path = bot_settings_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&content).ok()
+}
+
+fn load_legacy_bot_settings_entry(token: &str) -> LegacyBotSettingsEntry {
+    let Some(json) = load_legacy_bot_settings_json() else {
+        return LegacyBotSettingsEntry::default();
+    };
+    let Some(obj) = json.as_object() else {
+        return LegacyBotSettingsEntry::default();
+    };
+    let Some((_, entry)) = find_bot_settings_entry(obj, token) else {
+        return LegacyBotSettingsEntry::default();
+    };
+
+    let agent = entry
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let provider = entry
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(ProviderKind::from_str_or_unsupported);
+    let allowed_channel_ids = entry
+        .get("allowed_channel_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
+        .unwrap_or_default();
+    let channel_model_overrides = entry
+        .get("channel_model_overrides")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(channel_id, model)| {
+                    model
+                        .as_str()
+                        .map(|model| (channel_id.clone(), model.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let owner_user_id = entry.get("owner_user_id").and_then(json_u64);
+    let allowed_user_ids = entry
+        .get("allowed_user_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
+        .unwrap_or_default();
+    let allow_all_users = entry.get("allow_all_users").and_then(|v| v.as_bool());
+    let allowed_bot_ids = entry
+        .get("allowed_bot_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(json_u64).collect())
+        .unwrap_or_default();
+
+    let allowed_tools = match entry.get("allowed_tools") {
+        None => None,
+        Some(value) => value
+            .as_array()
+            .map(|tools_arr| normalize_allowed_tools(tools_arr.iter().filter_map(|v| v.as_str()))),
+    };
+
+    LegacyBotSettingsEntry {
+        agent,
+        provider,
+        allowed_tools,
+        allowed_channel_ids,
+        channel_model_overrides,
+        owner_user_id,
+        allowed_user_ids,
+        allow_all_users,
+        allowed_bot_ids,
+    }
+}
+
+fn config_path_for_write() -> Option<PathBuf> {
+    let root = crate::config::runtime_root()?;
+    let canonical = crate::runtime_layout::config_file_path(&root);
+    let legacy = crate::runtime_layout::legacy_config_file_path(&root);
+    if canonical.is_file() || !legacy.is_file() {
+        Some(canonical)
+    } else {
+        Some(legacy)
+    }
+}
+
+fn resolved_config_bot_name(config: &crate::config::Config, token: &str) -> Option<String> {
+    let mut bot_names = config.discord.bots.keys().cloned().collect::<Vec<_>>();
+    bot_names.sort();
+    bot_names.into_iter().find(|name| {
+        config
+            .discord
+            .bots
+            .get(name)
+            .and_then(|bot| {
+                bot.token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .or_else(|| crate::credential::read_bot_token(name))
+            })
+            .as_deref()
+            == Some(token)
+    })
+}
+
+fn persist_bot_auth_to_yaml(token: &str, settings: &DiscordBotSettings) {
+    let Some(path) = config_path_for_write() else {
+        return;
+    };
+
+    let mut config = if path.is_file() {
+        crate::config::load_from_path(&path).unwrap_or_default()
+    } else {
+        crate::config::Config::default()
+    };
+
+    config.discord.owner_id = settings.owner_user_id;
+
+    let Some(bot_name) = resolved_config_bot_name(&config, token) else {
+        let _ = crate::config::save_to_path(&path, &config);
+        return;
+    };
+
+    if let Some(bot) = config.discord.bots.get_mut(&bot_name) {
+        bot.provider = Some(settings.provider.as_str().to_string());
+        bot.agent = settings.agent.clone();
+        bot.auth.allowed_channel_ids = Some(settings.allowed_channel_ids.clone());
+        bot.auth.allowed_user_ids = Some(settings.allowed_user_ids.clone());
+        bot.auth.allowed_tools = Some(normalize_allowed_tools(&settings.allowed_tools));
+        bot.auth.allow_all_users = Some(settings.allow_all_users);
+        bot.auth.allowed_bot_ids = Some(settings.allowed_bot_ids.clone());
+    }
+
+    let _ = crate::config::save_to_path(&path, &config);
+}
+
+fn save_runtime_bot_settings(token: &str, settings: &DiscordBotSettings) {
+    let Some(path) = bot_settings_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut json: serde_json::Value = if let Ok(content) = fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let Some(obj) = json.as_object_mut() else {
+        return;
+    };
+
+    let yaml_manages_bot = config_path_for_write()
+        .map(|config_path| {
+            let config = if config_path.is_file() {
+                crate::config::load_from_path(&config_path).unwrap_or_default()
+            } else {
+                crate::config::Config::default()
+            };
+            resolved_config_bot_name(&config, token).is_some()
+        })
+        .unwrap_or(false);
+    let legacy_metadata =
+        find_bot_settings_entry(obj, token).and_then(|(_, entry)| entry.as_object().cloned());
+    let key = discord_token_hash(token);
+    obj.retain(|existing_key, existing_entry| {
+        if existing_key == &key {
+            return false;
+        }
+        existing_entry
+            .get("token")
+            .and_then(|value| value.as_str())
+            .map(|existing_token| existing_token != token)
+            .unwrap_or(true)
+    });
+
+    if yaml_manages_bot {
+        if !settings.channel_model_overrides.is_empty() {
+            obj.insert(
+                key,
+                serde_json::json!({
+                    "channel_model_overrides": settings.channel_model_overrides,
+                }),
+            );
+        }
+    } else {
+        let mut entry = legacy_metadata.unwrap_or_default();
+        entry.insert("token".to_string(), serde_json::json!(token));
+        entry.insert(
+            "provider".to_string(),
+            serde_json::json!(settings.provider.as_str()),
+        );
+        match settings
+            .agent
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            Some(agent) => {
+                entry.insert("agent".to_string(), serde_json::json!(agent));
+            }
+            None => {
+                entry.remove("agent");
+            }
+        }
+        if settings.allowed_channel_ids.is_empty() {
+            entry.remove("allowed_channel_ids");
+        } else {
+            entry.insert(
+                "allowed_channel_ids".to_string(),
+                serde_json::json!(settings.allowed_channel_ids),
+            );
+        }
+        if settings.allowed_user_ids.is_empty() {
+            entry.remove("allowed_user_ids");
+        } else {
+            entry.insert(
+                "allowed_user_ids".to_string(),
+                serde_json::json!(settings.allowed_user_ids),
+            );
+        }
+        if settings.allowed_bot_ids.is_empty() {
+            entry.remove("allowed_bot_ids");
+        } else {
+            entry.insert(
+                "allowed_bot_ids".to_string(),
+                serde_json::json!(settings.allowed_bot_ids),
+            );
+        }
+        if settings.allowed_tools.is_empty() {
+            entry.remove("allowed_tools");
+        } else {
+            entry.insert(
+                "allowed_tools".to_string(),
+                serde_json::json!(normalize_allowed_tools(&settings.allowed_tools)),
+            );
+        }
+        if settings.allow_all_users {
+            entry.insert("allow_all_users".to_string(), serde_json::json!(true));
+        } else {
+            entry.remove("allow_all_users");
+        }
+        match settings.owner_user_id {
+            Some(owner_user_id) => {
+                entry.insert(
+                    "owner_user_id".to_string(),
+                    serde_json::json!(owner_user_id),
+                );
+            }
+            None => {
+                entry.remove("owner_user_id");
+            }
+        }
+        if settings.channel_model_overrides.is_empty() {
+            entry.remove("channel_model_overrides");
+        } else {
+            entry.insert(
+                "channel_model_overrides".to_string(),
+                serde_json::json!(settings.channel_model_overrides),
+            );
+        }
+        obj.insert(key, serde_json::Value::Object(entry));
+    }
+
+    if obj.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+
+    if let Ok(rendered) = serde_json::to_string_pretty(&json) {
+        let _ = fs::write(&path, rendered);
+    }
+}
+
+fn last_session_path_key(token_hash: &str, channel_id: u64) -> String {
+    format!("discord:last_session:{token_hash}:{channel_id}")
+}
+
+fn last_remote_profile_key(token_hash: &str, channel_id: u64) -> String {
+    format!("discord:last_remote:{token_hash}:{channel_id}")
+}
+
+fn load_kv_meta_value(db: Option<&crate::db::Db>, key: &str) -> Option<String> {
+    let db = db?;
+    let conn = db.read_conn().ok()?;
+    conn.query_row("SELECT value FROM kv_meta WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+    .filter(|value| !value.trim().is_empty())
+}
+
+pub(super) fn load_last_session_path(
+    db: Option<&crate::db::Db>,
+    token_hash: &str,
+    channel_id: u64,
+) -> Option<String> {
+    load_kv_meta_value(db, &last_session_path_key(token_hash, channel_id))
+}
+
+pub(super) fn load_last_remote_profile(
+    db: Option<&crate::db::Db>,
+    token_hash: &str,
+    channel_id: u64,
+) -> Option<String> {
+    load_kv_meta_value(db, &last_remote_profile_key(token_hash, channel_id))
+}
+
+pub(super) fn save_last_session_runtime(
+    db: Option<&crate::db::Db>,
+    token_hash: &str,
+    channel_id: u64,
+    current_path: &str,
+    remote_profile_name: Option<&str>,
+) {
+    let Some(db) = db else {
+        return;
+    };
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+        [
+            last_session_path_key(token_hash, channel_id),
+            current_path.to_string(),
+        ],
+    );
+
+    let remote_key = last_remote_profile_key(token_hash, channel_id);
+    match remote_profile_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(remote) => {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                [remote_key, remote.to_string()],
+            );
+        }
+        None => {
+            let _ = conn.execute("DELETE FROM kv_meta WHERE key = ?1", [remote_key]);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -216,24 +583,12 @@ fn configured_memory_backend_name() -> Option<String> {
     runtime_memory_backend_config().map(|config| config.backend)
 }
 
-fn env_var_is_set(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-}
-
 fn memento_backend_available() -> bool {
-    let Some(config) = runtime_memory_backend_config() else {
-        return false;
-    };
-    let endpoint = config.mcp.endpoint.trim();
-    let access_key_env = config.mcp.access_key_env.trim();
-    !endpoint.is_empty() && !access_key_env.is_empty() && env_var_is_set(access_key_env)
+    crate::services::memory::backend_is_active(MemoryBackendKind::Memento)
 }
 
 fn mem0_backend_available() -> bool {
-    env_var_is_set("MEM0_API_KEY") && env_var_is_set("MEM0_BASE_URL")
+    crate::services::memory::backend_is_active(MemoryBackendKind::Mem0)
 }
 
 fn auto_detect_memory_backend() -> MemoryBackendKind {
@@ -255,10 +610,32 @@ fn resolve_memory_backend(raw: Option<&str>) -> MemoryBackendKind {
     match requested {
         "auto" => auto_detect_memory_backend(),
         "file" => MemoryBackendKind::File,
-        "mem0" => MemoryBackendKind::Mem0,
-        "memento" => MemoryBackendKind::Memento,
+        "mem0" => resolve_explicit_memory_backend(MemoryBackendKind::Mem0),
+        "memento" => resolve_explicit_memory_backend(MemoryBackendKind::Memento),
         _ => MemoryBackendKind::File,
     }
+}
+
+fn resolve_explicit_memory_backend(kind: MemoryBackendKind) -> MemoryBackendKind {
+    if crate::services::memory::backend_is_active(kind) {
+        return kind;
+    }
+
+    if let Some(state) = crate::services::memory::backend_state(kind) {
+        eprintln!(
+            "  [memory] Warning: requested backend '{}' unavailable (configured={}, failures={}); falling back to file",
+            kind.as_str(),
+            state.configured,
+            state.consecutive_failures
+        );
+    } else {
+        eprintln!(
+            "  [memory] Warning: requested backend '{}' unavailable; falling back to file",
+            kind.as_str()
+        );
+    }
+
+    MemoryBackendKind::File
 }
 
 fn resolve_mem0_profile(raw: Option<&str>) -> String {
@@ -568,6 +945,9 @@ pub(super) fn resolve_role_binding(
     channel_id: ChannelId,
     channel_name: Option<&str>,
 ) -> Option<RoleBinding> {
+    if let Some(binding) = agentdesk_config::resolve_role_binding(channel_id, channel_name) {
+        return Some(binding);
+    }
     if org_schema::org_schema_exists() {
         if let Some(binding) = org_schema::resolve_role_binding(channel_id, channel_name) {
             return Some(binding);
@@ -585,9 +965,13 @@ pub(crate) fn list_registered_channel_bindings() -> Vec<RegisteredChannelBinding
 
     if org_schema::org_schema_exists() {
         for binding in org_schema::list_registered_channel_bindings() {
-            // Org schema is the canonical source when both configs define the same channel.
             merged.insert(binding.channel_id, binding);
         }
+    }
+
+    for binding in agentdesk_config::list_registered_channel_bindings() {
+        // Match resolve_role_binding() precedence: agentdesk.yaml > org.yaml > role_map.json.
+        merged.insert(binding.channel_id, binding);
     }
 
     merged.into_values().collect()
@@ -598,12 +982,26 @@ pub(super) fn resolve_workspace(
     channel_id: ChannelId,
     channel_name: Option<&str>,
 ) -> Option<String> {
+    if let Some(ws) = agentdesk_config::resolve_workspace(channel_id, channel_name) {
+        return Some(ws);
+    }
     if org_schema::org_schema_exists() {
         if let Some(ws) = org_schema::resolve_workspace(channel_id, channel_name) {
             return Some(ws);
         }
     }
     resolve_workspace_from_role_map(channel_id, channel_name)
+}
+
+/// Returns true only when this runtime has an explicit or resolved binding for
+/// the concrete Discord channel ID. This deliberately avoids channel-name-only
+/// fallback for unrelated runtimes that happen to share a channel name.
+pub(super) fn has_configured_channel_binding(
+    channel_id: ChannelId,
+    _channel_name: Option<&str>,
+) -> bool {
+    resolve_role_binding(channel_id, None).is_some()
+        || resolve_workspace(channel_id, None).is_some()
 }
 
 pub(super) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
@@ -758,12 +1156,15 @@ pub(super) fn load_narrate_progress(db: Option<&crate::db::Db>) -> bool {
 /// Load the shared agent prompt (e.g. AGENTS.md) configured in org.yaml or role_map.json.
 /// Returns None if not configured or file not found.
 pub(super) fn load_shared_prompt() -> Option<String> {
-    let path_str = if org_schema::org_schema_exists() {
-        org_schema::load_shared_prompt_path()
-    } else {
-        None
-    }
-    .or_else(load_shared_prompt_path_from_role_map)?;
+    let path_str = agentdesk_config::load_shared_prompt_path()
+        .or_else(|| {
+            if org_schema::org_schema_exists() {
+                org_schema::load_shared_prompt_path()
+            } else {
+                None
+            }
+        })
+        .or_else(load_shared_prompt_path_from_role_map)?;
 
     let raw = fs::read_to_string(Path::new(&path_str)).ok()?;
     const MAX_CHARS: usize = 6_000;
@@ -796,6 +1197,9 @@ pub(super) fn load_review_tuning_guidance() -> Option<String> {
 /// Unlike load_peer_agents() which reads meeting.available_agents in legacy mode,
 /// this checks the full agent/channel binding registry.
 pub(super) fn is_known_agent(role_id: &str) -> bool {
+    if let Some(known) = agentdesk_config::is_known_agent(role_id) {
+        return known;
+    }
     if org_schema::org_schema_exists() {
         if let Some(known) = org_schema::is_known_agent(role_id) {
             return known;
@@ -805,6 +1209,10 @@ pub(super) fn is_known_agent(role_id: &str) -> bool {
 }
 
 pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
+    let peers = agentdesk_config::load_peer_agents();
+    if !peers.is_empty() {
+        return peers;
+    }
     if org_schema::org_schema_exists() {
         let peers = org_schema::load_peer_agents();
         if !peers.is_empty() {
@@ -912,180 +1320,89 @@ pub(super) fn cleanup_channel_uploads(channel_id: ChannelId) {
     }
 }
 
-/// Load Discord bot settings from bot_settings.json
+/// Load Discord bot settings from agentdesk.yaml plus runtime-only bot_settings.json.
 pub(super) fn load_bot_settings(token: &str) -> DiscordBotSettings {
-    let Some(path) = bot_settings_path() else {
-        return DiscordBotSettings::default();
-    };
-    let Ok(content) = fs::read_to_string(&path) else {
-        return DiscordBotSettings::default();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return DiscordBotSettings::default();
-    };
-    let Some(obj) = json.as_object() else {
-        return DiscordBotSettings::default();
-    };
-    let Some((_, entry)) = find_bot_settings_entry(obj, token) else {
-        return DiscordBotSettings::default();
-    };
-    let agent = entry
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let owner_user_id = entry.get("owner_user_id").and_then(json_u64);
-    let provider = entry
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .map(ProviderKind::from_str_or_unsupported)
+    let configured = agentdesk_config::find_discord_bot_by_token(token);
+    let legacy = load_legacy_bot_settings_entry(token);
+    let provider = configured
+        .as_ref()
+        .and_then(|bot| bot.provider.clone())
+        .or(legacy.provider.clone())
         .unwrap_or(ProviderKind::Claude);
-    let last_sessions = entry
-        .get("last_sessions")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let last_remotes = entry
-        .get("last_remotes")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let allowed_channel_ids = entry
-        .get("allowed_channel_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(json_u64).collect())
-        .unwrap_or_default();
-    let allowed_user_ids = entry
-        .get("allowed_user_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(json_u64).collect())
-        .unwrap_or_default();
-    let allow_all_users = entry
-        .get("allow_all_users")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let allowed_bot_ids = entry
-        .get("allowed_bot_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(json_u64).collect())
-        .unwrap_or_default();
-    let channel_model_overrides = entry
-        .get("channel_model_overrides")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(channel_id, model)| {
-                    model
-                        .as_str()
-                        .map(|model| (channel_id.clone(), model.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let allowed_tools = match entry.get("allowed_tools") {
-        None => default_allowed_tools_for_provider(&provider),
-        Some(value) => {
-            let Some(tools_arr) = value.as_array() else {
-                let allowed_tools = default_allowed_tools_for_provider(&provider);
-                return DiscordBotSettings {
-                    agent,
-                    provider,
-                    allowed_tools,
-                    allowed_channel_ids,
-                    owner_user_id,
-                    last_sessions,
-                    last_remotes,
-                    allowed_user_ids,
-                    allow_all_users,
-                    allowed_bot_ids,
-                    ..DiscordBotSettings::default()
-                };
-            };
-            normalize_allowed_tools(tools_arr.iter().filter_map(|v| v.as_str()))
-        }
-    };
+    let allowed_tools = configured
+        .as_ref()
+        .and_then(|bot| bot.auth.allowed_tools.as_ref().cloned())
+        .map(|tools| normalize_allowed_tools(&tools))
+        .or(legacy.allowed_tools.clone())
+        .unwrap_or_else(|| default_allowed_tools_for_provider(&provider));
+
     DiscordBotSettings {
-        agent,
+        agent: configured
+            .as_ref()
+            .and_then(|bot| bot.agent.clone())
+            .or(legacy.agent),
         provider,
         allowed_tools,
-        allowed_channel_ids,
-        last_sessions,
-        last_remotes,
-        channel_model_overrides,
-        owner_user_id,
-        allowed_user_ids,
-        allow_all_users,
-        allowed_bot_ids,
+        allowed_channel_ids: configured
+            .as_ref()
+            .and_then(|bot| bot.auth.allowed_channel_ids.clone())
+            .unwrap_or(legacy.allowed_channel_ids),
+        channel_model_overrides: legacy.channel_model_overrides,
+        owner_user_id: configured
+            .as_ref()
+            .and_then(|bot| bot.owner_id)
+            .or(legacy.owner_user_id),
+        allowed_user_ids: configured
+            .as_ref()
+            .and_then(|bot| bot.auth.allowed_user_ids.clone())
+            .unwrap_or(legacy.allowed_user_ids),
+        allow_all_users: configured
+            .as_ref()
+            .and_then(|bot| bot.auth.allow_all_users)
+            .or(legacy.allow_all_users)
+            .unwrap_or(false),
+        allowed_bot_ids: configured
+            .as_ref()
+            .and_then(|bot| bot.auth.allowed_bot_ids.clone())
+            .unwrap_or(legacy.allowed_bot_ids),
     }
 }
 
-/// Save Discord bot settings to bot_settings.json
+/// Save Discord bot settings.
+/// Auth moves to agentdesk.yaml; runtime-only overrides remain in bot_settings.json.
 pub(super) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
-    let Some(path) = bot_settings_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let mut json: serde_json::Value = if let Ok(content) = fs::read_to_string(&path) {
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    let key = discord_token_hash(token);
-    let normalized_tools = normalize_allowed_tools(&settings.allowed_tools);
-    let mut entry = serde_json::json!({
-        "token": token,
-        "agent": settings.agent,
-        "provider": settings.provider.as_str(),
-        "allowed_tools": normalized_tools,
-        "allowed_channel_ids": settings.allowed_channel_ids,
-        "last_sessions": settings.last_sessions,
-        "last_remotes": settings.last_remotes,
-        "channel_model_overrides": settings.channel_model_overrides,
-        "allowed_user_ids": settings.allowed_user_ids,
-        "allow_all_users": settings.allow_all_users,
-        "allowed_bot_ids": settings.allowed_bot_ids,
-    });
-    if let Some(owner_id) = settings.owner_user_id {
-        entry["owner_user_id"] = serde_json::json!(owner_id);
-    }
-    let Some(obj) = json.as_object_mut() else {
-        return;
-    };
-    obj.retain(|existing_key, existing_entry| {
-        if existing_key == &key {
-            return true;
-        }
-        existing_entry
-            .get("token")
-            .and_then(|value| value.as_str())
-            .map(|existing_token| existing_token != token)
-            .unwrap_or(true)
-    });
-    obj.insert(key, entry);
-    if let Ok(s) = serde_json::to_string_pretty(&json) {
-        let _ = fs::write(&path, s);
-    }
+    persist_bot_auth_to_yaml(token, settings);
+    save_runtime_bot_settings(token, settings);
 }
 
 pub fn load_discord_bot_launch_configs() -> Vec<DiscordBotLaunchConfig> {
-    let Some(path) = bot_settings_path() else {
-        return Vec::new();
-    };
-    let Ok(content) = fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let configured = agentdesk_config::load_discord_bot_configs();
+    if !configured.is_empty() {
+        // Only launch bots that are mapped to at least one agent channel.
+        // Utility bots (announce, notify) that aren't referenced by any agent
+        // channel config are excluded to prevent them from processing agent messages.
+        let agent_bot_names = agentdesk_config::collect_agent_bot_names();
+        let mut configs = configured
+            .into_iter()
+            .filter(|bot| agent_bot_names.contains(&bot.name))
+            .map(|bot| {
+                let legacy = load_legacy_bot_settings_entry(&bot.token);
+                DiscordBotLaunchConfig {
+                    hash_key: discord_token_hash(&bot.token),
+                    token: bot.token,
+                    provider: bot
+                        .provider
+                        .or(legacy.provider)
+                        .unwrap_or(ProviderKind::Claude),
+                }
+            })
+            .collect::<Vec<_>>();
+        configs.sort_by(|left, right| left.hash_key.cmp(&right.hash_key));
+        configs.dedup_by(|left, right| left.token == right.token);
+        return configs;
+    }
+
+    let Some(json) = load_legacy_bot_settings_json() else {
         return Vec::new();
     };
     let Some(obj) = json.as_object() else {
@@ -1123,11 +1440,18 @@ pub fn load_discord_bot_launch_configs() -> Vec<DiscordBotLaunchConfig> {
     configs_by_token.into_values().collect()
 }
 
-/// Resolve a Discord bot token from its hash by searching bot_settings.json
+/// Resolve a Discord bot token from its hash by searching agentdesk.yaml first,
+/// then falling back to legacy bot_settings.json entries.
 pub fn resolve_discord_token_by_hash(hash: &str) -> Option<String> {
-    let path = bot_settings_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    if let Some(token) = agentdesk_config::load_discord_bot_configs()
+        .into_iter()
+        .find(|bot| discord_token_hash(&bot.token) == hash)
+        .map(|bot| bot.token)
+    {
+        return Some(token);
+    }
+
+    let json = load_legacy_bot_settings_json()?;
     let obj = json.as_object()?;
     let entry = obj.get(hash)?;
     entry
@@ -1187,6 +1511,16 @@ mod tests {
         fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
+    fn write_agentdesk_yaml(temp_home: &TempDir, contents: &str) {
+        let path = temp_home
+            .path()
+            .join(".adk")
+            .join("config")
+            .join("agentdesk.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
     fn with_env_vars<F>(values: &[(&str, Option<&str>)], f: F)
     where
         F: FnOnce(),
@@ -1243,13 +1577,11 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_settings_defaults_to_file_and_code_defaults() {
+        crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
+            write_agentdesk_yaml(
                 temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "auto"
-                }),
+                "server:\n  port: 8791\nmemory:\n  backend: auto\n",
             );
 
             with_env_vars(&[("MEM0_API_KEY", None), ("MEM0_BASE_URL", None)], || {
@@ -1267,6 +1599,7 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_settings_applies_override_and_clamps_values() {
+        crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
             write_memory_backend_config(
                 temp_home,
@@ -1303,33 +1636,42 @@ mod tests {
                 }),
             };
 
-            let resolved = resolve_memory_settings(Some(&agent), Some(&channel));
-            assert_eq!(resolved.backend, super::MemoryBackendKind::Mem0);
-            assert_eq!(resolved.recall_timeout_ms, 2_000);
-            assert_eq!(resolved.capture_timeout_ms, 500);
-            assert_eq!(resolved.mem0.profile, "default");
-            assert_eq!(
-                resolved.mem0.ingestion.custom_instructions.as_deref(),
-                Some("Channel override")
+            with_env_vars(
+                &[
+                    ("MEM0_API_KEY", Some("mem0-key")),
+                    ("MEM0_BASE_URL", Some("http://mem0.local")),
+                ],
+                || {
+                    let resolved = resolve_memory_settings(Some(&agent), Some(&channel));
+                    assert_eq!(resolved.backend, super::MemoryBackendKind::Mem0);
+                    assert_eq!(resolved.recall_timeout_ms, 2_000);
+                    assert_eq!(resolved.capture_timeout_ms, 500);
+                    assert_eq!(resolved.mem0.profile, "default");
+                    assert_eq!(
+                        resolved.mem0.ingestion.custom_instructions.as_deref(),
+                        Some("Channel override")
+                    );
+                    assert_eq!(resolved.mem0.ingestion.infer, Some(true));
+                    assert_eq!(resolved.mem0.ingestion.confidence_threshold, None);
+                },
             );
-            assert_eq!(resolved.mem0.ingestion.infer, Some(true));
-            assert_eq!(resolved.mem0.ingestion.confidence_threshold, None);
         });
     }
 
     #[test]
     fn test_resolve_memory_settings_auto_detects_memento_then_mem0_then_file() {
+        crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
+            write_agentdesk_yaml(
                 temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "auto",
-                    "mcp": {
-                        "endpoint": "http://127.0.0.1:8765",
-                        "access_key_env": "MEMENTO_TEST_KEY"
-                    }
-                }),
+                r#"server:
+  port: 8791
+memory:
+  backend: auto
+  mcp:
+    endpoint: http://127.0.0.1:8765
+    access_key_env: MEMENTO_TEST_KEY
+"#,
             );
 
             with_env_vars(
@@ -1372,17 +1714,18 @@ mod tests {
 
     #[test]
     fn test_resolve_memory_settings_explicit_backend_skips_auto_detection() {
+        crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
+            write_agentdesk_yaml(
                 temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "auto",
-                    "mcp": {
-                        "endpoint": "http://127.0.0.1:8765",
-                        "access_key_env": "MEMENTO_TEST_KEY"
-                    }
-                }),
+                r#"server:
+  port: 8791
+memory:
+  backend: auto
+  mcp:
+    endpoint: http://127.0.0.1:8765
+    access_key_env: MEMENTO_TEST_KEY
+"#,
             );
 
             with_env_vars(
@@ -1418,6 +1761,167 @@ mod tests {
                         None,
                     );
                     assert_eq!(memento.backend, super::MemoryBackendKind::Memento);
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_memory_settings_accepts_local_alias_and_ignores_available_mcps() {
+        crate::services::memory::reset_backend_health_for_tests();
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"server:
+  port: 8791
+memory:
+  backend: auto
+  mcp:
+    endpoint: http://127.0.0.1:8765
+    access_key_env: MEMENTO_TEST_KEY
+"#,
+            );
+
+            with_env_vars(
+                &[
+                    ("MEMENTO_TEST_KEY", Some("memento-key")),
+                    ("MEM0_API_KEY", Some("mem0-key")),
+                    ("MEM0_BASE_URL", Some("http://mem0.local")),
+                ],
+                || {
+                    let resolved = resolve_memory_settings(
+                        Some(&super::MemoryConfigOverride {
+                            backend: Some("local".to_string()),
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    assert_eq!(resolved.backend, super::MemoryBackendKind::File);
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_memory_settings_explicit_backend_falls_back_to_file_when_unavailable() {
+        crate::services::memory::reset_backend_health_for_tests();
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"server:
+  port: 8791
+memory:
+  backend: auto
+  mcp:
+    endpoint: http://127.0.0.1:8765
+    access_key_env: MEMENTO_TEST_KEY
+"#,
+            );
+
+            with_env_vars(
+                &[
+                    ("MEMENTO_TEST_KEY", None),
+                    ("MEM0_API_KEY", None),
+                    ("MEM0_BASE_URL", None),
+                ],
+                || {
+                    let mem0 = resolve_memory_settings(
+                        Some(&super::MemoryConfigOverride {
+                            backend: Some("mem0".to_string()),
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    assert_eq!(mem0.backend, super::MemoryBackendKind::File);
+
+                    let memento = resolve_memory_settings(
+                        Some(&super::MemoryConfigOverride {
+                            backend: Some("memento".to_string()),
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    assert_eq!(memento.backend, super::MemoryBackendKind::File);
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_unavailable_explicit_backend_uses_local_prompt_guidance() {
+        crate::services::memory::reset_backend_health_for_tests();
+        with_temp_home(|_temp_home: &TempDir| {
+            with_env_vars(
+                &[
+                    ("MEMENTO_TEST_KEY", None),
+                    ("MEMENTO_WORKSPACE", None),
+                    ("MEM0_API_KEY", None),
+                    ("MEM0_BASE_URL", None),
+                ],
+                || {
+                    let resolved = resolve_memory_settings(
+                        Some(&super::MemoryConfigOverride {
+                            backend: Some("memento".to_string()),
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    assert_eq!(resolved.backend, super::MemoryBackendKind::File);
+
+                    let prompt = super::super::prompt_builder::build_system_prompt(
+                        "ctx",
+                        "/tmp",
+                        ChannelId::new(1),
+                        "tok",
+                        "",
+                        "",
+                        true,
+                        None,
+                        false,
+                        super::super::prompt_builder::DispatchProfile::Full,
+                        None,
+                        None,
+                        None,
+                        Some(&resolved),
+                    );
+
+                    assert!(prompt.contains("[Proactive Memory Guidance]"));
+                    assert!(prompt.contains("`memory-read` skill"));
+                    assert!(prompt.contains("`memory-write` skill"));
+                    assert!(!prompt.contains("`recall` MCP tool"));
+                    assert!(!prompt.contains("`remember` MCP tool"));
+                    assert!(!prompt.contains("`search_memory` MCP tool"));
+                    assert!(!prompt.contains("`add_memories` MCP tool"));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_memory_settings_uses_legacy_json_fallback_when_yaml_memory_is_absent() {
+        crate::services::memory::reset_backend_health_for_tests();
+        with_temp_home(|temp_home: &TempDir| {
+            write_memory_backend_config(
+                temp_home,
+                serde_json::json!({
+                    "version": 2,
+                    "backend": "memento",
+                    "mcp": {
+                        "endpoint": "http://127.0.0.1:8765",
+                        "access_key_env": "MEMENTO_TEST_KEY"
+                    }
+                }),
+            );
+
+            with_env_vars(
+                &[
+                    ("MEMENTO_TEST_KEY", Some("memento-key")),
+                    ("MEM0_API_KEY", None),
+                    ("MEM0_BASE_URL", None),
+                ],
+                || {
+                    let resolved = resolve_memory_settings(None, None);
+                    assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
                 },
             );
         });
@@ -1520,6 +2024,143 @@ mod tests {
             assert_eq!(configs.len(), 2);
             assert_eq!(configs[0].provider, ProviderKind::Claude);
             assert_eq!(configs[1].provider, ProviderKind::Codex);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_excludes_unmapped_utility_bots_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    claude:
+      token: "claude-token"
+      provider: "claude"
+    codex:
+      token: "codex-token"
+      provider: "codex"
+    announce:
+      token: "announce-token"
+      provider: "claude"
+    notify:
+      token: "notify-token"
+      provider: "claude"
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1479671298497183835"
+        name: "adk-cc"
+      codex:
+        id: "1479671301387059200"
+        name: "adk-cdx"
+"#,
+            );
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 2);
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.token.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["codex-token", "claude-token"]
+            );
+            assert_eq!(
+                configs
+                    .iter()
+                    .map(|cfg| cfg.provider.clone())
+                    .collect::<Vec<ProviderKind>>(),
+                vec![ProviderKind::Codex, ProviderKind::Claude]
+            );
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_includes_command_alias_bots_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    command:
+      token: "claude-token"
+      provider: "claude"
+    command_2:
+      token: "codex-token"
+      provider: "codex"
+    notify:
+      token: "notify-token"
+      provider: "claude"
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1479671298497183835"
+        name: "adk-cc"
+      codex:
+        id: "1479671301387059200"
+        name: "adk-cdx"
+"#,
+            );
+
+            let mut tokens = load_discord_bot_launch_configs()
+                .into_iter()
+                .map(|cfg| cfg.token)
+                .collect::<Vec<_>>();
+            tokens.sort();
+            assert_eq!(tokens, vec!["claude-token", "codex-token"]);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_includes_allowlisted_alias_bot_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    workspace-bot:
+      token: "workspace-token"
+      provider: "claude"
+      auth:
+        allowed_channel_ids:
+          - "1479671298497183835"
+    notify:
+      token: "notify-token"
+      provider: "claude"
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1479671298497183835"
+        name: "adk-cc"
+"#,
+            );
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].token, "workspace-token");
+            assert_eq!(configs[0].provider, ProviderKind::Claude);
         });
     }
 
@@ -1705,8 +2346,14 @@ mod tests {
 
     #[test]
     fn test_save_bot_settings_persists_allowed_channel_ids() {
-        with_temp_home(|_temp_home: &TempDir| {
+        with_temp_home(|temp_home: &TempDir| {
             let token = "test-token";
+            write_agentdesk_yaml(
+                temp_home,
+                &format!(
+                    "server:\n  port: 8791\ndiscord:\n  bots:\n    command:\n      token: \"{token}\"\n"
+                ),
+            );
             let mut settings = super::super::DiscordBotSettings::default();
             settings.allowed_channel_ids = vec![123, 456];
 
@@ -1732,6 +2379,12 @@ mod tests {
                 other_key.clone(): { "token": other_token, "owner_user_id": 2 }
             });
             fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+            write_agentdesk_yaml(
+                temp_home,
+                &format!(
+                    "server:\n  port: 8791\ndiscord:\n  bots:\n    command:\n      token: \"{token}\"\n"
+                ),
+            );
 
             let mut settings = super::super::DiscordBotSettings::default();
             settings.owner_user_id = Some(42);
@@ -1741,12 +2394,78 @@ mod tests {
             let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
             let obj = saved.as_object().unwrap();
             assert!(obj.get("claude").is_none());
-            assert!(obj.get(&canonical_key).is_some());
+            assert!(obj.get(&canonical_key).is_none());
             assert!(obj.get(&other_key).is_some());
-            assert_eq!(obj.len(), 2);
+            assert_eq!(obj.len(), 1);
 
             let loaded = load_bot_settings(token);
             assert_eq!(loaded.owner_user_id, Some(42));
+        });
+    }
+
+    #[test]
+    fn test_save_bot_settings_preserves_legacy_launch_metadata_without_yaml_match() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            let token = "legacy-token";
+            let key = discord_token_hash(token);
+            let path = settings_dir.join("bot_settings.json");
+            let json = serde_json::json!({
+                "legacy_alias": {
+                    "token": token,
+                    "provider": "codex",
+                    "agent": "codex",
+                    "allowed_channel_ids": [123],
+                    "owner_user_id": 7
+                }
+            });
+            fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+            let mut settings = load_bot_settings(token);
+            settings
+                .channel_model_overrides
+                .insert("123".to_string(), "gpt-5.4".to_string());
+            save_bot_settings(token, &settings);
+
+            let raw = fs::read_to_string(&path).unwrap();
+            let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let entry = saved.get(&key).unwrap();
+            assert_eq!(
+                entry.get("token").and_then(|value| value.as_str()),
+                Some(token)
+            );
+            assert_eq!(
+                entry.get("provider").and_then(|value| value.as_str()),
+                Some("codex")
+            );
+            assert_eq!(
+                entry.get("agent").and_then(|value| value.as_str()),
+                Some("codex")
+            );
+            assert_eq!(
+                entry
+                    .get("allowed_channel_ids")
+                    .and_then(|value| value.as_array())
+                    .map(|ids| ids.len()),
+                Some(1)
+            );
+            assert_eq!(
+                entry.get("owner_user_id").and_then(|value| value.as_u64()),
+                Some(7)
+            );
+            assert_eq!(
+                entry
+                    .get("channel_model_overrides")
+                    .and_then(|value| value.get("123"))
+                    .and_then(|value| value.as_str()),
+                Some("gpt-5.4")
+            );
+
+            let configs = load_discord_bot_launch_configs();
+            assert_eq!(configs.len(), 1);
+            assert_eq!(configs[0].token, token);
+            assert_eq!(configs[0].provider, ProviderKind::Codex);
         });
     }
 
@@ -1776,8 +2495,14 @@ mod tests {
 
     #[test]
     fn test_save_bot_settings_persists_allow_all_users() {
-        with_temp_home(|_temp_home: &TempDir| {
+        with_temp_home(|temp_home: &TempDir| {
             let token = "test-token";
+            write_agentdesk_yaml(
+                temp_home,
+                &format!(
+                    "server:\n  port: 8791\ndiscord:\n  bots:\n    command:\n      token: \"{token}\"\n"
+                ),
+            );
             let mut settings = super::super::DiscordBotSettings::default();
             settings.allow_all_users = true;
 
@@ -1814,8 +2539,14 @@ mod tests {
 
     #[test]
     fn test_save_bot_settings_persists_agent_identity() {
-        with_temp_home(|_temp_home: &TempDir| {
+        with_temp_home(|temp_home: &TempDir| {
             let token = "test-token";
+            write_agentdesk_yaml(
+                temp_home,
+                &format!(
+                    "server:\n  port: 8791\ndiscord:\n  bots:\n    command:\n      token: \"{token}\"\n"
+                ),
+            );
             let mut settings = super::super::DiscordBotSettings::default();
             settings.agent = Some("codex".to_string());
 
@@ -1970,6 +2701,97 @@ channels:
                     (456, ProviderKind::Claude),
                     (789, ProviderKind::Codex),
                 ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_list_registered_channel_bindings_includes_agentdesk_with_highest_precedence() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("role_map.json"),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 1,
+                    "byChannelId": {
+                        "123": {
+                            "roleId": "legacy-codex",
+                            "promptFile": "/tmp/legacy-codex.prompt.md",
+                            "provider": "codex"
+                        },
+                        "456": {
+                            "roleId": "legacy-claude",
+                            "promptFile": "/tmp/legacy-claude.prompt.md",
+                            "provider": "claude"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                settings_dir.join("org.yaml"),
+                r#"
+version: 1
+name: AgentDesk
+agents:
+  org-gemini:
+    display_name: Org Gemini
+    provider: gemini
+channels:
+  by_id:
+    "123":
+      agent: org-gemini
+    "789":
+      agent: org-gemini
+"#,
+            )
+            .unwrap();
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  bots: {}
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: codex
+    channels:
+      codex:
+        id: "123"
+        name: "adk-cdx"
+  - id: project-claude
+    name: "Claude Agent"
+    provider: claude
+    channels:
+      claude:
+        id: "999"
+        name: "adk-cc"
+"#,
+            );
+
+            let bindings = list_registered_channel_bindings();
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(|binding| (binding.channel_id, binding.owner_provider.clone()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (123, ProviderKind::Codex),
+                    (456, ProviderKind::Claude),
+                    (789, ProviderKind::Gemini),
+                    (999, ProviderKind::Claude),
+                ]
+            );
+            assert_eq!(
+                bindings
+                    .iter()
+                    .find(|binding| binding.channel_id == 123)
+                    .and_then(|binding| binding.fallback_name.as_deref()),
+                Some("adk-cdx")
             );
         });
     }
@@ -2144,6 +2966,68 @@ channels:
         ));
         assert!(!bot_settings_allow_agent(&settings, None, false));
         assert!(bot_settings_allow_agent(&settings, None, true));
+    }
+
+    #[test]
+    fn test_has_configured_channel_binding_requires_matching_explicit_channel_id() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: claude
+    channels:
+      claude:
+        id: "1484070499783803081"
+        name: "adk-cc"
+        aliases: ["agentdesk-cc"]
+"#,
+            );
+
+            assert!(super::has_configured_channel_binding(
+                ChannelId::new(1484070499783803081),
+                Some("adk-cc"),
+            ));
+            assert!(!super::has_configured_channel_binding(
+                ChannelId::new(1479671298497183835),
+                Some("adk-cc"),
+            ));
+        });
+    }
+
+    #[test]
+    fn test_has_configured_channel_binding_ignores_org_by_name_fallback_for_ownership() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("org.yaml"),
+                r#"
+version: 1
+name: AgentDesk
+agents:
+  codex:
+    display_name: Codex
+    provider: codex
+channels:
+  by_name:
+    enabled: true
+    mappings:
+      agentdesk-codex:
+        agent: codex
+"#,
+            )
+            .unwrap();
+
+            assert!(!super::has_configured_channel_binding(
+                ChannelId::new(1486017489027469493),
+                Some("agentdesk-codex"),
+            ));
+        });
     }
 
     #[test]

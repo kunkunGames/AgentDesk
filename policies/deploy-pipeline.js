@@ -105,9 +105,9 @@ function startDeploySession(cardId) {
   );
 
   // Spawn deploy in detached tmux session.
-  // deploy-dev.sh builds, stops dev, copies binary, restarts, health-checks.
+  // Build the workspace for release, then promote directly into the release runtime.
   // After script exits, store exit code in tmux env for the tick to read.
-  var cmd = "cd " + shellQuote(worktree.path) + " && scripts/deploy-dev.sh 2>&1; " +
+  var cmd = "cd " + shellQuote(worktree.path) + " && scripts/build-release.sh 2>&1 && scripts/promote-release.sh --skip-review 2>&1; " +
     "tmux set-environment -t " + sessionName + " DEPLOY_RESULT $?; " +
     "sleep 600";
 
@@ -172,6 +172,19 @@ function advancePipelineStage(cardId) {
     agentdesk.log.info("[deploy-pipeline] Card " + cardId + " advancing to stage: " + stage.stage_name);
 
     if (stage.provider === "counter") {
+      // Skip e2e if DoD doesn't mention it
+      var dodText = (card[0].description || "").toLowerCase();
+      if (dodText.indexOf("e2e") === -1 && dodText.indexOf("end-to-end") === -1 && dodText.indexOf("end to end") === -1) {
+        agentdesk.log.info("[deploy-pipeline] Skipping e2e-test for card " + cardId + " — DoD has no e2e item");
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET pipeline_stage_id = NULL, blocked_reason = NULL, updated_at = datetime('now') WHERE id = ?",
+          [cardId]
+        );
+        var skipCfg = agentdesk.pipeline.resolveForCard(cardId);
+        var skipTerminal = agentdesk.pipeline.terminalState(skipCfg);
+        agentdesk.kanban.setStatus(cardId, skipTerminal);
+        return;
+      }
       createE2eTestDispatch(cardId, card[0].assigned_agent_id);
     } else if (stage.provider === "self") {
       agentdesk.db.execute(

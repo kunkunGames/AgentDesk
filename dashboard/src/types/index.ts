@@ -34,7 +34,15 @@ export interface Department {
 }
 
 export type AgentStatus = "idle" | "working" | "break" | "offline";
-export type CliProvider = "claude" | "codex" | "gemini" | "qwen" | "opencode" | "copilot" | "antigravity" | "api";
+export type CliProvider =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "qwen"
+  | "opencode"
+  | "copilot"
+  | "antigravity"
+  | "api";
 export type MeetingReviewDecision = "reviewing" | "approved" | "hold";
 
 export type ActivitySource = "idle" | "agentdesk";
@@ -118,7 +126,13 @@ export type TaskStatus =
   | "done"
   | "pending"
   | "cancelled";
-export type TaskType = "general" | "development" | "design" | "analysis" | "presentation" | "documentation";
+export type TaskType =
+  | "general"
+  | "development"
+  | "design"
+  | "analysis"
+  | "presentation"
+  | "documentation";
 export const WORKFLOW_PACK_KEYS = [
   "development",
   "novel",
@@ -128,7 +142,9 @@ export const WORKFLOW_PACK_KEYS = [
   "roleplay",
   "cookingheart",
 ] as const;
-export type WorkflowPackKey = (typeof WORKFLOW_PACK_KEYS)[number] | (string & {});
+export type WorkflowPackKey =
+  | (typeof WORKFLOW_PACK_KEYS)[number]
+  | (string & {});
 
 export interface Task {
   id: string;
@@ -212,7 +228,13 @@ export interface MeetingMinute {
 // Messages
 export type SenderType = "ceo" | "agent" | "system";
 export type ReceiverType = "agent" | "department" | "all";
-export type MessageType = "chat" | "task_assign" | "announcement" | "directive" | "report" | "status_update";
+export type MessageType =
+  | "chat"
+  | "task_assign"
+  | "announcement"
+  | "directive"
+  | "report"
+  | "status_update";
 
 export interface Message {
   id: string;
@@ -328,12 +350,30 @@ export interface RoundTableMeetingChannelOption {
   channel_id: string;
   channel_name: string;
   owner_provider: string;
+  available_experts?: RoundTableMeetingExpertOption[];
+}
+
+export interface RoundTableMeetingExpertOption {
+  role_id: string;
+  display_name: string;
+  keywords: string[];
+  domain_summary?: string | null;
+  strengths: string[];
+  task_types: string[];
+  anti_signals: string[];
+  provider_hint?: string | null;
+  metadata_missing?: boolean;
+  metadata_confidence?: "high" | "medium" | "low";
 }
 
 export interface RoundTableMeeting {
   id: string;
+  channel_id?: string | null;
+  meeting_hash?: string | null;
+  thread_hash?: string | null;
   agenda: string;
   summary: string | null;
+  selection_reason?: string | null;
   status: "in_progress" | "completed" | "cancelled";
   primary_provider: string | null;
   reviewer_provider: string | null;
@@ -505,11 +545,25 @@ export interface PipelineConfigFull {
   name: string;
   version: number;
   states: { id: string; label: string; terminal?: boolean }[];
-  transitions: { from: string; to: string; type: "free" | "gated" | "force_only"; gates?: string[] }[];
+  transitions: {
+    from: string;
+    to: string;
+    type: "free" | "gated" | "force_only";
+    gates?: string[];
+  }[];
   gates: Record<string, { type: string; check?: string; description?: string }>;
   hooks: Record<string, { on_enter: string[]; on_exit: string[] }>;
   clocks: Record<string, { set: string; mode?: string }>;
-  timeouts: Record<string, { duration: string; clock: string; max_retries?: number; on_exhaust?: string; condition?: string }>;
+  timeouts: Record<
+    string,
+    {
+      duration: string;
+      clock: string;
+      max_retries?: number;
+      on_exhaust?: string;
+      condition?: string;
+    }
+  >;
 }
 
 export interface PipelineOverride {
@@ -632,7 +686,10 @@ export interface MessengerChannelConfig {
   receiveEnabled?: boolean;
 }
 
-export type MessengerChannelsConfig = Record<MessengerChannelType, MessengerChannelConfig>;
+export type MessengerChannelsConfig = Record<
+  MessengerChannelType,
+  MessengerChannelConfig
+>;
 
 export interface OfficePackProfile {
   departments: Department[];
@@ -640,7 +697,9 @@ export interface OfficePackProfile {
   updated_at: number;
 }
 
-export type OfficePackProfiles = Partial<Record<WorkflowPackKey, OfficePackProfile>>;
+export type OfficePackProfiles = Partial<
+  Record<WorkflowPackKey, OfficePackProfile>
+>;
 
 export interface CompanySettings {
   companyName: string;
