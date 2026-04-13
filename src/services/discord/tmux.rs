@@ -148,6 +148,21 @@ fn extract_result_error_text(value: &serde_json::Value) -> String {
     }
 }
 
+fn load_restored_session_cwd_from_conn(
+    conn: &rusqlite::Connection,
+    session_keys: &[String],
+) -> Option<String> {
+    session_keys.iter().find_map(|session_key| {
+        conn.query_row(
+            "SELECT cwd FROM sessions WHERE session_key = ?1",
+            [session_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|path| !path.is_empty() && std::path::Path::new(path).is_dir())
+    })
+}
+
 fn normalized_retry_payload_text(user_text: &str) -> &str {
     let trimmed = user_text.trim();
     if let Some((header, body)) = trimmed.split_once("\n\n") {
@@ -2683,6 +2698,21 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             );
             let configured_path =
                 super::settings::resolve_workspace(*channel_id, Some(channel_name.as_str()));
+            let tmux_name = provider.build_tmux_session_name(channel_name);
+            let session_keys = super::adk_session::build_session_key_candidates(
+                &shared.token_hash,
+                &provider,
+                &tmux_name,
+            );
+            let db_cwd = shared
+                .db
+                .as_ref()
+                .and_then(|db| {
+                    db.lock()
+                        .ok()
+                        .and_then(|conn| load_restored_session_cwd_from_conn(&conn, &session_keys))
+                })
+                .unwrap_or(None);
 
             let session =
                 data.sessions
@@ -2712,26 +2742,6 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
 
             // Restore current_path: DB cwd (worktree-aware) > last_sessions (yaml, main workspace)
             if session.current_path.is_none() {
-                // Try DB cwd first — preserves worktree paths from previous session
-                let tmux_name = provider.build_tmux_session_name(channel_name);
-                let session_keys = super::adk_session::build_session_key_candidates(
-                    &shared.token_hash,
-                    &provider,
-                    &tmux_name,
-                );
-                let db_cwd: Option<String> = shared.db.as_ref().and_then(|db| {
-                    db.lock().ok().and_then(|conn| {
-                        session_keys.iter().find_map(|session_key| {
-                            conn.query_row(
-                                "SELECT cwd FROM sessions WHERE session_key = ?1",
-                                [session_key],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .ok()
-                            .filter(|p| !p.is_empty() && std::path::Path::new(p).is_dir())
-                        })
-                    })
-                });
                 if let (Some(configured), Some(restored)) =
                     (configured_path.as_ref(), db_cwd.as_ref())
                 {
