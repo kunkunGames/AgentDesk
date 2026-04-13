@@ -23,6 +23,7 @@ use super::settings::{
 use super::{SharedData, TmuxWatcherHandle, rate_limit_wait};
 
 const PROVIDER_OVERLOAD_MAX_RETRIES: u8 = 3;
+const READY_FOR_INPUT_IDLE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 static PROVIDER_OVERLOAD_RETRY_STATE: LazyLock<dashmap::DashMap<u64, ProviderOverloadRetryState>> =
     LazyLock::new(dashmap::DashMap::new);
@@ -54,6 +55,16 @@ pub(super) struct WatcherLineOutcome {
     pub result_tokens: Option<u64>,
     pub stale_resume_detected: bool,
     pub auto_compacted: bool,
+}
+
+fn watcher_ready_for_input_turn_completed(
+    tracker: &mut crate::services::provider::ReadyForInputIdleTracker,
+    data_start_offset: u64,
+    current_offset: u64,
+    ready_for_input: bool,
+    now: std::time::Instant,
+) -> bool {
+    tracker.observe_idle(current_offset > data_start_offset, ready_for_input, now)
 }
 
 fn is_prompt_too_long_message(text: &str) -> bool {
@@ -909,6 +920,9 @@ pub(super) async fn tmux_output_watcher(
             let turn_start = tokio::time::Instant::now();
             let turn_timeout = super::turn_watchdog_timeout();
             let mut last_status_update = tokio::time::Instant::now();
+            let mut ready_for_input_tracker =
+                crate::services::provider::ReadyForInputIdleTracker::default();
+            let mut last_ready_probe_at: Option<std::time::Instant> = None;
 
             while !found_result && turn_start.elapsed() < turn_timeout {
                 if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
@@ -941,6 +955,7 @@ pub(super) async fn tmux_output_watcher(
                 match read_more {
                     Ok(Ok(Ok((chunk, off)))) if !chunk.is_empty() => {
                         current_offset = off;
+                        ready_for_input_tracker.record_output();
                         all_data.push_str(&String::from_utf8_lossy(&chunk));
                         let outcome = process_watcher_lines(
                             &mut all_data,
@@ -976,6 +991,46 @@ pub(super) async fn tmux_output_watcher(
                                         ],
                                     );
                                 }
+                            }
+                        }
+                    }
+                    Ok(Ok(Ok((_, off)))) => {
+                        current_offset = off;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        let now = std::time::Instant::now();
+                        let should_probe_ready = last_ready_probe_at
+                            .map(|last| {
+                                now.duration_since(last) >= READY_FOR_INPUT_IDLE_PROBE_INTERVAL
+                            })
+                            .unwrap_or(true);
+                        if should_probe_ready {
+                            last_ready_probe_at = Some(now);
+                            let ready_for_input = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::task::spawn_blocking({
+                                    let name = tmux_session_name.clone();
+                                    move || {
+                                        crate::services::provider::tmux_session_ready_for_input(
+                                            &name,
+                                        )
+                                    }
+                                }),
+                            )
+                            .await
+                            .unwrap_or(Ok(false))
+                            .unwrap_or(false);
+                            if watcher_ready_for_input_turn_completed(
+                                &mut ready_for_input_tracker,
+                                data_start_offset,
+                                current_offset,
+                                ready_for_input,
+                                now,
+                            ) {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::info!(
+                                    "  [{ts}] 👁 watcher synthesized completion for {tmux_session_name}: tmux ready for input with idle output at offset {current_offset}"
+                                );
+                                found_result = true;
                             }
                         }
                     }
@@ -2846,9 +2901,10 @@ mod tests {
         normalized_retry_payload_text, process_watcher_lines, provider_overload_fingerprint,
         provider_overload_retry_delay, record_provider_overload_retry,
         resolve_dispatched_thread_dispatch_from_conn, resolve_restart_handoff_scope,
+        watcher_ready_for_input_turn_completed,
     };
     use crate::services::discord::inflight::InflightTurnState;
-    use crate::services::provider::ProviderKind;
+    use crate::services::provider::{ProviderKind, ReadyForInputIdleTracker};
     use crate::services::session_backend::StreamLineState;
     use poise::serenity_prelude::ChannelId;
 
@@ -3475,5 +3531,42 @@ mod tests {
             tool_state.current_tool_line.as_deref(),
             Some("⚙ Bash: `cargo build`")
         );
+    }
+
+    #[test]
+    fn watcher_ready_for_input_completion_requires_stable_idle_prompt_after_output() {
+        let mut tracker = ReadyForInputIdleTracker::default();
+        let start = std::time::Instant::now();
+
+        assert!(!watcher_ready_for_input_turn_completed(
+            &mut tracker,
+            100,
+            100,
+            true,
+            start
+        ));
+
+        tracker.record_output();
+        assert!(!watcher_ready_for_input_turn_completed(
+            &mut tracker,
+            100,
+            120,
+            true,
+            start
+        ));
+        assert!(!watcher_ready_for_input_turn_completed(
+            &mut tracker,
+            100,
+            120,
+            true,
+            start + std::time::Duration::from_secs(10)
+        ));
+        assert!(watcher_ready_for_input_turn_completed(
+            &mut tracker,
+            100,
+            120,
+            true,
+            start + std::time::Duration::from_secs(16)
+        ));
     }
 }
