@@ -1,6 +1,10 @@
 use crate::db::Db;
+use std::{fs, path::PathBuf};
 
-use super::{register_globals, review_state_sync, review_state_sync_on_conn};
+use super::{
+    register_globals, register_globals_with_supervisor, review_state_sync,
+    review_state_sync_on_conn,
+};
 
 fn test_db() -> Db {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -63,6 +67,91 @@ fn test_engine_db_execute_op() {
         .query_row("SELECT name FROM agents WHERE id = 'b1'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(name, "Bot1");
+}
+
+#[test]
+fn test_engine_db_execute_warns_and_blocks_core_table_sql() {
+    let db = test_db();
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                    (function() {
+                        var warnings = [];
+                        agentdesk.log.warn = function(msg) { warnings.push(msg); };
+                        var outcome;
+                        try {
+                            agentdesk.db.execute("DELETE FROM task_dispatches WHERE id = ?", ["dispatch-1"]);
+                            outcome = "unexpected_success";
+                        } catch (e) {
+                            outcome = e.message;
+                        }
+                        return JSON.stringify({
+                            outcome: outcome,
+                            warning: warnings[0] || null
+                        });
+                    })()
+                "#,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["outcome"]
+                .as_str()
+                .unwrap_or("")
+                .contains("task_dispatches"),
+            "blocked error must mention task_dispatches: {parsed}"
+        );
+        let warning = parsed["warning"].as_str().unwrap_or("");
+        assert!(
+            warning.contains("[policy-sql-guard]"),
+            "warning log must include guard prefix: {warning}"
+        );
+        assert!(
+            warning.contains("task_dispatches"),
+            "warning log must name the guarded table: {warning}"
+        );
+    });
+}
+
+#[test]
+fn test_engine_db_query_raw_returns_unified_error_json() {
+    let db = test_db();
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+
+        let raw: String = ctx
+            .eval(r#"agentdesk.db.__query_raw("SELECT nope FROM missing_table", "[]")"#)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["code"], "database");
+        assert_eq!(value["context"]["operation"], "agentdesk.db.query.prepare");
+
+        let err_text: String = ctx
+            .eval(
+                r#"
+                (() => {
+                    try {
+                        agentdesk.db.query("SELECT nope FROM missing_table");
+                        return "no-error";
+                    } catch (error) {
+                        return String(error);
+                    }
+                })()
+                "#,
+            )
+            .unwrap();
+        assert!(
+            err_text.contains("missing_table") || err_text.contains("no such table"),
+            "db.query should surface the database failure, got: {err_text}"
+        );
+    });
 }
 
 #[test]
@@ -271,6 +360,140 @@ fn test_review_get_verdict_facade() {
 }
 
 #[test]
+fn test_review_entry_context_and_record_entry_facade() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, provider, status, discord_channel_id, discord_channel_cc, discord_channel_cdx) \
+             VALUES ('ag-review-entry', 'Review Bot', 'codex', 'idle', '111', '222', '333')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, review_round, created_at, updated_at) \
+             VALUES ('card-review-entry', 'Review Entry Card', 'review', 'ag-review-entry', 1, datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, completed_at, updated_at) \
+             VALUES ('impl-review-entry', 'card-review-entry', 'ag-review-entry', 'implementation', 'completed', 'Implementation', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, completed_at, updated_at) \
+             VALUES ('rework-review-entry', 'card-review-entry', 'ag-review-entry', 'rework', 'completed', 'Rework', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var entry = agentdesk.review.entryContext("card-review-entry");
+                    agentdesk.review.recordEntry("card-review-entry", {
+                        review_round: entry.next_round,
+                        exclude_status: "done"
+                    });
+                    var updated = agentdesk.cards.get("card-review-entry");
+                    return JSON.stringify({
+                        current_round: entry.current_round,
+                        completed_work_count: entry.completed_work_count,
+                        should_advance_round: entry.should_advance_round,
+                        next_round: entry.next_round,
+                        stored_round: updated.review_round
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"current_round":1,"completed_work_count":2,"should_advance_round":true,"next_round":2,"stored_round":2}"#
+        );
+    });
+}
+
+#[test]
+fn test_review_entry_hint_advances_round_once_and_clears_metadata() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, provider, status, discord_channel_id, discord_channel_cc, discord_channel_cdx) \
+             VALUES ('ag-review-hint', 'Review Hint Bot', 'codex', 'idle', '111', '222', '333')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, review_round, metadata, created_at, updated_at) \
+             VALUES ('card-review-hint', 'Review Hint Card', 'review', 'ag-review-hint', 1, ?1, datetime('now'), datetime('now'))",
+            [serde_json::json!({
+                crate::engine::ops::ADVANCE_REVIEW_ROUND_HINT_KEY: true,
+                "keep": "value"
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var entry = agentdesk.review.entryContext("card-review-hint");
+                    agentdesk.review.recordEntry("card-review-hint", {
+                        review_round: entry.next_round,
+                        exclude_status: "done"
+                    });
+                    var updated = agentdesk.cards.get("card-review-hint");
+                    return JSON.stringify({
+                        should_advance_round: entry.should_advance_round,
+                        next_round: entry.next_round,
+                        stored_round: updated.review_round
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            r#"{"should_advance_round":true,"next_round":2,"stored_round":2}"#
+        );
+    });
+
+    let conn = db.separate_conn().unwrap();
+    let metadata_raw: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM kanban_cards WHERE id = 'card-review-hint'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(metadata_raw.as_deref().unwrap_or("{}")).unwrap();
+    assert_eq!(metadata["keep"], "value");
+    assert!(
+        metadata
+            .get(crate::engine::ops::ADVANCE_REVIEW_ROUND_HINT_KEY)
+            .is_none(),
+        "review entry hint must be consumed after recordEntry"
+    );
+}
+
+#[test]
 fn test_queue_status_facade() {
     let db = test_db();
     {
@@ -339,6 +562,118 @@ fn test_queue_status_facade() {
         assert_eq!(
             result,
             r#"{"pending_dispatches":1,"pending_messages":1,"failed_dispatch_outbox":1,"active_runs":1,"pending_entries":1}"#
+        );
+    });
+}
+
+#[test]
+fn test_review_entry_slice_blocks_raw_db_reintroduction() {
+    let policy_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies/review-automation.js");
+    let policy =
+        fs::read_to_string(&policy_path).expect("review-automation policy must be readable");
+    let start = policy
+        .find("// typed-facade-slice:start review-entry")
+        .expect("review-entry slice start marker must exist");
+    let end = policy
+        .find("// typed-facade-slice:end review-entry")
+        .expect("review-entry slice end marker must exist");
+    let slice = &policy[start..end];
+    assert!(
+        !slice.contains("agentdesk.db."),
+        "review-entry slice must stay on typed facades: {policy_path:?}"
+    );
+}
+
+#[test]
+fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads() {
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('ag-queue', 'Queue Agent', '111', '222')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES ('card-log', 'Queue Card', 'in_progress', 'ag-queue', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
+             VALUES ('run-log', 'itismyfield/AgentDesk', 'ag-queue', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'implementation', 'dispatched', 'Queue Dispatch', ?4, datetime('now'), datetime('now'))",
+            rusqlite::params![
+                "dispatch-log",
+                "card-log",
+                "ag-queue",
+                r#"{"entry_id":"entry-log","agent_id":"ag-queue"}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, dispatch_id, status, thread_group, batch_phase, slot_index) \
+             VALUES ('entry-log', 'run-log', 'card-log', 'ag-queue', 'dispatch-log', 'dispatched', 2, 3, 4)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies/auto-queue.js");
+    let policy = fs::read_to_string(&policy_path).expect("auto-queue policy must be readable");
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let _: rquickjs::Value = ctx.eval(r#"agentdesk.registerPolicy = function(_) {};"#).unwrap();
+        let _: rquickjs::Value = ctx.eval(policy.as_str()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                (function() {
+                    var tracked = [];
+                    var originalQuery = agentdesk.db.query;
+                    agentdesk.db.query = function(sql, params) {
+                        if (sql.indexOf("FROM auto_queue_entries") >= 0 || sql.indexOf("FROM task_dispatches") >= 0) {
+                            tracked.push(sql);
+                        }
+                        return originalQuery.call(agentdesk.db, sql, params);
+                    };
+
+                    var ctx = _normalizeAutoQueueLogContext({
+                        entry_id: "entry-log",
+                        dispatch_id: "dispatch-log"
+                    });
+
+                    return JSON.stringify({
+                        ctx: ctx,
+                        query_count: tracked.length,
+                        formatted: _formatAutoQueueLogContext(ctx)
+                    });
+                })()
+                "#,
+            )
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ctx"]["agent_id"], "ag-queue");
+        assert_eq!(parsed["ctx"]["run_id"], "run-log");
+        assert_eq!(parsed["ctx"]["thread_group"], 2);
+        assert_eq!(parsed["query_count"], 2);
+
+        let formatted = parsed["formatted"].as_str().unwrap_or("");
+        assert!(
+            formatted.contains("agent_id=ag-queue"),
+            "formatted context must include agent_id: {formatted}"
         );
     });
 }
@@ -585,4 +920,85 @@ fn test_review_state_sync_json_wrapper() {
     assert_eq!(state, "suggestion_pending");
     assert_eq!(verdict.as_deref(), Some("improve"));
     assert_eq!(pd.as_deref(), Some("d-99"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_auto_queue_activate_bridge_dispatches_without_server_port() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, provider, status, discord_channel_id) \
+             VALUES ('aq-bridge-agent', 'AQ Bridge Agent', 'claude', 'idle', '123456789012345678')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, created_at, updated_at
+            ) VALUES (
+                'aq-bridge-card', 'AQ Bridge Card', 'ready', 'medium', 'aq-bridge-agent',
+                datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, agent_id, status) \
+             VALUES ('aq-bridge-run', 'aq-bridge-agent', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank
+            ) VALUES (
+                'aq-bridge-entry', 'aq-bridge-run', 'aq-bridge-card',
+                'aq-bridge-agent', 'pending', 0
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let engine =
+        crate::engine::PolicyEngine::new(&crate::config::Config::default(), db.clone()).unwrap();
+    let bridge = crate::supervisor::BridgeHandle::new();
+    bridge.attach_engine(&engine);
+
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals_with_supervisor(&ctx, db.clone(), bridge.clone()).unwrap();
+        let raw: String = ctx
+            .eval(
+                r#"
+                JSON.stringify(agentdesk.autoQueue.activate("aq-bridge-run"))
+                "#,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["dispatched"][0]["card_id"], "aq-bridge-card");
+    });
+
+    let conn = db.separate_conn().unwrap();
+    let entry_status: String = conn
+        .query_row(
+            "SELECT status FROM auto_queue_entries WHERE id = 'aq-bridge-entry'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let dispatch_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'aq-bridge-card'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(entry_status, "dispatched");
+    assert_eq!(dispatch_count, 1);
 }

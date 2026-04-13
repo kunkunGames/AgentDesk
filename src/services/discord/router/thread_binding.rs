@@ -2,7 +2,14 @@ use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
 
 /// Dispatch info returned by the card-thread internal API.
+#[derive(Debug, Clone, Default)]
 pub(super) struct DispatchInfo {
+    pub(super) card_id: Option<String>,
+    pub(super) card_title: Option<String>,
+    pub(super) github_issue_url: Option<String>,
+    pub(super) github_issue_number: Option<i64>,
+    pub(super) issue_body: Option<String>,
+    pub(super) deferred_dod: Option<serde_json::Value>,
     pub(super) active_thread_id: Option<String>,
     pub(super) dispatch_type: Option<String>,
     pub(super) discord_channel_alt: Option<String>,
@@ -17,21 +24,32 @@ pub(super) async fn lookup_card_thread(api_port: u16, dispatch_id: &str) -> Opti
 }
 
 pub(super) async fn lookup_dispatch_info(api_port: u16, dispatch_id: &str) -> Option<DispatchInfo> {
-    let url = crate::config::local_api_url(
-        api_port,
-        &format!("/api/internal/card-thread?dispatch_id={dispatch_id}"),
-    );
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
+    let _ = api_port;
+    let body = crate::services::discord::internal_api::lookup_dispatch_info(dispatch_id)
         .await
         .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
     Some(DispatchInfo {
+        card_id: body
+            .get("card_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        card_title: body
+            .get("card_title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        github_issue_url: body
+            .get("github_issue_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        github_issue_number: body.get("github_issue_number").and_then(|v| v.as_i64()),
+        issue_body: body
+            .get("issue_body")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        deferred_dod: body
+            .get("deferred_dod")
+            .cloned()
+            .filter(|value| !value.is_null()),
         active_thread_id: body
             .get("active_thread_id")
             .and_then(|v| v.as_str())
@@ -71,7 +89,9 @@ pub(super) async fn verify_thread_accessible(
                             poise::serenity_prelude::builder::EditThread::new().archived(false);
                         if let Err(e) = thread_id.edit_thread(&ctx.http, edit).await {
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!("  [{ts}] ⚠️ Failed to unarchive thread {thread_id}: {e}");
+                            tracing::info!(
+                                "  [{ts}] ⚠️ Failed to unarchive thread {thread_id}: {e}"
+                            );
                             return false;
                         }
                     }
@@ -92,15 +112,13 @@ pub(super) async fn link_dispatch_thread(
     thread_id: u64,
     channel_id: u64,
 ) {
-    let url = crate::config::local_api_url(api_port, "/api/internal/link-dispatch-thread");
-    let _ = reqwest::Client::new()
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(2))
-        .json(&serde_json::json!({
-            "dispatch_id": dispatch_id,
-            "thread_id": thread_id.to_string(),
-            "channel_id": channel_id.to_string(),
-        }))
-        .send()
-        .await;
+    let _ = api_port;
+    let _ = crate::services::discord::internal_api::link_dispatch_thread(
+        crate::server::routes::dispatches::LinkDispatchThreadBody {
+            dispatch_id: dispatch_id.to_string(),
+            thread_id: thread_id.to_string(),
+            channel_id: Some(channel_id.to_string()),
+        },
+    )
+    .await;
 }

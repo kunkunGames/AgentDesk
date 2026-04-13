@@ -811,7 +811,11 @@ pub(super) fn channel_supports_provider(
         return false;
     }
 
-    provider.is_channel_supported(channel_name, is_dm)
+    provider.is_channel_supported(
+        channel_name,
+        is_dm,
+        role_binding.and_then(|binding| binding.provider.as_ref()),
+    )
 }
 
 pub(super) fn bot_settings_allow_channel(
@@ -1879,6 +1883,7 @@ memory:
                         None,
                         false,
                         super::super::prompt_builder::DispatchProfile::Full,
+                        None,
                         None,
                         None,
                         None,

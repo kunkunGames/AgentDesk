@@ -801,7 +801,7 @@ fn load_memory_backend_from_yaml(root: &Path) -> Option<MemoryBackendConfig> {
                 }
             }
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "  [memory] Warning: failed to parse '{}' for memory config: {error}",
                     path.display()
                 );
@@ -1031,15 +1031,42 @@ fn merge_role_map_into_agentdesk_yaml(root: &Path) -> Result<(), String> {
     let json: Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse '{}': {e}", role_map.display()))?;
 
+    let changed = preview_role_map_merge(&mut config, &json);
+
+    if changed {
+        crate::config::save_to_path(&yaml_path, &config)
+            .map_err(|e| format!("Failed to write config '{}': {e}", yaml_path.display()))?;
+    }
+
+    // Migration complete — retire the legacy file so it is never re-merged.
+    let migrated = role_map.with_extension("json.migrated");
+    if let Err(e) = fs::rename(&role_map, &migrated) {
+        tracing::warn!(
+            "Failed to rename '{}' → '{}': {e}",
+            role_map.display(),
+            migrated.display()
+        );
+    } else {
+        tracing::info!(
+            "[role-map] Migrated '{}' → '{}' (one-time merge into agentdesk.yaml)",
+            role_map.display(),
+            migrated.display()
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn preview_role_map_merge(config: &mut crate::config::Config, json: &Value) -> bool {
     let mut changed = false;
-    changed |= merge_role_map_shared_prompt(&mut config, &json);
-    changed |= merge_role_map_meeting(&mut config, &json);
+    changed |= merge_role_map_shared_prompt(config, json);
+    changed |= merge_role_map_meeting(config, json);
 
     let mut providers_by_channel_id = BTreeMap::<String, String>::new();
     if let Some(by_id) = json.get("byChannelId").and_then(Value::as_object) {
         for (channel_id, entry) in by_id {
             if let Some((provider_key, entry_changed)) =
-                merge_role_map_channel_id_entry(&mut config, channel_id, entry)
+                merge_role_map_channel_id_entry(config, channel_id, entry)
             {
                 providers_by_channel_id.insert(channel_id.clone(), provider_key);
                 changed |= entry_changed;
@@ -1049,7 +1076,7 @@ fn merge_role_map_into_agentdesk_yaml(root: &Path) -> Result<(), String> {
     if let Some(by_name) = json.get("byChannelName").and_then(Value::as_object) {
         for (channel_name, entry) in by_name {
             if merge_role_map_channel_name_entry(
-                &mut config,
+                config,
                 channel_name,
                 entry,
                 &providers_by_channel_id,
@@ -1059,11 +1086,7 @@ fn merge_role_map_into_agentdesk_yaml(root: &Path) -> Result<(), String> {
         }
     }
 
-    if changed {
-        crate::config::save_to_path(&yaml_path, &config)
-            .map_err(|e| format!("Failed to write config '{}': {e}", yaml_path.display()))?;
-    }
-    Ok(())
+    changed
 }
 
 fn merge_role_map_shared_prompt(config: &mut crate::config::Config, json: &Value) -> bool {
@@ -1166,9 +1189,6 @@ fn role_map_meeting_agent_to_config(value: &Value) -> Option<crate::config::Meet
     let role_id = json_string_field_from_map(obj, &["role_id", "roleId"])?;
     let display_name = json_string_field_from_map(obj, &["display_name", "displayName"]);
     let prompt_file = json_string_field_from_map(obj, &["prompt_file", "promptFile"]);
-    let domain_summary = json_string_field_from_map(obj, &["domain_summary", "domainSummary"]);
-    let provider_hint =
-        json_string_field_from_map(obj, &["provider_hint", "providerHint", "provider"]);
     let keywords = obj
         .get("keywords")
         .and_then(Value::as_array)
@@ -1180,9 +1200,6 @@ fn role_map_meeting_agent_to_config(value: &Value) -> Option<crate::config::Meet
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let strengths = json_string_vec_field_from_map(obj, &["strengths"]);
-    let task_types = json_string_vec_field_from_map(obj, &["task_types", "taskTypes"]);
-    let anti_signals = json_string_vec_field_from_map(obj, &["anti_signals", "antiSignals"]);
 
     Some(crate::config::MeetingAgentEntry::Detailed(
         crate::config::MeetingAgentDef {
@@ -1190,11 +1207,11 @@ fn role_map_meeting_agent_to_config(value: &Value) -> Option<crate::config::Meet
             display_name,
             keywords,
             prompt_file,
-            domain_summary,
-            strengths,
-            task_types,
-            anti_signals,
-            provider_hint,
+            domain_summary: None,
+            strengths: Vec::new(),
+            task_types: Vec::new(),
+            anti_signals: Vec::new(),
+            provider_hint: None,
         },
     ))
 }
@@ -1449,22 +1466,6 @@ fn json_string_field_from_map(
             _ => None,
         })
     })
-}
-
-fn json_string_vec_field_from_map(
-    obj: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> Vec<String> {
-    keys.iter()
-        .find_map(|key| obj.get(*key).and_then(Value::as_array))
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .filter_map(normalize_non_empty)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn json_bool_field_from_map(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
@@ -2445,7 +2446,9 @@ mod tests {
             !managed_agents_root(root).join("alpha.memory").exists(),
             "role-context/*.memory should not be copied into config/agents"
         );
-        let role_map = fs::read_to_string(role_map_path(root)).unwrap();
+        // After merge_role_map_into_agentdesk_yaml, role_map.json is retired to .migrated
+        let migrated = role_map_path(root).with_extension("json.migrated");
+        let role_map = fs::read_to_string(&migrated).unwrap();
         assert!(role_map.contains("/tmp/config/agents/alpha/IDENTITY.md"));
         let backend = load_memory_backend(root);
         assert_eq!(backend.version, 2);

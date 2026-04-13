@@ -76,7 +76,6 @@ kanban:
 
 review:
   enabled: true
-  counter_model_enabled: true
   max_rounds: 3
 
 runtime:
@@ -104,6 +103,7 @@ runtime:
 automation:
   enabled: false
   strategy: "squash"
+  strategy_mode: "direct-first"
   allowed_authors: "itismyfield,octocat"
 
 # Dashboard edits still write runtime overrides into kv_meta.

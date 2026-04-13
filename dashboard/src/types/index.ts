@@ -34,15 +34,7 @@ export interface Department {
 }
 
 export type AgentStatus = "idle" | "working" | "break" | "offline";
-export type CliProvider =
-  | "claude"
-  | "codex"
-  | "gemini"
-  | "qwen"
-  | "opencode"
-  | "copilot"
-  | "antigravity"
-  | "api";
+export type CliProvider = "claude" | "codex" | "gemini" | "qwen" | "opencode" | "copilot" | "antigravity" | "api";
 export type MeetingReviewDecision = "reviewing" | "approved" | "hold";
 
 export type ActivitySource = "idle" | "agentdesk";
@@ -126,13 +118,7 @@ export type TaskStatus =
   | "done"
   | "pending"
   | "cancelled";
-export type TaskType =
-  | "general"
-  | "development"
-  | "design"
-  | "analysis"
-  | "presentation"
-  | "documentation";
+export type TaskType = "general" | "development" | "design" | "analysis" | "presentation" | "documentation";
 export const WORKFLOW_PACK_KEYS = [
   "development",
   "novel",
@@ -142,9 +128,7 @@ export const WORKFLOW_PACK_KEYS = [
   "roleplay",
   "cookingheart",
 ] as const;
-export type WorkflowPackKey =
-  | (typeof WORKFLOW_PACK_KEYS)[number]
-  | (string & {});
+export type WorkflowPackKey = (typeof WORKFLOW_PACK_KEYS)[number] | (string & {});
 
 export interface Task {
   id: string;
@@ -228,13 +212,7 @@ export interface MeetingMinute {
 // Messages
 export type SenderType = "ceo" | "agent" | "system";
 export type ReceiverType = "agent" | "department" | "all";
-export type MessageType =
-  | "chat"
-  | "task_assign"
-  | "announcement"
-  | "directive"
-  | "report"
-  | "status_update";
+export type MessageType = "chat" | "task_assign" | "announcement" | "directive" | "report" | "status_update";
 
 export interface Message {
   id: string;
@@ -498,6 +476,7 @@ export interface KanbanCard {
   updated_at: number;
   started_at: number | null;
   requested_at: number | null;
+  review_entered_at?: string | number | null;
   completed_at: number | null;
   latest_dispatch_status?: TaskDispatchStatus | null;
   latest_dispatch_title?: string | null;
@@ -545,25 +524,19 @@ export interface PipelineConfigFull {
   name: string;
   version: number;
   states: { id: string; label: string; terminal?: boolean }[];
-  transitions: {
-    from: string;
-    to: string;
-    type: "free" | "gated" | "force_only";
-    gates?: string[];
-  }[];
+  transitions: { from: string; to: string; type: "free" | "gated" | "force_only"; gates?: string[] }[];
   gates: Record<string, { type: string; check?: string; description?: string }>;
   hooks: Record<string, { on_enter: string[]; on_exit: string[] }>;
   clocks: Record<string, { set: string; mode?: string }>;
-  timeouts: Record<
-    string,
-    {
-      duration: string;
-      clock: string;
-      max_retries?: number;
-      on_exhaust?: string;
-      condition?: string;
-    }
-  >;
+  timeouts: Record<string, { duration: string; clock: string; max_retries?: number; on_exhaust?: string; condition?: string }>;
+  phase_gate: PhaseGateConfig;
+}
+
+export interface PhaseGateConfig {
+  dispatch_to: string;
+  dispatch_type: string;
+  pass_verdict: string;
+  checks: string[];
 }
 
 export interface PipelineOverride {
@@ -573,6 +546,7 @@ export interface PipelineOverride {
   hooks?: PipelineConfigFull["hooks"];
   clocks?: PipelineConfigFull["clocks"];
   timeouts?: PipelineConfigFull["timeouts"];
+  phase_gate?: PhaseGateConfig;
 }
 
 export interface KanbanRepoSource {
@@ -686,10 +660,7 @@ export interface MessengerChannelConfig {
   receiveEnabled?: boolean;
 }
 
-export type MessengerChannelsConfig = Record<
-  MessengerChannelType,
-  MessengerChannelConfig
->;
+export type MessengerChannelsConfig = Record<MessengerChannelType, MessengerChannelConfig>;
 
 export interface OfficePackProfile {
   departments: Department[];
@@ -697,9 +668,7 @@ export interface OfficePackProfile {
   updated_at: number;
 }
 
-export type OfficePackProfiles = Partial<
-  Record<WorkflowPackKey, OfficePackProfile>
->;
+export type OfficePackProfiles = Partial<Record<WorkflowPackKey, OfficePackProfile>>;
 
 export interface CompanySettings {
   companyName: string;
@@ -786,4 +755,96 @@ export interface DashboardStats {
       pressure_count: number;
     }>;
   };
+}
+
+export interface ReceiptSnapshotModelLine {
+  model: string;
+  display_name: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+  cost: number;
+  cost_without_cache: number;
+  provider: string;
+}
+
+export interface ReceiptSnapshotProviderShare {
+  provider: string;
+  tokens: number;
+  percentage: number;
+}
+
+export interface ReceiptSnapshotAgentShare {
+  agent: string;
+  tokens: number;
+  cost: number;
+  percentage: number;
+}
+
+export interface ReceiptSnapshotStats {
+  total_messages: number;
+  total_sessions: number;
+}
+
+export interface ReceiptSnapshot {
+  period_label: string;
+  period_start: string;
+  period_end: string;
+  models: ReceiptSnapshotModelLine[];
+  subtotal: number;
+  cache_discount: number;
+  total: number;
+  stats: ReceiptSnapshotStats;
+  providers: ReceiptSnapshotProviderShare[];
+  agents: ReceiptSnapshotAgentShare[];
+}
+
+export interface TokenAnalyticsPeakDay {
+  date: string;
+  total_tokens: number;
+  cost: number;
+}
+
+export interface TokenAnalyticsSummary {
+  total_tokens: number;
+  total_cost: number;
+  cache_discount: number;
+  total_messages: number;
+  total_sessions: number;
+  active_days: number;
+  average_daily_tokens: number;
+  peak_day?: TokenAnalyticsPeakDay | null;
+}
+
+export interface TokenAnalyticsDailyPoint {
+  date: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+  cost: number;
+}
+
+export interface TokenAnalyticsHeatmapCell {
+  date: string;
+  week_index: number;
+  weekday: number;
+  total_tokens: number;
+  cost: number;
+  level: number;
+  future: boolean;
+}
+
+export interface TokenAnalyticsResponse {
+  period: "7d" | "30d" | "90d" | (string & {});
+  period_label: string;
+  days: number;
+  generated_at: string;
+  summary: TokenAnalyticsSummary;
+  receipt: ReceiptSnapshot;
+  daily: TokenAnalyticsDailyPoint[];
+  heatmap: TokenAnalyticsHeatmapCell[];
 }

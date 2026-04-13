@@ -7,6 +7,7 @@
 //! Mutation operations (setStatus, dispatch.create, db.execute) are deferred.
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// A single intent produced by a JS policy hook.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,9 @@ pub enum Intent {
         dispatch_type: String,
         title: String,
     },
+    /// Auto-queue activation (used to defer bridge calls out of hook execution).
+    #[serde(rename = "activate_auto_queue")]
+    ActivateAutoQueue { body: serde_json::Value },
     /// Raw SQL execution (replaces agentdesk.db.execute)
     /// Retained as escape hatch; prefer typed intents above.
     #[serde(rename = "execute_sql")]
@@ -80,7 +84,11 @@ pub struct CreatedDispatch {
 ///
 /// Intents are applied in order. Failures are logged and skipped (fail-soft)
 /// to prevent one bad intent from blocking the rest.
-pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecutionResult {
+pub fn execute_intents(
+    db: &crate::db::Db,
+    engine: Option<&crate::engine::PolicyEngine>,
+    intents: Vec<Intent>,
+) -> IntentExecutionResult {
     let mut result = IntentExecutionResult {
         transitions: Vec::new(),
         created_dispatches: Vec::new(),
@@ -91,15 +99,16 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
         return result;
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 📋 execute_intents: {} intent(s)", intents.len());
+    tracing::info!(intent_count = intents.len(), "executing queued intents");
 
     for intent in intents {
         match intent {
             Intent::TransitionCard { card_id, from, to } => {
+                let intent_span =
+                    crate::logging::dispatch_span("intent_transition", None, Some(&card_id), None);
+                let _guard = intent_span.enter();
                 if let Err(e) = execute_transition(db, &card_id, &from, &to) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ intent TransitionCard({card_id} {from}→{to}) failed: {e}");
+                    tracing::warn!(from, to, error = %e, "transition intent failed");
                     result.errors += 1;
                 } else {
                     result.transitions.push((card_id, from, to));
@@ -112,6 +121,13 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
                 dispatch_type,
                 title,
             } => {
+                let intent_span = crate::logging::dispatch_span(
+                    "intent_create_dispatch",
+                    Some(&dispatch_id),
+                    Some(&card_id),
+                    Some(&agent_id),
+                );
+                let _guard = intent_span.enter();
                 match execute_create_dispatch(
                     db,
                     &dispatch_id,
@@ -122,18 +138,23 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
                 ) {
                     Ok(created) => result.created_dispatches.push(created),
                     Err(e) => {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] ⚠ intent CreateDispatch({dispatch_id} {card_id}→{agent_id}) failed: {e}"
-                        );
+                        tracing::warn!(dispatch_type, title, error = %e, "create-dispatch intent failed");
+                        result.errors += 1;
+                    }
+                }
+            }
+            Intent::ActivateAutoQueue { body } => {
+                match execute_activate_auto_queue(db, engine, body) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-queue activate intent failed");
                         result.errors += 1;
                     }
                 }
             }
             Intent::ExecuteSQL { sql, params } => {
                 if let Err(e) = execute_sql(db, &sql, &params) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ intent ExecuteSQL failed: {e}");
+                    tracing::warn!(error = %e, sql, "execute-sql intent failed");
                     result.errors += 1;
                 }
             }
@@ -144,8 +165,7 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
                 source,
             } => {
                 if let Err(e) = execute_queue_message(db, &target, &content, &bot, &source) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ intent QueueMessage failed: {e}");
+                    tracing::warn!(target, bot, source, error = %e, "queue-message intent failed");
                     result.errors += 1;
                 }
             }
@@ -155,27 +175,24 @@ pub fn execute_intents(db: &crate::db::Db, intents: Vec<Intent>) -> IntentExecut
                 ttl_seconds,
             } => {
                 if let Err(e) = execute_set_kv(db, &key, &value, ttl_seconds) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ intent SetKV({key}) failed: {e}");
+                    tracing::warn!(key, ttl_seconds, error = %e, "set-kv intent failed");
                     result.errors += 1;
                 }
             }
             Intent::DeleteKV { key } => {
                 if let Err(e) = execute_delete_kv(db, &key) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⚠ intent DeleteKV({key}) failed: {e}");
+                    tracing::warn!(key, error = %e, "delete-kv intent failed");
                     result.errors += 1;
                 }
             }
         }
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!(
-        "  [{ts}] ✅ execute_intents done: {} transitions, {} dispatches, {} errors",
-        result.transitions.len(),
-        result.created_dispatches.len(),
-        result.errors
+    tracing::info!(
+        transition_count = result.transitions.len(),
+        created_dispatch_count = result.created_dispatches.len(),
+        error_count = result.errors,
+        "finished executing queued intents"
     );
 
     result
@@ -189,6 +206,9 @@ fn execute_transition(
     expected_from: &str,
     to: &str,
 ) -> anyhow::Result<()> {
+    let transition_span =
+        crate::logging::dispatch_span("execute_transition", None, Some(card_id), None);
+    let _guard = transition_span.enter();
     let conn = db.separate_conn()?;
 
     // Verify current status matches expected
@@ -202,9 +222,11 @@ fn execute_transition(
 
     if current != expected_from {
         // Status changed between intent push and execution — skip
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
-            "  [{ts}] ⏭ TransitionCard({card_id}): expected from={expected_from} but current={current}, skipping"
+        tracing::info!(
+            expected_from,
+            current,
+            to,
+            "skipping transition intent due to stale source status"
         );
         return Ok(());
     }
@@ -271,8 +293,7 @@ fn execute_transition(
         );
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] 🔄 TransitionCard: {card_id} {expected_from}→{to}");
+    tracing::info!(from = expected_from, to, "applied transition intent");
     Ok(())
 }
 
@@ -284,6 +305,13 @@ fn execute_create_dispatch(
     dispatch_type: &str,
     title: &str,
 ) -> anyhow::Result<CreatedDispatch> {
+    let dispatch_span = crate::logging::dispatch_span(
+        "execute_create_dispatch",
+        Some(pre_id),
+        Some(card_id),
+        Some(agent_id),
+    );
+    let _guard = dispatch_span.enter();
     // Delegate to the authoritative dispatch creation path.
     // create_dispatch_core generates its own UUID — we override by using a
     // variant that accepts a pre-assigned ID.
@@ -331,6 +359,30 @@ fn execute_create_dispatch(
     })
 }
 
+fn execute_activate_auto_queue(
+    db: &crate::db::Db,
+    engine: Option<&crate::engine::PolicyEngine>,
+    body: serde_json::Value,
+) -> anyhow::Result<()> {
+    let engine =
+        engine.ok_or_else(|| anyhow::anyhow!("auto-queue activation intent requires engine"))?;
+    let body: crate::server::routes::auto_queue::ActivateBody = serde_json::from_value(body)?;
+    let deps = crate::server::routes::auto_queue::AutoQueueActivateDeps::for_bridge(
+        db.clone(),
+        engine.clone(),
+    );
+    let (_status, response) = crate::server::routes::auto_queue::activate_with_deps(&deps, body);
+    if response.0.get("error").is_some() {
+        return Err(anyhow::anyhow!(
+            "{}",
+            response.0["error"]
+                .as_str()
+                .unwrap_or("auto-queue activation failed")
+        ));
+    }
+    Ok(())
+}
+
 fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {
     match val {
         serde_json::Value::Null => rusqlite::types::Value::Null,
@@ -350,45 +402,9 @@ fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {
 }
 
 fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> anyhow::Result<()> {
-    // Block direct kanban_cards status/review_status/latest_dispatch_id UPDATE (#155)
-    let sql_upper = sql.to_uppercase();
-    if sql_upper.contains("UPDATE") && sql_upper.contains("KANBAN_CARDS") {
-        let re_status = regex::Regex::new(r"(?i)(?:^|[\s,])status\s*=").unwrap();
-        if re_status.is_match(sql) {
-            return Err(anyhow::anyhow!(
-                "Direct kanban_cards status UPDATE is blocked. Use TransitionCard intent."
-            ));
-        }
-        let re_review = regex::Regex::new(r"(?i)(?:^|[\s,])review_status\s*=").unwrap();
-        if re_review.is_match(sql) {
-            return Err(anyhow::anyhow!(
-                "Direct kanban_cards review_status UPDATE is blocked. Use the transition reducer."
-            ));
-        }
-        let re_dispatch = regex::Regex::new(r"(?i)(?:^|[\s,])latest_dispatch_id\s*=").unwrap();
-        if re_dispatch.is_match(sql) {
-            return Err(anyhow::anyhow!(
-                "Direct kanban_cards latest_dispatch_id UPDATE is blocked. Use the transition reducer."
-            ));
-        }
-    }
-    // Block direct task_dispatches mutation (same guard as ops.rs)
-    if sql_upper.contains("TASK_DISPATCHES")
-        && (sql_upper.contains("INSERT") || sql_upper.contains("UPDATE"))
-    {
-        return Err(anyhow::anyhow!(
-            "Direct task_dispatches mutation is blocked. Use CreateDispatch intent."
-        ));
-    }
-    // Block direct card_review_state mutation (#158 — same guard as ops.rs)
-    let re_review_state = regex::Regex::new(
-        r"(?i)\b(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+card_review_state\b",
-    )
-    .unwrap();
-    if re_review_state.is_match(sql) {
-        return Err(anyhow::anyhow!(
-            "Direct card_review_state mutation is blocked. Use reviewState.sync bridge."
-        ));
+    if let Some(violation) = crate::engine::sql_guard::detect_core_table_write(sql) {
+        warn!("{}", violation.warning_message("ExecuteSQL intent", sql));
+        return Err(anyhow::anyhow!(violation.error_message()));
     }
 
     let conn = db.separate_conn()?;
@@ -413,9 +429,14 @@ fn execute_queue_message(
         "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![target, content, bot, source],
     )?;
-    let ts = chrono::Local::now().format("%H:%M:%S");
     let id = conn.last_insert_rowid();
-    println!("  [{ts}] 📨 QueueMessage → {target} (bot={bot}, id={id})");
+    tracing::info!(
+        target,
+        bot,
+        source,
+        message_id = id,
+        "queued message intent"
+    );
     Ok(())
 }
 
@@ -462,7 +483,7 @@ mod tests {
     #[test]
     fn test_execute_empty_intents() {
         let db = test_db();
-        let result = execute_intents(&db, vec![]);
+        let result = execute_intents(&db, None, vec![]);
         assert!(result.transitions.is_empty());
         assert!(result.created_dispatches.is_empty());
         assert_eq!(result.errors, 0);
@@ -475,7 +496,7 @@ mod tests {
             sql: "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('test', 'hello')".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 0);
 
         let conn = db.lock().unwrap();
@@ -495,7 +516,7 @@ mod tests {
             value: "myval".into(),
             ttl_seconds: 0,
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 0);
 
         let conn = db.lock().unwrap();
@@ -516,7 +537,7 @@ mod tests {
             bot: "announce".into(),
             source: "system".into(),
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 0);
 
         let conn = db.lock().unwrap();
@@ -537,7 +558,7 @@ mod tests {
             sql: "UPDATE kanban_cards SET status = 'done' WHERE id = 'x'".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -549,7 +570,7 @@ mod tests {
             from: "requested".into(),
             to: "in_progress".into(),
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -560,7 +581,7 @@ mod tests {
             sql: "UPDATE kanban_cards SET review_status = 'rework' WHERE id = 'x'".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -571,7 +592,18 @@ mod tests {
             sql: "UPDATE kanban_cards SET latest_dispatch_id = 'abc' WHERE id = 'x'".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
+        assert_eq!(result.errors, 1);
+    }
+
+    #[test]
+    fn test_blocked_task_dispatches_delete_sql() {
+        let db = test_db();
+        let intents = vec![Intent::ExecuteSQL {
+            sql: "DELETE FROM task_dispatches WHERE id = 'dispatch-1'".into(),
+            params: vec![],
+        }];
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -596,7 +628,7 @@ mod tests {
             sql: "INSERT INTO card_review_state (card_id, state) VALUES ('x', 'idle')".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -607,7 +639,7 @@ mod tests {
             sql: "UPDATE card_review_state SET state = 'reviewing' WHERE card_id = 'x'".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -714,7 +746,7 @@ mod tests {
                 .into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -726,7 +758,7 @@ mod tests {
             sql: "REPLACE INTO card_review_state (card_id, state) VALUES ('c1', 'idle')".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 
@@ -738,7 +770,7 @@ mod tests {
             sql: "DELETE FROM card_review_state WHERE card_id = 'c1'".into(),
             params: vec![],
         }];
-        let result = execute_intents(&db, intents);
+        let result = execute_intents(&db, None, intents);
         assert_eq!(result.errors, 1);
     }
 }

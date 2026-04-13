@@ -363,6 +363,7 @@ async fn validate_channel_thread_maps_on_startup_with_base_url(
 pub(super) async fn try_reuse_thread(
     client: &reqwest::Client,
     token: &str,
+    discord_api_base: &str,
     thread_id: &str,
     expected_parent: u64,
     desired_thread_name: &str,
@@ -372,7 +373,11 @@ pub(super) async fn try_reuse_thread(
     db: &crate::db::Db,
 ) -> Option<bool> {
     // 1. Fetch thread info to verify it exists and belongs to the right parent channel
-    let thread_info_url = format!("https://discord.com/api/v10/channels/{}", thread_id);
+    let thread_info_url = format!(
+        "{}/channels/{}",
+        discord_api_base.trim_end_matches('/'),
+        thread_id
+    );
     let resp = client
         .get(&thread_info_url)
         .header("Authorization", format!("Bot {}", token))
@@ -469,38 +474,57 @@ pub(super) async fn try_reuse_thread(
             .await;
     }
 
-    let msg_url = format!(
-        "https://discord.com/api/v10/channels/{}/messages",
-        thread_id
-    );
-    let msg_ok = client
-        .post(&msg_url)
-        .header("Authorization", format!("Bot {}", token))
-        .json(&serde_json::json!({"content": message}))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    if msg_ok {
-        // Update dispatch thread_id and mark as notified
-        if let Ok(conn) = db.lock() {
-            conn.execute(
-                "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
-                rusqlite::params![thread_id, dispatch_id],
-            )
-            .ok();
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![format!("dispatch_notified:{}", dispatch_id), dispatch_id],
-            )
-            .ok();
+    match super::discord_delivery::post_dispatch_message_to_channel(
+        client,
+        token,
+        discord_api_base,
+        thread_id,
+        message,
+    )
+    .await
+    {
+        Ok(message_id) => {
+            // Update dispatch thread_id and mark as notified
+            if let Ok(conn) = db.lock() {
+                conn.execute(
+                    "UPDATE task_dispatches SET thread_id = ?1 WHERE id = ?2",
+                    rusqlite::params![thread_id, dispatch_id],
+                )
+                .ok();
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![format!("dispatch_notified:{}", dispatch_id), dispatch_id],
+                )
+                .ok();
+            }
+            if let Err(error) =
+                super::discord_delivery::persist_dispatch_message_target_and_add_pending_reaction(
+                    db,
+                    client,
+                    token,
+                    discord_api_base,
+                    dispatch_id,
+                    thread_id,
+                    &message_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "[dispatch] Failed to persist reused thread message target for {}: {}",
+                    dispatch_id,
+                    error
+                );
+            }
+            tracing::info!("[dispatch] Reused thread {thread_id} for dispatch {dispatch_id}");
+            Some(true)
         }
-        tracing::info!("[dispatch] Reused thread {thread_id} for dispatch {dispatch_id}");
-        Some(true)
-    } else {
-        tracing::warn!("[dispatch] Failed to send message to reused thread {thread_id}");
-        None
+        Err(error) => {
+            tracing::warn!(
+                "[dispatch] Failed to send message to reused thread {thread_id}: {}",
+                error
+            );
+            None
+        }
     }
 }
 
@@ -690,13 +714,20 @@ pub async fn get_card_thread(
 
     let result: Option<(
         String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
         Option<String>,
         Option<String>,
         String,
         Option<String>,
     )> = conn
         .query_row(
-            "SELECT kc.id, kc.active_thread_id, td.dispatch_type, \
+            "SELECT kc.id, kc.title, kc.github_issue_url, kc.github_issue_number, \
+                    kc.description, kc.deferred_dod_json, \
+                    kc.active_thread_id, td.dispatch_type, \
                     td.to_agent_id, \
                     td.context \
              FROM task_dispatches td \
@@ -710,13 +741,29 @@ pub async fn get_card_thread(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         )
         .ok();
 
     match result {
-        Some((card_id, _legacy_thread_id, dispatch_type, to_agent_id, dispatch_context)) => {
+        Some((
+            card_id,
+            card_title,
+            github_issue_url,
+            github_issue_number,
+            issue_body,
+            deferred_dod_json,
+            _legacy_thread_id,
+            dispatch_type,
+            to_agent_id,
+            dispatch_context,
+        )) => {
             let primary_channel = resolve_agent_primary_channel_on_conn(&conn, &to_agent_id)
                 .ok()
                 .flatten();
@@ -735,11 +782,19 @@ pub async fn get_card_thread(
             let thread_id = target_channel
                 .and_then(|ch| parse_channel_id(ch))
                 .and_then(|ch_num| get_thread_for_channel(&conn, &card_id, ch_num));
+            let deferred_dod = deferred_dod_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
 
             (
                 StatusCode::OK,
                 Json(json!({
                     "card_id": card_id,
+                    "card_title": card_title,
+                    "github_issue_url": github_issue_url,
+                    "github_issue_number": github_issue_number,
+                    "issue_body": issue_body,
+                    "deferred_dod": deferred_dod,
                     "active_thread_id": thread_id,
                     "dispatch_type": dispatch_type,
                     "discord_channel_id": primary_channel,

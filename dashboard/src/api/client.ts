@@ -8,13 +8,14 @@ import type {
   Office,
   DispatchedSession,
   DashboardStats,
+  TokenAnalyticsResponse,
   RoundTableMeeting,
   RoundTableMeetingChannelOption,
   SkillCatalogEntry,
   TaskDispatch,
 } from "../types";
 
-export type { AuditLogEntry, KanbanCard, KanbanRepoSource } from "../types";
+export type { AuditLogEntry, KanbanCard, KanbanRepoSource, TokenAnalyticsResponse } from "../types";
 
 const BASE = "";
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -76,7 +77,8 @@ async function request<T>(url: string, opts?: RequestInit): Promise<T> {
         return await res.json();
       } catch (error) {
         clearTimeout(timer);
-        const resolvedError = error instanceof Error ? error : new Error(String(error));
+        const resolvedError =
+          error instanceof Error ? error : new Error(String(error));
         if (resolvedError.name === "AbortError") {
           lastError = new Error(`Request timeout: ${url}`);
           if (isGet && attempt < MAX_RETRIES) continue;
@@ -101,7 +103,8 @@ async function request<T>(url: string, opts?: RequestInit): Promise<T> {
   if (isGet) inflightGets.set(url, promise);
 
   return promise.catch((error) => {
-    const resolvedError = error instanceof Error ? error : new Error(String(error));
+    const resolvedError =
+      error instanceof Error ? error : new Error(String(error));
     apiErrorListener?.(url, resolvedError);
     throw resolvedError;
   });
@@ -314,6 +317,23 @@ export interface RuntimeConfigResponse {
   defaults: Record<string, number>;
 }
 
+export type EscalationMode = "pm" | "user" | "scheduled";
+
+export interface EscalationSettings {
+  mode: EscalationMode;
+  owner_user_id: number | null;
+  pm_channel_id: string | null;
+  schedule: {
+    pm_hours: string;
+    timezone: string;
+  };
+}
+
+export interface EscalationSettingsResponse {
+  current: EscalationSettings;
+  defaults: EscalationSettings;
+}
+
 export async function getRuntimeConfig(): Promise<RuntimeConfigResponse> {
   return request("/api/settings/runtime-config");
 }
@@ -324,6 +344,19 @@ export async function saveRuntimeConfig(
   return request("/api/settings/runtime-config", {
     method: "PUT",
     body: JSON.stringify(patch),
+  });
+}
+
+export async function getEscalationSettings(): Promise<EscalationSettingsResponse> {
+  return request("/api/settings/escalation");
+}
+
+export async function saveEscalationSettings(
+  settings: EscalationSettings,
+): Promise<EscalationSettingsResponse> {
+  return request("/api/settings/escalation", {
+    method: "PUT",
+    body: JSON.stringify(settings),
   });
 }
 
@@ -387,6 +420,10 @@ export async function createDispatch(body: {
 export async function getStats(officeId?: string): Promise<DashboardStats> {
   const q = officeId ? `?officeId=${officeId}` : "";
   return request(`/api/stats${q}`);
+}
+
+export async function getTokenAnalytics(period: "7d" | "30d" | "90d" = "30d"): Promise<TokenAnalyticsResponse> {
+  return request(`/api/token-analytics?period=${period}`);
 }
 
 // ── Kanban & Dispatches ──
@@ -490,15 +527,20 @@ export async function getStalledCards(): Promise<KanbanCard[]> {
 }
 
 export async function bulkKanbanAction(
-  action: "pass" | "reset" | "cancel",
+  action: "pass" | "reset" | "cancel" | "transition",
   card_ids: string[],
+  targetStatus?: string,
 ): Promise<{
   action: string;
   results: Array<{ id: string; ok: boolean; error?: string }>;
 }> {
   return request("/api/kanban-cards/bulk-action", {
     method: "POST",
-    body: JSON.stringify({ action, card_ids }),
+    body: JSON.stringify({
+      action,
+      card_ids,
+      target_status: targetStatus,
+    }),
   });
 }
 
@@ -632,6 +674,8 @@ export interface PipelineStageInput {
   max_retries?: number;
   skip_condition?: string | null;
   parallel_with?: string | null;
+  applies_to_agent_id?: string | null;
+  trigger_after?: "ready" | "review_pass";
 }
 
 export async function getPipelineStages(
@@ -666,6 +710,16 @@ export async function getCardPipelineStatus(cardId: string): Promise<{
   current_stage: import("../types").PipelineStage | null;
 }> {
   return request(`/api/pipeline/cards/${cardId}`);
+}
+
+export async function getCardTranscripts(
+  cardId: string,
+  limit = 10,
+): Promise<SessionTranscript[]> {
+  const data = await request<{ transcripts: SessionTranscript[] }>(
+    `/api/pipeline/cards/${cardId}/transcripts?limit=${limit}`,
+  );
+  return data.transcripts;
 }
 
 export async function getTaskDispatches(filters?: {
@@ -750,6 +804,88 @@ export async function getAgentDispatchedSessions(
   return data.sessions;
 }
 
+export type SessionTranscriptEventKind =
+  | "user"
+  | "assistant"
+  | "thinking"
+  | "tool_use"
+  | "tool_result"
+  | "result"
+  | "error"
+  | "task"
+  | "system";
+
+export interface SessionTranscriptEvent {
+  kind: SessionTranscriptEventKind;
+  tool_name?: string | null;
+  summary?: string | null;
+  content: string;
+  status?: string | null;
+  is_error: boolean;
+}
+
+export interface SessionTranscript {
+  id: number;
+  turn_id: string;
+  session_key: string | null;
+  channel_id: string | null;
+  agent_id: string | null;
+  provider: string | null;
+  dispatch_id: string | null;
+  kanban_card_id: string | null;
+  dispatch_title: string | null;
+  card_title: string | null;
+  github_issue_number: number | null;
+  user_message: string;
+  assistant_message: string;
+  events: SessionTranscriptEvent[];
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export async function getAgentTranscripts(
+  agentId: string,
+  limit = 8,
+): Promise<SessionTranscript[]> {
+  const data = await request<{ transcripts: SessionTranscript[] }>(
+    `/api/agents/${agentId}/transcripts?limit=${limit}`,
+  );
+  return data.transcripts;
+}
+
+export interface AgentTurnToolEvent {
+  kind: "thinking" | "tool";
+  status: "info" | "running" | "success" | "error";
+  tool_name?: string | null;
+  summary: string;
+  line: string;
+}
+
+export interface AgentTurnState {
+  agent_id: string;
+  status: string;
+  started_at: string | null;
+  updated_at: string | null;
+  recent_output: string | null;
+  recent_output_source: string;
+  session_key: string | null;
+  tmux_session: string | null;
+  provider: string | null;
+  thread_channel_id: string | null;
+  active_dispatch_id: string | null;
+  last_heartbeat: string | null;
+  current_tool_line: string | null;
+  prev_tool_status: string | null;
+  tool_events: AgentTurnToolEvent[];
+  tool_count: number;
+}
+
+export async function getAgentTurn(
+  agentId: string,
+): Promise<AgentTurnState> {
+  return request(`/api/agents/${agentId}/turn`);
+}
+
 // ── Agent Skills ──
 
 export interface AgentSkill {
@@ -808,6 +944,20 @@ export async function getDiscordBindings(): Promise<DiscordBinding[]> {
     "/api/discord-bindings",
   );
   return data.bindings;
+}
+
+export interface DiscordChannelInfo {
+  id: string;
+  guild_id?: string | null;
+  name?: string | null;
+  parent_id?: string | null;
+  type?: number | null;
+}
+
+export async function getDiscordChannelInfo(
+  channelId: string,
+): Promise<DiscordChannelInfo> {
+  return request(`/api/discord/channels/${channelId}`);
 }
 
 export interface GitHubRepoOption {
@@ -1186,6 +1336,14 @@ export interface AutoQueueRun {
   thread_group_count?: number;
 }
 
+export interface AutoQueueThreadLink {
+  role: string;
+  label: string;
+  channel_id?: string | null;
+  thread_id: string;
+  url?: string | null;
+}
+
 export interface DispatchQueueEntry {
   id: string;
   agent_id: string;
@@ -1201,6 +1359,9 @@ export interface DispatchQueueEntry {
   github_repo?: string | null;
   thread_group?: number;
   batch_phase?: number;
+  thread_links?: AutoQueueThreadLink[];
+  card_status?: string;
+  review_round?: number;
 }
 
 export interface ThreadGroupStatus {
@@ -1228,16 +1389,9 @@ export interface AutoQueueStatus {
   thread_groups?: Record<string, ThreadGroupStatus>;
 }
 
-export type AutoQueueGenerateMode =
-  | "priority-sort"
-  | "dependency-aware"
-  | "similarity-aware"
-  | "pm-assisted";
-
 export async function generateAutoQueue(
   repo?: string | null,
   agentId?: string | null,
-  mode?: AutoQueueGenerateMode | null,
 ): Promise<{
   run: AutoQueueRun;
   entries: DispatchQueueEntry[];
@@ -1245,8 +1399,6 @@ export async function generateAutoQueue(
   const body: Record<string, unknown> = {
     repo: repo ?? null,
     agent_id: agentId ?? null,
-    mode: mode ?? "priority-sort",
-    parallel: mode === "similarity-aware" || undefined,
   };
   return request("/api/auto-queue/generate", {
     method: "POST",

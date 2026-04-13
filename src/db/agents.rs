@@ -17,37 +17,61 @@ pub struct AgentChannelBindings {
 }
 
 impl AgentChannelBindings {
-    pub fn primary_channel(&self) -> Option<String> {
-        match self.provider.as_deref().and_then(ProviderKind::from_str) {
-            Some(ProviderKind::Claude) => self
-                .claude_channel()
-                .or_else(|| self.codex_channel())
-                .or_else(|| self.legacy_primary_channel()),
-            Some(ProviderKind::Codex) => self
-                .codex_channel()
-                .or_else(|| self.claude_channel())
-                .or_else(|| self.legacy_primary_channel()),
-            Some(_) | None => self
-                .legacy_primary_channel()
-                .or_else(|| self.codex_channel())
-                .or_else(|| self.claude_channel()),
+    fn primary_provider_kind(&self) -> Option<ProviderKind> {
+        self.provider
+            .as_deref()
+            .and_then(ProviderKind::from_str)
+            .or_else(ProviderKind::default_channel_provider)
+    }
+
+    fn resolved_primary_provider_kind(&self) -> Option<ProviderKind> {
+        let configured_provider = self.primary_provider_kind()?;
+        if self
+            .provider_specific_channel(&configured_provider)
+            .is_some()
+        {
+            return Some(configured_provider);
+        }
+
+        configured_provider
+            .preferred_counterparts()
+            .into_iter()
+            .find(|provider| self.provider_specific_channel(provider).is_some())
+    }
+
+    fn provider_specific_channel(&self, provider: &ProviderKind) -> Option<String> {
+        match provider {
+            ProviderKind::Claude => self.claude_channel(),
+            ProviderKind::Codex => self.codex_channel(),
+            _ => None,
         }
     }
 
+    pub fn primary_channel(&self) -> Option<String> {
+        if let Some(primary_provider) = self.resolved_primary_provider_kind() {
+            if let Some(channel) = self.provider_specific_channel(&primary_provider) {
+                return Some(channel);
+            }
+        }
+        self.legacy_primary_channel()
+            .or_else(|| self.codex_channel())
+            .or_else(|| self.claude_channel())
+    }
+
     pub fn counter_model_channel(&self) -> Option<String> {
-        let target = self
-            .provider
-            .as_deref()
-            .and_then(ProviderKind::from_str)
-            .unwrap_or(ProviderKind::Claude)
-            .counterpart();
-        self.channel_for_provider(Some(target.as_str()))
+        self.resolved_primary_provider_kind().and_then(|provider| {
+            provider
+                .preferred_counterparts()
+                .into_iter()
+                .find_map(|counterpart| self.provider_specific_channel(&counterpart))
+        })
     }
 
     pub fn channel_for_provider(&self, provider: Option<&str>) -> Option<String> {
         match provider.and_then(ProviderKind::from_str) {
-            Some(ProviderKind::Claude) => self.claude_channel(),
-            Some(ProviderKind::Codex) => self.codex_channel(),
+            Some(kind) => self
+                .provider_specific_channel(&kind)
+                .or_else(|| self.legacy_primary_channel()),
             _ => self.legacy_primary_channel(),
         }
     }
@@ -557,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn single_provider_channel_falls_back_to_any_available() {
+    fn single_provider_channel_falls_back_to_available_primary_without_counter_model() {
         let db = test_db();
         let conn = db.lock().unwrap();
         // Claude agent (DEFAULT provider) with only codex channels configured
@@ -576,14 +600,14 @@ mod tests {
             .expect("bindings");
         // Falls back to codex channel since no claude channel exists
         assert_eq!(bindings.primary_channel(), Some("cdx-chan".into()));
-        assert_eq!(bindings.counter_model_channel(), Some("cdx-chan".into()));
+        assert_eq!(bindings.counter_model_channel(), None);
         assert_eq!(
             resolve_agent_dispatch_channel_on_conn(&conn, "ag-02", Some("implementation")).unwrap(),
             Some("cdx-chan".into())
         );
         assert_eq!(
             resolve_agent_dispatch_channel_on_conn(&conn, "ag-02", Some("review")).unwrap(),
-            Some("cdx-chan".into())
+            None
         );
     }
 
@@ -607,9 +631,14 @@ mod tests {
             .expect("bindings");
         // Should fall back to claude channel instead of returning None
         assert_eq!(bindings.primary_channel(), Some("cc-only".into()));
+        assert_eq!(bindings.counter_model_channel(), None);
         assert_eq!(
             resolve_agent_dispatch_channel_on_conn(&conn, "ag-03", Some("implementation")).unwrap(),
             Some("cc-only".into())
+        );
+        assert_eq!(
+            resolve_agent_dispatch_channel_on_conn(&conn, "ag-03", Some("review")).unwrap(),
+            None
         );
     }
 
@@ -633,6 +662,28 @@ mod tests {
             .expect("bindings");
         // Gemini hits Some(_) branch — should fall back to codex channel
         assert_eq!(bindings.primary_channel(), Some("cdx-chan".into()));
+        assert_eq!(bindings.counter_model_channel(), None);
+    }
+
+    #[test]
+    fn non_claude_codex_provider_without_second_channel_has_no_counter_model() {
+        let db = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (
+                id, name, provider,
+                discord_channel_id, discord_channel_alt,
+                discord_channel_cc, discord_channel_cdx
+            ) VALUES ('ag-04b', 'QwenAgent', 'qwen', 'cc-legacy', NULL, 'cc-chan', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let bindings = load_agent_channel_bindings(&conn, "ag-04b")
+            .unwrap()
+            .expect("bindings");
+        assert_eq!(bindings.primary_channel(), Some("cc-chan".into()));
+        assert_eq!(bindings.counter_model_channel(), None);
     }
 
     #[test]
@@ -654,9 +705,9 @@ mod tests {
             .unwrap()
             .expect("bindings");
         assert_eq!(bindings.primary_channel(), Some("cc-only".into()));
-        // counter_model returns None — no codex channel exists.
-        // This triggers PM-decision in onReviewEnter instead of routing
-        // to the same channel (which would strand the review).
+        // counter_model returns None — no alternate provider channel exists.
+        // Review automation now auto-approves instead of routing the review
+        // back to the same provider/channel.
         assert_eq!(bindings.counter_model_channel(), None);
         assert_eq!(
             resolve_agent_dispatch_channel_on_conn(&conn, "ag-05", Some("review")).unwrap(),

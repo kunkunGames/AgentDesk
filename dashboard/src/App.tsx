@@ -34,19 +34,19 @@ import {
 } from "./components/NotificationCenter";
 import { useDashboardSocket } from "./app/useDashboardSocket";
 import {
-  Activity,
   Building2,
   KanbanSquare,
+  LayoutDashboard,
   SlidersHorizontal,
   Wifi,
   WifiOff,
 } from "lucide-react";
 const CommandPalette = lazy(() => import("./components/CommandPalette"));
 
-type ViewMode = "office" | "pulse" | "kanban" | "more";
+type ViewMode = "office" | "dashboard" | "kanban" | "more";
 type ControlTab = "agents" | "departments" | "offices" | "settings" | "meetings";
 type AgentsPane = "directory" | "dispatch";
-type KanbanPulseFocus = "review" | "blocked" | "requested" | "stalled";
+type KanbanSignalFocus = "review" | "blocked" | "requested" | "stalled";
 
 interface ShellRoute {
   id: ViewMode;
@@ -66,14 +66,14 @@ interface PaletteRoute {
 
 const VIEW_ROUTES: ShellRoute[] = [
   { id: "office", labelKo: "오피스", labelEn: "Office", shortcutKey: "o", loadingKo: "오피스 로딩 중...", loadingEn: "Loading Office..." },
-  { id: "pulse", labelKo: "펄스", labelEn: "Pulse", shortcutKey: "p", loadingKo: "펄스 로딩 중...", loadingEn: "Loading Pulse..." },
+  { id: "dashboard", labelKo: "대시보드", labelEn: "Dashboard", shortcutKey: "d", loadingKo: "대시보드 로딩 중...", loadingEn: "Loading Dashboard..." },
   { id: "kanban", labelKo: "칸반", labelEn: "Kanban", shortcutKey: "b", loadingKo: "칸반 로딩 중...", loadingEn: "Loading Kanban..." },
   { id: "more", labelKo: "컨트롤", labelEn: "Control", shortcutKey: "m", loadingKo: "컨트롤 로딩 중...", loadingEn: "Loading Control..." },
 ];
 
 const PALETTE_ROUTES: PaletteRoute[] = [
   { id: "office", labelKo: "오피스", labelEn: "Office", icon: "🏢" },
-  { id: "pulse", labelKo: "펄스", labelEn: "Pulse", icon: "📊" },
+  { id: "dashboard", labelKo: "대시보드", labelEn: "Dashboard", icon: "📊" },
   { id: "kanban", labelKo: "칸반", labelEn: "Kanban", icon: "📋" },
   { id: "more", labelKo: "컨트롤", labelEn: "Control", icon: "🎛️" },
   { id: "control_agents", labelKo: "에이전트", labelEn: "Agents", icon: "👥" },
@@ -119,7 +119,7 @@ interface BootstrapData {
 export default function App() {
   const [data, setData] = useState<BootstrapData | null>(null);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
-  const { notifications, pushNotification, dismissNotification } = useNotifications();
+  const { notifications, pushNotification, updateNotification, dismissNotification } = useNotifications();
 
   // Wire up API error → toast notifications (throttled: max 1 per 3s per endpoint)
   useEffect(() => {
@@ -243,6 +243,7 @@ export default function App() {
             wsConnected={wsConnected}
             notifications={notifications}
             pushNotification={pushNotification}
+            updateNotification={updateNotification}
             dismissNotification={dismissNotification}
           />
         </KanbanProvider>
@@ -254,15 +255,16 @@ export default function App() {
 interface AppShellProps {
   wsConnected: boolean;
   notifications: Notification[];
-  pushNotification: (message: string, type?: Notification["type"]) => void;
+  pushNotification: (message: string, type?: Notification["type"]) => string;
+  updateNotification: (id: string, message: string, type?: Notification["type"]) => void;
   dismissNotification: (id: string) => void;
 }
 
-function AppShell({ wsConnected, notifications, pushNotification, dismissNotification }: AppShellProps) {
+function AppShell({ wsConnected, notifications, pushNotification, updateNotification, dismissNotification }: AppShellProps) {
   const [view, setView] = useState<ViewMode>("office");
   const [controlTab, setControlTab] = useState<ControlTab>("agents");
   const [agentsPane, setAgentsPane] = useState<AgentsPane>("directory");
-  const [kanbanPulseFocus, setKanbanPulseFocus] = useState<KanbanPulseFocus | null>(null);
+  const [kanbanSignalFocus, setKanbanSignalFocus] = useState<KanbanSignalFocus | null>(null);
   const [officeInfoAgent, setOfficeInfoAgent] = useState<Agent | null>(null);
   const [showCmdPalette, setShowCmdPalette] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -316,7 +318,7 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
 
   const navItems: Array<{ id: ViewMode; icon: React.ReactNode; label: string; badge?: number; badgeColor?: string }> = [
     { id: "office", icon: <Building2 size={20} />, label: isKo ? "오피스" : "Office" },
-    { id: "pulse", icon: <Activity size={20} />, label: isKo ? "펄스" : "Pulse" },
+    { id: "dashboard", icon: <LayoutDashboard size={20} />, label: isKo ? "대시보드" : "Dashboard" },
     { id: "kanban", icon: <KanbanSquare size={20} />, label: isKo ? "칸반" : "Kanban" },
     { id: "more", icon: <SlidersHorizontal size={20} />, label: isKo ? "컨트롤" : "Control", badge: moreBadge, badgeColor: moreBadgeColor },
   ];
@@ -324,14 +326,14 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
   const handleNavigate = useCallback(
     (nextView: ViewMode) => {
       setView(nextView);
-      if (nextView === "pulse") refreshStats();
+      if (nextView === "dashboard") refreshStats();
     },
     [refreshStats],
   );
 
   const handlePaletteNavigate = useCallback(
     (routeId: string) => {
-      if (routeId === "office" || routeId === "pulse" || routeId === "kanban" || routeId === "more") {
+      if (routeId === "office" || routeId === "dashboard" || routeId === "kanban" || routeId === "more") {
         handleNavigate(routeId);
         return;
       }
@@ -353,8 +355,8 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
     [handleNavigate],
   );
 
-  const openPulseKanbanSignal = useCallback((signal: KanbanPulseFocus) => {
-    setKanbanPulseFocus(signal);
+  const openKanbanSignalFocus = useCallback((signal: KanbanSignalFocus) => {
+    setKanbanSignalFocus(signal);
     setView("kanban");
   }, []);
 
@@ -413,7 +415,7 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
   }, [refreshOffices, refreshAgents, refreshAllAgents, refreshDepartments, refreshAllDepartments, refreshAuditLogs]);
 
   const showOfficeSelector =
-    offices.length > 0 && (view === "office" || (view === "more" && controlTab !== "settings" && controlTab !== "meetings"));
+    offices.length > 0 && (view === "office" || view === "dashboard" || (view === "more" && controlTab !== "settings" && controlTab !== "meetings"));
 
   return (
     <div className="flex fixed inset-0 bg-gray-900">
@@ -476,18 +478,17 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
               />
             )}
 
-            {view === "pulse" && (
+            {view === "dashboard" && (
               <DashboardPageView
                 stats={stats}
                 agents={agents}
-                sessions={visibleDispatchedSessions}
                 meetings={roundTableMeetings}
                 settings={settings}
                 onSelectAgent={(agent) => setOfficeInfoAgent(agent)}
-                onOpenKanbanSignal={openPulseKanbanSignal}
+                onOpenKanbanSignal={openKanbanSignalFocus}
                 onOpenDispatchSessions={openDispatchSessions}
-                onOpenMeetings={openMeetingsView}
                 onOpenSettings={openSettingsView}
+                onRefreshMeetings={() => api.getRoundTableMeetings().then(setRoundTableMeetings).catch(() => {})}
               />
             )}
 
@@ -531,8 +532,8 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
                   const updated = await api.patchKanbanDeferDod(id, payload);
                   upsertKanbanCard(updated);
                 }}
-                externalStatusFocus={kanbanPulseFocus}
-                onClearPulseFocus={() => setKanbanPulseFocus(null)}
+                externalStatusFocus={kanbanSignalFocus}
+                onClearSignalFocus={() => setKanbanSignalFocus(null)}
               />
             </div>
             )}
@@ -579,6 +580,7 @@ function AppShell({ wsConnected, notifications, pushNotification, dismissNotific
                 }}
                 notifications={notifications}
                 onNotify={pushNotification}
+                onUpdateNotification={updateNotification}
                 onDismissNotification={dismissNotification}
               />
             )}

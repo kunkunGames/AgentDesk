@@ -200,6 +200,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
             None,
             None,
             None,
+            None,
             shared.api_port,
         )
         .await;
@@ -223,9 +224,25 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
         }
         ManagedSessionClearBehavior::Noop => {}
     }
+
+    // Notify bot message for session clear visibility
+    if let Some(ref db) = shared.db {
+        if let Ok(conn) = db.lock() {
+            let _ = conn.execute(
+                "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
+                rusqlite::params![
+                    format!("channel:{}", channel_id.get()),
+                    format!("🧹 세션 클리어 ({})", clear_source),
+                ],
+            );
+        }
+    }
 }
 
 /// /stop — Cancel in-progress AI request
+///
+/// #441: flows through mailbox_cancel_active_turn → cancel_active_token
+/// → token.cancelled triggers turn_bridge loop exit → mailbox_finish_turn canonical cleanup
 #[poise::command(slash_command, rename = "stop")]
 pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
@@ -235,7 +252,7 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ◀ [{user_name}] /stop");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /stop");
 
     let channel_id = ctx.channel_id();
     let result = mailbox_cancel_active_turn(&ctx.data().shared, channel_id).await;
@@ -250,7 +267,7 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
             ctx.say("Stopping...").await?;
 
             cancel_active_token(&token, true, "/stop");
-            println!("  [{ts}] ■ Cancel signal sent");
+            tracing::info!("  [{ts}] ■ Cancel signal sent");
         }
         None => {
             ctx.say("No active request to stop.").await?;
@@ -269,7 +286,7 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ◀ [{user_name}] /clear");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /clear");
 
     let http = ctx.serenity_context().http.clone();
     clear_channel_session_state(
@@ -282,7 +299,7 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
     .await;
 
     ctx.say("Session cleared.").await?;
-    println!("  [{ts}] ▶ [{user_name}] Session cleared");
+    tracing::info!("  [{ts}] ▶ [{user_name}] Session cleared");
     Ok(())
 }
 
@@ -299,7 +316,7 @@ pub(in crate::services::discord) async fn cmd_down(
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ◀ [{user_name}] /down {file}");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /down {file}");
 
     let file_path = file.trim();
     if file_path.is_empty() {
@@ -453,7 +470,7 @@ pub(in crate::services::discord) async fn cmd_shell(
 
     let ts = chrono::Local::now().format("%H:%M:%S");
     let preview = truncate_str(&command, 60);
-    println!("  [{ts}] ◀ [{user_name}] /shell {preview}");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /shell {preview}");
 
     // Defer for potentially long-running commands
     ctx.defer().await?;
@@ -513,6 +530,6 @@ pub(in crate::services::discord) async fn cmd_shell(
     };
 
     send_long_message_ctx(ctx, &response).await?;
-    println!("  [{ts}] ▶ [{user_name}] Shell done");
+    tracing::info!("  [{ts}] ▶ [{user_name}] Shell done");
     Ok(())
 }

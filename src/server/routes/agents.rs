@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::OnceLock;
 
@@ -16,6 +16,11 @@ use super::session_activity::SessionActivityResolver;
 #[derive(Debug, Deserialize)]
 pub struct TimelineQuery {
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TranscriptQuery {
+    pub limit: Option<usize>,
 }
 
 const TURN_CAPTURE_SCROLLBACK_LINES: i32 = -80;
@@ -37,8 +42,26 @@ struct AgentTurnSession {
 #[derive(Debug, Clone, Default)]
 struct InflightTurnSnapshot {
     started_at: Option<String>,
+    updated_at: Option<String>,
     current_tool_line: Option<String>,
+    prev_tool_status: Option<String>,
     full_response: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TurnToolEvent {
+    kind: &'static str,
+    status: &'static str,
+    tool_name: Option<String>,
+    summary: String,
+    line: String,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTurnToolEvent {
+    event: TurnToolEvent,
+    identity_kind: &'static str,
+    identity_value: String,
 }
 
 fn agent_exists(conn: &rusqlite::Connection, id: &str) -> bool {
@@ -129,6 +152,13 @@ fn normalize_recent_output(text: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| tail_chars(normalized, TURN_OUTPUT_MAX_CHARS))
 }
 
+fn sanitize_status_line(text: &str) -> Option<String> {
+    let stripped = strip_ansi(text);
+    let sanitized = sanitize_sensitive_text(stripped.trim());
+    let normalized = sanitized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
 fn capture_recent_tmux_output(tmux_name: &str) -> Option<String> {
     let capture =
         crate::services::platform::tmux::capture_pane(tmux_name, TURN_CAPTURE_SCROLLBACK_LINES)?;
@@ -184,8 +214,16 @@ fn load_inflight_snapshot(
                     .get("started_at")
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
+                updated_at: state
+                    .get("updated_at")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
                 current_tool_line: state
                     .get("current_tool_line")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                prev_tool_status: state
+                    .get("prev_tool_status")
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
                 full_response: state
@@ -202,12 +240,18 @@ fn load_inflight_snapshot(
 fn inflight_recent_output(snapshot: &InflightTurnSnapshot) -> Option<String> {
     let mut sections = Vec::new();
     if let Some(tool_line) = snapshot
+        .prev_tool_status
+        .as_deref()
+        .and_then(sanitize_status_line)
+    {
+        sections.push(tool_line);
+    }
+    if let Some(tool_line) = snapshot
         .current_tool_line
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(sanitize_status_line)
     {
-        sections.push(tool_line.to_string());
+        sections.push(tool_line);
     }
     if let Some(response) = snapshot
         .full_response
@@ -220,6 +264,113 @@ fn inflight_recent_output(snapshot: &InflightTurnSnapshot) -> Option<String> {
     (!sections.is_empty())
         .then(|| normalize_recent_output(&sections.join("\n\n")))
         .flatten()
+}
+
+fn parse_turn_tool_event(line: &str) -> Option<ParsedTurnToolEvent> {
+    let trimmed = sanitize_status_line(line)?;
+
+    if trimmed.starts_with("💭") {
+        return Some(ParsedTurnToolEvent {
+            event: TurnToolEvent {
+                kind: "thinking",
+                status: "info",
+                tool_name: None,
+                summary: trimmed.trim_start_matches("💭").trim().to_string(),
+                line: trimmed.to_string(),
+            },
+            identity_kind: "thinking",
+            identity_value: "thinking".to_string(),
+        });
+    }
+
+    let (status, stripped) = if let Some(rest) = trimmed.strip_prefix("⚙") {
+        ("running", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("✓") {
+        ("success", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("✗") {
+        ("error", rest)
+    } else {
+        return None;
+    };
+
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let (tool_name, summary) = match stripped.split_once(':') {
+        Some((name, summary)) => (
+            Some(name.trim().to_string()).filter(|value| !value.is_empty()),
+            summary.trim().to_string(),
+        ),
+        None => (Some(stripped.to_string()), String::new()),
+    };
+    let summary = if summary.is_empty() {
+        tool_name.clone().unwrap_or_else(|| stripped.to_string())
+    } else {
+        summary
+    };
+
+    Some(ParsedTurnToolEvent {
+        event: TurnToolEvent {
+            kind: "tool",
+            status,
+            tool_name,
+            summary,
+            line: trimmed.to_string(),
+        },
+        identity_kind: "tool",
+        identity_value: stripped.to_string(),
+    })
+}
+
+fn collect_turn_tool_events(
+    recent_output: Option<&str>,
+    inflight: Option<&InflightTurnSnapshot>,
+) -> Vec<TurnToolEvent> {
+    let mut parsed = Vec::<ParsedTurnToolEvent>::new();
+    let mut push_line = |line: &str| {
+        let Some(event) = parse_turn_tool_event(line) else {
+            return;
+        };
+
+        if let Some(last) = parsed.last_mut() {
+            if last.identity_kind == event.identity_kind
+                && last.identity_value == event.identity_value
+            {
+                *last = event;
+                return;
+            }
+        }
+
+        parsed.push(event);
+    };
+
+    if let Some(previous) = inflight
+        .and_then(|snapshot| snapshot.prev_tool_status.as_deref())
+        .and_then(sanitize_status_line)
+    {
+        push_line(&previous);
+    }
+
+    if let Some(output) = recent_output {
+        for line in output.lines() {
+            push_line(line);
+        }
+    }
+
+    if let Some(current) = inflight
+        .and_then(|snapshot| snapshot.current_tool_line.as_deref())
+        .and_then(sanitize_status_line)
+    {
+        push_line(&current);
+    }
+
+    let len = parsed.len();
+    parsed
+        .into_iter()
+        .skip(len.saturating_sub(24))
+        .map(|entry| entry.event)
+        .collect()
 }
 
 fn find_agent_turn_session(
@@ -611,13 +762,19 @@ pub async fn agent_turn(
                 "agent_id": id,
                 "status": "idle",
                 "started_at": serde_json::Value::Null,
+                "updated_at": serde_json::Value::Null,
                 "recent_output": serde_json::Value::Null,
+                "recent_output_source": "none",
                 "session_key": serde_json::Value::Null,
                 "tmux_session": serde_json::Value::Null,
                 "provider": serde_json::Value::Null,
                 "thread_channel_id": serde_json::Value::Null,
                 "active_dispatch_id": serde_json::Value::Null,
                 "last_heartbeat": serde_json::Value::Null,
+                "current_tool_line": serde_json::Value::Null,
+                "prev_tool_status": serde_json::Value::Null,
+                "tool_events": Vec::<TurnToolEvent>::new(),
+                "tool_count": 0,
             })),
         );
     };
@@ -629,13 +786,19 @@ pub async fn agent_turn(
                 "agent_id": id,
                 "status": "idle",
                 "started_at": serde_json::Value::Null,
+                "updated_at": serde_json::Value::Null,
                 "recent_output": serde_json::Value::Null,
+                "recent_output_source": "none",
                 "session_key": session.session_key,
                 "tmux_session": extract_tmux_name(&session.session_key),
                 "provider": session.provider,
                 "thread_channel_id": session.thread_channel_id,
                 "active_dispatch_id": serde_json::Value::Null,
                 "last_heartbeat": session.last_heartbeat,
+                "current_tool_line": serde_json::Value::Null,
+                "prev_tool_status": serde_json::Value::Null,
+                "tool_events": Vec::<TurnToolEvent>::new(),
+                "tool_count": 0,
             })),
         );
     }
@@ -661,6 +824,11 @@ pub async fn agent_turn(
             None => (None, "none"),
         }
     };
+    let tool_events = collect_turn_tool_events(recent_output.as_deref(), inflight.as_ref());
+    let tool_count = tool_events
+        .iter()
+        .filter(|event| event.kind == "tool")
+        .count();
 
     (
         StatusCode::OK,
@@ -668,6 +836,7 @@ pub async fn agent_turn(
             "agent_id": id,
             "status": session.effective_status,
             "started_at": started_at,
+            "updated_at": inflight.as_ref().and_then(|snapshot| snapshot.updated_at.clone()),
             "recent_output": recent_output,
             "recent_output_source": recent_output_source,
             "session_key": session.session_key,
@@ -676,6 +845,10 @@ pub async fn agent_turn(
             "thread_channel_id": session.thread_channel_id,
             "active_dispatch_id": session.effective_active_dispatch_id,
             "last_heartbeat": session.last_heartbeat,
+            "current_tool_line": inflight.as_ref().and_then(|snapshot| snapshot.current_tool_line.as_deref()).and_then(sanitize_status_line),
+            "prev_tool_status": inflight.as_ref().and_then(|snapshot| snapshot.prev_tool_status.as_deref()).and_then(sanitize_status_line),
+            "tool_events": tool_events,
+            "tool_count": tool_count,
         })),
     )
 }
@@ -733,8 +906,13 @@ pub async fn stop_agent_turn(
     }
 
     let session_key = session.session_key.clone();
-    let (status, Json(mut body)) =
-        super::dispatched_sessions::force_kill_session_impl(&state, &session_key, false).await;
+    let (status, Json(mut body)) = super::dispatched_sessions::force_kill_session_impl_with_reason(
+        &state,
+        &session_key,
+        false,
+        "turn/stop API invoked",
+    )
+    .await;
     body["agent_id"] = json!(id);
     body["session_key"] = json!(session_key);
     body["status"] = json!(if status == StatusCode::OK {
@@ -865,6 +1043,48 @@ pub async fn agent_timeline(
     (StatusCode::OK, Json(json!({"events": events})))
 }
 
+/// GET /api/agents/:id/transcripts?limit=10
+pub async fn agent_transcripts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<TranscriptQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let conn = match state.db.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+
+    if !agent_exists(&conn, &id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "agent not found"})),
+        );
+    }
+
+    match crate::db::session_transcripts::list_transcripts_for_agent(
+        &conn,
+        &id,
+        params.limit.unwrap_or(8),
+    ) {
+        Ok(transcripts) => (
+            StatusCode::OK,
+            Json(json!({
+                "agent_id": id,
+                "transcripts": transcripts,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query: {e}")})),
+        ),
+    }
+}
+
 /// POST /api/agents/:id/signal
 /// Agent sends a status signal (e.g., "blocked" with reason).
 pub async fn agent_signal(
@@ -930,50 +1150,14 @@ pub async fn agent_signal(
     )
 }
 
-/// GET /api/agent-channels
-/// Returns agent ID → Discord channel mapping.
-pub async fn agent_channels(
-    State(state): State<super::AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx
-             FROM agents ORDER BY id",
-        )
-        .unwrap();
-
-    let channels: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
-            Ok(json!({
-                "agent_id": row.get::<_, String>(0)?,
-                "name": row.get::<_, Option<String>>(1)?,
-                "channel_id": row.get::<_, Option<String>>(2)?,
-                "channel_alt": row.get::<_, Option<String>>(3)?,
-                "channel_cc": row.get::<_, Option<String>>(4)?,
-                "channel_cdx": row.get::<_, Option<String>>(5)?,
-            }))
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    (StatusCode::OK, Json(json!({"channels": channels})))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::db::session_transcripts::{
+        PersistSessionTranscript, SessionTranscriptEvent, SessionTranscriptEventKind,
+        persist_turn_on_conn,
+    };
     use crate::engine::PolicyEngine;
 
     fn test_db() -> Db {
@@ -1016,6 +1200,123 @@ mod tests {
             body["sessions"][0]["thread_channel_id"],
             serde_json::Value::String("1485506232256168011".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn agent_transcripts_returns_structured_events() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState::test_state(db.clone(), engine);
+
+        {
+            let mut conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('agent-transcript', 'Transcript Agent', 'codex', 'idle', 0)",
+                [],
+            )
+            .unwrap();
+
+            let events = vec![SessionTranscriptEvent {
+                kind: SessionTranscriptEventKind::ToolUse,
+                tool_name: Some("Bash".to_string()),
+                summary: Some("cargo test".to_string()),
+                content: "cargo test --no-run".to_string(),
+                status: Some("success".to_string()),
+                is_error: false,
+            }];
+            persist_turn_on_conn(
+                &mut conn,
+                PersistSessionTranscript {
+                    turn_id: "discord:agent-transcript:1",
+                    session_key: Some("host:agent-transcript"),
+                    channel_id: Some("chan-1"),
+                    agent_id: Some("agent-transcript"),
+                    provider: Some("codex"),
+                    dispatch_id: None,
+                    user_message: "verify build",
+                    assistant_message: "build verified",
+                    events: &events,
+                    duration_ms: Some(4200),
+                },
+            )
+            .unwrap();
+        }
+
+        let (status, Json(body)) = agent_transcripts(
+            State(state),
+            Path("agent-transcript".to_string()),
+            Query(TranscriptQuery { limit: Some(5) }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["agent_id"],
+            serde_json::Value::String("agent-transcript".to_string())
+        );
+        assert_eq!(
+            body["transcripts"][0]["turn_id"],
+            "discord:agent-transcript:1"
+        );
+        assert!(body["transcripts"][0]["card_title"].is_null());
+        assert!(body["transcripts"][0]["github_issue_number"].is_null());
+        assert_eq!(body["transcripts"][0]["duration_ms"], 4200);
+        assert_eq!(body["transcripts"][0]["events"][0]["kind"], "tool_use");
+        assert_eq!(body["transcripts"][0]["events"][0]["tool_name"], "Bash");
+    }
+
+    #[tokio::test]
+    async fn agent_transcripts_falls_back_to_session_agent_for_legacy_rows() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState::test_state(db.clone(), engine);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('agent-transcript-fallback', 'Transcript Fallback', 'codex', 'idle', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat)
+                 VALUES ('host:agent-transcript-fallback', 'agent-transcript-fallback', 'codex', 'idle', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_transcripts (
+                    turn_id, session_key, channel_id, agent_id, provider, dispatch_id, user_message, assistant_message, events_json
+                 ) VALUES (
+                    'discord:agent-transcript-fallback:1',
+                    'host:agent-transcript-fallback',
+                    'chan-fallback',
+                    NULL,
+                    'codex',
+                    NULL,
+                    'legacy question',
+                    'legacy answer',
+                    '[]'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (status, Json(body)) = agent_transcripts(
+            State(state),
+            Path("agent-transcript-fallback".to_string()),
+            Query(TranscriptQuery { limit: Some(5) }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["transcripts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            body["transcripts"][0]["turn_id"],
+            "discord:agent-transcript-fallback:1"
+        );
+        assert_eq!(body["transcripts"][0]["agent_id"], serde_json::Value::Null);
     }
 
     #[test]

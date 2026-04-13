@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import * as api from "../../api";
 import type { GitHubIssue, GitHubRepoOption, KanbanRepoSource } from "../../api";
 import AutoQueuePanel from "./AutoQueuePanel";
+import CardTimeline from "./CardTimeline";
 import PipelineEditor from "./PipelineEditor";
 import PipelineConfigView from "./PipelineConfigView";
 import PipelineOverrideEditor from "./PipelineOverrideEditor";
@@ -35,7 +36,6 @@ import {
   isReviewCard,
   labelForStatus,
   parseCardMetadata,
-  parseGitHubCommentTimeline,
   parseIssueSections,
   priorityLabel,
   stringifyCardMetadata,
@@ -75,17 +75,11 @@ interface KanbanTabProps {
     payload: Parameters<typeof api.patchKanbanDeferDod>[1],
   ) => Promise<void>;
   externalStatusFocus?: "review" | "blocked" | "requested" | "stalled" | null;
-  onClearPulseFocus?: () => void;
+  onClearSignalFocus?: () => void;
 }
 
-const TIMELINE_KIND_STYLE: Record<string, { bg: string; text: string }> = {
-  review: { bg: "rgba(20,184,166,0.16)", text: "#5eead4" },
-  pm: { bg: "rgba(244,114,182,0.16)", text: "#f9a8d4" },
-  work: { bg: "rgba(96,165,250,0.16)", text: "#93c5fd" },
-  general: { bg: "rgba(148,163,184,0.10)", text: "#94a3b8" },
-};
-
 const STALE_IN_PROGRESS_MS = 100 * 60_000;
+type MobileKanbanView = "summary" | "minimap";
 
 export default function KanbanTab({
   tr,
@@ -101,8 +95,9 @@ export default function KanbanTab({
   onDeleteCard,
   onPatchDeferDod,
   externalStatusFocus,
-  onClearPulseFocus,
+  onClearSignalFocus,
 }: KanbanTabProps) {
+  const LIVE_TURN_POLL_MS = 4_000;
   const [repoSources, setRepoSources] = useState<KanbanRepoSource[]>([]);
   const [repoInput, setRepoInput] = useState("");
   const [selectedRepo, setSelectedRepo] = useState("");
@@ -113,7 +108,7 @@ export default function KanbanTab({
   const [agentFilter, setAgentFilter] = useState("all");
   const [deptFilter, setDeptFilter] = useState("all");
   const [cardTypeFilter, setCardTypeFilter] = useState<"all" | "issue" | "review">("all");
-  const [pulseStatusFilter, setPulseStatusFilter] = useState<"all" | "review" | "blocked" | "requested" | "stalled">("all");
+  const [signalStatusFilter, setSignalStatusFilter] = useState<"all" | "review" | "blocked" | "requested" | "stalled">("all");
   const [search, setSearch] = useState("");
   const [showClosed, setShowClosed] = useState(false);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
@@ -134,6 +129,7 @@ export default function KanbanTab({
   const [dragOverCardId, setDragOverCardId] = useState<string | null>(null);
   const [compactBoard, setCompactBoard] = useState(false);
   const [mobileColumnStatus, setMobileColumnStatus] = useState<KanbanCardStatus>("backlog");
+  const [mobileBoardView, setMobileBoardView] = useState<MobileKanbanView>("summary");
   const [retryAssigneeId, setRetryAssigneeId] = useState("");
   const [newChecklistItem, setNewChecklistItem] = useState("");
   const [closingIssueNumber, setClosingIssueNumber] = useState<number | null>(null);
@@ -156,6 +152,8 @@ export default function KanbanTab({
   const [ghComments, setGhComments] = useState<api.GitHubComment[]>([]);
   const [timelineFilter, setTimelineFilter] = useState<"review" | "pm" | "work" | "general" | null>(null);
   const [activityRefreshTick, setActivityRefreshTick] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [liveTurnsByAgentId, setLiveTurnsByAgentId] = useState<Record<string, api.AgentTurnState>>({});
   const ghCommentsCache = useRef<Map<string, { comments: api.GitHubComment[]; body: string; ts: number }>>(new Map());
   const detailRequestSeq = useRef(0);
 
@@ -195,7 +193,6 @@ export default function KanbanTab({
   }, [agents]);
 
   const selectedCard = selectedCardId ? cardsById.get(selectedCardId) ?? null : null;
-  const parsedGitHubTimeline = useMemo(() => parseGitHubCommentTimeline(ghComments), [ghComments]);
   const invalidateCardActivity = (cardId: string) => {
     ghCommentsCache.current.delete(cardId);
     if (selectedCardId === cardId) {
@@ -320,6 +317,11 @@ export default function KanbanTab({
   }, []);
 
   useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     Promise.all([
       api.getKanbanRepoSources().catch(() => [] as KanbanRepoSource[]),
       api.getGitHubRepos().then((result) => result.repos).catch(() => [] as GitHubRepoOption[]),
@@ -380,7 +382,7 @@ export default function KanbanTab({
   useEffect(() => {
     if (!externalStatusFocus) return;
     setSettingsOpen(true);
-    setPulseStatusFilter(externalStatusFocus);
+    setSignalStatusFilter(externalStatusFocus);
     if (externalStatusFocus === "review") {
       setCardTypeFilter("review");
       setMobileColumnStatus("review");
@@ -391,8 +393,8 @@ export default function KanbanTab({
     } else {
       setMobileColumnStatus("in_progress");
     }
-    onClearPulseFocus?.();
-  }, [externalStatusFocus, onClearPulseFocus]);
+    onClearSignalFocus?.();
+  }, [externalStatusFocus, onClearSignalFocus]);
 
   const getAgentLabel = (agentId: string | null | undefined) => {
     if (!agentId) return tr("미할당", "Unassigned");
@@ -401,57 +403,137 @@ export default function KanbanTab({
     return localeName(locale, agent);
   };
 
-  const getTimelineKindLabel = (kind: "review" | "pm" | "work" | "general") => {
-    switch (kind) {
-      case "review":
-        return tr("리뷰", "Review");
-      case "pm":
-        return tr("PM 결정", "PM Decision");
-      case "work":
-        return tr("작업 이력", "Work Log");
-      case "general":
-        return tr("코멘트", "Comment");
-    }
-  };
-
-  const getTimelineStatusLabel = (status: "reviewing" | "changes_requested" | "passed" | "decision" | "completed" | "comment") => {
-    switch (status) {
-      case "reviewing":
-        return tr("진행 중", "In Progress");
-      case "changes_requested":
-        return tr("수정 필요", "Changes Requested");
-      case "passed":
-        return tr("통과", "Passed");
-      case "decision":
-        return tr("결정", "Decision");
-      case "completed":
-        return tr("완료", "Completed");
-      case "comment":
-        return tr("일반", "General");
-    }
-  };
-
-  const getTimelineStatusStyle = (status: "reviewing" | "changes_requested" | "passed" | "decision" | "completed" | "comment") => {
-    switch (status) {
-      case "reviewing":
-        return { bg: "rgba(20,184,166,0.16)", text: "#5eead4" };
-      case "changes_requested":
-        return { bg: "rgba(251,113,133,0.16)", text: "#fda4af" };
-      case "passed":
-        return { bg: "rgba(34,197,94,0.18)", text: "#86efac" };
-      case "decision":
-        return { bg: "rgba(244,114,182,0.16)", text: "#f9a8d4" };
-      case "completed":
-        return { bg: "rgba(96,165,250,0.16)", text: "#93c5fd" };
-      case "comment":
-        return { bg: "rgba(148,163,184,0.12)", text: "#94a3b8" };
-    }
-  };
-
   const repoCards = useMemo(() => {
     if (!selectedRepo) return [] as KanbanCard[];
     return cards.filter((card) => card.github_repo === selectedRepo);
   }, [cards, selectedRepo]);
+
+  const repoCardsById = useMemo(() => new Map(repoCards.map((card) => [card.id, card])), [repoCards]);
+
+  const childCardsByParentId = useMemo(() => {
+    const grouped = new Map<string, KanbanCard[]>();
+    for (const card of repoCards) {
+      if (!card.parent_card_id) continue;
+      const siblings = grouped.get(card.parent_card_id) ?? [];
+      siblings.push(card);
+      grouped.set(card.parent_card_id, siblings);
+    }
+    for (const siblings of grouped.values()) {
+      siblings.sort((a, b) => {
+        if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+        return b.updated_at - a.updated_at;
+      });
+    }
+    return grouped;
+  }, [repoCards]);
+
+  const inProgressCardsByAgentId = useMemo(() => {
+    const grouped = new Map<string, KanbanCard[]>();
+    for (const card of repoCards) {
+      if (card.status !== "in_progress" || !card.assignee_agent_id) continue;
+      const agentCards = grouped.get(card.assignee_agent_id) ?? [];
+      agentCards.push(card);
+      grouped.set(card.assignee_agent_id, agentCards);
+    }
+    return grouped;
+  }, [repoCards]);
+
+  const liveTurnAgentIds = useMemo(
+    () => Array.from(inProgressCardsByAgentId.keys()).sort(),
+    [inProgressCardsByAgentId],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    let requestSeq = 0;
+    let scheduledRefresh: number | null = null;
+
+    const refreshLiveTurns = async () => {
+      if (liveTurnAgentIds.length === 0) {
+        setLiveTurnsByAgentId({});
+        return;
+      }
+
+      const currentRequest = ++requestSeq;
+      const results = await Promise.allSettled(
+        liveTurnAgentIds.map((agentId) => api.getAgentTurn(agentId)),
+      );
+
+      if (disposed || currentRequest !== requestSeq) return;
+
+      const next: Record<string, api.AgentTurnState> = {};
+      results.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        const turn = result.value;
+        if (turn.status === "idle") return;
+        next[liveTurnAgentIds[index]!] = turn;
+      });
+      setLiveTurnsByAgentId(next);
+    };
+
+    const scheduleRefresh = (delayMs = 150) => {
+      if (scheduledRefresh) window.clearTimeout(scheduledRefresh);
+      scheduledRefresh = window.setTimeout(() => {
+        scheduledRefresh = null;
+        void refreshLiveTurns();
+      }, delayMs);
+    };
+
+    const handleWSEvent = (event: Event) => {
+      const detail = (event as CustomEvent<import("../../types").WSEvent>).detail;
+      if (!detail) return;
+      switch (detail.type) {
+        case "connected":
+        case "agent_status":
+        case "dispatched_session_update":
+        case "task_dispatch_created":
+        case "task_dispatch_updated":
+        case "kanban_card_created":
+        case "kanban_card_updated":
+          scheduleRefresh(detail.type === "dispatched_session_update" ? 500 : 150);
+          break;
+        default:
+          break;
+      }
+    };
+
+    void refreshLiveTurns();
+    const pollTimer = window.setInterval(() => scheduleRefresh(0), LIVE_TURN_POLL_MS);
+    window.addEventListener("pcd-ws-event", handleWSEvent as EventListener);
+
+    return () => {
+      disposed = true;
+      requestSeq += 1;
+      if (scheduledRefresh) window.clearTimeout(scheduledRefresh);
+      window.clearInterval(pollTimer);
+      window.removeEventListener("pcd-ws-event", handleWSEvent as EventListener);
+    };
+  }, [LIVE_TURN_POLL_MS, liveTurnAgentIds]);
+
+  const liveToolStateByCardId = useMemo(() => {
+    const mapped = new Map<string, { agentId: string; line: string; updatedAt?: string | null }>();
+    for (const agentId of liveTurnAgentIds) {
+      const turn = liveTurnsByAgentId[agentId];
+      if (!turn) continue;
+      const line = turn.current_tool_line?.trim() || turn.prev_tool_status?.trim();
+      if (!line) continue;
+      const agentCards = inProgressCardsByAgentId.get(agentId) ?? [];
+      if (agentCards.length === 0) continue;
+
+      if (turn.active_dispatch_id) {
+        const matchedCard = agentCards.find((card) => card.latest_dispatch_id === turn.active_dispatch_id);
+        if (matchedCard) {
+          mapped.set(matchedCard.id, { agentId, line, updatedAt: turn.updated_at });
+        }
+        continue;
+      }
+
+      if (agentCards.length === 1) {
+        mapped.set(agentCards[0]!.id, { agentId, line, updatedAt: turn.updated_at });
+      }
+    }
+    return mapped;
+  }, [inProgressCardsByAgentId, liveTurnAgentIds, liveTurnsByAgentId]);
 
   // Agents that have cards in the current repo (for the per-agent dropdown)
   const repoAgentCounts = useMemo(() => {
@@ -506,12 +588,12 @@ export default function KanbanTab({
       }
       if (cardTypeFilter === "issue" && isReviewCard(card)) return false;
       if (cardTypeFilter === "review" && !isReviewCard(card)) return false;
-      if (pulseStatusFilter === "review" && card.status !== "review") return false;
-      if (pulseStatusFilter === "blocked" && card.status !== "blocked") return false;
-      if (pulseStatusFilter === "requested" && card.status !== "requested") return false;
+      if (signalStatusFilter === "review" && card.status !== "review") return false;
+      if (signalStatusFilter === "blocked" && card.status !== "blocked") return false;
+      if (signalStatusFilter === "requested" && card.status !== "requested") return false;
       if (
-        pulseStatusFilter === "stalled"
-        && !(card.status === "in_progress" && Boolean(card.started_at) && Date.now() - ((card.started_at ?? 0) < 1e12 ? (card.started_at ?? 0) * 1000 : (card.started_at ?? 0)) > STALE_IN_PROGRESS_MS)
+        signalStatusFilter === "stalled"
+        && !(card.status === "in_progress" && Boolean(card.started_at) && nowMs - ((card.started_at ?? 0) < 1e12 ? (card.started_at ?? 0) * 1000 : (card.started_at ?? 0)) > STALE_IN_PROGRESS_MS)
       ) {
         return false;
       }
@@ -522,7 +604,7 @@ export default function KanbanTab({
         getAgentLabel(card.assignee_agent_id).toLowerCase().includes(needle)
       );
     });
-  }, [agentFilter, agentMap, cardTypeFilter, deptFilter, getAgentLabel, pulseStatusFilter, repoCards, search, selectedAgentId, showClosed]);
+  }, [agentFilter, agentMap, cardTypeFilter, deptFilter, getAgentLabel, nowMs, signalStatusFilter, repoCards, search, selectedAgentId, showClosed]);
 
   const recentDoneCards = useMemo(() => {
     return repoCards
@@ -563,14 +645,52 @@ export default function KanbanTab({
     for (const card of filteredCards) {
       grouped.get(card.status)?.push(card);
     }
+
+    const isAncestor = (possibleAncestorId: string, card: KanbanCard): boolean => {
+      let parentId = card.parent_card_id;
+      let depthGuard = 0;
+      while (parentId && depthGuard < 12) {
+        if (parentId === possibleAncestorId) return true;
+        parentId = repoCardsById.get(parentId)?.parent_card_id ?? null;
+        depthGuard += 1;
+      }
+      return false;
+    };
+
+    const getRootCard = (card: KanbanCard): KanbanCard => {
+      let current = card;
+      let depthGuard = 0;
+      while (current.parent_card_id && depthGuard < 12) {
+        const parent = repoCardsById.get(current.parent_card_id);
+        if (!parent) break;
+        current = parent;
+        depthGuard += 1;
+      }
+      return current;
+    };
+
     for (const column of effectiveColumnDefs) {
       grouped.get(column.status)?.sort((a, b) => {
+        if (isAncestor(a.id, b)) return -1;
+        if (isAncestor(b.id, a)) return 1;
+
+        const aRoot = getRootCard(a);
+        const bRoot = getRootCard(b);
+        if (aRoot.sort_order !== bRoot.sort_order) return aRoot.sort_order - bRoot.sort_order;
+        if (aRoot.updated_at !== bRoot.updated_at) return bRoot.updated_at - aRoot.updated_at;
+
+        if (a.parent_card_id !== b.parent_card_id) {
+          if (!a.parent_card_id) return -1;
+          if (!b.parent_card_id) return 1;
+          if (a.parent_card_id < b.parent_card_id) return -1;
+          if (a.parent_card_id > b.parent_card_id) return 1;
+        }
         if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
         return b.updated_at - a.updated_at;
       });
     }
     return grouped;
-  }, [filteredCards, effectiveColumnDefs]);
+  }, [effectiveColumnDefs, filteredCards, repoCardsById]);
 
   // Include ALL cards (including terminal) to prevent done issues
   // from reappearing in the backlog when the done column is hidden.
@@ -592,12 +712,25 @@ export default function KanbanTab({
   const totalVisible = filteredCards.length + backlogIssues.length;
   const openCount = filteredCards.filter((card) => !TERMINAL_STATUSES.has(card.status)).length + backlogIssues.length;
   const hasQaCards = filteredCards.some((c) => QA_STATUSES.has(c.status));
+  const boardColumns = useMemo(() => effectiveColumnDefs.filter((column) =>
+    (showClosed || !TERMINAL_STATUSES.has(column.status))
+    && (!QA_STATUSES.has(column.status) || hasQaCards),
+  ), [effectiveColumnDefs, hasQaCards, showClosed]);
+  const mobileColumnSummaries = useMemo(() => boardColumns.map((column) => {
+    const columnCards = cardsByStatus.get(column.status) ?? [];
+    return {
+      column,
+      count: column.status === "backlog" ? columnCards.length + backlogIssues.length : columnCards.length,
+    };
+  }), [backlogIssues.length, boardColumns, cardsByStatus]);
+  const focusedMobileSummary = mobileColumnSummaries.find(
+    ({ column }) => column.status === mobileColumnStatus,
+  ) ?? mobileColumnSummaries[0] ?? null;
   const visibleColumns = compactBoard
-    ? effectiveColumnDefs.filter((column) => column.status === mobileColumnStatus)
-    : effectiveColumnDefs.filter((column) =>
-        (showClosed || !TERMINAL_STATUSES.has(column.status))
-        && (!QA_STATUSES.has(column.status) || hasQaCards),
-      );
+    ? mobileBoardView === "summary"
+      ? boardColumns
+      : boardColumns.filter((column) => column.status === mobileColumnStatus)
+    : boardColumns;
 
   const canRetryCard = (card: KanbanCard | null) =>
     Boolean(card && ["blocked", "requested", "in_progress"].includes(card.status));
@@ -882,11 +1015,28 @@ export default function KanbanTab({
   };
 
   const showDesktopDetailPanel = Boolean(selectedCard && !compactBoard);
-  const pulseFilterLabel =
-    pulseStatusFilter === "review" ? tr("리뷰 대기", "Review queue")
-      : pulseStatusFilter === "blocked" ? tr("블록됨", "Blocked")
-        : pulseStatusFilter === "requested" ? tr("수락 대기", "Waiting acceptance")
-          : pulseStatusFilter === "stalled" ? tr("진행 정체", "Stale in progress")
+
+  useEffect(() => {
+    const fallbackStatus = boardColumns[0]?.status ?? "backlog";
+    if (!boardColumns.some((column) => column.status === mobileColumnStatus)) {
+      setMobileColumnStatus(fallbackStatus);
+    }
+  }, [boardColumns, mobileColumnStatus]);
+
+  const focusMobileColumn = (status: KanbanCardStatus, scrollToSection: boolean) => {
+    setMobileColumnStatus(status);
+    if (!scrollToSection || typeof document === "undefined") return;
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById(`kanban-mobile-${status}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+  const signalFilterLabel =
+    signalStatusFilter === "review" ? tr("리뷰 대기", "Review queue")
+      : signalStatusFilter === "blocked" ? tr("블록됨", "Blocked")
+        : signalStatusFilter === "requested" ? tr("수락 대기", "Waiting acceptance")
+          : signalStatusFilter === "stalled" ? tr("진행 정체", "Stale in progress")
             : null;
 
   return (
@@ -1013,7 +1163,7 @@ export default function KanbanTab({
           </button>
         </div>
 
-        {pulseFilterLabel && (
+        {signalFilterLabel && (
           <div
             className="flex items-center justify-between gap-2 rounded-xl border px-3 py-2"
             style={{
@@ -1022,11 +1172,11 @@ export default function KanbanTab({
             }}
           >
             <div className="text-xs" style={{ color: "#fbbf24" }}>
-              {tr("Pulse 포커스", "Pulse focus")}: {pulseFilterLabel}
+              {tr("대시보드 포커스", "Dashboard focus")}: {signalFilterLabel}
             </div>
             <button
               type="button"
-              onClick={() => setPulseStatusFilter("all")}
+              onClick={() => setSignalStatusFilter("all")}
               className="rounded-lg px-2.5 py-1 text-[11px]"
               style={{ color: "var(--th-text-muted)", border: "1px solid rgba(255,255,255,0.08)" }}
             >
@@ -1253,12 +1403,12 @@ export default function KanbanTab({
                 <option value="review">{tr("리뷰만", "Reviews only")}</option>
               </select>
               <select
-                value={pulseStatusFilter}
-                onChange={(event) => setPulseStatusFilter(event.target.value as "all" | "review" | "blocked" | "requested" | "stalled")}
+                value={signalStatusFilter}
+                onChange={(event) => setSignalStatusFilter(event.target.value as "all" | "review" | "blocked" | "requested" | "stalled")}
                 className="rounded-xl px-3 py-2 text-sm bg-black/20 border"
                 style={{ borderColor: "rgba(148,163,184,0.28)", color: "var(--th-text-primary)" }}
               >
-                <option value="all">{tr("Pulse 상태 전체", "All pulse states")}</option>
+                <option value="all">{tr("대시보드 신호 전체", "All dashboard signals")}</option>
                 <option value="review">{tr("리뷰 대기", "Review queue")}</option>
                 <option value="blocked">{tr("블록됨", "Blocked")}</option>
                 <option value="requested">{tr("수락 대기", "Waiting acceptance")}</option>
@@ -1641,24 +1791,92 @@ export default function KanbanTab({
             <div className="space-y-3">
               {compactBoard && (
                 <>
-                  <div className="flex gap-2 overflow-x-auto pb-1">
-                    {effectiveColumnDefs.filter((column) => (showClosed || !TERMINAL_STATUSES.has(column.status)) && (!QA_STATUSES.has(column.status) || hasQaCards)).map((column) => (
+                  <div className="space-y-3">
+                    <div
+                      className="inline-flex rounded-2xl border p-1"
+                      style={{ borderColor: "rgba(148,163,184,0.24)", backgroundColor: "rgba(15,23,42,0.35)" }}
+                    >
                       <button
-                        key={column.status}
-                        onClick={() => setMobileColumnStatus(column.status)}
-                        className="shrink-0 rounded-full px-3 py-1.5 text-xs font-medium border"
+                        type="button"
+                        onClick={() => setMobileBoardView("summary")}
+                        className="rounded-xl px-3 py-2 text-xs font-medium"
                         style={{
-                          borderColor: mobileColumnStatus === column.status ? `${column.accent}88` : "rgba(148,163,184,0.24)",
-                          backgroundColor: mobileColumnStatus === column.status ? `${column.accent}22` : "rgba(255,255,255,0.04)",
-                          color: mobileColumnStatus === column.status ? "white" : "var(--th-text-secondary)",
+                          backgroundColor: mobileBoardView === "summary" ? "rgba(59,130,246,0.18)" : "transparent",
+                          color: mobileBoardView === "summary" ? "#bfdbfe" : "var(--th-text-muted)",
                         }}
                       >
-                        {tr(column.labelKo, column.labelEn)}
+                        {tr("요약+리스트", "Summary + List")}
                       </button>
-                    ))}
+                      <button
+                        type="button"
+                        onClick={() => setMobileBoardView("minimap")}
+                        className="rounded-xl px-3 py-2 text-xs font-medium"
+                        style={{
+                          backgroundColor: mobileBoardView === "minimap" ? "rgba(139,92,246,0.18)" : "transparent",
+                          color: mobileBoardView === "minimap" ? "#d8b4fe" : "var(--th-text-muted)",
+                        }}
+                      >
+                        {tr("미니맵", "Mini Map")}
+                      </button>
+                    </div>
+
+                    {mobileBoardView === "summary" ? (
+                      <div className="flex gap-2 overflow-x-auto pb-1">
+                        {mobileColumnSummaries.map(({ column, count }) => (
+                          <button
+                            key={column.status}
+                            type="button"
+                            onClick={() => focusMobileColumn(column.status, true)}
+                            className="shrink-0 rounded-2xl border px-3 py-2 text-left"
+                            style={{
+                              borderColor: mobileColumnStatus === column.status ? `${column.accent}88` : "rgba(148,163,184,0.24)",
+                              backgroundColor: mobileColumnStatus === column.status ? `${column.accent}22` : "rgba(255,255,255,0.04)",
+                              color: mobileColumnStatus === column.status ? "white" : "var(--th-text-secondary)",
+                            }}
+                          >
+                            <div className="text-[11px] font-semibold uppercase" style={{ color: mobileColumnStatus === column.status ? "white" : "var(--th-text-muted)" }}>
+                              {tr(column.labelKo, column.labelEn)}
+                            </div>
+                            <div className="mt-1 text-lg font-semibold">{count}</div>
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        {mobileColumnSummaries.map(({ column, count }) => (
+                          <button
+                            key={column.status}
+                            type="button"
+                            onClick={() => focusMobileColumn(column.status, false)}
+                            className="rounded-2xl border px-3 py-3 text-left"
+                            style={{
+                              borderColor: mobileColumnStatus === column.status ? `${column.accent}88` : "rgba(148,163,184,0.24)",
+                              backgroundColor: mobileColumnStatus === column.status ? `${column.accent}16` : "rgba(15,23,42,0.28)",
+                            }}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="inline-flex items-center gap-2 text-sm font-medium" style={{ color: "var(--th-text-primary)" }}>
+                                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: column.accent }} />
+                                {tr(column.labelKo, column.labelEn)}
+                              </span>
+                              <span className="text-lg font-semibold" style={{ color: mobileColumnStatus === column.status ? column.accent : "var(--th-text-primary)" }}>
+                                {count}
+                              </span>
+                            </div>
+                            <div className="mt-2 text-[11px]" style={{ color: mobileColumnStatus === column.status ? column.accent : "var(--th-text-muted)" }}>
+                              {mobileColumnStatus === column.status
+                                ? tr("아래 리스트 표시 중", "Shown below")
+                                : tr("탭해서 집중 보기", "Tap to focus")}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   <div className="rounded-xl border px-3 py-2 text-xs" style={{ borderColor: "rgba(148,163,184,0.18)", color: "var(--th-text-muted)", backgroundColor: "rgba(15,23,42,0.35)" }}>
-                    {tr("모바일에서는 카드를 탭해 상세 패널에서 상태를 변경하세요.", "On mobile, tap a card and change status in the detail sheet.")}
+                    {mobileBoardView === "summary"
+                      ? tr("상단 요약바를 탭하면 해당 상태 섹션으로 이동합니다. 카드 상태 변경은 상세 패널에서 처리하세요.", "Tap the summary bar to jump to a lane. Change card status from the detail sheet.")
+                      : tr(`미니맵으로 상태를 고르면 아래에 ${focusedMobileSummary ? tr(focusedMobileSummary.column.labelKo, focusedMobileSummary.column.labelEn) : tr("선택된", "selected")} 리스트만 표시됩니다.`, `Pick a lane in the mini map to show only the ${focusedMobileSummary ? tr(focusedMobileSummary.column.labelKo, focusedMobileSummary.column.labelEn) : "selected"} list below.`)}
                   </div>
                 </>
               )}
@@ -1669,40 +1887,45 @@ export default function KanbanTab({
                     const columnCards = cardsByStatus.get(column.status) ?? [];
                     const backlogCount = column.status === "backlog" ? columnCards.length + backlogIssues.length : columnCards.length;
                     return (
-                      <KanbanColumn
-                        key={column.status}
-                        column={column}
-                        columnCards={columnCards}
-                        backlogIssues={backlogIssues}
-                        backlogCount={backlogCount}
-                        tr={tr}
-                        locale={locale}
-                        compactBoard={compactBoard}
-                        initialLoading={initialLoading}
-                        loadingIssues={loadingIssues}
-                        draggingCardId={draggingCardId}
-                        dragOverStatus={dragOverStatus}
-                        dragOverCardId={dragOverCardId}
-                        closingIssueNumber={closingIssueNumber}
-                        assigningIssue={assigningIssue}
-                        dispatchMap={dispatchMap}
-                        dispatches={dispatches}
-                        repoSources={repoSources}
-                        selectedRepo={selectedRepo}
-                        getAgentLabel={getAgentLabel}
-                        resolveAgentFromLabels={resolveAgentFromLabels}
-                        onCardClick={setSelectedCardId}
-                        onBacklogIssueClick={setSelectedBacklogIssue}
-                        onSetDraggingCardId={setDraggingCardId}
-                        onSetDragOverStatus={setDragOverStatus}
-                        onSetDragOverCardId={setDragOverCardId}
-                        onDrop={handleDrop}
-                        onCloseIssue={handleCloseIssue}
-                        onDirectAssignIssue={handleDirectAssignIssue}
-                        onOpenAssignModal={handleOpenAssignModal}
-                        onUpdateCardStatus={handleUpdateCardStatus}
-                        onSetActionError={setActionError}
-                      />
+                      <div key={column.status} id={compactBoard ? `kanban-mobile-${column.status}` : undefined}>
+                        <KanbanColumn
+                          column={column}
+                          columnCards={columnCards}
+                          backlogIssues={backlogIssues}
+                          backlogCount={backlogCount}
+                          tr={tr}
+                          locale={locale}
+                          compactBoard={compactBoard}
+                          initialLoading={initialLoading}
+                          loadingIssues={loadingIssues}
+                          draggingCardId={draggingCardId}
+                          dragOverStatus={dragOverStatus}
+                          dragOverCardId={dragOverCardId}
+                          closingIssueNumber={closingIssueNumber}
+                          assigningIssue={assigningIssue}
+                          dispatchMap={dispatchMap}
+                          dispatches={dispatches}
+                          nowMs={nowMs}
+                          cardsById={repoCardsById}
+                          childCardsByParentId={childCardsByParentId}
+                          liveToolStateByCardId={liveToolStateByCardId}
+                          repoSources={repoSources}
+                          selectedRepo={selectedRepo}
+                          getAgentLabel={getAgentLabel}
+                          resolveAgentFromLabels={resolveAgentFromLabels}
+                          onCardClick={setSelectedCardId}
+                          onBacklogIssueClick={setSelectedBacklogIssue}
+                          onSetDraggingCardId={setDraggingCardId}
+                          onSetDragOverStatus={setDragOverStatus}
+                          onSetDragOverCardId={setDragOverCardId}
+                          onDrop={handleDrop}
+                          onCloseIssue={handleCloseIssue}
+                          onDirectAssignIssue={handleDirectAssignIssue}
+                          onOpenAssignModal={handleOpenAssignModal}
+                          onUpdateCardStatus={handleUpdateCardStatus}
+                          onSetActionError={setActionError}
+                        />
+                      </div>
                     );
                   })}
                 </div>
@@ -2377,134 +2600,14 @@ export default function KanbanTab({
                 )}
 
                 {/* Unified GitHub comment timeline */}
-                {parsedGitHubTimeline.length > 0 && (
-                  <div className="rounded-2xl border p-4 bg-white/5 space-y-3" style={{ borderColor: "rgba(148,163,184,0.18)" }}>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h4 className="font-medium" style={{ color: "var(--th-text-heading)" }}>
-                        {tr("GitHub 코멘트 타임라인", "GitHub Comment Timeline")}
-                        <span className="ml-2 text-xs font-normal" style={{ color: "var(--th-text-muted)" }}>
-                          ({parsedGitHubTimeline.length})
-                        </span>
-                      </h4>
-                      {selectedCard && (
-                        <button
-                          type="button"
-                          onClick={() => invalidateCardActivity(selectedCard.id)}
-                          className="rounded-full px-2.5 py-1 text-xs font-medium border transition-opacity hover:opacity-80"
-                          style={{
-                            borderColor: "rgba(147,197,253,0.28)",
-                            backgroundColor: "rgba(96,165,250,0.12)",
-                            color: "#93c5fd",
-                          }}
-                        >
-                          {tr("새로고침", "Refresh")}
-                        </button>
-                      )}
-                    </div>
-                    {/* Filter tabs */}
-                    {(() => {
-                      const kindCounts = parsedGitHubTimeline.reduce<Record<string, number>>((acc, e) => {
-                        acc[e.kind] = (acc[e.kind] ?? 0) + 1;
-                        return acc;
-                      }, {});
-                      const hasMultipleKinds = Object.keys(kindCounts).length > 1;
-                      return hasMultipleKinds ? (
-                        <div className="flex flex-wrap gap-1.5">
-                          <button
-                            className="px-2 py-0.5 rounded-full text-xs font-medium transition-colors"
-                            style={{
-                              backgroundColor: !timelineFilter ? "rgba(96,165,250,0.18)" : "rgba(148,163,184,0.08)",
-                              color: !timelineFilter ? "#93c5fd" : "var(--th-text-muted)",
-                            }}
-                            onClick={() => setTimelineFilter(null)}
-                          >
-                            {tr("전체", "All")} ({parsedGitHubTimeline.length})
-                          </button>
-                          {(["review", "pm", "work", "general"] as const).filter((k) => kindCounts[k]).map((k) => (
-                            <button
-                              key={k}
-                              className="px-2 py-0.5 rounded-full text-xs font-medium transition-colors"
-                              style={{
-                                backgroundColor: timelineFilter === k ? TIMELINE_KIND_STYLE[k].bg : "rgba(148,163,184,0.08)",
-                                color: timelineFilter === k ? TIMELINE_KIND_STYLE[k].text : "var(--th-text-muted)",
-                              }}
-                              onClick={() => setTimelineFilter(timelineFilter === k ? null : k)}
-                            >
-                              {getTimelineKindLabel(k)} ({kindCounts[k]})
-                            </button>
-                          ))}
-                        </div>
-                      ) : null;
-                    })()}
-                    <div className="space-y-3 max-h-96 overflow-y-auto">
-                      {parsedGitHubTimeline
-                        .filter((entry) => !timelineFilter || entry.kind === timelineFilter)
-                        .map((entry, idx) => {
-                        const statusStyle = getTimelineStatusStyle(entry.status);
-                        const kindStyle = TIMELINE_KIND_STYLE[entry.kind];
-                        const isGeneral = entry.kind === "general";
-                        return (
-                          <div
-                            key={`${entry.kind}-${entry.createdAt}-${idx}`}
-                            className="rounded-xl border p-3 space-y-2"
-                            style={{
-                              borderColor: isGeneral ? "rgba(148,163,184,0.08)" : `${kindStyle.text}22`,
-                              backgroundColor: isGeneral ? "rgba(255,255,255,0.02)" : `${kindStyle.text}06`,
-                            }}
-                          >
-                            <div className="flex flex-wrap items-center gap-2 text-xs">
-                              <span
-                                className="px-2 py-0.5 rounded-full font-medium"
-                                style={{ backgroundColor: kindStyle.bg, color: kindStyle.text }}
-                              >
-                                {getTimelineKindLabel(entry.kind)}
-                              </span>
-                              {!isGeneral && (
-                                <span
-                                  className="px-2 py-0.5 rounded-full font-medium"
-                                  style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
-                                >
-                                  {getTimelineStatusLabel(entry.status)}
-                                </span>
-                              )}
-                              <span className="font-medium" style={{ color: "#93c5fd" }}>{entry.author}</span>
-                              <span style={{ color: "var(--th-text-muted)" }}>{formatIso(entry.createdAt, locale)}</span>
-                            </div>
-                            <div className="space-y-1">
-                              {!isGeneral && (
-                                <div className="text-sm font-medium" style={{ color: "var(--th-text-heading)" }}>
-                                  {entry.title}
-                                </div>
-                              )}
-                              {!isGeneral && entry.summary && entry.summary !== entry.title && (
-                                <div className="text-sm" style={{ color: "var(--th-text-primary)" }}>
-                                  {entry.summary}
-                                </div>
-                              )}
-                              {entry.details.length > 0 && (
-                                <ul className="space-y-1 pl-4 text-xs list-disc" style={{ color: "var(--th-text-secondary)" }}>
-                                  {entry.details.map((detail, detailIdx) => (
-                                    <li key={detailIdx}>{detail}</li>
-                                  ))}
-                                </ul>
-                              )}
-                              <div
-                                className="rounded-lg border px-3 py-2 text-sm"
-                                style={{
-                                  borderColor: "rgba(148,163,184,0.16)",
-                                  backgroundColor: "rgba(15,23,42,0.24)",
-                                  color: "var(--th-text-primary)",
-                                }}
-                              >
-                                <MarkdownContent content={entry.body} />
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
+                <CardTimeline
+                  ghComments={ghComments}
+                  timelineFilter={timelineFilter}
+                  setTimelineFilter={setTimelineFilter}
+                  tr={tr}
+                  locale={locale}
+                  onRefresh={() => selectedCard && invalidateCardActivity(selectedCard.id)}
+                />
 
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex gap-2">

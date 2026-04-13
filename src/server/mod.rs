@@ -1,4 +1,5 @@
 pub mod routes;
+mod worker_registry;
 pub mod ws;
 
 use std::sync::Arc;
@@ -35,84 +36,16 @@ pub async fn run(
     engine: PolicyEngine,
     health_registry: Option<Arc<HealthRegistry>>,
 ) -> Result<()> {
-    refresh_memory_health_for_startup().await;
+    seed_startup_runtime_state(&db, &config);
 
-    // Startup: drain any deferred hooks persisted before last shutdown (#125)
-    engine.drain_startup_hooks();
-
-    // #251 (boot-only): reconcile broken DB/runtime state before workers begin
-    // draining outbox rows or ticks resume.
-    crate::reconcile::reconcile_boot_runtime(&db, &engine)?;
-
-    // Spawn periodic GitHub sync task
-    let sync_interval = config.github.sync_interval_minutes;
-    if sync_interval > 0 {
-        let sync_db = db.clone();
-        let sync_engine = engine.clone();
-        tokio::spawn(async move {
-            github_sync_loop(sync_db, sync_engine, sync_interval).await;
-        });
-    }
-
-    // Spawn periodic policy tick on a DEDICATED OS thread to avoid
-    // engine lock deadlock with request handler threads.
-    // The std::thread runs its own blocking loop, never competing with
-    // tokio workers for the engine Mutex.
-    {
-        let tick_engine = engine.clone();
-        let tick_db = db.clone();
-        std::thread::Builder::new()
-            .name("policy-tick".to_string())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap_or_else(|e| {
-                        eprintln!("Fatal: failed to create policy-tick runtime: {e}");
-                        std::process::exit(1);
-                    });
-                rt.block_on(policy_tick_loop(tick_engine, tick_db));
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to spawn policy-tick thread: {e}"))?;
-    }
-
-    // Spawn periodic rate-limit cache sync (every 120s)
-    {
-        let rl_db = db.clone();
-        tokio::spawn(async move {
-            rate_limit_sync_loop(rl_db).await;
-        });
-    }
-
-    // Spawn async message outbox worker (#120) — drains queued messages
-    {
-        let outbox_db = db.clone();
-        let outbox_port = config.server.port;
-        tokio::spawn(async move {
-            message_outbox_loop(outbox_db, outbox_port).await;
-        });
-    }
-
-    // #144: Spawn dispatch notification outbox worker — centralizes Discord side-effects
-    {
-        let dispatch_outbox_db = db.clone();
-        tokio::spawn(async move {
-            routes::dispatches::dispatch_outbox_loop(dispatch_outbox_db).await;
-        });
-    }
-
-    // #189: Spawn DM reply notification retry loop (5-min interval)
-    {
-        let dm_retry_db = db.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-            interval.tick().await; // skip immediate first tick
-            loop {
-                interval.tick().await;
-                crate::services::discord::retry_failed_dm_notifications(&dm_retry_db).await;
-            }
-        });
-    }
+    let mut worker_registry = worker_registry::SupervisedWorkerRegistry::new(
+        config.clone(),
+        db.clone(),
+        engine.clone(),
+        health_registry.clone(),
+    );
+    worker_registry.run_boot_only_steps().await?;
+    worker_registry.start_after_boot_reconcile()?;
 
     // Resolve dashboard dist path relative to runtime root or binary location
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
@@ -150,18 +83,7 @@ pub async fn run(
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);
 
     let broadcast_tx = ws::new_broadcast();
-    let batch_buffer = ws::spawn_batch_flusher(broadcast_tx.clone());
-
-    // Seed config defaults + store server port in kv_meta so policy JS can read them
-    if let Ok(conn) = db.lock() {
-        routes::settings::seed_config_defaults(&conn, &config);
-        // server_port is always overwritten (not INSERT OR IGNORE) to match current config
-        conn.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
-            [config.server.port.to_string()],
-        )
-        .ok();
-    }
+    let batch_buffer = worker_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
 
     let app = Router::new()
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
@@ -182,6 +104,50 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("HTTP server listening on {addr}");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn seed_startup_runtime_state(db: &Db, config: &Config) {
+    if let Ok(conn) = db.lock() {
+        routes::settings::seed_config_defaults(&conn, config);
+        // server_port is always overwritten (not INSERT OR IGNORE) to match current config
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
+            [config.server.port.to_string()],
+        )
+        .ok();
+    } else {
+        tracing::warn!("[startup] failed to lock db for config default seeding");
+    }
+
+    if let Err(error) = seed_github_repos_from_config(db, config) {
+        tracing::warn!("[startup] failed to seed github repos from config: {error}");
+    }
+}
+
+fn seed_github_repos_from_config(db: &Db, config: &Config) -> std::result::Result<(), String> {
+    use std::collections::BTreeSet;
+
+    let mut repo_ids = BTreeSet::new();
+    for raw_repo_id in &config.github.repos {
+        let repo_id = raw_repo_id.trim();
+        if repo_id.is_empty() {
+            continue;
+        }
+        if !repo_id.contains('/') {
+            tracing::warn!(
+                "[startup] skipping invalid github.repos entry {:?}: expected owner/repo",
+                raw_repo_id
+            );
+            continue;
+        }
+        repo_ids.insert(repo_id.to_string());
+    }
+
+    for repo_id in repo_ids {
+        crate::github::register_repo(db, &repo_id)?;
+    }
+
     Ok(())
 }
 
@@ -222,6 +188,11 @@ async fn policy_tick_loop(engine: PolicyEngine, db: Db) {
             fire_tick_hook_by_name(&engine, &db, "OnTick5min", "5min");
             drain_transitions(&engine, &db);
             refresh_memory_health_for_five_min_tick().await;
+            if let Err(error) =
+                crate::services::api_friction::process_api_friction_patterns(&db, None, None).await
+            {
+                tracing::warn!("[policy-tick] api-friction aggregation failed: {error}");
+            }
             // Also fire legacy OnTick for backward compat
             fire_tick_hook_by_name(&engine, &db, "OnTick", "legacy");
             drain_transitions(&engine, &db);
@@ -361,6 +332,56 @@ async fn rate_limit_sync_loop(db: Db) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn test_db() -> Db {
+        crate::db::test_db()
+    }
+
+    fn test_engine_with_dir(db: &Db, dir: &std::path::Path) -> PolicyEngine {
+        let mut config = crate::config::Config::default();
+        config.policies.dir = dir.to_path_buf();
+        config.policies.hot_reload = false;
+        PolicyEngine::new(&config, db.clone()).unwrap()
+    }
+
+    fn kv_value(db: &Db, key: &str) -> Option<String> {
+        let conn = db.lock().unwrap();
+        conn.query_row("SELECT value FROM kv_meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .ok()
+    }
+
+    fn repo_ids(db: &Db) -> Vec<String> {
+        crate::github::list_repos(db)
+            .unwrap()
+            .into_iter()
+            .map(|repo| repo.id)
+            .collect()
+    }
+
+    fn insert_pending_message(db: &Db, target: &str, content: &str) -> i64 {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
+            rusqlite::params![target, content],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn message_row_status(db: &Db, id: i64) -> (String, Option<String>, Option<String>) {
+        db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT status, error, sent_at FROM message_outbox WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn startup_memory_health_refresh_uses_startup_reason() {
@@ -388,6 +409,183 @@ mod tests {
             crate::services::memory::last_refresh_reason_for_tests().as_deref(),
             Some(MEMORY_HEALTH_FIVE_MIN_REASON)
         );
+    }
+
+    #[test]
+    fn seed_startup_runtime_state_records_server_port_and_registered_repos() {
+        let db = test_db();
+        let mut config = crate::config::Config::default();
+        config.server.port = 43121;
+        config.github.repos = vec!["owner/repo-a".to_string(), "owner/repo-b".to_string()];
+
+        seed_startup_runtime_state(&db, &config);
+
+        assert_eq!(kv_value(&db, "server_port").as_deref(), Some("43121"));
+        assert_eq!(
+            repo_ids(&db),
+            vec!["owner/repo-a".to_string(), "owner/repo-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn seed_startup_runtime_state_deduplicates_and_skips_invalid_repo_entries() {
+        let db = test_db();
+        let mut config = crate::config::Config::default();
+        config.github.repos = vec![
+            " owner/repo-a ".to_string(),
+            "owner/repo-a".to_string(),
+            "".to_string(),
+            "noslash".to_string(),
+            "owner/repo-b".to_string(),
+        ];
+
+        seed_startup_runtime_state(&db, &config);
+        seed_startup_runtime_state(&db, &config);
+
+        assert_eq!(
+            repo_ids(&db),
+            vec!["owner/repo-a".to_string(), "owner/repo-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn tiered_tick_hooks_record_expected_markers_per_label() {
+        crate::services::memory::reset_backend_health_for_tests();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("tick-tier-probe.js"),
+            r#"
+            agentdesk.registerPolicy({
+                name: "tick-tier-probe",
+                priority: 1,
+                onTick30s: function() {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('probe_30s', 'hit')"
+                    );
+                },
+                onTick1min: function() {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('probe_1min', 'hit')"
+                    );
+                },
+                onTick5min: function() {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('probe_5min', 'hit')"
+                    );
+                },
+                onTick: function() {
+                    agentdesk.db.execute(
+                        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('probe_legacy', 'hit')"
+                    );
+                }
+            });
+            "#,
+        )
+        .unwrap();
+
+        let db = test_db();
+        let engine = test_engine_with_dir(&db, dir.path());
+
+        fire_tick_hook_by_name(&engine, &db, "OnTick30s", "30s");
+        assert_eq!(kv_value(&db, "probe_30s").as_deref(), Some("hit"));
+        assert_eq!(kv_value(&db, "last_tick_30s_status").as_deref(), Some("ok"));
+        assert!(kv_value(&db, "last_tick_30s_ms").is_some());
+        assert_eq!(kv_value(&db, "probe_1min"), None);
+        assert_eq!(kv_value(&db, "probe_5min"), None);
+        assert_eq!(kv_value(&db, "probe_legacy"), None);
+
+        fire_tick_hook_by_name(&engine, &db, "OnTick1min", "1min");
+        assert_eq!(kv_value(&db, "probe_1min").as_deref(), Some("hit"));
+        assert_eq!(
+            kv_value(&db, "last_tick_1min_status").as_deref(),
+            Some("ok")
+        );
+        assert!(kv_value(&db, "last_tick_1min_ms").is_some());
+
+        fire_tick_hook_by_name(&engine, &db, "OnTick5min", "5min");
+        assert_eq!(kv_value(&db, "probe_5min").as_deref(), Some("hit"));
+        assert_eq!(
+            kv_value(&db, "last_tick_5min_status").as_deref(),
+            Some("ok")
+        );
+        assert!(kv_value(&db, "last_tick_5min_ms").is_some());
+
+        fire_tick_hook_by_name(&engine, &db, "OnTick", "legacy");
+        assert_eq!(kv_value(&db, "probe_legacy").as_deref(), Some("hit"));
+        assert_eq!(
+            kv_value(&db, "last_tick_legacy_status").as_deref(),
+            Some("ok")
+        );
+        assert!(kv_value(&db, "last_tick_legacy_ms").is_some());
+        assert!(kv_value(&db, "last_tick_ms").is_some());
+        assert_eq!(
+            crate::services::memory::last_refresh_reason_for_tests(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_message_outbox_batch_marks_successful_rows_sent() {
+        let db = test_db();
+        let message_id = insert_pending_message(&db, "channel:1492506767085801535", "hello");
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+
+        let processed = drain_message_outbox_batch_once(&db, {
+            let delivered = delivered.clone();
+            move |target, content, source, bot| {
+                let delivered = delivered.clone();
+                async move {
+                    delivered.lock().unwrap().push(json!({
+                        "target": target,
+                        "content": content,
+                        "source": source,
+                        "bot": bot,
+                    }));
+                    ("200 OK".to_string(), json!({"ok": true}).to_string())
+                }
+            }
+        })
+        .await;
+
+        let captured = delivered.lock().unwrap().clone();
+        let (status, error, sent_at) = message_row_status(&db, message_id);
+
+        assert_eq!(processed, 1, "one pending outbox row should be drained");
+        assert_eq!(status, "sent");
+        assert_eq!(error, None);
+        assert!(sent_at.is_some(), "successful delivery must stamp sent_at");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0]["target"], "channel:1492506767085801535");
+        assert_eq!(captured[0]["content"], "hello");
+        assert_eq!(captured[0]["source"], "system");
+        assert_eq!(captured[0]["bot"], "notify");
+    }
+
+    #[tokio::test]
+    async fn drain_message_outbox_batch_marks_http_failures_failed() {
+        let db = test_db();
+        let message_id = insert_pending_message(&db, "channel:1492506767085801535", "boom");
+
+        let processed =
+            drain_message_outbox_batch_once(&db, |_target, _content, _source, _bot| async {
+                (
+                    "500 Internal Server Error".to_string(),
+                    json!({"error": "mock failure"}).to_string(),
+                )
+            })
+            .await;
+
+        let (status, error, sent_at) = message_row_status(&db, message_id);
+
+        assert_eq!(
+            processed, 1,
+            "failed deliveries still consume the pending outbox row"
+        );
+        assert_eq!(status, "failed");
+        assert_eq!(sent_at, None);
+        let error = error.expect("failed rows must persist error details");
+        assert!(error.contains("500 Internal Server Error"));
+        assert!(error.contains("mock failure"));
     }
 }
 
@@ -767,25 +965,81 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(count)
 }
 
-/// Async worker that drains the message_outbox table and delivers via /api/send (#120).
+/// Async worker that drains the message_outbox table via the in-process Discord delivery path (#120).
 /// Runs every 2 seconds, processes up to 10 messages per tick.
-async fn message_outbox_loop(db: Db, port: u16) {
+fn load_pending_message_outbox_batch(db: &Db) -> Vec<(i64, String, String, String, String)> {
+    let conn = match db.lock() {
+        Ok(conn) => conn,
+        Err(_) => return Vec::new(),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, target, content, bot, source FROM message_outbox \
+         WHERE status = 'pending' ORDER BY id ASC LIMIT 10",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|row| row.ok()).collect())
+    .unwrap_or_default()
+}
+
+async fn drain_message_outbox_batch_once<F, Fut>(db: &Db, mut deliver: F) -> usize
+where
+    F: FnMut(String, String, String, String) -> Fut,
+    Fut: std::future::Future<Output = (String, String)>,
+{
+    let pending = load_pending_message_outbox_batch(db);
+    if pending.is_empty() {
+        return 0;
+    }
+
+    for (id, target, content, bot, source) in &pending {
+        let (status, err_text) =
+            deliver(target.clone(), content.clone(), source.clone(), bot.clone()).await;
+        if status == "200 OK" {
+            if let Ok(conn) = db.lock() {
+                conn.execute(
+                    "UPDATE message_outbox SET status = 'sent', sent_at = datetime('now') WHERE id = ?1",
+                    [id],
+                )
+                .ok();
+            }
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::debug!("[{ts}] [outbox] ✅ delivered msg {id} → {target}");
+        } else {
+            if let Ok(conn) = db.lock() {
+                conn.execute(
+                    "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
+                    rusqlite::params![format!("{status}: {err_text}"), id],
+                )
+                .ok();
+            }
+            tracing::warn!("[outbox] ❌ msg {id} → {target} failed: {status}");
+        }
+    }
+
+    pending.len()
+}
+
+async fn message_outbox_loop(db: Db, health_registry: Option<Arc<HealthRegistry>>) {
     use std::time::Duration;
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("[outbox] Failed to create HTTP client: {e}");
-            return;
-        }
+    let Some(health_registry) = health_registry else {
+        tracing::error!("[outbox] Health registry unavailable; message outbox worker stopped");
+        return;
     };
 
-    let url = crate::config::local_api_url(port, "/api/send");
-
-    // Wait for server to be ready
+    // Give Discord runtime bootstrap a brief head start before polling.
     tokio::time::sleep(Duration::from_secs(3)).await;
     tracing::info!("[outbox] Message outbox worker started (adaptive backoff 500ms-5s)");
 
@@ -794,85 +1048,43 @@ async fn message_outbox_loop(db: Db, port: u16) {
 
     loop {
         tokio::time::sleep(poll_interval).await;
-
-        // Fetch pending messages
-        let pending: Vec<(i64, String, String, String, String)> = {
-            let conn = match db.lock() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let mut stmt = match conn.prepare(
-                "SELECT id, target, content, bot, source FROM message_outbox \
-                 WHERE status = 'pending' ORDER BY id ASC LIMIT 10",
-            ) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        };
-
-        if pending.is_empty() {
+        if drain_message_outbox_batch_once(&db, {
+            let health_registry = health_registry.clone();
+            let db = db.clone();
+            move |target, content, source, bot| {
+                let health_registry = health_registry.clone();
+                let db = db.clone();
+                async move {
+                    let (status, err_text) = crate::services::discord::health::send_message(
+                        &health_registry,
+                        &db,
+                        &target,
+                        &content,
+                        &source,
+                        &bot,
+                    )
+                    .await;
+                    (status.to_string(), err_text)
+                }
+            }
+        })
+        .await
+            == 0
+        {
             // No work: increase interval (up to max)
             poll_interval = (poll_interval.mul_f64(1.5)).min(max_interval);
             continue;
         }
         // Work found: reset to fast polling
         poll_interval = Duration::from_millis(500);
+    }
+}
 
-        for (id, target, content, bot, source) in pending {
-            let body = serde_json::json!({
-                "target": target,
-                "content": content,
-                "bot": bot,
-                "source": source,
-            });
-
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'sent', sent_at = datetime('now') WHERE id = ?1",
-                            [id],
-                        )
-                        .ok();
-                    }
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::debug!("[{ts}] [outbox] ✅ delivered msg {id} → {target}");
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let err_text = resp.text().await.unwrap_or_default();
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
-                            rusqlite::params![format!("{status}: {err_text}"), id],
-                        )
-                        .ok();
-                    }
-                    tracing::warn!("[outbox] ❌ msg {id} → {target} failed: {status}");
-                }
-                Err(e) => {
-                    if let Ok(conn) = db.lock() {
-                        conn.execute(
-                            "UPDATE message_outbox SET status = 'failed', error = ?1 WHERE id = ?2",
-                            rusqlite::params![e.to_string(), id],
-                        )
-                        .ok();
-                    }
-                    tracing::warn!("[outbox] ❌ msg {id} → {target} error: {e}");
-                }
-            }
-        }
+async fn dm_reply_retry_loop(db: Db) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.tick().await; // skip immediate first tick
+    loop {
+        interval.tick().await;
+        crate::services::discord::retry_failed_dm_notifications(&db).await;
     }
 }

@@ -22,7 +22,9 @@ fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), Strin
         match crate::services::platform::git_head_commit(&repo_dir) {
             Some(c) => c,
             None => {
-                eprintln!("stamp_review_passed_marker: git rev-parse HEAD failed, skipping marker");
+                tracing::warn!(
+                    "stamp_review_passed_marker: git rev-parse HEAD failed, skipping marker"
+                );
                 return Ok(());
             }
         }
@@ -32,10 +34,10 @@ fn stamp_review_passed_marker(reviewed_commit: Option<&str>) -> Result<(), Strin
     })?;
     let dir = root.join("runtime").join("review_passed");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("stamp_review_passed_marker: failed to create dir: {e}");
+        tracing::warn!("stamp_review_passed_marker: failed to create dir: {e}");
     }
     if let Err(e) = std::fs::write(dir.join(&commit), "") {
-        eprintln!("stamp_review_passed_marker: failed to write marker: {e}");
+        tracing::warn!("stamp_review_passed_marker: failed to write marker: {e}");
     }
     Ok(())
 }
@@ -307,9 +309,14 @@ pub async fn submit_verdict(
         if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
             // Roll back the dispatch status since we can't complete the pass flow
             if let Ok(conn) = state.db.lock() {
-                let _ = conn.execute(
-                    "UPDATE task_dispatches SET status = 'dispatched', updated_at = datetime('now') WHERE id = ?1",
-                    [&body.dispatch_id],
+                let _ = crate::dispatch::set_dispatch_status_on_conn(
+                    &conn,
+                    &body.dispatch_id,
+                    "dispatched",
+                    None,
+                    "review_verdict_marker_rollback",
+                    Some(&["completed"]),
+                    false,
                 );
             }
             return (

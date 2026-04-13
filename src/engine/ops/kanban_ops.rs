@@ -230,12 +230,29 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 return format!(r#"{{"error":"UPDATE: {}"}}"#, e);
             }
 
-            conn.execute(
-                "UPDATE auto_queue_entries SET status = 'dispatched', completed_at = NULL \
-                 WHERE kanban_card_id = ?1 AND status = 'done'",
-                [&card_id],
-            )
-            .ok();
+            let entry_ids: Vec<String> = conn
+                .prepare(
+                    "SELECT id FROM auto_queue_entries
+                     WHERE kanban_card_id = ?1 AND status = 'done'",
+                )
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map([&card_id], |row| row.get::<_, String>(0))
+                        .ok()
+                        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+                })
+                .unwrap_or_default();
+            for entry_id in entry_ids {
+                if let Err(error) = crate::db::auto_queue::update_entry_status_on_conn(
+                    &conn,
+                    &entry_id,
+                    crate::db::auto_queue::ENTRY_STATUS_DISPATCHED,
+                    "js_reopen",
+                    &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+                ) {
+                    return format!(r#"{{"error":"{}"}}"#, error);
+                }
+            }
 
             crate::kanban::correct_tn_to_fn_on_reopen(&db_reopen, &card_id);
 
@@ -483,19 +500,65 @@ pub(super) fn review_state_sync(db: &Db, json_str: &str) -> String {
 /// stale pending copies in active or paused runs should be skipped so they do
 /// not block other runs.
 pub(super) fn sync_auto_queue_terminal_on_conn(conn: &rusqlite::Connection, card_id: &str) {
-    conn.execute(
-        "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') \
-         WHERE kanban_card_id = ?1 AND status = 'dispatched'",
-        [card_id],
-    )
-    .ok();
-    conn.execute(
-        "UPDATE auto_queue_entries SET status = 'skipped', completed_at = datetime('now') \
-         WHERE kanban_card_id = ?1 AND status = 'pending' \
-         AND run_id IN (SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused'))",
-        [card_id],
-    )
-    .ok();
+    let dispatched_ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM auto_queue_entries
+             WHERE kanban_card_id = ?1 AND status = 'dispatched'",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([card_id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        })
+        .unwrap_or_default();
+    for entry_id in dispatched_ids {
+        if let Err(error) = crate::db::auto_queue::update_entry_status_on_conn(
+            conn,
+            &entry_id,
+            crate::db::auto_queue::ENTRY_STATUS_DONE,
+            "card_terminal",
+            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+        ) {
+            tracing::warn!(
+                "[auto-queue] failed to mark entry {} done during terminal sync: {}",
+                entry_id,
+                error
+            );
+        }
+    }
+
+    let pending_ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM auto_queue_entries
+             WHERE kanban_card_id = ?1
+               AND status = 'pending'
+               AND run_id IN (
+                   SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused')
+               )",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([card_id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|row| row.ok()).collect())
+        })
+        .unwrap_or_default();
+    for entry_id in pending_ids {
+        if let Err(error) = crate::db::auto_queue::update_entry_status_on_conn(
+            conn,
+            &entry_id,
+            crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
+            "card_terminal_pending_cleanup",
+            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+        ) {
+            tracing::warn!(
+                "[auto-queue] failed to skip pending entry {} during terminal sync: {}",
+                entry_id,
+                error
+            );
+        }
+    }
 }
 
 /// Skip live auto-queue entries for a card after PMD explicitly backs the card out.
@@ -506,13 +569,39 @@ pub(super) fn skip_live_auto_queue_entries_for_card_on_conn(
     conn: &rusqlite::Connection,
     card_id: &str,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE auto_queue_entries \
-         SET status = 'skipped', dispatch_id = NULL, dispatched_at = NULL, completed_at = datetime('now') \
-         WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched') \
-         AND run_id IN (SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused'))",
-        [card_id],
-    )
+    let mut stmt = conn.prepare(
+        "SELECT id FROM auto_queue_entries
+         WHERE kanban_card_id = ?1
+           AND status IN ('pending', 'dispatched')
+           AND run_id IN (SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused'))",
+    )?;
+    let entry_ids: Vec<String> = stmt
+        .query_map([card_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut changed = 0usize;
+    for entry_id in entry_ids {
+        if crate::db::auto_queue::update_entry_status_on_conn(
+            conn,
+            &entry_id,
+            crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
+            "force_transition_cleanup",
+            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+        )
+        .map_err(|error| match error {
+            crate::db::auto_queue::EntryStatusUpdateError::Sql(sql) => sql,
+            other => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                other.to_string(),
+            ))),
+        })?
+        .changed
+        {
+            changed += 1;
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Same as `review_state_sync` but operates on an already-acquired connection.
@@ -547,12 +636,13 @@ pub(super) fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &
     let last_decision = params["last_decision"].as_str();
     let pending_dispatch_id = params["pending_dispatch_id"].as_str();
     let approach_change_round = params["approach_change_round"].as_i64();
+    let session_reset_round = params["session_reset_round"].as_i64();
     let review_entered_at = params["review_entered_at"].as_str();
 
     // UPSERT: INSERT OR REPLACE with all fields
     let result = conn.execute(
-        "INSERT INTO card_review_state (card_id, state, review_round, last_verdict, last_decision, pending_dispatch_id, approach_change_round, review_entered_at, updated_at) \
-         VALUES (?1, ?2, COALESCE(?3, 0), ?4, ?5, ?6, ?7, COALESCE(?8, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE NULL END), datetime('now')) \
+        "INSERT INTO card_review_state (card_id, state, review_round, last_verdict, last_decision, pending_dispatch_id, approach_change_round, session_reset_round, review_entered_at, updated_at) \
+         VALUES (?1, ?2, COALESCE(?3, 0), ?4, ?5, ?6, ?7, ?8, COALESCE(?9, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE NULL END), datetime('now')) \
          ON CONFLICT(card_id) DO UPDATE SET \
          state = ?2, \
          review_round = COALESCE(?3, review_round), \
@@ -564,7 +654,8 @@ pub(super) fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &
              ELSE NULL \
          END, \
          approach_change_round = COALESCE(?7, approach_change_round), \
-         review_entered_at = COALESCE(?8, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
+         session_reset_round = COALESCE(?8, session_reset_round), \
+         review_entered_at = COALESCE(?9, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
          updated_at = datetime('now')",
         rusqlite::params![
             card_id,
@@ -574,6 +665,7 @@ pub(super) fn review_state_sync_on_conn(conn: &rusqlite::Connection, json_str: &
             last_decision,
             pending_dispatch_id,
             approach_change_round,
+            session_reset_round,
             review_entered_at,
         ],
     );

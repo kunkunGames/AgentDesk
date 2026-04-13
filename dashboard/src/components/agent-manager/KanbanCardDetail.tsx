@@ -4,6 +4,7 @@ import type { KanbanReview } from "../../api";
 import PipelineProgress from "./PipelineProgress";
 import CardIssueContent from "./CardIssueContent";
 import CardTimeline from "./CardTimeline";
+import TurnTranscriptPanel from "./TurnTranscriptPanel";
 import { localeName } from "../../i18n";
 import type {
   Agent,
@@ -297,6 +298,10 @@ export default function KanbanCardDetail({
                         setActionError(tr("review checklist를 모두 완료해야 done으로 이동할 수 있습니다.", "Complete the review checklist before moving to done."));
                         return;
                       }
+                      if (target === "backlog") {
+                        setCancelConfirm({ cardIds: [selectedCard.id], source: "single" });
+                        return;
+                      }
                       setSavingCard(true);
                       setActionError(null);
                       try {
@@ -542,6 +547,25 @@ export default function KanbanCardDetail({
           tr={tr}
         />
 
+        <div
+          className="rounded-2xl border overflow-hidden"
+          style={{
+            borderColor: "var(--th-border-subtle)",
+            backgroundColor: "rgba(255,255,255,0.02)",
+          }}
+        >
+          <TurnTranscriptPanel
+            source={{
+              type: "card",
+              id: selectedCard.id,
+              refreshSeed: `${selectedCard.latest_dispatch_id ?? ""}:${selectedCard.updated_at}`,
+            }}
+            tr={tr}
+            isKo={locale === "ko"}
+            title={tr("연결된 턴 트랜스크립트", "Linked Turn Transcript")}
+          />
+        </div>
+
         {canRedispatchCard(selectedCard) && (
           <div className="rounded-2xl border p-4 bg-surface-subtle space-y-3" style={{ borderColor: "var(--th-border-subtle)" }}>
             <div>
@@ -782,7 +806,7 @@ export default function KanbanCardDetail({
                 className="rounded-xl px-4 py-2 text-sm font-medium"
                 style={{ color: "#9ca3af", backgroundColor: "rgba(107,114,128,0.18)" }}
               >
-                {tr("카드 취소", "Cancel card")}
+                {tr("백로그로 되돌리기", "Move to backlog")}
               </button>
             )}
           </div>

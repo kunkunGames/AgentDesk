@@ -1,6 +1,7 @@
 mod completion_guard;
 mod context_window;
 mod memory_lifecycle;
+mod recall_feedback;
 mod recovery_text;
 mod retry_state;
 mod skill_usage;
@@ -14,17 +15,18 @@ use super::gateway::TurnGateway;
 use super::handoff::{HandoffRecord, save_handoff};
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
+use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
 use crate::services::memory::{
     CaptureRequest, TokenUsage, resolve_memory_role_id, resolve_memory_session_id,
 };
 use crate::services::provider::cancel_requested;
 #[cfg(unix)]
-use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 use crate::utils::format::tail_with_ellipsis;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
 pub(super) use completion_guard::{
-    fail_dispatch_with_retry, guard_review_dispatch_completion, runtime_db_fallback_complete,
+    build_work_dispatch_completion_result, fail_dispatch_with_retry,
+    guard_review_dispatch_completion, runtime_db_fallback_complete_with_result,
 };
 pub(super) use recovery_text::auto_retry_with_history;
 pub(super) use stale_resume::result_event_has_stale_resume_error;
@@ -41,6 +43,7 @@ use memory_lifecycle::{
     optional_metric_token_fields, plan_turn_end_memory, spawn_memory_capture_task,
     spawn_memory_reflect_task, take_memento_reflect_request,
 };
+use recall_feedback::{analyze_recall_feedback_turn, submit_pending_feedbacks};
 use retry_state::{
     clear_local_session_state, handle_gemini_retry_boundary, reset_session_for_auto_retry,
 };
@@ -75,6 +78,38 @@ pub(super) struct TurnBridgeContext {
     pub(super) inflight_state: InflightTurnState,
 }
 
+fn push_transcript_event(events: &mut Vec<SessionTranscriptEvent>, event: SessionTranscriptEvent) {
+    let has_payload = !event.content.trim().is_empty()
+        || event
+            .summary
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || event
+            .tool_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if has_payload
+        || matches!(
+            event.kind,
+            SessionTranscriptEventKind::Thinking
+                | SessionTranscriptEventKind::Result
+                | SessionTranscriptEventKind::Error
+                | SessionTranscriptEventKind::Task
+                | SessionTranscriptEventKind::System
+        )
+    {
+        events.push(event);
+    }
+}
+
+fn turn_duration_ms(started_at: std::time::Instant) -> i64 {
+    i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn response_portion_after_offset(full_response: &str, response_sent_offset: usize) -> &str {
+    full_response.get(response_sent_offset..).unwrap_or("")
+}
+
 pub(super) fn spawn_turn_bridge(
     shared_owned: Arc<SharedData>,
     cancel_token: Arc<CancelToken>,
@@ -95,6 +130,13 @@ pub(super) fn spawn_turn_bridge(
         let adk_session_info = bridge.adk_session_info.clone();
         let adk_cwd = bridge.adk_cwd.clone();
         let dispatch_id = bridge.dispatch_id.clone();
+        let bridge_span = tracing::info_span!(
+            "discord_turn_bridge",
+            channel_id = channel_id.get(),
+            provider = provider.as_str(),
+            dispatch_id = tracing::field::debug(dispatch_id.as_deref()),
+        );
+        let _bridge_guard = bridge_span.enter();
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
@@ -115,12 +157,14 @@ pub(super) fn spawn_turn_bridge(
         let mut has_post_tool_text = bridge.inflight_state.has_post_tool_text;
         let mut tmux_handed_off = false;
         let mut transport_error = false;
+        let mut api_friction_reports = Vec::new();
+        let mut transcript_events = Vec::<SessionTranscriptEvent>::new();
         let mut resume_failure_detected = false;
         let mut terminal_session_reset_required = false;
         let mut restart_recovery_handoff = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
-        let current_msg_id = bridge.current_msg_id;
+        let mut current_msg_id = bridge.current_msg_id;
         let mut response_sent_offset = bridge.response_sent_offset;
         let mut tmux_last_offset = bridge.tmux_last_offset;
         let mut new_session_id = bridge.new_session_id.clone();
@@ -199,6 +243,7 @@ pub(super) fn spawn_turn_bridge(
                                     &mut inflight_state,
                                 )
                             {
+                                transcript_events.clear();
                                 state_dirty = true;
                             }
                         }
@@ -209,6 +254,17 @@ pub(super) fn spawn_turn_bridge(
                         }
                         StreamMessage::Text { content } => {
                             full_response.push_str(&content);
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: SessionTranscriptEventKind::Assistant,
+                                    tool_name: None,
+                                    summary: None,
+                                    content: content.clone(),
+                                    status: Some("success".to_string()),
+                                    is_error: false,
+                                },
+                            );
                             if any_tool_used {
                                 has_post_tool_text = true;
                                 inflight_state.has_post_tool_text = true;
@@ -238,6 +294,17 @@ pub(super) fn spawn_turn_bridge(
                             current_tool_line = Some(display);
                             last_tool_name = None;
                             last_tool_summary = None;
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: SessionTranscriptEventKind::Thinking,
+                                    tool_name: None,
+                                    summary: summary.clone(),
+                                    content: summary.unwrap_or_default(),
+                                    status: Some("info".to_string()),
+                                    is_error: false,
+                                },
+                            );
                         }
                         StreamMessage::ToolUse { name, input } => {
                             any_tool_used = true;
@@ -256,9 +323,10 @@ pub(super) fn spawn_turn_bridge(
                                     Ok(None) => {}
                                     Err(e) => {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
-                                        eprintln!(
+                                        tracing::warn!(
                                             "  [{ts}] ⚠ Failed to record skill usage for tool {}: {}",
-                                            name, e
+                                            name,
+                                            e
                                         );
                                     }
                                 }
@@ -278,6 +346,17 @@ pub(super) fn spawn_turn_bridge(
                             current_tool_line = Some(display);
                             last_tool_name = Some(name.clone());
                             last_tool_summary = Some(display_summary);
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: SessionTranscriptEventKind::ToolUse,
+                                    tool_name: Some(name.clone()),
+                                    summary: last_tool_summary.clone(),
+                                    content: input.clone(),
+                                    status: Some("running".to_string()),
+                                    is_error: false,
+                                },
+                            );
                             if !restart_followup_pending && is_dcserver_restart_command(&input) {
                                 let mut report = RestartCompletionReport::new(
                                     provider.clone(),
@@ -309,7 +388,7 @@ pub(super) fn spawn_turn_bridge(
                                     );
                                     if let Err(e) = save_handoff(&handoff) {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
-                                        println!("  [{ts}] ⚠ failed to save handoff: {e}");
+                                        tracing::info!("  [{ts}] ⚠ failed to save handoff: {e}");
                                     }
 
                                     let handoff_text = "♻️ dcserver 재시작 중...\n\n새 dcserver가 이 메시지를 이어받는 중입니다.";
@@ -345,7 +424,23 @@ pub(super) fn spawn_turn_bridge(
                                 );
                                 current_tool_line = Some(detail);
                             }
-                            let _ = content;
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: if is_error {
+                                        SessionTranscriptEventKind::Error
+                                    } else {
+                                        SessionTranscriptEventKind::ToolResult
+                                    },
+                                    tool_name: last_tool_name.clone(),
+                                    summary: last_tool_summary.clone(),
+                                    content,
+                                    status: Some(
+                                        if is_error { "error" } else { "success" }.to_string(),
+                                    ),
+                                    is_error,
+                                },
+                            );
                         }
                         StreamMessage::TaskNotification { summary, .. } => {
                             if !summary.is_empty() {
@@ -353,6 +448,17 @@ pub(super) fn spawn_turn_bridge(
                                 inflight_state.full_response = full_response.clone();
                                 state_dirty = true;
                             }
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: SessionTranscriptEventKind::Task,
+                                    tool_name: None,
+                                    summary: Some(summary.clone()),
+                                    content: summary,
+                                    status: Some("info".to_string()),
+                                    is_error: false,
+                                },
+                            );
                         }
                         StreamMessage::Done {
                             result,
@@ -380,6 +486,25 @@ pub(super) fn spawn_turn_bridge(
                             if let Some(s) = sid {
                                 new_session_id = Some(s.clone());
                                 inflight_state.session_id = Some(s);
+                            }
+                            if result != super::recovery::RESTART_SESSION_DIED_HANDOFF_SENTINEL
+                                && result != "__session_died_retry__"
+                            {
+                                push_transcript_event(
+                                    &mut transcript_events,
+                                    SessionTranscriptEvent {
+                                        kind: SessionTranscriptEventKind::Result,
+                                        tool_name: None,
+                                        summary: Some(if result.trim().is_empty() {
+                                            "Turn completed".to_string()
+                                        } else {
+                                            truncate_str(&result, 120).to_string()
+                                        }),
+                                        content: result,
+                                        status: Some("success".to_string()),
+                                        is_error: false,
+                                    },
+                                );
                             }
                             state_dirty = true;
                             done = true;
@@ -427,11 +552,26 @@ pub(super) fn spawn_turn_bridge(
                             } else {
                                 full_response = format!("Error: {}", message);
                             }
+                            push_transcript_event(
+                                &mut transcript_events,
+                                SessionTranscriptEvent {
+                                    kind: SessionTranscriptEventKind::Error,
+                                    tool_name: last_tool_name.clone(),
+                                    summary: Some(message.clone()),
+                                    content: if stderr.trim().is_empty() {
+                                        message.clone()
+                                    } else {
+                                        format!("{message}\n{stderr}")
+                                    },
+                                    status: Some("error".to_string()),
+                                    is_error: true,
+                                },
+                            );
                             if session_reset_required {
                                 terminal_session_reset_required = true;
                                 clear_local_session_state(&mut new_session_id, &mut inflight_state);
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!(
+                                tracing::warn!(
                                     "  [{ts}] ⚠ Clearing stored provider session after terminal {} session failure (channel {})",
                                     provider.as_str(),
                                     channel_id,
@@ -522,7 +662,7 @@ pub(super) fn spawn_turn_bridge(
                                         ));
                                     } else {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
-                                        eprintln!(
+                                        tracing::warn!(
                                             "  [{ts}] ⚠ cached serenity context missing; tmux watcher not started for channel {}",
                                             channel_id
                                         );
@@ -566,11 +706,70 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            let current_portion = if response_sent_offset < full_response.len() {
-                &full_response[response_sent_offset..]
-            } else {
-                ""
-            };
+            loop {
+                let current_portion =
+                    response_portion_after_offset(&full_response, response_sent_offset);
+                if done || current_portion.is_empty() {
+                    break;
+                }
+
+                let indicator = SPINNER[spin_idx % SPINNER.len()];
+                let status_block = super::formatting::build_placeholder_status_block(
+                    indicator,
+                    prev_tool_status.as_deref(),
+                    current_tool_line.as_deref(),
+                    &full_response,
+                    narrate_progress,
+                );
+                let Some(plan) =
+                    super::formatting::plan_streaming_rollover(current_portion, &status_block)
+                else {
+                    break;
+                };
+
+                match gateway
+                    .edit_message(channel_id, current_msg_id, &plan.frozen_chunk)
+                    .await
+                {
+                    Ok(()) => match gateway.send_message(channel_id, &status_block).await {
+                        Ok(next_msg_id) => {
+                            response_sent_offset += plan.split_at;
+                            current_msg_id = next_msg_id;
+                            last_edit_text = status_block;
+                            last_status_edit = tokio::time::Instant::now() - status_interval;
+                            inflight_state.current_msg_id = current_msg_id.get();
+                            inflight_state.current_msg_len = last_edit_text.len();
+                            inflight_state.response_sent_offset = response_sent_offset;
+                            inflight_state.full_response = full_response.clone();
+                            state_dirty = true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "[discord] failed to create rollover placeholder in channel {}: {}",
+                                channel_id,
+                                error
+                            );
+                            let _ = gateway
+                                .edit_message(channel_id, current_msg_id, &plan.display_snapshot)
+                                .await;
+                            last_edit_text = plan.display_snapshot;
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            "[discord] failed to freeze rollover chunk for message {} in channel {}: {}",
+                            current_msg_id,
+                            channel_id,
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+
+            let current_portion =
+                response_portion_after_offset(&full_response, response_sent_offset);
             let status_block = super::formatting::build_placeholder_status_block(
                 indicator,
                 prev_tool_status.as_deref(),
@@ -578,15 +777,8 @@ pub(super) fn spawn_turn_bridge(
                 &full_response,
                 narrate_progress,
             );
-            let footer = format!("\n\n{status_block}");
-            let body_budget = DISCORD_MSG_LIMIT.saturating_sub(footer.len() + 10);
-            let normalized = normalize_empty_lines(current_portion);
-            let stable_display_text = if current_portion.is_empty() {
-                status_block.clone()
-            } else {
-                let body = tail_with_ellipsis(&normalized, body_budget.max(1));
-                format!("{}{}", body, footer)
-            };
+            let stable_display_text =
+                super::formatting::build_streaming_placeholder_text(current_portion, &status_block);
 
             if stable_display_text != last_edit_text
                 && !done
@@ -624,12 +816,29 @@ pub(super) fn spawn_turn_bridge(
                     None,
                     adk_cwd.as_deref(),
                     dispatch_id.as_deref(),
-                    None,
+                    adk_session_name.as_deref().and_then(
+                        crate::services::discord::adk_session::parse_thread_channel_id_from_name,
+                    ),
+                    role_binding
+                        .as_ref()
+                        .map(|binding| binding.role_id.as_str()),
                     shared_owned.api_port,
                 )
                 .await;
                 last_adk_heartbeat = std::time::Instant::now();
             }
+        }
+
+        let extracted_api_friction =
+            crate::services::api_friction::extract_api_friction_reports(&full_response);
+        if !extracted_api_friction.reports.is_empty() {
+            api_friction_reports.extend(extracted_api_friction.reports);
+            full_response = extracted_api_friction.cleaned_response;
+            inflight_state.full_response = full_response.clone();
+        }
+        for error in extracted_api_friction.parse_errors {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!("  [{ts}] ⚠ invalid API_FRICTION marker: {error}");
         }
 
         let is_prompt_too_long = full_response.contains("__prompt too long__");
@@ -678,7 +887,12 @@ pub(super) fn spawn_turn_bridge(
             persisted_context_tokens(accumulated_input_tokens, accumulated_output_tokens),
             adk_cwd.as_deref(),
             dispatch_id.as_deref(),
-            None,
+            adk_session_name
+                .as_deref()
+                .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name),
+            role_binding
+                .as_ref()
+                .map(|binding| binding.role_id.as_str()),
             shared_owned.api_port,
         )
         .await;
@@ -727,7 +941,7 @@ pub(super) fn spawn_turn_bridge(
         // Recovery auto-retry: session died during restart recovery
         if recovery_retry {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!(
+            tracing::warn!(
                 "  [{ts}] ↻ Recovery session died — triggering auto-retry with history (channel {})",
                 channel_id
             );
@@ -782,7 +996,7 @@ pub(super) fn spawn_turn_bridge(
                     .await
                 } else {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
+                    tracing::warn!(
                         "  [{ts}] ⚠ cached serenity context missing; restart handoff unavailable (channel {})",
                         channel_id
                     );
@@ -791,13 +1005,13 @@ pub(super) fn spawn_turn_bridge(
                 if handed_off {
                     full_response = String::new();
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
+                    tracing::warn!(
                         "  [{ts}] ↻ Recovery session died — queued internal handoff instead of Discord auto-retry (channel {})",
                         channel_id
                     );
                 } else {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
+                    tracing::warn!(
                         "  [{ts}] ⚠ Recovery session died — internal handoff failed, falling back to auto-retry (channel {})",
                         channel_id
                     );
@@ -833,22 +1047,26 @@ pub(super) fn spawn_turn_bridge(
                 crate::services::process::kill_pid_tree(pid);
             }
 
-            full_response = if full_response.trim().is_empty() {
+            let remaining_response =
+                response_portion_after_offset(&full_response, response_sent_offset);
+            let terminal_response = if remaining_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let formatted =
-                    super::formatting::format_for_discord_with_provider(&full_response, &provider);
+                let formatted = super::formatting::format_for_discord_with_provider(
+                    remaining_response,
+                    &provider,
+                );
                 format!("{}\n\n[Stopped]", formatted)
             };
 
             let _ = gateway
-                .replace_message(channel_id, current_msg_id, &full_response)
+                .replace_message(channel_id, current_msg_id, &terminal_response)
                 .await;
 
             gateway.add_reaction(channel_id, user_msg_id, '🛑').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ■ Stopped");
+            tracing::info!("  [{ts}] ■ Stopped");
         } else if is_prompt_too_long {
             let mention = gateway.requester_mention().unwrap_or_default();
             full_response = format!(
@@ -864,7 +1082,7 @@ pub(super) fn spawn_turn_bridge(
             gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
+            tracing::info!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
         } else if rx_disconnected && tmux_handed_off && full_response.is_empty() {
             // Tmux watcher is handling response delivery — this is normal.
             // Don't delete placeholder — update it so the user sees the turn is still active.
@@ -873,7 +1091,7 @@ pub(super) fn spawn_turn_bridge(
                 .edit_message(channel_id, current_msg_id, "⏳ 처리 중...")
                 .await;
             let ts = chrono::Local::now().format("%H:%M:%S");
-            eprintln!(
+            tracing::warn!(
                 "  [{ts}] ✓ tmux handoff complete, placeholder cleaned up, watcher handles response (channel {})",
                 channel_id
             );
@@ -882,7 +1100,7 @@ pub(super) fn spawn_turn_bridge(
             // This path is driven by explicit error/result events, not assistant text.
             if resume_failure_detected {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!(
+                tracing::warn!(
                     "  [{ts}] ⚠ Resume failed (error in response), clearing session_id (channel {})",
                     channel_id
                 );
@@ -914,7 +1132,7 @@ pub(super) fn spawn_turn_bridge(
                     );
                     if !recovered.trim().is_empty() {
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        eprintln!(
+                        tracing::warn!(
                             "  [{ts}] ↻ Recovered {} chars from output file for channel {}",
                             recovered.len(),
                             channel_id
@@ -937,7 +1155,7 @@ pub(super) fn spawn_turn_bridge(
                 if stale_resume_in_output {
                     resume_failure_detected = true;
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
+                    tracing::warn!(
                         "  [{ts}] ⚠ Resume failed (stale session_id in recovered output), auto-retrying (channel {})",
                         channel_id
                     );
@@ -973,7 +1191,7 @@ pub(super) fn spawn_turn_bridge(
                         resume_failed = true;
                         resume_failure_detected = true;
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        eprintln!(
+                        tracing::warn!(
                             "  [{ts}] ⚠ Resume failed (stale session_id in output file), auto-retrying (channel {})",
                             channel_id
                         );
@@ -1009,7 +1227,7 @@ pub(super) fn spawn_turn_bridge(
                             resume_failed = true;
                             resume_failure_detected = true;
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!(
+                            tracing::warn!(
                                 "  [{ts}] ⚠ Quick exit with empty response — auto-retrying with fresh session (channel {})",
                                 channel_id
                             );
@@ -1042,15 +1260,17 @@ pub(super) fn spawn_turn_bridge(
                             full_response =
                                 "(No response — 프로세스가 응답 없이 종료됨)".to_string();
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!(
+                            tracing::warn!(
                                 "  [{ts}] ⚠ Empty response: rx disconnected before any text \
                                  (channel {}, output_path={:?}, last_offset={})",
-                                channel_id, inflight_state.output_path, inflight_state.last_offset
+                                channel_id,
+                                inflight_state.output_path,
+                                inflight_state.last_offset
                             );
                         } else {
                             full_response = "(No response)".to_string();
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            eprintln!(
+                            tracing::warn!(
                                 "  [{ts}] ⚠ Empty response: done without text (channel {})",
                                 channel_id
                             );
@@ -1059,7 +1279,20 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            let mut delivery_response = full_response.clone();
+            let late_api_friction =
+                crate::services::api_friction::extract_api_friction_reports(&full_response);
+            if !late_api_friction.reports.is_empty() {
+                api_friction_reports.extend(late_api_friction.reports);
+                full_response = late_api_friction.cleaned_response;
+                inflight_state.full_response = full_response.clone();
+            }
+            for error in late_api_friction.parse_errors {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!("  [{ts}] ⚠ invalid API_FRICTION marker: {error}");
+            }
+
+            let mut delivery_response =
+                response_portion_after_offset(&full_response, response_sent_offset).to_string();
             if let Some(warning) = review_dispatch_warning.as_deref() {
                 let warning = warning.trim();
                 if !warning.is_empty() {
@@ -1101,7 +1334,7 @@ pub(super) fn spawn_turn_bridge(
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ▶ Response sent");
+            tracing::info!("  [{ts}] ▶ Response sent");
             if let Ok(mut last) = shared_owned.last_turn_at.lock() {
                 *last = Some(chrono::Local::now().to_rfc3339());
             }
@@ -1146,17 +1379,6 @@ pub(super) fn spawn_turn_bridge(
                     terminal_session_reset_required,
                     should_record_final_turn,
                 ) {
-                    if memory_plan.persist_transcript {
-                        session.history.push(HistoryItem {
-                            item_type: HistoryType::User,
-                            content: user_text_owned.clone(),
-                        });
-                        session.history.push(HistoryItem {
-                            item_type: HistoryType::Assistant,
-                            content: full_response.clone(),
-                        });
-                        should_persist_transcript = true;
-                    }
                     if let Some(reason) = memory_plan.reflect_reason {
                         reflect_request = take_memento_reflect_request(
                             session,
@@ -1171,6 +1393,17 @@ pub(super) fn spawn_turn_bridge(
                         session.clear_provider_session();
                     } else if let Some(sid) = new_session_id.as_ref() {
                         session.restore_provider_session(Some(sid.clone()));
+                    }
+                    if memory_plan.persist_transcript {
+                        session.history.push(HistoryItem {
+                            item_type: HistoryType::User,
+                            content: user_text_owned.clone(),
+                        });
+                        session.history.push(HistoryItem {
+                            item_type: HistoryType::Assistant,
+                            content: full_response.clone(),
+                        });
+                        should_persist_transcript = true;
                     }
                     should_spawn_memory_capture = memory_plan.spawn_capture;
                     session.session_id.clone()
@@ -1199,24 +1432,115 @@ pub(super) fn spawn_turn_bridge(
             super::adk_session::clear_provider_session_id(session_key, shared_owned.api_port).await;
         }
 
+        let turn_id = should_persist_transcript
+            .then(|| format!("discord:{}:{}", channel_id.get(), user_msg_id.get()));
+        let memory_role_id = resolve_memory_role_id(role_binding.as_ref());
+        let recall_feedback_analysis =
+            should_persist_transcript.then(|| analyze_recall_feedback_turn(&transcript_events));
+
         if should_persist_transcript && let Some(db) = shared_owned.db.as_ref() {
-            let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id.get());
             let channel_id_text = channel_id.get().to_string();
             if let Err(e) = crate::db::session_transcripts::persist_turn(
                 db,
                 crate::db::session_transcripts::PersistSessionTranscript {
-                    turn_id: &turn_id,
+                    turn_id: turn_id.as_deref().unwrap_or_default(),
                     session_key: adk_session_key.as_deref(),
                     channel_id: Some(channel_id_text.as_str()),
-                    agent_id: None,
+                    agent_id: role_binding
+                        .as_ref()
+                        .map(|binding| binding.role_id.as_str()),
                     provider: Some(provider.as_str()),
                     dispatch_id: dispatch_id.as_deref(),
                     user_message: &user_text_owned,
                     assistant_message: &full_response,
+                    events: &transcript_events,
+                    duration_ms: Some(turn_duration_ms(turn_start)),
                 },
             ) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                eprintln!("  [{ts}] ⚠ failed to persist session transcript: {e}");
+                tracing::warn!("  [{ts}] ⚠ failed to persist session transcript: {e}");
+            }
+
+            if !api_friction_reports.is_empty() {
+                match crate::services::api_friction::record_api_friction_reports(
+                    db,
+                    &capture_memory_settings,
+                    crate::services::api_friction::ApiFrictionRecordContext {
+                        channel_id: channel_id.get(),
+                        session_key: adk_session_key.as_deref(),
+                        dispatch_id: dispatch_id.as_deref(),
+                        provider: provider.as_str(),
+                    },
+                    &api_friction_reports,
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        accumulated_memory_input_tokens = accumulated_memory_input_tokens
+                            .saturating_add(summary.token_usage.input_tokens);
+                        accumulated_memory_output_tokens = accumulated_memory_output_tokens
+                            .saturating_add(summary.token_usage.output_tokens);
+                        for error in summary.memory_errors {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] ⚠ failed to store API friction memory: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        tracing::warn!("  [{ts}] ⚠ failed to record API friction: {error}");
+                    }
+                }
+            }
+        }
+
+        let mut auto_feedback_count = 0usize;
+        if let Some(analysis) = recall_feedback_analysis.as_ref()
+            && !analysis.pending_feedbacks.is_empty()
+        {
+            let submit_result = submit_pending_feedbacks(
+                &capture_memory_settings,
+                session_id_to_persist.as_deref(),
+                analysis.pending_feedbacks.clone(),
+            )
+            .await;
+            auto_feedback_count = submit_result.submitted_count;
+            accumulated_memory_input_tokens = accumulated_memory_input_tokens
+                .saturating_add(submit_result.token_usage.input_tokens);
+            accumulated_memory_output_tokens = accumulated_memory_output_tokens
+                .saturating_add(submit_result.token_usage.output_tokens);
+            for error in submit_result.errors {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!("  [{ts}] ⚠ failed to auto-submit recall tool_feedback: {error}");
+            }
+        }
+
+        if let (Some(db), Some(turn_id), Some(analysis)) = (
+            shared_owned.db.as_ref(),
+            turn_id.as_deref(),
+            recall_feedback_analysis.as_ref(),
+        ) && analysis.recall_count > 0
+        {
+            let stat = crate::db::memento_feedback_stats::MementoFeedbackTurnStat {
+                turn_id: turn_id.to_string(),
+                stat_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                agent_id: memory_role_id.clone(),
+                provider: provider.as_str().to_string(),
+                recall_count: i64::try_from(analysis.recall_count).unwrap_or(i64::MAX),
+                manual_tool_feedback_count: i64::try_from(analysis.manual_feedback_count)
+                    .unwrap_or(i64::MAX),
+                manual_covered_recall_count: i64::try_from(analysis.manual_covered_recall_count)
+                    .unwrap_or(i64::MAX),
+                auto_tool_feedback_count: i64::try_from(auto_feedback_count).unwrap_or(i64::MAX),
+                covered_recall_count: i64::try_from(
+                    analysis.covered_recall_count_after(auto_feedback_count),
+                )
+                .unwrap_or(i64::MAX),
+            };
+            if let Err(error) = crate::db::memento_feedback_stats::upsert_turn_stat(db, &stat) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!("  [{ts}] ⚠ failed to persist memento feedback stats: {error}");
             }
         }
 
@@ -1231,7 +1555,7 @@ pub(super) fn spawn_turn_bridge(
         if should_spawn_memory_capture {
             let capture_request = CaptureRequest {
                 provider: provider.clone(),
-                role_id: resolve_memory_role_id(role_binding.as_ref()),
+                role_id: memory_role_id,
                 channel_id: channel_id.get(),
                 session_id: resolve_memory_session_id(
                     session_id_to_persist.as_deref(),
@@ -1258,7 +1582,7 @@ pub(super) fn spawn_turn_bridge(
                 }
                 Err(err) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    eprintln!(
+                    tracing::warn!(
                         "  [{ts}] [memory] background task join failed for channel {}: {}",
                         channel_id.get(),
                         err
@@ -1310,7 +1634,7 @@ pub(super) fn spawn_turn_bridge(
         if restart_followup_pending {
             clear_restart_report(&provider, channel_id.get());
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!(
+            tracing::info!(
                 "  [{ts}] ✓ Cleared restart report for channel {} (turn completed normally)",
                 channel_id
             );
@@ -1321,82 +1645,9 @@ pub(super) fn spawn_turn_bridge(
         inflight_guard.provider.take();
         super::mailbox_clear_recovery_marker(&shared_owned, channel_id).await;
 
-        // For dispatch-based turns (threads), kill the tmux session after
-        // finalization. Thread sessions are one-shot — keeping claude alive
-        // in "Ready for input" blocks idle detection and the auto-complete pipeline.
-        //
-        // Exception (#145): unified-thread auto-queue runs reuse the same thread
-        // session across multiple entries. Skip kill if the run is still active.
-        #[cfg(unix)]
-        if dispatch_id.is_some() {
-            let should_kill = if let Some(ref did) = dispatch_id {
-                !crate::dispatch::is_unified_thread_active(did)
-            } else {
-                true
-            };
-            if should_kill {
-                if let Some(ref name) = cancel_token
-                    .tmux_session
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                {
-                    record_tmux_exit_reason(
-                        name,
-                        "dispatch turn completed — killing thread session",
-                    );
-                    let name_c = name.to_string();
-                    let kill_result = tokio::task::spawn_blocking(move || {
-                        crate::services::platform::tmux::kill_session_output(&name_c)
-                    })
-                    .await;
-                    let kill_ok = matches!(&kill_result, Ok(Ok(o)) if o.status.success());
-                    if !kill_ok {
-                        match &kill_result {
-                            Ok(Ok(o)) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!(
-                                    "  [{ts}] ⚠ tmux kill-session failed for {}: {}",
-                                    name,
-                                    String::from_utf8_lossy(&o.stderr)
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!("  [{ts}] ⚠ tmux kill-session error for {name}: {e}");
-                            }
-                            Err(e) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                eprintln!(
-                                    "  [{ts}] ⚠ tmux kill-session spawn error for {name}: {e}"
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Only delete the DB session row if tmux kill succeeded.
-                    // If kill failed, leave the row so the periodic reaper can retry.
-                    if kill_ok
-                        && let Some(session_key) = super::adk_session::build_adk_session_key(
-                            &shared_owned,
-                            channel_id,
-                            &provider,
-                        )
-                        .await
-                    {
-                        super::adk_session::delete_adk_session(&session_key, shared_owned.api_port)
-                            .await;
-                    }
-                }
-            } else {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
-                    "  [{ts}] ♻ Skipping tmux kill for unified-thread dispatch {:?} — run still active",
-                    dispatch_id
-                );
-            }
-        }
+        // Dispatch thread sessions now stay alive after finalization so the next
+        // implementation/review/rework turn can warm-resume from the same tmux.
+        // New dispatch arrivals validate the managed tmux session before reuse.
 
         // Finalization complete — decrement counters
         shared_owned
@@ -1417,16 +1668,17 @@ pub(super) fn spawn_turn_bridge(
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
+                tracing::info!(
                     "  [{ts}] ⏸ DRAIN: skipping queued turn dequeue for channel {} (restart pending)",
                     channel_id
                 );
             } else if let Some(bot_owner_provider) = gateway.bot_owner_provider() {
                 if let Err(reason) = gateway.validate_live_routing(channel_id).await {
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
+                    tracing::info!(
                         "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} (reason={})",
-                        channel_id, reason
+                        channel_id,
+                        reason
                     );
                 } else {
                     let next_intervention = super::mailbox_take_next_soft_intervention(
@@ -1438,19 +1690,18 @@ pub(super) fn spawn_turn_bridge(
 
                     if let Some((intervention, has_more_queued_turns)) = next_intervention {
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 📋 Processing next queued command");
+                        tracing::info!("  [{ts}] 📋 Processing next queued command");
                         if let Err(e) = gateway
                             .dispatch_queued_turn(
                                 channel_id,
-                                intervention.message_id,
+                                &intervention,
                                 &request_owner_name,
-                                &intervention.text,
                                 has_more_queued_turns,
                             )
                             .await
                         {
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!("  [{ts}]   ⚠ queued command failed: {e}");
+                            tracing::info!("  [{ts}]   ⚠ queued command failed: {e}");
                             super::mailbox_requeue_intervention_front(
                                 &shared_owned,
                                 &bot_owner_provider,
@@ -1463,7 +1714,7 @@ pub(super) fn spawn_turn_bridge(
                 }
             } else {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!(
+                tracing::info!(
                     "  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain"
                 );
                 if let Some(offset) = tmux_last_offset
@@ -1474,31 +1725,12 @@ pub(super) fn spawn_turn_bridge(
                     }
                     watcher.paused.store(false, Ordering::Relaxed);
                 }
-                // Deferred drain: wait briefly then kickoff idle queues using cached context
-                let shared_for_drain = shared_owned.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    if let (Some(ctx), Some(tok)) = (
-                        shared_for_drain.cached_serenity_ctx.get(),
-                        shared_for_drain.cached_bot_token.get(),
-                    ) {
-                        let bot_owner_provider = super::resolve_discord_bot_provider(tok);
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts}] 🚀 Deferred drain: kicking off idle queues");
-                        super::kickoff_idle_queues(
-                            ctx,
-                            &shared_for_drain,
-                            tok,
-                            &bot_owner_provider,
-                        )
-                        .await;
-                    } else {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        println!(
-                            "  [{ts}] ⚠ Deferred drain: still no cached context, queued messages remain pending"
-                        );
-                    }
-                });
+                super::schedule_deferred_idle_queue_kickoff(
+                    shared_owned.clone(),
+                    provider.clone(),
+                    channel_id,
+                    "turn bridge queued backlog",
+                );
             }
         }
 

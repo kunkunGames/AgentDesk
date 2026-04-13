@@ -3,6 +3,7 @@ use super::settings::{
     load_role_prompt, load_shared_prompt, render_peer_agent_guidance,
 };
 use super::*;
+use crate::github::dod::{DodItem, parse_dod_from_body, render_dod_markdown};
 use crate::services::memory::{
     UNBOUND_MEMORY_ROLE_ID, resolve_memento_agent_id, resolve_memento_workspace,
     sanitize_memento_workspace_segment,
@@ -11,6 +12,14 @@ use crate::services::memory::{
 const CONTEXT_COMPRESSION_SECTION_ORDER: &str = "`Goal`, `Progress`, `Decisions`, `Files`, `Next`";
 const STALE_TOOL_RESULT_PLACEHOLDER_EXAMPLE: &str =
     "[이전 결과 — 3줄 요약: cargo test failed in src/foo.rs because ...]";
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CurrentTaskContext<'a> {
+    pub(crate) card_title: Option<&'a str>,
+    pub(crate) github_issue_url: Option<&'a str>,
+    pub(crate) issue_body: Option<&'a str>,
+    pub(crate) deferred_dod: Option<&'a serde_json::Value>,
+}
 
 fn context_compression_guidance() -> String {
     format!(
@@ -25,15 +34,94 @@ fn context_compression_guidance() -> String {
     )
 }
 
-pub(crate) fn build_followup_turn_system_reminder() -> String {
-    format!(
-        "<system-reminder>\n\
-         Discord formatting: minimize code blocks, keep messages concise.\n\
-         If the session was compacted, treat the compacted summary as authoritative.\n\
-         Keep prior context organized as {CONTEXT_COMPRESSION_SECTION_ORDER}.\n\
-         Replace stale tool chatter, raw logs, and old command output with placeholders like {STALE_TOOL_RESULT_PLACEHOLDER_EXAMPLE} instead of replaying them verbatim.\n\
-         </system-reminder>"
-    )
+fn strip_dod_section(issue_body: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut in_dod_section = false;
+
+    for line in issue_body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            let header = trimmed[3..].trim().to_lowercase();
+            if header == "dod" || header == "definition of done" {
+                in_dod_section = true;
+                continue;
+            }
+            if in_dod_section {
+                in_dod_section = false;
+            }
+        }
+
+        if in_dod_section {
+            continue;
+        }
+
+        lines.push(line);
+    }
+
+    let stripped = lines.join("\n").trim().to_string();
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+fn deferred_dod_items(value: &serde_json::Value) -> Vec<DodItem> {
+    let verified: std::collections::HashSet<String> = value
+        .get("verified")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .map(str::to_string)
+        .collect();
+
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+        .map(|text| DodItem {
+            text: text.to_string(),
+            checked: verified.contains(text),
+        })
+        .collect()
+}
+
+fn render_current_task_section(current_task: &CurrentTaskContext<'_>) -> Option<String> {
+    let mut sections = Vec::new();
+
+    if let Some(title) = current_task
+        .card_title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sections.push(format!("Title: {title}"));
+    }
+    if let Some(url) = current_task
+        .github_issue_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sections.push(format!("GitHub URL: {url}"));
+    }
+    if let Some(issue_body) = current_task.issue_body.and_then(strip_dod_section) {
+        sections.push(format!("Issue Body:\n{issue_body}"));
+    }
+
+    let dod_items = current_task
+        .deferred_dod
+        .map(deferred_dod_items)
+        .filter(|items| !items.is_empty())
+        .or_else(|| {
+            current_task
+                .issue_body
+                .map(parse_dod_from_body)
+                .filter(|items| !items.is_empty())
+        });
+
+    if let Some(dod_items) = dod_items {
+        sections.push(format!("DoD:\n{}", render_dod_markdown(&dod_items)));
+    }
+
+    (!sections.is_empty()).then(|| format!("[Current Task]\n{}", sections.join("\n\n")))
 }
 
 fn proactive_memory_guidance(
@@ -98,6 +186,18 @@ fn proactive_memory_guidance(
          - 트리거: 에러 원인 확정, 아키텍처 결정, 설정 변경, \"이전에\" 언급 시{extra_note}"
     ))
 }
+
+fn api_friction_guidance(profile: DispatchProfile) -> Option<String> {
+    (profile == DispatchProfile::Full).then_some(
+        "\n\n[ADK API Usage]\n\
+         - ADK API 작업 전에는 먼저 `GET /api/docs` 또는 `GET /api/docs/{category}`로 관련 엔드포인트를 확인한다.\n\
+         - API 호출이 실패하면 `sqlite3`나 `agentdesk.db.query`로 우회하지 말고 `/api/docs`에서 대안 엔드포인트를 다시 찾는다.\n\
+         - 같은 엔드포인트 재시도, DB 직접 우회, 과도한 다단계 API 호출, `/api/docs` 없이 시행착오 탐색은 `API friction`으로 본다.\n\
+         - API friction이 발생하면 응답 마지막 줄에 단일 행 JSON marker를 남긴다: `API_FRICTION: {\"endpoint\":\"/api/docs/kanban\",\"friction_type\":\"docs-bypass\",\"summary\":\"...\",\"workaround\":\"sqlite3\",\"suggested_fix\":\"...\",\"docs_category\":\"kanban\",\"keywords\":[\"/api/docs/kanban\",\"sqlite3\"]}`\n\
+         - 서버가 이 marker를 사용자 응답에서 제거하고 `topic=api-friction`, `type=error`로 구조화 저장한다."
+            .to_string(),
+    )
+}
 /// Dispatch prompt profile — controls which system prompt sections are injected.
 /// `Full` includes everything (used for implementation dispatches and normal turns).
 /// `ReviewLite` strips peer agents, long-term memory, and skills to reduce token cost.
@@ -133,6 +233,7 @@ pub(super) fn build_system_prompt(
     queued_turn: bool,
     profile: DispatchProfile,
     dispatch_type: Option<&str>,
+    current_task: Option<&CurrentTaskContext<'_>>,
     shared_knowledge: Option<&str>,
     longterm_catalog: Option<&str>,
     memory_settings: Option<&ResolvedMemorySettings>,
@@ -161,7 +262,11 @@ pub(super) fn build_system_prompt(
          - Avoid long horizontal lines or decorative separators.\n\n\
          IMPORTANT: The user is on Discord and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
-         Never use tools that expect user interaction. If you need clarification, just ask in plain text.{}{}",
+         Never use tools that expect user interaction. If you need clarification, just ask in plain text.\n\n\
+         Reply context: When a user message includes a [Reply context] tag, the user is responding to the **replied-to message**, \
+         not necessarily your most recent message. Prioritize the reply target over the latest message when interpreting user intent. \
+         If ambiguous, ask which message the user is responding to. \
+         Avoid mixing status reports and action questions in a single message — it makes the reply target unclear.{}{}",
         discord_context,
         current_path,
         channel_id.get(),
@@ -214,7 +319,7 @@ pub(super) fn build_system_prompt(
             // Full profile: inject complete shared agent prompt (AGENTS.md)
             system_prompt_owned.push_str("\n\n[Shared Agent Rules]\n");
             system_prompt_owned.push_str(&shared_prompt);
-            eprintln!(
+            tracing::warn!(
                 "  [role-map] Injected shared prompt ({} chars) for channel {}",
                 shared_prompt.len(),
                 channel_id.get()
@@ -231,14 +336,14 @@ pub(super) fn build_system_prompt(
                      unless the user explicitly asks you to audit or compare role definitions.\n\n",
                 );
                 system_prompt_owned.push_str(&role_prompt);
-                eprintln!(
+                tracing::warn!(
                     "  [role-map] Applied role '{}' for channel {}",
                     binding.role_id,
                     channel_id.get()
                 );
             }
             None => {
-                eprintln!(
+                tracing::warn!(
                     "  [role-map] Failed to load prompt file '{}' for role '{}' (channel {})",
                     binding.prompt_file,
                     binding.role_id,
@@ -286,6 +391,9 @@ pub(super) fn build_system_prompt(
     ) {
         system_prompt_owned.push_str(&memory_guidance);
     }
+    if let Some(api_friction_guidance) = api_friction_guidance(profile) {
+        system_prompt_owned.push_str(&api_friction_guidance);
+    }
 
     if queued_turn {
         system_prompt_owned.push_str(
@@ -296,10 +404,14 @@ pub(super) fn build_system_prompt(
              If the latest user message asks for an exact literal output, return exactly that literal output and nothing else.",
         );
     }
+    if let Some(current_task_section) = current_task.and_then(render_current_task_section) {
+        system_prompt_owned.push_str("\n\n");
+        system_prompt_owned.push_str(&current_task_section);
+    }
 
     if profile == DispatchProfile::ReviewLite {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        println!(
+        tracing::info!(
             "  [{ts}] 📉 ReviewLite prompt: {} chars (channel {})",
             system_prompt_owned.len(),
             channel_id.get()
@@ -334,6 +446,7 @@ mod tests {
             false, // queued_turn
             DispatchProfile::Full,
             None, // dispatch_type
+            None, // current_task
             None, // shared_knowledge
             None, // longterm_catalog
             None, // memory_settings
@@ -396,6 +509,15 @@ mod tests {
     }
 
     #[test]
+    fn test_build_system_prompt_includes_api_friction_guidance() {
+        let output = call_build("ctx", "/tmp", 1, "tok", "", "");
+        assert!(output.contains("[ADK API Usage]"));
+        assert!(output.contains("GET /api/docs/{category}"));
+        assert!(output.contains("API_FRICTION:"));
+        assert!(output.contains("topic=api-friction"));
+    }
+
+    #[test]
     fn test_build_system_prompt_includes_narration_when_enabled() {
         let output = call_build("ctx", "/tmp", 1, "tok", "", "");
         assert!(output.contains("Always keep the user informed about what you are doing."));
@@ -419,22 +541,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(!output.contains("Always keep the user informed about what you are doing."));
         assert!(!output.contains("The user cannot see your tool calls"));
         assert!(output.contains("ALWAYS mention the specific file path"));
-    }
-
-    #[test]
-    fn test_followup_turn_reminder_reinjects_compaction_rules() {
-        let reminder = build_followup_turn_system_reminder();
-
-        assert!(reminder.contains("<system-reminder>"));
-        assert!(reminder.contains("Discord formatting: minimize code blocks"));
-        assert!(reminder.contains("treat the compacted summary as authoritative"));
-        assert!(reminder.contains(CONTEXT_COMPRESSION_SECTION_ORDER));
-        assert!(reminder.contains(STALE_TOOL_RESULT_PLACEHOLDER_EXAMPLE));
     }
 
     #[test]
@@ -491,6 +603,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let without_skills = build_system_prompt(
             "ctx",
@@ -504,6 +617,7 @@ mod tests {
             false,
             DispatchProfile::ReviewLite,
             Some("review"),
+            None,
             None,
             None,
             None,
@@ -531,6 +645,7 @@ mod tests {
             false,
             DispatchProfile::ReviewLite,
             Some("review"),
+            None,
             None,
             None,
             None,
@@ -568,6 +683,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let decision_prompt = build_system_prompt(
             "ctx",
@@ -581,6 +697,7 @@ mod tests {
             false,
             DispatchProfile::ReviewLite,
             Some("review-decision"),
+            None,
             None,
             None,
             None,
@@ -623,6 +740,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(!prompt.contains("[Peer Agent Directory]"));
@@ -655,6 +773,7 @@ mod tests {
             DispatchProfile::Full,
             None,
             None,
+            None,
             Some("- facts.md: deployment notes"),
             None,
         );
@@ -676,6 +795,7 @@ mod tests {
             None,
             false,
             DispatchProfile::Full,
+            None,
             None,
             None,
             None,
@@ -717,6 +837,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&ResolvedMemorySettings {
                 backend: MemoryBackendKind::Memento,
                 ..ResolvedMemorySettings::default()
@@ -735,6 +856,7 @@ mod tests {
                 .contains("`workspace=agentdesk-project-agentdesk` + `agentId=project-agentdesk`")
         );
         assert!(prompt.contains("workspace 스코프 이름은 `agentdesk`"));
+        assert!(!prompt.contains("tool_feedback("));
     }
 
     #[test]
@@ -753,6 +875,7 @@ mod tests {
             Some("review"),
             None,
             None,
+            None,
             Some(&ResolvedMemorySettings {
                 backend: MemoryBackendKind::Mem0,
                 ..ResolvedMemorySettings::default()
@@ -762,5 +885,81 @@ mod tests {
         assert!(!prompt.contains("[Proactive Memory Guidance]"));
         assert!(!prompt.contains("`search_memory`"));
         assert!(!prompt.contains("`add_memories`"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_appends_current_task_after_queued_turn_rules() {
+        let deferred_dod = serde_json::json!({
+            "items": ["ship tests"],
+            "verified": ["ship tests"]
+        });
+        let current_task = CurrentTaskContext {
+            card_title: Some("fix: prompt context"),
+            github_issue_url: Some("https://github.com/itismyfield/AgentDesk/issues/570"),
+            issue_body: Some("## 배경\n\ncompact에서 사라짐\n\n## DoD\n- [ ] old item"),
+            deferred_dod: Some(&deferred_dod),
+        };
+        let prompt = build_system_prompt(
+            "ctx",
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            "",
+            "",
+            true,
+            None,
+            true,
+            DispatchProfile::Full,
+            Some("implementation"),
+            Some(&current_task),
+            None,
+            None,
+            None,
+        );
+
+        let queued_index = prompt.find("[Queued Turn Rules]").unwrap();
+        let task_index = prompt.find("[Current Task]").unwrap();
+        assert!(task_index > queued_index);
+        assert!(prompt.contains("GitHub URL: https://github.com/itismyfield/AgentDesk/issues/570"));
+        assert!(prompt.contains("Title: fix: prompt context"));
+        assert!(prompt.contains("- [x] ship tests"));
+        assert!(!prompt.contains("## DoD"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_omits_current_task_when_context_empty() {
+        let current_task = CurrentTaskContext::default();
+        let prompt = build_system_prompt(
+            "ctx",
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            "",
+            "",
+            true,
+            None,
+            false,
+            DispatchProfile::Full,
+            Some("implementation"),
+            Some(&current_task),
+            None,
+            None,
+            None,
+        );
+
+        assert!(!prompt.contains("[Current Task]"));
+    }
+
+    #[test]
+    fn test_shared_prompt_declares_discord_response_style_rules() {
+        let shared_prompt = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("config/agents/_shared.prompt.md"),
+        )
+        .expect("shared prompt file should exist");
+
+        assert!(shared_prompt.contains("## Discord Response Style"));
+        assert!(shared_prompt.contains("`⏳ 대기 중...`"));
+        assert!(shared_prompt.contains("raw 로그, JSON, 반복 출력은 그대로 덤프하지 않는다"));
     }
 }
