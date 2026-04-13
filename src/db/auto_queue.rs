@@ -55,144 +55,219 @@ pub fn update_entry_status_on_conn(
     trigger_source: &str,
     options: &EntryStatusUpdateOptions,
 ) -> Result<EntryStatusUpdateResult, EntryStatusUpdateError> {
-    let current = load_entry_status_row(conn, entry_id)?;
     let normalized = normalize_entry_status(new_status)?;
-    let log_ctx = crate::services::auto_queue::AutoQueueLogContext::new()
-        .run(&current.run_id)
-        .entry(entry_id)
-        .card(&current.card_id)
-        .maybe_dispatch(current.dispatch_id.as_deref())
-        .thread_group(current.thread_group)
-        .batch_phase(current.batch_phase)
-        .maybe_slot_index(current.slot_index);
+    let current = load_entry_status_row(conn, entry_id)?;
+    update_entry_status_from_row_on_conn(
+        conn,
+        entry_id,
+        current,
+        normalized,
+        trigger_source,
+        options,
+    )
+}
 
-    if !is_allowed_entry_transition(&current.status, normalized) {
-        crate::auto_queue_log!(
-            warn,
-            "entry_status_transition_blocked",
-            log_ctx.clone(),
-            "[auto-queue] blocked invalid entry transition {} {} -> {} (source: {})",
+fn update_entry_status_from_row_on_conn(
+    conn: &Connection,
+    entry_id: &str,
+    mut current: EntryStatusRow,
+    normalized: &str,
+    trigger_source: &str,
+    options: &EntryStatusUpdateOptions,
+) -> Result<EntryStatusUpdateResult, EntryStatusUpdateError> {
+    loop {
+        let log_ctx = crate::services::auto_queue::AutoQueueLogContext::new()
+            .run(&current.run_id)
+            .entry(entry_id)
+            .card(&current.card_id)
+            .maybe_dispatch(current.dispatch_id.as_deref())
+            .thread_group(current.thread_group)
+            .batch_phase(current.batch_phase)
+            .maybe_slot_index(current.slot_index);
+
+        if !is_allowed_entry_transition(&current.status, normalized) {
+            crate::auto_queue_log!(
+                warn,
+                "entry_status_transition_blocked",
+                log_ctx.clone(),
+                "[auto-queue] blocked invalid entry transition {} {} -> {} (source: {})",
+                entry_id,
+                current.status,
+                normalized,
+                trigger_source
+            );
+            return Err(EntryStatusUpdateError::InvalidTransition {
+                entry_id: entry_id.to_string(),
+                from_status: current.status,
+                to_status: normalized.to_string(),
+            });
+        }
+
+        let effective_dispatch_id = options
+            .dispatch_id
+            .clone()
+            .or_else(|| current.dispatch_id.clone());
+        let effective_slot_index = options.slot_index.or(current.slot_index);
+        let metadata_change = match normalized {
+            ENTRY_STATUS_PENDING => {
+                current.dispatch_id.is_some()
+                    || current.slot_index.is_some()
+                    || current.completed_at.is_some()
+            }
+            ENTRY_STATUS_DISPATCHED => {
+                effective_dispatch_id != current.dispatch_id
+                    || effective_slot_index != current.slot_index
+                    || current.completed_at.is_some()
+            }
+            ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED => false,
+            _ => false,
+        };
+        let changed = current.status != normalized || metadata_change;
+
+        if !changed {
+            return Ok(EntryStatusUpdateResult {
+                run_id: current.run_id,
+                from_status: current.status,
+                to_status: normalized.to_string(),
+                changed: false,
+            });
+        }
+
+        let rows_affected = apply_entry_status_update_on_conn(
+            conn,
             entry_id,
-            current.status,
+            &current.status,
             normalized,
-            trigger_source
-        );
-        return Err(EntryStatusUpdateError::InvalidTransition {
-            entry_id: entry_id.to_string(),
-            from_status: current.status,
-            to_status: normalized.to_string(),
-        });
-    }
+            effective_dispatch_id.as_deref(),
+            effective_slot_index,
+        )?;
 
-    let effective_dispatch_id = options
-        .dispatch_id
-        .clone()
-        .or_else(|| current.dispatch_id.clone());
-    let effective_slot_index = options.slot_index.or(current.slot_index);
-    let metadata_change = match normalized {
-        ENTRY_STATUS_PENDING => {
-            current.dispatch_id.is_some()
-                || current.slot_index.is_some()
-                || current.completed_at.is_some()
-        }
-        ENTRY_STATUS_DISPATCHED => {
-            effective_dispatch_id != current.dispatch_id
-                || effective_slot_index != current.slot_index
-                || current.completed_at.is_some()
-        }
-        ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED => false,
-        _ => false,
-    };
-    let changed = current.status != normalized || metadata_change;
+        if rows_affected == 0 {
+            let latest = load_entry_status_row(conn, entry_id)?;
+            if entry_status_row_matches_target(
+                &latest,
+                normalized,
+                effective_dispatch_id.as_deref(),
+                effective_slot_index,
+            ) {
+                return Ok(EntryStatusUpdateResult {
+                    run_id: latest.run_id,
+                    from_status: latest.status,
+                    to_status: normalized.to_string(),
+                    changed: false,
+                });
+            }
 
-    if !changed {
+            crate::auto_queue_log!(
+                warn,
+                "entry_status_transition_stale_retry",
+                log_ctx.clone(),
+                "[auto-queue] stale entry transition revalidating {} {} -> {} (source: {})",
+                entry_id,
+                latest.status,
+                normalized,
+                trigger_source
+            );
+            current = latest;
+            continue;
+        }
+
+        if normalized == ENTRY_STATUS_DISPATCHED {
+            if let Some(previous_dispatch_id) = current
+                .dispatch_id
+                .as_deref()
+                .filter(|value| Some(*value) != effective_dispatch_id.as_deref())
+            {
+                record_entry_dispatch_history_on_conn(
+                    conn,
+                    entry_id,
+                    previous_dispatch_id,
+                    trigger_source,
+                )?;
+            }
+            if let Some(dispatch_id) = effective_dispatch_id.as_deref() {
+                record_entry_dispatch_history_on_conn(conn, entry_id, dispatch_id, trigger_source)?;
+            }
+        }
+
+        record_entry_transition_on_conn(
+            conn,
+            entry_id,
+            &current.status,
+            normalized,
+            trigger_source,
+        )?;
+
+        if matches!(normalized, ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED) {
+            release_completed_group_slots_for_run(conn, &current.run_id);
+            maybe_finalize_run_after_terminal_entry(conn, &current.run_id, normalized)?;
+        }
+
         return Ok(EntryStatusUpdateResult {
             run_id: current.run_id,
             from_status: current.status,
             to_status: normalized.to_string(),
-            changed: false,
+            changed: true,
         });
     }
+}
 
+fn apply_entry_status_update_on_conn(
+    conn: &Connection,
+    entry_id: &str,
+    current_status: &str,
+    normalized: &str,
+    effective_dispatch_id: Option<&str>,
+    effective_slot_index: Option<i64>,
+) -> rusqlite::Result<usize> {
     match normalized {
-        ENTRY_STATUS_PENDING => {
-            conn.execute(
-                "UPDATE auto_queue_entries
+        ENTRY_STATUS_PENDING => conn.execute(
+            "UPDATE auto_queue_entries
                  SET status = 'pending',
                      dispatch_id = NULL,
                      slot_index = NULL,
                      dispatched_at = NULL,
                      completed_at = NULL
-                 WHERE id = ?1",
-                [entry_id],
-            )?;
-        }
-        ENTRY_STATUS_DISPATCHED => {
-            conn.execute(
-                "UPDATE auto_queue_entries
+                 WHERE id = ?1
+                   AND status = ?2",
+            rusqlite::params![entry_id, current_status],
+        ),
+        ENTRY_STATUS_DISPATCHED => conn.execute(
+            "UPDATE auto_queue_entries
                  SET status = 'dispatched',
                      dispatch_id = ?1,
                      slot_index = ?2,
                      dispatched_at = datetime('now'),
                      completed_at = NULL
-                 WHERE id = ?3",
-                rusqlite::params![effective_dispatch_id, effective_slot_index, entry_id],
-            )?;
-        }
-        ENTRY_STATUS_DONE => {
-            conn.execute(
-                "UPDATE auto_queue_entries
+                 WHERE id = ?3
+                   AND status = ?4",
+            rusqlite::params![
+                effective_dispatch_id,
+                effective_slot_index,
+                entry_id,
+                current_status
+            ],
+        ),
+        ENTRY_STATUS_DONE => conn.execute(
+            "UPDATE auto_queue_entries
                  SET status = 'done',
                      completed_at = datetime('now')
-                 WHERE id = ?1",
-                [entry_id],
-            )?;
-        }
-        ENTRY_STATUS_SKIPPED => {
-            conn.execute(
-                "UPDATE auto_queue_entries
+                 WHERE id = ?1
+                   AND status = ?2",
+            rusqlite::params![entry_id, current_status],
+        ),
+        ENTRY_STATUS_SKIPPED => conn.execute(
+            "UPDATE auto_queue_entries
                  SET status = 'skipped',
                      dispatch_id = NULL,
                      dispatched_at = NULL,
                      completed_at = datetime('now')
-                 WHERE id = ?1",
-                [entry_id],
-            )?;
-        }
+                 WHERE id = ?1
+                   AND status = ?2",
+            rusqlite::params![entry_id, current_status],
+        ),
         _ => unreachable!(),
     }
-
-    if normalized == ENTRY_STATUS_DISPATCHED {
-        if let Some(previous_dispatch_id) = current
-            .dispatch_id
-            .as_deref()
-            .filter(|value| Some(*value) != effective_dispatch_id.as_deref())
-        {
-            record_entry_dispatch_history_on_conn(
-                conn,
-                entry_id,
-                previous_dispatch_id,
-                trigger_source,
-            )?;
-        }
-        if let Some(dispatch_id) = effective_dispatch_id.as_deref() {
-            record_entry_dispatch_history_on_conn(conn, entry_id, dispatch_id, trigger_source)?;
-        }
-    }
-
-    record_entry_transition_on_conn(conn, entry_id, &current.status, normalized, trigger_source)?;
-
-    if matches!(normalized, ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED) {
-        release_completed_group_slots_for_run(conn, &current.run_id);
-        maybe_finalize_run_after_terminal_entry(conn, &current.run_id, normalized)?;
-    }
-
-    Ok(EntryStatusUpdateResult {
-        run_id: current.run_id,
-        from_status: current.status,
-        to_status: normalized.to_string(),
-        changed: true,
-    })
 }
 
 fn record_entry_dispatch_history_on_conn(
@@ -963,6 +1038,30 @@ fn is_allowed_entry_transition(from_status: &str, to_status: &str) -> bool {
     )
 }
 
+fn entry_status_row_matches_target(
+    row: &EntryStatusRow,
+    normalized: &str,
+    effective_dispatch_id: Option<&str>,
+    effective_slot_index: Option<i64>,
+) -> bool {
+    if row.status != normalized {
+        return false;
+    }
+
+    match normalized {
+        ENTRY_STATUS_PENDING => {
+            row.dispatch_id.is_none() && row.slot_index.is_none() && row.completed_at.is_none()
+        }
+        ENTRY_STATUS_DISPATCHED => {
+            row.dispatch_id.as_deref() == effective_dispatch_id
+                && row.slot_index == effective_slot_index
+                && row.completed_at.is_none()
+        }
+        ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED => true,
+        _ => false,
+    }
+}
+
 fn release_completed_group_slots_for_run(conn: &Connection, run_id: &str) {
     let completed_slots = completed_group_slots(conn, run_id);
     if !completed_slots.is_empty() {
@@ -1218,8 +1317,9 @@ fn append_card_filters(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENTRY_STATUS_DISPATCHED, ENTRY_STATUS_DONE, ENTRY_STATUS_PENDING, EntryStatusUpdateError,
-        EntryStatusUpdateOptions, list_entry_dispatch_history, update_entry_status_on_conn,
+        ENTRY_STATUS_DISPATCHED, ENTRY_STATUS_DONE, ENTRY_STATUS_PENDING, ENTRY_STATUS_SKIPPED,
+        EntryStatusUpdateError, EntryStatusUpdateOptions, list_entry_dispatch_history,
+        load_entry_status_row, update_entry_status_from_row_on_conn, update_entry_status_on_conn,
     };
     use rusqlite::Connection;
 
@@ -1469,6 +1569,86 @@ mod tests {
             )
             .expect("current dispatch");
         assert_eq!(current_dispatch_id.as_deref(), Some("dispatch-impl"));
+    }
+
+    #[test]
+    fn stale_skip_transition_revalidates_against_latest_status() {
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                 id, run_id, kanban_card_id, agent_id, status, thread_group
+             ) VALUES ('entry-stale', 'run-1', 'card-stale', 'agent-1', 'pending', 0)",
+            [],
+        )
+        .expect("seed entry");
+
+        let stale = load_entry_status_row(&conn, "entry-stale").expect("stale snapshot");
+        conn.execute(
+            "UPDATE auto_queue_entries
+                SET status = 'dispatched',
+                    dispatch_id = 'dispatch-live',
+                    slot_index = 0,
+                    dispatched_at = datetime('now')
+              WHERE id = 'entry-stale'",
+            [],
+        )
+        .expect("advance entry");
+
+        let result = update_entry_status_from_row_on_conn(
+            &conn,
+            "entry-stale",
+            stale,
+            ENTRY_STATUS_SKIPPED,
+            "test_stale_skip",
+            &EntryStatusUpdateOptions::default(),
+        )
+        .expect("stale skip transition");
+        assert!(result.changed);
+        assert_eq!(result.from_status, ENTRY_STATUS_DISPATCHED);
+        assert_eq!(result.to_status, ENTRY_STATUS_SKIPPED);
+
+        let (status, dispatch_id, slot_index, dispatched_at, completed_at): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, dispatch_id, slot_index, dispatched_at, completed_at
+                   FROM auto_queue_entries
+                  WHERE id = 'entry-stale'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("entry row");
+        assert_eq!(status, ENTRY_STATUS_SKIPPED);
+        assert!(dispatch_id.is_none());
+        assert_eq!(slot_index, Some(0));
+        assert!(dispatched_at.is_none());
+        assert!(completed_at.is_some());
+
+        let (from_status, to_status): (String, String) = conn
+            .query_row(
+                "SELECT from_status, to_status
+                   FROM auto_queue_entry_transitions
+                  WHERE entry_id = 'entry-stale'
+               ORDER BY id DESC
+                  LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("transition row");
+        assert_eq!(from_status, ENTRY_STATUS_DISPATCHED);
+        assert_eq!(to_status, ENTRY_STATUS_SKIPPED);
     }
 
     #[test]
