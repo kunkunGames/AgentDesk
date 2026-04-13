@@ -273,25 +273,31 @@ pub(super) async fn handle_model_picker_interaction(
                     .await;
                 }
             }
-
             return Ok(());
         }
         super::commands::ModelPickerAction::Reset => {
-            super::commands::clear_model_picker_pending(&data.shared, message_id);
-            let changed = super::commands::update_channel_model_override(
+            let changed = super::commands::would_channel_model_override_change(
                 &data.shared,
-                &data.token,
                 target_channel_id,
-                &data.provider,
                 None,
-            )
-            .await;
+            );
+            super::commands::clear_model_picker_pending(&data.shared, message_id);
             let notice = if changed {
                 model_picker_submit_notice(None)
             } else {
                 model_picker_no_change_notice()
             };
             save_model_picker_interaction(ctx, component, notice).await?;
+            if changed {
+                super::commands::update_channel_model_override(
+                    &data.shared,
+                    &data.token,
+                    target_channel_id,
+                    &data.provider,
+                    None,
+                )
+                .await;
+            }
             return Ok(());
         }
         super::commands::ModelPickerAction::Cancel => {
