@@ -34,6 +34,15 @@ fn context_compression_guidance() -> String {
     )
 }
 
+fn tool_output_efficiency_guidance() -> &'static str {
+    "[Tool Output Efficiency]\n\
+     Large tool results persist in context and increase cost for every subsequent turn.\n\
+     - Bash: Use LIMIT clauses for SQL, pipe to head/grep for filtering, avoid tail with large line counts\n\
+     - Read: Use offset/limit to read specific sections, not entire large files\n\
+     - Grep: Set head_limit, use narrow glob/type filters, avoid broad patterns that match hundreds of lines\n\
+     - Prefer targeted queries over exhaustive dumps"
+}
+
 fn strip_dod_section(issue_body: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut in_dod_section = false;
@@ -280,6 +289,9 @@ pub(super) fn build_system_prompt(
             skills_notice
         }
     );
+    system_prompt_owned.push_str("\n\n");
+    system_prompt_owned.push_str(tool_output_efficiency_guidance());
+
     if profile == DispatchProfile::Full {
         system_prompt_owned.push_str("\n\n");
         system_prompt_owned.push_str(&context_compression_guidance());
@@ -509,6 +521,16 @@ mod tests {
     }
 
     #[test]
+    fn test_build_system_prompt_includes_tool_output_efficiency_guidance() {
+        let output = call_build("ctx", "/tmp", 1, "tok", "", "");
+        assert!(output.contains("[Tool Output Efficiency]"));
+        assert!(output.contains("Large tool results persist in context"));
+        assert!(output.contains("Use LIMIT clauses for SQL"));
+        assert!(output.contains("Use offset/limit to read specific sections"));
+        assert!(output.contains("Set head_limit"));
+    }
+
+    #[test]
     fn test_build_system_prompt_includes_api_friction_guidance() {
         let output = call_build("ctx", "/tmp", 1, "tok", "", "");
         assert!(output.contains("[ADK API Usage]"));
@@ -654,6 +676,30 @@ mod tests {
         assert!(!prompt.contains("[Context Compression]"));
         assert!(!prompt.contains(CONTEXT_COMPRESSION_SECTION_ORDER));
         assert!(!prompt.contains(STALE_TOOL_RESULT_PLACEHOLDER_EXAMPLE));
+    }
+
+    #[test]
+    fn test_review_lite_includes_tool_output_efficiency_guidance() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            "",
+            "",
+            true,
+            None,
+            false,
+            DispatchProfile::ReviewLite,
+            Some("review"),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(prompt.contains("[Tool Output Efficiency]"));
+        assert!(prompt.contains("Prefer targeted queries over exhaustive dumps"));
     }
 
     #[test]
