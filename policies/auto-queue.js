@@ -202,9 +202,10 @@ var autoQueue = {
 
       var entry = aqEntries[0];
       if (entry.status === "pending" || entry.status === "dispatched") {
-        agentdesk.db.execute(
-          "UPDATE auto_queue_entries SET status = 'done', completed_at = datetime('now') WHERE id = ? AND status IN ('pending', 'dispatched')",
-          [entry.id]
+        agentdesk.autoQueue.updateEntryStatus(
+          entry.id,
+          "done",
+          "noop_completion"
         );
         entry.status = "done";
       }
