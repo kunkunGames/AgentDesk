@@ -8254,6 +8254,23 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         Some(0),
         "completed group slot must be reused for the next group"
     );
+    let recycled_dispatch_context: Option<String> = conn
+        .query_row(
+            "SELECT td.context
+             FROM task_dispatches td
+             JOIN auto_queue_entries e ON e.dispatch_id = td.id
+             WHERE e.id = 'entry-slot-2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let recycled_dispatch_context =
+        serde_json::from_str::<serde_json::Value>(&recycled_dispatch_context.unwrap()).unwrap();
+    assert_eq!(
+        recycled_dispatch_context["reset_slot_thread_before_reuse"].as_bool(),
+        Some(true),
+        "independent group reuse must force a fresh slot-thread reset"
+    );
 
     let slot_zero_group: Option<i64> = conn
         .query_row(
@@ -8471,6 +8488,24 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
         continued_session,
         ("idle".to_string(), None, 0, None),
         "same-group continuation must keep the slot assignment but start from a fresh session"
+    );
+    let continued_dispatch_context: Option<String> = conn
+        .query_row(
+            "SELECT td.context
+             FROM task_dispatches td
+             JOIN auto_queue_entries e ON e.dispatch_id = td.id
+             WHERE e.id = 'entry-same-group-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let continued_dispatch_context =
+        serde_json::from_str::<serde_json::Value>(&continued_dispatch_context.unwrap()).unwrap();
+    assert!(
+        continued_dispatch_context
+            .get("reset_slot_thread_before_reuse")
+            .is_none(),
+        "same-group continuation must not force an independent slot-thread reset"
     );
     assert_eq!(
         slot_group,
