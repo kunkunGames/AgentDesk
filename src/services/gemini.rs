@@ -664,20 +664,21 @@ fn gemini_trusted_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-fn gemini_trusted_root_for_entry(path: &str, status: &Value) -> Option<PathBuf> {
-    match status.as_str()? {
-        "TRUST_FOLDER" => Some(normalize_gemini_path(path)),
-        "TRUST_PARENT" => {
-            let rule_path = Path::new(path);
-            let parent = rule_path.parent().unwrap_or(rule_path);
-            Some(normalize_gemini_path(parent))
-        }
-        _ => None,
-    }
-}
-
 fn gemini_trust_status_allows_root(status: &Value) -> bool {
     matches!(status.as_str(), Some("TRUST_FOLDER") | Some("TRUST_PARENT"))
+}
+
+fn gemini_trusted_root_for_entry(path: &str, status: &Value) -> Option<PathBuf> {
+    if !gemini_trust_status_allows_root(status) {
+        return None;
+    }
+    if matches!(status.as_str(), Some("TRUST_PARENT")) {
+        let rule_path = Path::new(path);
+        let parent = rule_path.parent().unwrap_or(rule_path);
+        Some(normalize_gemini_path(parent))
+    } else {
+        Some(normalize_gemini_path(path))
+    }
 }
 
 fn select_gemini_working_dir(

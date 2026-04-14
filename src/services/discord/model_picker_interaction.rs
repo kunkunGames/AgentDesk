@@ -44,15 +44,18 @@ async fn save_model_picker_interaction(
     Ok(())
 }
 
-fn model_picker_submit_notice(saved_model: Option<&str>) -> String {
+fn model_picker_submit_notice(
+    saved_model: Option<&str>,
+    provider: &crate::services::provider::ProviderKind,
+) -> String {
+    use crate::services::provider::ProviderKind;
+    let session_note = match provider {
+        ProviderKind::Gemini => "새 세션 + 새 모델로 적용됩니다.",
+        _ => "현재 세션을 유지한 채 다음 turn부터 새 모델로 적용됩니다.",
+    };
     match saved_model {
-        Some(model) => format!(
-            "모델 설정을 `{model}`로 저장했습니다. 다음 메시지부터 새 세션 + 새 모델로 적용됩니다."
-        ),
-        None => {
-            "모델 설정을 기본값으로 저장했습니다. 다음 메시지부터 기본 모델 설정으로 적용됩니다."
-                .to_string()
-        }
+        Some(model) => format!("모델 설정을 `{model}`로 저장했습니다. {session_note}"),
+        None => format!("모델 설정을 기본값으로 저장했습니다. {session_note}"),
     }
 }
 
@@ -256,14 +259,14 @@ pub(super) async fn handle_model_picker_interaction(
             let notice = match next_override.as_ref() {
                 Some(Some(model)) => {
                     if changed {
-                        model_picker_submit_notice(Some(model))
+                        model_picker_submit_notice(Some(model), &data.provider)
                     } else {
                         model_picker_no_change_notice()
                     }
                 }
                 Some(None) => {
                     if changed {
-                        model_picker_submit_notice(None)
+                        model_picker_submit_notice(None, &data.provider)
                     } else {
                         model_picker_no_change_notice()
                     }
@@ -295,7 +298,7 @@ pub(super) async fn handle_model_picker_interaction(
             );
             super::commands::clear_model_picker_pending(&data.shared, message_id);
             let notice = if changed {
-                model_picker_submit_notice(None)
+                model_picker_submit_notice(None, &data.provider)
             } else {
                 model_picker_no_change_notice()
             };
@@ -363,10 +366,40 @@ mod tests {
     };
 
     #[test]
-    fn model_picker_submit_notice_describes_next_turn_new_model_session() {
-        let notice = model_picker_submit_notice(Some("gpt-5.4-mini"));
-        assert!(notice.contains("`gpt-5.4-mini`"));
-        assert!(notice.contains("다음 메시지부터 새 세션 + 새 모델"));
+    fn model_picker_submit_notice_non_gemini_keeps_session() {
+        use crate::services::provider::ProviderKind;
+        for provider in [ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Qwen] {
+            let notice = model_picker_submit_notice(Some("gpt-5.4-mini"), &provider);
+            assert!(
+                notice.contains("`gpt-5.4-mini`"),
+                "{provider:?}: model name missing"
+            );
+            assert!(
+                notice.contains("현재 세션을 유지"),
+                "{provider:?}: should say session is kept"
+            );
+            assert!(
+                !notice.contains("새 세션"),
+                "{provider:?}: must not claim new session"
+            );
+        }
+    }
+
+    #[test]
+    fn model_picker_submit_notice_gemini_starts_new_session() {
+        use crate::services::provider::ProviderKind;
+        let notice = model_picker_submit_notice(Some("gemini-2.5-pro"), &ProviderKind::Gemini);
+        assert!(notice.contains("`gemini-2.5-pro`"));
+        assert!(notice.contains("새 세션"));
+    }
+
+    #[test]
+    fn model_picker_submit_notice_default_reset_is_provider_aware() {
+        use crate::services::provider::ProviderKind;
+        let notice_claude = model_picker_submit_notice(None, &ProviderKind::Claude);
+        assert!(notice_claude.contains("현재 세션을 유지"));
+        let notice_gemini = model_picker_submit_notice(None, &ProviderKind::Gemini);
+        assert!(notice_gemini.contains("새 세션"));
     }
 
     #[test]
