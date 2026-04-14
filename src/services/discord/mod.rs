@@ -63,8 +63,8 @@ use adk_session::{
     lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
 };
 use formatting::{
-    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_skills_notice,
-    format_tool_input, send_long_message_raw, truncate_str,
+    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_tool_input,
+    send_long_message_raw, truncate_str,
 };
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 use inflight::{
