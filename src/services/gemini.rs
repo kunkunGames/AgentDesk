@@ -145,7 +145,7 @@ pub fn execute_command_simple_cancellable(
         .clone()
         .ok_or_else(|| "Gemini CLI not found".to_string())?;
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let working_dir = resolve_gemini_working_dir(&current_dir.to_string_lossy())?;
+    let working_dir = resolve_gemini_requested_dir(current_dir)?;
     let args = build_exec_args(prompt, None, None, false)?;
     let mut command = Command::new(&gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
@@ -650,10 +650,13 @@ fn compose_gemini_prompt(
     crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
 }
 
-fn resolve_gemini_working_dir(working_dir: &str) -> Result<PathBuf, String> {
-    let requested_dir = expand_gemini_working_dir(working_dir);
+fn resolve_gemini_requested_dir(requested_dir: PathBuf) -> Result<PathBuf, String> {
     let trust_rules = gemini_trust_rules();
     select_gemini_working_dir(requested_dir, dirs::home_dir(), &trust_rules)
+}
+
+fn resolve_gemini_working_dir(working_dir: &str) -> Result<PathBuf, String> {
+    resolve_gemini_requested_dir(expand_gemini_working_dir(working_dir))
 }
 
 fn expand_gemini_working_dir(raw: &str) -> PathBuf {
@@ -1178,6 +1181,24 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("/private/tmp/worktree-b/project"));
         assert!(error.contains("not trusted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_gemini_working_dir_keeps_non_utf8_trusted_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let trusted_path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/private/tmp/gemini-\xff".to_vec(),
+        ));
+        let trusted = vec![super::GeminiTrustRule::allow(trusted_path.clone())];
+        let resolved = select_gemini_working_dir(
+            trusted_path.clone(),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap();
+        assert_eq!(resolved, trusted_path);
     }
 
     #[test]
