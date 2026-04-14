@@ -202,6 +202,94 @@ fn load_slot_bindings_for_runs(
     .collect::<Result<Vec<_>, _>>()
 }
 
+fn slot_thread_map_has_bindings(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    slot_index: i64,
+) -> bool {
+    let raw_map: Option<String> = conn
+        .query_row(
+            "SELECT thread_id_map
+             FROM auto_queue_slots
+             WHERE agent_id = ?1 AND slot_index = ?2",
+            rusqlite::params![agent_id, slot_index],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    raw_map
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .map(|map| {
+            map.values().any(|value| {
+                value
+                    .as_str()
+                    .map(|raw| !raw.trim().is_empty())
+                    .or_else(|| value.as_u64().map(|_| true))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn slot_has_dispatch_thread_history(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    slot_index: i64,
+) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM task_dispatches
+         WHERE to_agent_id = ?1
+           AND thread_id IS NOT NULL
+           AND TRIM(thread_id) != ''
+           AND CASE
+                 WHEN context IS NULL OR TRIM(context) = '' OR json_valid(context) = 0
+                     THEN NULL
+                 ELSE CAST(json_extract(context, '$.slot_index') AS INTEGER)
+               END = ?2",
+        rusqlite::params![agent_id, slot_index],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
+}
+
+fn slot_requires_thread_reset_before_reuse(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    slot_index: i64,
+    newly_assigned: bool,
+) -> bool {
+    newly_assigned
+        && (slot_thread_map_has_bindings(conn, agent_id, slot_index)
+            || slot_has_dispatch_thread_history(conn, agent_id, slot_index))
+}
+
+fn build_auto_queue_dispatch_context(
+    entry_id: &str,
+    thread_group: i64,
+    slot_index: Option<i64>,
+    reset_slot_thread_before_reuse: bool,
+    extra_fields: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+) -> serde_json::Value {
+    let mut context = serde_json::Map::new();
+    context.insert("auto_queue".to_string(), json!(true));
+    context.insert("entry_id".to_string(), json!(entry_id));
+    context.insert("thread_group".to_string(), json!(thread_group));
+    context.insert("slot_index".to_string(), json!(slot_index));
+    if reset_slot_thread_before_reuse {
+        context.insert(
+            "reset_slot_thread_before_reuse".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    for (key, value) in extra_fields {
+        context.insert(key.to_string(), value);
+    }
+    serde_json::Value::Object(context)
+}
+
 fn load_live_dispatch_ids_for_runs(
     conn: &rusqlite::Connection,
     run_ids: &[String],
@@ -3258,6 +3346,7 @@ pub(crate) fn activate_with_deps(
         let slot_allocation =
             crate::db::auto_queue::allocate_slot_for_group_agent(&conn, &run_id, *group, &agent_id);
         let slot_index = slot_allocation.as_ref().map(|(slot_index, _)| *slot_index);
+        let mut reset_slot_thread_before_reuse = false;
         if slot_allocation.is_none() {
             crate::auto_queue_log!(
                 info,
@@ -3268,6 +3357,12 @@ pub(crate) fn activate_with_deps(
             continue;
         }
         if let Some((assigned_slot, _newly_assigned)) = slot_allocation {
+            reset_slot_thread_before_reuse = slot_requires_thread_reset_before_reuse(
+                &conn,
+                &agent_id,
+                assigned_slot,
+                _newly_assigned,
+            );
             let slot_key = (agent_id.clone(), assigned_slot);
             if !cleared_slots.contains(&slot_key) {
                 let cleared = crate::services::auto_queue::runtime::clear_slot_threads_for_slot(
@@ -3328,6 +3423,13 @@ pub(crate) fn activate_with_deps(
         drop(conn);
 
         let dispatch_result = run_activate_blocking(|| {
+            let dispatch_context = build_auto_queue_dispatch_context(
+                &entry_id,
+                *group,
+                slot_index,
+                reset_slot_thread_before_reuse,
+                std::iter::empty(),
+            );
             crate::dispatch::create_dispatch(
                 &deps.db,
                 &deps.engine,
@@ -3335,12 +3437,7 @@ pub(crate) fn activate_with_deps(
                 &agent_id,
                 "implementation",
                 &post_walk.title,
-                &json!({
-                    "auto_queue": true,
-                    "entry_id": entry_id,
-                    "thread_group": group,
-                    "slot_index": slot_index,
-                }),
+                &dispatch_context,
             )
         });
 
@@ -4417,7 +4514,16 @@ pub async fn restore_run(
                     &entry.agent_id,
                 );
                 let slot_index = slot_allocation.as_ref().map(|(slot_index, _)| *slot_index);
+                let mut reset_slot_thread_before_reuse = false;
                 if let Some((_, newly_assigned)) = slot_allocation {
+                    if let Some(assigned_slot) = slot_index {
+                        reset_slot_thread_before_reuse = slot_requires_thread_reset_before_reuse(
+                            &conn,
+                            &entry.agent_id,
+                            assigned_slot,
+                            newly_assigned,
+                        );
+                    }
                     if newly_assigned {
                         counts.rebound_slots += 1;
                     }
@@ -4453,6 +4559,16 @@ pub async fn restore_run(
                 }
 
                 let dispatch_result = run_activate_blocking(|| {
+                    let dispatch_context = build_auto_queue_dispatch_context(
+                        &entry.entry_id,
+                        entry.thread_group,
+                        slot_index,
+                        reset_slot_thread_before_reuse,
+                        [
+                            ("restored_run", json!(true)),
+                            ("run_id", json!(run_id.clone())),
+                        ],
+                    );
                     crate::dispatch::create_dispatch(
                         &deps.db,
                         &deps.engine,
@@ -4460,14 +4576,7 @@ pub async fn restore_run(
                         &entry.agent_id,
                         "implementation",
                         &title,
-                        &json!({
-                            "auto_queue": true,
-                            "restored_run": true,
-                            "run_id": run_id,
-                            "entry_id": entry.entry_id,
-                            "thread_group": entry.thread_group,
-                            "slot_index": slot_index,
-                        }),
+                        &dispatch_context,
                     )
                 });
 
