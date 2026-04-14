@@ -99,6 +99,15 @@ fn post_json(path: &str, body: Option<Value>) -> Result<Value, String> {
     request_json("POST", path, body_string.as_deref())
 }
 
+pub(crate) fn post_json_value(path: &str, body: Value) -> Result<Value, String> {
+    post_json(path, Some(body))
+}
+
+pub(crate) fn patch_json_value(path: &str, body: Value) -> Result<Value, String> {
+    let body_string = body.to_string();
+    request_json("PATCH", path, Some(&body_string))
+}
+
 fn parse_github_repo_from_remote(remote: &str) -> Option<String> {
     crate::services::platform::shell::parse_github_repo_from_remote(remote)
 }
