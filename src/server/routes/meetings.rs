@@ -795,61 +795,67 @@ pub async fn create_issues(
     Path(id): Path<String>,
     Json(body): Json<CreateIssuesBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.db.lock() {
-        Ok(c) => c,
-        Err(e) => {
+    let (repo, summaries) = {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
+
+        // Verify meeting exists
+        let meeting_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM meetings WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !meeting_exists {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "meeting not found"})),
             );
         }
-    };
 
-    // Verify meeting exists
-    let meeting_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM meetings WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !meeting_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "meeting not found"})),
-        );
-    }
-
-    // Get issue repo from kv_meta or request body
-    let repo: Option<String> = body.repo.clone().or_else(|| {
-        conn.query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
-            [&format!("meeting_issue_repo:{id}")],
-            |row| row.get(0),
-        )
-        .ok()
-    });
-
-    let Some(repo) = repo else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "no repo configured for this meeting — set issue_repo first"})),
-        );
-    };
-
-    // Get summary transcripts (action items)
-    let summaries: Vec<String> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT content FROM meeting_transcripts
-                 WHERE meeting_id = ?1 AND is_summary = 1
-                 ORDER BY seq ASC",
+        // Get issue repo from kv_meta or request body
+        let repo: Option<String> = body.repo.clone().or_else(|| {
+            conn.query_row(
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                [&format!("meeting_issue_repo:{id}")],
+                |row| row.get(0),
             )
-            .unwrap();
-        stmt.query_map([&id], |row| row.get::<_, String>(0))
             .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+        });
+
+        let Some(repo) = repo else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": "no repo configured for this meeting — set issue_repo first"}),
+                ),
+            );
+        };
+
+        // Get summary transcripts (action items)
+        let summaries: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content FROM meeting_transcripts
+                     WHERE meeting_id = ?1 AND is_summary = 1
+                     ORDER BY seq ASC",
+                )
+                .unwrap();
+            stmt.query_map([&id], |row| row.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        };
+
+        (repo, summaries)
     };
 
     if summaries.is_empty() {
@@ -863,9 +869,6 @@ pub async fn create_issues(
             })),
         );
     }
-
-    drop(conn);
-
     // Create issues from summaries using gh CLI
     let mut results = Vec::new();
     let mut created = 0i64;
@@ -918,16 +921,11 @@ pub async fn create_issues(
             String::new()
         };
 
-        // Create GitHub issue
-        let output = std::process::Command::new("gh")
-            .args([
-                "issue", "create", "--repo", &repo, "--title", title, "--body", &body_text,
-            ])
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // Use the shared async/timeout-bounded GitHub helper so this route
+        // does not block the Tokio worker on a direct gh subprocess call.
+        match crate::github::create_issue(&repo, title, &body_text).await {
+            Ok(issue) => {
+                let url = issue.url;
                 // Store result
                 let conn = state.db.lock().unwrap();
                 conn.execute(
@@ -939,13 +937,8 @@ pub async fn create_issues(
                 results.push(json!({"key": key, "title": title, "assignee": "", "ok": true, "issue_url": url, "attempted_at": chrono::Utc::now().timestamp()}));
                 created += 1;
             }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr).to_string();
-                results.push(json!({"key": key, "title": title, "assignee": "", "ok": false, "error": err, "attempted_at": chrono::Utc::now().timestamp()}));
-                failed += 1;
-            }
-            Err(e) => {
-                results.push(json!({"key": key, "title": title, "assignee": "", "ok": false, "error": format!("{e}"), "attempted_at": chrono::Utc::now().timestamp()}));
+            Err(error) => {
+                results.push(json!({"key": key, "title": title, "assignee": "", "ok": false, "error": error, "attempted_at": chrono::Utc::now().timestamp()}));
                 failed += 1;
             }
         }
@@ -1160,10 +1153,13 @@ pub async fn start_meeting(
             StatusCode::OK,
             Json(json!({"ok": true, "message": "Meeting start scheduled"})),
         ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"ok": false, "error": error})),
-        ),
+        Err(error) => {
+            let error_message = normalize_direct_start_error(&error);
+            (
+                direct_start_error_status(&error_message),
+                Json(json!({"ok": false, "error": error_message})),
+            )
+        }
     }
 }
 
@@ -1484,6 +1480,35 @@ fn validate_reviewer_provider(
         return Err("reviewer_provider must differ from primary_provider".to_string());
     }
     Ok(())
+}
+
+fn normalize_direct_start_error(error: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(error)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn direct_start_error_status(error: &str) -> StatusCode {
+    if error.contains("이미 회의가 진행 중")
+        || error.to_ascii_lowercase().contains("already in progress")
+    {
+        return StatusCode::CONFLICT;
+    }
+
+    if error.contains("Too many fixed participants")
+        || error.contains("Unknown fixed meeting participant role_id")
+        || error.contains("reviewer_provider must differ")
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    StatusCode::INTERNAL_SERVER_ERROR
 }
 
 fn build_meeting_start_command(agenda: &str, primary_provider: Option<ProviderKind>) -> String {
@@ -1930,6 +1955,35 @@ mod tests {
         assert_eq!(
             body.0["error"],
             "channel_id is not a registered meeting channel"
+        );
+    }
+
+    #[test]
+    fn normalize_direct_start_error_extracts_embedded_json_message() {
+        let raw = r#"{"ok":false,"error":"provider runtime not registered: codex"}"#;
+        assert_eq!(
+            normalize_direct_start_error(raw),
+            "provider runtime not registered: codex"
+        );
+    }
+
+    #[test]
+    fn direct_start_error_status_maps_known_validation_and_conflict_errors() {
+        assert_eq!(
+            direct_start_error_status("이 채널에서 이미 회의가 진행 중이야."),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            direct_start_error_status("Too many fixed participants: 6 (max 5)"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            direct_start_error_status("Unknown fixed meeting participant role_id: role-123"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            direct_start_error_status("provider runtime not registered: codex"),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

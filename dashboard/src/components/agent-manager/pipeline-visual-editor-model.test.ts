@@ -20,8 +20,6 @@ function makePipeline(): PipelineConfigFull {
       { id: "requested", label: "Requested" },
       { id: "in_progress", label: "In Progress" },
       { id: "review", label: "Review" },
-      { id: "pending_decision", label: "Pending Decision" },
-      { id: "blocked", label: "Blocked" },
       { id: "done", label: "Done", terminal: true },
     ],
     transitions: [
@@ -50,7 +48,7 @@ function makePipeline(): PipelineConfigFull {
       review: {
         duration: "30m",
         clock: "review_entered_at",
-        on_exhaust: "pending_decision",
+        on_exhaust: "review",
       },
     },
     phase_gate: {
@@ -149,7 +147,7 @@ describe("pipeline-visual-editor-model", () => {
       on_dispatch_completed: ["OnDispatchCompleted"],
     });
     expect(payload.note).toBe("keep me");
-    expect(payload.states).toHaveLength(8);
+    expect(payload.states).toHaveLength(6);
     expect(payload.phase_gate?.dispatch_type).toBe("phase-gate");
   });
 
@@ -160,9 +158,9 @@ describe("pipeline-visual-editor-model", () => {
     expect(compact.columns).toBe(1);
     expect(compact.nodes[1].x).toBe(compact.nodes[0].x);
     expect(compact.nodes[1].y).toBeGreaterThan(compact.nodes[0].y);
-    expect(compact.edges[0].path).toContain("C");
+    expect(compact.edges[0].path).toContain("L");
 
-    expect(desktop.columns).toBe(4);
+    expect(desktop.columns).toBe(3);
     expect(desktop.nodes[1].x).toBeGreaterThan(desktop.nodes[0].x);
   });
 
@@ -170,7 +168,7 @@ describe("pipeline-visual-editor-model", () => {
     const pipeline = makePipeline();
     pipeline.transitions.push({
       from: "review",
-      to: "in_progress",
+      to: "ready",
       type: "gated",
       gates: ["review_passed"],
     });
@@ -178,7 +176,7 @@ describe("pipeline-visual-editor-model", () => {
     const graph = buildPipelineGraph(pipeline, false);
     const edge = graph.edges.at(-1);
     const fromNode = graph.nodes.find((node) => node.id === "review");
-    const toNode = graph.nodes.find((node) => node.id === "in_progress");
+    const toNode = graph.nodes.find((node) => node.id === "ready");
 
     expect(edge).toBeTruthy();
     expect(fromNode).toBeTruthy();

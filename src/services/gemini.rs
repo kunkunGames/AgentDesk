@@ -87,7 +87,7 @@ fn resolve_gemini_binary() -> crate::services::platform::BinaryResolution {
 }
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
-    execute_command_simple_inner(prompt, None)
+    execute_command_simple_cancellable(prompt, None)
 }
 
 pub fn execute_command_simple_with_timeout(
@@ -95,12 +95,20 @@ pub fn execute_command_simple_with_timeout(
     timeout: Duration,
     label: &str,
 ) -> Result<String, String> {
-    execute_command_simple_inner(prompt, Some((timeout, label)))
+    let prompt = prompt.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(execute_command_simple(&prompt));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(format!("{label} timeout after {}s", timeout.as_secs())),
+    }
 }
 
-fn execute_command_simple_inner(
+pub fn execute_command_simple_cancellable(
     prompt: &str,
-    timeout: Option<(Duration, &str)>,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<String, String> {
     let resolution = resolve_gemini_binary();
     let gemini_bin = resolution
@@ -111,23 +119,24 @@ fn execute_command_simple_inner(
     let args = build_exec_args(prompt, None, None, false)?;
     let mut command = Command::new(&gemini_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    command
+    let mut child = command
         .args(args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = if let Some((timeout, label)) = timeout {
-        configure_child_process_group(&mut command);
-        let child = command
-            .spawn()
-            .map_err(|e| format!("Failed to start Gemini: {}", e))?;
-        wait_with_output_timeout(child, timeout, label)?
-    } else {
-        command
-            .output()
-            .map_err(|e| format!("Failed to start Gemini: {}", e))?
-    };
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start Gemini: {}", e))?;
+
+    register_child_pid(cancel_token, child.id());
+    if is_cancelled(cancel_token) {
+        kill_child_tree(&mut child);
+        return Err("Gemini request cancelled".to_string());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read Gemini output: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

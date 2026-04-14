@@ -17,12 +17,10 @@ use crate::services::claude;
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
-use crate::services::process::{
-    configure_child_process_group, kill_child_tree, shell_escape, wait_with_output_timeout,
-};
+use crate::services::process::{kill_child_tree, shell_escape};
 use crate::services::provider::{
-    CancelToken, FollowupResult, ProviderKind, ReadOutputResult, SessionProbe,
-    tmux_followup_fallback_after_read_error,
+    CancelToken, FollowupResult, ProviderKind, ReadOutputResult, SessionProbe, cancel_requested,
+    register_child_pid, tmux_followup_fallback_after_read_error,
 };
 use crate::services::provider_runtime::{
     LineStreamEvent, SharedAllowedToolKind, resolve_shared_allowed_tool_compat,
@@ -180,20 +178,12 @@ fn resolve_qwen_binary() -> crate::services::platform::BinaryResolution {
 }
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
-    execute_command_simple_inner(prompt, None)
+    execute_command_simple_cancellable(prompt, None)
 }
 
-pub fn execute_command_simple_with_timeout(
+pub fn execute_command_simple_cancellable(
     prompt: &str,
-    timeout: Duration,
-    label: &str,
-) -> Result<String, String> {
-    execute_command_simple_inner(prompt, Some((timeout, label)))
-}
-
-fn execute_command_simple_inner(
-    prompt: &str,
-    timeout: Option<(Duration, &str)>,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<String, String> {
     let resolution = resolve_qwen_binary();
     let qwen_bin = resolution
@@ -204,23 +194,24 @@ fn execute_command_simple_inner(
 
     let mut command = Command::new(&qwen_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    command
+    let mut child = command
         .args(build_simple_exec_args(prompt))
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = if let Some((timeout, label)) = timeout {
-        configure_child_process_group(&mut command);
-        let child = command
-            .spawn()
-            .map_err(|e| format!("Failed to start Qwen: {}", e))?;
-        wait_with_output_timeout(child, timeout, label)?
-    } else {
-        command
-            .output()
-            .map_err(|e| format!("Failed to start Qwen: {}", e))?
-    };
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start Qwen: {}", e))?;
+
+    register_child_pid(cancel_token, child.id());
+    if cancel_requested(cancel_token) {
+        kill_child_tree(&mut child);
+        return Err("Qwen request cancelled".to_string());
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read Qwen output: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -375,7 +366,6 @@ fn execute_qwen_streaming_attempt(
     if let Some(provider) = report_provider {
         command.env(RESTART_REPORT_PROVIDER_ENV, provider.as_str());
     }
-    configure_child_process_group(&mut command);
 
     let mut child = command
         .spawn()
@@ -383,10 +373,6 @@ fn execute_qwen_streaming_attempt(
 
     if let Some(ref token) = cancel_token {
         *token.child_pid.lock().unwrap() = Some(child.id());
-    }
-    if crate::services::provider::cancel_requested(cancel_token.as_deref()) {
-        kill_child_tree(&mut child);
-        return Ok(QwenAttemptResult::Cancelled);
     }
 
     let stdout = child
@@ -510,6 +496,9 @@ fn collect_qwen_stream_events(
                 return QwenStreamLoopResult::Eof;
             }
             Err(RecvTimeoutError::Timeout) => {
+                if is_cancelled(cancel_token) {
+                    return QwenStreamLoopResult::Cancelled;
+                }
                 if state.terminal_result_seen {
                     return QwenStreamLoopResult::Eof;
                 }
