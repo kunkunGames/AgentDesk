@@ -1026,7 +1026,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gh_cmd_path = dir.path().join("gh.cmd");
         let wrapper = format!(
-            "@echo off\r\nif /I \"%~1\"==\"--version\" (\r\n  echo gh mock 1.0\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"issue\" if /I \"%~2\"==\"create\" (\r\n  echo {url}\r\n  exit /b 0\r\n)\r\nexit /b 1\r\n"
+            "@echo off\r\nsetlocal\r\nif /I \"%~1\"==\"--version\" goto version\r\nif /I not \"%~1\"==\"issue\" exit /b 1\r\nif /I not \"%~2\"==\"create\" exit /b 1\r\necho {url}\r\nexit /b 0\r\n:version\r\necho gh mock 1.0\r\nexit /b 0\r\n"
         );
         fs::write(&gh_cmd_path, wrapper).unwrap();
 
