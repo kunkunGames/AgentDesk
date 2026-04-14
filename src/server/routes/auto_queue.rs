@@ -247,8 +247,11 @@ fn live_dispatches_for_runs_sql(select_expr: &str, run_count: usize) -> String {
                    JOIN target_runs tr ON tr.id = pg.run_id
                    WHERE pg.dispatch_id = td.id
                )
-               OR json_extract(COALESCE(td.context, '{{}}'), '$.phase_gate.run_id') IN (
-                   SELECT id FROM target_runs
+               OR (
+                   json_valid(td.context)
+                   AND json_extract(td.context, '$.phase_gate.run_id') IN (
+                       SELECT id FROM target_runs
+                   )
                )
            )"
     )

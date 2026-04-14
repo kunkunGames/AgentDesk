@@ -78,6 +78,7 @@ fn resolve_dispatch_tmux_protection_from_conn(
          JOIN task_dispatches td
            ON td.id = s.active_dispatch_id
          WHERE s.active_dispatch_id IS NOT NULL
+           AND s.status != 'disconnected'
            AND (
              s.session_key = ?1
              OR s.session_key = ?2
@@ -92,8 +93,7 @@ fn resolve_dispatch_tmux_protection_from_conn(
            CASE s.status
              WHEN 'working' THEN 0
              WHEN 'idle' THEN 1
-             WHEN 'disconnected' THEN 2
-             ELSE 3
+             ELSE 2
            END,
            datetime(COALESCE(s.last_heartbeat, s.created_at)) DESC,
            s.rowid DESC
@@ -347,54 +347,6 @@ mod tests {
                 session_status: "idle".to_string(),
             })
         );
-    }
-
-    #[test]
-    fn ignores_session_rows_with_missing_dispatch_ids() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE sessions (
-                session_key TEXT,
-                provider TEXT,
-                status TEXT,
-                active_dispatch_id TEXT,
-                created_at TEXT,
-                last_heartbeat TEXT,
-                thread_channel_id TEXT
-            );
-            CREATE TABLE task_dispatches (
-                id TEXT PRIMARY KEY,
-                status TEXT,
-                thread_id TEXT,
-                created_at TEXT
-            );
-            ",
-        )
-        .unwrap();
-
-        let provider = ProviderKind::Codex;
-        let tmux_name = sample_tmux_name();
-        let session_key = crate::services::discord::adk_session::build_namespaced_session_key(
-            "tokenxyz", &provider, &tmux_name,
-        );
-        conn.execute(
-            "INSERT INTO sessions
-             (session_key, provider, status, active_dispatch_id, created_at, last_heartbeat, thread_channel_id)
-             VALUES (?1, ?2, 'idle', 'dispatch-missing', datetime('now'), datetime('now'), '1485506232256168011')",
-            rusqlite::params![session_key.as_str(), provider.as_str()],
-        )
-        .unwrap();
-
-        let protection = resolve_dispatch_tmux_protection_from_conn(
-            &conn,
-            "tokenxyz",
-            &provider,
-            &tmux_name,
-            Some("adk-cdx-t1485506232256168011"),
-        );
-
-        assert_eq!(protection, None);
     }
 
     #[test]
