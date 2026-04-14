@@ -4758,6 +4758,81 @@ mod tests {
     }
 
     #[test]
+    fn scenario_494_implementation_noop_completion_final_entry_queues_single_completion_notify() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-494-noop-final", "in_progress");
+        seed_dispatch(
+            &db,
+            "impl-494-noop-final",
+            "card-494-noop-final",
+            "implementation",
+            "pending",
+        );
+
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+             VALUES ('run-494-noop-final', 'test/repo', 'agent-1', 'active', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at, batch_phase, created_at) \
+             VALUES ('entry-494-noop-final', 'run-494-noop-final', 'card-494-noop-final', 'agent-1', 'dispatched', 'impl-494-noop-final', datetime('now'), 0, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-494-noop-final",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "work_outcome": "noop",
+                "completed_without_changes": true,
+                "card_status_target": "ready",
+                "notes": "already implemented"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        let conn = db.lock().unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-494-noop-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(
+            run_status, "completed",
+            "#494: noop completion on the final entry must complete the run"
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "#494: noop completion on the final entry must queue exactly one completion notify"
+        );
+        assert!(
+            messages[0]
+                .1
+                .contains("자동큐 완료: test/repo / run run-494- / 1개"),
+            "#494: completion notify should describe the completed run"
+        );
+    }
+
+    #[test]
     fn scenario_211_review_pass_seeds_pr_tracking_and_create_pr_dispatch() {
         let (repo, _repo_guard) = setup_test_repo();
         run_git(repo.path(), &["checkout", "-b", "wt/card-211-review"]);
