@@ -1111,35 +1111,33 @@ function extractIssueNumberFromUrl(url) {
 
 function buildCodexFollowUpTitle(card, pr) {
   var issueNum = card.github_issue_number || "?";
-  return "[Codex Follow-up] PR #" + pr.number + " #" + issueNum + " " + card.title;
+  return compactWhitespace("[Codex Follow-up] PR #" + pr.number + " #" + issueNum + " " + card.title);
 }
 
 function buildCodexFollowUpBody(card, pr, snapshot) {
-  var issueNum = card.github_issue_number || "?";
   var lines = [
-    "Codex review found unresolved P1/P2 inline comments on PR #" + pr.number + ".",
+    "Codex PR review reported unresolved P1/P2 inline comments.",
     "",
-    "- Source card: " + card.id,
-    "- Original issue: " + (card.github_issue_url || ("#" + issueNum)),
-    "- Original PR: https://github.com/" + pr.repo + "/pull/" + pr.number
+    "원본 카드: `" + card.id + "`",
+    "원본 PR: https://github.com/" + pr.repo + "/pull/" + pr.number,
+    "원본 이슈: " + (card.github_issue_url || "(none)"),
+    "담당 에이전트: `" + card.assigned_agent_id + "`",
+    "리뷰 ID: `" + (snapshot.triggerReviewId || snapshot.latestReviewId || "") + "`",
+    "",
+    "현재 작업을 끊는 rework dispatch 대신 follow-up backlog issue로 전환합니다.",
+    "",
+    "Comments:"
   ];
 
-  if (card.assigned_agent_id) {
-    lines.push("- Original agent: " + card.assigned_agent_id);
-  }
-
   if (snapshot.blockingFiles.length > 0) {
-    lines.push("- Affected files: " + snapshot.blockingFiles.join(", "));
+    lines.push("Files: " + snapshot.blockingFiles.join(", "));
   }
 
-  lines.push("");
-  lines.push("Unresolved comments:");
   for (var i = 0; i < snapshot.blockingComments.length; i++) {
     var comment = snapshot.blockingComments[i];
-    lines.push((i + 1) + ". " + comment.path + ":" + comment.line);
-    lines.push("   - Comment: " + comment.body);
+    lines.push("- " + comment.path + ":" + comment.line + " — " + comment.body);
     if (comment.url) {
-      lines.push("   - URL: " + comment.url);
+      lines.push("  comment: " + comment.url);
     }
   }
 
@@ -1154,52 +1152,134 @@ function buildCodexFollowUpBody(card, pr, snapshot) {
   return lines.join("\n");
 }
 
+function parseIssueNumberFromUrl(url) {
+  return extractIssueNumberFromUrl(url);
+}
+
+function codexFollowupPriority(snapshot) {
+  for (var i = 0; i < snapshot.blockingComments.length; i++) {
+    if (/\bP1\b/i.test(snapshot.blockingComments[i].body || "")) {
+      return "urgent";
+    }
+  }
+  return "high";
+}
+
+function createCodexFollowupIssue(card, pr, snapshot) {
+  var repo = pr.repo || card.repo_id;
+  if (!repo) return null;
+
+  var title = buildCodexFollowUpTitle(card, pr);
+  var body = buildCodexFollowUpBody(card, pr, snapshot);
+  var agentLabel = card.assigned_agent_id ? "agent:" + card.assigned_agent_id : null;
+  if (agentLabel) {
+    ensureGitHubLabel(repo, agentLabel, "1D76DB", "Auto-assign follow-up work to " + card.assigned_agent_id);
+  }
+  var args = [
+    "issue", "create",
+    "--repo", repo,
+    "--title", title,
+    "--body", body
+  ];
+  if (agentLabel) {
+    args.push("--label", agentLabel);
+  }
+  var output = agentdesk.exec("gh", args);
+  if (agentLabel && typeof output === "string" && output.indexOf("ERROR") === 0) {
+    agentdesk.log.warn("[merge] Codex follow-up issue create with label failed for PR #" + pr.number + ": " + output);
+    output = agentdesk.exec("gh", [
+      "issue", "create",
+      "--repo", repo,
+      "--title", title,
+      "--body", body
+    ]);
+  }
+  if (typeof output === "string" && output.indexOf("ERROR") === 0) {
+    throw new Error(output.replace(/^ERROR:\s*/, ""));
+  }
+  if (typeof output !== "string") {
+    throw new Error("gh issue create returned non-string output");
+  }
+
+  var issueUrl = normalizeGitHubUrlOutput(output);
+  if (!issueUrl) {
+    throw new Error("gh issue create returned empty output");
+  }
+  var issueNumber = extractIssueNumberFromUrl(issueUrl);
+  if (!issueNumber) {
+    throw new Error("gh issue create returned invalid issue URL: " + issueUrl);
+  }
+
+  return {
+    url: issueUrl,
+    issueNumber: issueNumber,
+    title: title,
+    body: body,
+    repo: repo,
+    priority: codexFollowupPriority(snapshot),
+    labels: agentLabel || ""
+  };
+}
+
+function createCodexFollowupBacklogCard(card, pr, snapshot, issueInfo) {
+  if (!issueInfo || !issueInfo.url || !issueInfo.repo) return null;
+
+  var issueNumber = Number(issueInfo.issueNumber || 0) || parseIssueNumberFromUrl(issueInfo.url);
+  if (!issueNumber) {
+    agentdesk.log.warn("[merge] Codex follow-up issue URL missing issue number for PR #" + pr.number + ": " + issueInfo.url);
+    return null;
+  }
+
+  var localCardId = compactWhitespace(
+    "codex-followup-" +
+    sanitizeKvKeyPart(issueInfo.repo) + "-" +
+    sanitizeKvKeyPart(pr.number) + "-" +
+    sanitizeKvKeyPart(snapshot.triggerReviewId || snapshot.latestReviewId)
+  );
+
+  agentdesk.db.execute(
+    "INSERT OR IGNORE INTO kanban_cards " +
+    "(id, repo_id, title, status, priority, github_issue_url, github_issue_number, description, metadata, created_at, updated_at) " +
+    "VALUES (?, ?, ?, 'backlog', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+    [
+      localCardId,
+      issueInfo.repo,
+      issueInfo.title,
+      issueInfo.priority,
+      issueInfo.url,
+      issueNumber,
+      issueInfo.body,
+      JSON.stringify({ labels: issueInfo.labels })
+    ]
+  );
+
+  return localCardId;
+}
+
 function processCodexBlockingReview(card, pr, snapshot) {
   if (!card || !snapshot.hasBlocking) return;
 
   var dedupKey = codexReviewDedupKey(pr.repo, pr.number, snapshot.triggerReviewId);
   if (agentdesk.kv.get(dedupKey)) return;
-
   var latestCard = loadCardContext(card.id);
   if (!latestCard) return;
 
-  var agentLabel = latestCard.assigned_agent_id ? "agent:" + latestCard.assigned_agent_id : null;
-  if (agentLabel) {
-    ensureGitHubLabel(pr.repo, agentLabel, "1D76DB", "Auto-assign follow-up work to " + latestCard.assigned_agent_id);
+  try {
+    var issueInfo = createCodexFollowupIssue(latestCard, pr, snapshot);
+    agentdesk.kv.set(dedupKey, issueInfo.url, CODEX_REVIEW_TTL_SECONDS);
+    createCodexFollowupBacklogCard(latestCard, pr, snapshot, issueInfo);
+    var followUpIssue = {
+      url: issueInfo.url,
+      number: issueInfo.issueNumber
+    };
+    agentdesk.log.info(
+      "[merge] Created Codex follow-up issue for PR #" + pr.number +
+      (followUpIssue.url ? ": " + followUpIssue.url : "")
+    );
+    notifyCodexReview(latestCard, pr, snapshot, "blocking", followUpIssue, false);
+  } catch (e) {
+    agentdesk.log.warn("[merge] Failed to create Codex follow-up issue for PR #" + pr.number + ": " + e);
   }
-
-  var args = [
-    "issue", "create",
-    "--repo", pr.repo,
-    "--title", buildCodexFollowUpTitle(latestCard, pr),
-    "--body", buildCodexFollowUpBody(latestCard, pr, snapshot)
-  ];
-  if (agentLabel) {
-    args.push("--label", agentLabel);
-  }
-
-  // Set dedup key optimistically BEFORE the gh call so concurrent ticks skip
-  agentdesk.kv.set(dedupKey, "true", CODEX_REVIEW_TTL_SECONDS);
-
-  // WARNING: agentdesk.exec is synchronous with no timeout — gh CLI hang will block all tick hooks
-  var created = agentdesk.exec("gh", args);
-  if (created && created.indexOf("ERROR") === 0) {
-    agentdesk.kv.delete(dedupKey);
-    agentdesk.log.warn("[merge] Failed to create Codex follow-up issue for PR #" + pr.number + ": " + created);
-    return;
-  }
-
-  var followUpUrl = normalizeGitHubUrlOutput(created);
-  var followUpIssue = {
-    url: followUpUrl,
-    number: extractIssueNumberFromUrl(followUpUrl) || extractIssueNumberFromText(created)
-  };
-
-  agentdesk.log.info(
-    "[merge] Created Codex follow-up issue for PR #" + pr.number +
-    (followUpIssue.url ? ": " + followUpIssue.url : "")
-  );
-  notifyCodexReview(latestCard, pr, snapshot, "blocking", followUpIssue, false);
 }
 
 function processCodexPassReview(card, pr, snapshot) {
