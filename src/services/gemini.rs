@@ -51,6 +51,34 @@ denyMessage = "AgentDesk meeting_readonly mode allows only filesystem read/searc
 
 type GeminiStreamEvent = LineStreamEvent;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeminiTrustRuleKind {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeminiTrustRule {
+    root: PathBuf,
+    kind: GeminiTrustRuleKind,
+}
+
+impl GeminiTrustRule {
+    fn allow(root: PathBuf) -> Self {
+        Self {
+            root,
+            kind: GeminiTrustRuleKind::Allow,
+        }
+    }
+
+    fn deny(root: PathBuf) -> Self {
+        Self {
+            root,
+            kind: GeminiTrustRuleKind::Deny,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum GeminiStreamLoopResult {
     Eof,
@@ -624,8 +652,8 @@ fn compose_gemini_prompt(
 
 fn resolve_gemini_working_dir(working_dir: &str) -> Result<PathBuf, String> {
     let requested_dir = expand_gemini_working_dir(working_dir);
-    let trusted_roots = gemini_trusted_roots();
-    select_gemini_working_dir(requested_dir, dirs::home_dir(), &trusted_roots)
+    let trust_rules = gemini_trust_rules();
+    select_gemini_working_dir(requested_dir, dirs::home_dir(), &trust_rules)
 }
 
 fn expand_gemini_working_dir(raw: &str) -> PathBuf {
@@ -644,7 +672,7 @@ fn expand_gemini_working_dir(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-fn gemini_trusted_roots() -> Vec<PathBuf> {
+fn gemini_trust_rules() -> Vec<GeminiTrustRule> {
     let Some(path) = dirs::home_dir().map(|home| home.join(GEMINI_TRUSTED_FOLDERS_PATH)) else {
         return Vec::new();
     };
@@ -660,7 +688,7 @@ fn gemini_trusted_roots() -> Vec<PathBuf> {
 
     entries
         .iter()
-        .filter_map(|(path, status)| gemini_trusted_root_for_entry(path, status))
+        .filter_map(|(path, status)| gemini_trust_rule_for_entry(path, status))
         .collect()
 }
 
@@ -668,32 +696,34 @@ fn gemini_trust_status_allows_root(status: &Value) -> bool {
     matches!(status.as_str(), Some("TRUST_FOLDER") | Some("TRUST_PARENT"))
 }
 
-fn gemini_trusted_root_for_entry(path: &str, status: &Value) -> Option<PathBuf> {
-    if !gemini_trust_status_allows_root(status) {
-        return None;
-    }
+fn gemini_trust_rule_for_entry(path: &str, status: &Value) -> Option<GeminiTrustRule> {
     if matches!(status.as_str(), Some("TRUST_PARENT")) {
         let rule_path = Path::new(path);
         let parent = rule_path.parent().unwrap_or(rule_path);
-        Some(normalize_gemini_path(parent))
-    } else {
-        Some(normalize_gemini_path(path))
+        return Some(GeminiTrustRule::allow(normalize_gemini_path(parent)));
     }
+    if gemini_trust_status_allows_root(status) {
+        return Some(GeminiTrustRule::allow(normalize_gemini_path(path)));
+    }
+    if matches!(status.as_str(), Some("DO_NOT_TRUST")) {
+        return Some(GeminiTrustRule::deny(normalize_gemini_path(path)));
+    }
+    None
 }
 
 fn select_gemini_working_dir(
     requested_dir: PathBuf,
     home_dir: Option<PathBuf>,
-    trusted_roots: &[PathBuf],
+    trust_rules: &[GeminiTrustRule],
 ) -> Result<PathBuf, String> {
-    if path_is_trusted_by_gemini(&requested_dir, trusted_roots) {
+    if path_is_trusted_by_gemini(&requested_dir, trust_rules) {
         return Ok(requested_dir);
     }
 
     if requested_dir.has_root() && requested_dir.parent().is_none() {
         if let Some(home_dir) = home_dir {
             let normalized_home = normalize_gemini_path(home_dir);
-            if path_is_trusted_by_gemini(&normalized_home, trusted_roots) {
+            if path_is_trusted_by_gemini(&normalized_home, trust_rules) {
                 return Ok(normalized_home);
             }
         }
@@ -711,11 +741,16 @@ fn select_gemini_working_dir(
     ))
 }
 
-fn path_is_trusted_by_gemini(path: &Path, trusted_roots: &[PathBuf]) -> bool {
+fn path_is_trusted_by_gemini(path: &Path, trust_rules: &[GeminiTrustRule]) -> bool {
     let normalized = normalize_gemini_path(path);
-    trusted_roots
+    let most_specific_rule = trust_rules
         .iter()
-        .any(|root| normalized.starts_with(root))
+        .filter(|rule| normalized.starts_with(&rule.root))
+        .max_by_key(|rule| rule.root.components().count());
+    matches!(
+        most_specific_rule.map(|rule| &rule.kind),
+        Some(GeminiTrustRuleKind::Allow)
+    )
 }
 
 fn normalize_gemini_path(path: impl AsRef<Path>) -> PathBuf {
@@ -958,8 +993,8 @@ mod tests {
         GEMINI_SESSION_DEAD_MESSAGE, GeminiAttemptState, GeminiStreamEvent, GeminiStreamLoopResult,
         build_exec_args, build_gemini_tool_result_message, build_gemini_tool_use_message,
         collect_gemini_stream_events, execute_command_streaming, extract_gemini_error_message,
-        extract_text_from_stream_output, finalize_gemini_attempt, gemini_trust_status_allows_root,
-        gemini_trusted_root_for_entry, looks_like_uuid, normalize_resume_selector,
+        extract_text_from_stream_output, finalize_gemini_attempt, gemini_trust_rule_for_entry,
+        gemini_trust_status_allows_root, looks_like_uuid, normalize_resume_selector,
         observed_session_to_resume_selector, process_gemini_stream_line,
         remote_profile_not_supported_message, run_gemini_streaming_attempts,
         select_gemini_working_dir,
@@ -1033,7 +1068,9 @@ mod tests {
 
     #[test]
     fn select_gemini_working_dir_keeps_trusted_descendant() {
-        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let trusted = vec![super::GeminiTrustRule::allow(PathBuf::from(
+            "/Users/kunkun",
+        ))];
         let resolved = select_gemini_working_dir(
             PathBuf::from("/Users/kunkun/kunkunGames/agentdesk"),
             Some(PathBuf::from("/Users/kunkun")),
@@ -1048,7 +1085,9 @@ mod tests {
 
     #[test]
     fn select_gemini_working_dir_falls_back_from_root_to_trusted_home() {
-        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let trusted = vec![super::GeminiTrustRule::allow(PathBuf::from(
+            "/Users/kunkun",
+        ))];
         let resolved = select_gemini_working_dir(
             PathBuf::from("/"),
             Some(PathBuf::from("/Users/kunkun")),
@@ -1061,7 +1100,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn select_gemini_working_dir_falls_back_from_drive_root_to_trusted_home() {
-        let trusted = vec![PathBuf::from(r"C:\Users\kunkun")];
+        let trusted = vec![super::GeminiTrustRule::allow(PathBuf::from(
+            r"C:\Users\kunkun",
+        ))];
         let resolved = select_gemini_working_dir(
             PathBuf::from(r"C:\"),
             Some(PathBuf::from(r"C:\Users\kunkun")),
@@ -1073,7 +1114,9 @@ mod tests {
 
     #[test]
     fn select_gemini_working_dir_rejects_untrusted_directory() {
-        let trusted = vec![PathBuf::from("/Users/kunkun")];
+        let trusted = vec![super::GeminiTrustRule::allow(PathBuf::from(
+            "/Users/kunkun",
+        ))];
         let error = select_gemini_working_dir(
             PathBuf::from("/private/tmp/example"),
             Some(PathBuf::from("/Users/kunkun")),
@@ -1092,24 +1135,25 @@ mod tests {
     }
 
     #[test]
-    fn gemini_trusted_root_maps_trust_parent_to_rule_parent() {
+    fn gemini_trust_rule_maps_supported_statuses() {
         assert_eq!(
-            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT"))
-                .unwrap(),
-            PathBuf::from("/private/tmp")
+            gemini_trust_rule_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT")).unwrap(),
+            super::GeminiTrustRule::allow(PathBuf::from("/private/tmp"))
         );
         assert_eq!(
-            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_FOLDER"))
-                .unwrap(),
-            PathBuf::from("/private/tmp/worktree-a")
+            gemini_trust_rule_for_entry("/private/tmp/worktree-a", &json!("TRUST_FOLDER")).unwrap(),
+            super::GeminiTrustRule::allow(PathBuf::from("/private/tmp/worktree-a"))
+        );
+        assert_eq!(
+            gemini_trust_rule_for_entry("/private/tmp/worktree-b", &json!("DO_NOT_TRUST")).unwrap(),
+            super::GeminiTrustRule::deny(PathBuf::from("/private/tmp/worktree-b"))
         );
     }
 
     #[test]
     fn select_gemini_working_dir_accepts_trust_parent_sibling() {
         let trusted = vec![
-            gemini_trusted_root_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT"))
-                .unwrap(),
+            gemini_trust_rule_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT")).unwrap(),
         ];
         let resolved = select_gemini_working_dir(
             PathBuf::from("/private/tmp/worktree-b/project"),
@@ -1118,6 +1162,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/private/tmp/worktree-b/project"));
+    }
+
+    #[test]
+    fn select_gemini_working_dir_rejects_denied_child_under_trusted_parent() {
+        let trusted = vec![
+            gemini_trust_rule_for_entry("/private/tmp/worktree-a", &json!("TRUST_PARENT")).unwrap(),
+            gemini_trust_rule_for_entry("/private/tmp/worktree-b", &json!("DO_NOT_TRUST")).unwrap(),
+        ];
+        let error = select_gemini_working_dir(
+            PathBuf::from("/private/tmp/worktree-b/project"),
+            Some(PathBuf::from("/Users/kunkun")),
+            &trusted,
+        )
+        .unwrap_err();
+        assert!(error.contains("/private/tmp/worktree-b/project"));
+        assert!(error.contains("not trusted"));
     }
 
     #[test]

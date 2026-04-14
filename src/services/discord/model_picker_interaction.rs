@@ -368,7 +368,11 @@ mod tests {
     #[test]
     fn model_picker_submit_notice_non_gemini_keeps_session() {
         use crate::services::provider::ProviderKind;
-        for provider in [ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Qwen] {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Qwen,
+        ] {
             let notice = model_picker_submit_notice(Some("gpt-5.4-mini"), &provider);
             assert!(
                 notice.contains("`gpt-5.4-mini`"),

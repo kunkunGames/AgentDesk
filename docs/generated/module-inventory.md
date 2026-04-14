@@ -197,7 +197,7 @@
 | `services::discord::meeting_orchestrator` | `src/services/discord/meeting_orchestrator.rs` | 3433 | giant-file |
 | `services::discord::metrics` | `src/services/discord/metrics.rs` | 148 |  |
 | `services::discord::model_catalog` | `src/services/discord/model_catalog.rs` | 1081 | giant-file |
-| `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 387 |  |
+| `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 424 |  |
 | `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 984 |  |
 | `services::discord::org_writer` | `src/services/discord/org_writer.rs` | 239 |  |
 | `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 965 |  |
@@ -231,7 +231,7 @@
 | `services::discord::turn_bridge::stale_resume` | `src/services/discord/turn_bridge/stale_resume.rs` | 87 |  |
 | `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 122 |  |
 | `services::dispatches` | `src/services/dispatches.rs` | 331 |  |
-| `services::gemini` | `src/services/gemini.rs` | 1875 | giant-file |
+| `services::gemini` | `src/services/gemini.rs` | 1936 | giant-file |
 | `services::kanban` | `src/services/kanban.rs` | 145 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 345 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 114 |  |
