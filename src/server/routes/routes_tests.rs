@@ -6519,6 +6519,224 @@ async fn auto_queue_dispatch_force_cancels_live_run_and_creates_new_run() {
 }
 
 #[tokio::test]
+async fn auto_queue_add_run_entry_creates_pending_entry_for_active_run() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_agent(&db, "project-agentdesk");
+    seed_auto_queue_card(
+        &db,
+        "card-run-entry-existing",
+        4921,
+        "ready",
+        "project-agentdesk",
+    );
+    seed_auto_queue_card(
+        &db,
+        "card-run-entry-new",
+        4922,
+        "ready",
+        "project-agentdesk",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count, created_at
+            ) VALUES (
+                'run-add-entry-active', 'test-repo', 'project-agentdesk', 'active', 1, 1, datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-run-entry-existing', 'run-add-entry-active', 'card-run-entry-existing',
+                'project-agentdesk', 'pending', 0, 0, 1
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/runs/run-add-entry-active/entries")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "issue_number": 4922,
+                        "batch_phase": 4,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["run_id"], "run-add-entry-active");
+    assert_eq!(json["thread_group"], 1);
+    assert_eq!(json["priority_rank"], 0);
+
+    let conn = db.lock().unwrap();
+    let inserted: (i64, i64, i64, String) = conn
+        .query_row(
+            "SELECT priority_rank, thread_group, batch_phase, status
+             FROM auto_queue_entries
+             WHERE run_id = 'run-add-entry-active'
+               AND kanban_card_id = 'card-run-entry-new'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(inserted, (0, 1, 4, "pending".to_string()));
+
+    let run_meta: (i64, i64) = conn
+        .query_row(
+            "SELECT thread_group_count, max_concurrent_threads
+             FROM auto_queue_runs
+             WHERE id = 'run-add-entry-active'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(run_meta, (2, 2));
+}
+
+#[tokio::test]
+async fn auto_queue_add_run_entry_rejects_non_active_runs() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_agent(&db, "project-agentdesk");
+    seed_auto_queue_card(
+        &db,
+        "card-run-entry-cancelled",
+        4923,
+        "ready",
+        "project-agentdesk",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, created_at
+            ) VALUES (
+                'run-add-entry-cancelled', 'test-repo', 'project-agentdesk', 'cancelled', datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/runs/run-add-entry-cancelled/entries")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "issue_number": 4923,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("status=cancelled"),
+        "inactive runs must be rejected with status details: {json}"
+    );
+}
+
+#[tokio::test]
+async fn auto_queue_add_run_entry_rejects_non_ready_cards() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_repo(&db, "test-repo");
+    seed_agent(&db, "project-agentdesk");
+    seed_auto_queue_card(
+        &db,
+        "card-run-entry-backlog",
+        4924,
+        "backlog",
+        "project-agentdesk",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, created_at
+            ) VALUES (
+                'run-add-entry-ready-only', 'test-repo', 'project-agentdesk', 'active', datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/runs/run-add-entry-ready-only/entries")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "issue_number": 4924,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("must be in ready status"),
+        "run-entry add must reject non-ready cards: {json}"
+    );
+}
+
+#[tokio::test]
 async fn auto_queue_update_entry_moves_pending_entry_and_syncs_run_groups() {
     let db = test_db();
     let engine = test_engine(&db);

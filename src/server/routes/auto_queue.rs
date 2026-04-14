@@ -107,6 +107,13 @@ pub struct UpdateEntryBody {
     pub priority_rank: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddRunEntryBody {
+    pub issue_number: i64,
+    pub thread_group: Option<i64>,
+    pub batch_phase: Option<i64>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ResetBody {
     pub agent_id: Option<String>,
@@ -1038,6 +1045,138 @@ fn find_matching_active_run_id(
         .map_err(|err| format!("query live runs: {err}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("collect live runs: {err}"))
+}
+
+#[derive(Debug)]
+struct AddedRunEntry {
+    entry_id: String,
+    thread_group: i64,
+    priority_rank: i64,
+}
+
+fn enqueue_entries_into_existing_run(
+    conn: &mut rusqlite::Connection,
+    run_id: &str,
+    requested_entries: &[GenerateEntryBody],
+    cards_by_issue: &HashMap<i64, ResolvedDispatchCard>,
+) -> Result<Vec<AddedRunEntry>, String> {
+    let existing_live_cards: HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT kanban_card_id
+                 FROM auto_queue_entries
+                 WHERE run_id = ?1
+                   AND status IN ('pending', 'dispatched')",
+            )
+            .map_err(|err| format!("prepare existing queued cards: {err}"))?;
+        stmt.query_map([run_id], |row| row.get::<_, String>(0))
+            .map_err(|err| format!("query existing queued cards: {err}"))?
+            .filter_map(|row| row.ok())
+            .collect()
+    };
+
+    let mut next_rank_by_group: HashMap<i64, i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT COALESCE(thread_group, 0), COALESCE(MAX(priority_rank), -1) + 1
+                 FROM auto_queue_entries
+                 WHERE run_id = ?1
+                 GROUP BY COALESCE(thread_group, 0)",
+            )
+            .map_err(|err| format!("prepare group ranks: {err}"))?;
+        stmt.query_map([run_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|err| format!("query group ranks: {err}"))?
+        .filter_map(|row| row.ok())
+        .collect()
+    };
+    let mut next_auto_group = conn
+        .query_row(
+            "SELECT COALESCE(MAX(COALESCE(thread_group, 0)), -1) + 1
+             FROM auto_queue_entries
+             WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| format!("query next thread group: {err}"))?;
+    let mut existing_live_cards = existing_live_cards;
+    let tx = conn
+        .transaction()
+        .map_err(|err| format!("begin enqueue transaction: {err}"))?;
+    let mut inserted = Vec::new();
+
+    for entry in requested_entries {
+        let Some(card) = cards_by_issue.get(&entry.issue_number) else {
+            continue;
+        };
+        if existing_live_cards.contains(&card.card_id) {
+            return Err(format!(
+                "issue #{} is already queued in run {run_id}",
+                entry.issue_number
+            ));
+        }
+
+        let has_active_dispatch: bool = tx
+            .query_row(
+                "SELECT COUNT(*) > 0
+                 FROM task_dispatches
+                 WHERE kanban_card_id = ?1
+                   AND status IN ('pending', 'dispatched')",
+                [&card.card_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_active_dispatch {
+            return Err(format!(
+                "issue #{} already has an active dispatch and cannot be queued again",
+                entry.issue_number
+            ));
+        }
+
+        let thread_group = entry.thread_group.unwrap_or_else(|| {
+            let chosen = next_auto_group;
+            next_auto_group += 1;
+            chosen
+        });
+        let priority_rank = *next_rank_by_group.entry(thread_group).or_insert(0);
+        next_rank_by_group.insert(thread_group, priority_rank + 1);
+        let entry_id = uuid::Uuid::new_v4().to_string();
+
+        tx.execute(
+            "INSERT INTO auto_queue_entries (
+                 id, run_id, kanban_card_id, agent_id, priority_rank, thread_group, batch_phase, reason
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             )",
+            rusqlite::params![
+                &entry_id,
+                run_id,
+                &card.card_id,
+                card.assigned_agent_id.as_deref().unwrap_or(""),
+                priority_rank,
+                thread_group,
+                entry.batch_phase.unwrap_or(0),
+                format!("manual run entry add for issue #{}", entry.issue_number),
+            ],
+        )
+        .map_err(|err| format!("insert auto-queue entry: {err}"))?;
+        existing_live_cards.insert(card.card_id.clone());
+        inserted.push(AddedRunEntry {
+            entry_id,
+            thread_group,
+            priority_rank,
+        });
+    }
+
+    if !inserted.is_empty() {
+        crate::db::auto_queue::sync_run_group_metadata(&tx, run_id)
+            .map_err(|err| format!("sync run group metadata: {err}"))?;
+    }
+
+    tx.commit()
+        .map_err(|err| format!("commit enqueue transaction: {err}"))?;
+    Ok(inserted)
 }
 
 fn existing_live_run_conflict_response(
@@ -3708,6 +3847,178 @@ pub async fn update_entry(
             "entry": state
                 .auto_queue_service()
                 .entry_json(&id, None)
+                .unwrap_or(serde_json::Value::Null),
+        })),
+    )
+}
+
+/// POST /api/auto-queue/runs/{id}/entries
+pub async fn add_run_entry(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(body): Json<AddRunEntryBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if body.issue_number <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "issue_number must be > 0"})),
+        );
+    }
+    if let Some(thread_group) = body.thread_group {
+        if thread_group < 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "thread_group must be >= 0"})),
+            );
+        }
+    }
+    let batch_phase = body.batch_phase.unwrap_or(0);
+    if batch_phase < 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "batch_phase must be >= 0"})),
+        );
+    }
+
+    let mut conn = match state.db.separate_conn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}")})),
+            );
+        }
+    };
+    let run_info: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, repo, agent_id
+             FROM auto_queue_runs
+             WHERE id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let Some((run_status, run_repo, run_agent_id)) = run_info else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("auto-queue run '{run_id}' not found")})),
+        );
+    };
+    if run_status != "active" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("auto-queue run '{run_id}' is not active (status={run_status})"),
+                "run_id": run_id,
+                "status": run_status,
+            })),
+        );
+    }
+
+    let issue_numbers = [body.issue_number];
+    let cards_by_issue = match resolve_dispatch_cards(&conn, run_repo.as_ref(), &issue_numbers) {
+        Ok(cards) => cards,
+        Err(err) => {
+            let status = if err.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (status, Json(json!({"error": err})));
+        }
+    };
+    let Some(card) = cards_by_issue.get(&body.issue_number) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(
+                json!({"error": format!("kanban card not found for issue #{}", body.issue_number)}),
+            ),
+        );
+    };
+    if card.status != "ready" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "issue #{} must be in ready status to be added to an active run (current={})",
+                    body.issue_number,
+                    card.status
+                )
+            })),
+        );
+    }
+
+    let run_agent = run_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let card_agent = card
+        .assigned_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (run_agent, card_agent) {
+        (_, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("issue #{} has no assigned agent", body.issue_number)
+                })),
+            );
+        }
+        (Some(run_agent), Some(card_agent)) if run_agent != card_agent => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "issue #{} is assigned to {}, not the active run agent {}",
+                        body.issue_number,
+                        card_agent,
+                        run_agent
+                    )
+                })),
+            );
+        }
+        _ => {}
+    }
+
+    let inserted = match enqueue_entries_into_existing_run(
+        &mut conn,
+        &run_id,
+        &[GenerateEntryBody {
+            issue_number: body.issue_number,
+            batch_phase: Some(batch_phase),
+            thread_group: body.thread_group,
+        }],
+        &cards_by_issue,
+    ) {
+        Ok(entries) => entries,
+        Err(err) => {
+            let status = if err.contains("already queued") || err.contains("active dispatch") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (status, Json(json!({"error": err})));
+        }
+    };
+    let Some(inserted_entry) = inserted.into_iter().next() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to create auto-queue entry"})),
+        );
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "ok": true,
+            "run_id": run_id,
+            "thread_group": inserted_entry.thread_group,
+            "priority_rank": inserted_entry.priority_rank,
+            "entry": state
+                .auto_queue_service()
+                .entry_json(&inserted_entry.entry_id, None)
                 .unwrap_or(serde_json::Value::Null),
         })),
     )
