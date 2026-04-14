@@ -3479,8 +3479,43 @@ mod tests {
             "card-615-terminal",
             "implementation",
         );
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE kanban_cards SET review_status = 'reviewing', blocked_reason = 'stale review dispatch' WHERE id = 'card-615-terminal'",
+                [],
+            )
+            .unwrap();
 
         kanban::fire_enter_hooks(&db, &engine, "card-615-terminal", "review");
+
+        let conn = db.lock().unwrap();
+        let review_dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-615-terminal' AND dispatch_type = 'review' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_dispatch_count, 0,
+            "#615: terminal cards must not spawn new review dispatches on stale OnReviewEnter"
+        );
+
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-615-terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            blocked_reason.is_none(),
+            "#615: terminal OnReviewEnter must clear stale blocked_reason"
+        );
+        drop(conn);
 
         assert_eq!(get_card_status(&db, "card-615-terminal"), "done");
         assert_eq!(
@@ -3488,9 +3523,10 @@ mod tests {
             0,
             "#615: terminal card must not create a stale review dispatch"
         );
-        assert!(
-            get_review_state(&db, "card-615-terminal").is_none(),
-            "#615: terminal card must not recreate canonical review state"
+        assert_eq!(
+            review_state_value(&db, "card-615-terminal").as_deref(),
+            Some("idle"),
+            "#615: terminal OnReviewEnter must keep canonical review state idle"
         );
     }
 
@@ -4596,6 +4632,79 @@ mod tests {
         assert_eq!(
             metadata["work_resolution_result"]["card_status_target"],
             "ready"
+        );
+    }
+
+    #[test]
+    fn scenario_615_completed_without_changes_skips_review_even_without_explicit_noop_marker() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-615-noop", "in_progress");
+        seed_dispatch(
+            &db,
+            "impl-615-noop",
+            "card-615-noop",
+            "implementation",
+            "pending",
+        );
+        seed_assistant_response_for_dispatch(
+            &db,
+            "impl-615-noop",
+            "verified existing implementation without additional edits",
+        );
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-615-noop",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "completed_without_changes": true,
+                "card_status_target": "done",
+                "notes": "already applied without code change"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            get_card_status(&db, "card-615-noop"),
+            "done",
+            "#615: completed_without_changes must bypass review and respect terminal target"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-615-noop", "review"),
+            0,
+            "#615: completed_without_changes must not enqueue a review dispatch"
+        );
+        assert_eq!(
+            review_state_value(&db, "card-615-noop").as_deref(),
+            Some("idle"),
+            "#615: noop completion must leave canonical review state idle"
+        );
+
+        let metadata_json: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT metadata FROM kanban_cards WHERE id = 'card-615-noop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["work_resolution_status"], "noop");
+        assert_eq!(
+            metadata["work_resolution_result"]["completed_without_changes"],
+            true
+        );
+        assert_eq!(
+            metadata["work_resolution_result"]["card_status_target"],
+            "done"
         );
     }
 
@@ -5907,7 +6016,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scenario_208_on_tick_creates_codex_follow_up_issue_and_dedups_review() {
-        let (repo, gh) = setup_test_repo_with_mock_gh(&[
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
             MockGhReply {
                 key: "pr:list",
                 contains: Some("--state merged"),
@@ -5936,7 +6045,7 @@ mod tests {
             MockGhReply {
                 key: "issue:create",
                 contains: Some("--label agent:agent-1"),
-                stdout: "https://github.com/test/repo/issues/400",
+                stdout: "https://github.com/test/repo/issues/900",
             },
         ]);
         run_git(
@@ -5964,17 +6073,45 @@ mod tests {
 
         assert_eq!(get_card_status(&db, "card-208"), "done");
         assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 0);
-        assert_ne!(
-            review_state_value(&db, "card-208").as_deref(),
-            Some("rework_pending")
+        assert_eq!(review_state_value(&db, "card-208").as_deref(), None);
+
+        let conn = db.lock().unwrap();
+        let (followup_status, followup_title, followup_description, followup_metadata): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, title, description, metadata \
+                 FROM kanban_cards WHERE repo_id = 'test/repo' AND github_issue_number = 900",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(followup_status, "backlog");
+        assert!(followup_title.contains("PR #323"));
+        assert!(
+            followup_description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("src/server/routes/github.rs:77")
         );
+        let followup_metadata_json: serde_json::Value =
+            serde_json::from_str(followup_metadata.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(followup_metadata_json["labels"], "agent:agent-1");
 
         let messages = message_outbox_rows(&db);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].0, "thread-208");
         assert!(messages[0].1.contains("PR #323"));
         assert!(messages[0].1.contains("follow-up 이슈를 생성했습니다"));
-        assert!(messages[0].1.contains("#400"));
+        assert!(
+            messages[0]
+                .1
+                .contains("https://github.com/test/repo/issues/900")
+        );
 
         engine
             .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
@@ -5984,7 +6121,7 @@ mod tests {
         assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 0);
         assert_eq!(message_outbox_rows(&db).len(), 1);
 
-        let log = gh_log(&gh._gh);
+        let log = gh_log(&env._gh);
         assert_eq!(
             log.matches("label create agent:agent-1").count(),
             1,
@@ -5994,6 +6131,191 @@ mod tests {
             log.matches("issue create --repo test/repo").count(),
             1,
             "Codex follow-up flow must create exactly one follow-up issue per review"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_615_codex_followup_dedups_even_if_backlog_insert_fails() {
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":325,\"headRefName\":\"wt/card-615-dedup\",\"title\":\"fix: follow-up dedup (#615)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/325/reviews",
+                contains: None,
+                stdout: "[{\"id\":9003,\"state\":\"COMMENTED\",\"body\":\"P1 blocking finding\",\"submitted_at\":\"2026-04-06T00:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-615\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-615\",\"body\":\"P1 keep dedup even if backlog insert fails\",\"path\":\"policies/merge-automation.js\",\"line\":1209,\"url\":\"https://example.com/comment-615\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9003\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "label:create",
+                contains: Some("agent:agent-1"),
+                stdout: "label ok",
+            },
+            MockGhReply {
+                key: "issue:create",
+                contains: Some("--label agent:agent-1"),
+                stdout: "https://github.com/test/repo/issues/901",
+            },
+        ]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:test/repo.git"],
+        );
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-615-dedup", "done", "test/repo", 615, None);
+        seed_thread_session(&db, "s-615-dedup", "thread-615-dedup");
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(
+            &db,
+            "pr:card-615-dedup",
+            r#"{"number":325,"repo":"test/repo","branch":"wt/card-615-dedup"}"#,
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_codex_followup_backlog_insert
+                 BEFORE INSERT ON kanban_cards
+                 WHEN NEW.id LIKE 'codex-followup-%'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'boom');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let followup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_cards \
+                 WHERE repo_id = 'test/repo' AND github_issue_number = 901",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            followup_count, 0,
+            "failed backlog insert must not leave partial local card"
+        );
+        assert_eq!(
+            gh_log(&env._gh).matches("issue create").count(),
+            1,
+            "issue creation must still dedup even when backlog insert fails"
+        );
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "failed backlog insert should not emit success notification"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_615_codex_followup_rejects_invalid_issue_url() {
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":326,\"headRefName\":\"wt/card-615-url\",\"title\":\"fix: validate follow-up url (#615)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/326/reviews",
+                contains: None,
+                stdout: "[{\"id\":9004,\"state\":\"COMMENTED\",\"body\":\"P2 malformed follow-up url risk\",\"submitted_at\":\"2026-04-06T00:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-615-url\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-615-url\",\"body\":\"P2 validate issue URL\",\"path\":\"policies/merge-automation.js\",\"line\":1167,\"url\":\"https://example.com/comment-615-url\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9004\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "label:create",
+                contains: Some("agent:agent-1"),
+                stdout: "label ok",
+            },
+            MockGhReply {
+                key: "issue:create",
+                contains: Some("--label agent:agent-1"),
+                stdout: "https://github.com/test/repo/pull/901",
+            },
+        ]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:test/repo.git"],
+        );
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-615-url", "done", "test/repo", 615, None);
+        seed_thread_session(&db, "s-615-url", "thread-615-url");
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(
+            &db,
+            "pr:card-615-url",
+            r#"{"number":326,"repo":"test/repo","branch":"wt/card-615-url"}"#,
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let followup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_cards \
+                 WHERE repo_id = 'test/repo' AND title LIKE '%PR #326%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            followup_count, 0,
+            "invalid issue URL must not create a backlog card"
+        );
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "invalid issue URL must not emit a follow-up success notification"
+        );
+        assert_eq!(
+            gh_log(&env._gh).matches("issue create").count(),
+            1,
+            "invalid issue URL should fail fast without fallback loops inside one tick"
         );
     }
 
