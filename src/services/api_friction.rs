@@ -1267,6 +1267,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "batch file argument sanitization rejects gh mock args on Windows"
+    )]
     async fn process_api_friction_patterns_creates_issue_once() {
         let lock = crate::services::discord::runtime_store::lock_test_env();
         let _mock_gh =
