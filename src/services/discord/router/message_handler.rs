@@ -3182,9 +3182,7 @@ mod tests {
     fn session_reset_reason_triggers_after_idle_timeout() {
         let mut session = make_session(Some("/tmp/project".to_string()), None);
         let last_active = tokio::time::Instant::now();
-        let now = last_active
-            + crate::services::discord::SESSION_MAX_IDLE
-            + Duration::from_secs(1);
+        let now = last_active + crate::services::discord::SESSION_MAX_IDLE + Duration::from_secs(1);
         session.last_active = last_active;
 
         assert_eq!(
