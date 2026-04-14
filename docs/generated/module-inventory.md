@@ -92,7 +92,7 @@
 | `engine::sql_guard` | `src/engine/sql_guard.rs` | 230 |  |
 | `engine::transition` | `src/engine/transition.rs` | 1342 | giant-file |
 | `error` | `src/error.rs` | 188 |  |
-| `github` | `src/github/mod.rs` | 703 |  |
+| `github` | `src/github/mod.rs` | 737 |  |
 | `github::dod` | `src/github/dod.rs` | 395 |  |
 | `github::sync` | `src/github/sync.rs` | 496 |  |
 | `github::triage` | `src/github/triage.rs` | 247 |  |
@@ -105,7 +105,7 @@
 | `reconcile` | `src/reconcile.rs` | 539 |  |
 | `runtime` | `src/runtime.rs` | 112 |  |
 | `runtime_layout` | `src/runtime_layout.rs` | 2955 | giant-file |
-| `server` | `src/server/mod.rs` | 1090 | giant-file |
+| `server` | `src/server/mod.rs` | 1086 | giant-file |
 | `server::background` | `src/server/background.rs` | 535 |  |
 | `server::boot` | `src/server/boot.rs` | 141 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 71 |  |
