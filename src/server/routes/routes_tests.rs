@@ -3862,6 +3862,67 @@ fn on_tick1min_orphan_review_treats_e2e_dispatch_as_active() {
 }
 
 #[test]
+fn on_tick1min_orphan_review_skips_recently_completed_review_gap() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-review-gap");
+    seed_repo(&db, "test-repo");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, repo_id,
+                review_entered_at, created_at, updated_at
+            ) VALUES (
+                'card-review-gap', 'Review Gap', 'review', 'medium', 'agent-review-gap', 'test-repo',
+                datetime('now', '-10 minutes'), datetime('now', '-10 minutes'), datetime('now', '-10 minutes')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                created_at, updated_at, completed_at
+            ) VALUES (
+                'dispatch-review-gap', 'card-review-gap', 'agent-review-gap', 'review', 'completed', 'Review Gap R1',
+                datetime('now', '-10 minutes'), datetime('now', '-30 seconds'), datetime('now', '-30 seconds')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = 'dispatch-review-gap' WHERE id = 'card-review-gap'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let _ = engine.try_fire_hook_by_name("OnTick1min", serde_json::json!({}));
+    drain_pending_transitions(&db, &engine);
+
+    let conn = db.lock().unwrap();
+    let (status, blocked_reason): (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, blocked_reason FROM kanban_cards WHERE id = 'card-review-gap'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        status, "review",
+        "recently completed review dispatch must protect the review-decision creation gap"
+    );
+    assert!(
+        blocked_reason.is_none(),
+        "recent review completion gap must not leave an orphan-review blocked_reason"
+    );
+}
+
+#[test]
 fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
     crate::pipeline::ensure_loaded();
     let db = test_db();

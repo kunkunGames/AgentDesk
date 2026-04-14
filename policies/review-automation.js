@@ -79,7 +79,11 @@ var reviewAutomation = {
         " (completed work dispatches=" + completedWorkCount + ")"
       );
     }
-    agentdesk.kanban.setReviewStatus(card.id, "reviewing", {review_entered_at: "now", exclude_status: terminalState});
+    agentdesk.kanban.setReviewStatus(card.id, "reviewing", {
+      review_entered_at: "now",
+      blocked_reason: null,
+      exclude_status: terminalState
+    });
 
     // #117: Update canonical card_review_state
     agentdesk.reviewState.sync(card.id, "reviewing", { review_round: newRound });
