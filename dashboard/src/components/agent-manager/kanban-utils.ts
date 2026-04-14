@@ -116,14 +116,6 @@ export interface CardDwellBadge {
 // Pure functions
 // ---------------------------------------------------------------------------
 
-export function isManualInterventionCard(card: KanbanCard): boolean {
-  return card.status === "blocked" || card.status === "pending_decision";
-}
-
-export function hasManualInterventionReason(card: KanbanCard): boolean {
-  return Boolean(card.blocked_reason);
-}
-
 export function isReviewCard(card: KanbanCard): boolean {
   return !!(card.latest_dispatch_type && REVIEW_DISPATCH_TYPES.has(card.latest_dispatch_type));
 }
@@ -145,7 +137,10 @@ export function hasManualInterventionReason(card: Pick<KanbanCard, "blocked_reas
 export function isManualInterventionCard(
   card: Pick<KanbanCard, "review_status" | "blocked_reason">,
 ): boolean {
-  return card.review_status === "dilemma_pending" || hasManualInterventionReason(card);
+  return (
+    MANUAL_INTERVENTION_REVIEW_STATUSES.has(card.review_status ?? "") ||
+    hasManualInterventionReason(card)
+  );
 }
 
 export function priorityLabel(priority: KanbanCardPriority, tr: (ko: string, en: string) => string): string {
