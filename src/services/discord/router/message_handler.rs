@@ -305,6 +305,15 @@ pub(in crate::services::discord) async fn handle_text_message(
             uploads,
         )
     };
+    let is_dm_channel = matches!(
+        channel_id.to_channel(&ctx.http).await.ok(),
+        Some(serenity::Channel::Private(_))
+    );
+    let dm_default_agent = if is_dm_channel {
+        super::super::agentdesk_config::resolve_dm_default_agent(&provider)
+    } else {
+        None
+    };
 
     let (session_id, memento_context_loaded, current_path) = match session_info {
         Some(info) => info,
@@ -338,6 +347,16 @@ pub(in crate::services::discord) async fn handle_text_message(
                         );
                     }
                 }
+            }
+            if workspace.is_none()
+                && let Some(default_agent) = dm_default_agent.as_ref()
+            {
+                workspace = Some(default_agent.workspace.clone());
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 💬 DM auto-start: using default agent '{}' workspace",
+                    default_agent.role_binding.role_id
+                );
             }
             if let Some(ws_path) = workspace {
                 let ws = std::path::Path::new(&ws_path);
@@ -740,7 +759,12 @@ pub(in crate::services::discord) async fn handle_text_message(
                 .and_then(|s| s.channel_name.as_deref());
             resolve_role_binding(channel_id, ch_name)
         }
-    };
+    }
+    .or_else(|| {
+        dm_default_agent
+            .as_ref()
+            .map(|resolved| resolved.role_binding.clone())
+    });
 
     // For cross-channel dispatch reuse, override the provider so the turn
     // executes via the counter-model CLI (e.g. Codex reviews Claude's work).

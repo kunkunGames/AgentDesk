@@ -408,12 +408,24 @@ pub(super) async fn auto_restore_session(
         resolve_thread_parent(&serenity_ctx.http, channel_id).await,
         channel_id,
     );
+    let is_dm = matches!(
+        channel_id.to_channel(&serenity_ctx.http).await.ok(),
+        Some(serenity::Channel::Private(_))
+    );
 
     // Read settings first to get provider and runtime restore metadata.
     let (last_path, saved_remote, provider) = {
         let settings = shared.settings.read().await;
         let provider = settings.provider.clone();
-        let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref());
+        let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref())
+            .or_else(|| {
+                if is_dm {
+                    super::agentdesk_config::resolve_dm_default_agent(&provider)
+                        .map(|resolved| resolved.workspace)
+                } else {
+                    None
+                }
+            });
         let saved_remote =
             load_last_remote_profile(shared.db.as_ref(), &shared.token_hash, channel_id.get());
 
