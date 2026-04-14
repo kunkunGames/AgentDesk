@@ -1881,11 +1881,10 @@ fn render_qwen_value(value: &Value) -> String {
 mod tests {
     use super::{
         QWEN_CODE_SYSTEM_SETTINGS_ENV, QwenAttemptState, QwenResumeStrategy, QwenStreamEvent,
-        QwenStreamLoopResult, build_stream_exec_args, collect_qwen_stream_events,
-        compose_qwen_prompt, create_system_settings_override, extract_text_from_json_output,
-        normalize_resume_strategy, process_qwen_json_event, qwen_project_cache_key,
-        resolve_allowed_core_tools,
-        build_simple_exec_args,
+        QwenStreamLoopResult, build_simple_exec_args, build_stream_exec_args,
+        collect_qwen_stream_events, compose_qwen_prompt, create_system_settings_override,
+        extract_text_from_json_output, normalize_resume_strategy, process_qwen_json_event,
+        qwen_project_cache_key, resolve_allowed_core_tools,
     };
     use crate::services::agent_protocol::StreamMessage;
     use crate::services::provider::CancelToken;

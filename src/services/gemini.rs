@@ -689,7 +689,7 @@ fn select_gemini_working_dir(
         return Ok(requested_dir);
     }
 
-    if requested_dir == Path::new("/") {
+    if requested_dir.has_root() && requested_dir.parent().is_none() {
         if let Some(home_dir) = home_dir {
             let normalized_home = normalize_gemini_path(home_dir);
             if path_is_trusted_by_gemini(&normalized_home, trusted_roots) {
@@ -697,7 +697,8 @@ fn select_gemini_working_dir(
             }
         }
         return Err(format!(
-            "Gemini cannot use `/` as the working directory in headless mode because it is not trusted in `~/{}`. Trust `/` or switch the session to a trusted folder.",
+            "Gemini cannot use `{}` as the working directory in headless mode because it is not trusted in `~/{}`. Trust that filesystem root or switch the session to a trusted folder.",
+            requested_dir.display(),
             GEMINI_TRUSTED_FOLDERS_PATH
         ));
     }
@@ -1054,6 +1055,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, PathBuf::from("/Users/kunkun"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_gemini_working_dir_falls_back_from_drive_root_to_trusted_home() {
+        let trusted = vec![PathBuf::from(r"C:\Users\kunkun")];
+        let resolved = select_gemini_working_dir(
+            PathBuf::from(r"C:\"),
+            Some(PathBuf::from(r"C:\Users\kunkun")),
+            &trusted,
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from(r"C:\Users\kunkun"));
     }
 
     #[test]

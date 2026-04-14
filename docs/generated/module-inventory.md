@@ -63,10 +63,10 @@
 | `db::cron_history` | `src/db/cron_history.rs` | 74 |  |
 | `db::kanban` | `src/db/kanban.rs` | 165 |  |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 255 |  |
-| `db::schema` | `src/db/schema.rs` | 2714 | giant-file |
+| `db::schema` | `src/db/schema.rs` | 2716 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 262 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 788 |  |
-| `dispatch` | `src/dispatch/mod.rs` | 3883 | giant-file |
+| `dispatch` | `src/dispatch/mod.rs` | 3917 | giant-file |
 | `engine` | `src/engine/mod.rs` | 1492 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 |  |
 | `engine::intent` | `src/engine/intent.rs` | 812 |  |
@@ -176,7 +176,7 @@
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 716 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 814 |  |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 38 |  |
-| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1141 | giant-file |
+| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1153 | giant-file |
 | `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 535 |  |
 | `services::discord::commands::diagnostics` | `src/services/discord/commands/diagnostics.rs` | 827 |  |
 | `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 59 |  |
@@ -197,7 +197,7 @@
 | `services::discord::meeting_orchestrator` | `src/services/discord/meeting_orchestrator.rs` | 3433 | giant-file |
 | `services::discord::metrics` | `src/services/discord/metrics.rs` | 148 |  |
 | `services::discord::model_catalog` | `src/services/discord/model_catalog.rs` | 1081 | giant-file |
-| `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 295 |  |
+| `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 387 |  |
 | `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 984 |  |
 | `services::discord::org_writer` | `src/services/discord/org_writer.rs` | 239 |  |
 | `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 965 |  |
@@ -217,7 +217,7 @@
 | `services::discord::settings` | `src/services/discord/settings.rs` | 3221 | giant-file |
 | `services::discord::shared_memory` | `src/services/discord/shared_memory.rs` | 59 |  |
 | `services::discord::shared_state` | `src/services/discord/shared_state.rs` | 370 |  |
-| `services::discord::tmux` | `src/services/discord/tmux.rs` | 3610 | giant-file |
+| `services::discord::tmux` | `src/services/discord/tmux.rs` | 3664 | giant-file |
 | `services::discord::tmux_lifecycle` | `src/services/discord/tmux_lifecycle.rs` | 716 |  |
 | `services::discord::tmux_reaper` | `src/services/discord/tmux_reaper.rs` | 343 |  |
 | `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 1759 | giant-file |
@@ -231,7 +231,7 @@
 | `services::discord::turn_bridge::stale_resume` | `src/services/discord/turn_bridge/stale_resume.rs` | 87 |  |
 | `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 122 |  |
 | `services::dispatches` | `src/services/dispatches.rs` | 331 |  |
-| `services::gemini` | `src/services/gemini.rs` | 1669 | giant-file |
+| `services::gemini` | `src/services/gemini.rs` | 1875 | giant-file |
 | `services::kanban` | `src/services/kanban.rs` | 145 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 345 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 114 |  |
@@ -248,7 +248,7 @@
 | `services::provider_exec` | `src/services/provider_exec.rs` | 355 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 247 |  |
-| `services::qwen` | `src/services/qwen.rs` | 2185 | giant-file |
+| `services::qwen` | `src/services/qwen.rs` | 2204 | giant-file |
 | `services::qwen_tmux_wrapper` | `src/services/qwen_tmux_wrapper.rs` | 1047 | giant-file |
 | `services::remote_stub` | `src/services/remote_stub.rs` | 45 |  |
 | `services::retrospectives` | `src/services/retrospectives.rs` | 635 |  |
