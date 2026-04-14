@@ -2905,9 +2905,12 @@ pub(crate) fn activate_with_deps(
 
         if post_walk.entry_status != "pending" {
             if post_walk.entry_status == "dispatched" {
+                // Another activate worker already reserved this group while this
+                // call was walking the card. Treat the slot as occupied for
+                // scheduling, but do not count it as a dispatch created by this
+                // request.
                 occupied_agents.insert(agent_id.clone());
                 dispatched_groups_this_activate += 1;
-                dispatched.push(deps.entry_json(&entry_id));
             }
             continue;
         }
@@ -2956,9 +2959,10 @@ pub(crate) fn activate_with_deps(
                 ),
             }
             drop(conn);
+            // Repair the entry linkage to the dispatch that already exists, but
+            // do not report it as a new dispatch created by this activate call.
             occupied_agents.insert(agent_id.clone());
             dispatched_groups_this_activate += 1;
-            dispatched.push(deps.entry_json(&entry_id));
             continue;
         }
 
