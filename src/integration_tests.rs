@@ -3741,6 +3741,57 @@ mod tests {
         assert_eq!(phase_gate_json["next_phase"], 2);
     }
 
+    #[test]
+    fn deploy_gate_creation_skips_when_phase_still_has_live_entries() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-deploy-anchor", "done");
+        seed_card(&db, "card-deploy-live", "ready");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, deploy_phases, created_at) \
+                 VALUES ('run-deploy-live-phase', 'test/repo', 'agent-1', 'active', '[1]', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, batch_phase, priority_rank, created_at) \
+                 VALUES ('entry-deploy-live', 'run-deploy-live-phase', 'card-deploy-live', 'agent-1', 'pending', 1, 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .eval_js::<String>(
+                r#"(() => {
+                    _createDeployGateDispatch("run-deploy-live-phase", 1, 2, false, "card-deploy-anchor");
+                    return "ok";
+                })()"#,
+            )
+            .expect("deploy gate helper should evaluate");
+
+        let run_status: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-deploy-live-phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(run_status, "active");
+        assert!(
+            phase_gate_state(&db, "run-deploy-live-phase", 1).is_none(),
+            "deploy gate must not persist while the phase still has live entries"
+        );
+    }
+
     #[tokio::test]
     async fn auto_queue_phase_gate_blocks_resume_then_completes_final_run_on_pass() {
         let db = test_db();
