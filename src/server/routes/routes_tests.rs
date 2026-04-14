@@ -7249,61 +7249,12 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         .unwrap();
     let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
     assert_eq!(
-        first_json["count"], 1,
-        "first activation must dispatch only one group for the same agent"
+        first_json["count"], 2,
+        "first activation must dispatch two groups in parallel when two slots are available"
     );
 
     {
         let conn = db.lock().unwrap();
-        let first_slot_session: (String, Option<String>, i64, Option<String>) = conn
-            .query_row(
-                "SELECT status, active_dispatch_id, COALESCE(tokens, 0), claude_session_id
-                 FROM sessions WHERE thread_channel_id = '222000000000000001'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        let second_slot_session: (String, Option<String>, i64, Option<String>) = conn
-            .query_row(
-                "SELECT status, active_dispatch_id, COALESCE(tokens, 0), claude_session_id
-                 FROM sessions WHERE thread_channel_id = '222000000000000002'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            first_slot_session.0, "idle",
-            "slot session status must be idle after release"
-        );
-        assert_eq!(
-            first_slot_session.1, None,
-            "active_dispatch_id must be cleared on slot release"
-        );
-        assert_eq!(
-            first_slot_session.2, 0,
-            "tokens must be cleared so the slot starts from a fresh session"
-        );
-        assert!(
-            first_slot_session.3.is_none(),
-            "claude_session_id must be cleared on slot release"
-        );
-        assert_eq!(
-            second_slot_session.0, "working",
-            "unused sibling slot must stay untouched until it is actually reused"
-        );
-        assert_eq!(
-            second_slot_session.1.as_deref(),
-            Some("dispatch-slot-old-1"),
-            "unused sibling slot must keep its original dispatch context"
-        );
-        assert_eq!(
-            second_slot_session.2, 73,
-            "unused sibling slot must preserve existing token state"
-        );
-        assert!(
-            second_slot_session.3.as_deref() == Some("claude-slot-1"),
-            "unused sibling slot must preserve claude_session_id"
-        );
         let first_slot: Option<i64> = conn
             .query_row(
                 "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-slot-0'",
@@ -7319,7 +7270,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
             )
             .unwrap();
         assert_eq!(first_slot, Some(0));
-        assert_eq!(second_slot, None);
+        assert_eq!(second_slot, Some(1));
         conn.execute(
             "UPDATE sessions
              SET status = 'working',
@@ -7407,7 +7358,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         )
         .unwrap();
     assert_eq!(slot_zero_group, Some(2));
-    assert_eq!(slot_one_group, None);
+    assert_eq!(slot_one_group, Some(1));
 
     let recycled_slot_session: (String, Option<String>, i64, Option<String>) = conn
         .query_row(
@@ -7716,8 +7667,8 @@ async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_
         .unwrap();
     let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
     assert_eq!(
-        first_json["count"], 1,
-        "first activate must dispatch only one group for the same agent"
+        first_json["count"], 2,
+        "first activate must dispatch both groups in parallel when slots are available"
     );
 
     let second_response = app
@@ -7768,8 +7719,8 @@ async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_
         )
         .unwrap();
     assert_eq!(
-        sibling_group_status, "pending",
-        "different thread_group for the same agent must also stay pending until the next activate"
+        sibling_group_status, "dispatched",
+        "different thread_group for the same agent must dispatch in parallel when slots are available"
     );
 
     let guard_dispatch_count: i64 = conn
@@ -7867,10 +7818,10 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        json["count"], 1,
-        "activate must still dispatch only one group when all pending work targets the same agent"
+        json["count"], 4,
+        "activate must dispatch all groups in parallel when slots are available"
     );
-    assert_eq!(json["active_groups"], 1);
+    assert_eq!(json["active_groups"], 4);
 
     let conn = db.lock().unwrap();
     let slot_count: i64 = conn
@@ -7899,7 +7850,7 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         .filter_map(|row| row.ok().flatten())
         .collect::<Vec<_>>();
     assigned_slots.sort_unstable();
-    assert_eq!(assigned_slots, vec![0]);
+    assert_eq!(assigned_slots, vec![0, 1, 2, 3]);
 
     let fourth_slot_group: Option<i64> = conn
         .query_row(
@@ -7911,8 +7862,9 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         )
         .unwrap();
     assert_eq!(
-        fourth_slot_group, None,
-        "newly created slot must stay unassigned until a later activate consumes it"
+        fourth_slot_group,
+        Some(3),
+        "newly expanded slot must be assigned when parallel dispatch fills all slots"
     );
 }
 
@@ -10250,8 +10202,8 @@ async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
         .await
         .unwrap();
     let activate_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(activate_json["count"], 1);
-    assert_eq!(activate_json["active_groups"], 1);
+    assert_eq!(activate_json["count"], 2);
+    assert_eq!(activate_json["active_groups"], 2);
 }
 
 #[test]
