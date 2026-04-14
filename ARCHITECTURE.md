@@ -323,7 +323,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |
 | `src/logging.rs` | Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs. |
 | `src/main.rs` | Binary entry point. Dispatches CLI commands or boots the server runtime. |
-| `src/manual_intervention.rs` | Classifies blocked/review states that should escalate to explicit manual intervention. |
+| `src/manual_intervention.rs` | Manual intervention parsing and helpers shared by Discord reply/requeue flows. |
 | `src/pipeline.rs` | Pipeline stage loading, resolution, and transition helpers. |
 | `src/receipt.rs` | Receipt parsing and workspace attribution helpers. |
 | `src/reconcile.rs` | Boot-time reconciliation for persisted state and dispatch-runtime drift. |

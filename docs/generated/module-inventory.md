@@ -179,7 +179,7 @@
 | `services::auto_queue` | `src/services/auto_queue.rs` | 914 |  |
 | `services::auto_queue::runtime` | `src/services/auto_queue/runtime.rs` | 235 |  |
 | `services::claude` | `src/services/claude.rs` | 2295 | giant-file |
-| `services::codex` | `src/services/codex.rs` | 1321 | giant-file |
+| `services::codex` | `src/services/codex.rs` | 1319 | giant-file |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 572 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 1939 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 716 |  |
@@ -241,7 +241,7 @@
 | `services::discord::turn_bridge::stale_resume` | `src/services/discord/turn_bridge/stale_resume.rs` | 87 |  |
 | `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 122 |  |
 | `services::dispatches` | `src/services/dispatches.rs` | 331 |  |
-| `services::gemini` | `src/services/gemini.rs` | 1959 | giant-file |
+| `services::gemini` | `src/services/gemini.rs` | 1957 | giant-file |
 | `services::kanban` | `src/services/kanban.rs` | 145 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 347 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 114 |  |
@@ -253,7 +253,7 @@
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1159 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 184 |  |
-| `services::process` | `src/services/process.rs` | 706 |  |
+| `services::process` | `src/services/process.rs` | 707 |  |
 | `services::provider` | `src/services/provider.rs` | 1962 | giant-file |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 355 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |

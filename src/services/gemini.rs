@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -8,9 +8,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
-use crate::services::process::{
-    configure_child_process_group, kill_child_tree, wait_with_output_timeout,
-};
+use crate::services::process::{configure_child_process_group, kill_child_tree};
 use crate::services::provider::{
     CancelToken, ProviderKind, StreamAttemptFailure, StreamAttemptResult, StreamFinalState,
     cancel_requested, is_readonly_tool_policy, register_child_pid, run_retrying_stream_attempts,

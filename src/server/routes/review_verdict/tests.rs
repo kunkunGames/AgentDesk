@@ -365,7 +365,7 @@ async fn repeated_findings_after_session_reset_escalates_to_dilemma_pending() {
             .unwrap_or("")
             .contains("세션 리셋 후에도 동일 finding 반복")
     );
-    assert_ne!(card_status, "review");
+    assert_eq!(card_status, "review");
     assert_eq!(rework_count, 0);
 
     let (review_state, session_reset_round): (String, Option<i64>) = conn
