@@ -3,6 +3,7 @@ pub(crate) mod agentdesk_config;
 mod commands;
 pub(crate) mod config_audit;
 mod discord_io;
+pub(crate) mod dm_reply_store;
 mod formatting;
 mod gateway;
 mod handoff;
