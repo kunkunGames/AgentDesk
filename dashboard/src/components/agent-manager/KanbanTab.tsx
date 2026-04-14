@@ -97,6 +97,19 @@ const TIMELINE_KIND_STYLE: Record<string, { bg: string; text: string }> = {
 
 const STALE_IN_PROGRESS_MS = 100 * 60_000;
 type MobileKanbanView = "summary" | "minimap";
+type MobileMinimapEntry =
+  | {
+    key: string;
+    kind: "card";
+    card: KanbanCard;
+    label: string;
+  }
+  | {
+    key: string;
+    kind: "issue";
+    issue: GitHubIssue;
+    label: string;
+  };
 
 const SURFACE_FIELD_STYLE = {
   background: "color-mix(in srgb, var(--th-bg-surface) 92%, transparent)",
@@ -829,9 +842,41 @@ export default function KanbanTab({
       count: column.status === "backlog" ? columnCards.length + backlogIssues.length : columnCards.length,
     };
   }), [backlogIssues.length, boardColumns, cardsByStatus]);
+  const mobileMinimapLanes = useMemo(() => boardColumns.map((column) => {
+    const columnCards = cardsByStatus.get(column.status) ?? [];
+    const items: MobileMinimapEntry[] = column.status === "backlog"
+      ? [
+          ...backlogIssues.map((issue) => ({
+            key: `issue-${issue.number}`,
+            kind: "issue" as const,
+            issue,
+            label: `#${issue.number}`,
+          })),
+          ...columnCards.map((card) => ({
+            key: `card-${card.id}`,
+            kind: "card" as const,
+            card,
+            label: card.github_issue_number ? `#${card.github_issue_number}` : `#${card.id.slice(0, 6)}`,
+          })),
+        ]
+      : columnCards.map((card) => ({
+          key: `card-${card.id}`,
+          kind: "card" as const,
+          card,
+          label: card.github_issue_number ? `#${card.github_issue_number}` : `#${card.id.slice(0, 6)}`,
+        }));
+
+    return {
+      column,
+      count: items.length,
+      items,
+    };
+  }), [backlogIssues, boardColumns, cardsByStatus]);
   const focusedMobileSummary = mobileColumnSummaries.find(
     ({ column }) => column.status === mobileColumnStatus,
   ) ?? mobileColumnSummaries[0] ?? null;
+  const focusedMobileSummaryLabelKo = focusedMobileSummary?.column.labelKo ?? "선택된";
+  const focusedMobileSummaryLabelEn = focusedMobileSummary?.column.labelEn ?? "selected";
   const visibleColumns = compactBoard
     ? mobileBoardView === "summary"
       ? boardColumns
@@ -1079,6 +1124,16 @@ export default function KanbanTab({
         .getElementById(`kanban-mobile-${status}`)
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
+  };
+  const handleMiniMapCardOpen = (card: KanbanCard) => {
+    focusMobileColumn(card.status, false);
+    setSelectedBacklogIssue(null);
+    setSelectedCardId(card.id);
+  };
+  const handleMiniMapIssueOpen = (issue: GitHubIssue) => {
+    focusMobileColumn("backlog", false);
+    setSelectedCardId(null);
+    setSelectedBacklogIssue(issue);
   };
   const signalFilterLabel =
     signalStatusFilter === "review" ? tr("리뷰 대기", "Review queue")
@@ -1865,13 +1920,13 @@ export default function KanbanTab({
                     </div>
 
                     {mobileBoardView === "summary" ? (
-                      <div className="flex gap-2 overflow-x-auto pb-1">
+                      <div className="grid grid-cols-2 gap-2">
                         {mobileColumnSummaries.map(({ column, count }) => (
                           <button
                             key={column.status}
                             type="button"
                             onClick={() => focusMobileColumn(column.status, true)}
-                            className="shrink-0 rounded-2xl border px-3 py-2 text-left"
+                            className="min-w-0 rounded-2xl border px-3 py-2 text-left"
                             style={{
                               borderColor: mobileColumnStatus === column.status ? `${column.accent}88` : "rgba(148,163,184,0.24)",
                               backgroundColor: mobileColumnStatus === column.status ? `${column.accent}22` : "rgba(255,255,255,0.04)",
@@ -1886,41 +1941,110 @@ export default function KanbanTab({
                         ))}
                       </div>
                     ) : (
-                      <div className="grid grid-cols-2 gap-2">
-                        {mobileColumnSummaries.map(({ column, count }) => (
-                          <button
-                            key={column.status}
-                            type="button"
-                            onClick={() => focusMobileColumn(column.status, false)}
-                            className="rounded-2xl border px-3 py-3 text-left"
-                            style={{
-                              borderColor: mobileColumnStatus === column.status ? `${column.accent}88` : "rgba(148,163,184,0.24)",
-                              backgroundColor: mobileColumnStatus === column.status ? `${column.accent}16` : "rgba(15,23,42,0.28)",
-                            }}
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="inline-flex items-center gap-2 text-sm font-medium" style={{ color: "var(--th-text-primary)" }}>
-                                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: column.accent }} />
-                                {tr(column.labelKo, column.labelEn)}
-                              </span>
-                              <span className="text-lg font-semibold" style={{ color: mobileColumnStatus === column.status ? column.accent : "var(--th-text-primary)" }}>
-                                {count}
-                              </span>
-                            </div>
-                            <div className="mt-2 text-[11px]" style={{ color: mobileColumnStatus === column.status ? column.accent : "var(--th-text-muted)" }}>
-                              {mobileColumnStatus === column.status
-                                ? tr("아래 리스트 표시 중", "Shown below")
-                                : tr("탭해서 집중 보기", "Tap to focus")}
-                            </div>
-                          </button>
-                        ))}
+                      <div className="space-y-3">
+                        {mobileMinimapLanes.map(({ column, count, items }) => {
+                          const isActive = mobileColumnStatus === column.status;
+                          const laneLabel = tr(column.labelKo, column.labelEn);
+                          return (
+                            <section
+                              key={column.status}
+                              className="rounded-2xl border px-3 py-3"
+                              style={{
+                                borderColor: isActive ? `${column.accent}88` : "rgba(148,163,184,0.24)",
+                                backgroundColor: isActive ? `${column.accent}14` : "rgba(15,23,42,0.28)",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => focusMobileColumn(column.status, false)}
+                                className="flex w-full items-center justify-between gap-2 text-left"
+                              >
+                                <span className="inline-flex items-center gap-2 text-sm font-medium" style={{ color: "var(--th-text-primary)" }}>
+                                  <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: column.accent }} />
+                                  {laneLabel}
+                                </span>
+                                <span className="text-lg font-semibold" style={{ color: isActive ? column.accent : "var(--th-text-primary)" }}>
+                                  {count}
+                                </span>
+                              </button>
+                              <div className="mt-2 text-[11px]" style={{ color: isActive ? column.accent : "var(--th-text-muted)" }}>
+                                {isActive
+                                  ? tr("아래 리스트가 이 lane에 맞춰집니다.", "The list below stays focused on this lane.")
+                                  : tr("헤더를 탭해 lane을 고정하거나 블록을 탭해 상세를 엽니다.", "Tap the header to pin this lane or tap a block for details.")}
+                              </div>
+
+                              {items.length > 0 ? (
+                                <div
+                                  className="mt-3 grid gap-2"
+                                  style={{ gridTemplateColumns: "repeat(auto-fill, minmax(2.35rem, 1fr))" }}
+                                >
+                                  {items.map((item) => {
+                                    const isCard = item.kind === "card";
+                                    const isSelected = isCard
+                                      ? selectedCardId === item.card.id
+                                      : selectedBacklogIssue?.number === item.issue.number;
+                                    const title = isCard ? item.card.title : item.issue.title;
+                                    return (
+                                      <button
+                                        key={item.key}
+                                        type="button"
+                                        onClick={() => {
+                                          if (isCard) {
+                                            handleMiniMapCardOpen(item.card);
+                                            return;
+                                          }
+                                          handleMiniMapIssueOpen(item.issue);
+                                        }}
+                                        className="group relative aspect-square rounded-xl border transition-transform active:scale-95"
+                                        aria-label={tr(
+                                          `${column.labelKo} ${item.label} ${title} 상세 열기`,
+                                          `Open ${column.labelEn} ${item.label} ${title} details`,
+                                        )}
+                                        title={`${item.label} ${title}`}
+                                        style={{
+                                          borderColor: isSelected ? "rgba(255,255,255,0.78)" : `${column.accent}66`,
+                                          background: isCard
+                                            ? `linear-gradient(180deg, color-mix(in srgb, ${column.accent} 60%, var(--th-card-bg) 40%) 0%, color-mix(in srgb, ${column.accent} 34%, var(--th-bg-surface) 66%) 100%)`
+                                            : `linear-gradient(180deg, color-mix(in srgb, ${column.accent} 36%, var(--th-card-bg) 64%) 0%, color-mix(in srgb, ${column.accent} 18%, var(--th-bg-surface) 82%) 100%)`,
+                                          boxShadow: isSelected ? `0 0 0 2px ${column.accent}` : "none",
+                                        }}
+                                      >
+                                        {!isCard && (
+                                          <span
+                                            className="absolute left-1.5 top-1.5 rounded-full px-1 py-0.5 text-[8px] font-semibold"
+                                            style={{ backgroundColor: "rgba(15,23,42,0.56)", color: "var(--th-text-secondary)" }}
+                                          >
+                                            GH
+                                          </span>
+                                        )}
+                                        <span
+                                          className="absolute inset-x-1.5 bottom-1.5 truncate text-[9px] font-semibold"
+                                          style={{ color: "rgba(255,255,255,0.92)" }}
+                                        >
+                                          {item.label}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <div
+                                  className="mt-3 rounded-xl border border-dashed px-3 py-4 text-center text-xs"
+                                  style={{ borderColor: "rgba(148,163,184,0.18)", color: "var(--th-text-muted)" }}
+                                >
+                                  {tr("표시할 카드가 없습니다.", "No cards to show.")}
+                                </div>
+                              )}
+                            </section>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
                   <div className="rounded-xl border px-3 py-2 text-xs" style={{ borderColor: "rgba(148,163,184,0.18)", color: "var(--th-text-muted)", backgroundColor: "rgba(15,23,42,0.35)" }}>
                     {mobileBoardView === "summary"
                       ? tr("상단 요약바를 탭하면 해당 상태 섹션으로 이동합니다. 카드 상태 변경은 상세 패널에서 처리하세요.", "Tap the summary bar to jump to a lane. Change card status from the detail sheet.")
-                      : tr(`미니맵으로 상태를 고르면 아래에 ${focusedMobileSummary ? tr(focusedMobileSummary.column.labelKo, focusedMobileSummary.column.labelEn) : tr("선택된", "selected")} 리스트만 표시됩니다.`, `Pick a lane in the mini map to show only the ${focusedMobileSummary ? tr(focusedMobileSummary.column.labelKo, focusedMobileSummary.column.labelEn) : "selected"} list below.`)}
+                      : tr(`미니맵 블록을 탭하면 카드 상세가 열리고 아래에는 ${focusedMobileSummaryLabelKo} 리스트만 남깁니다.`, `Tap a mini-map block to open details and keep only the ${focusedMobileSummaryLabelEn} list below.`)}
                   </div>
                 </>
               )}
