@@ -188,33 +188,7 @@ fn load_live_dispatch_ids_for_runs(
         return Ok(Vec::new());
     }
 
-    let values = std::iter::repeat("(?)")
-        .take(run_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "WITH target_runs(id) AS (VALUES {values})
-         SELECT td.id
-         FROM task_dispatches td
-         WHERE td.status IN ('pending', 'dispatched')
-           AND (
-               EXISTS (
-                   SELECT 1
-                   FROM auto_queue_entries e
-                   JOIN target_runs tr ON tr.id = e.run_id
-                   WHERE e.dispatch_id = td.id
-               )
-               OR EXISTS (
-                   SELECT 1
-                   FROM auto_queue_phase_gates pg
-                   JOIN target_runs tr ON tr.id = pg.run_id
-                   WHERE pg.dispatch_id = td.id
-               )
-               OR json_extract(COALESCE(td.context, '{{}}'), '$.phase_gate.run_id') IN (
-                   SELECT id FROM target_runs
-               )
-           )"
-    );
+    let sql = live_dispatches_for_runs_sql("td.id", run_ids.len());
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_map(rusqlite::params_from_iter(run_ids.iter()), |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()
@@ -242,13 +216,21 @@ fn count_live_dispatches_for_runs(conn: &rusqlite::Connection, run_ids: &[String
         return 0;
     }
 
+    let sql = live_dispatches_for_runs_sql("COUNT(*)", run_ids.len());
+    conn.query_row(&sql, rusqlite::params_from_iter(run_ids.iter()), |row| {
+        row.get(0)
+    })
+    .unwrap_or(0)
+}
+
+fn live_dispatches_for_runs_sql(select_expr: &str, run_count: usize) -> String {
     let values = std::iter::repeat("(?)")
-        .take(run_ids.len())
+        .take(run_count)
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!(
+    format!(
         "WITH target_runs(id) AS (VALUES {values})
-         SELECT COUNT(*)
+         SELECT {select_expr}
          FROM task_dispatches td
          WHERE td.status IN ('pending', 'dispatched')
            AND (
@@ -268,11 +250,7 @@ fn count_live_dispatches_for_runs(conn: &rusqlite::Connection, run_ids: &[String
                    SELECT id FROM target_runs
                )
            )"
-    );
-    conn.query_row(&sql, rusqlite::params_from_iter(run_ids.iter()), |row| {
-        row.get(0)
-    })
-    .unwrap_or(0)
+    )
 }
 
 fn cancel_live_dispatches_for_runs(
