@@ -894,11 +894,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         )
     };
 
-    // Build skills notice for system prompt
-    let skills_notice = {
-        let skills = shared.skills_cache.read().await;
-        format_skills_notice(&provider, &skills)
-    };
+    // Claude Code/Codex inject their own skills inventory natively.
+    // Avoid duplicating it in AgentDesk's appended system prompt because it
+    // bloats the cache prefix and inflates per-turn cache_read tokens.
+    let skills_notice = String::new();
 
     // Build Discord context info
     let discord_context = {
