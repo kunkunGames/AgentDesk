@@ -1329,6 +1329,13 @@ var timeouts = {
       "  WHERE td.kanban_card_id = kc.id " +
       "  AND td.dispatch_type IN ('review', 'review-decision', 'e2e-test') " +
       "  AND td.status IN ('pending', 'dispatched')" +
+      ") " +
+      "AND NOT EXISTS (" +
+      "  SELECT 1 FROM task_dispatches td " +
+      "  WHERE td.kanban_card_id = kc.id " +
+      "  AND td.dispatch_type = 'review' " +
+      "  AND td.status = 'completed' " +
+      "  AND COALESCE(td.completed_at, td.updated_at) >= datetime('now', '-1 minute')" +
       ")",
       [nReview]
     );

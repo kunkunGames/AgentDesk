@@ -3271,6 +3271,13 @@ mod tests {
         seed_agent(&db);
         seed_card(&db, "card-158e", "review");
         seed_completed_work_dispatch_for_review(&db, "impl-158e", "card-158e", "implementation");
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE kanban_cards SET blocked_reason = 'orphan review — dispatch 없음' WHERE id = 'card-158e'",
+                [],
+            )
+            .unwrap();
 
         kanban::fire_enter_hooks(&db, &engine, "card-158e", "review");
 
@@ -3303,6 +3310,18 @@ mod tests {
         assert_eq!(
             review_dispatch_count, 1,
             "OnReviewEnter must create exactly one pending review dispatch"
+        );
+
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-158e'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            blocked_reason.is_none(),
+            "OnReviewEnter must clear stale blocked_reason from prior review rounds"
         );
     }
 
