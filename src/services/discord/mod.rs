@@ -29,6 +29,8 @@ pub(crate) mod shared_memory;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
+mod tmux_lifecycle;
+#[cfg(unix)]
 mod tmux_reaper;
 mod turn_bridge;
 
@@ -1265,7 +1267,8 @@ pub(super) async fn kickoff_idle_queues(
             has_more, // defer_watcher_resume
             false,    // wait_for_completion — don't block, let channels run concurrently
             intervention.merge_consecutive,
-            None, // reply_context
+            intervention.reply_context.clone(),
+            intervention.has_reply_boundary,
         )
         .await
         {

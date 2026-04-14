@@ -377,8 +377,14 @@ mod outbox_boundary {
 
     fn outbox_status(db: &db::Db, dispatch_id: &str) -> Vec<String> {
         let conn = db.lock().unwrap();
+        // Exclude auto-generated status_reaction entries (#513) — those are
+        // side-effects of dispatch status transitions, not the entries under test.
         let mut stmt = conn
-            .prepare("SELECT status FROM dispatch_outbox WHERE dispatch_id = ?1 ORDER BY id")
+            .prepare(
+                "SELECT status FROM dispatch_outbox \
+                 WHERE dispatch_id = ?1 AND action != 'status_reaction' \
+                 ORDER BY id",
+            )
             .unwrap();
         stmt.query_map([dispatch_id], |row| row.get(0))
             .unwrap()
@@ -489,6 +495,10 @@ mod outbox_boundary {
             outbox_status_for_action(&db, "d-160-1", "status_reaction"),
             vec!["done"]
         );
+
+        // Third batch should truly be empty after notify + status_reaction drain.
+        let processed3 = process_outbox_batch(&db, &mock).await;
+        assert_eq!(processed3, 0, "No pending entries after full drain");
     }
 
     /// Scenario 160-2: Recovery API failure → DB fallback completes dispatch
@@ -992,14 +1002,9 @@ mod idle_session_cleanup {
         assert!(url.contains("/api/sessions/"));
         assert!(url.contains("host%3Aidle-492-no-dispatch"));
         assert!(url.ends_with("/force-kill"));
-
-        let messages = message_outbox_rows(&db);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "channel:111");
         assert!(
-            messages[0]
-                .1
-                .contains("idle 60분 경과 (active_dispatch_id 없음)")
+            message_outbox_rows(&db).is_empty(),
+            "idle force-kill policy path must not enqueue a duplicate notify alert"
         );
     }
 
@@ -1060,10 +1065,9 @@ mod idle_session_cleanup {
         let url = http_last["url"].as_str().unwrap_or("");
         assert!(url.contains("host%3Aidle-492-active-dispatch"));
         assert!(url.ends_with("/force-kill"));
-
-        let messages = message_outbox_rows(&db);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "channel:111");
-        assert!(messages[0].1.contains("idle 180분 경과 (safety TTL)"));
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "idle safety TTL policy path must not enqueue a duplicate notify alert"
+        );
     }
 }

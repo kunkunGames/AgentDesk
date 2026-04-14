@@ -7,6 +7,7 @@ const SESSION_AGENT_ID_BACKFILL_META_KEY: &str = "session_agent_id_backfill:v1";
 const SESSION_TRANSCRIPT_AGENT_ID_BACKFILL_META_KEY: &str =
     "session_transcript_agent_id_backfill:v1";
 const AUTO_QUEUE_PHASE_GATE_BACKFILL_META_KEY: &str = "auto_queue_phase_gate_backfill:v1";
+const EXISTING_ID_LOOKUP_CHUNK_SIZE: usize = 500;
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -1321,26 +1322,26 @@ fn load_existing_ids(conn: &Connection, table: &str, ids: &[String]) -> Result<H
         return Ok(HashSet::new());
     }
 
-    let placeholders = (0..normalized_ids.len())
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = match table {
-        "auto_queue_runs" | "task_dispatches" | "kanban_cards" => {
-            format!("SELECT id FROM {table} WHERE id IN ({placeholders})")
-        }
-        _ => unreachable!("unexpected id lookup table"),
-    };
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(normalized_ids.iter()), |row| {
-        row.get::<_, String>(0)
-    })?;
-
     let mut existing = HashSet::new();
-    for row in rows {
-        existing.insert(row?);
+    for chunk in normalized_ids.chunks(EXISTING_ID_LOOKUP_CHUNK_SIZE) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = match table {
+            "auto_queue_runs" | "task_dispatches" | "kanban_cards" => {
+                format!("SELECT id FROM {table} WHERE id IN ({placeholders})")
+            }
+            _ => unreachable!("unexpected id lookup table"),
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        for row in rows {
+            existing.insert(row?);
+        }
     }
+
     Ok(existing)
 }
 
@@ -1456,6 +1457,23 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    struct LegacyKvPhaseGateState {
+        run_id: String,
+        phase: i64,
+        status: String,
+        verdict: Option<String>,
+        dispatch_ids: Vec<String>,
+        pass_verdict: String,
+        next_phase: Option<i64>,
+        final_phase: i64,
+        anchor_card_id: Option<String>,
+        failure_reason: Option<String>,
+        created_at: Option<String>,
+    }
+
+    let mut parsed_rows = Vec::new();
+    let mut candidate_run_ids = Vec::new();
+    let mut candidate_anchor_card_ids = Vec::new();
     for (key, raw_value) in &rows {
         let suffix = key.strip_prefix("aq_phase_gate:").unwrap_or(key);
         let mut parts = suffix.rsplitn(2, ':');
@@ -1525,9 +1543,40 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        let valid_dispatch_ids = filter_existing_dispatch_ids(conn, &dispatch_ids)?;
         let final_phase = if final_phase { 1 } else { 0 };
+
+        candidate_run_ids.push(run_id.clone());
+        if let Some(anchor_card_id) = anchor_card_id.as_ref() {
+            candidate_anchor_card_ids.push(anchor_card_id.clone());
+        }
+        parsed_rows.push(LegacyKvPhaseGateState {
+            run_id,
+            phase,
+            status,
+            verdict,
+            dispatch_ids,
+            pass_verdict,
+            next_phase,
+            final_phase,
+            anchor_card_id,
+            failure_reason,
+            created_at,
+        });
+    }
+
+    let valid_run_ids = load_existing_ids(conn, "auto_queue_runs", &candidate_run_ids)?;
+    let valid_anchor_card_ids =
+        load_existing_ids(conn, "kanban_cards", &candidate_anchor_card_ids)?;
+
+    for row in parsed_rows {
+        if !valid_run_ids.contains(row.run_id.as_str()) {
+            continue;
+        }
+
+        let valid_dispatch_ids = filter_existing_dispatch_ids(conn, &row.dispatch_ids)?;
+        let anchor_card_id = row
+            .anchor_card_id
+            .filter(|value| valid_anchor_card_ids.contains(value.as_str()));
 
         if valid_dispatch_ids.is_empty() {
             conn.execute(
@@ -1546,16 +1595,16 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     updated_at
                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), datetime('now'))",
                 rusqlite::params![
-                    run_id,
-                    phase,
-                    status,
-                    verdict,
-                    pass_verdict,
-                    next_phase,
-                    final_phase,
+                    row.run_id,
+                    row.phase,
+                    row.status,
+                    row.verdict,
+                    row.pass_verdict,
+                    row.next_phase,
+                    row.final_phase,
                     anchor_card_id,
-                    failure_reason,
-                    created_at,
+                    row.failure_reason,
+                    row.created_at,
                 ],
             )?;
             continue;
@@ -1589,17 +1638,17 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     failure_reason = excluded.failure_reason,
                     updated_at = datetime('now')",
                 rusqlite::params![
-                    run_id,
-                    phase,
-                    status,
-                    verdict,
+                    row.run_id,
+                    row.phase,
+                    row.status,
+                    row.verdict,
                     dispatch_id,
-                    pass_verdict,
-                    next_phase,
-                    final_phase,
+                    row.pass_verdict,
+                    row.next_phase,
+                    row.final_phase,
                     anchor_card_id,
-                    failure_reason,
-                    created_at,
+                    row.failure_reason,
+                    row.created_at,
                 ],
             )?;
         }
@@ -2333,6 +2382,160 @@ mod tests {
             )
             .unwrap();
         assert!(!legacy_key_exists);
+    }
+
+    #[test]
+    fn backfill_auto_queue_phase_gates_filters_missing_fk_targets() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
+             VALUES ('card-phase-backfill-valid', 'Phase Gate FK', 'done', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-phase-backfill-valid', 'test/repo', 'agent-1', 'paused')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value)
+             VALUES ('aq_phase_gate:run-phase-backfill-valid:1', ?1)",
+            [serde_json::json!({
+                "run_id": "run-phase-backfill-valid",
+                "batch_phase": 1,
+                "final_phase": false,
+                "anchor_card_id": "card-phase-backfill-missing",
+                "status": "pending",
+                "dispatch_ids": ["dispatch-phase-backfill-missing"]
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value)
+             VALUES ('aq_phase_gate:run-phase-backfill-missing:2', ?1)",
+            [serde_json::json!({
+                "run_id": "run-phase-backfill-missing",
+                "batch_phase": 2,
+                "anchor_card_id": "card-phase-backfill-valid",
+                "status": "pending"
+            })
+            .to_string()],
+        )
+        .unwrap();
+
+        backfill_auto_queue_phase_gates(&conn).unwrap();
+
+        let rows: Vec<(String, i64, Option<String>)> = conn
+            .prepare(
+                "SELECT run_id, phase, anchor_card_id
+                 FROM auto_queue_phase_gates
+                 ORDER BY phase",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![("run-phase-backfill-valid".to_string(), 1, None,)]
+        );
+
+        let legacy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kv_meta WHERE key LIKE 'aq_phase_gate:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0);
+    }
+
+    #[test]
+    fn backfill_auto_queue_phase_gates_chunks_large_fk_lookups() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate(&conn).unwrap();
+
+        let total = EXISTING_ID_LOOKUP_CHUNK_SIZE + 25;
+        for index in 0..total {
+            let card_id = format!("card-phase-batch-{index}");
+            let run_id = format!("run-phase-batch-{index}");
+            let dispatch_id = format!("dispatch-phase-batch-{index}");
+            let phase_key = format!("aq_phase_gate:{run_id}:1");
+
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
+                 VALUES (?1, ?2, 'done', datetime('now'), datetime('now'))",
+                rusqlite::params![card_id, format!("Phase Gate Card {index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+                 VALUES (?1, 'test/repo', 'agent-1', 'paused')",
+                rusqlite::params![run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at, context
+                 ) VALUES (
+                    ?1, ?2, 'agent-1', 'phase-gate', 'pending', ?3, datetime('now'), datetime('now'), '{}'
+                 )",
+                rusqlite::params![dispatch_id, card_id, format!("Phase Gate Dispatch {index}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    phase_key,
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "batch_phase": 1,
+                        "final_phase": false,
+                        "anchor_card_id": card_id,
+                        "status": "pending",
+                        "dispatch_ids": [dispatch_id]
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        backfill_auto_queue_phase_gates(&conn).unwrap();
+
+        let phase_gate_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM auto_queue_phase_gates", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(phase_gate_count, total as i64);
+
+        let linked_anchor_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_phase_gates WHERE anchor_card_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_anchor_count, total as i64);
+
+        let legacy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kv_meta WHERE key LIKE 'aq_phase_gate:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0);
     }
 
     #[test]
