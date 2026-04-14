@@ -390,7 +390,7 @@ pub fn git_branch_name(dir: &str) -> Option<String> {
         .filter(|s| s != "HEAD") // detached HEAD → None
 }
 
-fn is_mainlike_branch(branch: &str) -> bool {
+pub(crate) fn is_mainlike_branch(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "origin/main" | "origin/master")
 }
 
@@ -425,6 +425,7 @@ pub fn git_branch_containing_commit(
     preferred_branch: Option<&str>,
     preferred_substring: Option<&str>,
 ) -> Option<String> {
+    let started = std::time::Instant::now();
     let output = Command::new("git")
         .args([
             "for-each-ref",
@@ -442,7 +443,7 @@ pub fn git_branch_containing_commit(
     }
 
     let mut seen = std::collections::HashSet::new();
-    String::from_utf8_lossy(&output.stdout)
+    let candidates = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
         .filter(|branch| !branch.is_empty() && *branch != "HEAD" && *branch != "origin/HEAD")
@@ -462,6 +463,20 @@ pub fn git_branch_containing_commit(
                 is_mainlike_branch(branch),
             ))
         })
+        .collect::<Vec<_>>();
+    let elapsed = started.elapsed();
+    if candidates.len() > 20 || elapsed > std::time::Duration::from_millis(250) {
+        tracing::warn!(
+            "[platform::shell] git_branch_containing_commit scanned {} candidate branches for commit {} in {}ms (dir: {})",
+            candidates.len(),
+            &commit[..8.min(commit.len())],
+            elapsed.as_millis(),
+            dir
+        );
+    }
+
+    candidates
+        .into_iter()
         .min_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.cmp(&a.2))

@@ -469,10 +469,6 @@ fn latest_completed_work_dispatch_is_noop(db: &Db, kanban_card_id: &str) -> bool
             .unwrap_or(false)
 }
 
-fn is_mainlike_branch(branch: &str) -> bool {
-    matches!(branch, "main" | "master" | "origin/main" | "origin/master")
-}
-
 pub(crate) const REVIEW_QUALITY_SCOPE_REMINDER: &str =
     "기존 DoD/기능 검증과 함께 아래 품질 항목도 반드시 확인하세요.";
 pub(crate) const REVIEW_VERDICT_IMPROVE_GUIDANCE: &str = "기능이 맞더라도 아래 품질 항목에서 실제 문제가 하나라도 보이면 `VERDICT: improve`로 판정하세요.";
@@ -518,7 +514,7 @@ fn inject_review_merge_base_context(obj: &mut serde_json::Map<String, serde_json
         return;
     };
 
-    if is_mainlike_branch(&branch) {
+    if crate::services::platform::shell::is_mainlike_branch(&branch) {
         tracing::warn!(
             "[dispatch] skipping review merge-base injection for branch '{}' at commit {}: main-like branch would produce an empty diff range",
             branch,
@@ -527,19 +523,25 @@ fn inject_review_merge_base_context(obj: &mut serde_json::Map<String, serde_json
         return;
     }
 
-    if let Some(merge_base) =
-        crate::services::platform::shell::git_merge_base(&path, "main", &branch)
-    {
-        if merge_base == reviewed_commit {
-            tracing::warn!(
-                "[dispatch] skipping review merge-base injection for branch '{}' at commit {}: merge-base resolved to the reviewed commit",
-                branch,
-                &reviewed_commit[..8.min(reviewed_commit.len())]
-            );
-            return;
-        }
-        obj.insert("merge_base".to_string(), json!(merge_base));
+    let Some(merge_base) = crate::services::platform::shell::git_merge_base(&path, "main", &branch)
+    else {
+        tracing::warn!(
+            "[dispatch] skipping review merge-base injection for branch '{}' at commit {}: git merge-base returned no result",
+            branch,
+            &reviewed_commit[..8.min(reviewed_commit.len())]
+        );
+        return;
+    };
+
+    if merge_base == reviewed_commit {
+        tracing::warn!(
+            "[dispatch] skipping review merge-base injection for branch '{}' at commit {}: merge-base resolved to the reviewed commit",
+            branch,
+            &reviewed_commit[..8.min(reviewed_commit.len())]
+        );
+        return;
     }
+    obj.insert("merge_base".to_string(), json!(merge_base));
 }
 
 /// Resolve the canonical worktree for a card's GitHub issue.
@@ -3722,6 +3724,24 @@ mod tests {
         assert_eq!(parsed["reviewed_commit"], reviewed_commit);
         assert_eq!(parsed["branch"], "wt/fix-542");
         assert_eq!(parsed["merge_base"], fork_point);
+    }
+
+    #[test]
+    fn review_context_skips_missing_merge_base_for_unknown_branch() {
+        let mut obj = serde_json::Map::new();
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let reviewed_commit = crate::services::platform::git_head_commit(repo_dir).unwrap();
+        obj.insert("worktree_path".to_string(), json!(repo_dir));
+        obj.insert("branch".to_string(), json!("missing-branch"));
+        obj.insert("reviewed_commit".to_string(), json!(reviewed_commit));
+
+        inject_review_merge_base_context(&mut obj);
+
+        assert!(
+            !obj.contains_key("merge_base"),
+            "missing git merge-base must leave merge_base absent"
+        );
     }
 
     #[test]
