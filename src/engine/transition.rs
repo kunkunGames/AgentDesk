@@ -258,6 +258,7 @@ fn decide_pipeline_transition(
         Some(t) => match t.transition_type {
             TransitionType::Free => {}
             TransitionType::Gated if force => {}
+            TransitionType::ForceOnly if force => {}
             TransitionType::Gated => {
                 // Evaluate gates
                 for gate_name in &t.gates {
@@ -295,6 +296,21 @@ fn decide_pipeline_transition(
                         }
                     }
                 }
+            }
+            TransitionType::ForceOnly => {
+                return TransitionDecision {
+                    outcome: TransitionOutcome::Blocked(format!(
+                        "Status transition {} → {} requires force",
+                        card.status, target
+                    )),
+                    intents: vec![TransitionIntent::AuditLog {
+                        card_id: card.id.clone(),
+                        from: card.status.clone(),
+                        to: target.to_string(),
+                        source: source.to_string(),
+                        message: "BLOCKED: force_only transition requires force".to_string(),
+                    }],
+                };
             }
         },
         None if force => {

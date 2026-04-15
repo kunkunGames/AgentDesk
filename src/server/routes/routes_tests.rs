@@ -672,10 +672,11 @@ async fn agent_turn_returns_recent_output_from_inflight_snapshot() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
+    assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "working");
     assert_eq!(json["started_at"], "2026-04-06 10:11:12");
@@ -1897,6 +1898,12 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-manual-backlog-pending', 'test-repo', 'agent-manual-backlog', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at
             ) VALUES (
@@ -1910,7 +1917,7 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status
             ) VALUES (
-                'entry-manual-backlog-pending', 'run-manual-backlog', 'card-manual-backlog', 'agent-manual-backlog', 'pending'
+                'entry-manual-backlog-pending', 'run-manual-backlog-pending', 'card-manual-backlog', 'agent-manual-backlog', 'pending'
             )",
             [],
         )
@@ -4748,6 +4755,12 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-ft-clean-pending', 'test-repo', 'agent-ft-clean', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at
             ) VALUES (
@@ -4761,7 +4774,7 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status
             ) VALUES (
-                'entry-ft-pending', 'run-ft-clean', 'card-ft-clean', 'agent-ft-clean', 'pending'
+                'entry-ft-pending', 'run-ft-clean-pending', 'card-ft-clean', 'agent-ft-clean', 'pending'
             )",
             [],
         )
@@ -5751,6 +5764,12 @@ async fn reopen_reset_full_clears_review_thread_and_preflight_state() {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-reopen-reset-done', 'test-repo', 'agent-reopen-reset', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at
             ) VALUES (
@@ -5764,7 +5783,7 @@ async fn reopen_reset_full_clears_review_thread_and_preflight_state() {
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, completed_at
             ) VALUES (
-                'entry-reopen-done', 'run-reopen-reset', 'card-reopen-reset', 'agent-reopen-reset',
+                'entry-reopen-done', 'run-reopen-reset-done', 'card-reopen-reset', 'agent-reopen-reset',
                 'done', datetime('now', '-30 minutes')
             )",
             [],

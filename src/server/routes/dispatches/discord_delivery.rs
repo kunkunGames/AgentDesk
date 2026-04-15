@@ -1791,8 +1791,9 @@ async fn send_review_result_to_primary_with_context(
     // For improve/rework/reject: create a review-decision dispatch via the
     // authoritative path and let the outbox worker deliver the message.
     if verdict != "pass" && verdict != "approved" && verdict != "unknown" {
-        // #118: If approach-change already created a rework dispatch (review_status = rework_pending),
-        // skip creating the review-decision dispatch to avoid double dispatch.
+        // #118/#420: If review automation already converged on a concrete
+        // follow-up state, don't enqueue a generic review-decision dispatch on
+        // top of it.
         {
             let skip = db
                 .lock()
@@ -1806,11 +1807,11 @@ async fn send_review_result_to_primary_with_context(
                     .ok()
                     .flatten()
                 })
-                .map(|s| s == "rework_pending")
+                .map(|s| s == "rework_pending" || s == "dilemma_pending")
                 .unwrap_or(false);
             if skip {
                 tracing::info!(
-                    "[review-followup] #118 skipping review-decision for {card_id} — approach-change rework already dispatched"
+                    "[review-followup] skipping review-decision for {card_id} — review automation already resolved the follow-up state"
                 );
                 return Ok(());
             }

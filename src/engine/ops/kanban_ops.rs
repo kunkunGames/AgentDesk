@@ -60,7 +60,7 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 let transition_rule = pipeline.find_transition(&old_status, &new_status);
 
                 // Guard: prevent reverting terminal cards
-                if pipeline.is_terminal(&old_status) && old_status != new_status {
+                if pipeline.is_terminal(&old_status) && old_status != new_status && !force {
                     return format!(
                         r#"{{"error":"cannot revert terminal card from {} to {}"}}"#,
                         old_status, new_status
@@ -177,7 +177,7 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                         crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
                             &conn,
                             dispatch_id,
-                            Some("js_terminal_cleanup"),
+                            Some("auto_cancelled_on_terminal_card"),
                         )
                         .ok();
                     }

@@ -30,7 +30,7 @@ pub(super) fn register_pipeline_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()>
         "__resolveForCardRaw",
         Function::new(ctx.clone(), move |card_id: String| -> String {
             crate::pipeline::ensure_loaded();
-            let conn = match db_resolve.separate_conn() {
+            let conn = match db_resolve.lock() {
                 Ok(c) => c,
                 Err(_) => {
                     return crate::pipeline::try_get()
