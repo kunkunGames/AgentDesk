@@ -2855,7 +2855,7 @@ async fn kanban_terminal_status_fires_hook() {
             ).unwrap();
     }
 
-    // Use force transition: requested → done (force_only in YAML pipeline)
+    // Use force transition: requested → done (no rule, force bypasses)
     let result =
         crate::kanban::transition_status_with_opts(&db, &engine, "c1", "done", "pmd", true);
     assert!(
