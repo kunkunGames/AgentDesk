@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import type { CompanySettings } from "../types";
 import * as api from "../api";
 import TooltipLabel from "./common/TooltipLabel";
@@ -47,6 +47,7 @@ type ConfigEditValue = string | boolean;
 type SettingsPanel = "general" | "runtime" | "pipeline" | "onboarding";
 
 const SETTINGS_PANEL_STORAGE_KEY = "agentdesk.settings.active-panel";
+const GENERAL_FIELD_KEYS = ["companyName", "ceoName", "language", "theme"] as const;
 
 const CATEGORIES: Array<{
   id: string;
@@ -264,6 +265,10 @@ const NUMERIC_CONFIG_KEYS = new Set([
 ]);
 
 const READ_ONLY_CONFIG_KEYS = new Set(["server_port"]);
+const GENERAL_FIELD_LIMITS = {
+  companyName: 80,
+  ceoName: 60,
+} as const;
 
 const SYSTEM_CONFIG_DESCRIPTIONS: Record<string, { ko: string; en: string }> = {
   kanban_manager_channel_id: {
@@ -505,6 +510,58 @@ function GroupLabel({ title }: { title: string }) {
   );
 }
 
+function joinDescribedBy(...ids: Array<string | null | undefined | false>): string | undefined {
+  const value = ids.filter(Boolean).join(" ");
+  return value.length > 0 ? value : undefined;
+}
+
+function GeneralSettingsField({
+  id,
+  label,
+  description,
+  error,
+  footer,
+  children,
+}: {
+  id: string;
+  label: string;
+  description: string;
+  error?: string | null;
+  footer?: string;
+  children: ReactNode;
+}) {
+  const descriptionId = `${id}-description`;
+  const errorId = `${id}-error`;
+
+  return (
+    <SettingsCard
+      className="rounded-2xl p-4"
+      style={{
+        borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
+        background: "color-mix(in srgb, var(--th-card-bg) 90%, transparent)",
+      }}
+    >
+      <label htmlFor={id} className="block text-sm font-medium" style={{ color: "var(--th-text)" }}>
+        {label}
+      </label>
+      <p id={descriptionId} className="mt-1 text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>
+        {description}
+      </p>
+      <div className="mt-3">{children}</div>
+      {footer ? (
+        <div className="mt-3 text-[11px] leading-5" style={{ color: "var(--th-text-muted)" }}>
+          {footer}
+        </div>
+      ) : null}
+      {error ? (
+        <p id={errorId} className="mt-3 text-xs" style={{ color: "#fca5a5" }}>
+          {error}
+        </p>
+      ) : null}
+    </SettingsCard>
+  );
+}
+
 export default function SettingsView({
   settings,
   onSave,
@@ -561,9 +618,30 @@ export default function SettingsView({
       .catch(() => {});
   }, []);
 
+  const normalizedCompanyName = companyName.trim();
+  const normalizedCeoName = ceoName.trim();
+  const companyNameError =
+    normalizedCompanyName.length === 0
+      ? tr("회사 이름은 비워둘 수 없습니다.", "Company name is required.")
+      : normalizedCompanyName.length > GENERAL_FIELD_LIMITS.companyName
+        ? tr(
+            `회사 이름은 ${GENERAL_FIELD_LIMITS.companyName}자 이하여야 합니다.`,
+            `Company name must be ${GENERAL_FIELD_LIMITS.companyName} characters or fewer.`,
+          )
+        : null;
+  const ceoNameError =
+    normalizedCeoName.length > GENERAL_FIELD_LIMITS.ceoName
+      ? tr(
+          `CEO 이름은 ${GENERAL_FIELD_LIMITS.ceoName}자 이하여야 합니다.`,
+          `CEO name must be ${GENERAL_FIELD_LIMITS.ceoName} characters or fewer.`,
+        )
+      : null;
+  const generalFormInvalid = Boolean(companyNameError || ceoNameError);
+  const generalFieldCount = GENERAL_FIELD_KEYS.length;
+
   const companyDirty =
-    companyName !== settings.companyName ||
-    ceoName !== settings.ceoName ||
+    normalizedCompanyName !== settings.companyName.trim() ||
+    normalizedCeoName !== settings.ceoName.trim() ||
     language !== settings.language ||
     theme !== settings.theme;
   const configDirty = Object.keys(configEdits).length > 0;
@@ -594,7 +672,7 @@ export default function SettingsView({
         id: "general" as const,
         title: tr("일반", "General"),
         detail: tr("회사명, CEO, 언어, 테마", "Company name, CEO, language, theme"),
-        count: "4",
+        count: String(generalFieldCount),
       },
       {
         id: "runtime" as const,
@@ -614,7 +692,7 @@ export default function SettingsView({
         detail: tr("Discord 연결과 초기 세팅 재실행", "Re-run Discord wiring and first-run setup"),
       },
     ],
-    [runtimeFieldCount, tr, visibleConfigEntries.length],
+    [generalFieldCount, runtimeFieldCount, tr, visibleConfigEntries.length],
   );
 
   const inputStyle: CSSProperties = {
@@ -637,10 +715,17 @@ export default function SettingsView({
     background: "color-mix(in srgb, var(--th-bg-surface) 94%, transparent)",
   };
 
-  const handleSave = async () => {
+  const handleSave = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (generalFormInvalid) return;
     setSaving(true);
     try {
-      await onSave({ companyName, ceoName, language, theme });
+      await onSave({
+        companyName: normalizedCompanyName,
+        ceoName: normalizedCeoName,
+        language,
+        theme,
+      });
     } finally {
       setSaving(false);
     }
@@ -695,74 +780,96 @@ export default function SettingsView({
   const renderGeneralPanel = () => (
     <SettingsSection
       eyebrow={tr("일반", "General")}
-      title={tr("일반 설정 카탈로그", "General settings catalog")}
+      title={tr("브랜드와 표시 환경", "Brand and display")}
       description={tr(
-        "브랜드 정보는 먼저, 표시 환경은 별도 그룹으로 나눠 빠르게 훑을 수 있게 구성했습니다.",
-        "Brand basics come first, while display preferences stay in a separate group for faster scanning.",
-      )}
-      actions={(
-        <button
-          onClick={handleSave}
-          disabled={saving || !companyDirty}
-          className={primaryActionClass}
-          style={primaryActionStyle}
-        >
-          {saving ? tr("저장 중...", "Saving...") : tr("일반 설정 저장", "Save general settings")}
-        </button>
+        "브랜드 정보와 화면 표시 옵션을 한 폼에서 저장합니다.",
+        "Save brand identity and display preferences in one form.",
       )}
     >
-      <div className="mt-5 space-y-5">
-        <SettingsSubsection
-          title={tr("자주 쓰는 설정", "Frequent settings")}
-          description={tr(
-            "오피스와 대시보드에서 가장 먼저 보이는 이름을 바로 바꿀 수 있습니다.",
-            "Adjust the names that appear first across office and dashboard surfaces.",
-          )}
-        >
-          <div className="grid gap-3 xl:grid-cols-2">
-            <CompactFieldCard
+      <form className="mt-5 space-y-5" onSubmit={handleSave} noValidate>
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+            {tr("브랜드 정보", "Brand identity")}
+          </legend>
+          <p className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>
+            {tr(
+              "대시보드 헤더와 오피스에서 반복 노출되는 이름을 정리합니다.",
+              "Controls the names that repeat across dashboard headers and office surfaces.",
+            )}
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            <GeneralSettingsField
+              id="settings-company-name"
               label={tr("회사 이름", "Company name")}
-              tooltip={tr("대시보드와 주요 헤더에 표시되는 이름입니다.", "Shown in the dashboard and primary headers.")}
+              description={tr("대시보드와 주요 헤더에 표시되는 이름입니다.", "Shown in the dashboard and primary headers.")}
+              error={companyNameError}
+              footer={tr(
+                `${GENERAL_FIELD_LIMITS.companyName}자 이내, 저장 시 앞뒤 공백을 자동으로 정리합니다.`,
+                `Up to ${GENERAL_FIELD_LIMITS.companyName} characters. Leading and trailing spaces are trimmed on save.`,
+              )}
             >
               <input
+                id="settings-company-name"
                 type="text"
                 value={companyName}
                 onChange={(event) => setCompanyName(event.target.value)}
+                onBlur={() => setCompanyName((current) => current.trim())}
+                required
+                maxLength={GENERAL_FIELD_LIMITS.companyName}
+                aria-invalid={Boolean(companyNameError)}
+                aria-describedby={joinDescribedBy("settings-company-name-description", companyNameError ? "settings-company-name-error" : null)}
                 className="w-full rounded-2xl px-3 py-2.5 text-sm"
                 style={inputStyle}
               />
-            </CompactFieldCard>
+            </GeneralSettingsField>
 
-            <CompactFieldCard
+            <GeneralSettingsField
+              id="settings-ceo-name"
               label={tr("CEO 이름", "CEO name")}
-              tooltip={tr("오피스와 일부 운영 UI에서 대표 인물 이름으로 사용됩니다.", "Used as the representative persona name in office and ops surfaces.")}
+              description={tr("오피스와 일부 운영 UI에서 대표 인물 이름으로 사용됩니다.", "Used as the representative persona name in office and ops surfaces.")}
+              error={ceoNameError}
+              footer={tr(
+                `${GENERAL_FIELD_LIMITS.ceoName}자 이내, 비워둘 수 있지만 저장 시 공백만 있는 값은 제거합니다.`,
+                `Up to ${GENERAL_FIELD_LIMITS.ceoName} characters. Whitespace-only values are cleared on save.`,
+              )}
             >
               <input
+                id="settings-ceo-name"
                 type="text"
                 value={ceoName}
                 onChange={(event) => setCeoName(event.target.value)}
+                onBlur={() => setCeoName((current) => current.trim())}
+                maxLength={GENERAL_FIELD_LIMITS.ceoName}
+                aria-invalid={Boolean(ceoNameError)}
+                aria-describedby={joinDescribedBy("settings-ceo-name-description", ceoNameError ? "settings-ceo-name-error" : null)}
                 className="w-full rounded-2xl px-3 py-2.5 text-sm"
                 style={inputStyle}
               />
-            </CompactFieldCard>
+            </GeneralSettingsField>
           </div>
-        </SettingsSubsection>
+        </fieldset>
 
-        <SettingsSubsection
-          title={tr("표시 환경", "Display preferences")}
-          description={tr(
-            "언어와 테마처럼 덜 자주 바꾸는 표시 옵션은 별도 그룹으로 분리했습니다.",
-            "Less frequently changed presentation options such as language and theme stay in their own group.",
-          )}
-        >
-          <div className="grid gap-3 xl:grid-cols-2">
-            <CompactFieldCard
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
+            {tr("표시 환경", "Display preferences")}
+          </legend>
+          <p className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>
+            {tr(
+              "언어와 테마처럼 화면에 바로 드러나는 표시 옵션을 조정합니다.",
+              "Adjusts the presentation options that immediately change how the dashboard looks.",
+            )}
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            <GeneralSettingsField
+              id="settings-language"
               label={tr("언어", "Language")}
-              tooltip={tr("대시보드 전반의 기본 언어와 로캘을 정합니다.", "Sets the default language and locale across the dashboard.")}
+              description={tr("대시보드 전반의 기본 언어와 로캘을 정합니다.", "Sets the default language and locale across the dashboard.")}
             >
               <select
+                id="settings-language"
                 value={language}
                 onChange={(event) => setLanguage(event.target.value as typeof language)}
+                aria-describedby="settings-language-description"
                 className="w-full rounded-2xl px-3 py-2.5 text-sm"
                 style={inputStyle}
               >
@@ -771,15 +878,18 @@ export default function SettingsView({
                 <option value="ja">日本語</option>
                 <option value="zh">中文</option>
               </select>
-            </CompactFieldCard>
+            </GeneralSettingsField>
 
-            <CompactFieldCard
+            <GeneralSettingsField
+              id="settings-theme"
               label={tr("테마", "Theme")}
-              tooltip={tr("대시보드와 오피스 화면의 기본 분위기를 정합니다.", "Sets the base look and feel for dashboard and office views.")}
+              description={tr("대시보드와 오피스 화면의 기본 분위기를 정합니다.", "Sets the base look and feel for dashboard and office views.")}
             >
               <select
+                id="settings-theme"
                 value={theme}
                 onChange={(event) => setTheme(event.target.value as typeof theme)}
+                aria-describedby="settings-theme-description"
                 className="w-full rounded-2xl px-3 py-2.5 text-sm"
                 style={inputStyle}
               >
@@ -787,10 +897,33 @@ export default function SettingsView({
                 <option value="light">{tr("라이트", "Light")}</option>
                 <option value="auto">{tr("자동 (시스템)", "Auto (System)")}</option>
               </select>
-            </CompactFieldCard>
+            </GeneralSettingsField>
           </div>
-        </SettingsSubsection>
-      </div>
+        </fieldset>
+
+        <div
+          className="flex flex-col gap-3 rounded-2xl border px-4 py-4 sm:flex-row sm:items-center sm:justify-between"
+          style={{
+            borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
+            background: "color-mix(in srgb, var(--th-card-bg) 90%, transparent)",
+          }}
+        >
+          <p className="text-sm leading-6" style={{ color: "var(--th-text-muted)" }}>
+            {tr(
+              "일반 설정은 한 번에 저장되며 기존 `settings` JSON과 병합해 hidden key 손실을 막습니다. 회사 이름은 필수이고 텍스트 입력은 저장 시 trim 처리됩니다.",
+              "General settings save together and merge into the existing `settings` JSON so hidden keys are preserved. Company name is required, and text inputs are trimmed on save.",
+            )}
+          </p>
+          <button
+            type="submit"
+            disabled={saving || !companyDirty || generalFormInvalid}
+            className={primaryActionClass}
+            style={primaryActionStyle}
+          >
+            {saving ? tr("저장 중...", "Saving...") : tr("일반 설정 저장", "Save general settings")}
+          </button>
+        </div>
+      </form>
     </SettingsSection>
   );
 
