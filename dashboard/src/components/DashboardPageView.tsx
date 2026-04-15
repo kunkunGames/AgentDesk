@@ -88,7 +88,7 @@ export default function DashboardPageView({
     achievements: activeTab === "achievements",
   });
   const [skillRanking, setSkillRanking] = useState<SkillRankingResponse | null>(null);
-  const [skillWindow, setSkillWindow] = useState<"7d" | "30d" | "all">("7d");
+  const [skillWindow, setSkillWindow] = useState<"7d" | "30d" | "all">("all");
 
   useEffect(() => {
     setMountedTabs((prev) => (prev[activeTab] ? prev : { ...prev, [activeTab]: true }));
@@ -424,7 +424,7 @@ function SkillRankingSection({
       })}
       actions={(
         <>
-          {(["7d", "30d", "all"] as const).map((windowId) => (
+          {(["all", "30d", "7d"] as const).map((windowId) => (
             <SurfaceSegmentButton
               key={windowId}
               onClick={() => onChangeWindow(windowId)}
