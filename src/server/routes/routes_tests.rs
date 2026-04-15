@@ -9253,6 +9253,72 @@ async fn smart_generate_creates_correct_thread_groups_and_batch_phases() {
 }
 
 #[tokio::test]
+async fn auto_queue_generate_rolls_back_when_entry_insert_fails() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let _card_ids = seed_parallel_test_cards(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_auto_queue_entry_insert
+             BEFORE INSERT ON auto_queue_entries
+             BEGIN
+                 SELECT RAISE(ABORT, 'entry insert blocked');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "max_concurrent_threads": 3,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("create auto-queue entry"),
+        "generate must expose entry insert failure instead of silently succeeding"
+    );
+
+    let conn = db.lock().unwrap();
+    let run_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM auto_queue_runs", [], |row| row.get(0))
+        .unwrap();
+    let entry_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM auto_queue_entries", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(run_count, 0, "failed generate must roll back run creation");
+    assert_eq!(
+        entry_count, 0,
+        "failed generate must not leave partial entries"
+    );
+}
+
+#[tokio::test]
 async fn auto_queue_status_exposes_explicit_thread_links_from_configured_channels() {
     let db = test_db();
     let engine = test_engine(&db);

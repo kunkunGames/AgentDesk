@@ -155,53 +155,111 @@ fn update_entry_status_with_current_on_conn(
             });
         }
 
-        let rows_affected = match normalized {
-            ENTRY_STATUS_PENDING => conn.execute(
-                "UPDATE auto_queue_entries
-                     SET status = 'pending',
-                         dispatch_id = NULL,
-                         slot_index = NULL,
-                         dispatched_at = NULL,
-                         completed_at = NULL
-                     WHERE id = ?1
-                       AND status = ?2",
-                rusqlite::params![entry_id, current.status],
-            )?,
-            ENTRY_STATUS_DISPATCHED => conn.execute(
-                "UPDATE auto_queue_entries
-                     SET status = 'dispatched',
-                         dispatch_id = ?1,
-                         slot_index = ?2,
-                         dispatched_at = datetime('now'),
-                         completed_at = NULL
-                     WHERE id = ?3
-                       AND status = ?4",
-                rusqlite::params![
-                    effective_dispatch_id,
-                    effective_slot_index,
-                    entry_id,
-                    current.status
-                ],
-            )?,
-            ENTRY_STATUS_DONE => conn.execute(
-                "UPDATE auto_queue_entries
-                     SET status = 'done',
-                         completed_at = datetime('now')
-                     WHERE id = ?1
-                       AND status = ?2",
-                rusqlite::params![entry_id, current.status],
-            )?,
-            ENTRY_STATUS_SKIPPED => conn.execute(
-                "UPDATE auto_queue_entries
-                     SET status = 'skipped',
-                         dispatch_id = NULL,
-                         dispatched_at = NULL,
-                         completed_at = datetime('now')
-                     WHERE id = ?1
-                       AND status = ?2",
-                rusqlite::params![entry_id, current.status],
-            )?,
-            _ => unreachable!(),
+        conn.execute_batch("SAVEPOINT auto_queue_entry_status_transition")?;
+        let transition_result = (|| -> rusqlite::Result<usize> {
+            let rows_affected = match normalized {
+                ENTRY_STATUS_PENDING => conn.execute(
+                    "UPDATE auto_queue_entries
+                         SET status = 'pending',
+                             dispatch_id = NULL,
+                             slot_index = NULL,
+                             dispatched_at = NULL,
+                             completed_at = NULL
+                         WHERE id = ?1
+                           AND status = ?2",
+                    rusqlite::params![entry_id, current.status],
+                )?,
+                ENTRY_STATUS_DISPATCHED => conn.execute(
+                    "UPDATE auto_queue_entries
+                         SET status = 'dispatched',
+                             dispatch_id = ?1,
+                             slot_index = ?2,
+                             dispatched_at = datetime('now'),
+                             completed_at = NULL
+                         WHERE id = ?3
+                           AND status = ?4",
+                    rusqlite::params![
+                        effective_dispatch_id,
+                        effective_slot_index,
+                        entry_id,
+                        current.status
+                    ],
+                )?,
+                ENTRY_STATUS_DONE => conn.execute(
+                    "UPDATE auto_queue_entries
+                         SET status = 'done',
+                             completed_at = datetime('now')
+                         WHERE id = ?1
+                           AND status = ?2",
+                    rusqlite::params![entry_id, current.status],
+                )?,
+                ENTRY_STATUS_SKIPPED => conn.execute(
+                    "UPDATE auto_queue_entries
+                         SET status = 'skipped',
+                             dispatch_id = NULL,
+                             dispatched_at = NULL,
+                             completed_at = datetime('now')
+                         WHERE id = ?1
+                           AND status = ?2",
+                    rusqlite::params![entry_id, current.status],
+                )?,
+                _ => unreachable!(),
+            };
+
+            if rows_affected == 0 {
+                return Ok(0);
+            }
+
+            if normalized == ENTRY_STATUS_DISPATCHED {
+                if let Some(previous_dispatch_id) = current
+                    .dispatch_id
+                    .as_deref()
+                    .filter(|value| Some(*value) != effective_dispatch_id.as_deref())
+                {
+                    record_entry_dispatch_history_on_conn(
+                        conn,
+                        entry_id,
+                        previous_dispatch_id,
+                        trigger_source,
+                    )?;
+                }
+                if let Some(dispatch_id) = effective_dispatch_id.as_deref() {
+                    record_entry_dispatch_history_on_conn(
+                        conn,
+                        entry_id,
+                        dispatch_id,
+                        trigger_source,
+                    )?;
+                }
+            }
+
+            record_entry_transition_on_conn(
+                conn,
+                entry_id,
+                &current.status,
+                normalized,
+                trigger_source,
+            )?;
+
+            if matches!(normalized, ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED) {
+                release_completed_group_slots_for_run(conn, &current.run_id)?;
+                maybe_finalize_run_after_terminal_entry(conn, &current.run_id, normalized)?;
+            }
+
+            Ok(rows_affected)
+        })();
+        let rows_affected = match transition_result {
+            Ok(rows_affected) => {
+                conn.execute_batch("RELEASE SAVEPOINT auto_queue_entry_status_transition")?;
+                rows_affected
+            }
+            Err(error) => {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT auto_queue_entry_status_transition; \
+                     RELEASE SAVEPOINT auto_queue_entry_status_transition",
+                );
+                return Err(EntryStatusUpdateError::Sql(error));
+            }
         };
 
         if rows_affected == 0 {
@@ -249,37 +307,6 @@ fn update_entry_status_with_current_on_conn(
 
             current = latest;
             continue;
-        }
-
-        if normalized == ENTRY_STATUS_DISPATCHED {
-            if let Some(previous_dispatch_id) = current
-                .dispatch_id
-                .as_deref()
-                .filter(|value| Some(*value) != effective_dispatch_id.as_deref())
-            {
-                record_entry_dispatch_history_on_conn(
-                    conn,
-                    entry_id,
-                    previous_dispatch_id,
-                    trigger_source,
-                )?;
-            }
-            if let Some(dispatch_id) = effective_dispatch_id.as_deref() {
-                record_entry_dispatch_history_on_conn(conn, entry_id, dispatch_id, trigger_source)?;
-            }
-        }
-
-        record_entry_transition_on_conn(
-            conn,
-            entry_id,
-            &current.status,
-            normalized,
-            trigger_source,
-        )?;
-
-        if matches!(normalized, ENTRY_STATUS_DONE | ENTRY_STATUS_SKIPPED) {
-            release_completed_group_slots_for_run(conn, &current.run_id);
-            maybe_finalize_run_after_terminal_entry(conn, &current.run_id, normalized)?;
         }
 
         return Ok(EntryStatusUpdateResult {
@@ -811,7 +838,7 @@ pub fn completed_group_slots(conn: &Connection, run_id: &str) -> Vec<(String, i6
     released
 }
 
-pub fn release_group_slots(conn: &Connection, slots: &[(String, i64)]) {
+pub fn release_group_slots(conn: &Connection, slots: &[(String, i64)]) -> rusqlite::Result<()> {
     for (agent_id, slot_index) in slots {
         conn.execute(
             "UPDATE auto_queue_slots
@@ -820,12 +847,12 @@ pub fn release_group_slots(conn: &Connection, slots: &[(String, i64)]) {
                  updated_at = datetime('now')
              WHERE agent_id = ?1 AND slot_index = ?2",
             rusqlite::params![agent_id, slot_index],
-        )
-        .ok();
+        )?;
     }
+    Ok(())
 }
 
-pub fn release_run_slots(conn: &Connection, run_id: &str) {
+pub fn release_run_slots(conn: &Connection, run_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE auto_queue_slots
          SET assigned_run_id = NULL,
@@ -833,8 +860,8 @@ pub fn release_run_slots(conn: &Connection, run_id: &str) {
              updated_at = datetime('now')
          WHERE assigned_run_id = ?1",
         [run_id],
-    )
-    .ok();
+    )?;
+    Ok(())
 }
 
 pub fn current_batch_phase(conn: &Connection, run_id: &str) -> Option<i64> {
@@ -1290,19 +1317,65 @@ pub fn allocate_slot_for_group_agent(
 ) -> Option<(i64, bool)> {
     ensure_agent_slot_rows(conn, run_id, agent_id).ok()?;
 
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT slot_index
-             FROM auto_queue_slots
-             WHERE agent_id = ?1
-               AND assigned_run_id = ?2
-               AND COALESCE(assigned_thread_group, 0) = ?3
-             LIMIT 1",
-            rusqlite::params![agent_id, run_id, thread_group],
-            |row| row.get(0),
-        )
-        .ok();
-    if let Some(slot_index) = existing {
+    loop {
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT slot_index
+                 FROM auto_queue_slots
+                 WHERE agent_id = ?1
+                   AND assigned_run_id = ?2
+                   AND COALESCE(assigned_thread_group, 0) = ?3
+                 LIMIT 1",
+                rusqlite::params![agent_id, run_id, thread_group],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(slot_index) = existing {
+            conn.execute(
+                "UPDATE auto_queue_entries
+                 SET slot_index = ?1
+                 WHERE run_id = ?2
+                   AND agent_id = ?3
+                   AND COALESCE(thread_group, 0) = ?4
+                   AND slot_index IS NULL",
+                rusqlite::params![slot_index, run_id, agent_id, thread_group],
+            )
+            .ok();
+            return Some((slot_index, false));
+        }
+
+        let free_slot: Option<i64> = conn
+            .query_row(
+                "SELECT slot_index
+                 FROM auto_queue_slots
+                 WHERE agent_id = ?1
+                   AND assigned_run_id IS NULL
+                 ORDER BY slot_index ASC
+                 LIMIT 1",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(slot_index) = free_slot else {
+            return None;
+        };
+
+        let claimed = conn
+            .execute(
+                "UPDATE auto_queue_slots
+                 SET assigned_run_id = ?1,
+                     assigned_thread_group = ?2,
+                     updated_at = datetime('now')
+                 WHERE agent_id = ?3
+                   AND slot_index = ?4
+                   AND assigned_run_id IS NULL",
+                rusqlite::params![run_id, thread_group, agent_id, slot_index],
+            )
+            .ok()?;
+        if claimed == 0 {
+            continue;
+        }
+
         conn.execute(
             "UPDATE auto_queue_entries
              SET slot_index = ?1
@@ -1313,47 +1386,8 @@ pub fn allocate_slot_for_group_agent(
             rusqlite::params![slot_index, run_id, agent_id, thread_group],
         )
         .ok();
-        return Some((slot_index, false));
+        return Some((slot_index, true));
     }
-
-    let free_slot: Option<i64> = conn
-        .query_row(
-            "SELECT slot_index
-             FROM auto_queue_slots
-             WHERE agent_id = ?1
-               AND assigned_run_id IS NULL
-             ORDER BY slot_index ASC
-             LIMIT 1",
-            [agent_id],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(slot_index) = free_slot else {
-        return None;
-    };
-
-    conn.execute(
-        "UPDATE auto_queue_slots
-         SET assigned_run_id = ?1,
-             assigned_thread_group = ?2,
-             updated_at = datetime('now')
-         WHERE agent_id = ?3
-           AND slot_index = ?4
-           AND assigned_run_id IS NULL",
-        rusqlite::params![run_id, thread_group, agent_id, slot_index],
-    )
-    .ok()?;
-    conn.execute(
-        "UPDATE auto_queue_entries
-         SET slot_index = ?1
-         WHERE run_id = ?2
-           AND agent_id = ?3
-           AND COALESCE(thread_group, 0) = ?4
-           AND slot_index IS NULL",
-        rusqlite::params![slot_index, run_id, agent_id, thread_group],
-    )
-    .ok();
-    Some((slot_index, true))
 }
 
 pub fn slot_has_active_dispatch(conn: &Connection, agent_id: &str, slot_index: i64) -> bool {
@@ -1484,7 +1518,6 @@ fn is_allowed_entry_transition(from_status: &str, to_status: &str) -> bool {
             | (ENTRY_STATUS_SKIPPED, ENTRY_STATUS_PENDING)
             | (ENTRY_STATUS_SKIPPED, ENTRY_STATUS_DISPATCHED)
             | (ENTRY_STATUS_SKIPPED, ENTRY_STATUS_DONE)
-            | (ENTRY_STATUS_DONE, ENTRY_STATUS_DISPATCHED)
     )
 }
 
@@ -1512,11 +1545,12 @@ fn entry_status_row_matches_target(
     }
 }
 
-fn release_completed_group_slots_for_run(conn: &Connection, run_id: &str) {
+fn release_completed_group_slots_for_run(conn: &Connection, run_id: &str) -> rusqlite::Result<()> {
     let completed_slots = completed_group_slots(conn, run_id);
     if !completed_slots.is_empty() {
-        release_group_slots(conn, &completed_slots);
+        release_group_slots(conn, &completed_slots)?;
     }
+    Ok(())
 }
 
 fn maybe_finalize_run_after_terminal_entry(
@@ -1541,7 +1575,7 @@ fn maybe_finalize_run_after_terminal_entry(
         return Ok(false);
     }
 
-    release_run_slots(conn, run_id);
+    release_run_slots(conn, run_id)?;
     complete_run_on_conn(conn, run_id)
 }
 
@@ -1554,7 +1588,7 @@ pub fn pause_run_on_conn(conn: &Connection, run_id: &str) -> rusqlite::Result<bo
         [run_id],
     )?;
     if updated > 0 {
-        release_run_slots(conn, run_id);
+        release_run_slots(conn, run_id)?;
     }
     Ok(updated > 0)
 }
@@ -2199,6 +2233,111 @@ mod tests {
             error,
             EntryStatusUpdateError::InvalidTransition { .. }
         ));
+    }
+
+    #[test]
+    fn entry_transition_blocks_invalid_done_to_dispatched_restore() {
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                 id, run_id, kanban_card_id, agent_id, status, thread_group
+             ) VALUES ('entry-4b', 'run-1', 'card-4b', 'agent-1', 'done', 0)",
+            [],
+        )
+        .expect("seed done entry");
+
+        let error = update_entry_status_on_conn(
+            &conn,
+            "entry-4b",
+            ENTRY_STATUS_DISPATCHED,
+            "test_invalid_done_dispatch",
+            &EntryStatusUpdateOptions {
+                dispatch_id: Some("dispatch-retry".to_string()),
+                slot_index: Some(0),
+            },
+        )
+        .expect_err("done -> dispatched transition must fail");
+        assert!(matches!(
+            error,
+            EntryStatusUpdateError::InvalidTransition { .. }
+        ));
+    }
+
+    #[test]
+    fn terminal_transition_rolls_back_when_slot_release_fails() {
+        let conn = setup_conn();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_slot_release
+             BEFORE UPDATE OF assigned_run_id ON auto_queue_slots
+             WHEN OLD.assigned_run_id IS NOT NULL AND NEW.assigned_run_id IS NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'slot release blocked');
+             END;",
+        )
+        .expect("create trigger");
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, thread_group
+             ) VALUES ('entry-rollback', 'run-1', 'card-rollback', 'agent-1', 'pending', NULL, 0, 0)",
+            [],
+        )
+        .expect("seed entry");
+
+        update_entry_status_on_conn(
+            &conn,
+            "entry-rollback",
+            ENTRY_STATUS_DISPATCHED,
+            "test_dispatch",
+            &EntryStatusUpdateOptions {
+                dispatch_id: Some("dispatch-rollback".to_string()),
+                slot_index: Some(0),
+            },
+        )
+        .expect("dispatch transition");
+
+        let error = update_entry_status_on_conn(
+            &conn,
+            "entry-rollback",
+            ENTRY_STATUS_DONE,
+            "test_done_rollback",
+            &EntryStatusUpdateOptions::default(),
+        )
+        .expect_err("slot release failure must roll back the terminal transition");
+        assert!(matches!(error, EntryStatusUpdateError::Sql(_)));
+
+        let (status, dispatch_id, completed_at): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_id, completed_at
+                 FROM auto_queue_entries
+                 WHERE id = 'entry-rollback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("entry row");
+        assert_eq!(status, ENTRY_STATUS_DISPATCHED);
+        assert_eq!(dispatch_id.as_deref(), Some("dispatch-rollback"));
+        assert!(completed_at.is_none());
+
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run status");
+        assert_eq!(run_status, "active");
+
+        let audit_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entry_transitions WHERE entry_id = 'entry-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("audit count");
+        assert_eq!(
+            audit_rows, 1,
+            "done transition audit must roll back together"
+        );
     }
 
     #[test]

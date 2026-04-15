@@ -405,7 +405,7 @@ fn clear_and_release_slots_for_runs(
     }
 
     for run_id in run_ids {
-        crate::db::auto_queue::release_run_slots(conn, run_id);
+        let _ = crate::db::auto_queue::release_run_slots(conn, run_id);
     }
 
     (released_slots.len(), cleared_sessions)
@@ -821,50 +821,65 @@ fn handle_activate_preflight_metadata(
     match parsed.get("preflight_status").and_then(|v| v.as_str()) {
         Some("consult_required") => {
             let consult_agent_id = {
-                let conn = deps.db.separate_conn().unwrap();
-                let provider = conn
-                    .query_row(
-                        "SELECT COALESCE(provider, 'claude') FROM agents WHERE id = ?1",
-                        [agent_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map(|raw| ProviderKind::from_str_or_unsupported(&raw))
-                    .unwrap_or_else(|_| {
-                        ProviderKind::default_channel_provider().unwrap_or(ProviderKind::Claude)
-                    });
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, COALESCE(provider, 'claude')
-                         FROM agents
-                         WHERE id != ?1
-                         ORDER BY id ASC",
-                    )
-                    .unwrap();
-                let available_agents: Vec<(String, ProviderKind)> = stmt
-                    .query_map([agent_id], |row| {
-                        let provider_raw: String = row.get(1)?;
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            ProviderKind::from_str_or_unsupported(&provider_raw),
-                        ))
-                    })
-                    .ok()
-                    .map(|rows| rows.filter_map(|row| row.ok()).collect())
-                    .unwrap_or_default();
-                provider
-                    .select_counterpart_from(
-                        available_agents
-                            .iter()
-                            .map(|(_, candidate_provider)| candidate_provider.clone()),
-                    )
-                    .and_then(|counterpart| {
-                        available_agents
-                            .iter()
-                            .find_map(|(candidate_id, candidate_provider)| {
-                                (*candidate_provider == counterpart).then_some(candidate_id.clone())
+                match deps.db.separate_conn() {
+                    Ok(conn) => {
+                        let provider = conn
+                            .query_row(
+                                "SELECT COALESCE(provider, 'claude') FROM agents WHERE id = ?1",
+                                [agent_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .map(|raw| ProviderKind::from_str_or_unsupported(&raw))
+                            .unwrap_or_else(|_| {
+                                ProviderKind::default_channel_provider()
+                                    .unwrap_or(ProviderKind::Claude)
+                            });
+                        let available_agents: Vec<(String, ProviderKind)> = conn
+                            .prepare(
+                                "SELECT id, COALESCE(provider, 'claude')
+                                 FROM agents
+                                 WHERE id != ?1
+                                 ORDER BY id ASC",
+                            )
+                            .ok()
+                            .and_then(|mut stmt| {
+                                stmt.query_map([agent_id], |row| {
+                                    let provider_raw: String = row.get(1)?;
+                                    Ok((
+                                        row.get::<_, String>(0)?,
+                                        ProviderKind::from_str_or_unsupported(&provider_raw),
+                                    ))
+                                })
+                                .ok()
+                                .map(|rows| rows.filter_map(|row| row.ok()).collect())
                             })
-                    })
-                    .unwrap_or_else(|| agent_id.to_string())
+                            .unwrap_or_default();
+                        provider
+                            .select_counterpart_from(
+                                available_agents
+                                    .iter()
+                                    .map(|(_, candidate_provider)| candidate_provider.clone()),
+                            )
+                            .and_then(|counterpart| {
+                                available_agents.iter().find_map(
+                                    |(candidate_id, candidate_provider)| {
+                                        (*candidate_provider == counterpart)
+                                            .then_some(candidate_id.clone())
+                                    },
+                                )
+                            })
+                            .unwrap_or_else(|| agent_id.to_string())
+                    }
+                    Err(error) => {
+                        crate::auto_queue_log!(
+                            warn,
+                            "activate_preflight_consultation_db_open_failed",
+                            log_ctx.clone(),
+                            "[auto-queue] failed to open DB while selecting consultation counterpart for entry {entry_id}: {error}"
+                        );
+                        agent_id.to_string()
+                    }
+                }
             };
 
             let dispatch_result = run_activate_blocking(|| {
@@ -902,21 +917,32 @@ fn handle_activate_preflight_metadata(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let mut conn = deps.db.separate_conn().unwrap();
-            if let Err(error) = crate::db::auto_queue::record_consultation_dispatch_on_conn(
-                &mut conn,
-                entry_id,
-                card_id,
-                &dispatch_id,
-                "activate_preflight_consultation_dispatch",
-                metadata,
-            ) {
-                crate::auto_queue_log!(
-                    warn,
-                    "activate_preflight_consultation_record_failed",
-                    log_ctx.clone().dispatch(&dispatch_id),
-                    "[auto-queue] failed to persist consultation dispatch state for entry {entry_id}: {error}"
-                );
+            match deps.db.separate_conn() {
+                Ok(mut conn) => {
+                    if let Err(error) = crate::db::auto_queue::record_consultation_dispatch_on_conn(
+                        &mut conn,
+                        entry_id,
+                        card_id,
+                        &dispatch_id,
+                        "activate_preflight_consultation_dispatch",
+                        metadata,
+                    ) {
+                        crate::auto_queue_log!(
+                            warn,
+                            "activate_preflight_consultation_record_failed",
+                            log_ctx.clone().dispatch(&dispatch_id),
+                            "[auto-queue] failed to persist consultation dispatch state for entry {entry_id}: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::auto_queue_log!(
+                        warn,
+                        "activate_preflight_consultation_record_db_open_failed",
+                        log_ctx.clone().dispatch(&dispatch_id),
+                        "[auto-queue] failed to open DB while persisting consultation dispatch state for entry {entry_id}: {error}"
+                    );
+                }
             }
             crate::auto_queue_log!(
                 info,
@@ -927,15 +953,32 @@ fn handle_activate_preflight_metadata(
             ActivatePreflightOutcome::Dispatched(deps.entry_json(entry_id))
         }
         Some("invalid") | Some("already_applied") => {
-            let conn = deps.db.separate_conn().unwrap();
-            conn.execute(
-                "UPDATE auto_queue_entries
-                 SET status = 'skipped',
-                     completed_at = datetime('now')
-                 WHERE id = ?1 AND status = 'pending'",
-                [entry_id],
-            )
-            .ok();
+            match deps.db.separate_conn() {
+                Ok(conn) => {
+                    if let Err(error) = crate::db::auto_queue::update_entry_status_on_conn(
+                        &conn,
+                        entry_id,
+                        crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
+                        "activate_preflight_invalid",
+                        &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+                    ) {
+                        crate::auto_queue_log!(
+                            warn,
+                            "activate_preflight_invalid_skip_failed",
+                            log_ctx.clone(),
+                            "[auto-queue] failed to skip preflight-invalid entry {entry_id}: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::auto_queue_log!(
+                        warn,
+                        "activate_preflight_invalid_db_open_failed",
+                        log_ctx.clone(),
+                        "[auto-queue] failed to open DB while skipping preflight-invalid entry {entry_id}: {error}"
+                    );
+                }
+            }
             crate::auto_queue_log!(
                 info,
                 "activate_preflight_skipped",
@@ -2267,7 +2310,7 @@ pub async fn generate(
         );
     }
 
-    let conn = match state.db.separate_conn() {
+    let mut conn = match state.db.separate_conn() {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -2448,10 +2491,19 @@ pub async fn generate(
         )
     };
 
-    // Create run
+    // Create run + entries atomically so partial inserts cannot masquerade as success.
     let run_id = uuid::Uuid::new_v4().to_string();
     let ai_model_str = "smart-planner".to_string();
-    conn.execute(
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("begin auto-queue generate transaction: {error}")})),
+            );
+        }
+    };
+    if let Err(error) = tx.execute(
         "INSERT INTO auto_queue_runs (id, repo, agent_id, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, thread_group_count) \
          VALUES (?1, ?2, ?3, 'generated', ?4, ?5, 0, ?6, ?7)",
         rusqlite::params![
@@ -2463,11 +2515,14 @@ pub async fn generate(
             max_concurrent,
             thread_group_count
         ],
-    )
-    .ok();
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("create auto-queue run: {error}")})),
+        );
+    }
 
-    // Create entries
-    let mut entries = Vec::new();
+    let mut entry_ids = Vec::new();
     for planned in &grouped_entries {
         let card = &filtered_cards[planned.card_idx];
         let entry_id = uuid::Uuid::new_v4().to_string();
@@ -2476,7 +2531,7 @@ pub async fn generate(
         } else {
             card.agent_id.as_str()
         };
-        conn.execute(
+        if let Err(error) = tx.execute(
             "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, priority_rank, thread_group, reason, batch_phase)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
@@ -2489,15 +2544,30 @@ pub async fn generate(
                 planned.reason,
                 planned.batch_phase
             ],
-        )
-        .ok();
-        entries.push(
-            state
-                .auto_queue_service()
-                .entry_json(&entry_id, guild_id)
-                .unwrap_or(serde_json::Value::Null),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("create auto-queue entry: {error}")})),
+            );
+        }
+        entry_ids.push(entry_id);
+    }
+    if let Err(error) = tx.commit() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("commit auto-queue generate transaction: {error}")})),
         );
     }
+
+    let entries = entry_ids
+        .iter()
+        .map(|entry_id| {
+            state
+                .auto_queue_service()
+                .entry_json(entry_id, guild_id)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect::<Vec<_>>();
 
     let run = state
         .auto_queue_service()
@@ -2660,7 +2730,14 @@ pub(crate) fn activate_with_deps(
         }
         cleared_slots.insert((agent_id.clone(), *slot_index));
     }
-    crate::db::auto_queue::release_group_slots(&conn, &completed_slots);
+    if let Err(error) = crate::db::auto_queue::release_group_slots(&conn, &completed_slots) {
+        crate::auto_queue_log!(
+            warn,
+            "activate_release_completed_slots_failed",
+            run_log_ctx.clone(),
+            "[auto-queue] failed to release completed slots for run {run_id}: {error}"
+        );
+    }
 
     // Stale empty run cleanup: after generate()/enqueue() fixes, normal paths never
     // leave an active run with 0 entries.  Any such run is legacy corruption — complete
@@ -3347,7 +3424,7 @@ pub(crate) fn activate_with_deps(
             let conn = deps.db.separate_conn().unwrap();
             let still_pending: bool = conn
                 .query_row(
-                    "SELECT status = 'pending' FROM auto_queue_entries WHERE entry_id = ?1",
+                    "SELECT status = 'pending' FROM auto_queue_entries WHERE id = ?1",
                     [&entry_id],
                     |row| row.get(0),
                 )
@@ -3598,7 +3675,14 @@ pub(crate) fn activate_with_deps(
         .unwrap_or(0);
 
     if remaining == 0 {
-        crate::db::auto_queue::release_run_slots(&conn, &run_id);
+        if let Err(error) = crate::db::auto_queue::release_run_slots(&conn, &run_id) {
+            crate::auto_queue_log!(
+                warn,
+                "activate_release_run_slots_failed",
+                run_log_ctx.clone(),
+                "[auto-queue] failed to release slots for drained run {run_id}: {error}"
+            );
+        }
         let still_dispatched: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM auto_queue_entries WHERE run_id = ?1 AND status = 'dispatched'",

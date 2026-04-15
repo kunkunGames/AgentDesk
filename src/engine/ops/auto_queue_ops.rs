@@ -297,7 +297,12 @@ fn complete_run_raw(db: &Db, run_id: &str, source: &str, opts_json: &str) -> Str
     };
 
     if release_slots {
-        crate::db::auto_queue::release_run_slots(&conn, run_id);
+        if let Err(error) = crate::db::auto_queue::release_run_slots(&conn, run_id) {
+            return serde_json::json!({
+                "error": format!("release auto-queue slots: {error}")
+            })
+            .to_string();
+        }
     }
 
     match crate::db::auto_queue::complete_run_on_conn(&conn, run_id) {
