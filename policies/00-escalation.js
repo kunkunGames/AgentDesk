@@ -38,6 +38,16 @@ function loadManualInterventionState(cardId) {
   );
   if (cards.length === 0) return null;
   var card = cards[0];
+  var cfg = agentdesk.pipeline.config();
+  if (agentdesk.pipeline.isTerminal(card.status, cfg)) {
+    return {
+      status: card.status,
+      review_status: card.review_status,
+      blocked_reason: card.blocked_reason,
+      fingerprint: null,
+      active: false
+    };
+  }
   var fingerprint = manualInterventionFingerprint(card.status, card.review_status, card.blocked_reason);
   return {
     status: card.status,
