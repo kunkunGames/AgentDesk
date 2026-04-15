@@ -92,7 +92,7 @@ function _runPreflight(cardId) {
           return { status: "already_applied", summary: "GitHub issue #" + c.github_issue_number + " is closed" };
         }
       } catch (e) {
-        // GitHub CLI not available or failed, skip check
+        agentdesk.log.warn("[preflight] gh issue view failed for card " + cardId + " issue #" + c.github_issue_number + ": " + e);
       }
     }
   }
