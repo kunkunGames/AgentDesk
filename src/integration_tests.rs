@@ -2831,12 +2831,7 @@ mod tests {
                 {"from": "in_progress", "to": "review", "type": "gated", "gates": ["active_dispatch"]},
                 {"from": "review", "to": "qa_test", "type": "gated", "gates": ["review_passed"]},
                 {"from": "review", "to": "in_progress", "type": "gated", "gates": ["review_rework"]},
-                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]},
-                {"from": "qa_test", "to": "in_progress", "type": "force_only"},
-                {"from": "requested", "to": "done", "type": "force_only"},
-                {"from": "in_progress", "to": "requested", "type": "force_only"},
-                {"from": "review", "to": "requested", "type": "force_only"},
-                {"from": "qa_test", "to": "requested", "type": "force_only"}
+                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]}
             ],
             "gates": {
                 "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
@@ -2888,11 +2883,11 @@ mod tests {
         let qa_done = effective.find_transition("qa_test", "done");
         assert!(qa_done.is_some(), "qa_test → done must exist");
 
-        // qa_test → in_progress force transition
+        // qa_test → in_progress has no explicit rule (force bypass only)
         let qa_rework = effective.find_transition("qa_test", "in_progress");
         assert!(
-            qa_rework.is_some(),
-            "qa_test → in_progress (force) must exist"
+            qa_rework.is_none(),
+            "qa_test → in_progress should not have explicit rule"
         );
 
         // Verify custom state has hooks
