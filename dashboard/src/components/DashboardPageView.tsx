@@ -114,7 +114,9 @@ export default function DashboardPageView({
   const t: TFunction = useCallback((messages) => messages[language] ?? messages.ko, [language]);
   const [activeTab, setActiveTab] = useState<DashboardTab>(() => readDashboardTabFromUrl());
   const [skillRanking, setSkillRanking] = useState<SkillRankingResponse | null>(null);
-  const [skillWindow, setSkillWindow] = useState<"7d" | "30d" | "all">("all");
+  const [skillWindow, setSkillWindow] = useState<"7d" | "30d" | "all">("30d");
+  const [skillRankingUpdatedAt, setSkillRankingUpdatedAt] = useState<number | null>(null);
+  const [skillRankingRefreshFailed, setSkillRankingRefreshFailed] = useState(false);
   const tabButtonRefs = useRef<Record<DashboardTab, HTMLButtonElement | null>>({
     operations: null,
     tokens: null,
@@ -228,9 +230,13 @@ export default function DashboardPageView({
     const load = async () => {
       try {
         const next = await getSkillRanking(skillWindow, 10);
-        if (mounted) setSkillRanking(next);
+        if (!mounted) return;
+        setSkillRanking(next);
+        setSkillRankingUpdatedAt(Date.now());
+        setSkillRankingRefreshFailed(false);
       } catch {
         // Keep the last successful ranking during transient network failures.
+        if (mounted) setSkillRankingRefreshFailed(true);
       }
     };
 
@@ -515,7 +521,7 @@ export default function DashboardPageView({
                 "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, var(--th-accent-warn) 4%) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
             }}
           >
-            <CronTimelineWidget t={t} />
+            <CronTimelineWidget t={t} localeTag={localeTag} />
 
             <AutoQueueHistoryWidget t={t} />
 
@@ -524,6 +530,9 @@ export default function DashboardPageView({
               skillWindow={skillWindow}
               onChangeWindow={setSkillWindow}
               numberFormatter={numberFormatter}
+              localeTag={localeTag}
+              lastUpdatedAt={skillRankingUpdatedAt}
+              refreshFailed={skillRankingRefreshFailed}
               t={t}
             />
 
@@ -959,14 +968,29 @@ function SkillRankingSection({
   skillWindow,
   onChangeWindow,
   numberFormatter,
+  localeTag,
+  lastUpdatedAt,
+  refreshFailed,
   t,
 }: {
   skillRanking: SkillRankingResponse | null;
   skillWindow: "7d" | "30d" | "all";
   onChangeWindow: (value: "7d" | "30d" | "all") => void;
   numberFormatter: Intl.NumberFormat;
+  localeTag: string;
+  lastUpdatedAt: number | null;
+  refreshFailed: boolean;
   t: TFunction;
 }) {
+  const updatedLabel = lastUpdatedAt
+    ? new Intl.DateTimeFormat(localeTag, {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      }).format(lastUpdatedAt)
+    : null;
+
   return (
     <SurfaceSubsection
       title={t({ ko: "스킬 랭킹", en: "Skill Ranking", ja: "スキルランキング", zh: "技能排行" })}
@@ -978,7 +1002,24 @@ function SkillRankingSection({
       })}
       actions={(
         <>
-          {(["all", "30d", "7d"] as const).map((windowId) => (
+          {updatedLabel ? (
+            <SurfaceMetaBadge tone={refreshFailed ? "warn" : "neutral"}>
+              {refreshFailed
+                ? t({
+                    ko: `새로고침 실패 · 마지막 ${updatedLabel}`,
+                    en: `Refresh failed · last ${updatedLabel}`,
+                    ja: `更新失敗 · 最終 ${updatedLabel}`,
+                    zh: `刷新失败 · 最后 ${updatedLabel}`,
+                  })
+                : t({
+                    ko: `마지막 갱신 ${updatedLabel}`,
+                    en: `Last updated ${updatedLabel}`,
+                    ja: `最終更新 ${updatedLabel}`,
+                    zh: `最后更新 ${updatedLabel}`,
+                  })}
+            </SurfaceMetaBadge>
+          ) : null}
+          {(["7d", "30d", "all"] as const).map((windowId) => (
             <SurfaceSegmentButton
               key={windowId}
               onClick={() => onChangeWindow(windowId)}

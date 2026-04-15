@@ -29,7 +29,10 @@ export function formatCompactDuration(ms: number): string {
   return `${Math.round(safeMs / 1_000)}s`;
 }
 
-export function describeCronSchedule(schedule: api.CronSchedule): string {
+export function describeCronSchedule(
+  schedule: api.CronSchedule,
+  localeTag = "en-US",
+): string {
   if (schedule.kind === "every" && schedule.everyMs) {
     return `Every ${formatCompactDuration(schedule.everyMs)}`;
   }
@@ -37,7 +40,7 @@ export function describeCronSchedule(schedule: api.CronSchedule): string {
     return schedule.cron;
   }
   if (schedule.kind === "at" && schedule.atMs) {
-    return new Date(schedule.atMs).toLocaleString("ko-KR", {
+    return new Date(schedule.atMs).toLocaleString(localeTag, {
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
@@ -66,6 +69,7 @@ export interface CronTimelineMetrics {
 export function buildCronTimelineMetrics(
   job: api.CronJobGlobal,
   now = Date.now(),
+  localeTag = "en-US",
 ): CronTimelineMetrics {
   const intervalMs =
     job.schedule.kind === "every" && job.schedule.everyMs && job.schedule.everyMs > 0
@@ -99,7 +103,7 @@ export function buildCronTimelineMetrics(
     lastPercent: lastRunAtMs != null ? toPercent(lastRunAtMs) : null,
     nextPercent: nextRunAtMs != null ? toPercent(nextRunAtMs) : null,
     overdue: nextRunAtMs != null && nextRunAtMs < now,
-    intervalLabel: describeCronSchedule(job.schedule),
+    intervalLabel: describeCronSchedule(job.schedule, localeTag),
   };
 }
 
@@ -721,9 +725,10 @@ function MetricChip({ label, value, accent }: { label: string; value: string; ac
 
 interface CronTimelineWidgetProps {
   t: TFunction;
+  localeTag: string;
 }
 
-export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
+export function CronTimelineWidget({ t, localeTag }: CronTimelineWidgetProps) {
   const [jobs, setJobs] = useState<api.CronJobGlobal[]>([]);
   const [now, setNow] = useState(() => Date.now());
 
@@ -777,7 +782,7 @@ export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
           .map((job) => {
             const lastRun = job.state?.lastRunAtMs ?? null;
             const nextRun = job.state?.nextRunAtMs ?? null;
-            const metrics = buildCronTimelineMetrics(job, now);
+            const metrics = buildCronTimelineMetrics(job, now, localeTag);
             const isOk = job.state?.lastStatus === "ok";
             const accent = metrics.overdue ? "#fb7185" : isOk ? "#34d399" : "#f59e0b";
             const stateLabel = metrics.overdue
@@ -788,7 +793,7 @@ export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
             const formatClock = (value: number | null) =>
               value == null
                 ? "—"
-                : new Date(value).toLocaleTimeString("ko-KR", {
+                : new Date(value).toLocaleTimeString(localeTag, {
                     hour: "2-digit",
                     minute: "2-digit",
                   });
