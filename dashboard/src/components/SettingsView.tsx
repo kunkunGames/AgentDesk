@@ -695,10 +695,10 @@ export default function SettingsView({
   const renderGeneralPanel = () => (
     <SettingsSection
       eyebrow={tr("일반", "General")}
-      title={tr("대시보드 기본 설정", "Dashboard basics")}
+      title={tr("일반 설정 카탈로그", "General settings catalog")}
       description={tr(
-        "자주 바꾸는 기본값만 먼저 보이게 정리했습니다.",
-        "Keep the frequently changed basics visible first.",
+        "브랜드 정보는 먼저, 표시 환경은 별도 그룹으로 나눠 빠르게 훑을 수 있게 구성했습니다.",
+        "Brand basics come first, while display preferences stay in a separate group for faster scanning.",
       )}
       actions={(
         <button
@@ -711,65 +711,85 @@ export default function SettingsView({
         </button>
       )}
     >
-      <div className="mt-5 grid gap-3 xl:grid-cols-2">
-        <CompactFieldCard
-          label={tr("회사 이름", "Company name")}
-          tooltip={tr("대시보드와 주요 헤더에 표시되는 이름입니다.", "Shown in the dashboard and primary headers.")}
+      <div className="mt-5 space-y-5">
+        <SettingsSubsection
+          title={tr("자주 쓰는 설정", "Frequent settings")}
+          description={tr(
+            "오피스와 대시보드에서 가장 먼저 보이는 이름을 바로 바꿀 수 있습니다.",
+            "Adjust the names that appear first across office and dashboard surfaces.",
+          )}
         >
-          <input
-            type="text"
-            value={companyName}
-            onChange={(event) => setCompanyName(event.target.value)}
-            className="w-full rounded-2xl px-3 py-2.5 text-sm"
-            style={inputStyle}
-          />
-        </CompactFieldCard>
+          <div className="grid gap-3 xl:grid-cols-2">
+            <CompactFieldCard
+              label={tr("회사 이름", "Company name")}
+              tooltip={tr("대시보드와 주요 헤더에 표시되는 이름입니다.", "Shown in the dashboard and primary headers.")}
+            >
+              <input
+                type="text"
+                value={companyName}
+                onChange={(event) => setCompanyName(event.target.value)}
+                className="w-full rounded-2xl px-3 py-2.5 text-sm"
+                style={inputStyle}
+              />
+            </CompactFieldCard>
 
-        <CompactFieldCard
-          label={tr("CEO 이름", "CEO name")}
-          tooltip={tr("오피스와 일부 운영 UI에서 대표 인물 이름으로 사용됩니다.", "Used as the representative persona name in office and ops surfaces.")}
-        >
-          <input
-            type="text"
-            value={ceoName}
-            onChange={(event) => setCeoName(event.target.value)}
-            className="w-full rounded-2xl px-3 py-2.5 text-sm"
-            style={inputStyle}
-          />
-        </CompactFieldCard>
+            <CompactFieldCard
+              label={tr("CEO 이름", "CEO name")}
+              tooltip={tr("오피스와 일부 운영 UI에서 대표 인물 이름으로 사용됩니다.", "Used as the representative persona name in office and ops surfaces.")}
+            >
+              <input
+                type="text"
+                value={ceoName}
+                onChange={(event) => setCeoName(event.target.value)}
+                className="w-full rounded-2xl px-3 py-2.5 text-sm"
+                style={inputStyle}
+              />
+            </CompactFieldCard>
+          </div>
+        </SettingsSubsection>
 
-        <CompactFieldCard
-          label={tr("언어", "Language")}
-          tooltip={tr("대시보드 전반의 기본 언어와 로캘을 정합니다.", "Sets the default language and locale across the dashboard.")}
+        <SettingsSubsection
+          title={tr("표시 환경", "Display preferences")}
+          description={tr(
+            "언어와 테마처럼 덜 자주 바꾸는 표시 옵션은 별도 그룹으로 분리했습니다.",
+            "Less frequently changed presentation options such as language and theme stay in their own group.",
+          )}
         >
-          <select
-            value={language}
-            onChange={(event) => setLanguage(event.target.value as typeof language)}
-            className="w-full rounded-2xl px-3 py-2.5 text-sm"
-            style={inputStyle}
-          >
-            <option value="ko">한국어</option>
-            <option value="en">English</option>
-            <option value="ja">日本語</option>
-            <option value="zh">中文</option>
-          </select>
-        </CompactFieldCard>
+          <div className="grid gap-3 xl:grid-cols-2">
+            <CompactFieldCard
+              label={tr("언어", "Language")}
+              tooltip={tr("대시보드 전반의 기본 언어와 로캘을 정합니다.", "Sets the default language and locale across the dashboard.")}
+            >
+              <select
+                value={language}
+                onChange={(event) => setLanguage(event.target.value as typeof language)}
+                className="w-full rounded-2xl px-3 py-2.5 text-sm"
+                style={inputStyle}
+              >
+                <option value="ko">한국어</option>
+                <option value="en">English</option>
+                <option value="ja">日本語</option>
+                <option value="zh">中文</option>
+              </select>
+            </CompactFieldCard>
 
-        <CompactFieldCard
-          label={tr("테마", "Theme")}
-          tooltip={tr("대시보드와 오피스 화면의 기본 분위기를 정합니다.", "Sets the base look and feel for dashboard and office views.")}
-        >
-          <select
-            value={theme}
-            onChange={(event) => setTheme(event.target.value as typeof theme)}
-            className="w-full rounded-2xl px-3 py-2.5 text-sm"
-            style={inputStyle}
-          >
-            <option value="dark">{tr("다크", "Dark")}</option>
-            <option value="light">{tr("라이트", "Light")}</option>
-            <option value="auto">{tr("자동 (시스템)", "Auto (System)")}</option>
-          </select>
-        </CompactFieldCard>
+            <CompactFieldCard
+              label={tr("테마", "Theme")}
+              tooltip={tr("대시보드와 오피스 화면의 기본 분위기를 정합니다.", "Sets the base look and feel for dashboard and office views.")}
+            >
+              <select
+                value={theme}
+                onChange={(event) => setTheme(event.target.value as typeof theme)}
+                className="w-full rounded-2xl px-3 py-2.5 text-sm"
+                style={inputStyle}
+              >
+                <option value="dark">{tr("다크", "Dark")}</option>
+                <option value="light">{tr("라이트", "Light")}</option>
+                <option value="auto">{tr("자동 (시스템)", "Auto (System)")}</option>
+              </select>
+            </CompactFieldCard>
+          </div>
+        </SettingsSubsection>
       </div>
     </SettingsSection>
   );
@@ -1150,7 +1170,7 @@ export default function SettingsView({
                 className={secondaryActionClass}
                 style={secondaryActionStyle}
               >
-                {tr("온보딩", "Onboarding")}
+                {tr("온보딩 다시 실행", "Re-run onboarding")}
               </button>
             </div>
 
