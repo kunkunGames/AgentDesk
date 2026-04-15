@@ -605,15 +605,6 @@ function runHasBlockingPhaseGate(runId) {
   return rows.length > 0 && rows[0].cnt > 0;
 }
 
-function remainingRunnableEntryCount(runId) {
-  var rows = agentdesk.db.query(
-    "SELECT COUNT(*) as cnt FROM auto_queue_entries " +
-    "WHERE run_id = ? AND status IN ('pending', 'dispatched')",
-    [runId]
-  );
-  return rows.length > 0 ? (rows[0].cnt || 0) : 0;
-}
-
 function finalizeRunWithoutPhaseGate(runId) {
   if (!runId) return false;
 
@@ -1060,18 +1051,6 @@ function activateRun(runId, threadGroup, agentId) {
   }
 }
 
-// ── Shared dispatch helper (group-aware) (#140) ─────────────────
-function dispatchNextEntryInGroup(agentId, runId, threadGroup) {
-  var result = activateRun(runId, threadGroup, agentId);
-  if (!result) return;
-  if (result.count > 0) {
-    autoQueueLog("info", "activate API dispatched " + result.count + " entry(s) for run " + runId + " group " + threadGroup, {
-      run_id: runId,
-      thread_group: threadGroup
-    });
-  }
-}
-
 // ── Consultation dispatch helper (#256) ─────────────────────────
 function _createConsultationDispatch(entry, agentId, preflightMeta) {
   // Find the counterpart agent for consultation
@@ -1113,19 +1092,6 @@ function _createConsultationDispatch(entry, agentId, preflightMeta) {
       entry_id: entry.id,
       card_id: entry.kanban_card_id
     });
-  }
-}
-
-// Legacy helper for backward compatibility
-function dispatchNextEntry(agentId) {
-  if (!agentId) return;
-  try {
-    agentdesk.autoQueue.activate({
-      agent_id: agentId,
-      active_only: true
-    });
-  } catch (e) {
-    agentdesk.log.warn("[auto-queue] legacy activate bridge failed for agent " + agentId + ": " + e);
   }
 }
 
