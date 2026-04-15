@@ -513,22 +513,17 @@ export default function TokenAnalyticsSection({
               {periodLabel(option, t)}
             </button>
           ))}
-          {loading && (
-            <span
-              className={cx(
-                dashboardBadge.default,
-                "font-semibold uppercase tracking-[0.18em]",
-              )}
-              style={{ color: "#fbbf24", background: "rgba(245,158,11,0.12)" }}
-            >
-              {t({
-                ko: "토큰 분석 동기화 중",
+          {loading ? (
+            <LoadingIndicator
+              compact
+              label={t({
+                ko: "토큰 분석을 동기화하는 중입니다",
                 en: "Syncing token analytics",
                 ja: "トークン分析を同期中",
-                zh: "同步 Token 分析中",
+                zh: "正在同步 Token 分析",
               })}
-            </span>
-          )}
+            />
+          ) : null}
         </div>
       </div>
 
