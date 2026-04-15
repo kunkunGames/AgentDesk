@@ -35,13 +35,14 @@ import TokenAnalyticsSection from "./dashboard/TokenAnalyticsSection";
 import type { TFunction } from "./dashboard/model";
 
 const SkillCatalogView = lazy(() => import("./SkillCatalogView"));
+const MeetingMinutesView = lazy(() => import("./MeetingMinutesView"));
 
 type PulseKanbanSignal = "review" | "blocked" | "requested" | "stalled";
-type DashboardTab = "operations" | "tokens" | "automation" | "achievements";
+type DashboardTab = "operations" | "tokens" | "automation" | "achievements" | "meetings";
 
 const DASHBOARD_TAB_QUERY_KEY = "dashboardTab";
 const DASHBOARD_TAB_STORAGE_KEY = "agentdesk.dashboard.active-tab";
-const DASHBOARD_TABS: DashboardTab[] = ["operations", "tokens", "automation", "achievements"];
+const DASHBOARD_TABS: DashboardTab[] = ["operations", "tokens", "automation", "achievements", "meetings"];
 
 function readDashboardTabFromUrl(): DashboardTab {
   if (typeof window === "undefined") return "operations";
@@ -70,15 +71,17 @@ interface DashboardPageViewProps {
   onOpenKanbanSignal?: (signal: PulseKanbanSignal) => void;
   onOpenDispatchSessions?: () => void;
   onOpenSettings?: () => void;
-  onOpenMeetings?: () => void;
+  onRefreshMeetings?: () => void;
 }
 
 export default function DashboardPageView({
   stats,
   agents,
+  meetings,
   settings,
   onSelectAgent,
   onOpenSettings,
+  onRefreshMeetings,
 }: DashboardPageViewProps) {
   const language = settings.language;
   const localeTag = language === "ko" ? "ko-KR" : language === "ja" ? "ja-JP" : language === "zh" ? "zh-CN" : "en-US";
@@ -189,7 +192,7 @@ export default function DashboardPageView({
 
       <SurfaceSection
         eyebrow={t({ ko: "Dashboard Layout", en: "Dashboard Layout", ja: "Dashboard Layout", zh: "Dashboard Layout" })}
-        title={t({ ko: "운영 / 토큰 / 자동화 / 업적", en: "Operations / Tokens / Automation / Achievements", ja: "運用 / トークン / 自動化 / 実績", zh: "运营 / Token / 自动化 / 成就" })}
+        title={t({ ko: "운영 / 토큰 / 자동화 / 업적 / 회의", en: "Operations / Tokens / Automation / Achievements / Meetings", ja: "運用 / トークン / 自動化 / 実績 / 会議", zh: "运营 / Token / 自动化 / 成就 / 会议" })}
         description={t({
           ko: "단일 장문 스크롤 대신 탭 전환으로 필요한 표면만 집중해서 봅니다.",
           en: "Switch surfaces by tab instead of scrolling one long page.",
@@ -227,6 +230,12 @@ export default function DashboardPageView({
             label={t({ ko: "업적", en: "Achievements", ja: "実績", zh: "成就" })}
             detail={t({ ko: "랭킹 + 업적", en: "Ranking + achievements", ja: "ランキング + 実績", zh: "排行 + 成就" })}
             onClick={() => setActiveTab("achievements")}
+          />
+          <DashboardTabButton
+            active={activeTab === "meetings"}
+            label={t({ ko: "회의", en: "Meetings", ja: "会議", zh: "会议" })}
+            detail={t({ ko: "기록 + 후속 일감", en: "Records + follow-ups", ja: "記録 + フォローアップ", zh: "记录 + 后续事项" })}
+            onClick={() => setActiveTab("meetings")}
           />
         </div>
       </SurfaceSection>
@@ -359,6 +368,32 @@ export default function DashboardPageView({
                 </div>
               </SurfaceSubsection>
             </div>
+          </PulseSectionShell>
+        </div>
+      )}
+
+      {activeTab === "meetings" && (
+        <div className="space-y-5">
+          <PulseSectionShell
+            eyebrow={t({ ko: "Meetings", en: "Meetings", ja: "Meetings", zh: "Meetings" })}
+            title={t({ ko: "회의 기록 / 후속 일감", en: "Meeting Records / Follow-ups", ja: "会議記録 / フォローアップ", zh: "会议记录 / 后续事项" })}
+            subtitle={t({
+              ko: "라운드 테이블 결과와 후속 이슈 정리를 대시보드 안에서 바로 이어서 처리합니다.",
+              en: "Continue round-table review and follow-up issue cleanup directly from the dashboard.",
+              ja: "ラウンドテーブル結果と後続イシュー整理をダッシュボード内で続けて処理します。",
+              zh: "在仪表盘内直接继续处理圆桌结果与后续 issue 整理。",
+            })}
+            badge={t({ ko: `${meetings.length}개 기록`, en: `${meetings.length} records`, ja: `${meetings.length}件`, zh: `${meetings.length} 条` })}
+          >
+            <Suspense
+              fallback={(
+                <div className="py-8 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
+                  {t({ ko: "회의 기록을 불러오는 중입니다", en: "Loading meeting records", ja: "会議記録を読み込み中", zh: "正在加载会议记录" })}
+                </div>
+              )}
+            >
+              <MeetingMinutesView meetings={meetings} onRefresh={() => onRefreshMeetings?.()} embedded />
+            </Suspense>
           </PulseSectionShell>
         </div>
       )}
