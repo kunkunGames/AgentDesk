@@ -2336,6 +2336,63 @@ mod tests {
         assert_eq!(active_dispatch_id, None);
     }
 
+    #[tokio::test]
+    async fn hook_session_turn_activity_refreshes_last_heartbeat_from_created_at() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState::test_state(db.clone(), engine);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_key, provider, status, created_at, last_heartbeat)
+                 VALUES ('session-heartbeat', 'codex', 'idle', '2026-04-09 01:02:03', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (status, _) = hook_session(
+            State(state),
+            Json(HookSessionBody {
+                session_key: "session-heartbeat".to_string(),
+                agent_id: None,
+                status: Some("working".to_string()),
+                provider: Some("codex".to_string()),
+                session_info: Some("working".to_string()),
+                name: None,
+                model: None,
+                tokens: None,
+                cwd: None,
+                dispatch_id: None,
+                claude_session_id: None,
+                thread_channel_id: Some("1485506232256168011".to_string()),
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let conn = db.lock().unwrap();
+        let (created_at, last_heartbeat): (String, Option<String>) = conn
+            .query_row(
+                "SELECT created_at, last_heartbeat
+                 FROM sessions
+                 WHERE session_key = 'session-heartbeat'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at, "2026-04-09 01:02:03");
+        assert!(
+            last_heartbeat
+                .as_deref()
+                .is_some_and(|value| value > created_at.as_str()),
+            "turn activity must refresh last_heartbeat beyond the original created_at"
+        );
+    }
+
     #[test]
     fn parse_thread_channel_name_extracts_parent_and_thread_id() {
         let result = parse_thread_channel_name("adk-cc-t1485400795435372796");
