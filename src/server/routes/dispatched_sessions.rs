@@ -354,17 +354,6 @@ pub async fn hook_session(
             let dispatch_id = body.dispatch_id.clone();
             drop(conn);
 
-            // Capture card status BEFORE hook fires.
-            let pre_hook_card: Option<(String, String)> = dispatch_id.as_ref().and_then(|did| {
-                let conn = state.db.lock().ok()?;
-                conn.query_row(
-                    "SELECT kc.id, kc.status FROM kanban_cards kc WHERE kc.latest_dispatch_id = ?1",
-                    [did],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ok()
-            });
-
             // Fire event hooks for session status change (#134)
             crate::kanban::fire_event_hooks(
                 &state.db,
@@ -379,49 +368,6 @@ pub async fn hook_session(
                     "provider": provider,
                 }),
             );
-
-            // After the hook fires, policies may have changed card status via kanban.setStatus.
-            // Fire transition hooks if status actually changed.
-            if let Some((card_id, old_card_status)) = &pre_hook_card {
-                let new_card_status: Option<String> = {
-                    let conn = state.db.lock().ok();
-                    conn.and_then(|c| {
-                        c.query_row(
-                            "SELECT status FROM kanban_cards WHERE id = ?1",
-                            [card_id],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                    })
-                };
-                if let Some(ref new_s) = new_card_status {
-                    if new_s != old_card_status {
-                        crate::kanban::fire_transition_hooks(
-                            &state.db,
-                            &state.engine,
-                            card_id,
-                            old_card_status,
-                            new_s,
-                        );
-                        // Drain any transitions accumulated by hooks (e.g., OnReviewEnter → manual-intervention follow-up)
-                        loop {
-                            let extra = state.engine.drain_pending_transitions();
-                            if extra.is_empty() {
-                                break;
-                            }
-                            for (cid, os, ns) in &extra {
-                                crate::kanban::fire_transition_hooks(
-                                    &state.db,
-                                    &state.engine,
-                                    cid,
-                                    os,
-                                    ns,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
 
             // NOTE: The additional idle-specific re-fire of OnDispatchCompleted was removed.
             // Dispatch finalization already fires OnDispatchCompleted elsewhere in the
@@ -1942,6 +1888,75 @@ mod tests {
             active_dispatch_id.as_deref(),
             Some(dispatch_id),
             "idle dispatch sessions must keep sticky active_dispatch_id for 180-minute TTL cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn working_hook_records_single_transition_audit_for_requested_to_in_progress() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        let state = AppState::test_state(db.clone(), engine);
+
+        let card_id = "card-working-audit";
+        let dispatch_id = "dispatch-working-audit";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
+                 VALUES (?1, 'Audit Card', 'requested', ?2, datetime('now'), datetime('now'))",
+                rusqlite::params![card_id, dispatch_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
+                 VALUES (?1, ?2, 'project-agentdesk', 'implementation', 'pending', 'Audit Card', '{}', datetime('now'), datetime('now'))",
+                rusqlite::params![dispatch_id, card_id],
+            )
+            .unwrap();
+        }
+
+        let (status, _) = hook_session(
+            State(state),
+            Json(HookSessionBody {
+                session_key: "session-working-audit".to_string(),
+                agent_id: None,
+                status: Some("working".to_string()),
+                provider: Some("codex".to_string()),
+                session_info: Some("working".to_string()),
+                name: None,
+                model: None,
+                tokens: None,
+                cwd: None,
+                dispatch_id: Some(dispatch_id.to_string()),
+                claude_session_id: None,
+                thread_channel_id: None,
+                session_id: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let conn = db.lock().unwrap();
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = ?1",
+                [card_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_audit_logs
+                 WHERE card_id = ?1 AND from_status = 'requested' AND to_status = 'in_progress' AND source = 'hook'",
+                [card_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(card_status, "in_progress");
+        assert_eq!(
+            audit_count, 1,
+            "session status hook should not replay the same requested -> in_progress transition"
         );
     }
 
