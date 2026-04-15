@@ -405,12 +405,21 @@ fn complete_dispatch_inner(
                         |row| row.get(0),
                     )
                     .unwrap_or(false);
+                let has_active_work: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) > 0 FROM task_dispatches \
+                         WHERE kanban_card_id = ?1 AND dispatch_type IN ('implementation', 'rework') \
+                         AND status IN ('pending', 'dispatched')",
+                        [&kanban_card_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(false);
                 let is_review_state = card_status.as_deref().map_or(false, |s| {
                     let eff = crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
                     eff.hooks_for_state(s)
                         .map_or(false, |h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
                 });
-                is_review_state && !has_review_dispatch
+                is_review_state && !has_review_dispatch && !has_active_work
             })
             .unwrap_or(false);
 

@@ -45,6 +45,18 @@ var reviewAutomation = {
       return;
     }
 
+    // Guard: don't create review dispatch if implementation/rework is still active
+    var activeWork = agentdesk.db.query(
+      "SELECT COUNT(*) as cnt FROM task_dispatches " +
+      "WHERE kanban_card_id = ? AND dispatch_type IN ('implementation', 'rework') " +
+      "AND status IN ('pending', 'dispatched')",
+      [card.id]
+    );
+    if (activeWork.length > 0 && activeWork[0].cnt > 0) {
+      agentdesk.log.info("[review] Card " + card.id + " has active work dispatch — deferring review");
+      return;
+    }
+
     // Check if review is enabled — if not, complete immediately
     var reviewEnabled = agentdesk.config.get("review_enabled");
     if (reviewEnabled === "false" || reviewEnabled === false) {
