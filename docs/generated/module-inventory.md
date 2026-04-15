@@ -105,7 +105,7 @@
 | `logging` | `src/logging.rs` | 160 |  |
 | `manual_intervention` | `src/manual_intervention.rs` | 34 |  |
 | `pipeline` | `src/pipeline.rs` | 1018 | giant-file |
-| `receipt` | `src/receipt.rs` | 1625 | giant-file |
+| `receipt` | `src/receipt.rs` | 2083 | giant-file |
 | `reconcile` | `src/reconcile.rs` | 539 |  |
 | `runtime` | `src/runtime.rs` | 112 |  |
 | `runtime_layout` | `src/runtime_layout/mod.rs` | 1259 | giant-file |
@@ -120,7 +120,7 @@
 | `server::routes` | `src/server/routes/mod.rs` | 177 |  |
 | `server::routes::agents` | `src/server/routes/agents.rs` | 1325 | giant-file |
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 616 |  |
-| `server::routes::analytics` | `src/server/routes/analytics.rs` | 687 |  |
+| `server::routes::analytics` | `src/server/routes/analytics.rs` | 817 |  |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 94 |  |
 | `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 4735 | giant-file |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 134 |  |
@@ -253,7 +253,7 @@
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1159 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 184 |  |
-| `services::process` | `src/services/process.rs` | 707 |  |
+| `services::process` | `src/services/process.rs` | 706 |  |
 | `services::provider` | `src/services/provider.rs` | 1962 | giant-file |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 355 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |

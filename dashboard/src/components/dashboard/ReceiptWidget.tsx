@@ -35,7 +35,7 @@ interface AgentShare {
   percentage: number;
 }
 
-interface ReceiptData {
+export interface ReceiptData {
   period_label: string;
   period_start: string;
   period_end: string;
@@ -81,11 +81,11 @@ function formatCost(value: number): string {
   return `$${value.toFixed(4)}`;
 }
 
-function providerKey(value: string): string {
+export function providerKey(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function buildProviderOptions(data: ReceiptData | null): string[] {
+export function buildProviderOptions(data: ReceiptData | null): string[] {
   if (!data) return [];
 
   const seen = new Set<string>();
@@ -99,7 +99,7 @@ function buildProviderOptions(data: ReceiptData | null): string[] {
   return providers;
 }
 
-function deriveReceiptView(data: ReceiptData | null, selectedProvider: string): ReceiptData | null {
+export function deriveReceiptView(data: ReceiptData | null, selectedProvider: string): ReceiptData | null {
   if (!data) return null;
   if (selectedProvider === "all") return data;
 
