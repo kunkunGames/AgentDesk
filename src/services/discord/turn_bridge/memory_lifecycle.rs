@@ -132,12 +132,12 @@ fn assistant_turn_count(history: &[HistoryItem]) -> usize {
 pub(super) fn plan_turn_end_memory(
     session: &DiscordSession,
     backend: settings::MemoryBackendKind,
-    is_prompt_too_long: bool,
+    _is_prompt_too_long: bool,
     resume_failure_detected: bool,
     terminal_session_reset_required: bool,
     should_record_final_turn: bool,
 ) -> Option<TurnEndMemoryPlan> {
-    if session.cleared || is_prompt_too_long {
+    if session.cleared {
         return None;
     }
 
@@ -159,7 +159,7 @@ pub(super) fn plan_turn_end_memory(
         session_end_reason,
         clear_provider_session,
         persist_transcript,
-        analyze_recall_feedback: persist_transcript,
+        analyze_recall_feedback: backend == settings::MemoryBackendKind::Memento,
         spawn_capture: persist_transcript && backend != settings::MemoryBackendKind::Memento,
     })
 }
