@@ -1,32 +1,23 @@
 import { useEffect, useState, useMemo } from "react";
-import type { Agent, DashboardStats } from "../../types";
+import type { Agent } from "../../types";
 import * as api from "../../api/client";
 import type { TFunction } from "./model";
-import { getAgentLevel, getAgentTitle } from "../agent-manager/AgentInfoCard";
-import { hasManualInterventionReason, isManualInterventionCard } from "../agent-manager/kanban-utils";
 import AgentAvatar from "../AgentAvatar";
-import { cx, dashboardBadge, dashboardButton, dashboardCard } from "./ui";
+import { cx, dashboardBadge, dashboardCard } from "./ui";
 import {
+  DEFAULT_BOTTLENECK_THRESHOLDS,
   LONG_BLOCKED_DAYS,
   REVIEW_DELAY_DAYS,
   REWORK_ALERT_THRESHOLD,
   buildBottleneckGroups,
+  type BottleneckThresholds,
   type BottleneckRow,
 } from "./dashboardInsights";
 
-// ── CookingHeart Role Board Widget ──
-
-const CH_ROLE_PREFIXES = ["ch-pmd", "ch-pd", "ch-dd", "ch-td", "ch-ad", "ch-tad", "ch-qad"];
-const CH_ROLE_LABELS: Record<string, { ko: string; en: string }> = {
-  "ch-pmd": { ko: "프로젝트관리", en: "PMD" },
-  "ch-pd": { ko: "기획", en: "PD" },
-  "ch-dd": { ko: "게임디자인", en: "DD" },
-  "ch-td": { ko: "기술개발", en: "TD" },
-  "ch-ad": { ko: "아트", en: "AD" },
-  "ch-tad": { ko: "테크아트", en: "TAD" },
-  "ch-qad": { ko: "QA", en: "QAD" },
-};
 const DEFAULT_CRON_TIMELINE_WINDOW_MS = 60 * 60_000;
+const BOTTLE_NECK_THRESHOLDS_STORAGE_KEY = "agentdesk:dashboard:bottleneck-thresholds";
+const AUTO_QUEUE_HISTORY_LIMIT = 24;
+const AUTO_QUEUE_HISTORY_PREVIEW_COUNT = 8;
 
 export function formatCompactDuration(ms: number): string {
   const safeMs = Math.max(ms, 1_000);
@@ -38,7 +29,10 @@ export function formatCompactDuration(ms: number): string {
   return `${Math.round(safeMs / 1_000)}s`;
 }
 
-export function describeCronSchedule(schedule: api.CronSchedule): string {
+export function describeCronSchedule(
+  schedule: api.CronSchedule,
+  localeTag = "en-US",
+): string {
   if (schedule.kind === "every" && schedule.everyMs) {
     return `Every ${formatCompactDuration(schedule.everyMs)}`;
   }
@@ -46,7 +40,7 @@ export function describeCronSchedule(schedule: api.CronSchedule): string {
     return schedule.cron;
   }
   if (schedule.kind === "at" && schedule.atMs) {
-    return new Date(schedule.atMs).toLocaleString("ko-KR", {
+    return new Date(schedule.atMs).toLocaleString(localeTag, {
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
@@ -75,6 +69,7 @@ export interface CronTimelineMetrics {
 export function buildCronTimelineMetrics(
   job: api.CronJobGlobal,
   now = Date.now(),
+  localeTag = "en-US",
 ): CronTimelineMetrics {
   const intervalMs =
     job.schedule.kind === "every" && job.schedule.everyMs && job.schedule.everyMs > 0
@@ -108,360 +103,8 @@ export function buildCronTimelineMetrics(
     lastPercent: lastRunAtMs != null ? toPercent(lastRunAtMs) : null,
     nextPercent: nextRunAtMs != null ? toPercent(nextRunAtMs) : null,
     overdue: nextRunAtMs != null && nextRunAtMs < now,
-    intervalLabel: describeCronSchedule(job.schedule),
+    intervalLabel: describeCronSchedule(job.schedule, localeTag),
   };
-}
-
-interface CookingHeartWidgetProps {
-  agents: Agent[];
-  t: TFunction;
-  isKo: boolean;
-}
-
-export function CookingHeartRoleBoardWidget({ agents, t, isKo }: CookingHeartWidgetProps) {
-  const chAgents = useMemo(
-    () => agents.filter((a) => CH_ROLE_PREFIXES.some((p) => a.id.startsWith(p) || a.name.startsWith(p))),
-    [agents],
-  );
-  if (chAgents.length === 0) return null;
-
-  const workingCount = chAgents.filter((a) => a.status === "working").length;
-
-  return (
-    <div
-      className={dashboardCard.accentStandard}
-      style={{
-        borderColor: "var(--th-border)",
-        background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 90%, #ef4444 10%), var(--th-surface))",
-      }}
-    >
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
-          🍳 CookingHeart
-        </h3>
-        <span className={dashboardBadge.default} style={{ background: "rgba(239,68,68,0.15)", color: "#f87171" }}>
-          {workingCount}/{chAgents.length} {t({ ko: "가동", en: "active", ja: "稼働", zh: "活跃" })}
-        </span>
-      </div>
-      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-        {chAgents.map((agent) => {
-          const roleKey = CH_ROLE_PREFIXES.find((p) => agent.id.startsWith(p) || agent.name.startsWith(p));
-          const roleLabel = roleKey ? (isKo ? CH_ROLE_LABELS[roleKey]?.ko : CH_ROLE_LABELS[roleKey]?.en) : "";
-          const isWorking = agent.status === "working";
-          return (
-            <div
-              key={agent.id}
-              className={cx(dashboardCard.nestedCompact, "flex items-center gap-1.5")}
-              style={{ background: "var(--th-bg-surface)" }}
-            >
-              <span className={`w-2 h-2 rounded-full shrink-0 ${isWorking ? "bg-emerald-400" : "bg-gray-400"}`} />
-              <div className="min-w-0 flex-1">
-                <div className="text-xs font-medium truncate" style={{ color: "var(--th-text)" }}>
-                  {agent.avatar_emoji} {roleLabel || agent.alias || agent.name}
-                </div>
-                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {agent.stats_xp.toLocaleString()} XP
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// ── GitHub Issues Widget ──
-
-interface GitHubIssuesWidgetProps {
-  t: TFunction;
-  repo?: string;
-}
-
-export function GitHubIssuesWidget({ t, repo }: GitHubIssuesWidgetProps) {
-  const [data, setData] = useState<api.GitHubIssuesResponse | null>(null);
-
-  useEffect(() => {
-    api.getGitHubIssues(repo, "open", 8).then(setData).catch(() => {});
-  }, [repo]);
-
-  if (!data || data.issues.length === 0) return null;
-
-  return (
-    <div
-      className={dashboardCard.standard}
-      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
-    >
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
-          {t({ ko: "GitHub 이슈", en: "GitHub Issues", ja: "GitHub Issues", zh: "GitHub Issues" })}
-        </h3>
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-          {data.repo}
-        </span>
-      </div>
-      <div className="space-y-1.5 max-h-48 overflow-y-auto">
-        {data.issues.map((issue) => (
-          <div
-            key={issue.number}
-            className={cx(dashboardCard.nestedCompact, "flex items-start gap-2")}
-            style={{ background: "var(--th-bg-surface)" }}
-          >
-            <span className="text-xs shrink-0 mt-0.5" style={{ color: "#34d399" }}>
-              #{issue.number}
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="text-xs font-medium truncate" style={{ color: "var(--th-text)" }}>
-                {issue.title}
-              </div>
-              <div className="flex gap-1 flex-wrap mt-0.5">
-                {issue.labels.slice(0, 3).map((label) => (
-                  <span
-                    key={label.name}
-                    className={dashboardBadge.default}
-                    style={{ background: `#${label.color}33`, color: `#${label.color}` }}
-                  >
-                    {label.name}
-                  </span>
-                ))}
-                {issue.assignees.length > 0 && (
-                  <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                    → {issue.assignees.map((a) => a.login).join(", ")}
-                  </span>
-                )}
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-interface KanbanOpsWidgetProps {
-  kanban: DashboardStats["kanban"];
-  t: TFunction;
-}
-
-type OpsCategory = "review" | "acceptance" | "stalled" | "blocked";
-
-export function KanbanOpsWidget({ kanban, t }: KanbanOpsWidgetProps) {
-  const [expanded, setExpanded] = useState<OpsCategory | null>(null);
-  const [cards, setCards] = useState<api.KanbanCard[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const categoryFilter: Record<OpsCategory, (c: api.KanbanCard) => boolean> = useMemo(() => ({
-    review: (c) => c.status === "review",
-    acceptance: (c) => c.status === "requested",
-    stalled: (c) => c.status === "in_progress",
-    blocked: (c) => isManualInterventionCard(c),
-  }), []);
-
-  const handleToggle = async (cat: OpsCategory) => {
-    if (expanded === cat) { setExpanded(null); return; }
-    setExpanded(cat);
-    setLoading(true);
-    try {
-      const all = await api.getKanbanCards();
-      setCards(all.filter(categoryFilter[cat]));
-    } catch { setCards([]); }
-    setLoading(false);
-  };
-
-  const handleAction = async (cardId: string, action: "retry" | "ready" | "done") => {
-    try {
-      if (action === "retry") await api.retryKanbanCard(cardId);
-      else if (action === "ready") await api.updateKanbanCard(cardId, { status: "ready" } as never);
-      else if (action === "done") await api.updateKanbanCard(cardId, { status: "done" } as never);
-      // Refresh
-      if (expanded) {
-        const all = await api.getKanbanCards();
-        setCards(all.filter(categoryFilter[expanded]));
-      }
-    } catch { /* ignore */ }
-  };
-
-  const categories: Array<{ key: OpsCategory; label: string; value: number; color: string }> = [
-    { key: "review", label: t({ ko: "검토 대기", en: "Review", ja: "レビュー待ち", zh: "待审查" }), value: kanban.review_queue, color: "#14b8a6" },
-    { key: "acceptance", label: t({ ko: "수락 지연", en: "Ack delay", ja: "受諾遅延", zh: "接收延迟" }), value: kanban.waiting_acceptance, color: "#10b981" },
-    { key: "stalled", label: t({ ko: "진행 정체", en: "Stalled", ja: "停滞", zh: "停滞" }), value: kanban.stale_in_progress, color: "#f59e0b" },
-    { key: "blocked", label: t({ ko: "수동 개입", en: "Manual intervention", ja: "手動介入", zh: "人工介入" }), value: kanban.blocked, color: "#ef4444" },
-  ];
-
-  return (
-    <div
-      className={dashboardCard.accentStandard}
-      style={{
-        borderColor: "var(--th-border)",
-        background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 92%, #0ea5e9 8%), var(--th-surface))",
-      }}
-    >
-      <div className="flex items-center justify-between mb-3 gap-3">
-        <div>
-          <h3 className="text-sm font-semibold" style={{ color: "var(--th-text)" }}>
-            {t({ ko: "칸반 운영 상태", en: "Kanban Ops", ja: "カンバン運用", zh: "看板运营" })}
-          </h3>
-          <p className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-            {t({ ko: "병목과 대기 중인 카드", en: "Bottlenecks and waiting cards", ja: "ボトルネックと待機カード", zh: "瓶颈与等待卡片" })}
-          </p>
-        </div>
-        <span className={dashboardBadge.default} style={{ color: "var(--th-text-secondary)", background: "var(--th-overlay-medium)" }}>
-          {kanban.open_total}
-        </span>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
-        {categories.map((item) => (
-          <button
-            key={item.key}
-            type="button"
-            onClick={() => item.value > 0 && handleToggle(item.key)}
-            className={cx(dashboardButton.md, "w-full flex-col items-start text-left transition-all")}
-            style={{
-              background: expanded === item.key ? `color-mix(in srgb, ${item.color} 12%, var(--th-bg-surface))` : "var(--th-bg-surface)",
-              borderColor: expanded === item.key ? `color-mix(in srgb, ${item.color} 40%, transparent)` : "rgba(148,163,184,0.14)",
-              cursor: item.value > 0 ? "pointer" : "default",
-            }}
-          >
-            <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>{item.label}</div>
-            <div className="text-xl font-black" style={{ color: item.color }}>{item.value}</div>
-          </button>
-        ))}
-      </div>
-
-      {/* Expanded card list */}
-      {expanded && (
-        <div className="mt-3 space-y-2">
-          {loading ? (
-            <div className="text-xs text-center py-2" style={{ color: "var(--th-text-muted)" }}>...</div>
-          ) : cards.length === 0 ? (
-            <div className="text-xs text-center py-2" style={{ color: "var(--th-text-muted)" }}>
-              {t({ ko: "카드 없음", en: "No cards", ja: "カードなし", zh: "无卡片" })}
-            </div>
-          ) : cards.map((card) => (
-            <OpsCardRow key={card.id} card={card} t={t} onAction={handleAction} />
-          ))}
-        </div>
-      )}
-
-      {kanban.top_repos.length > 0 && (
-        <div className="mt-4 space-y-1.5">
-          <div className="text-xs font-semibold uppercase tracking-[0.14em]" style={{ color: "var(--th-text-muted)" }}>
-            {t({ ko: "압력 높은 Repo", en: "High-pressure repos", ja: "高圧 Repo", zh: "高压 Repo" })}
-          </div>
-          {kanban.top_repos.map((repo) => (
-            <div
-              key={repo.github_repo}
-              className={cx(dashboardCard.nestedCompact, "flex items-center justify-between gap-3")}
-              style={{ background: "var(--th-bg-surface)" }}
-            >
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium" style={{ color: "var(--th-text)" }}>
-                  {repo.github_repo}
-                </div>
-                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-                  {t({ ko: "열린 카드", en: "Open cards", ja: "オープンカード", zh: "开放卡片" })}: {repo.open_count}
-                </div>
-              </div>
-              <span className={dashboardBadge.default} style={{ color: "#fca5a5", background: "rgba(239,68,68,0.12)" }}>
-                {repo.pressure_count}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function OpsCardRow({ card, t, onAction }: {
-  card: api.KanbanCard;
-  t: TFunction;
-  onAction: (id: string, action: "retry" | "ready" | "done") => void;
-}) {
-  const repo = card.github_repo?.replace(/^[^/]+\//, "") ?? "";
-  const statusColor = isManualInterventionCard(card) ? "#f59e0b"
-    : card.status === "review" ? "#14b8a6"
-    : "#10b981";
-
-  return (
-    <div
-      className={cx(dashboardCard.nestedCompact, "flex flex-col gap-1.5")}
-      style={{ background: "var(--th-bg-surface)", border: "1px solid var(--th-border)" }}
-    >
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span
-              className={cx(dashboardBadge.default, "font-semibold uppercase shrink-0")}
-              style={{ color: statusColor, background: `color-mix(in srgb, ${statusColor} 15%, transparent)` }}
-            >
-              {card.status}
-            </span>
-            {repo && (
-              <span className={dashboardBadge.default} style={{ color: "var(--th-text-muted)", background: "rgba(255,255,255,0.06)" }}>
-                {repo}
-              </span>
-            )}
-          </div>
-          <div className="text-sm font-medium mt-0.5 truncate" style={{ color: "var(--th-text)" }}>
-            {card.title}
-          </div>
-          {hasManualInterventionReason(card) && card.blocked_reason && (
-            <div className="text-xs mt-0.5" style={{ color: "#fca5a5" }}>
-              {card.blocked_reason}
-            </div>
-          )}
-          {card.latest_dispatch_result_summary && isManualInterventionCard(card) && (
-            <div className="text-xs mt-0.5" style={{ color: "#fca5a5" }}>
-              {card.latest_dispatch_result_summary}
-            </div>
-          )}
-        </div>
-        {card.github_issue_url && (
-          <a
-            href={card.github_issue_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs shrink-0 hover:underline"
-            style={{ color: "#93c5fd" }}
-          >
-            #{card.github_issue_number}
-          </a>
-        )}
-      </div>
-      <div className="flex items-center gap-1.5">
-        {isManualInterventionCard(card) && (
-          <>
-            <button
-              type="button"
-              onClick={() => onAction(card.id, "retry")}
-              className={dashboardButton.sm}
-              style={{ color: "#67e8f9", background: "rgba(103,232,249,0.12)", border: "1px solid rgba(103,232,249,0.2)" }}
-            >
-              {t({ ko: "재시도", en: "Retry", ja: "再試行", zh: "重试" })}
-            </button>
-            <button
-              type="button"
-              onClick={() => onAction(card.id, "ready")}
-              className={dashboardButton.sm}
-              style={{ color: "#a5b4fc", background: "rgba(165,180,252,0.12)", border: "1px solid rgba(165,180,252,0.2)" }}
-            >
-              {t({ ko: "Ready로", en: "To Ready", ja: "Readyへ", zh: "重置Ready" })}
-            </button>
-          </>
-        )}
-        <button
-          type="button"
-          onClick={() => onAction(card.id, "done")}
-          className={dashboardButton.sm}
-          style={{ color: "#86efac", background: "rgba(134,239,172,0.12)", border: "1px solid rgba(134,239,172,0.2)" }}
-        >
-          {t({ ko: "Done", en: "Done", ja: "Done", zh: "完成" })}
-        </button>
-      </div>
-    </div>
-  );
 }
 
 function formatRelativeAge(days: number, t: TFunction): string {
@@ -486,6 +129,46 @@ function formatPercent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
+function sanitizeThreshold(value: number, fallback: number, min = 1, max = 30): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function readStoredBottleneckThresholds(): BottleneckThresholds {
+  if (typeof window === "undefined") return DEFAULT_BOTTLENECK_THRESHOLDS;
+  try {
+    const raw = window.localStorage.getItem(BOTTLE_NECK_THRESHOLDS_STORAGE_KEY);
+    if (!raw) return DEFAULT_BOTTLENECK_THRESHOLDS;
+    const parsed = JSON.parse(raw) as Partial<BottleneckThresholds>;
+    return {
+      review_delay_days: sanitizeThreshold(parsed.review_delay_days ?? NaN, REVIEW_DELAY_DAYS),
+      long_blocked_days: sanitizeThreshold(parsed.long_blocked_days ?? NaN, LONG_BLOCKED_DAYS),
+      rework_alert_threshold: sanitizeThreshold(parsed.rework_alert_threshold ?? NaN, REWORK_ALERT_THRESHOLD, 1, 20),
+    };
+  } catch {
+    return DEFAULT_BOTTLENECK_THRESHOLDS;
+  }
+}
+
+function persistBottleneckThresholds(thresholds: BottleneckThresholds) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(BOTTLE_NECK_THRESHOLDS_STORAGE_KEY, JSON.stringify(thresholds));
+  } catch {
+    // Ignore localStorage failures and keep the current in-memory values.
+  }
+}
+
+function buildWeightedSuccessRate(runs: api.AutoQueueHistoryRun[]): number {
+  const totalEntries = runs.reduce((sum, run) => sum + Math.max(run.entry_count, 0), 0);
+  if (totalEntries <= 0) return 0;
+  const successfulEntries = runs.reduce(
+    (sum, run) => sum + Math.max(run.entry_count, 0) * run.success_rate,
+    0,
+  );
+  return successfulEntries / totalEntries;
+}
+
 // ── Bottleneck Widget ──
 
 interface BottleneckWidgetProps {
@@ -495,6 +178,13 @@ interface BottleneckWidgetProps {
 export function BottleneckWidget({ t }: BottleneckWidgetProps) {
   const [cards, setCards] = useState<api.KanbanCard[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showThresholdControls, setShowThresholdControls] = useState(false);
+  const [thresholds, setThresholds] = useState<BottleneckThresholds>(() => readStoredBottleneckThresholds());
+
+  useEffect(() => {
+    persistBottleneckThresholds(thresholds);
+  }, [thresholds]);
 
   useEffect(() => {
     let mounted = true;
@@ -503,9 +193,12 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
       if (mounted) setLoading(true);
       try {
         const next = await api.getKanbanCards();
-        if (mounted) setCards(next);
-      } catch {
-        if (mounted) setCards([]);
+        if (!mounted) return;
+        setCards(next);
+        setError(null);
+      } catch (nextError) {
+        if (!mounted) return;
+        setError(nextError instanceof Error ? nextError.message : String(nextError));
       } finally {
         if (mounted) setLoading(false);
       }
@@ -519,9 +212,27 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
     };
   }, []);
 
-  const groups = useMemo(() => buildBottleneckGroups(cards), [cards]);
-  const totalAlerts =
-    groups.review_delay.length + groups.repeat_rework.length + groups.long_blocked.length;
+  const groups = useMemo(() => buildBottleneckGroups(cards, Date.now(), thresholds), [cards, thresholds]);
+  const totalAlerts = useMemo(() => {
+    const ids = new Set<string>();
+    for (const row of groups.review_delay) ids.add(row.id);
+    for (const row of groups.repeat_rework) ids.add(row.id);
+    for (const row of groups.long_blocked) ids.add(row.id);
+    return ids.size;
+  }, [groups]);
+
+  const updateThreshold = (
+    key: keyof BottleneckThresholds,
+    nextValue: number,
+    fallback: number,
+    min = 1,
+    max = 30,
+  ) => {
+    setThresholds((current) => ({
+      ...current,
+      [key]: sanitizeThreshold(nextValue, fallback, min, max),
+    }));
+  };
 
   return (
     <div
@@ -545,13 +256,94 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
             })}
           </p>
         </div>
-        <span
-          className="rounded-full px-3 py-1 text-xs font-semibold"
-          style={{ color: "#fca5a5", background: "rgba(239,68,68,0.14)" }}
-        >
-          {totalAlerts} {t({ ko: "경고", en: "alerts", ja: "警告", zh: "警报" })}
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="rounded-full px-3 py-1 text-[11px] font-semibold"
+            style={{
+              color: "var(--th-text)",
+              background: "rgba(148,163,184,0.14)",
+              border: "1px solid rgba(148,163,184,0.2)",
+            }}
+            onClick={() => setShowThresholdControls((current) => !current)}
+          >
+            {showThresholdControls
+              ? t({ ko: "기준 닫기", en: "Hide thresholds", ja: "基準を閉じる", zh: "收起阈值" })
+              : t({ ko: "기준 조정", en: "Tune thresholds", ja: "基準調整", zh: "调整阈值" })}
+          </button>
+          <span
+            className="rounded-full px-3 py-1 text-xs font-semibold"
+            style={{ color: "#fca5a5", background: "rgba(239,68,68,0.14)" }}
+          >
+            {totalAlerts} {t({ ko: "경고", en: "alerts", ja: "警告", zh: "警报" })}
+          </span>
+        </div>
       </div>
+
+      {showThresholdControls ? (
+        <div className="mt-4 grid gap-3 rounded-2xl border p-3 text-[11px] sm:grid-cols-3" style={{ borderColor: "rgba(255,255,255,0.08)", background: "rgba(15,23,42,0.18)" }}>
+          <label className="flex min-w-0 flex-col gap-1">
+            <span style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "리뷰 지연 일수", en: "Review delay days", ja: "レビュー遅延日数", zh: "审查延迟天数" })}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={thresholds.review_delay_days}
+              onChange={(event) => updateThreshold("review_delay_days", Number(event.target.value), REVIEW_DELAY_DAYS)}
+              className="rounded-xl border px-3 py-2 text-sm"
+              style={{ borderColor: "rgba(255,255,255,0.1)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}
+            />
+          </label>
+          <label className="flex min-w-0 flex-col gap-1">
+            <span style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "장기 블록 일수", en: "Blocked days", ja: "長期ブロック日数", zh: "长期阻塞天数" })}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={30}
+              value={thresholds.long_blocked_days}
+              onChange={(event) => updateThreshold("long_blocked_days", Number(event.target.value), LONG_BLOCKED_DAYS)}
+              className="rounded-xl border px-3 py-2 text-sm"
+              style={{ borderColor: "rgba(255,255,255,0.1)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}
+            />
+          </label>
+          <label className="flex min-w-0 flex-col gap-1">
+            <span style={{ color: "var(--th-text-muted)" }}>
+              {t({ ko: "리워크 경고 횟수", en: "Rework threshold", ja: "リワーク閾値", zh: "返工阈值" })}
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={thresholds.rework_alert_threshold}
+              onChange={(event) => updateThreshold("rework_alert_threshold", Number(event.target.value), REWORK_ALERT_THRESHOLD, 1, 20)}
+              className="rounded-xl border px-3 py-2 text-sm"
+              style={{ borderColor: "rgba(255,255,255,0.1)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}
+            />
+          </label>
+        </div>
+      ) : null}
+
+      {error ? (
+        <div className="mt-4 rounded-2xl border px-3 py-2 text-xs" style={{ borderColor: "rgba(251,191,36,0.28)", background: "rgba(251,191,36,0.12)", color: "#fde68a" }}>
+          {cards.length > 0
+            ? t({
+                ko: `최근 카드 스냅샷을 유지 중이며 새 동기화에 실패했습니다. (${error})`,
+                en: `Keeping the last card snapshot because refresh failed. (${error})`,
+                ja: `最新同期に失敗したため、直近のカードスナップショットを維持しています。(${error})`,
+                zh: `最新同步失败，正在保留最近一次卡片快照。(${error})`,
+              })
+            : t({
+                ko: `칸반 카드를 불러오지 못했습니다. (${error})`,
+                en: `Unable to load kanban cards. (${error})`,
+                ja: `kanban カードを読み込めませんでした。(${error})`,
+                zh: `无法加载 kanban 卡片。(${error})`,
+              })}
+        </div>
+      ) : null}
 
       {loading && totalAlerts === 0 ? (
         <div className="py-10 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
@@ -562,10 +354,10 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
           <BottleneckColumn
             title={t({ ko: "리뷰 지연", en: "Review Delay", ja: "レビュー遅延", zh: "审查延迟" })}
             hint={t({
-              ko: `${REVIEW_DELAY_DAYS}일 이상 review`,
-              en: `${REVIEW_DELAY_DAYS}+ days in review`,
-              ja: `${REVIEW_DELAY_DAYS}日以上 review`,
-              zh: `review 超过 ${REVIEW_DELAY_DAYS} 天`,
+              ko: `${thresholds.review_delay_days}일 이상 review`,
+              en: `${thresholds.review_delay_days}+ days in review`,
+              ja: `${thresholds.review_delay_days}日以上 review`,
+              zh: `review 超过 ${thresholds.review_delay_days} 天`,
             })}
             rows={groups.review_delay}
             emptyLabel={t({ ko: "지연된 review 카드가 없습니다", en: "No delayed review cards", ja: "遅延レビューカードはありません", zh: "暂无延迟审查卡片" })}
@@ -575,10 +367,10 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
           <BottleneckColumn
             title={t({ ko: "반복 리워크", en: "Repeat Rework", ja: "反復リワーク", zh: "重复返工" })}
             hint={t({
-              ko: `${REWORK_ALERT_THRESHOLD}회 이상 rework`,
-              en: `${REWORK_ALERT_THRESHOLD}+ reworks`,
-              ja: `${REWORK_ALERT_THRESHOLD}回以上リワーク`,
-              zh: `${REWORK_ALERT_THRESHOLD} 次以上返工`,
+              ko: `${thresholds.rework_alert_threshold}회 이상 rework`,
+              en: `${thresholds.rework_alert_threshold}+ reworks`,
+              ja: `${thresholds.rework_alert_threshold}回以上リワーク`,
+              zh: `${thresholds.rework_alert_threshold} 次以上返工`,
             })}
             rows={groups.repeat_rework}
             emptyLabel={t({ ko: "반복 리워크 카드는 없습니다", en: "No repeat rework cards", ja: "反復リワークカードはありません", zh: "暂无重复返工卡片" })}
@@ -588,10 +380,10 @@ export function BottleneckWidget({ t }: BottleneckWidgetProps) {
           <BottleneckColumn
             title={t({ ko: "장기 블로킹", en: "Long Blocked", ja: "長期ブロック", zh: "长期阻塞" })}
             hint={t({
-              ko: `${LONG_BLOCKED_DAYS}일 이상 blocked`,
-              en: `${LONG_BLOCKED_DAYS}+ days blocked`,
-              ja: `${LONG_BLOCKED_DAYS}日以上 blocked`,
-              zh: `blocked 超过 ${LONG_BLOCKED_DAYS} 天`,
+              ko: `${thresholds.long_blocked_days}일 이상 blocked`,
+              en: `${thresholds.long_blocked_days}+ days blocked`,
+              ja: `${thresholds.long_blocked_days}日以上 blocked`,
+              zh: `blocked 超过 ${thresholds.long_blocked_days} 天`,
             })}
             rows={groups.long_blocked}
             emptyLabel={t({ ko: "장기 블로킹 카드는 없습니다", en: "No long blocked cards", ja: "長期ブロックカードはありません", zh: "暂无长期阻塞卡片" })}
@@ -619,6 +411,10 @@ function BottleneckColumn({
   accent: string;
   t: TFunction;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const visibleRows = expanded ? rows : rows.slice(0, 4);
+  const hiddenCount = Math.max(0, rows.length - visibleRows.length);
+
   return (
     <div
       className="rounded-2xl border p-3"
@@ -647,7 +443,7 @@ function BottleneckColumn({
         </div>
       ) : (
         <div className="mt-3 space-y-2">
-          {rows.slice(0, 4).map((row) => (
+          {visibleRows.map((row) => (
             <div
               key={row.id}
               className="rounded-xl border px-3 py-2"
@@ -674,6 +470,35 @@ function BottleneckColumn({
               )}
             </div>
           ))}
+          {hiddenCount > 0 ? (
+            <button
+              type="button"
+              className="w-full rounded-xl border px-3 py-2 text-xs font-medium"
+              style={{ borderColor: `${accent}33`, color: accent, background: "transparent" }}
+              onClick={() => setExpanded(true)}
+            >
+              {t({
+                ko: `${hiddenCount}건 더 보기`,
+                en: `Show ${hiddenCount} more`,
+                ja: `${hiddenCount}件をさらに表示`,
+                zh: `再显示 ${hiddenCount} 条`,
+              })}
+            </button>
+          ) : rows.length > 4 ? (
+            <button
+              type="button"
+              className="w-full rounded-xl border px-3 py-2 text-xs font-medium"
+              style={{ borderColor: `${accent}33`, color: "var(--th-text-muted)", background: "transparent" }}
+              onClick={() => setExpanded(false)}
+            >
+              {t({
+                ko: "접기",
+                en: "Collapse",
+                ja: "折りたたむ",
+                zh: "收起",
+              })}
+            </button>
+          ) : null}
         </div>
       )}
     </div>
@@ -688,16 +513,25 @@ interface AutoQueueHistoryWidgetProps {
 
 export function AutoQueueHistoryWidget({ t }: AutoQueueHistoryWidgetProps) {
   const [data, setData] = useState<api.AutoQueueHistoryResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     let mounted = true;
 
     const load = async () => {
+      if (mounted) setLoading(true);
       try {
-        const next = await api.getAutoQueueHistory(8);
-        if (mounted) setData(next);
-      } catch {
-        if (mounted) setData(null);
+        const next = await api.getAutoQueueHistory(AUTO_QUEUE_HISTORY_LIMIT);
+        if (!mounted) return;
+        setData(next);
+        setError(null);
+      } catch (nextError) {
+        if (!mounted) return;
+        setError(nextError instanceof Error ? nextError.message : String(nextError));
+      } finally {
+        if (mounted) setLoading(false);
       }
     };
 
@@ -709,7 +543,10 @@ export function AutoQueueHistoryWidget({ t }: AutoQueueHistoryWidgetProps) {
     };
   }, []);
 
-  if (!data || data.runs.length === 0) return null;
+  const runs = data?.runs ?? [];
+  const visibleRuns = expanded ? runs : runs.slice(0, AUTO_QUEUE_HISTORY_PREVIEW_COUNT);
+  const weightedSuccessRate = useMemo(() => buildWeightedSuccessRate(runs), [runs]);
+  const hiddenRuns = Math.max(0, runs.length - visibleRuns.length);
 
   return (
     <div
@@ -732,16 +569,58 @@ export function AutoQueueHistoryWidget({ t }: AutoQueueHistoryWidgetProps) {
         </div>
         <div className="flex flex-wrap items-center gap-2 text-[11px]">
           <span className="rounded-full px-2 py-1" style={{ color: "#86efac", background: "rgba(34,197,94,0.12)" }}>
-            {data.summary.completed_runs}/{data.summary.total_runs} {t({ ko: "완료", en: "completed", ja: "完了", zh: "完成" })}
+            {(data?.summary.completed_runs ?? 0)}/{data?.summary.total_runs ?? 0} {t({ ko: "완료", en: "completed", ja: "完了", zh: "完成" })}
           </span>
           <span className="rounded-full px-2 py-1" style={{ color: "#38bdf8", background: "rgba(56,189,248,0.12)" }}>
-            {formatPercent(data.summary.success_rate)} {t({ ko: "성공", en: "success", ja: "成功", zh: "成功" })}
+            {formatPercent(weightedSuccessRate)} {t({ ko: "성공", en: "success", ja: "成功", zh: "成功" })}
           </span>
+          {runs.length > 0 ? (
+            <span className="rounded-full px-2 py-1" style={{ color: "var(--th-text-muted)", background: "rgba(148,163,184,0.12)" }}>
+              {t({
+                ko: `최근 ${runs.length}건 기준`,
+                en: `Based on ${runs.length} recent runs`,
+                ja: `直近 ${runs.length} 件 기준`,
+                zh: `基于最近 ${runs.length} 次运行`,
+              })}
+            </span>
+          ) : null}
         </div>
       </div>
 
-      <div className="mt-4 space-y-2 max-h-80 overflow-y-auto">
-        {data.runs.map((run) => {
+      {error ? (
+        <div className="mt-4 rounded-2xl border px-3 py-2 text-xs" style={{ borderColor: "rgba(251,191,36,0.28)", background: "rgba(251,191,36,0.12)", color: "#fde68a" }}>
+          {runs.length > 0
+            ? t({
+                ko: `최근 실행 이력은 유지 중이며 새 동기화에 실패했습니다. (${error})`,
+                en: `Keeping the recent history while refresh failed. (${error})`,
+                ja: `最新同期に失敗したため、直近の履歴を維持しています。(${error})`,
+                zh: `最新刷新失败，正在保留最近的历史记录。(${error})`,
+              })
+            : t({
+                ko: `자동큐 이력을 불러오지 못했습니다. (${error})`,
+                en: `Unable to load auto-queue history. (${error})`,
+                ja: `自動キュー履歴を読み込めませんでした。(${error})`,
+                zh: `无法加载自动队列历史。(${error})`,
+              })}
+        </div>
+      ) : null}
+
+      {loading && runs.length === 0 ? (
+        <div className="py-10 text-center text-sm" style={{ color: "var(--th-text-muted)" }}>
+          {t({ ko: "자동큐 이력을 불러오는 중입니다", en: "Loading auto-queue history", ja: "自動キュー履歴を読み込み中", zh: "正在加载自动队列历史" })}
+        </div>
+      ) : runs.length === 0 ? (
+        <div className="mt-4 rounded-2xl border border-dashed px-4 py-8 text-center text-sm" style={{ borderColor: "rgba(148,163,184,0.24)", color: "var(--th-text-muted)" }}>
+          {t({
+            ko: "아직 기록된 자동큐 실행이 없습니다. 실행이 시작되면 최근 성공률과 엔트리 규모가 이곳에 표시됩니다.",
+            en: "No auto-queue runs have been recorded yet. Recent success rates and entry volume will appear here once runs start.",
+            ja: "まだ記録された自動キュー実行はありません。実行が始まると、最近の成功率とエントリ規模がここに表示されます。",
+            zh: "尚无自动队列运行记录。开始运行后，最近的成功率和条目规模会显示在这里。",
+          })}
+        </div>
+      ) : (
+        <div className="mt-4 space-y-2 max-h-80 overflow-y-auto">
+          {visibleRuns.map((run) => {
           const statusColor =
             run.status === "completed"
               ? "#22c55e"
@@ -792,8 +671,39 @@ export function AutoQueueHistoryWidget({ t }: AutoQueueHistoryWidgetProps) {
               </div>
             </div>
           );
-        })}
-      </div>
+          })}
+
+          {hiddenRuns > 0 ? (
+            <button
+              type="button"
+              className="w-full rounded-xl border px-3 py-2 text-xs font-medium"
+              style={{ borderColor: "rgba(56,189,248,0.24)", color: "#38bdf8", background: "transparent" }}
+              onClick={() => setExpanded(true)}
+            >
+              {t({
+                ko: `${hiddenRuns}건 더 보기`,
+                en: `Show ${hiddenRuns} more`,
+                ja: `${hiddenRuns}件をさらに表示`,
+                zh: `再显示 ${hiddenRuns} 条`,
+              })}
+            </button>
+          ) : runs.length > AUTO_QUEUE_HISTORY_PREVIEW_COUNT ? (
+            <button
+              type="button"
+              className="w-full rounded-xl border px-3 py-2 text-xs font-medium"
+              style={{ borderColor: "rgba(148,163,184,0.24)", color: "var(--th-text-muted)", background: "transparent" }}
+              onClick={() => setExpanded(false)}
+            >
+              {t({
+                ko: "접기",
+                en: "Collapse",
+                ja: "折りたたむ",
+                zh: "收起",
+              })}
+            </button>
+          ) : null}
+        </div>
+      )}
     </div>
   );
 }
@@ -811,129 +721,14 @@ function MetricChip({ label, value, accent }: { label: string; value: string; ac
   );
 }
 
-// ── Machine Status Widget ──
-
-interface MachineStatusWidgetProps {
-  t: TFunction;
-}
-
-export function MachineStatusWidget({ t }: MachineStatusWidgetProps) {
-  const [machines, setMachines] = useState<api.MachineStatus[]>([]);
-
-  useEffect(() => {
-    api.getMachineStatus().then(setMachines).catch(() => {});
-    const timer = setInterval(() => {
-      api.getMachineStatus().then(setMachines).catch(() => {});
-    }, 60_000);
-    return () => clearInterval(timer);
-  }, []);
-
-  if (machines.length === 0) return null;
-
-  return (
-    <div
-      className={dashboardCard.standard}
-      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
-    >
-      <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--th-text)" }}>
-        {t({ ko: "머신 상태", en: "Machine Status", ja: "マシン状態", zh: "机器状态" })}
-      </h3>
-      <div className="flex gap-3">
-        {machines.map((m) => (
-          <div
-            key={m.name}
-            className={cx(dashboardCard.nestedCompact, "flex flex-1 items-center gap-2")}
-            style={{ background: "var(--th-bg-surface)" }}
-          >
-            <span className="text-lg">{m.name === "mac-mini" ? "🖥️" : "💻"}</span>
-            <div>
-              <div className="text-xs font-medium" style={{ color: "var(--th-text)" }}>{m.name}</div>
-              <div className="flex items-center gap-1">
-                <span
-                  className={`w-2 h-2 rounded-full ${m.online ? "bg-emerald-400" : "bg-red-400 animate-pulse"}`}
-                />
-                <span className="text-xs" style={{ color: m.online ? "#34d399" : "#f87171" }}>
-                  {m.online
-                    ? t({ ko: "온라인", en: "Online", ja: "オンライン", zh: "在线" })
-                    : t({ ko: "오프라인", en: "Offline", ja: "オフライン", zh: "离线" })}
-                </span>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── Activity Heatmap Widget ──
-
-interface HeatmapWidgetProps {
-  agents: Agent[];
-  t: TFunction;
-}
-
-export function HeatmapWidget({ agents, t }: HeatmapWidgetProps) {
-  const [data, setData] = useState<api.HeatmapData | null>(null);
-
-  useEffect(() => {
-    api.getActivityHeatmap().then(setData).catch(() => {});
-  }, []);
-
-  if (!data) return null;
-
-  const maxCount = Math.max(1, ...data.hours.map((h) => Object.values(h.agents).reduce((s, v) => s + v, 0)));
-  const currentHour = new Date().getHours();
-
-  return (
-    <div
-      className={dashboardCard.standard}
-      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
-    >
-      <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--th-text)" }}>
-        {t({ ko: "오늘의 활동 히트맵", en: "Today's Activity Heatmap", ja: "今日の活動ヒートマップ", zh: "今日活动热力图" })}
-      </h3>
-      <div className="flex gap-[2px] items-end h-16">
-        {data.hours.map((h) => {
-          const total = Object.values(h.agents).reduce((s, v) => s + v, 0);
-          const height = Math.max(2, (total / maxCount) * 100);
-          const isCurrent = h.hour === currentHour;
-          return (
-            <div
-              key={h.hour}
-              className="flex-1 rounded-t relative group cursor-default"
-              style={{
-                height: `${height}%`,
-                background: total === 0
-                  ? "rgba(100,116,139,0.15)"
-                  : isCurrent
-                    ? "var(--th-accent-primary)"
-                    : `color-mix(in srgb, var(--th-accent-primary) ${Math.round((0.2 + (total / maxCount) * 0.6) * 100)}%, transparent)`,
-                minWidth: 0,
-              }}
-              title={`${h.hour}:00 — ${total} events`}
-            />
-          );
-        })}
-      </div>
-      <div className="flex justify-between mt-1">
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>0h</span>
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>6h</span>
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>12h</span>
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>18h</span>
-        <span className="text-xs" style={{ color: "var(--th-text-muted)" }}>24h</span>
-      </div>
-    </div>
-  );
-}
-
 // ── Cron Timeline Widget ──
 
 interface CronTimelineWidgetProps {
   t: TFunction;
+  localeTag: string;
 }
 
-export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
+export function CronTimelineWidget({ t, localeTag }: CronTimelineWidgetProps) {
   const [jobs, setJobs] = useState<api.CronJobGlobal[]>([]);
   const [now, setNow] = useState(() => Date.now());
 
@@ -987,7 +782,7 @@ export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
           .map((job) => {
             const lastRun = job.state?.lastRunAtMs ?? null;
             const nextRun = job.state?.nextRunAtMs ?? null;
-            const metrics = buildCronTimelineMetrics(job, now);
+            const metrics = buildCronTimelineMetrics(job, now, localeTag);
             const isOk = job.state?.lastStatus === "ok";
             const accent = metrics.overdue ? "#fb7185" : isOk ? "#34d399" : "#f59e0b";
             const stateLabel = metrics.overdue
@@ -998,7 +793,7 @@ export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
             const formatClock = (value: number | null) =>
               value == null
                 ? "—"
-                : new Date(value).toLocaleTimeString("ko-KR", {
+                : new Date(value).toLocaleTimeString(localeTag, {
                     hour: "2-digit",
                     minute: "2-digit",
                   });
@@ -1102,51 +897,6 @@ export function CronTimelineWidget({ t }: CronTimelineWidgetProps) {
   );
 }
 
-// ── Streak Counter Widget ──
-
-interface StreakWidgetProps {
-  agents: Agent[];
-  t: TFunction;
-}
-
-export function StreakWidget({ agents, t }: StreakWidgetProps) {
-  const [streaks, setStreaks] = useState<api.AgentStreak[]>([]);
-  const workingCount = agents.filter((a) => a.status === "working").length;
-  const totalXp = agents.reduce((s, a) => s + a.stats_xp, 0);
-
-  useEffect(() => {
-    api.getStreaks().then((d) => setStreaks(d.streaks)).catch(() => {});
-  }, []);
-
-  const topStreak = streaks.length > 0 ? streaks[0] : null;
-
-  return (
-    <div
-      className={cx(dashboardCard.accentStandard, "text-center")}
-      style={{
-        borderColor: "var(--th-border)",
-        background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 90%, #f97316 10%), var(--th-surface))",
-      }}
-    >
-      <div className="text-3xl mb-1">{workingCount > 0 ? "🔥" : "💤"}</div>
-      <div className="text-2xl font-bold" style={{ color: "var(--th-text)" }}>
-        {workingCount}
-      </div>
-      <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
-        {t({ ko: "현재 가동 중", en: "Currently Active", ja: "現在稼働中", zh: "当前活跃" })}
-      </div>
-      {topStreak && topStreak.streak > 1 && (
-        <div className="text-xs mt-2" style={{ color: "#f97316" }}>
-          🏅 {topStreak.avatar_emoji} {topStreak.name} — {topStreak.streak}{t({ ko: "일 연속", en: "d streak", ja: "日連続", zh: "天连续" })}
-        </div>
-      )}
-      <div className="text-xs mt-1" style={{ color: "var(--th-text-muted)" }}>
-        {t({ ko: "총 XP", en: "Total XP", ja: "合計XP", zh: "总XP" })}: {totalXp.toLocaleString()}
-      </div>
-    </div>
-  );
-}
-
 // ── Achievement Wall Widget ──
 
 interface AchievementWidgetProps {
@@ -1225,157 +975,6 @@ export function AchievementWidget({ t, agents }: AchievementWidgetProps) {
           );
         })}
       </div>
-    </div>
-  );
-}
-
-// ── Weekly MVP Widget ──
-
-interface MvpWidgetProps {
-  agents: Agent[];
-  t: TFunction;
-  isKo: boolean;
-}
-
-export function MvpWidget({ agents, t, isKo }: MvpWidgetProps) {
-  if (agents.length === 0) return null;
-  const mvp = agents.reduce((best, a) => (a.stats_xp > best.stats_xp ? a : best), agents[0]);
-  const lvInfo = getAgentLevel(mvp.stats_xp);
-  const title = getAgentTitle(mvp.stats_xp, isKo);
-
-  return (
-    <div
-      className={cx(dashboardCard.accentStandard, "text-center")}
-      style={{
-        borderColor: "var(--th-border)",
-        background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 88%, #eab308 12%), var(--th-surface))",
-      }}
-    >
-      <div className="text-2xl mb-1">🏆</div>
-      <div className="mb-3 flex justify-center">
-        <AgentAvatar agent={mvp} agents={agents} size={56} rounded="2xl" className="shadow-lg" />
-      </div>
-      <div className="text-lg font-bold" style={{ color: "var(--th-text)" }}>
-        {mvp.alias || mvp.name_ko || mvp.name}
-      </div>
-      <div className="text-xs mt-1" style={{ color: "#eab308" }}>
-        Lv.{lvInfo.level} {title}
-      </div>
-      <div className="text-xs mt-0.5" style={{ color: "var(--th-text-muted)" }}>
-        {mvp.stats_xp.toLocaleString()} XP — {t({ ko: "최다 XP", en: "Top XP", ja: "最多XP", zh: "最多XP" })}
-      </div>
-    </div>
-  );
-}
-
-// ── Activity Feed Widget ──
-
-interface ActivityFeedWidgetProps {
-  agents: Agent[];
-  t: TFunction;
-}
-
-interface ActivityEvent {
-  id: string;
-  type: string;
-  agent_name: string;
-  agent_emoji: string;
-  description: string;
-  time: number;
-}
-
-export function ActivityFeedWidget({ agents, t }: ActivityFeedWidgetProps) {
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-
-  // Listen to WebSocket events via CustomEvent dispatched by useDashboardSocket
-  useEffect(() => {
-    let eventId = 0;
-    const handler = (e: Event) => {
-      const data = (e as CustomEvent).detail as { type: string; payload: unknown };
-      if (!data.type || data.type === "connected") return;
-
-      let description = "";
-      let agentName = "";
-      let agentEmoji = "🔔";
-
-      const payload = data.payload as Record<string, unknown>;
-
-      switch (data.type) {
-        case "agent_status": {
-          const a = payload as { name?: string; name_ko?: string; avatar_emoji?: string; status?: string; alias?: string };
-          agentName = a.alias as string || a.name_ko as string || a.name as string || "Agent";
-          agentEmoji = a.avatar_emoji as string || "🤖";
-          description = `상태 → ${a.status}`;
-          break;
-        }
-        case "agent_created": {
-          const a = payload as { name_ko?: string; name?: string; avatar_emoji?: string };
-          agentName = a.name_ko as string || a.name as string || "New Agent";
-          agentEmoji = a.avatar_emoji as string || "🆕";
-          description = "새 에이전트 입사";
-          break;
-        }
-        case "new_message": {
-          const m = payload as { sender_name_ko?: string; sender_name?: string; sender_avatar?: string; content?: string; sender_type?: string };
-          agentName = m.sender_type === "ceo" ? "CEO" : (m.sender_name_ko as string || m.sender_name as string || "Agent");
-          agentEmoji = m.sender_type === "ceo" ? "👑" : (m.sender_avatar as string || "💬");
-          description = String(m.content || "").slice(0, 50);
-          break;
-        }
-        default: {
-          agentName = "System";
-          agentEmoji = "📡";
-          description = data.type.replace(/_/g, " ");
-        }
-      }
-
-      if (description) {
-        setEvents((prev) => [
-          { id: `evt-${++eventId}`, type: data.type, agent_name: agentName, agent_emoji: agentEmoji, description, time: Date.now() },
-          ...prev,
-        ].slice(0, 30));
-      }
-    };
-
-    window.addEventListener("pcd-ws-event", handler);
-    return () => window.removeEventListener("pcd-ws-event", handler);
-  }, []);
-
-  return (
-    <div
-      className={dashboardCard.standard}
-      style={{ borderColor: "var(--th-border)", background: "var(--th-surface)" }}
-    >
-      <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--th-text)" }}>
-        📡 {t({ ko: "실시간 피드", en: "Live Feed", ja: "リアルタイム", zh: "实时动态" })}
-      </h3>
-      {events.length === 0 ? (
-        <div className="text-center py-4 text-xs" style={{ color: "var(--th-text-muted)" }}>
-          {t({ ko: "이벤트 대기 중...", en: "Waiting for events...", ja: "イベント待機中...", zh: "等待事件..." })}
-        </div>
-      ) : (
-        <div className="space-y-1.5 max-h-48 overflow-y-auto">
-          {events.map((evt) => (
-            <div
-              key={evt.id}
-              className={cx(dashboardCard.nestedCompact, "flex items-center gap-2")}
-              style={{ background: "var(--th-bg-surface)" }}
-            >
-              <span className="text-sm">{evt.agent_emoji}</span>
-              <div className="flex-1 min-w-0">
-                <div className="text-xs truncate" style={{ color: "var(--th-text)" }}>
-                  <span className="font-medium">{evt.agent_name}</span>
-                  <span className="mx-1" style={{ color: "var(--th-text-muted)" }}>·</span>
-                  {evt.description}
-                </div>
-              </div>
-              <span className="text-xs shrink-0" style={{ color: "var(--th-text-muted)" }}>
-                {new Date(evt.time).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

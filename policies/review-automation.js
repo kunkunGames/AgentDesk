@@ -27,15 +27,33 @@ var reviewAutomation = {
   onReviewEnter: function(payload) {
     var card = agentdesk.cards.get(payload.card_id);
     if (!card) return;
-    var entry = agentdesk.review.entryContext(card.id);
-    if (!entry) return;
     var cfg = agentdesk.pipeline.resolveForCard(card.id);
     var terminalState = agentdesk.pipeline.terminalState(cfg);
+    if (agentdesk.pipeline.isTerminal(card.status, cfg)) {
+      agentdesk.reviewState.sync(card.id, "idle");
+      agentdesk.kanban.setReviewStatus(card.id, null, { blocked_reason: null });
+      agentdesk.log.info("[review] Card " + card.id + " already terminal — skipping OnReviewEnter");
+      return;
+    }
+    var entry = agentdesk.review.entryContext(card.id);
+    if (!entry) return;
 
     // #128: If card entered review with awaiting_dod (DoD incomplete),
     // skip review dispatch — timeouts.js [D] will escalate to dilemma_pending after 15 min
     if (card.review_status === "awaiting_dod") {
       agentdesk.log.info("[review] Card " + card.id + " is awaiting_dod — skipping review dispatch");
+      return;
+    }
+
+    // Guard: don't create review dispatch if implementation/rework is still active
+    var activeWork = agentdesk.db.query(
+      "SELECT COUNT(*) as cnt FROM task_dispatches " +
+      "WHERE kanban_card_id = ? AND dispatch_type IN ('implementation', 'rework') " +
+      "AND status IN ('pending', 'dispatched')",
+      [card.id]
+    );
+    if (activeWork.length > 0 && activeWork[0].cnt > 0) {
+      agentdesk.log.info("[review] Card " + card.id + " has active work dispatch — deferring review");
       return;
     }
 
@@ -103,11 +121,21 @@ var reviewAutomation = {
     // #245: Log agent_id for diagnostics — "project-agentdesk-cdx" phantom agent was traced here
     agentdesk.log.info("[review] Creating review dispatch: card=" + card.id + " agent=" + card.assigned_agent_id + " round=" + newRound);
     try {
+      var latestWorkDispatch = loadLatestCompletedWorkDispatch(card.id);
+      var reviewDispatchContext = {};
+      var noopReviewContext = buildNoopReviewContext(latestWorkDispatch);
+      if (noopReviewContext) {
+        reviewDispatchContext = noopReviewContext;
+        agentdesk.log.info(
+          "[review] Card " + card.id + " entering noop_verification mode from " + latestWorkDispatch.id
+        );
+      }
       var reviewDispatchId = agentdesk.dispatch.create(
         card.id,
         card.assigned_agent_id,
         "review",
-        "[Review R" + newRound + "] " + card.id
+        "[Review R" + newRound + "] " + card.id,
+        reviewDispatchContext
       );
       agentdesk.log.info("[review] Counter-model review dispatched: " + reviewDispatchId + " to " + card.assigned_agent_id);
       // Discord notification is handled by the Rust handler (async send_dispatch_to_discord)
@@ -244,18 +272,17 @@ var reviewAutomation = {
 
     agentdesk.log.info("[review-debug] onDispatchCompleted: dispatch=" + dispatch.id + " type=" + dispatch.dispatch_type + " verdict=" + verdict + " auto_completed=" + result.auto_completed + " result=" + JSON.stringify(result).substring(0, 200));
 
-    // When a review-decision dispatch is auto-completed, do NOT create another
-    // review-decision — that causes an infinite loop.  Only "review" type
-    // dispatches should spawn review-decision followups.
-    if (!verdict && result.auto_completed && dispatch.dispatch_type === "review-decision") {
-      agentdesk.log.info("[review] review-decision auto-completed without verdict — skipping (no infinite loop). dispatch=" + dispatch.id);
+    // review-decision dispatches must never spawn another review-decision followup.
+    // If they finish without an explicit verdict, leave resolution to manual/API paths.
+    if (dispatch.dispatch_type === "review-decision" && !verdict) {
+      agentdesk.log.info("[review] review-decision completed without explicit verdict — skipping follow-up dispatch. dispatch=" + dispatch.id);
       return;
     }
 
     // Legacy fallback: if a review dispatch somehow arrives completed without an
     // explicit verdict, create a review-decision dispatch so the original agent
     // can inspect the review comments and decide the outcome.
-    if (!verdict && result.auto_completed) {
+    if (!verdict && result.auto_completed && dispatch.dispatch_type === "review") {
       var cards = agentdesk.db.query(
         "SELECT assigned_agent_id, title, github_issue_number, status FROM kanban_cards WHERE id = ?",
         [dispatch.kanban_card_id]
@@ -289,13 +316,17 @@ var reviewAutomation = {
     }
 
     agentdesk.log.info("[review-debug] CALLING processVerdict: card=" + dispatch.kanban_card_id + " verdict=" + verdict);
-    processVerdict(dispatch.kanban_card_id, verdict, result);
+    processVerdict(dispatch.kanban_card_id, verdict, result, {
+      review_dispatch_id: dispatch.dispatch_type === "review" ? dispatch.id : null
+    });
   },
 
   // ── Review Verdict — from /api/review-verdict ─────────────
   onReviewVerdict: function(payload) {
     if (!payload.card_id || !payload.verdict) return;
-    processVerdict(payload.card_id, payload.verdict, payload);
+    processVerdict(payload.card_id, payload.verdict, payload, {
+      review_dispatch_id: payload.dispatch_id || null
+    });
   }
 };
 
@@ -418,9 +449,9 @@ function extractRepoFromIssueUrl(url) {
   return prTracking.extractRepoFromIssueUrl(url);
 }
 
-function loadLatestCompletedWorkTarget(cardId) {
+function loadLatestCompletedWorkDispatch(cardId) {
   var rows = agentdesk.db.query(
-    "SELECT result, context FROM task_dispatches " +
+    "SELECT id, dispatch_type, result, context FROM task_dispatches " +
     "WHERE kanban_card_id = ? " +
     "AND dispatch_type IN ('implementation', 'rework') " +
     "AND status = 'completed' " +
@@ -429,8 +460,46 @@ function loadLatestCompletedWorkTarget(cardId) {
   );
   if (rows.length === 0) return null;
 
-  var result = parseJsonObject(rows[0].result);
-  var context = parseJsonObject(rows[0].context);
+  return {
+    id: rows[0].id,
+    dispatch_type: rows[0].dispatch_type,
+    result: parseJsonObject(rows[0].result),
+    context: parseJsonObject(rows[0].context)
+  };
+}
+
+function buildNoopReviewContext(workDispatch) {
+  if (!workDispatch || !workDispatch.result) return null;
+
+  var result = workDispatch.result;
+  if (result.work_outcome !== "noop" && result.completed_without_changes !== true) {
+    return null;
+  }
+
+  var noopReason = firstPresent(
+    result.noop_reason,
+    result.notes,
+    result.summary,
+    result.feedback
+  );
+  var reviewContext = {
+    review_mode: "noop_verification",
+    noop_reason: noopReason || "noop 사유가 제공되지 않았습니다.",
+    noop_work_outcome: result.work_outcome || "noop",
+    noop_result: result
+  };
+  if (workDispatch.id) {
+    reviewContext.parent_dispatch_id = workDispatch.id;
+  }
+  return reviewContext;
+}
+
+function loadLatestCompletedWorkTarget(cardId) {
+  var latestWork = loadLatestCompletedWorkDispatch(cardId);
+  if (!latestWork) return null;
+
+  var result = latestWork.result || {};
+  var context = latestWork.context || {};
   var worktreePath = firstPresent(
     result.completed_worktree_path,
     result.worktree_path,
@@ -485,7 +554,31 @@ function findOpenPrByTrackedBranch(repoId, branch) {
   return prTracking.findOpenPrByBranch(repoId, branch);
 }
 
-function processVerdict(cardId, verdict, result) {
+function loadLatestReviewDispatchContext(cardId, dispatchId) {
+  if (dispatchId) {
+    var exactRows = agentdesk.db.query(
+      "SELECT context FROM task_dispatches " +
+      "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
+      [dispatchId, cardId]
+    );
+    if (exactRows.length > 0) {
+      return parseJsonObject(exactRows[0].context);
+    }
+  }
+
+  var rows = agentdesk.db.query(
+    "SELECT context FROM task_dispatches " +
+    "WHERE kanban_card_id = ? AND dispatch_type = 'review' " +
+    "ORDER BY CASE WHEN status IN ('pending', 'dispatched') THEN 0 ELSE 1 END ASC, " +
+    "COALESCE(dispatched_at, completed_at, updated_at, created_at) DESC, rowid DESC LIMIT 1",
+    [cardId]
+  );
+  if (rows.length === 0) return {};
+  return parseJsonObject(rows[0].context);
+}
+
+function processVerdict(cardId, verdict, result, options) {
+  var opts = options || {};
   // Guard: skip processing for terminal cards — prevents stale dispatches from
   // re-triggering review state changes after dismiss.
   var cfg = agentdesk.pipeline.resolveForCard(cardId);
@@ -503,6 +596,9 @@ function processVerdict(cardId, verdict, result) {
     agentdesk.log.info("[review] processVerdict skipped — card " + cardId + " already terminal");
     return;
   }
+
+  var latestReviewContext = loadLatestReviewDispatchContext(cardId, opts.review_dispatch_id);
+  var noopVerification = latestReviewContext.review_mode === "noop_verification";
 
   // #116: accept is NOT a counter-model verdict — it's an agent's review-decision action
   // (rework continuation). Only pass/approved route to done/next-stage.
@@ -649,7 +745,7 @@ function processVerdict(cardId, verdict, result) {
       // #198/#211: If the card completed work in a canonical worktree, create
       // a create-pr dispatch and seed pr_tracking before going terminal.
       var prDispatched = false;
-      var latestWorkTarget = loadLatestCompletedWorkTarget(cardId);
+      var latestWorkTarget = noopVerification ? null : loadLatestCompletedWorkTarget(cardId);
       var prCardInfo = agentdesk.db.query(
         "SELECT assigned_agent_id, title, github_issue_number, repo_id, github_issue_url FROM kanban_cards WHERE id = ?",
         [cardId]
@@ -698,6 +794,8 @@ function processVerdict(cardId, verdict, result) {
             agentdesk.log.warn("[review] Create-PR dispatch failed: " + e + " — falling through to terminal");
           }
         }
+      } else if (noopVerification) {
+        agentdesk.log.info("[review] Card " + cardId + " passed noop_verification — skipping create-pr dispatch");
       }
 
       if (!prDispatched) {
@@ -763,6 +861,47 @@ function processVerdict(cardId, verdict, result) {
         "UPDATE kanban_cards SET review_notes = ? WHERE id = ?",
         [newNotes, cardId]
       );
+    }
+
+    if (noopVerification) {
+      var noopCardInfo = agentdesk.db.query(
+        "SELECT assigned_agent_id, title, github_issue_number FROM kanban_cards WHERE id = ?",
+        [cardId]
+      );
+      var noopAssignedAgent = noopCardInfo.length > 0 ? noopCardInfo[0].assigned_agent_id : null;
+      var noopTitle = noopCardInfo.length > 0 ? (noopCardInfo[0].title || cardId) : cardId;
+      var noopIssueNum = noopCardInfo.length > 0 ? (noopCardInfo[0].github_issue_number || "?") : "?";
+      var noopReason = latestReviewContext.noop_reason || "(noop 사유 없음)";
+      var noopReworkPrompt = "[Noop Rework] #" + noopIssueNum + " " + noopTitle +
+        "\n\n기존 noop 판단이 리뷰에서 반려되었습니다. 실제 구현이 필요합니다." +
+        "\n- 리뷰 verdict: " + verdict +
+        "\n- noop 사유: " + summarizeFindingForPrompt(noopReason) +
+        "\n- 리뷰 피드백: " + summarizeFindingForPrompt(newNotes || "(없음)") +
+        "\n\nGitHub 이슈 본문과 리뷰 피드백을 기준으로 필요한 코드를 구현하세요.";
+
+      if (noopAssignedAgent) {
+        try {
+          var noopReworkDispatchId = agentdesk.dispatch.create(
+            cardId,
+            noopAssignedAgent,
+            "rework",
+            noopReworkPrompt,
+            {
+              review_mode: "noop_verification",
+              noop_reason: noopReason
+            }
+          );
+          agentdesk.log.info("[review] noop_verification " + verdict + " → rework dispatch " + noopReworkDispatchId + " for " + cardId);
+          agentdesk.reviewState.sync(cardId, "rework_pending", { last_verdict: verdict });
+          agentdesk.kanban.setReviewStatus(cardId, "rework_pending", {exclude_status: terminalState});
+          agentdesk.kanban.setStatus(cardId, reviewReworkTarget);
+          return;
+        } catch (e) {
+          agentdesk.log.warn("[review] noop_verification rework dispatch failed for " + cardId + ": " + e + " — falling back to suggestion_pending");
+        }
+      } else {
+        agentdesk.log.warn("[review] noop_verification " + verdict + " on " + cardId + " has no assigned agent — falling back to suggestion_pending");
+      }
     }
 
     if (repeatedFindings && assignedAgent) {

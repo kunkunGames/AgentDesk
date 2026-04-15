@@ -391,8 +391,7 @@ var timeouts = {
       var rInitial = agentdesk.pipeline.kickoffState(rCfg);
       var rInProgress = agentdesk.pipeline.nextGatedTarget(rInitial, rCfg);
       var rReview = agentdesk.pipeline.nextGatedTarget(rInProgress, rCfg);
-      var rForce = agentdesk.pipeline.forceOnlyTargets(rInProgress, rCfg);
-      var rPending = rForce[0];
+      var rPending = rInitial;
       if (agentdesk.pipeline.isTerminal(card.status, rCfg)) continue;
       if (di.dispatch_type === "review" || di.dispatch_type === "review-decision") continue;
       if (di.dispatch_type === "rework") {
@@ -527,7 +526,8 @@ var timeouts = {
     var staleInProgress = agentdesk.db.query(
       "SELECT kc.id FROM kanban_cards kc " +
       "LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id " +
-      "WHERE kc.status = ? AND " + latestCardActivityExpr("kc", "td") + " < datetime('now', '" + inProgressInterval + "')",
+      "WHERE kc.status = ? AND COALESCE(kc.blocked_reason, '') = '' AND " +
+      latestCardActivityExpr("kc", "td") + " < datetime('now', '" + inProgressInterval + "')",
       [bInProgress]
     );
     for (var j = 0; j < staleInProgress.length; j++) {
@@ -548,7 +548,7 @@ var timeouts = {
       "SELECT kc.id as card_id " +
       "FROM kanban_cards kc " +
       "JOIN task_dispatches td ON td.kanban_card_id = kc.id " +
-      "WHERE kc.status = ? AND kc.review_status = 'reviewing' " +
+      "WHERE kc.status = ? AND COALESCE(kc.review_status, 'reviewing') = 'reviewing' " +
       "AND td.dispatch_type = 'review' AND td.status IN ('completed', 'failed') " +
       "AND kc.review_entered_at IS NOT NULL AND kc.review_entered_at < datetime('now', '-30 minutes') " +
       "AND NOT EXISTS (SELECT 1 FROM task_dispatches td2 WHERE td2.kanban_card_id = kc.id " +
@@ -592,8 +592,9 @@ var timeouts = {
     var eReworkTarget = agentdesk.pipeline.nextGatedTargetWithGate(eReview, "review_rework", eCfg) || eInProgress;
     var staleSuggestions = agentdesk.db.query(
       "SELECT id, assigned_agent_id, title FROM kanban_cards " +
-      "WHERE review_status = 'suggestion_pending' " +
-      "AND suggestion_pending_at IS NOT NULL AND suggestion_pending_at < datetime('now', '-15 minutes')"
+      "WHERE status = ? AND review_status = 'suggestion_pending' " +
+      "AND suggestion_pending_at IS NOT NULL AND suggestion_pending_at < datetime('now', '-15 minutes')",
+      [eReview]
     );
     for (var s = 0; s < staleSuggestions.length; s++) {
       var sc = staleSuggestions[s];
@@ -749,7 +750,6 @@ var timeouts = {
     var jCfg = agentdesk.pipeline.getConfig();
     var jInitial = agentdesk.pipeline.kickoffState(jCfg);
     var jInProgress = agentdesk.pipeline.nextGatedTarget(jInitial, jCfg);
-    var jBlocked = agentdesk.pipeline.forceOnlyTargets(jInProgress, jCfg)[0];
     var failedForRetry = agentdesk.db.query(
       "SELECT td.id, td.kanban_card_id, td.to_agent_id, td.dispatch_type, td.title, " +
       "COALESCE(td.retry_count, 0) as retry_count, kc.github_issue_url, kc.github_issue_number " +
@@ -816,8 +816,6 @@ var timeouts = {
     var iCfg = agentdesk.pipeline.getConfig();
     var iInitial = agentdesk.pipeline.kickoffState(iCfg);
     var iInProgress = agentdesk.pipeline.nextGatedTarget(iInitial, iCfg);
-    var iForce = agentdesk.pipeline.forceOnlyTargets(iInProgress, iCfg);
-    var iPending = iForce[0];
 
     // 먼저: heartbeat가 신선한 working 세션의 카운터를 리셋 (비연속 스톨 누적 방지)
     var freshSessions = agentdesk.db.query(
@@ -1322,6 +1320,7 @@ var timeouts = {
       "SELECT kc.id, kc.title, kc.github_issue_number, kc.assigned_agent_id " +
       "FROM kanban_cards kc " +
       "WHERE kc.status = ? " +
+      "AND COALESCE(kc.review_status, 'reviewing') = 'reviewing' " +
       "AND kc.review_entered_at IS NOT NULL " +
       "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
       "AND NOT EXISTS (" +

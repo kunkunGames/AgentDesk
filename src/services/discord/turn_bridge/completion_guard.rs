@@ -351,6 +351,36 @@ pub(in crate::services::discord) fn runtime_db_fallback_complete_with_result(
     changed > 0
 }
 
+fn reset_linked_auto_queue_entries_on_conn(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE auto_queue_entries
+         SET status = 'pending',
+             dispatch_id = NULL,
+             slot_index = NULL,
+             dispatched_at = NULL,
+             completed_at = NULL
+         WHERE dispatch_id = ?1
+           AND status IN ('pending', 'dispatched')",
+        [dispatch_id],
+    )
+}
+
+fn runtime_db_reset_linked_auto_queue_entries(dispatch_id: &str) -> bool {
+    let Some(root) = crate::cli::agentdesk_runtime_root() else {
+        return false;
+    };
+    let db_path = root.join("data/agentdesk.sqlite");
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+        return false;
+    };
+    reset_linked_auto_queue_entries_on_conn(&conn, dispatch_id)
+        .map(|changed| changed > 0)
+        .unwrap_or(false)
+}
+
 #[allow(dead_code)]
 pub(in crate::services::discord) fn runtime_db_fallback_complete(
     dispatch_id: &str,
@@ -424,79 +454,138 @@ fn extract_commit_sha_from_output(output: &str, cwd: &str) -> Option<String> {
 struct DispatchCompletionHints {
     issue_number: Option<i64>,
     dispatch_created_at: Option<String>,
+    target_repo: Option<String>,
     /// Commit SHA extracted directly from agent output (most reliable).
     output_commit: Option<String>,
+    output_commit_repo_dir: Option<String>,
 }
 
 fn lookup_dispatch_completion_hints(
     db: Option<&crate::db::Db>,
     dispatch_id: &str,
-    card_id: Option<&str>,
 ) -> DispatchCompletionHints {
     let conn = db.and_then(|db| db.separate_conn().ok());
-    let issue_number = conn.as_ref().and_then(|conn| {
-        card_id.and_then(|cid| {
+    let (issue_number, dispatch_created_at, target_repo) = conn
+        .as_ref()
+        .and_then(|conn| {
             conn.query_row(
-                "SELECT github_issue_number FROM kanban_cards WHERE id = ?1",
-                [cid],
-                |row| row.get::<_, Option<i64>>(0),
+                "SELECT kc.github_issue_number, td.created_at, td.context, kc.repo_id
+                 FROM task_dispatches td
+                 LEFT JOIN kanban_cards kc ON kc.id = td.kanban_card_id
+                 WHERE td.id = ?1",
+                [dispatch_id],
+                |row| {
+                    let context_raw: Option<String> = row.get(2)?;
+                    let target_repo = context_raw
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .as_ref()
+                        .and_then(|value| value.get("target_repo"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .or_else(|| row.get::<_, Option<String>>(3).ok().flatten());
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        target_repo,
+                    ))
+                },
             )
             .ok()
-            .flatten()
         })
-    });
-    let dispatch_created_at = conn.as_ref().and_then(|conn| {
-        conn.query_row(
-            "SELECT created_at FROM task_dispatches WHERE id = ?1",
-            [dispatch_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-    });
+        .unwrap_or((None, None, None));
     DispatchCompletionHints {
         issue_number,
         dispatch_created_at,
+        target_repo,
         output_commit: None,
+        output_commit_repo_dir: None,
     }
+}
+
+fn completion_repo_dirs(adk_cwd: Option<&str>, hints: &DispatchCompletionHints) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut push_dir = |candidate: Option<String>| {
+        if let Some(path) = candidate.filter(|path| std::path::Path::new(path).is_dir()) {
+            if !dirs.iter().any(|existing| existing == &path) {
+                dirs.push(path);
+            }
+        }
+    };
+
+    push_dir(adk_cwd.map(str::to_string));
+    push_dir(
+        hints
+            .target_repo
+            .as_deref()
+            .and_then(|value| {
+                crate::services::platform::shell::resolve_repo_dir_for_target(Some(value)).ok()
+            })
+            .flatten(),
+    );
+    dirs
+}
+
+fn extract_output_commit_from_repo_dirs(
+    output: &str,
+    repo_dirs: &[String],
+) -> Option<(String, String)> {
+    repo_dirs.iter().find_map(|repo_dir| {
+        extract_commit_sha_from_output(output, repo_dir).map(|sha| (repo_dir.clone(), sha))
+    })
 }
 
 fn work_dispatch_completion_context(
     adk_cwd: Option<&str>,
     hints: &DispatchCompletionHints,
 ) -> Option<serde_json::Value> {
-    let cwd = adk_cwd.filter(|p| std::path::Path::new(p).is_dir())?;
+    let repo_dirs = completion_repo_dirs(adk_cwd, hints);
     // Commit resolution priority:
     // 1) Agent's own commit extracted from turn output (most reliable — direct evidence)
     // 2) Time-scoped: newest commit since dispatch start, preferring issue-number match
     // 3) Issue grep: recent commits matching (#issue_number)
-    let completed_commit = hints
-        .output_commit
-        .clone()
-        .or_else(|| {
-            hints.dispatch_created_at.as_deref().and_then(|since| {
+    let (cwd, completed_commit) = if let Some(commit) = hints.output_commit.clone() {
+        let repo_dir = hints
+            .output_commit_repo_dir
+            .clone()
+            .or_else(|| repo_dirs.first().cloned())?;
+        (repo_dir, commit)
+    } else if let Some((repo_dir, commit)) =
+        hints.dispatch_created_at.as_deref().and_then(|since| {
+            repo_dirs.iter().find_map(|repo_dir| {
                 crate::services::platform::shell::git_best_commit_for_dispatch(
-                    cwd,
+                    repo_dir,
                     since,
                     hints.issue_number,
                 )
+                .map(|commit| (repo_dir.clone(), commit))
             })
         })
-        .or_else(|| {
-            hints
-                .issue_number
-                .and_then(|n| crate::services::platform::shell::git_latest_commit_for_issue(cwd, n))
-        })?;
+    {
+        (repo_dir, commit)
+    } else {
+        let issue_number = hints.issue_number?;
+        repo_dirs.iter().find_map(|repo_dir| {
+            crate::services::platform::shell::git_latest_commit_for_issue(repo_dir, issue_number)
+                .map(|commit| (repo_dir.clone(), commit))
+        })?
+    };
     let mut obj = serde_json::Map::new();
     obj.insert(
         "completed_worktree_path".to_string(),
-        serde_json::Value::String(cwd.to_string()),
+        serde_json::Value::String(cwd.clone()),
     );
     obj.insert(
         "completed_commit".to_string(),
         serde_json::Value::String(completed_commit),
     );
-    if let Some(branch) = crate::services::platform::shell::git_branch_name(cwd) {
+    if let Some(target_repo) = hints.target_repo.as_deref() {
+        obj.insert(
+            "target_repo".to_string(),
+            serde_json::Value::String(target_repo.to_string()),
+        );
+    }
+    if let Some(branch) = crate::services::platform::shell::git_branch_name(&cwd) {
         obj.insert(
             "completed_branch".to_string(),
             serde_json::Value::String(branch),
@@ -533,23 +622,14 @@ pub(in crate::services::discord) fn build_work_dispatch_completion_result(
     adk_cwd: Option<&str>,
     turn_output: Option<&str>,
 ) -> serde_json::Value {
-    let resolved_card_id = db.and_then(|db| {
-        db.separate_conn().ok().and_then(|conn| {
-            conn.query_row(
-                "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
-                [dispatch_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .ok()
-            .flatten()
-        })
-    });
-    let mut hints = lookup_dispatch_completion_hints(db, dispatch_id, resolved_card_id.as_deref());
-    hints.output_commit = turn_output.and_then(|output| {
-        adk_cwd
-            .filter(|path| std::path::Path::new(path).is_dir())
-            .and_then(|cwd| extract_commit_sha_from_output(output, cwd))
-    });
+    let mut hints = lookup_dispatch_completion_hints(db, dispatch_id);
+    let repo_dirs = completion_repo_dirs(adk_cwd, &hints);
+    if let Some((repo_dir, output_commit)) =
+        turn_output.and_then(|output| extract_output_commit_from_repo_dirs(output, &repo_dirs))
+    {
+        hints.output_commit_repo_dir = Some(repo_dir);
+        hints.output_commit = Some(output_commit);
+    }
     completion_result_with_context(source, needs_reconcile, adk_cwd, &hints)
 }
 
@@ -639,6 +719,9 @@ pub(in crate::services::discord) async fn fail_dispatch_with_retry(
         {
             Ok(_) => {
                 tracing::warn!("marked dispatch as failed after transport error");
+                if !runtime_db_reset_linked_auto_queue_entries(dispatch_id) {
+                    tracing::warn!("failed dispatch auto-queue reset skipped or affected no rows");
+                }
                 return;
             }
             _ => {
@@ -661,9 +744,12 @@ pub(in crate::services::discord) async fn fail_dispatch_with_retry(
                 "failed",
                 Some(&fallback_result),
                 "turn_bridge_patch_failure_fallback",
-                Some(&["pending"]),
+                Some(&["pending", "dispatched"]),
                 false,
             );
+            if let Err(error) = reset_linked_auto_queue_entries_on_conn(&conn, dispatch_id) {
+                tracing::warn!(%error, "failed to reset linked auto-queue entries after dispatch failure fallback");
+            }
             // Leave reconciliation marker for onTick to pick up and run hook chain
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
@@ -735,28 +821,23 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
         }
 
         // Extract commit SHA directly from agent output (most reliable method)
-        let output_commit = if explicit_work_outcome == Some("noop") {
-            None
-        } else {
-            turn_output.and_then(|output| {
-                adk_cwd
-                    .filter(|p| std::path::Path::new(p).is_dir())
-                    .and_then(|cwd| extract_commit_sha_from_output(output, cwd))
-            })
-        };
-        if let Some(ref sha) = output_commit {
+        let mut hints = lookup_dispatch_completion_hints(Some(db), dispatch_id);
+        let repo_dirs = completion_repo_dirs(adk_cwd, &hints);
+        if explicit_work_outcome != Some("noop") {
+            if let Some((repo_dir, output_commit)) = turn_output
+                .and_then(|output| extract_output_commit_from_repo_dirs(output, &repo_dirs))
+            {
+                hints.output_commit_repo_dir = Some(repo_dir);
+                hints.output_commit = Some(output_commit);
+            }
+        }
+        if let Some(ref sha) = hints.output_commit {
             tracing::info!(
                 "[turn_bridge] Extracted commit {} from agent output for dispatch {}",
                 &sha[..8.min(sha.len())],
                 dispatch_id,
             );
         }
-        let mut hints = lookup_dispatch_completion_hints(
-            Some(db),
-            dispatch_id,
-            snapshot.kanban_card_id.as_deref(),
-        );
-        hints.output_commit = output_commit;
         let completion_context = if explicit_work_outcome == Some("noop") {
             Some(noop_completion_context(adk_cwd, turn_output))
         } else {
@@ -885,7 +966,9 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
                 &DispatchCompletionHints {
                     issue_number: None,
                     dispatch_created_at: None,
+                    target_repo: None,
                     output_commit: None,
+                    output_commit_repo_dir: None,
                 },
             )
         };
@@ -1002,7 +1085,9 @@ mod tests {
             &DispatchCompletionHints {
                 issue_number: None,
                 dispatch_created_at: None,
+                target_repo: None,
                 output_commit: None,
+                output_commit_repo_dir: None,
             },
         );
 
@@ -1020,7 +1105,9 @@ mod tests {
             &DispatchCompletionHints {
                 issue_number: None,
                 dispatch_created_at: None,
+                target_repo: None,
                 output_commit: Some(head.clone()),
+                output_commit_repo_dir: repo_dir.to_str().map(str::to_string),
             },
         )
         .unwrap();
@@ -1030,6 +1117,53 @@ mod tests {
             context["completed_worktree_path"].as_str(),
             repo_dir.to_str()
         );
+    }
+
+    #[test]
+    fn work_dispatch_completion_context_searches_target_repo_when_cwd_has_no_commit() {
+        let default_repo = init_repo_with_initial_commit();
+        let target_repo = init_repo_with_initial_commit();
+        let target_repo_dir = target_repo.path();
+
+        std::fs::write(target_repo_dir.join("feature.txt"), "external\n").unwrap();
+        run_git(target_repo_dir, &["add", "feature.txt"]);
+        run_git(
+            target_repo_dir,
+            &["commit", "-m", "fix: external repo (#627)"],
+        );
+        let target_head = run_git(target_repo_dir, &["rev-parse", "HEAD"]);
+        let expected_target_repo = std::fs::canonicalize(target_repo_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let context = work_dispatch_completion_context(
+            default_repo.path().to_str(),
+            &DispatchCompletionHints {
+                issue_number: Some(627),
+                dispatch_created_at: None,
+                target_repo: Some(target_repo_dir.to_string_lossy().to_string()),
+                output_commit: None,
+                output_commit_repo_dir: None,
+            },
+        )
+        .expect("target repo issue commit should be detected");
+        let actual_completed_worktree =
+            std::fs::canonicalize(context["completed_worktree_path"].as_str().unwrap())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        let actual_target_repo = std::fs::canonicalize(context["target_repo"].as_str().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            context["completed_commit"].as_str(),
+            Some(target_head.as_str())
+        );
+        assert_eq!(actual_completed_worktree, expected_target_repo);
+        assert_eq!(actual_target_repo, expected_target_repo);
     }
 
     #[test]
@@ -1110,5 +1244,127 @@ mod tests {
         assert_eq!(result["completed_without_changes"], true);
         assert_eq!(result["card_status_target"], "ready");
         assert_eq!(result["notes"], "OUTCOME: noop\nalready satisfied");
+    }
+
+    #[test]
+    fn reset_linked_auto_queue_entries_on_conn_resets_pending_and_dispatched_rows() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE auto_queue_entries (
+                id TEXT PRIMARY KEY,
+                run_id TEXT,
+                kanban_card_id TEXT,
+                agent_id TEXT,
+                status TEXT,
+                dispatch_id TEXT,
+                slot_index INTEGER,
+                thread_group INTEGER DEFAULT 0,
+                batch_phase INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                dispatched_at DATETIME,
+                completed_at DATETIME
+            );",
+        )
+        .expect("schema");
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, thread_group, batch_phase, dispatched_at, completed_at
+             ) VALUES
+                ('entry-pending', 'run-1', 'card-1', 'agent-1', 'pending', 'dispatch-1', 7, 0, 0, datetime('now'), datetime('now')),
+                ('entry-dispatched', 'run-1', 'card-2', 'agent-1', 'dispatched', 'dispatch-1', 8, 0, 0, datetime('now'), NULL),
+                ('entry-done', 'run-1', 'card-3', 'agent-1', 'done', 'dispatch-1', 9, 0, 0, datetime('now'), datetime('now'))",
+            [],
+        )
+        .expect("seed entries");
+
+        let changed = reset_linked_auto_queue_entries_on_conn(&conn, "dispatch-1").expect("reset");
+        assert_eq!(changed, 2);
+
+        let pending: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, dispatch_id, slot_index, dispatched_at, completed_at
+                 FROM auto_queue_entries
+                 WHERE id = 'entry-pending'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("pending row");
+        assert_eq!(pending.0, "pending");
+        assert!(pending.1.is_none());
+        assert!(pending.2.is_none());
+        assert!(pending.3.is_none());
+        assert!(pending.4.is_none());
+
+        let dispatched: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, dispatch_id, slot_index, dispatched_at, completed_at
+                 FROM auto_queue_entries
+                 WHERE id = 'entry-dispatched'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("dispatched row");
+        assert_eq!(dispatched.0, "pending");
+        assert!(dispatched.1.is_none());
+        assert!(dispatched.2.is_none());
+        assert!(dispatched.3.is_none());
+        assert!(dispatched.4.is_none());
+
+        let done: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, dispatch_id, slot_index, dispatched_at, completed_at
+                 FROM auto_queue_entries
+                 WHERE id = 'entry-done'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("done row");
+        assert_eq!(done.0, "done");
+        assert_eq!(done.1.as_deref(), Some("dispatch-1"));
+        assert_eq!(done.2, Some(9));
+        assert!(done.3.is_some());
+        assert!(done.4.is_some());
     }
 }

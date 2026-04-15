@@ -193,6 +193,15 @@ pub(super) fn choose_restore_channel_name(
         .map(ToOwned::to_owned)
 }
 
+pub(super) fn resolve_is_dm_channel(
+    dm_hint: Option<bool>,
+    live_channel_lookup_says_dm: bool,
+) -> bool {
+    // Prefer the gateway-provided DM hint when available so a transient
+    // Discord channel lookup failure cannot disable DM default-agent fallback.
+    dm_hint.unwrap_or(live_channel_lookup_says_dm)
+}
+
 /// Check if a path is a git repo and if another channel already uses it.
 /// Returns the conflicting channel's name if found.
 pub(super) fn detect_worktree_conflict(
@@ -256,9 +265,12 @@ pub(super) fn create_git_worktree(
         .map_err(|e| format!("Failed to create worktree base dir: {}", e))?;
     let wt_dir = wt_base.join(format!("{}-{}-{}", provider, safe_name, ts));
     let wt_path = wt_dir.display().to_string();
+    let base_ref = git_upstream_base_ref(repo_path);
 
     let output = std::process::Command::new("git")
-        .args(["-C", repo_path, "worktree", "add", &wt_path, "-b", &branch])
+        .args([
+            "-C", repo_path, "worktree", "add", "-b", &branch, &wt_path, &base_ref,
+        ])
         .output()
         .map_err(|e| format!("git worktree add failed: {}", e))?;
 
@@ -285,6 +297,31 @@ fn git_upstream_base_ref(repo_path: &str) -> String {
     {
         return "origin/main".to_string();
     }
+
+    // origin/main not available locally — attempt a shallow fetch before falling back
+    let fetch = std::process::Command::new("git")
+        .args(["-C", repo_path, "fetch", "origin", "main", "--depth=1"])
+        .output();
+    if let Ok(out) = fetch
+        && out.status.success()
+    {
+        // Re-verify after fetch
+        let recheck = std::process::Command::new("git")
+            .args(["-C", repo_path, "rev-parse", "--verify", "origin/main"])
+            .output();
+        if let Ok(out) = recheck
+            && out.status.success()
+        {
+            tracing::info!(
+                "git fetch origin main --depth=1 succeeded for repo {repo_path}; using origin/main as base ref"
+            );
+            return "origin/main".to_string();
+        }
+    }
+
+    tracing::warn!(
+        "origin/main unavailable for repo {repo_path} even after fetch attempt; falling back to local 'main'"
+    );
     "main".to_string()
 }
 
@@ -387,6 +424,15 @@ pub(super) async fn auto_restore_session(
     channel_id: ChannelId,
     serenity_ctx: &serenity::prelude::Context,
 ) {
+    auto_restore_session_with_dm_hint(shared, channel_id, serenity_ctx, None).await;
+}
+
+pub(super) async fn auto_restore_session_with_dm_hint(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    serenity_ctx: &serenity::prelude::Context,
+    dm_hint: Option<bool>,
+) {
     if matches!(
         resolve_runtime_channel_binding_status(&serenity_ctx.http, channel_id).await,
         RuntimeChannelBindingStatus::Unowned
@@ -412,6 +458,7 @@ pub(super) async fn auto_restore_session(
         channel_id.to_channel(&serenity_ctx.http).await.ok(),
         Some(serenity::Channel::Private(_))
     );
+    let is_dm = resolve_is_dm_channel(dm_hint, is_dm);
 
     // Read settings first to get provider and runtime restore metadata.
     let (last_path, saved_remote, provider) = {
@@ -880,6 +927,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_is_dm_channel_prefers_gateway_hint() {
+        assert!(resolve_is_dm_channel(Some(true), false));
+        assert!(!resolve_is_dm_channel(Some(false), true));
+    }
+
+    #[test]
+    fn resolve_is_dm_channel_uses_lookup_when_hint_missing() {
+        assert!(resolve_is_dm_channel(None, true));
+        assert!(!resolve_is_dm_channel(None, false));
+    }
+
+    #[test]
     fn assistant_turn_count_only_counts_assistant_messages() {
         let session = DiscordSession {
             session_id: None,
@@ -1060,6 +1119,40 @@ mod tests {
             branch_exists(repo_dir, branch),
             "branch should stay until origin/main contains it"
         );
+    }
+
+    #[test]
+    fn create_git_worktree_starts_from_origin_main_even_when_local_main_is_ahead() {
+        let (repo, _origin) = setup_git_repo_with_origin();
+        let repo_dir = repo.path();
+
+        let origin_head_before = run_git(repo_dir, &["rev-parse", "origin/main"]);
+        run_git(
+            repo_dir,
+            &["commit", "--allow-empty", "-m", "local-only commit"],
+        );
+        let local_head_after = run_git(repo_dir, &["rev-parse", "HEAD"]);
+        assert_ne!(
+            origin_head_before, local_head_after,
+            "test setup requires local main to be ahead of origin/main"
+        );
+
+        let (worktree_path, branch_name) =
+            create_git_worktree(repo_dir.to_str().unwrap(), "slot-reset", "claude").unwrap();
+        let worktree_head = run_git(Path::new(&worktree_path), &["rev-parse", "HEAD"]);
+        let worktree_branch = run_git(Path::new(&worktree_path), &["branch", "--show-current"]);
+
+        assert_eq!(
+            worktree_head, origin_head_before,
+            "fresh worktree must start from origin/main rather than local main HEAD"
+        );
+        assert_eq!(worktree_branch, branch_name);
+
+        cleanup_git_worktree(&WorktreeInfo {
+            original_path: repo_dir.to_string_lossy().to_string(),
+            worktree_path,
+            branch_name,
+        });
     }
 
     #[test]

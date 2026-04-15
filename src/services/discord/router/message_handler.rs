@@ -8,7 +8,7 @@ use crate::services::memory::{
     resolve_memory_session_id,
 };
 use crate::services::provider::{CancelToken, cancel_requested};
-use poise::serenity_prelude::{CreateAttachment, CreateMessage};
+use poise::serenity_prelude::CreateMessage;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -263,6 +263,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     merge_consecutive: bool,
     reply_context: Option<String>,
     has_reply_boundary: bool,
+    dm_hint: Option<bool>,
 ) -> Result<(), Error> {
     let original_channel_id = channel_id;
     let mut session_reset_reason = None;
@@ -309,6 +310,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         channel_id.to_channel(&ctx.http).await.ok(),
         Some(serenity::Channel::Private(_))
     );
+    let is_dm_channel = super::super::resolve_is_dm_channel(dm_hint, is_dm_channel);
     let dm_default_agent = if is_dm_channel {
         super::super::agentdesk_config::resolve_dm_default_agent(&provider)
     } else {
@@ -1054,11 +1056,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         )
     };
 
-    // Claude Code/Codex inject their own skills inventory natively.
-    // Avoid duplicating it in AgentDesk's appended system prompt because it
-    // bloats the cache prefix and inflates per-turn cache_read tokens.
-    let skills_notice = String::new();
-
     // Build Discord context info
     let discord_context = {
         let data = shared.core.lock().await;
@@ -1107,7 +1104,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         channel_id,
         token,
         &disabled_notice,
-        &skills_notice,
         narrate_progress,
         role_binding.as_ref(),
         reply_to_user_message,
@@ -1869,51 +1865,6 @@ pub(super) async fn cancel_text_stop_token_mailbox(
     }
 }
 
-async fn fetch_escalation_settings_via_api()
--> Result<crate::server::routes::escalation::EscalationSettingsResponse, String> {
-    let body = crate::services::discord::internal_api::get_escalation_settings().await?;
-    serde_json::from_value(body).map_err(|err| err.to_string())
-}
-
-async fn save_escalation_settings_via_api(
-    settings: &crate::server::routes::escalation::EscalationSettings,
-) -> Result<crate::server::routes::escalation::EscalationSettingsResponse, String> {
-    let body =
-        crate::services::discord::internal_api::put_escalation_settings(settings.clone()).await?;
-    serde_json::from_value(body).map_err(|err| err.to_string())
-}
-
-fn parse_discord_user_id(raw: &str) -> Option<u64> {
-    raw.trim()
-        .trim_start_matches("<@")
-        .trim_end_matches('>')
-        .trim_start_matches('!')
-        .parse::<u64>()
-        .ok()
-}
-
-fn format_escalation_settings_summary(
-    settings: &crate::server::routes::escalation::EscalationSettings,
-) -> String {
-    let mode = match settings.mode {
-        crate::config::EscalationMode::Pm => "pm",
-        crate::config::EscalationMode::User => "user",
-        crate::config::EscalationMode::Scheduled => "scheduled",
-    };
-    let owner = settings
-        .owner_user_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "(none)".to_string());
-    let pm_channel = settings
-        .pm_channel_id
-        .clone()
-        .unwrap_or_else(|| "(none)".to_string());
-    format!(
-        "mode: `{}`\nowner_user_id: `{}`\npm_channel_id: `{}`\nschedule: `{}` / `{}`",
-        mode, owner, pm_channel, settings.schedule.pm_hours, settings.schedule.timezone
-    )
-}
-
 /// Handle text-based commands (!start, !meeting, !stop, !clear, etc.).
 /// Returns true if the command was handled, false otherwise.
 pub(super) async fn handle_text_command(
@@ -1923,6 +1874,7 @@ pub(super) async fn handle_text_command(
     channel_id: serenity::ChannelId,
     text: &str,
 ) -> Result<bool, Error> {
+/* legacy inline text-command handler kept commented during upstream merge
     let parts: Vec<&str> = text.splitn(3, char::is_whitespace).collect();
     let cmd = parts[0];
     let arg1 = parts.get(1).unwrap_or(&"");
@@ -3029,6 +2981,8 @@ Any other message is sent to {p}.
     }
 
     Ok(false)
+*/
+    super::super::commands::handle_text_command(ctx, msg, data, channel_id, text).await
 }
 
 fn resolve_session_id_for_current_turn(

@@ -92,18 +92,9 @@ function _runPreflight(cardId) {
           return { status: "already_applied", summary: "GitHub issue #" + c.github_issue_number + " is closed" };
         }
       } catch (e) {
-        // GitHub CLI not available or failed, skip check
+        agentdesk.log.warn("[preflight] gh issue view failed for card " + cardId + " issue #" + c.github_issue_number + ": " + e);
       }
     }
-  }
-
-  // Check 2: Already has terminal dispatch?
-  var terminalDispatch = agentdesk.db.query(
-    "SELECT id, status FROM task_dispatches WHERE kanban_card_id = ? AND dispatch_type = 'implementation' AND status = 'completed'",
-    [cardId]
-  );
-  if (terminalDispatch.length > 0) {
-    return { status: "already_applied", summary: "Implementation dispatch already completed" };
   }
 
   // Check 3: Description/body too short or empty?
@@ -366,28 +357,18 @@ var rules = {
     var workResult = {};
     try { workResult = JSON.parse(dispatch.result || "{}"); } catch(e) {}
     if ((dispatch.dispatch_type === "implementation" || dispatch.dispatch_type === "rework")
-        && workResult.work_outcome === "noop") {
-      var noopMeta = _loadCardMetadata(dispatch.kanban_card_id);
-      noopMeta.work_resolution_status = "noop";
-      noopMeta.work_resolution_result = workResult;
-      var noopCardStatusTarget = workResult.card_status_target || "ready";
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET metadata = ?, blocked_reason = NULL WHERE id = ?",
-        [JSON.stringify(noopMeta), dispatch.kanban_card_id]
-      );
-      var noopEntries = _findAutoQueueEntriesByDispatch(dispatch.id, true);
-      for (var ne = 0; ne < noopEntries.length; ne++) {
-        agentdesk.autoQueue.updateEntryStatus(
-          noopEntries[ne].id,
-          "done",
-          "dispatch_noop"
-        );
-      }
-      agentdesk.kanban.setReviewStatus(card.id, null, {suggestion_pending_at: null, awaiting_dod_at: null});
-      agentdesk.reviewState.sync(card.id, "idle");
-      agentdesk.kanban.setStatus(card.id, noopCardStatusTarget, true);
-      agentdesk.log.info("[kanban] " + card.id + " " + dispatch.dispatch_type + " noop → " + noopCardStatusTarget + " (auto-queue done)");
-      return;
+        && (workResult.work_outcome === "noop" || workResult.completed_without_changes === true)) {
+      _mergeCardMetadata(dispatch.kanban_card_id, {
+        work_resolution_status: "noop",
+        work_resolution_result: workResult,
+        preflight_status: null,
+        preflight_summary: null,
+        preflight_checked_at: null,
+        consultation_status: null,
+        consultation_result: null
+      });
+      agentdesk.db.execute("UPDATE kanban_cards SET blocked_reason = NULL WHERE id = ?", [dispatch.kanban_card_id]);
+      agentdesk.log.info("[kanban] " + card.id + " " + dispatch.dispatch_type + " noop completion recorded — routing through review flow");
     }
 
     // Rework dispatches — skip gate, go directly to review

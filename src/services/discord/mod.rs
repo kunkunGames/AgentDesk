@@ -30,9 +30,15 @@ pub(crate) mod shared_memory;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
+mod tmux_error_detect;
+#[cfg(unix)]
 mod tmux_lifecycle;
 #[cfg(unix)]
+mod tmux_overload_retry;
+#[cfg(unix)]
 mod tmux_reaper;
+#[cfg(unix)]
+mod tmux_restart_handoff;
 mod turn_bridge;
 
 pub(crate) use meeting_orchestrator as meeting;
@@ -291,8 +297,9 @@ pub(super) fn check_deferred_restart(shared: &SharedData) {
 
 use session_runtime::{
     DiscordSession, RuntimeChannelBindingStatus, WorktreeInfo, auto_restore_session,
-    bootstrap_thread_session, cleanup_git_worktree, create_git_worktree, detect_worktree_conflict,
-    provider_handles_channel, resolve_channel_category, resolve_runtime_channel_binding_status,
+    auto_restore_session_with_dm_hint, bootstrap_thread_session, cleanup_git_worktree,
+    create_git_worktree, detect_worktree_conflict, provider_handles_channel,
+    resolve_channel_category, resolve_is_dm_channel, resolve_runtime_channel_binding_status,
     resolve_thread_parent, select_restored_session_path, synthetic_thread_channel_name,
     validate_live_channel_routing, validate_live_channel_routing_with_dm_hint,
 };
@@ -1276,6 +1283,7 @@ pub(super) async fn kickoff_idle_queues(
             intervention.merge_consecutive,
             intervention.reply_context.clone(),
             intervention.has_reply_boundary,
+            None,
         )
         .await
         {

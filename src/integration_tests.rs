@@ -776,10 +776,17 @@ mod tests {
 
     fn setup_timeouts_policy_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("policies")
-            .join("timeouts.js");
-        fs::copy(&source, dir.path().join("timeouts.js")).unwrap();
+        let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+        fs::copy(
+            source_dir.join("00-escalation.js"),
+            dir.path().join("00-escalation.js"),
+        )
+        .unwrap();
+        fs::copy(
+            source_dir.join("timeouts.js"),
+            dir.path().join("timeouts.js"),
+        )
+        .unwrap();
         fs::write(
             dir.path().join("zz-timeouts-test-overrides.js"),
             r#"
@@ -824,6 +831,15 @@ mod tests {
             "#,
         )
         .unwrap();
+        dir
+    }
+
+    fn setup_triage_policy_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("policies")
+            .join("triage-rules.js");
+        fs::copy(&source, dir.path().join("triage-rules.js")).unwrap();
         dir
     }
 
@@ -1818,6 +1834,52 @@ mod tests {
     }
 
     #[test]
+    fn on_tick5min_stale_in_progress_skips_cards_already_blocked() {
+        let db = test_db();
+        let policy_dir = setup_timeouts_policy_dir();
+        let engine = test_engine_with_dir(&db, policy_dir.path());
+        seed_agent(&db);
+        seed_card(&db, "card-stale-blocked", "in_progress");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards
+                 SET blocked_reason = 'Stalled: no activity for 120+ min',
+                     started_at = datetime('now', '-3 hours'),
+                     updated_at = datetime('now', '-3 hours')
+                 WHERE id = 'card-stale-blocked'",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let blocked_reason: Option<String> = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-stale-blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            blocked_reason.as_deref(),
+            Some("Stalled: no activity for 120+ min")
+        );
+        assert!(
+            kv_value(&db, "test_http_count").is_none(),
+            "#653: stale in_progress cards with blocked_reason must not re-escalate"
+        );
+    }
+
+    #[test]
     fn active_manual_intervention_preserves_pending_escalation_bundle() {
         let db = test_db();
         let engine = test_engine(&db);
@@ -2115,6 +2177,107 @@ mod tests {
         assert_eq!(
             entry_dispatch_id, latest_dispatch_id,
             "recovered concurrent activate must keep the entry attached to the surviving dispatch"
+        );
+    }
+
+    #[test]
+    fn auto_queue_activate_agent_scope_uses_free_slot_for_additional_group() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at) \
+                 VALUES ('card-aq-live', 'AQ Live', 'in_progress', 'agent-1', 'repo-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at) \
+                 VALUES ('card-aq-next', 'AQ Next', 'ready', 'agent-1', 'repo-1', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, max_concurrent_threads, thread_group_count, created_at) \
+                 VALUES ('run-aq-slot-scale', 'repo-1', 'agent-1', 'active', 2, 2, datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, thread_group, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-aq-live', 'run-aq-slot-scale', 'card-aq-live', 'agent-1', 'dispatched', 'dispatch-aq-live', 0, 0, 0, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, thread_group, priority_rank, created_at) \
+                 VALUES ('entry-aq-next', 'run-aq-slot-scale', 'card-aq-next', 'agent-1', 'pending', 1, 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_slots (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at) \
+                 VALUES ('agent-1', 0, 'run-aq-slot-scale', 0, '{}', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_slots (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at) \
+                 VALUES ('agent-1', 1, NULL, NULL, '{}', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        seed_dispatch(
+            &db,
+            "dispatch-aq-live",
+            "card-aq-live",
+            "implementation",
+            "dispatched",
+        );
+
+        let deps = crate::server::routes::auto_queue::AutoQueueActivateDeps::for_bridge(
+            db.clone(),
+            engine.clone(),
+        );
+        let (status, body) = crate::server::routes::auto_queue::activate_with_deps(
+            &deps,
+            crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-aq-slot-scale".to_string()),
+                repo: Some("repo-1".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            },
+        );
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body.0["count"].as_u64(),
+            Some(1),
+            "agent-scoped activate should dispatch another group when a free slot exists"
+        );
+
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let (entry_status, slot_index, dispatch_id): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT status, slot_index, dispatch_id FROM auto_queue_entries WHERE id = 'entry-aq-next'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(entry_status, "dispatched");
+        assert_eq!(slot_index, Some(1));
+        assert!(
+            dispatch_id.is_some(),
+            "newly dispatched group must persist dispatch_id"
         );
     }
 
@@ -2506,6 +2669,248 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn scenario_655_noop_review_pass_skips_create_pr_and_closes_issue() {
+        let gh = install_mock_gh(&[MockGhReply {
+            key: "issue:close",
+            contains: Some("--repo test/repo"),
+            stdout: "",
+        }]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-655-pass", "review", "test/repo", 655, None);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET review_status = 'reviewing', latest_dispatch_id = 'review-655-pass' WHERE id = 'card-655-pass'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-655-pass', 'test/repo', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, priority_rank, created_at, dispatched_at) \
+                 VALUES ('entry-655-pass', 'run-655-pass', 'card-655-pass', 'agent-1', 'dispatched', 'impl-655-pass', 1, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, result, context, completed_at, created_at, updated_at) \
+                 VALUES ('impl-655-pass', 'card-655-pass', 'agent-1', 'implementation', 'completed', '[Impl noop]', ?1, ?2, datetime('now', '-2 minutes'), datetime('now', '-5 minutes'), datetime('now', '-2 minutes'))",
+                rusqlite::params![
+                    serde_json::json!({
+                        "work_outcome": "noop",
+                        "completed_without_changes": true,
+                        "completed_worktree_path": "/tmp/wt-655-pass",
+                        "completed_branch": "wt/655-noop",
+                        "completed_commit": "abc12345deadbeef",
+                        "notes": "already implemented"
+                    }).to_string(),
+                    serde_json::json!({
+                        "worktree_path": "/tmp/wt-655-pass",
+                        "worktree_branch": "wt/655-noop",
+                        "target_repo": "test/repo"
+                    }).to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, completed_at, created_at, updated_at) \
+                 VALUES ('review-655-pass-stale', 'card-655-pass', 'agent-1', 'review', 'completed', '[Review stale]', ?1, datetime('now', '+1 minute'), datetime('now', '-10 minutes'), datetime('now', '+1 minute'))",
+                rusqlite::params![serde_json::json!({
+                    "review_mode": "regular_review",
+                    "parent_dispatch_id": "impl-655-pass"
+                })
+                .to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at) \
+                 VALUES ('review-655-pass', 'card-655-pass', 'agent-1', 'review', 'pending', '[Review noop]', ?1, datetime('now'), datetime('now'))",
+                rusqlite::params![
+                    serde_json::json!({
+                        "review_mode": "noop_verification",
+                        "noop_reason": "already implemented",
+                        "parent_dispatch_id": "impl-655-pass"
+                    }).to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        let state = AppState::test_state(db.clone(), engine);
+        let (status, body) = crate::server::routes::review_verdict::submit_verdict(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::SubmitVerdictBody {
+                dispatch_id: "review-655-pass".to_string(),
+                overall: "pass".to_string(),
+                items: None,
+                notes: Some("noop verification passed".to_string()),
+                feedback: None,
+                commit: None,
+                provider: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "noop verification pass should succeed: {body:?}"
+        );
+
+        let conn = db.lock().unwrap();
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-655-pass'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let create_pr_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-655-pass' AND dispatch_type = 'create-pr'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-655-pass'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-655-pass'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(card_status, "done");
+        assert_eq!(
+            create_pr_count, 0,
+            "#655: noop verification pass must not create a create-pr dispatch"
+        );
+        assert_eq!(
+            entry_status, "done",
+            "#655: noop verification pass must still close the active auto-queue entry"
+        );
+        assert_eq!(
+            run_status, "completed",
+            "#655: noop verification pass must still complete the auto-queue run via terminal review flow"
+        );
+
+        let log = gh_log(&gh);
+        assert!(
+            log.contains("issue close 655 --repo test/repo"),
+            "#655: noop verification pass must close the linked GitHub issue"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scenario_655_noop_review_reject_creates_rework_dispatch() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-655-reject", "review");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET assigned_agent_id = 'agent-1', review_status = 'reviewing', latest_dispatch_id = 'review-655-reject', title = 'Noop Reject Card', github_issue_number = 655 WHERE id = 'card-655-reject'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at) \
+                 VALUES ('review-655-reject', 'card-655-reject', 'agent-1', 'review', 'pending', '[Review noop]', ?1, datetime('now'), datetime('now'))",
+                rusqlite::params![
+                    serde_json::json!({
+                        "review_mode": "noop_verification",
+                        "noop_reason": "already implemented elsewhere"
+                    }).to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        let state = AppState::test_state(db.clone(), engine);
+        let (status, body) = crate::server::routes::review_verdict::submit_verdict(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::SubmitVerdictBody {
+                dispatch_id: "review-655-reject".to_string(),
+                overall: "reject".to_string(),
+                items: None,
+                notes: Some("required behavior is still missing".to_string()),
+                feedback: None,
+                commit: None,
+                provider: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "noop verification reject should succeed: {body:?}"
+        );
+
+        let conn = db.lock().unwrap();
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-655-reject'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let review_status: Option<String> = conn
+            .query_row(
+                "SELECT review_status FROM kanban_cards WHERE id = 'card-655-reject'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        let rework_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-655-reject' AND dispatch_type = 'rework' AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let review_decision_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = 'card-655-reject' AND dispatch_type = 'review-decision' AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(card_status, "in_progress");
+        assert_eq!(review_status.as_deref(), Some("rework_pending"));
+        assert_eq!(
+            rework_count, 1,
+            "#655: noop verification reject must create a rework dispatch"
+        );
+        assert_eq!(
+            review_decision_count, 0,
+            "#655: noop verification reject must not create a review-decision dispatch on the synchronous verdict path"
+        );
+    }
+
     // ── Scenario 7: dispatch uses card's effective pipeline, not global default (#134/#136) ──
 
     #[test]
@@ -2776,12 +3181,7 @@ mod tests {
                 {"from": "in_progress", "to": "review", "type": "gated", "gates": ["active_dispatch"]},
                 {"from": "review", "to": "qa_test", "type": "gated", "gates": ["review_passed"]},
                 {"from": "review", "to": "in_progress", "type": "gated", "gates": ["review_rework"]},
-                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]},
-                {"from": "qa_test", "to": "in_progress", "type": "force_only"},
-                {"from": "requested", "to": "done", "type": "force_only"},
-                {"from": "in_progress", "to": "requested", "type": "force_only"},
-                {"from": "review", "to": "requested", "type": "force_only"},
-                {"from": "qa_test", "to": "requested", "type": "force_only"}
+                {"from": "qa_test", "to": "done", "type": "gated", "gates": ["active_dispatch"]}
             ],
             "gates": {
                 "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
@@ -2833,11 +3233,11 @@ mod tests {
         let qa_done = effective.find_transition("qa_test", "done");
         assert!(qa_done.is_some(), "qa_test → done must exist");
 
-        // qa_test → in_progress force transition
+        // qa_test → in_progress has no explicit rule (force bypass only)
         let qa_rework = effective.find_transition("qa_test", "in_progress");
         assert!(
-            qa_rework.is_some(),
-            "qa_test → in_progress (force) must exist"
+            qa_rework.is_none(),
+            "qa_test → in_progress should not have explicit rule"
         );
 
         // Verify custom state has hooks
@@ -3372,6 +3772,69 @@ mod tests {
     }
 
     #[test]
+    fn scenario_615_on_review_enter_skips_terminal_card() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-615-terminal", "done");
+        seed_completed_work_dispatch_for_review(
+            &db,
+            "impl-615-terminal",
+            "card-615-terminal",
+            "implementation",
+        );
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE kanban_cards SET review_status = 'reviewing', blocked_reason = 'stale review dispatch' WHERE id = 'card-615-terminal'",
+                [],
+            )
+            .unwrap();
+
+        kanban::fire_enter_hooks(&db, &engine, "card-615-terminal", "review");
+
+        let conn = db.lock().unwrap();
+        let review_dispatch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-615-terminal' AND dispatch_type = 'review' \
+                 AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_dispatch_count, 0,
+            "#615: terminal cards must not spawn new review dispatches on stale OnReviewEnter"
+        );
+
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-615-terminal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            blocked_reason.is_none(),
+            "#615: terminal OnReviewEnter must clear stale blocked_reason"
+        );
+        drop(conn);
+
+        assert_eq!(get_card_status(&db, "card-615-terminal"), "done");
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-615-terminal", "review"),
+            0,
+            "#615: terminal card must not create a stale review dispatch"
+        );
+        assert_eq!(
+            review_state_value(&db, "card-615-terminal").as_deref(),
+            Some("idle"),
+            "#615: terminal OnReviewEnter must keep canonical review state idle"
+        );
+    }
+
+    #[test]
     fn scenario_335_on_review_enter_reuses_round_without_new_completed_work() {
         let db = test_db();
         let engine = test_engine(&db);
@@ -3684,6 +4147,57 @@ mod tests {
         assert_eq!(phase_gate_json["status"], "pending");
         assert_eq!(phase_gate_json["batch_phase"], 1);
         assert_eq!(phase_gate_json["next_phase"], 2);
+    }
+
+    #[test]
+    fn deploy_gate_creation_skips_when_phase_still_has_live_entries() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-deploy-anchor", "done");
+        seed_card(&db, "card-deploy-live", "ready");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, deploy_phases, created_at) \
+                 VALUES ('run-deploy-live-phase', 'test/repo', 'agent-1', 'active', '[1]', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, batch_phase, priority_rank, created_at) \
+                 VALUES ('entry-deploy-live', 'run-deploy-live-phase', 'card-deploy-live', 'agent-1', 'pending', 1, 0, datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .eval_js::<String>(
+                r#"(() => {
+                    _createDeployGateDispatch("run-deploy-live-phase", 1, 2, false, "card-deploy-anchor");
+                    return "ok";
+                })()"#,
+            )
+            .expect("deploy gate helper should evaluate");
+
+        let run_status: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-deploy-live-phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(run_status, "active");
+        assert!(
+            phase_gate_state(&db, "run-deploy-live-phase", 1).is_none(),
+            "deploy gate must not persist while the phase still has live entries"
+        );
     }
 
     #[tokio::test]
@@ -4332,7 +4846,70 @@ mod tests {
     }
 
     #[test]
-    fn scenario_332_implementation_noop_completion_returns_card_to_ready_and_closes_auto_queue() {
+    fn scenario_655_rework_noop_completion_uses_noop_verification_review_context() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-655-rework-noop", "in_progress");
+        seed_dispatch(
+            &db,
+            "rw-655-noop",
+            "card-655-rework-noop",
+            "rework",
+            "pending",
+        );
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "rw-655-noop",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "work_outcome": "noop",
+                "completed_without_changes": true,
+                "notes": "rework turned out already implemented"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(get_card_status(&db, "card-655-rework-noop"), "review");
+
+        let conn = db.lock().unwrap();
+        let latest_dispatch_id: Option<String> = conn
+            .query_row(
+                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = 'card-655-rework-noop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let latest_dispatch_id = latest_dispatch_id
+            .expect("#655: latest_dispatch_id must point at the follow-up review dispatch");
+        let latest_dispatch_context: serde_json::Value = conn
+            .query_row(
+                "SELECT context FROM task_dispatches WHERE id = ?1",
+                [&latest_dispatch_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .unwrap_or_else(|| serde_json::json!({}));
+        drop(conn);
+
+        assert_eq!(latest_dispatch_context["review_mode"], "noop_verification");
+        assert_eq!(latest_dispatch_context["parent_dispatch_id"], "rw-655-noop");
+        assert_eq!(
+            latest_dispatch_context["noop_reason"],
+            "rework turned out already implemented"
+        );
+    }
+
+    #[test]
+    fn scenario_332_implementation_noop_completion_routes_to_review_with_noop_context() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -4348,6 +4925,21 @@ mod tests {
                 "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
                  VALUES ('entry-332', 'run-332', 'card-332', 'agent-1', 'dispatched', 'impl-332', datetime('now'))",
             [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET metadata = ?1 WHERE id = 'card-332'",
+            rusqlite::params![
+                serde_json::json!({
+                    "preflight_status": "consult_required",
+                    "preflight_summary": "need clarification",
+                    "preflight_checked_at": "2026-04-15T01:02:03Z",
+                    "consultation_status": "completed",
+                    "consultation_result": {"summary": "stale"},
+                    "keep": "yes"
+                })
+                .to_string()
+            ],
         )
         .unwrap();
         drop(conn);
@@ -4372,25 +4964,36 @@ mod tests {
 
         assert_eq!(
             get_card_status(&db, "card-332"),
-            "ready",
-            "#332: explicit noop outcome must return implementation card to ready"
+            "review",
+            "#655: explicit noop outcome must route implementation card into review"
         );
 
         let conn = db.lock().unwrap();
-        let review_count: i64 = conn
+        let (review_count, latest_dispatch_id): (i64, Option<String>) = conn
             .query_row(
-                "SELECT COUNT(*) FROM task_dispatches \
-                 WHERE kanban_card_id = 'card-332' AND dispatch_type = 'review' \
-                 AND status IN ('pending', 'dispatched')",
+                "SELECT \
+                    (SELECT COUNT(*) FROM task_dispatches \
+                     WHERE kanban_card_id = 'card-332' AND dispatch_type = 'review' \
+                     AND status IN ('pending', 'dispatched')), \
+                    latest_dispatch_id \
+                 FROM kanban_cards WHERE id = 'card-332'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(
-            review_count, 0,
-            "#332: noop completion must not create a follow-up review dispatch"
+            review_count, 1,
+            "#655: noop completion must create a follow-up review dispatch"
         );
-
+        let latest_dispatch_id =
+            latest_dispatch_id.expect("#655: latest_dispatch_id must point at the review dispatch");
+        let (latest_dispatch_type, latest_dispatch_context): (String, Option<String>) = conn
+            .query_row(
+                "SELECT dispatch_type, context FROM task_dispatches WHERE id = ?1",
+                [&latest_dispatch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         let auto_queue_status: String = conn
             .query_row(
                 "SELECT status FROM auto_queue_entries WHERE id = 'entry-332'",
@@ -4399,8 +5002,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            auto_queue_status, "done",
-            "#332: noop completion must close the active auto-queue entry"
+            latest_dispatch_type, "review",
+            "#655: latest_dispatch_id must move to the pending review dispatch"
+        );
+        let latest_dispatch_context: serde_json::Value = serde_json::from_str(
+            latest_dispatch_context
+                .as_deref()
+                .expect("review dispatch must carry JSON context"),
+        )
+        .unwrap();
+        assert_eq!(latest_dispatch_context["review_mode"], "noop_verification");
+        assert_eq!(
+            latest_dispatch_context["noop_reason"],
+            "spec already satisfied"
+        );
+        assert_eq!(latest_dispatch_context["parent_dispatch_id"], "impl-332");
+        assert_eq!(
+            auto_queue_status, "dispatched",
+            "#655: auto-queue entry must remain live until noop review reaches terminal state"
         );
 
         let metadata_json: String = conn
@@ -4423,11 +5042,89 @@ mod tests {
             metadata["work_resolution_result"]["card_status_target"],
             "ready"
         );
+        assert!(metadata["preflight_status"].is_null());
+        assert!(metadata["preflight_summary"].is_null());
+        assert!(metadata["preflight_checked_at"].is_null());
+        assert!(metadata["consultation_status"].is_null());
+        assert!(metadata["consultation_result"].is_null());
+        assert_eq!(metadata["keep"], "yes");
     }
 
     #[test]
-    fn scenario_547_implementation_noop_completion_triggers_auto_queue_activate_for_follow_up_entry()
-     {
+    fn scenario_615_completed_without_changes_routes_to_review_even_without_explicit_noop_marker() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-615-noop", "in_progress");
+        seed_dispatch(
+            &db,
+            "impl-615-noop",
+            "card-615-noop",
+            "implementation",
+            "pending",
+        );
+        seed_assistant_response_for_dispatch(
+            &db,
+            "impl-615-noop",
+            "verified existing implementation without additional edits",
+        );
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-615-noop",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "completed_without_changes": true,
+                "card_status_target": "done",
+                "notes": "already applied without code change"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            get_card_status(&db, "card-615-noop"),
+            "review",
+            "#655: completed_without_changes must route through review instead of bypassing it"
+        );
+        assert_eq!(
+            count_active_dispatches_by_type(&db, "card-615-noop", "review"),
+            1,
+            "#655: completed_without_changes must enqueue a review dispatch"
+        );
+        assert_eq!(
+            review_state_value(&db, "card-615-noop").as_deref(),
+            Some("reviewing"),
+            "#655: noop completion must leave canonical review state in reviewing"
+        );
+
+        let metadata_json: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT metadata FROM kanban_cards WHERE id = 'card-615-noop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["work_resolution_status"], "noop");
+        assert_eq!(
+            metadata["work_resolution_result"]["completed_without_changes"],
+            true
+        );
+        assert_eq!(
+            metadata["work_resolution_result"]["card_status_target"],
+            "done"
+        );
+    }
+
+    #[test]
+    fn scenario_547_implementation_noop_completion_waits_for_review_before_auto_queue_activate() {
         let policies_dir = setup_auto_queue_activate_spy_policy_dir();
         let db = test_db();
         let engine = test_engine_with_dir(&db, policies_dir.path());
@@ -4481,7 +5178,7 @@ mod tests {
             result.err()
         );
 
-        assert_eq!(get_card_status(&db, "card-547-noop"), "ready");
+        assert_eq!(get_card_status(&db, "card-547-noop"), "review");
 
         let conn = db.lock().unwrap();
         let entry_status: String = conn
@@ -4493,22 +5190,15 @@ mod tests {
             .unwrap();
         drop(conn);
         assert_eq!(
-            entry_status, "done",
-            "#547: noop completion must close the active auto-queue entry before continuing"
+            entry_status, "dispatched",
+            "#655: noop completion must keep the active auto-queue entry live until review finishes"
         );
 
         assert_eq!(
             kv_value(&db, "test_auto_queue_activate_count").as_deref(),
-            Some("1"),
-            "#547: noop completion must trigger exactly one auto-queue activate call"
+            None,
+            "#655: noop completion must not trigger auto-queue activate before review verdict"
         );
-
-        let activate_payload = kv_value(&db, "test_auto_queue_activate_last")
-            .expect("activate payload should be recorded");
-        let activate_json: serde_json::Value = serde_json::from_str(&activate_payload).unwrap();
-        assert_eq!(activate_json["run_id"], "run-547");
-        assert_eq!(activate_json["thread_group"], 0);
-        assert_eq!(activate_json["active_only"], true);
 
         let next_entry_status: String = db
             .lock()
@@ -4520,13 +5210,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            next_entry_status, "dispatched",
-            "#547: deferred activate must still dispatch the next queued entry"
+            next_entry_status, "pending",
+            "#655: follow-up auto-queue entry must stay pending until noop review reaches terminal state"
         );
     }
 
     #[test]
-    fn scenario_547_implementation_noop_completion_creates_phase_gate_for_multi_phase_run() {
+    fn scenario_547_implementation_noop_completion_defers_phase_gate_until_review_passes() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -4579,7 +5269,7 @@ mod tests {
             result.err()
         );
 
-        assert_eq!(get_card_status(&db, "card-547-phase-1"), "ready");
+        assert_eq!(get_card_status(&db, "card-547-phase-1"), "review");
 
         let conn = db.lock().unwrap();
         let entry_status: String = conn
@@ -4608,20 +5298,88 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let phase_gate_json =
-            phase_gate_state(&db, "run-547-phase", 1).expect("phase gate state must exist");
-        assert_eq!(entry_status, "done");
+        assert_eq!(entry_status, "dispatched");
         assert_eq!(
-            run_status, "paused",
-            "#547: noop completion must still pause multi-phase runs for a gate"
+            run_status, "active",
+            "#655: multi-phase auto-queue run must stay active until noop review passes"
         );
         assert_eq!(
-            phase_gate_count, 1,
-            "#547: noop completion must create a phase-gate dispatch when the phase finishes"
+            phase_gate_count, 0,
+            "#655: noop completion must not create a phase-gate dispatch before review finishes"
         );
-        assert_eq!(phase_gate_json["status"], "pending");
-        assert_eq!(phase_gate_json["batch_phase"], 1);
-        assert_eq!(phase_gate_json["next_phase"], 2);
+        assert!(
+            phase_gate_state(&db, "run-547-phase", 1).is_none(),
+            "#655: phase-gate state must remain empty until the noop review reaches terminal state"
+        );
+    }
+
+    #[test]
+    fn scenario_494_implementation_noop_completion_final_entry_waits_for_review_before_notify() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_card(&db, "card-494-noop-final", "in_progress");
+        seed_dispatch(
+            &db,
+            "impl-494-noop-final",
+            "card-494-noop-final",
+            "implementation",
+            "pending",
+        );
+
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+             VALUES ('run-494-noop-final', 'test/repo', 'agent-1', 'active', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at, batch_phase, created_at) \
+             VALUES ('entry-494-noop-final', 'run-494-noop-final', 'card-494-noop-final', 'agent-1', 'dispatched', 'impl-494-noop-final', datetime('now'), 0, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            "impl-494-noop-final",
+            &serde_json::json!({
+                "completion_source": "test_harness",
+                "work_outcome": "noop",
+                "completed_without_changes": true,
+                "card_status_target": "ready",
+                "notes": "already implemented"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "complete_dispatch should succeed: {:?}",
+            result.err()
+        );
+
+        let conn = db.lock().unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-494-noop-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let messages = message_outbox_rows(&db);
+        assert_eq!(
+            run_status, "active",
+            "#655: noop completion on the final entry must keep the run active until review passes"
+        );
+        assert_eq!(
+            messages.len(),
+            0,
+            "#655: noop completion on the final entry must not queue completion notify before review passes"
+        );
     }
 
     #[test]
@@ -5657,8 +6415,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scenario_208_on_tick_creates_codex_rework_and_dedups_review() {
-        let (repo, _env) = setup_test_repo_with_mock_gh(&[
+    fn scenario_208_on_tick_creates_codex_follow_up_issue_and_dedups_review() {
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
             MockGhReply {
                 key: "pr:list",
                 contains: Some("--state merged"),
@@ -5678,6 +6436,16 @@ mod tests {
                 key: "api:graphql",
                 contains: None,
                 stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-1\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-1\",\"body\":\"P1 force-transition leaves dispatch alive\",\"path\":\"src/server/routes/github.rs\",\"line\":77,\"url\":\"https://example.com/comment-1\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9001\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "label:create",
+                contains: Some("agent:agent-1"),
+                stdout: "label ok",
+            },
+            MockGhReply {
+                key: "issue:create",
+                contains: Some("--label agent:agent-1"),
+                stdout: "https://github.com/test/repo/issues/900",
             },
         ]);
         run_git(
@@ -5703,29 +6471,252 @@ mod tests {
             .unwrap();
         kanban::drain_hook_side_effects(&db, &engine);
 
-        assert_eq!(get_card_status(&db, "card-208"), "in_progress");
-        assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 1);
-        let title = latest_dispatch_title(&db, "card-208", "rework").unwrap();
-        assert!(title.contains("src/server/routes/github.rs:77"));
-        assert!(title.contains("P1 force-transition leaves dispatch alive"));
-        assert_eq!(
-            review_state_value(&db, "card-208").as_deref(),
-            Some("rework_pending")
+        assert_eq!(get_card_status(&db, "card-208"), "done");
+        assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 0);
+        assert_eq!(review_state_value(&db, "card-208").as_deref(), None);
+
+        let conn = db.lock().unwrap();
+        let (followup_status, followup_title, followup_description, followup_metadata): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, title, description, metadata \
+                 FROM kanban_cards WHERE repo_id = 'test/repo' AND github_issue_number = 900",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(followup_status, "backlog");
+        assert!(followup_title.contains("PR #323"));
+        assert!(
+            followup_description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("src/server/routes/github.rs:77")
         );
+        let followup_metadata_json: serde_json::Value =
+            serde_json::from_str(followup_metadata.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(followup_metadata_json["labels"], "agent:agent-1");
 
         let messages = message_outbox_rows(&db);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].0, "thread-208");
         assert!(messages[0].1.contains("PR #323"));
-        assert!(messages[0].1.contains("rework dispatch"));
+        assert!(messages[0].1.contains("follow-up 이슈를 생성했습니다"));
+        assert!(
+            messages[0]
+                .1
+                .contains("https://github.com/test/repo/issues/900")
+        );
 
         engine
             .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
             .unwrap();
         kanban::drain_hook_side_effects(&db, &engine);
 
-        assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 1);
+        assert_eq!(count_dispatches_by_type(&db, "card-208", "rework"), 0);
         assert_eq!(message_outbox_rows(&db).len(), 1);
+
+        let log = gh_log(&env._gh);
+        assert_eq!(
+            log.matches("label create agent:agent-1").count(),
+            1,
+            "Codex follow-up flow must ensure the agent label only once"
+        );
+        assert_eq!(
+            log.matches("issue create --repo test/repo").count(),
+            1,
+            "Codex follow-up flow must create exactly one follow-up issue per review"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_615_codex_followup_dedups_even_if_backlog_insert_fails() {
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":325,\"headRefName\":\"wt/card-615-dedup\",\"title\":\"fix: follow-up dedup (#615)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/325/reviews",
+                contains: None,
+                stdout: "[{\"id\":9003,\"state\":\"COMMENTED\",\"body\":\"P1 blocking finding\",\"submitted_at\":\"2026-04-06T00:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-615\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-615\",\"body\":\"P1 keep dedup even if backlog insert fails\",\"path\":\"policies/merge-automation.js\",\"line\":1209,\"url\":\"https://example.com/comment-615\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9003\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "label:create",
+                contains: Some("agent:agent-1"),
+                stdout: "label ok",
+            },
+            MockGhReply {
+                key: "issue:create",
+                contains: Some("--label agent:agent-1"),
+                stdout: "https://github.com/test/repo/issues/901",
+            },
+        ]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:test/repo.git"],
+        );
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-615-dedup", "done", "test/repo", 615, None);
+        seed_thread_session(&db, "s-615-dedup", "thread-615-dedup");
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(
+            &db,
+            "pr:card-615-dedup",
+            r#"{"number":325,"repo":"test/repo","branch":"wt/card-615-dedup"}"#,
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_codex_followup_backlog_insert
+                 BEFORE INSERT ON kanban_cards
+                 WHEN NEW.id LIKE 'codex-followup-%'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'boom');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let followup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_cards \
+                 WHERE repo_id = 'test/repo' AND github_issue_number = 901",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            followup_count, 0,
+            "failed backlog insert must not leave partial local card"
+        );
+        assert_eq!(
+            gh_log(&env._gh).matches("issue create").count(),
+            1,
+            "issue creation must still dedup even when backlog insert fails"
+        );
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "failed backlog insert should not emit success notification"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_615_codex_followup_rejects_invalid_issue_url() {
+        let (repo, env) = setup_test_repo_with_mock_gh(&[
+            MockGhReply {
+                key: "pr:list",
+                contains: Some("--state merged"),
+                stdout: "[]",
+            },
+            MockGhReply {
+                key: "pr:list",
+                contains: None,
+                stdout: "[{\"number\":326,\"headRefName\":\"wt/card-615-url\",\"title\":\"fix: validate follow-up url (#615)\",\"mergeable\":\"MERGEABLE\"}]",
+            },
+            MockGhReply {
+                key: "api:repos/test/repo/pulls/326/reviews",
+                contains: None,
+                stdout: "[{\"id\":9004,\"state\":\"COMMENTED\",\"body\":\"P2 malformed follow-up url risk\",\"submitted_at\":\"2026-04-06T00:00:00Z\",\"user\":{\"login\":\"chatgpt-codex-connector\"}}]",
+            },
+            MockGhReply {
+                key: "api:graphql",
+                contains: None,
+                stdout: "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"id\":\"thread-615-url\",\"isResolved\":false,\"isOutdated\":false,\"comments\":{\"nodes\":[{\"id\":\"comment-615-url\",\"body\":\"P2 validate issue URL\",\"path\":\"policies/merge-automation.js\",\"line\":1167,\"url\":\"https://example.com/comment-615-url\",\"author\":{\"login\":\"chatgpt-codex-connector\"},\"pullRequestReview\":{\"id\":\"PRR_9004\",\"state\":\"COMMENTED\",\"author\":{\"login\":\"chatgpt-codex-connector\"}}}]}}]}}}}}",
+            },
+            MockGhReply {
+                key: "label:create",
+                contains: Some("agent:agent-1"),
+                stdout: "label ok",
+            },
+            MockGhReply {
+                key: "issue:create",
+                contains: Some("--label agent:agent-1"),
+                stdout: "https://github.com/test/repo/pull/901",
+            },
+        ]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", "git@github.com:test/repo.git"],
+        );
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-615-url", "done", "test/repo", 615, None);
+        seed_thread_session(&db, "s-615-url", "thread-615-url");
+        set_kv(&db, "merge_automation_enabled", "true");
+        set_kv(
+            &db,
+            "pr:card-615-url",
+            r#"{"number":326,"repo":"test/repo","branch":"wt/card-615-url"}"#,
+        );
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let conn = db.lock().unwrap();
+        let followup_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kanban_cards \
+                 WHERE repo_id = 'test/repo' AND title LIKE '%PR #326%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            followup_count, 0,
+            "invalid issue URL must not create a backlog card"
+        );
+        assert!(
+            message_outbox_rows(&db).is_empty(),
+            "invalid issue URL must not emit a follow-up success notification"
+        );
+        assert_eq!(
+            gh_log(&env._gh).matches("issue create").count(),
+            1,
+            "invalid issue URL should fail fast without fallback loops inside one tick"
+        );
     }
 
     #[cfg(unix)]
@@ -5971,6 +6962,70 @@ mod tests {
         assert_eq!(metadata["preflight_status"], "consult_required");
         assert!(metadata["preflight_summary"].is_string());
         assert!(metadata["preflight_checked_at"].is_string());
+    }
+
+    #[test]
+    fn triage_requested_key_uses_ttl_and_requeues_after_expiry() {
+        let db = test_db();
+        let policy_dir = setup_triage_policy_dir();
+        let engine = test_engine_with_dir(&db, policy_dir.path());
+        set_config_key(&db, "kanban_manager_channel_id", json!("channel-triage"));
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (
+                    id, title, status, metadata, github_issue_url, github_issue_number, created_at, updated_at
+                 ) VALUES (
+                    'card-triage-ttl', 'Needs classification', 'backlog', ?1,
+                    'https://github.com/test/repo/issues/777', 777, datetime('now'), datetime('now')
+                 )",
+                rusqlite::params![serde_json::json!({"labels": ""}).to_string()],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        let first_expiry: Option<String> = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at FROM kv_meta WHERE key = 'triage_requested:card-triage-ttl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            first_expiry.is_some(),
+            "#654: triage dedup key must use TTL"
+        );
+        assert_eq!(message_outbox_rows(&db).len(), 1);
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kv_meta
+                 SET expires_at = datetime('now', '-1 minute')
+                 WHERE key = 'triage_requested:card-triage-ttl'",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            message_outbox_rows(&db).len(),
+            2,
+            "#654: expired triage dedup key must allow a fresh backlog classification request"
+        );
     }
 
     #[test]

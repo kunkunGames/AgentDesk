@@ -57,6 +57,7 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 let effective =
                     crate::pipeline::resolve_for_card(&conn, repo_id.as_deref(), agent_id.as_deref());
                 let pipeline = &effective;
+                let transition_rule = pipeline.find_transition(&old_status, &new_status);
 
                 // Guard: prevent reverting terminal cards
                 if pipeline.is_terminal(&old_status) && old_status != new_status {
@@ -68,11 +69,10 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
 
                 // #228: Enforce review_verdict_pass gate on transitions to terminal states.
                 // Only this specific gate is checked — other gates (has_active_dispatch,
-                // review_rework) and force_only transitions are used legitimately by
-                // policies and must not be blocked here. PMD bypasses via force-transition API.
+                // review_rework) are used legitimately by policies and must not be blocked here.
                 if pipeline.is_terminal(&new_status)
                     && !force
-                    && let Some(t) = pipeline.find_transition(&old_status, &new_status)
+                    && let Some(t) = transition_rule
                 {
                     let needs_review_pass = t.gates.iter().any(|g| {
                         pipeline
@@ -106,6 +106,31 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     }
                 }
 
+                let mut active_dispatch_warning: Option<&'static str> = None;
+                if let Some(t) = transition_rule {
+                    let needs_active_dispatch = t.gates.iter().any(|g| {
+                        pipeline
+                            .gates
+                            .get(g.as_str())
+                            .is_some_and(|gc| gc.check.as_deref() == Some("has_active_dispatch"))
+                    });
+                    if needs_active_dispatch {
+                        let has_active_dispatch: bool = conn
+                            .query_row(
+                                "SELECT COUNT(*) > 0 FROM task_dispatches \
+                                 WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
+                                [&card_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(false);
+                        if !has_active_dispatch {
+                            active_dispatch_warning = Some(
+                                "transition bypassed has_active_dispatch gate without an active dispatch",
+                            );
+                        }
+                    }
+                }
+
                 // Clock fields from pipeline config
                 let clock_extra = match pipeline.clock_for_state(&new_status) {
                     Some(clock) if clock.mode.as_deref() == Some("coalesce") => {
@@ -116,7 +141,7 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                 };
                 // Terminal cleanup: clear review-related fields
                 let terminal_cleanup = if pipeline.is_terminal(&new_status) {
-                    ", review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL"
+                    ", review_status = NULL, suggestion_pending_at = NULL, review_entered_at = NULL, awaiting_dod_at = NULL, blocked_reason = NULL, review_round = NULL, deferred_dod_json = NULL"
                 } else {
                     ""
                 };
@@ -129,9 +154,33 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     return format!(r#"{{"error":"UPDATE: {}"}}"#, e);
                 }
 
-                // Also update auto_queue_entries if terminal
+                // Also update auto_queue_entries and cancel orphan dispatches if terminal
                 if pipeline.is_terminal(&new_status) {
                     sync_auto_queue_terminal_on_conn(&conn, &card_id);
+                    // Cancel active implementation/rework/review-decision dispatches
+                    // so they don't remain orphaned after card reaches terminal.
+                    let orphan_dispatches: Vec<String> = conn
+                        .prepare(
+                            "SELECT id FROM task_dispatches \
+                             WHERE kanban_card_id = ?1 \
+                             AND dispatch_type IN ('implementation', 'review-decision', 'rework') \
+                             AND status IN ('pending', 'dispatched')",
+                        )
+                        .ok()
+                        .and_then(|mut stmt| {
+                            stmt.query_map([&*card_id], |row| row.get::<_, String>(0))
+                                .ok()
+                                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                        })
+                        .unwrap_or_default();
+                    for dispatch_id in &orphan_dispatches {
+                        crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+                            &conn,
+                            dispatch_id,
+                            Some("js_terminal_cleanup"),
+                        )
+                        .ok();
+                    }
                 }
 
                 // #117/#158: Sync canonical review state via unified entrypoint
@@ -153,9 +202,12 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                     );
                 }
 
+                let warning_json = active_dispatch_warning
+                    .map(|warning| format!(r#","warning":"{}""#, warning))
+                    .unwrap_or_default();
                 format!(
-                    r#"{{"ok":true,"changed":true,"from":"{}","to":"{}","card_id":"{}"}}"#,
-                    old_status, new_status, card_id
+                    r#"{{"ok":true,"changed":true,"from":"{}","to":"{}","card_id":"{}"{} }}"#,
+                    old_status, new_status, card_id, warning_json
                 )
             },
         )?,
@@ -310,6 +362,41 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
         })?,
     )?;
 
+    let db_clear_latest = db.clone();
+    kanban_obj.set(
+        "__clearLatestDispatchRaw",
+        Function::new(
+            ctx.clone(),
+            move |card_id: String, expected_dispatch_id: Option<String>| -> String {
+                let conn = match db_clear_latest.separate_conn() {
+                    Ok(c) => c,
+                    Err(e) => return format!(r#"{{"error":"{}"}}"#, e),
+                };
+                let current_latest: Option<String> = conn
+                    .query_row(
+                        "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
+                        [&card_id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
+                if let Some(expected) = expected_dispatch_id.as_deref() {
+                    if current_latest.as_deref() != Some(expected) {
+                        return r#"{"ok":true,"rows_affected":0,"skipped":"latest_mismatch"}"#.to_string();
+                    }
+                }
+                match conn.execute(
+                    "UPDATE kanban_cards SET latest_dispatch_id = NULL, updated_at = datetime('now') \
+                     WHERE id = ?1 AND latest_dispatch_id IS NOT NULL",
+                    [&card_id],
+                ) {
+                    Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":"UPDATE: {}"}}"#, e),
+                }
+            },
+        )?,
+    )?;
+
     // #155: setReviewStatus — controlled path for review_status + clock updates.
     // Replaces direct SQL UPDATEs so the ExecuteSQL guard can block bare review_status writes.
     let db_review = db.clone();
@@ -432,6 +519,7 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             var raw = agentdesk.kanban.__setStatusRaw;
             var reopenRaw = agentdesk.kanban.__reopenRaw;
             var getRaw = agentdesk.kanban.__getCardRaw;
+            var clearLatestRaw = agentdesk.kanban.__clearLatestDispatchRaw;
             agentdesk.kanban.__pendingTransitions = [];
             agentdesk.kanban.setStatus = function(cardId, newStatus, force) {
                 var result = JSON.parse(raw(cardId, newStatus, !!force));
@@ -442,6 +530,9 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
                         from: result.from,
                         to: result.to
                     });
+                    if (result.warning) {
+                        agentdesk.log.warn("[setStatus] " + result.card_id + " " + result.from + " -> " + result.to + " — " + result.warning);
+                    }
                     agentdesk.log.info("[setStatus] " + result.card_id + " " + result.from + " -> " + result.to + " (pendingLen=" + agentdesk.kanban.__pendingTransitions.length + ")");
                 } else {
                     agentdesk.log.info("[setStatus] " + cardId + " -> " + newStatus + " (no-change)");
@@ -466,6 +557,11 @@ pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()> {
             agentdesk.kanban.getCard = function(cardId) {
                 var result = JSON.parse(getRaw(cardId));
                 if (result.error) return null;
+                return result;
+            };
+            agentdesk.kanban.clearLatestDispatch = function(cardId, expectedDispatchId) {
+                var result = JSON.parse(clearLatestRaw(cardId, expectedDispatchId || null));
+                if (result.error) throw new Error(result.error);
                 return result;
             };
             var reviewRaw = agentdesk.kanban.__setReviewStatusRaw;

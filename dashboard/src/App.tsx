@@ -33,6 +33,7 @@ import {
   useNotifications,
 } from "./components/NotificationCenter";
 import { useDashboardSocket } from "./app/useDashboardSocket";
+import type { DashboardTab } from "./app/dashboardTabs";
 import {
   Building2,
   KanbanSquare,
@@ -265,6 +266,7 @@ function AppShell({ wsConnected, notifications, pushNotification, updateNotifica
   const [controlTab, setControlTab] = useState<ControlTab>("agents");
   const [agentsPane, setAgentsPane] = useState<AgentsPane>("directory");
   const [kanbanSignalFocus, setKanbanSignalFocus] = useState<KanbanSignalFocus | null>(null);
+  const [dashboardRequestedTab, setDashboardRequestedTab] = useState<DashboardTab | null>(null);
   const [officeInfoAgent, setOfficeInfoAgent] = useState<Agent | null>(null);
   const [showCmdPalette, setShowCmdPalette] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
@@ -338,6 +340,12 @@ function AppShell({ wsConnected, notifications, pushNotification, updateNotifica
         return;
       }
 
+      if (routeId === "dashboard_meetings") {
+        setDashboardRequestedTab("meetings");
+        handleNavigate("dashboard");
+        return;
+      }
+
       setView("more");
       if (routeId === "control_departments") {
         setControlTab("departments");
@@ -374,6 +382,10 @@ function AppShell({ wsConnected, notifications, pushNotification, updateNotifica
   const openSettingsView = useCallback(() => {
     setControlTab("settings");
     setView("more");
+  }, []);
+
+  const clearRequestedDashboardTab = useCallback(() => {
+    setDashboardRequestedTab(null);
   }, []);
 
   useEffect(() => {
@@ -485,11 +497,13 @@ function AppShell({ wsConnected, notifications, pushNotification, updateNotifica
                 sessions={visibleDispatchedSessions}
                 meetings={roundTableMeetings}
                 settings={settings}
+                requestedTab={dashboardRequestedTab}
+                onRequestedTabHandled={clearRequestedDashboardTab}
                 onSelectAgent={(agent) => setOfficeInfoAgent(agent)}
                 onOpenKanbanSignal={openKanbanSignalFocus}
                 onOpenDispatchSessions={openDispatchSessions}
                 onOpenSettings={openSettingsView}
-                onOpenMeetings={() => api.getRoundTableMeetings().then(setRoundTableMeetings).catch(() => {})}
+                onRefreshMeetings={() => api.getRoundTableMeetings().then(setRoundTableMeetings).catch(() => {})}
               />
             )}
 

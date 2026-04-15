@@ -2,6 +2,7 @@ use super::{
     discord_delivery::{discord_api_base_url, discord_api_url},
     thread_reuse::clear_all_threads,
 };
+use rusqlite::OptionalExtension;
 use std::process::Command;
 
 #[derive(Clone, Debug)]
@@ -121,6 +122,23 @@ const RETRY_BACKOFF_SECS: [i64; 4] = [60, 300, 900, 3600];
 /// Maximum number of retries before marking as permanent failure.
 const MAX_RETRY_COUNT: i32 = 4;
 
+fn dispatch_notify_delivery_suppressed(
+    conn: &rusqlite::Connection,
+    dispatch_id: &str,
+) -> rusqlite::Result<bool> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(matches!(
+        status.as_deref(),
+        Some("completed") | Some("failed") | Some("cancelled")
+    ))
+}
+
 /// Process one batch of pending outbox entries.
 /// Returns the number of entries processed (0 if queue was empty).
 ///
@@ -175,6 +193,24 @@ pub(crate) async fn process_outbox_batch<N: OutboxNotifier>(
 
     let count = pending.len();
     for (id, dispatch_id, action, agent_id, card_id, title, retry_count) in pending {
+        if action == "notify" {
+            let suppress_delivery = if let Ok(conn) = db.lock() {
+                dispatch_notify_delivery_suppressed(&conn, &dispatch_id).unwrap_or(false)
+            } else {
+                false
+            };
+            if suppress_delivery {
+                if let Ok(conn) = db.lock() {
+                    conn.execute(
+                        "UPDATE dispatch_outbox SET status = 'done', processed_at = datetime('now'), error = NULL WHERE id = ?1",
+                        [id],
+                    )
+                    .ok();
+                }
+                continue;
+            }
+        }
+
         // Mark as processing
         if let Ok(conn) = db.lock() {
             conn.execute(
@@ -918,6 +954,10 @@ pub(super) fn format_dispatch_message(
         .get("verdict")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+    let review_mode = context_json
+        .get("review_mode")
+        .and_then(|value| value.as_str());
+    let noop_verification = review_mode == Some("noop_verification");
 
     if dispatch_type == Some("review") {
         let mut message = format!(
@@ -936,21 +976,55 @@ pub(super) fn format_dispatch_message(
                 "\n\n리뷰 대상 브랜치: `{branch}` (commit: `{short_commit}`)\n\
                  반드시 해당 브랜치를 checkout하여 리뷰하세요. main 브랜치가 아닙니다."
             ));
-            if let (Some(merge_base), Some(reviewed_commit)) = (
-                context_json
-                    .get("merge_base")
-                    .and_then(|value| value.as_str()),
-                reviewed_commit,
-            ) {
+            if !noop_verification {
+                if let (Some(merge_base), Some(reviewed_commit)) = (
+                    context_json
+                        .get("merge_base")
+                        .and_then(|value| value.as_str()),
+                    reviewed_commit,
+                ) {
+                    message.push_str(&format!(
+                        "\n\
+                         merge-base(main, `{branch}`): `{merge_base}`\n\
+                         정확한 변경 범위는 아래 명령으로 확인하세요:\n\
+                         ```bash\n\
+                         git diff {merge_base}..{reviewed_commit}\n\
+                         ```"
+                    ));
+                }
+            } else {
                 message.push_str(&format!(
                     "\n\
-                     merge-base(main, `{branch}`): `{merge_base}`\n\
-                     정확한 변경 범위는 아래 명령으로 확인하세요:\n\
-                     ```bash\n\
-                     git diff {merge_base}..{reviewed_commit}\n\
-                     ```"
+                     이번 리뷰는 diff 검토가 아니라 현재 브랜치 상태 검증입니다. `git diff`보다 이슈 본문과 실제 코드 상태 대조를 우선하세요."
                 ));
             }
+        }
+        if let Some(warning) = context_json
+            .get("review_target_warning")
+            .and_then(|value| value.as_str())
+        {
+            message.push_str(&format!("\n\n리뷰 타겟 안내: {warning}"));
+        }
+        if noop_verification {
+            let noop_reason = context_json
+                .get("noop_reason")
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    context_json
+                        .get("noop_result")
+                        .and_then(|value| value.get("notes"))
+                        .and_then(|value| value.as_str())
+                })
+                .unwrap_or("noop 사유가 제공되지 않았습니다.");
+            message.push_str(&format!(
+                "\n\n리뷰 모드: `noop_verification`\n\
+                 이번 리뷰는 코드 diff 대신 GitHub 이슈 본문과 현재 코드 상태를 대조하는 검증입니다.\n\
+                 noop 사유: {noop_reason}\n\
+                 반드시 아래 항목을 판정하세요:\n\
+                 - 이슈가 요구한 변경이 현재 코드에 이미 존재하는지\n\
+                 - noop 사유가 구체적이고 직접 검증 가능한지\n\
+                 둘 중 하나라도 아니면 `VERDICT: reject` 또는 `VERDICT: rework`로 판정하세요."
+            ));
         }
         let review_scope_reminder = context_json
             .get("review_quality_scope_reminder")
@@ -1051,19 +1125,8 @@ pub(super) fn prefix_dispatch_message(dispatch_type: &str, message: &str) -> Str
 /// Replaces `tokio::spawn(handle_completed_dispatch_followups(...))`.
 pub(crate) fn queue_dispatch_followup(db: &crate::db::Db, dispatch_id: &str) {
     if let Ok(conn) = db.separate_conn() {
-        // Dedup: skip if a followup entry already exists for this dispatch
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'followup'",
-                [dispatch_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if exists {
-            return;
-        }
         conn.execute(
-            "INSERT INTO dispatch_outbox (dispatch_id, action) VALUES (?1, 'followup')",
+            "INSERT OR IGNORE INTO dispatch_outbox (dispatch_id, action) VALUES (?1, 'followup')",
             [dispatch_id],
         )
         .ok();
