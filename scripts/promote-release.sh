@@ -356,6 +356,14 @@ if [ -d "$REPO/config/agents" ]; then
     rsync -a "$REPO/config/agents/" "$PROMPTS_STAGED/"
 fi
 
+if [ -d "$REPO/policies" ]; then
+    echo "▸ Staging policies..."
+    POLICIES_STAGED="$ADK_REL/policies.new"
+    rm -rf "$POLICIES_STAGED"
+    mkdir -p "$POLICIES_STAGED"
+    rsync -a --delete "$REPO/policies/" "$POLICIES_STAGED/"
+fi
+
 # Stage managed skills before stopping release so skill sync never sees partial content.
 echo "▸ Staging managed skills..."
 SKILLS_STAGED="$ADK_REL/skills.new"
@@ -463,6 +471,13 @@ if [ -d "${PROMPTS_STAGED:-}" ]; then
             && echo "▸ Audit copy → ObsidianVault" \
             || echo "▸ Audit copy to ObsidianVault failed (non-fatal)"
     fi
+fi
+
+if [ -d "${POLICIES_STAGED:-}" ]; then
+    rm -rf "$ADK_REL/policies.old"
+    [ -d "$ADK_REL/policies" ] && mv "$ADK_REL/policies" "$ADK_REL/policies.old"
+    mv "$POLICIES_STAGED" "$ADK_REL/policies"
+    rm -rf "$ADK_REL/policies.old"
 fi
 
 # Keep the user-facing CLI wrapper discoverable via PATH.

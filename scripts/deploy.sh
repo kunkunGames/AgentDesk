@@ -218,6 +218,12 @@ if [ -d "$PROJECT_DIR/dashboard/dist" ]; then
   ok "Dashboard: $AD_HOME/dashboard/dist/"
 fi
 
+if [ -d "$PROJECT_DIR/policies" ]; then
+  mkdir -p "$AD_HOME/policies"
+  rsync -a --delete "$PROJECT_DIR/policies/" "$AD_HOME/policies/"
+  ok "Policies: $AD_HOME/policies/"
+fi
+
 if [ -d "$PROJECT_DIR/skills" ]; then
   mkdir -p "$AD_HOME/skills"
   rsync -a --delete "$PROJECT_DIR/skills/" "$AD_HOME/skills/"
