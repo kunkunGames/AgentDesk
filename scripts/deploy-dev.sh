@@ -356,6 +356,7 @@ fi
 
 # 4. Start dev
 echo "▸ Starting dev..."
+launchctl enable "gui/$(id -u)/$PLIST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$PLIST.plist"
 
 # 5. Health check
