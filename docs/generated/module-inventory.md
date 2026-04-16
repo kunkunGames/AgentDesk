@@ -195,7 +195,7 @@
 | `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 59 |  |
 | `services::discord::commands::meeting_cmd` | `src/services/discord/commands/meeting_cmd.rs` | 105 |  |
 | `services::discord::commands::model_picker` | `src/services/discord/commands/model_picker.rs` | 183 |  |
-| `services::discord::commands::model_ui` | `src/services/discord/commands/model_ui.rs` | 481 |  |
+| `services::discord::commands::model_ui` | `src/services/discord/commands/model_ui.rs` | 484 |  |
 | `services::discord::commands::receipt` | `src/services/discord/commands/receipt.rs` | 161 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 369 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 353 |  |
