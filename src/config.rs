@@ -11,6 +11,8 @@ pub struct Config {
     pub discord: DiscordConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
     #[serde(default)]
     pub agents: Vec<AgentDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +175,29 @@ pub struct AgentDef {
     pub department: Option<String>,
     #[serde(default)]
     pub avatar_emoji: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpServerConfig {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<McpServerAuthConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpServerAuthConfig {
+    #[serde(rename = "type")]
+    pub auth_type: McpServerAuthType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env_var: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpServerAuthType {
+    Bearer,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -837,6 +862,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             discord: DiscordConfig::default(),
             shared_prompt: None,
+            mcp_servers: std::collections::BTreeMap::new(),
             agents: Vec::new(),
             meeting: None,
             github: GitHubConfig::default(),
@@ -1029,9 +1055,9 @@ mod tests {
     use super::{
         AgentChannel, AgentChannels, AgentDef, AutomationConfig, BotConfig, Config,
         DiscordBotAuthConfig, EscalationConfig, EscalationMode, EscalationScheduleConfig,
-        FileMemoryConfig, KanbanConfig, McpMemoryConfig, MemoryConfig, ReviewConfig,
-        RuntimeSettingsConfig, load_from_path, resolve_graceful_config_path, runtime_root,
-        save_to_path,
+        FileMemoryConfig, KanbanConfig, McpMemoryConfig, McpServerAuthConfig, McpServerAuthType,
+        McpServerConfig, MemoryConfig, ReviewConfig, RuntimeSettingsConfig, load_from_path,
+        resolve_graceful_config_path, runtime_root, save_to_path,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
@@ -1276,6 +1302,16 @@ mod tests {
             strategy_mode: Some("pr-always".to_string()),
             allowed_authors: Some("itismyfield,octocat".to_string()),
         };
+        config.mcp_servers.insert(
+            "memento".to_string(),
+            McpServerConfig {
+                url: "http://127.0.0.1:57332/mcp".to_string(),
+                auth: Some(McpServerAuthConfig {
+                    auth_type: McpServerAuthType::Bearer,
+                    token_env_var: Some("MEMENTO_ACCESS_KEY".to_string()),
+                }),
+            },
+        );
         config.escalation = EscalationConfig {
             mode: EscalationMode::Scheduled,
             owner_user_id: Some(343742347365974026),
@@ -1352,6 +1388,16 @@ mod tests {
         assert_eq!(
             loaded.discord.bots["announce"].auth.allow_all_users,
             Some(false)
+        );
+        assert_eq!(
+            loaded.mcp_servers.get("memento"),
+            Some(&McpServerConfig {
+                url: "http://127.0.0.1:57332/mcp".to_string(),
+                auth: Some(McpServerAuthConfig {
+                    auth_type: McpServerAuthType::Bearer,
+                    token_env_var: Some("MEMENTO_ACCESS_KEY".to_string()),
+                }),
+            })
         );
         assert_eq!(
             loaded.discord.bots["announce"]

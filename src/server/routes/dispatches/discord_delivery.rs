@@ -2309,10 +2309,10 @@ mod tests {
     }
 
     fn write_announce_token(root: &std::path::Path) {
-        let credential_dir = root.join("credential");
+        let credential_dir = crate::runtime_layout::credential_dir(root);
         std::fs::create_dir_all(&credential_dir).unwrap();
         std::fs::write(
-            credential_dir.join("announce_bot_token"),
+            crate::runtime_layout::credential_token_path(root, "announce"),
             "announce-token\n",
         )
         .unwrap();
@@ -2737,7 +2737,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reused_thread_probe_error_falls_back_to_creating_new_thread() {
+    async fn reused_thread_probe_error_falls_back_to_creating_new_thread_after_phase_gate_dispatch()
+    {
         let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
         let db = test_db();
         {
@@ -3010,6 +3011,101 @@ mod tests {
         let context = serde_json::from_str::<serde_json::Value>(&context.unwrap()).unwrap();
         assert_eq!(context["discord_message_channel_id"], "123");
         assert_eq!(context["discord_message_id"], "message-123");
+    }
+
+    #[tokio::test]
+    async fn reused_thread_probe_error_falls_back_to_creating_new_thread() {
+        let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', '123')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (
+                    id, title, status, assigned_agent_id, latest_dispatch_id, channel_thread_map, active_thread_id,
+                    created_at, updated_at
+                ) VALUES (
+                    'card-probe-error', 'Probe error card', 'requested', 'agent-1', 'dispatch-probe-error',
+                    '{\"123\":\"thread-invalid-json\"}', 'thread-invalid-json',
+                    datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+                    created_at, updated_at
+                ) VALUES (
+                    'dispatch-probe-error', 'card-probe-error', 'agent-1', 'implementation', 'pending', 'Probe error card',
+                    datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+        }
+
+        send_dispatch_to_discord_inner_with_context(
+            &db,
+            "agent-1",
+            "Probe error card",
+            "card-probe-error",
+            "dispatch-probe-error",
+            "announce-token",
+            &base_url,
+            None,
+        )
+        .await
+        .expect("reused thread probe errors should fall back to new thread creation");
+
+        server_handle.abort();
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.calls.first().map(String::as_str),
+            Some("GET /channels/thread-invalid-json")
+        );
+        assert!(
+            !state
+                .calls
+                .contains(&"POST /channels/thread-invalid-json/messages".to_string())
+        );
+        assert!(
+            state
+                .calls
+                .contains(&"POST /channels/123/threads".to_string())
+        );
+        assert!(
+            state
+                .calls
+                .contains(&"POST /channels/thread-created/messages".to_string())
+        );
+        assert!(state.calls.contains(
+            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9C%85/@me"
+                .to_string()
+        ));
+        assert!(state.calls.contains(
+            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9D%8C/@me"
+                .to_string()
+        ));
+        assert!(state.calls.contains(
+            &"PUT /channels/thread-created/messages/message-thread-created/reactions/%E2%8F%B3/@me"
+                .to_string()
+        ));
+
+        let conn = db.lock().unwrap();
+        let thread_id: Option<String> = conn
+            .query_row(
+                "SELECT thread_id FROM task_dispatches WHERE id = 'dispatch-probe-error'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thread_id.as_deref(), Some("thread-created"));
     }
 
     #[tokio::test]

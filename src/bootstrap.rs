@@ -49,5 +49,9 @@ pub(crate) fn initialize() -> Result<BootstrapState> {
         loaded.config
     };
 
+    if let Err(error) = crate::services::mcp_config::sync_codex_mcp_servers(&config) {
+        tracing::warn!("  [mcp] Failed to sync Codex MCP servers: {error}");
+    }
+
     Ok(BootstrapState { config, db })
 }

@@ -88,6 +88,7 @@ pub(super) async fn try_handle_pending_dm_reply(
                 info.channel_id.as_deref(),
                 &username,
                 &info.answer,
+                &info.context,
             )
             .await
             {
@@ -129,6 +130,7 @@ async fn notify_source_agent(
     stored_channel_id: Option<&str>,
     username: &str,
     answer: &str,
+    context: &serde_json::Value,
 ) -> Result<(), String> {
     let token =
         crate::credential::read_bot_token("announce").ok_or("no announce bot token configured")?;
@@ -151,11 +153,37 @@ async fn notify_source_agent(
         resolve_channel_to_u64(&raw)?
     };
 
-    let message = format!("DM_REPLY:{reply_id} from {username}: {answer}");
+    let message = format_dm_reply_notification(reply_id, username, answer, context)?;
     send_message_to_channel(&token, channel_id, &message)
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(())
+}
+
+fn format_dm_reply_notification(
+    reply_id: i64,
+    username: &str,
+    answer: &str,
+    context: &serde_json::Value,
+) -> Result<String, String> {
+    let context_json = serde_json::to_string(&notification_context(context))
+        .map_err(|e| format!("serialize dm reply context: {e}"))?;
+    Ok(format!(
+        "DM_REPLY:{reply_id} from {username}: {answer}\ncontext={context_json}"
+    ))
+}
+
+fn notification_context(context: &serde_json::Value) -> serde_json::Value {
+    match context {
+        serde_json::Value::Object(map) => {
+            let mut cleaned = map.clone();
+            cleaned.remove("_answer");
+            cleaned.remove("_notify_failed");
+            cleaned.remove("_notify_error");
+            serde_json::Value::Object(cleaned)
+        }
+        _ => context.clone(),
+    }
 }
 
 /// Parse a channel identifier — numeric ID or name alias (e.g. "윤호네비서") → u64.
@@ -202,11 +230,7 @@ pub async fn retry_failed_dm_notifications(db: &crate::db::Db) {
     for (id, source_agent, context_str, channel_id) in entries {
         let ctx: serde_json::Value =
             serde_json::from_str(&context_str).unwrap_or(serde_json::json!({}));
-        let answer = ctx
-            .get("_answer")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let answer = ctx.get("_answer").and_then(|v| v.as_str()).unwrap_or("");
         if answer.is_empty() {
             continue;
         }
@@ -217,7 +241,8 @@ pub async fn retry_failed_dm_notifications(db: &crate::db::Db) {
             id,
             channel_id.as_deref(),
             "(retry)",
-            &answer,
+            answer,
+            &ctx,
         )
         .await
         {
@@ -249,6 +274,7 @@ struct ConsumedDmReply {
     id: i64,
     source_agent: String,
     answer: String,
+    context: serde_json::Value,
     channel_id: Option<String>,
     db: crate::db::Db,
 }
@@ -273,6 +299,7 @@ fn consume_pending_dm_reply(
     // Merge the answer into the context JSON
     let mut context: serde_json::Value =
         serde_json::from_str(&context_str).unwrap_or(serde_json::json!({}));
+    let notification_context = context.clone();
     context["_answer"] = serde_json::Value::String(answer.to_string());
     let updated_context = serde_json::to_string(&context).unwrap_or_default();
 
@@ -292,6 +319,7 @@ fn consume_pending_dm_reply(
         id,
         source_agent,
         answer: answer.to_string(),
+        context: notification_context,
         channel_id,
         db: db.clone(),
     })
@@ -406,6 +434,7 @@ pub async fn send_message_to_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn user_is_authorized_allows_owner_and_explicit_users() {
@@ -430,5 +459,103 @@ mod tests {
 
         assert!(user_is_authorized(&settings, 42));
         assert!(user_is_authorized(&settings, 99));
+    }
+
+    #[test]
+    fn format_dm_reply_notification_inlines_saved_context() {
+        let message = format_dm_reply_notification(
+            42,
+            "family-counsel",
+            "지난주에 했어",
+            &json!({
+                "topicKey": "obujang.health_checkup",
+                "targetKey": "obujang",
+            }),
+        )
+        .expect("notification should serialize");
+
+        let mut lines = message.lines();
+        assert_eq!(
+            lines.next(),
+            Some("DM_REPLY:42 from family-counsel: 지난주에 했어")
+        );
+        let context_line = lines.next().expect("context line should exist");
+        assert!(lines.next().is_none());
+        let context_json = context_line
+            .strip_prefix("context=")
+            .expect("context line should have prefix");
+        let context: serde_json::Value =
+            serde_json::from_str(context_json).expect("context should be valid json");
+        assert_eq!(
+            context,
+            json!({
+                "topicKey": "obujang.health_checkup",
+                "targetKey": "obujang",
+            })
+        );
+    }
+
+    #[test]
+    fn format_dm_reply_notification_keeps_empty_context_explicit() {
+        let message = format_dm_reply_notification(
+            7,
+            "(retry)",
+            "네",
+            &json!({
+                "_answer": "네",
+                "_notify_failed": true,
+                "_notify_error": "timeout",
+            }),
+        )
+        .expect("notification should serialize");
+
+        let mut lines = message.lines();
+        assert_eq!(lines.next(), Some("DM_REPLY:7 from (retry): 네"));
+        assert_eq!(lines.next(), Some("context={}"));
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn consume_pending_dm_reply_stores_answer_but_returns_original_context() {
+        let db = crate::db::test_db();
+        let reply_id = crate::services::discord::dm_reply_store::register_pending_dm_reply(
+            &db,
+            "family-counsel",
+            "12345",
+            Some("1473922824350601297"),
+            r#"{"topicKey":"obujang.health_checkup","question":"건강검진 했어?"}"#,
+            3_600,
+        )
+        .expect("insert should succeed");
+
+        let consumed =
+            consume_pending_dm_reply(&db, "12345", "지난주에 했어").expect("reply should consume");
+
+        assert_eq!(consumed.id, reply_id);
+        assert_eq!(consumed.source_agent, "family-counsel");
+        assert_eq!(consumed.answer, "지난주에 했어");
+        assert_eq!(consumed.channel_id.as_deref(), Some("1473922824350601297"));
+        assert_eq!(
+            consumed.context,
+            json!({
+                "topicKey": "obujang.health_checkup",
+                "question": "건강검진 했어?",
+            })
+        );
+
+        let stored_context: String = db
+            .separate_conn()
+            .expect("db connection")
+            .query_row(
+                "SELECT context FROM pending_dm_replies WHERE id = ?1",
+                rusqlite::params![reply_id],
+                |row| row.get(0),
+            )
+            .expect("stored context should exist");
+        let stored_context: serde_json::Value =
+            serde_json::from_str(&stored_context).expect("stored context should be json");
+        assert_eq!(stored_context["topicKey"], "obujang.health_checkup");
+        assert_eq!(stored_context["question"], "건강검진 했어?");
+        assert_eq!(stored_context["_answer"], "지난주에 했어");
     }
 }

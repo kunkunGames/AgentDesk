@@ -9,6 +9,7 @@ pub mod discord;
 pub mod dispatches;
 pub mod gemini;
 pub mod kanban;
+pub mod mcp_config;
 pub mod memory;
 pub mod platform;
 pub mod process;
