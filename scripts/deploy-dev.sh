@@ -314,8 +314,8 @@ chflags uchg "$ADK_DEV/bin/agentdesk"
 
 # 3.5. Register with macOS firewall (NOPASSWD via /etc/sudoers.d/agentdesk-firewall)
 FW=/usr/libexec/ApplicationFirewall/socketfilterfw
-sudo "$FW" --add "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
-sudo "$FW" --unblockapp "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
+sudo -n "$FW" --add "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
+sudo -n "$FW" --unblockapp "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
 
 # 3.6. Build & symlink dashboard dist
 echo "▸ Building dashboard..."
