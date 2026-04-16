@@ -2134,9 +2134,9 @@ mod tests {
 
         let total_dispatched =
             first.1.0["count"].as_u64().unwrap_or(0) + second.1.0["count"].as_u64().unwrap_or(0);
-        assert!(
-            total_dispatched <= 1,
-            "concurrent activate must not report more than one direct dispatch response"
+        assert_eq!(
+            total_dispatched, 1,
+            "concurrent activate must reserve and dispatch the entry exactly once"
         );
 
         kanban::drain_hook_side_effects(&db, &engine);
