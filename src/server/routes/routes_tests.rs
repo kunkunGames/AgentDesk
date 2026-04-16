@@ -1959,6 +1959,12 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-manual-backlog-2', 'test-repo', 'agent-manual-backlog', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status
             ) VALUES (
@@ -4737,12 +4743,19 @@ async fn batch_transition_resolves_issue_numbers_to_cards() {
 
 #[tokio::test]
 async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_entries() {
+    crate::pipeline::ensure_loaded();
     let db = test_db();
     let engine = test_engine(&db);
     seed_agent(&db, "agent-ft-clean");
     seed_repo(&db, "test-repo");
     set_pmd_channel(&db, "pmd-chan-123");
     ensure_auto_queue_tables(&db);
+    // Ensure agent has counter-model channel so OnReviewEnter creates a review dispatch
+    // instead of auto-approving (single-provider fast-path).
+    db.lock().unwrap().execute(
+        "UPDATE agents SET discord_channel_cc = '111', discord_channel_cdx = '222' WHERE id = 'agent-ft-clean'",
+        [],
+    ).unwrap();
 
     {
         let conn = db.lock().unwrap();
@@ -4812,6 +4825,12 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
                 'entry-ft-dispatched', 'run-ft-clean', 'card-ft-clean', 'agent-ft-clean',
                 'dispatched', 'dispatch-ft-clean', datetime('now', '-10 minutes')
             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-ft-clean-2', 'test-repo', 'agent-ft-clean', 'active')",
             [],
         )
         .unwrap();
@@ -5043,7 +5062,7 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
             "INSERT INTO task_dispatches (
                 id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
             ) VALUES (
-                'dispatch-ft-clean-retry', 'card-ft-clean', 'agent-ft-clean', 'implementation', 'pending',
+                'dispatch-ft-clean-retry', 'card-ft-clean', 'agent-ft-clean', 'implementation', 'dispatched',
                 'retry impl', datetime('now'), datetime('now')
             )",
             [],
@@ -5054,6 +5073,28 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
     let verify_engine = test_engine(&db);
     crate::kanban::transition_status(&db, &verify_engine, "card-ft-clean", "requested").unwrap();
     crate::kanban::transition_status(&db, &verify_engine, "card-ft-clean", "in_progress").unwrap();
+    // Complete the implementation dispatch so OnReviewEnter's hasActiveWork guard
+    // doesn't block review dispatch creation (hasActiveWork checks implementation/rework only).
+    db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE task_dispatches SET status = 'completed' WHERE id = 'dispatch-ft-clean-retry'",
+            [],
+        )
+        .unwrap();
+    // Insert a non-work dispatch (phase-gate) in dispatched status so the
+    // active_dispatch pipeline gate passes for in_progress → review.
+    // The gate checks ANY dispatch with status IN ('pending','dispatched'),
+    // while hasActiveWork only checks implementation/rework types.
+    db.lock().unwrap().execute(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+        ) VALUES (
+            'dispatch-ft-gate-helper', 'card-ft-clean', 'agent-ft-clean', 'phase-gate', 'dispatched',
+            'gate helper', datetime('now'), datetime('now')
+        )",
+        [],
+    ).unwrap();
     crate::kanban::transition_status(&db, &verify_engine, "card-ft-clean", "review").unwrap();
 
     let conn = db.lock().unwrap();

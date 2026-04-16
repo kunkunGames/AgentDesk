@@ -228,15 +228,27 @@ var reviewAutomation = {
       );
       var completeCfg = agentdesk.pipeline.resolveForCard(dispatch.kanban_card_id);
       var completeTerminalState = agentdesk.pipeline.terminalState(completeCfg);
-      var completeInitialState = agentdesk.pipeline.kickoffState(completeCfg);
-      var completeInProgressState = agentdesk.pipeline.nextGatedTarget(completeInitialState, completeCfg);
-      var completeReviewPassTransition = findGateTransition(completeCfg, "review_passed");
-      var completeReviewState = completeReviewPassTransition
-        ? completeReviewPassTransition.from
-        : agentdesk.pipeline.nextGatedTarget(completeInProgressState, completeCfg);
-      var completeReviewPassTarget = completeReviewPassTransition
-        ? completeReviewPassTransition.to
-        : completeTerminalState;
+      // Find review state by scanning for the state with a review_passed gated
+      // outbound transition, rather than assuming a fixed 2-hop shape from kickoff.
+      var completeReviewState = null;
+      var completeReviewPassTarget = completeTerminalState;
+      if (completeCfg && completeCfg.transitions) {
+        for (var ti = 0; ti < completeCfg.transitions.length; ti++) {
+          var tr = completeCfg.transitions[ti];
+          if (tr.type === "gated" && tr.gates && tr.gates.indexOf("review_passed") >= 0) {
+            completeReviewState = tr.from;
+            completeReviewPassTarget = tr.to;
+            break;
+          }
+        }
+      }
+      if (!completeReviewState) {
+        // Fallback: 2-hop walk from kickoff (legacy behavior)
+        var completeInitialState = agentdesk.pipeline.kickoffState(completeCfg);
+        var completeInProgressState = agentdesk.pipeline.nextGatedTarget(completeInitialState, completeCfg);
+        completeReviewState = agentdesk.pipeline.nextGatedTarget(completeInProgressState, completeCfg);
+        completeReviewPassTarget = agentdesk.pipeline.nextGatedTargetWithGate(completeReviewState, "review_passed", completeCfg) || completeTerminalState;
+      }
       var lifecycleRows = agentdesk.db.query(
         "SELECT status FROM kanban_cards WHERE id = ?",
         [dispatch.kanban_card_id]
@@ -259,6 +271,8 @@ var reviewAutomation = {
       if (currentStatus === completeReviewState) {
         agentdesk.kanban.setStatus(dispatch.kanban_card_id, completeReviewPassTarget, true);
       }
+      // Set blocked_reason AFTER setStatus — terminal transitions clear
+      // blocked_reason as part of cleanup, so this must come last.
       agentdesk.db.execute(
         "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
         [dispatch.kanban_card_id]

@@ -758,7 +758,10 @@ pub async fn submit_review_decision(
                                                 .map(str::to_string)
                                         })
                                         .as_deref()
-                                        == Some("auto_cancelled_on_terminal_card")
+                                        .is_some_and(|reason| {
+                                            reason == "auto_cancelled_on_terminal_card"
+                                                || reason == "js_terminal_cleanup"
+                                        })
                                 })
                                 .unwrap_or(false);
                         let dispatch_no_longer_active = terminal_auto_approved
