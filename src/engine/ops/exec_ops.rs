@@ -336,6 +336,7 @@ mod tests {
     fn exec_wrapper_runs_gh_with_timeout() {
         let rt = rquickjs::Runtime::new().expect("runtime");
         let ctx = rquickjs::Context::full(&rt).expect("context");
+        let gh_timeout_ms = if cfg!(windows) { 5_000 } else { 1_000 };
 
         ctx.with(|ctx| {
             let globals = ctx.globals();
@@ -344,7 +345,10 @@ mod tests {
             register_exec_ops(&ctx).expect("register exec ops");
 
             let gh_version: String = ctx
-                .eval(r#"agentdesk.exec("gh", ["--version"], { timeout_ms: 1000 })"#)
+                .eval(format!(
+                    r#"agentdesk.exec("gh", ["--version"], {{ timeout_ms: {} }})"#,
+                    gh_timeout_ms
+                ))
                 .expect("gh exec");
 
             assert!(

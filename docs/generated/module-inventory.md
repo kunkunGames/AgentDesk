@@ -86,7 +86,7 @@
 | `engine::ops::deploy_ops` | `src/engine/ops/deploy_ops.rs` | 122 |  |
 | `engine::ops::dispatch_ops` | `src/engine/ops/dispatch_ops.rs` | 237 |  |
 | `engine::ops::dm_reply_ops` | `src/engine/ops/dm_reply_ops.rs` | 250 |  |
-| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 366 |  |
+| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 370 |  |
 | `engine::ops::http_ops` | `src/engine/ops/http_ops.rs` | 57 |  |
 | `engine::ops::kanban_ops` | `src/engine/ops/kanban_ops.rs` | 779 |  |
 | `engine::ops::kv_ops` | `src/engine/ops/kv_ops.rs` | 143 |  |
