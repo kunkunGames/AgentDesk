@@ -257,11 +257,9 @@ fn create_dispatch_core_internal(
             if let Ok(mut obj) =
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
             {
-                obj.entry("worktree_path".to_string())
-                    .or_insert(json!(wt_path.clone()));
+                obj.insert("worktree_path".to_string(), json!(wt_path.clone()));
                 if let Some(wt_branch) = wt_branch {
-                    obj.entry("worktree_branch".to_string())
-                        .or_insert(json!(wt_branch));
+                    obj.insert("worktree_branch".to_string(), json!(wt_branch));
                 }
                 tracing::info!(
                     "[dispatch] {} dispatch for card {}: injecting worktree_path={}",

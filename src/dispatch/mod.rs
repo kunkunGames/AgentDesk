@@ -2162,9 +2162,17 @@ mod tests {
         let context =
             build_review_context(&db, "card-review-stale-worktree", "agent-1", &json!({})).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
+        let actual_worktree = std::fs::canonicalize(parsed["worktree_path"].as_str().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let expected_worktree = std::fs::canonicalize(live_wt_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         assert_eq!(parsed["reviewed_commit"], reviewed_commit);
-        assert_eq!(parsed["worktree_path"], live_wt_path);
+        assert_eq!(actual_worktree, expected_worktree);
         assert_eq!(parsed["branch"], "wt/682-live");
     }
 
