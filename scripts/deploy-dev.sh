@@ -27,6 +27,8 @@ DEV_DEPLOY_TEST_MODE="${AGENTDESK_DEPLOY_DEV_TEST_MODE:-0}"
 DEV_DEPLOY_DELAY_SECS="${AGENTDESK_DEPLOY_DEV_DELAY_SECS:-2}"
 DEV_HEALTH_RETRIES="${AGENTDESK_DEPLOY_DEV_HEALTH_RETRIES:-20}"
 DEV_HEALTH_DELAY_SECS="${AGENTDESK_DEPLOY_DEV_HEALTH_DELAY_SECS:-2}"
+CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
+ALLOW_ADHOC_SIGN="${AGENTDESK_ALLOW_ADHOC_SIGN:-0}"
 
 echo "═══ ADK Dev Deploy ═══"
 
@@ -52,6 +54,53 @@ _tail_for_summary() {
     local log_path="$1"
     [ -f "$log_path" ] || return 0
     tail -n 12 "$log_path" 2>/dev/null || true
+}
+
+sign_binary_with_fallback() {
+    local target="$1"
+    local identity="${CODESIGN_IDENTITY:-}"
+
+    if [ -z "$identity" ]; then
+        if [ "$ALLOW_ADHOC_SIGN" = "1" ]; then
+            echo "⚠ No signing identity configured; using explicit ad-hoc dev signature override"
+            identity="-"
+        else
+            echo "✗ No dev signing identity configured"
+            echo "  Set AGENTDESK_CODESIGN_IDENTITY to a valid Developer ID Application certificate"
+            echo "  or set AGENTDESK_ALLOW_ADHOC_SIGN=1 for an explicit local override"
+            exit 1
+        fi
+    fi
+
+    if [ "$identity" = "-" ] && [ "$ALLOW_ADHOC_SIGN" != "1" ]; then
+        echo "✗ Refusing ad-hoc dev signing without AGENTDESK_ALLOW_ADHOC_SIGN=1"
+        exit 1
+    fi
+
+    if [ -n "$identity" ] && [ "$identity" != "-" ] && command -v security >/dev/null 2>&1; then
+        if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$identity"; then
+            if [ "$ALLOW_ADHOC_SIGN" = "1" ]; then
+                echo "⚠ Signing identity not found locally; using explicit ad-hoc dev signature override"
+                identity="-"
+            else
+                echo "✗ Signing identity not found locally: $identity"
+                echo "  Set AGENTDESK_CODESIGN_IDENTITY to a valid Developer ID Application certificate"
+                echo "  or set AGENTDESK_ALLOW_ADHOC_SIGN=1 for an explicit local override"
+                exit 1
+            fi
+        fi
+    fi
+
+    if [ "$identity" = "-" ]; then
+        codesign -f -s "$identity" --identifier "com.itismyfield.agentdesk" "$target"
+    else
+        codesign -f -s "$identity" --options runtime --identifier "com.itismyfield.agentdesk" "$target"
+    fi
+
+    if ! codesign -v "$target" 2>/dev/null; then
+        echo "✗ Codesign verification failed — aborting"
+        exit 1
+    fi
 }
 
 # ── Credential Sync ──────────────────────────────────────────────────
@@ -207,7 +256,7 @@ EOF
 # 1. Build release
 echo "▸ Building release..."
 cd "$REPO"
-make build 2>&1 | tail -3
+make build CODESIGN_IDENTITY="$CODESIGN_IDENTITY" ALLOW_ADHOC_SIGN="$ALLOW_ADHOC_SIGN" 2>&1 | tail -3
 
 if _self_hosted_dev_session; then
     _spawn_detached_helper "$@"
@@ -250,7 +299,7 @@ chflags nouchg "$ADK_DEV/bin/agentdesk" 2>/dev/null || true
 cp "$REPO/target/release/agentdesk" "$ADK_DEV/bin/agentdesk.new"
 chmod +x "$ADK_DEV/bin/agentdesk.new"
 xattr -d com.apple.provenance "$ADK_DEV/bin/agentdesk.new" 2>/dev/null || true
-codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$ADK_DEV/bin/agentdesk.new"
+sign_binary_with_fallback "$ADK_DEV/bin/agentdesk.new"
 # Verify signature before swap
 if ! codesign -v "$ADK_DEV/bin/agentdesk.new" 2>/dev/null; then
     echo "✗ Codesign verification failed — aborting"
