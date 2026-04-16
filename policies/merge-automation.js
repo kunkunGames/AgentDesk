@@ -334,17 +334,6 @@ function maybeResetDirectMergeHead(mainWorktreePath, originalHead) {
   return "main worktree reset to pre-merge HEAD";
 }
 
-function maybeAbortDirectMergeRebase(mainWorktreePath) {
-  var output = agentdesk.exec("git", ["-C", mainWorktreePath, "rebase", "--abort"]);
-  if (typeof output === "string" && output.indexOf("ERROR") === 0) {
-    var err = output.replace(/^ERROR:\s*/, "").trim();
-    return err
-      ? "rebase abort failed: " + err
-      : "rebase abort failed";
-  }
-  return "rebase aborted";
-}
-
 function isCherryPickConflict(errorText) {
   return /CONFLICT|could not apply|after resolving the conflicts|merge conflict/i.test(String(errorText || ""));
 }
@@ -500,6 +489,7 @@ function attemptDirectMerge(candidate) {
   var mainWorktree = resolveMainWorktree(repoDir);
   var mainBranch = mainWorktree.branch || "main";
   var branchRange = mainBranch + ".." + candidate.branch;
+  var originalHead = execGitOrThrow(["-C", mainWorktree.path, "rev-parse", "HEAD"]).trim();
   var commitsOutput = execGitOrThrow([
     "-C",
     mainWorktree.path,
@@ -551,13 +541,10 @@ function attemptDirectMerge(candidate) {
     };
   }
 
-  var pushResult = retryDirectMergePush(mainWorktree.path, mainBranch);
-  if (!pushResult.ok) {
+  try {
+    execGitOrThrow(["-C", mainWorktree.path, "push", "origin", mainBranch]);
+  } catch (e) {
     var cleanupNotes = [];
-    if (pushResult.rebase_failed) {
-      var abortStatus = maybeAbortDirectMergeRebase(mainWorktree.path);
-      if (abortStatus) cleanupNotes.push(abortStatus);
-    }
     var resetStatus = maybeResetDirectMergeHead(mainWorktree.path, originalHead);
     if (resetStatus) cleanupNotes.push(resetStatus);
     var stashStatus = maybeRestoreMergeStash(mainWorktree.path, stashCreated);
@@ -567,7 +554,7 @@ function attemptDirectMerge(candidate) {
       conflict: !!pushResult.conflict,
       branch: candidate.branch,
       main_branch: mainBranch,
-      error: pushResult.error,
+      error: String(e),
       stash: cleanupNotes.length > 0 ? cleanupNotes.join("; ") : null
     };
   }
@@ -595,10 +582,12 @@ function buildTrackedPrBody(card, options) {
 
   if (mode === "pr-always") {
     lines.push("Automated PR created because `merge_strategy_mode` is set to `pr-always`.");
-  } else {
+  } else if (mergeResult && mergeResult.conflict) {
     lines.push(
       "Automated fallback PR after direct merge into `" + mainBranch + "` hit a cherry-pick conflict."
     );
+  } else {
+    lines.push("Automated fallback PR after direct merge into `" + mainBranch + "` could not be completed safely.");
   }
   lines.push("");
   lines.push("Card: `" + card.id + "`");
@@ -610,10 +599,71 @@ function buildTrackedPrBody(card, options) {
     lines.push("Merge path: wait for CI + Codex review approval before auto-merge.");
   } else if (mergeResult && mergeResult.error) {
     lines.push("");
-    lines.push("Conflict summary:");
+    lines.push(mergeResult.conflict ? "Conflict summary:" : "Direct-merge failure summary:");
     lines.push(summarizeInlineText(mergeResult.error));
   }
   return lines.join("\n");
+}
+
+function resolveTrackedPrBaseBranch(candidate, fallbackBranch) {
+  try {
+    return resolveMainBranchForCandidate(candidate);
+  } catch (e) {
+    return fallbackBranch || "main";
+  }
+}
+
+function markTrackedPrWaitingForCi(cardId, candidate, pr, headSha) {
+  upsertPrTracking(
+    cardId,
+    candidate.repo_id,
+    candidate.worktree_path,
+    pr.branch || candidate.branch,
+    pr.number,
+    headSha,
+    "wait-ci",
+    null
+  );
+  agentdesk.db.execute(
+    "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
+    [cardId]
+  );
+}
+
+function tryCreateTrackedPr(cardId, tracking, candidate, options) {
+  try {
+    var trackedPr = createOrLocateTrackedPr(candidate, options || {});
+    if (!trackedPr || !trackedPr.number) {
+      throw new Error("no open PR found for branch " + candidate.branch);
+    }
+
+    var trackedHeadSha = getCurrentPrHeadSha(trackedPr.number, candidate.repo_id) || trackedPr.sha || candidate.head_sha;
+    markTrackedPrWaitingForCi(cardId, candidate, trackedPr, trackedHeadSha);
+    return {
+      ok: true,
+      pr: trackedPr,
+      head_sha: trackedHeadSha
+    };
+  } catch (e) {
+    upsertPrTracking(
+      cardId,
+      candidate.repo_id,
+      candidate.worktree_path,
+      candidate.branch,
+      tracking ? tracking.pr_number : null,
+      candidate.head_sha,
+      "create-pr",
+      String(e)
+    );
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = ?",
+      [cardId]
+    );
+    return {
+      ok: false,
+      error: String(e)
+    };
+  }
 }
 
 function createOrLocateTrackedPr(candidate, options) {
@@ -663,47 +713,14 @@ function tryDirectMergeOrTrackPr(cardId, tracking) {
   persistTrackedMergeStrategyMode(cardId, mergeMode);
 
   if (mergeMode === "pr-always") {
-    try {
-      var trackedPr = createOrLocateTrackedPr(candidate, {
-        mode: mergeMode,
-        main_branch: resolveMainBranchForCandidate(candidate)
-      });
-      if (!trackedPr || !trackedPr.number) {
-        throw new Error("no open PR found for branch " + candidate.branch);
-      }
-
-      var trackedHeadSha = getCurrentPrHeadSha(trackedPr.number, candidate.repo_id) || trackedPr.sha || candidate.head_sha;
-      upsertPrTracking(
-        cardId,
-        candidate.repo_id,
-        candidate.worktree_path,
-        trackedPr.branch || candidate.branch,
-        trackedPr.number,
-        trackedHeadSha,
-        "wait-ci",
-        null
-      );
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
-        [cardId]
-      );
-      agentdesk.log.info("[merge] Card " + cardId + " is in pr-always mode — PR #" + trackedPr.number + " is now tracked for CI");
-    } catch (e) {
-      agentdesk.log.warn("[merge] PR creation failed for pr-always card " + cardId + ": " + e);
-      upsertPrTracking(
-        cardId,
-        candidate.repo_id,
-        candidate.worktree_path,
-        candidate.branch,
-        tracking ? tracking.pr_number : null,
-        candidate.head_sha,
-        "create-pr",
-        String(e)
-      );
-      agentdesk.db.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = ?",
-        [cardId]
-      );
+    var trackedPrResult = tryCreateTrackedPr(cardId, tracking, candidate, {
+      mode: mergeMode,
+      main_branch: resolveTrackedPrBaseBranch(candidate)
+    });
+    if (trackedPrResult.ok) {
+      agentdesk.log.info("[merge] Card " + cardId + " is in pr-always mode — PR #" + trackedPrResult.pr.number + " is now tracked for CI");
+    } else {
+      agentdesk.log.warn("[merge] PR creation failed for pr-always card " + cardId + ": " + trackedPrResult.error);
     }
     return;
   }
@@ -713,16 +730,18 @@ function tryDirectMergeOrTrackPr(cardId, tracking) {
     mergeResult = attemptDirectMerge(candidate);
   } catch (e) {
     agentdesk.log.warn("[merge] Direct merge setup failed for card " + cardId + ": " + e);
-    upsertPrTracking(
-      cardId,
-      candidate.repo_id,
-      candidate.worktree_path,
-      candidate.branch,
-      tracking ? tracking.pr_number : null,
-      candidate.head_sha,
-      tracking && tracking.state ? tracking.state : "create-pr",
-      String(e)
-    );
+    var setupFallback = tryCreateTrackedPr(cardId, tracking, candidate, {
+      mode: mergeMode,
+      main_branch: resolveTrackedPrBaseBranch(candidate),
+      merge_result: { error: String(e), conflict: false }
+    });
+    if (setupFallback.ok) {
+      agentdesk.log.info(
+        "[merge] Card " + cardId + " fell back to PR #" + setupFallback.pr.number + " after direct-merge setup failure"
+      );
+    } else {
+      agentdesk.log.warn("[merge] Direct merge setup fallback PR creation failed for card " + cardId + ": " + setupFallback.error);
+    }
     return;
   }
 
@@ -746,63 +765,18 @@ function tryDirectMergeOrTrackPr(cardId, tracking) {
     return;
   }
 
-  if (!mergeResult.conflict) {
-    agentdesk.log.warn("[merge] Direct merge failed for card " + cardId + ": " + mergeResult.error);
-    upsertPrTracking(
-      cardId,
-      candidate.repo_id,
-      candidate.worktree_path,
-      candidate.branch,
-      tracking ? tracking.pr_number : null,
-      candidate.head_sha,
-      tracking && tracking.state ? tracking.state : "create-pr",
-      mergeResult.error
+  agentdesk.log.warn("[merge] Direct merge failed for card " + cardId + ": " + mergeResult.error);
+  var fallbackPr = tryCreateTrackedPr(cardId, tracking, candidate, {
+    mode: mergeMode,
+    main_branch: mergeResult.main_branch || resolveTrackedPrBaseBranch(candidate),
+    merge_result: mergeResult
+  });
+  if (fallbackPr.ok) {
+    agentdesk.log.info(
+      "[merge] Card " + cardId + " fell back to PR #" + fallbackPr.pr.number + " after direct-merge failure"
     );
-    return;
-  }
-
-  try {
-    var pr = createOrLocateTrackedPr(candidate, {
-      mode: mergeMode,
-      main_branch: mergeResult.main_branch,
-      merge_result: mergeResult
-    });
-    if (!pr || !pr.number) {
-      throw new Error("no open PR found after conflict fallback for branch " + candidate.branch);
-    }
-
-    var headSha = getCurrentPrHeadSha(pr.number, candidate.repo_id) || pr.sha || candidate.head_sha;
-    upsertPrTracking(
-      cardId,
-      candidate.repo_id,
-      candidate.worktree_path,
-      pr.branch || candidate.branch,
-      pr.number,
-      headSha,
-      "wait-ci",
-      null
-    );
-    agentdesk.db.execute(
-      "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
-      [cardId]
-    );
-    agentdesk.log.info("[merge] Card " + cardId + " hit direct-merge conflict — PR #" + pr.number + " is now tracked for CI");
-  } catch (e) {
-    agentdesk.log.warn("[merge] Conflict fallback PR creation failed for card " + cardId + ": " + e);
-    upsertPrTracking(
-      cardId,
-      candidate.repo_id,
-      candidate.worktree_path,
-      candidate.branch,
-      tracking ? tracking.pr_number : null,
-      candidate.head_sha,
-      "create-pr",
-      String(e)
-    );
-    agentdesk.db.execute(
-      "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = ?",
-      [cardId]
-    );
+  } else {
+    agentdesk.log.warn("[merge] Direct merge fallback PR creation failed for card " + cardId + ": " + fallbackPr.error);
   }
 }
 
@@ -1657,10 +1631,7 @@ function processManualMergeRequests() {
 }
 
 function processTrackedMergeQueue() {
-  var tracked = listTrackedPrRows(
-    "state = 'merge' AND pr_number IS NOT NULL AND repo_id IS NOT NULL",
-    []
-  );
+  var tracked = listTrackedPrRows("state IN ('create-pr', 'merge')", []);
   for (var i = 0; i < tracked.length; i++) {
     var row = tracked[i];
     var card = loadCardContext(row.card_id);
@@ -1668,6 +1639,27 @@ function processTrackedMergeQueue() {
     var cfg = agentdesk.pipeline.resolveForCard(card.id);
     if (!agentdesk.pipeline.isTerminal(card.status, cfg)) continue;
 
+    if (row.state === "create-pr") {
+      var candidate = resolveTerminalMergeCandidate(row.card_id, row);
+      if (!candidate) continue;
+      var trackedMode = resolveTrackedMergeStrategyMode(row.card_id);
+      persistTrackedMergeStrategyMode(row.card_id, trackedMode);
+      var retriedPr = tryCreateTrackedPr(row.card_id, row, candidate, {
+        mode: trackedMode,
+        main_branch: resolveTrackedPrBaseBranch(candidate),
+        merge_result: row.last_error ? { error: row.last_error, conflict: false } : null
+      });
+      if (retriedPr.ok) {
+        agentdesk.log.info(
+          "[merge] Card " + row.card_id + " retried create-pr — PR #" + retriedPr.pr.number + " is now tracked for CI"
+        );
+      } else {
+        agentdesk.log.warn("[merge] Create-pr retry failed for card " + row.card_id + ": " + retriedPr.error);
+      }
+      continue;
+    }
+
+    if (!row.pr_number || !row.repo_id) continue;
     var author = getPrAuthor(row.pr_number, row.repo_id);
     if (!isAllowedAuthor(author)) continue;
     enableAutoMerge(row.pr_number, row.repo_id, row.card_id);
