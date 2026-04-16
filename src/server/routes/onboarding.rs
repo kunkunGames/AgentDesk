@@ -209,6 +209,18 @@ fn sanitize_legacy_owner_id(owner_id: Option<String>) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+fn sanitize_draft_owner_id(owner_id: &str) -> String {
+    let trimmed = owner_id.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if parse_owner_id(Some(trimmed)).ok().flatten().is_some() {
+        trimmed.to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn onboarding_draft_secret_policy_value() -> serde_json::Value {
     json!({
         "stores_raw_tokens": true,
@@ -866,6 +878,8 @@ fn load_onboarding_draft(runtime_root: &Path) -> Result<Option<OnboardingDraft>,
             return Ok(None);
         }
     };
+    let mut draft = draft;
+    draft.owner_id = sanitize_draft_owner_id(&draft.owner_id);
     Ok(Some(draft))
 }
 
@@ -3749,6 +3763,37 @@ mod tests {
 
         assert_eq!(status_code, StatusCode::OK);
         assert_eq!(status_body["owner_id"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn draft_get_sanitizes_invalid_legacy_owner_id_from_saved_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeRootGuard::new(temp.path());
+        let db = test_db();
+        let state = AppState::test_state(db.clone(), test_engine(&db));
+        let app = Router::new()
+            .route("/draft", axum::routing::get(draft_get))
+            .with_state(state);
+
+        let mut legacy_draft = sample_draft();
+        legacy_draft.owner_id = "42".to_string();
+        save_onboarding_draft(temp.path(), &legacy_draft).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/draft")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["draft"]["owner_id"], json!(""));
     }
 
     #[tokio::test]
