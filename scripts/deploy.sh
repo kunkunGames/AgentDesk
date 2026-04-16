@@ -74,24 +74,37 @@ print_recent_macos_binary_logs() {
 }
 
 write_wrapper_script() {
-  cat > "$WRAPPER_BIN" <<EOF
+  local tmp_wrapper
+  tmp_wrapper="$(mktemp "$WRAPPER_BIN.new.XXXXXX")"
+  cat > "$tmp_wrapper" <<EOF
 #!/bin/bash
 exec "$REAL_BIN" "\$@"
 EOF
-  chmod +x "$WRAPPER_BIN"
+  chmod +x "$tmp_wrapper"
+  mv -f "$tmp_wrapper" "$WRAPPER_BIN"
+}
+
+install_file_atomically() {
+  local src="$1"
+  local dest="$2"
+  local mode="${3:-755}"
+  local tmp_dest
+
+  tmp_dest="$(mktemp "$dest.new.XXXXXX")"
+  cp "$src" "$tmp_dest"
+  chmod "$mode" "$tmp_dest"
+  mv -f "$tmp_dest" "$dest"
 }
 
 restore_previous_install() {
   if [ -n "${BACKUP_WRAPPER:-}" ] && [ -f "$BACKUP_WRAPPER" ]; then
-    cp "$BACKUP_WRAPPER" "$WRAPPER_BIN"
-    chmod +x "$WRAPPER_BIN"
+    install_file_atomically "$BACKUP_WRAPPER" "$WRAPPER_BIN" 755
   else
     rm -f "$WRAPPER_BIN"
   fi
 
   if [ -n "${BACKUP_REAL:-}" ] && [ -f "$BACKUP_REAL" ]; then
-    cp "$BACKUP_REAL" "$REAL_BIN"
-    chmod +x "$REAL_BIN"
+    install_file_atomically "$BACKUP_REAL" "$REAL_BIN" 755
   else
     rm -f "$REAL_BIN"
   fi
@@ -168,8 +181,7 @@ if [ -e "$REAL_BIN" ]; then
   BACKUP_REAL="$(mktemp "$LIBEXEC_DIR/agentdesk.real.backup.XXXXXX")"
   cp "$REAL_BIN" "$BACKUP_REAL"
 fi
-cp "$PROJECT_DIR/target/release/agentdesk" "$REAL_BIN"
-chmod +x "$REAL_BIN"
+install_file_atomically "$PROJECT_DIR/target/release/agentdesk" "$REAL_BIN" 755
 if [ "$OS" = "darwin" ]; then
   codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$REAL_BIN" 2>/dev/null || true
   if ! codesign -v "$REAL_BIN" 2>/dev/null; then
@@ -277,6 +289,7 @@ info "Restarting service..."
 
 restart_launchd() {
   local PLIST="$HOME/Library/LaunchAgents/com.agentdesk.release.plist"
+  local attempt max_attempts=5
   if [ ! -f "$PLIST" ]; then
     info "Plist not installed — skipping restart"
     return
@@ -286,7 +299,20 @@ restart_launchd() {
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   sleep 1
 
-  # Load
+  # Load with retry because launchd can briefly report
+  # "operation already in progress" immediately after bootout.
+  for attempt in $(seq 1 "$max_attempts"); do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1; then
+      _kickstart_launchd_job_if_needed "$LABEL" || true
+      ok "Service restarted via launchd"
+      return
+    fi
+
+    info "  launchd bootstrap attempt $attempt/$max_attempts failed — retrying"
+    sleep 1
+  done
+
+  # Surface the real launchctl error on the final attempt.
   launchctl bootstrap "gui/$(id -u)" "$PLIST"
   ok "Service restarted via launchd"
 }
@@ -304,25 +330,10 @@ esac
 
 # ── Step 5: Smoke test ────────────────────────────────────────────────────────
 info "Waiting for health check (port $HEALTH_PORT)..."
-
-RETRIES=10
-DELAY=2
-HEALTHY=false
-
-for i in $(seq 1 $RETRIES); do
-  sleep "$DELAY"
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${ADK_DEFAULT_LOOPBACK}:$HEALTH_PORT/api/health" 2>/dev/null || echo "000")
-  if [ "$HTTP_CODE" = "200" ]; then
-    HEALTHY=true
-    break
-  fi
-  info "  Attempt $i/$RETRIES — HTTP $HTTP_CODE"
-done
-
-if [ "$HEALTHY" = true ]; then
-  ok "Health check passed (HTTP 200 on :$HEALTH_PORT/api/health)"
+if wait_for_http_service_health "$LABEL" "$HEALTH_PORT" 10 2 0 1; then
+  ok "Health check passed on :$HEALTH_PORT/api/health"
 else
-  fail "Health check failed after $RETRIES attempts. Check logs:"
+  fail "Health check failed after waiting for :$HEALTH_PORT/api/health. Check logs:"
   echo "  $AD_HOME/logs/dcserver.stdout.log"
   echo "  $AD_HOME/logs/dcserver.stderr.log"
 fi
