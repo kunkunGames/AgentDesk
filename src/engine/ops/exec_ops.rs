@@ -333,9 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn exec_wrapper_runs_gh_with_timeout() {
+    fn exec_wrapper_runs_git_with_timeout() {
         let rt = rquickjs::Runtime::new().expect("runtime");
         let ctx = rquickjs::Context::full(&rt).expect("context");
+        let version_timeout_ms = 5_000;
 
         ctx.with(|ctx| {
             let globals = ctx.globals();
@@ -343,13 +344,16 @@ mod tests {
             globals.set("agentdesk", agentdesk).expect("set agentdesk");
             register_exec_ops(&ctx).expect("register exec ops");
 
-            let gh_version: String = ctx
-                .eval(r#"agentdesk.exec("gh", ["--version"], { timeout_ms: 1000 })"#)
-                .expect("gh exec");
+            let git_version: String = ctx
+                .eval(format!(
+                    r#"agentdesk.exec("git", ["--version"], {{ timeout_ms: {} }})"#,
+                    version_timeout_ms
+                ))
+                .expect("git exec");
 
             assert!(
-                gh_version.contains("gh version"),
-                "expected gh version output, got: {gh_version}"
+                git_version.contains("git version"),
+                "expected git version output, got: {git_version}"
             );
         });
     }

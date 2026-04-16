@@ -86,7 +86,7 @@
 | `engine::ops::deploy_ops` | `src/engine/ops/deploy_ops.rs` | 122 |  |
 | `engine::ops::dispatch_ops` | `src/engine/ops/dispatch_ops.rs` | 237 |  |
 | `engine::ops::dm_reply_ops` | `src/engine/ops/dm_reply_ops.rs` | 250 |  |
-| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 366 |  |
+| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 370 |  |
 | `engine::ops::http_ops` | `src/engine/ops/http_ops.rs` | 57 |  |
 | `engine::ops::kanban_ops` | `src/engine/ops/kanban_ops.rs` | 779 |  |
 | `engine::ops::kv_ops` | `src/engine/ops/kv_ops.rs` | 143 |  |
@@ -195,7 +195,7 @@
 | `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 59 |  |
 | `services::discord::commands::meeting_cmd` | `src/services/discord/commands/meeting_cmd.rs` | 105 |  |
 | `services::discord::commands::model_picker` | `src/services/discord/commands/model_picker.rs` | 183 |  |
-| `services::discord::commands::model_ui` | `src/services/discord/commands/model_ui.rs` | 481 |  |
+| `services::discord::commands::model_ui` | `src/services/discord/commands/model_ui.rs` | 484 |  |
 | `services::discord::commands::receipt` | `src/services/discord/commands/receipt.rs` | 161 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 369 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 353 |  |
@@ -264,7 +264,7 @@
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 878 |  |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
-| `services::platform::shell` | `src/services/platform/shell.rs` | 1205 | giant-file |
+| `services::platform::shell` | `src/services/platform/shell.rs` | 1220 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 184 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
 | `services::provider` | `src/services/provider.rs` | 1962 | giant-file |
