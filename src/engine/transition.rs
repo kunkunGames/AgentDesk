@@ -191,6 +191,10 @@ fn decide_operator_override(ctx: &TransitionContext, target: &str) -> Transition
             review_status: review_status_for(target, &ctx.pipeline),
         });
     }
+    intents.push(TransitionIntent::SyncReviewState {
+        card_id: card.id.clone(),
+        state: review_state_for(target, &ctx.pipeline),
+    });
     if ctx.pipeline.is_terminal(target) {
         intents.push(TransitionIntent::ClearTerminalFields {
             card_id: card.id.clone(),
@@ -199,10 +203,6 @@ fn decide_operator_override(ctx: &TransitionContext, target: &str) -> Transition
             card_id: card.id.clone(),
         });
     }
-    intents.push(TransitionIntent::SyncReviewState {
-        card_id: card.id.clone(),
-        state: review_state_for(target, &ctx.pipeline),
-    });
     intents.push(TransitionIntent::AuditLog {
         card_id: card.id.clone(),
         from: card.status.clone(),
@@ -353,6 +353,10 @@ fn decide_pipeline_transition(
         state: target.to_string(),
         clock: pipeline.clock_for_state(target).cloned(),
     });
+    intents.push(TransitionIntent::SyncReviewState {
+        card_id: card.id.clone(),
+        state: review_state_for(target, pipeline),
+    });
     if pipeline.is_terminal(target) {
         intents.push(TransitionIntent::ClearTerminalFields {
             card_id: card.id.clone(),
@@ -361,10 +365,6 @@ fn decide_pipeline_transition(
             card_id: card.id.clone(),
         });
     }
-    intents.push(TransitionIntent::SyncReviewState {
-        card_id: card.id.clone(),
-        state: review_state_for(target, pipeline),
-    });
     intents.push(TransitionIntent::AuditLog {
         card_id: card.id.clone(),
         from: card.status.clone(),
@@ -477,15 +477,15 @@ fn decide_review_verdict(ctx: &TransitionContext, verdict: &str) -> TransitionDe
                     from: card.status.clone(),
                     to: terminal.id.clone(),
                 });
+                intents.push(TransitionIntent::SyncReviewState {
+                    card_id: card.id.clone(),
+                    state: "idle".to_string(),
+                });
                 intents.push(TransitionIntent::ClearTerminalFields {
                     card_id: card.id.clone(),
                 });
                 intents.push(TransitionIntent::SyncAutoQueue {
                     card_id: card.id.clone(),
-                });
-                intents.push(TransitionIntent::SyncReviewState {
-                    card_id: card.id.clone(),
-                    state: "idle".to_string(),
                 });
                 intents.push(TransitionIntent::AuditLog {
                     card_id: card.id.clone(),

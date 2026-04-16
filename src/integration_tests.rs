@@ -2054,6 +2054,10 @@ mod tests {
 
     #[test]
     fn auto_queue_activate_concurrent_calls_dispatch_once() {
+        // `create_dispatch()` may resolve the default repo/worktree from
+        // AGENTDESK_REPO_DIR. Hold the shared env lock with a real git repo so
+        // this concurrency test does not race unrelated env-mutating tests.
+        let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);

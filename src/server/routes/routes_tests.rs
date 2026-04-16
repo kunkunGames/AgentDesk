@@ -3,6 +3,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use std::ffi::OsString;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::MutexGuard;
@@ -77,6 +80,44 @@ impl Drop for EnvVarGuard {
             Some(value) => unsafe { std::env::set_var(self.key, value) },
             None => unsafe { std::env::remove_var(self.key) },
         }
+    }
+}
+
+struct MockGhOverride {
+    _dir: tempfile::TempDir,
+    _env: EnvVarGuard,
+}
+
+#[cfg(unix)]
+fn install_mock_gh_issue_view_closed(issue_number: i64, repo: &str) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"--version\" ]; then\n  echo 'gh mock 1.0'\n  exit 0\nfi\nif [ \"${{1-}}\" = \"issue\" ] && [ \"${{2-}}\" = \"view\" ] && [ \"${{3-}}\" = \"{issue_number}\" ]; then\n  shift 3\n  args=\"$*\"\n  if printf '%s\\n' \"$args\" | grep -F -q -- '--repo {repo}' && printf '%s\\n' \"$args\" | grep -F -q -- '--json state' && printf '%s\\n' \"$args\" | grep -F -q -- '--jq .state'; then\n    echo 'CLOSED'\n    exit 0\n  fi\nfi\necho 'gh mock: unexpected args: $*' >&2\nexit 1\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
+    }
+}
+
+#[cfg(windows)]
+fn install_mock_gh_issue_view_closed(issue_number: i64, repo: &str) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh.cmd");
+    let script = format!(
+        "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo gh mock 1.0\r\n  exit /b 0\r\n)\r\nif \"%~1\"==\"issue\" if \"%~2\"==\"view\" if \"%~3\"==\"{issue_number}\" (\r\n  echo %* | findstr /C:\"--repo {repo}\" /C:\"--json state\" /C:\"--jq .state\" >nul\r\n  if not errorlevel 1 (\r\n    echo CLOSED\r\n    exit /b 0\r\n  )\r\n)\r\necho gh mock: unexpected args: %* 1>&2\r\nexit /b 1\r\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
     }
 }
 
@@ -7626,9 +7667,17 @@ async fn auto_queue_activate_walk_respects_requested_hook_skip() {
     seed_agent(&db, "agent-walk-skip");
     ensure_auto_queue_tables(&db);
     seed_auto_queue_card(&db, "card-walk-skip", 1632, "backlog", "agent-walk-skip");
+    let _gh = install_mock_gh_issue_view_closed(1632, "itismyfield/AgentDesk");
 
     {
         let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE kanban_cards
+             SET github_issue_url = 'https://github.com/itismyfield/AgentDesk/issues/1632'
+             WHERE id = 'card-walk-skip'",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task_dispatches (
                 id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at, completed_at

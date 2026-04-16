@@ -227,9 +227,14 @@ fn build_retrospective_draft(
 ) -> Result<Option<RetrospectiveDraft>, String> {
     let card = conn
         .query_row(
-            "SELECT title, github_issue_number, repo_id, COALESCE(review_round, 0), review_notes
-             FROM kanban_cards
-             WHERE id = ?1",
+            "SELECT kc.title,
+                    kc.github_issue_number,
+                    kc.repo_id,
+                    MAX(COALESCE(crs.review_round, 0), COALESCE(kc.review_round, 0)),
+                    kc.review_notes
+             FROM kanban_cards kc
+             LEFT JOIN card_review_state crs ON crs.card_id = kc.id
+             WHERE kc.id = ?1",
             [card_id],
             |row| {
                 Ok((

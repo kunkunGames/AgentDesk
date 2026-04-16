@@ -109,6 +109,9 @@ pub fn wrap_conn(conn: Connection) -> Db {
 
 pub fn init(config: &Config) -> Result<Db> {
     let db_path = config.data.dir.join(&config.data.db_name);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let conn = Connection::open(&db_path)?;
 
     conn.execute_batch(

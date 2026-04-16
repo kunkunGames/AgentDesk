@@ -74,6 +74,8 @@ pub(super) fn register_pipeline_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()>
             agentdesk.pipeline.getConfig = function() {
                 return JSON.parse(rawConfig());
             };
+            // Backward-compatible alias used by older policies.
+            agentdesk.pipeline.config = agentdesk.pipeline.getConfig;
 
             agentdesk.pipeline.resolveForCard = function(cardId) {
                 return JSON.parse(rawResolve(cardId));
@@ -138,10 +140,7 @@ pub(super) fn register_pipeline_ops<'js>(ctx: &Ctx<'js>, db: Db) -> JsResult<()>
                         if (t.to === s.id && t.type !== "free") allInboundFree = false;
                     }
                     if (hasGatedOut && allInboundFree) {
-                        for (var ti2 = 0; ti2 < cfg.transitions.length; ti2++) {
-                            var t2 = cfg.transitions[ti2];
-                            if (t2.from === s.id && t2.type === "gated") return t2.to;
-                        }
+                        return s.id;
                     }
                 }
                 return "requested";
