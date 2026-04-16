@@ -103,6 +103,54 @@ sign_binary_with_fallback() {
     fi
 }
 
+write_dev_launchd_plist() {
+    local plist_dir="$HOME/Library/LaunchAgents"
+    local plist_path="$plist_dir/$PLIST.plist"
+
+    mkdir -p "$plist_dir"
+    cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$PLIST</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$ADK_DEV/bin/agentdesk</string>
+        <string>dcserver</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGENTDESK_ROOT_DIR</key>
+        <string>$ADK_DEV</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:$HOME/.cargo/bin:$HOME/.local/bin</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>$ADK_DEV</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>$ADK_DEV/logs/dcserver.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>$ADK_DEV/logs/dcserver.stderr.log</string>
+</dict>
+</plist>
+PLIST
+}
+
 # ── Credential Sync ──────────────────────────────────────────────────
 # Dev and release runtimes share a single credential directory so that
 # bot tokens, OAuth secrets, etc. stay in sync across environments.
@@ -347,7 +395,11 @@ _sync_dev_credentials
 echo "▸ Ensuring global agentdesk CLI..."
 "$SCRIPT_DIR/ensure-agentdesk-cli.sh"
 
-# 3.10. Re-apply optional local launchd env overrides before restart.
+# 3.11. Rebuild the dev launchd plist so missing/stale files self-heal on deploy.
+echo "▸ Writing dev launchd plist..."
+write_dev_launchd_plist
+
+# 3.12. Re-apply optional local launchd env overrides before restart.
 DEV_LAUNCHD_ENV_FILE="$ADK_DEV/config/launchd.env"
 if [ -f "$DEV_LAUNCHD_ENV_FILE" ]; then
     echo "▸ Syncing dev launchd env..."
