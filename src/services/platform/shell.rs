@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 /// Canonicalize a path, stripping the Windows `\\?\` extended-length prefix
 /// that `std::fs::canonicalize` adds on Windows.  Without stripping, these
@@ -28,6 +29,53 @@ fn strip_unc_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
     }
     let _ = &path; // suppress unused on non-windows
     path
+}
+
+fn git_binary() -> &'static std::ffi::OsString {
+    static GIT_BINARY: OnceLock<std::ffi::OsString> = OnceLock::new();
+    GIT_BINARY.get_or_init(|| {
+        for key in ["AGENTDESK_TEST_GIT", "AGENTDESK_GIT"] {
+            if let Some(configured) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+                return configured;
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(output) = Command::new(r"C:\Windows\System32\where.exe")
+                .arg("git")
+                .output()
+            {
+                if output.status.success() {
+                    if let Some(path) = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                    {
+                        return path.into();
+                    }
+                }
+            }
+            for candidate in [
+                r"C:\Program Files\Git\cmd\git.exe",
+                r"C:\Program Files\Git\bin\git.exe",
+                r"C:\Program Files (x86)\Git\cmd\git.exe",
+                r"C:\Program Files (x86)\Git\bin\git.exe",
+            ] {
+                if std::path::Path::new(candidate).exists() {
+                    return candidate.into();
+                }
+            }
+            "git.exe".into()
+        }
+        #[cfg(not(windows))]
+        {
+            "git".into()
+        }
+    })
+}
+
+fn git_command() -> Command {
+    Command::new(git_binary())
 }
 
 /// Execute a shell command string using the platform's default shell.
@@ -257,7 +305,7 @@ pub(crate) fn parse_github_repo_from_remote(remote: &str) -> Option<String> {
 }
 
 fn repo_id_for_dir(repo_dir: &str) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(repo_dir)
         .output()
@@ -267,7 +315,7 @@ fn repo_id_for_dir(repo_dir: &str) -> Option<String> {
 }
 
 fn ensure_git_worktree(path: &str) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
         .output()
@@ -347,7 +395,7 @@ pub fn resolve_repo_dir_for_target(target_repo: Option<&str>) -> Result<Option<S
 ///
 /// Returns `None` if git is unavailable or the directory is not a repo.
 pub fn git_head_commit(repo_dir: &str) -> Option<String> {
-    Command::new("git")
+    git_command()
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)
         .output()
@@ -361,7 +409,7 @@ pub fn git_head_commit(repo_dir: &str) -> Option<String> {
 /// Untracked files are ignored because they do not participate in commit
 /// resolution until they are added.
 pub fn git_tracked_change_paths(repo_dir: &str) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(repo_dir)
         .output()
@@ -391,7 +439,7 @@ pub fn git_tracked_change_paths(repo_dir: &str) -> Option<Vec<String>> {
 /// when no matching commit is found or git is unavailable.
 pub fn git_latest_commit_for_issue(repo_dir: &str, issue_number: i64) -> Option<String> {
     let pattern = format!("(#{})", issue_number);
-    Command::new("git")
+    git_command()
         .args(["log", "--format=%H %s", "-20"])
         .current_dir(repo_dir)
         .output()
@@ -421,7 +469,7 @@ pub fn git_best_commit_for_dispatch(
     since_iso: &str,
     issue_number: Option<i64>,
 ) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["log", "--format=%H %s", "--after", since_iso, "-50"])
         .current_dir(repo_dir)
         .output()
@@ -454,7 +502,7 @@ pub fn git_best_commit_for_dispatch(
 
 /// Get the current branch name from a git directory (repo or worktree).
 pub fn git_branch_name(dir: &str) -> Option<String> {
-    Command::new("git")
+    git_command()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(dir)
         .output()
@@ -470,7 +518,7 @@ pub(crate) fn is_mainlike_branch(branch: &str) -> bool {
 
 fn git_ref_ahead_count_from_commit(dir: &str, commit: &str, git_ref: &str) -> Option<u64> {
     let range = format!("{commit}..{git_ref}");
-    Command::new("git")
+    git_command()
         .args(["rev-list", "--count", &range])
         .current_dir(dir)
         .output()
@@ -500,7 +548,7 @@ pub fn git_branch_containing_commit(
     preferred_substring: Option<&str>,
 ) -> Option<String> {
     let started = std::time::Instant::now();
-    let output = Command::new("git")
+    let output = git_command()
         .args([
             "for-each-ref",
             "--format=%(refname:short)",
@@ -564,7 +612,7 @@ pub fn git_branch_containing_commit(
 
 /// Resolve the merge-base SHA between two refs in a git directory.
 pub fn git_merge_base(dir: &str, base_ref: &str, other_ref: &str) -> Option<String> {
-    Command::new("git")
+    git_command()
         .args(["merge-base", base_ref, other_ref])
         .current_dir(dir)
         .output()
@@ -587,7 +635,7 @@ pub struct WorktreeInfo {
 /// Prefers `origin/main` over local `main` to avoid false negatives when
 /// local main has already fast-forwarded past the worktree's commits.
 fn upstream_base_ref(repo_dir: &str) -> String {
-    let check = Command::new("git")
+    let check = git_command()
         .args(["rev-parse", "--verify", "origin/main"])
         .current_dir(repo_dir)
         .output();
@@ -611,7 +659,7 @@ fn upstream_base_ref(repo_dir: &str) -> String {
 /// 1. Preferring branches whose name contains the issue number
 /// 2. Among ties, preferring the worktree with the newest HEAD commit
 pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<WorktreeInfo> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_dir)
         .output()
@@ -660,7 +708,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
     let mut matches: Vec<WorktreeInfo> = Vec::new();
 
     for (path, branch, head) in &candidates {
-        let check = Command::new("git")
+        let check = git_command()
             .args([
                 "-C",
                 path,
@@ -712,7 +760,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
     let mut best_idx = finalists[0];
     let mut best_ts: i64 = 0;
     for &idx in &finalists {
-        let ts = Command::new("git")
+        let ts = git_command()
             .args(["log", "-1", "--format=%ct", &matches[idx].commit])
             .current_dir(repo_dir)
             .output()
@@ -762,7 +810,7 @@ pub fn find_latest_commit_for_issue(repo_dir: &str, issue_number: i64) -> Option
             "1".to_string(),
         ],
     ] {
-        let output = Command::new("git")
+        let output = git_command()
             .args(args.iter().map(String::as_str))
             .current_dir(repo_dir)
             .output()
@@ -782,53 +830,6 @@ pub fn find_latest_commit_for_issue(repo_dir: &str, issue_number: i64) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn git_binary() -> &'static std::ffi::OsString {
-        static GIT_BINARY: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
-        GIT_BINARY.get_or_init(|| {
-            if let Some(configured) = std::env::var_os("AGENTDESK_TEST_GIT") {
-                if !configured.is_empty() {
-                    return configured;
-                }
-            }
-            #[cfg(windows)]
-            {
-                if let Ok(output) = Command::new(r"C:\Windows\System32\where.exe")
-                    .arg("git")
-                    .output()
-                {
-                    if output.status.success() {
-                        if let Some(path) = String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                        {
-                            return path.into();
-                        }
-                    }
-                }
-                for candidate in [
-                    r"C:\Program Files\Git\cmd\git.exe",
-                    r"C:\Program Files\Git\bin\git.exe",
-                    r"C:\Program Files (x86)\Git\cmd\git.exe",
-                    r"C:\Program Files (x86)\Git\bin\git.exe",
-                ] {
-                    if std::path::Path::new(candidate).exists() {
-                        return candidate.into();
-                    }
-                }
-                "git.exe".into()
-            }
-            #[cfg(not(windows))]
-            {
-                "git".into()
-            }
-        })
-    }
-
-    fn git_command() -> Command {
-        Command::new(git_binary())
-    }
 
     #[test]
     fn shell_command_echo_works() {
@@ -1143,19 +1144,19 @@ mod tests {
 
         let wt_dir = repo.path().join("wt-542");
         let wt_path = wt_dir.to_str().unwrap();
-        Command::new("git")
+        git_command()
             .args(["worktree", "add", "-b", "wt/fix-542", wt_path])
             .current_dir(repo_dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["commit", "--allow-empty", "-m", "fix: branch-only change"])
             .current_dir(wt_path)
             .output()
             .unwrap();
         let branch_commit = git_head_commit(wt_path).unwrap();
 
-        Command::new("git")
+        git_command()
             .args(["commit", "--allow-empty", "-m", "chore: main advanced"])
             .current_dir(repo_dir)
             .output()
@@ -1173,19 +1174,19 @@ mod tests {
         let (repo, _origin) = setup_test_repo();
         let repo_dir = repo.path().to_str().unwrap();
 
-        Command::new("git")
+        git_command()
             .args(["checkout", "-b", "feat/610-review"])
             .current_dir(repo_dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["commit", "--allow-empty", "-m", "fix: review target (#610)"])
             .current_dir(repo_dir)
             .output()
             .unwrap();
         let reviewed_commit = git_head_commit(repo_dir).unwrap();
 
-        Command::new("git")
+        git_command()
             .args(["checkout", "main"])
             .current_dir(repo_dir)
             .output()
