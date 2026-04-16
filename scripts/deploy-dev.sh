@@ -240,6 +240,8 @@ export AGENTDESK_REPO_DIR=$(printf '%q' "$REPO")
 export AGENTDESK_DEPLOY_DEV_DETACHED_CHILD=1
 export AGENTDESK_DEPLOY_DEV_LOG_PATH=$(printf '%q' "$log_path")
 export AGENTDESK_DEPLOY_DEV_TEST_MODE=$(printf '%q' "$DEV_DEPLOY_TEST_MODE")
+export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "$CODESIGN_IDENTITY")
+export AGENTDESK_ALLOW_ADHOC_SIGN=$(printf '%q' "$ALLOW_ADHOC_SIGN")
 ${AGENTDESK_SHARED_CREDENTIAL_DIR:+export AGENTDESK_SHARED_CREDENTIAL_DIR=$(printf '%q' "$AGENTDESK_SHARED_CREDENTIAL_DIR")}
 cd $(printf '%q' "$REPO")
 exec $(printf '%q' "$SCRIPT_DIR/deploy-dev.sh")${quoted_args}

@@ -254,6 +254,8 @@ export AGENTDESK_REPO_DIR=$(printf '%q' "$REPO")
 export AGENTDESK_PROMOTE_DETACHED_CHILD=1
 export AGENTDESK_PROMOTE_LOG_PATH=$(printf '%q' "$log_path")
 export AGENTDESK_PROMOTE_TEST_MODE=$(printf '%q' "$PROMOTE_TEST_MODE")
+export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "$CODESIGN_IDENTITY")
+export AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=$(printf '%q' "$ALLOW_ADHOC_RELEASE_SIGN")
 cd $(printf '%q' "$REPO")
 exec $(printf '%q' "$SCRIPT_DIR/promote-release.sh")${quoted_args}
 EOF
