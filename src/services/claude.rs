@@ -856,7 +856,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
                 // Track session_id and final result for Done message
                 match &msg {
-                    StreamMessage::Init { session_id } => {
+                    StreamMessage::Init { session_id, .. } => {
                         debug_log(&format!("  >>> Init: session_id={}", session_id));
                         last_session_id = Some(session_id.clone());
                     }
@@ -1977,7 +1977,7 @@ mod tests {
                 .unwrap();
 
         match parse_stream_message(&json) {
-            Some(StreamMessage::Init { session_id }) => {
+            Some(StreamMessage::Init { session_id, .. }) => {
                 assert_eq!(session_id, "test-123");
             }
             _ => panic!("Expected Init message"),

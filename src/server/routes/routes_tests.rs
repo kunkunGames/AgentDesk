@@ -3,6 +3,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use std::ffi::OsString;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::MutexGuard;
@@ -77,6 +80,44 @@ impl Drop for EnvVarGuard {
             Some(value) => unsafe { std::env::set_var(self.key, value) },
             None => unsafe { std::env::remove_var(self.key) },
         }
+    }
+}
+
+struct MockGhOverride {
+    _dir: tempfile::TempDir,
+    _env: EnvVarGuard,
+}
+
+#[cfg(unix)]
+fn install_mock_gh_issue_view_closed(issue_number: i64, repo: &str) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"--version\" ]; then\n  echo 'gh mock 1.0'\n  exit 0\nfi\nif [ \"${{1-}}\" = \"issue\" ] && [ \"${{2-}}\" = \"view\" ] && [ \"${{3-}}\" = \"{issue_number}\" ]; then\n  shift 3\n  args=\"$*\"\n  if printf '%s\\n' \"$args\" | grep -F -q -- '--repo {repo}' && printf '%s\\n' \"$args\" | grep -F -q -- '--json state' && printf '%s\\n' \"$args\" | grep -F -q -- '--jq .state'; then\n    echo 'CLOSED'\n    exit 0\n  fi\nfi\necho 'gh mock: unexpected args: $*' >&2\nexit 1\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
+    }
+}
+
+#[cfg(windows)]
+fn install_mock_gh_issue_view_closed(issue_number: i64, repo: &str) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh.cmd");
+    let script = format!(
+        "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo gh mock 1.0\r\n  exit /b 0\r\n)\r\nif \"%~1\"==\"issue\" if \"%~2\"==\"view\" if \"%~3\"==\"{issue_number}\" (\r\n  echo %* | findstr /C:\"--repo {repo}\" /C:\"--json state\" /C:\"--jq .state\" >nul\r\n  if not errorlevel 1 (\r\n    echo CLOSED\r\n    exit /b 0\r\n  )\r\n)\r\necho gh mock: unexpected args: %* 1>&2\r\nexit /b 1\r\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
     }
 }
 
@@ -672,10 +713,11 @@ async fn agent_turn_returns_recent_output_from_inflight_snapshot() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
+    assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "working");
     assert_eq!(json["started_at"], "2026-04-06 10:11:12");
@@ -1901,6 +1943,12 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-manual-backlog-pending', 'test-repo', 'agent-manual-backlog', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at
             ) VALUES (
@@ -1914,7 +1962,7 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status
             ) VALUES (
-                'entry-manual-backlog-pending', 'run-manual-backlog', 'card-manual-backlog', 'agent-manual-backlog', 'pending'
+                'entry-manual-backlog-pending', 'run-manual-backlog-pending', 'card-manual-backlog', 'agent-manual-backlog', 'pending'
             )",
             [],
         )
@@ -4752,6 +4800,12 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-ft-clean-pending', 'test-repo', 'agent-ft-clean', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at
             ) VALUES (
@@ -4765,7 +4819,7 @@ async fn force_transition_to_ready_cancels_live_dispatches_and_skips_auto_queue_
             "INSERT INTO auto_queue_entries (
                 id, run_id, kanban_card_id, agent_id, status
             ) VALUES (
-                'entry-ft-pending', 'run-ft-clean', 'card-ft-clean', 'agent-ft-clean', 'pending'
+                'entry-ft-pending', 'run-ft-clean-pending', 'card-ft-clean', 'agent-ft-clean', 'pending'
             )",
             [],
         )
@@ -7878,9 +7932,17 @@ async fn auto_queue_activate_walk_respects_requested_hook_skip() {
     seed_agent(&db, "agent-walk-skip");
     ensure_auto_queue_tables(&db);
     seed_auto_queue_card(&db, "card-walk-skip", 1632, "backlog", "agent-walk-skip");
+    let _gh = install_mock_gh_issue_view_closed(1632, "itismyfield/AgentDesk");
 
     {
         let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE kanban_cards
+             SET github_issue_url = 'https://github.com/itismyfield/AgentDesk/issues/1632'
+             WHERE id = 'card-walk-skip'",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task_dispatches (
                 id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at, completed_at
@@ -9527,6 +9589,69 @@ async fn hook_session_normalizes_empty_claude_session_id_to_null() {
     assert!(
         json["claude_session_id"].is_null(),
         "GET should return null after clear"
+    );
+}
+
+#[tokio::test]
+async fn hook_session_persists_raw_provider_session_id_separately() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hook/session")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"session_key":"test:gemini-raw","status":"working","provider":"gemini","claude_session_id":"latest","session_id":"aa678e6b-c6d3-4dd2-9197-58580c00cc6c"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    {
+        let conn = db.lock().unwrap();
+        let stored: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT claude_session_id, raw_provider_session_id
+                 FROM sessions
+                 WHERE session_key = 'test:gemini-raw'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0.as_deref(), Some("latest"));
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("aa678e6b-c6d3-4dd2-9197-58580c00cc6c")
+        );
+    }
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatched-sessions/claude-session-id?session_key=test:gemini-raw&provider=gemini")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["claude_session_id"], "latest");
+    assert_eq!(json["session_id"], "latest");
+    assert_eq!(
+        json["raw_provider_session_id"],
+        "aa678e6b-c6d3-4dd2-9197-58580c00cc6c"
     );
 }
 

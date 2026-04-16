@@ -45,18 +45,6 @@ var reviewAutomation = {
       return;
     }
 
-    // Guard: don't create review dispatch if implementation/rework is still active
-    var activeWork = agentdesk.db.query(
-      "SELECT COUNT(*) as cnt FROM task_dispatches " +
-      "WHERE kanban_card_id = ? AND dispatch_type IN ('implementation', 'rework') " +
-      "AND status IN ('pending', 'dispatched')",
-      [card.id]
-    );
-    if (activeWork.length > 0 && activeWork[0].cnt > 0) {
-      agentdesk.log.info("[review] Card " + card.id + " has active work dispatch — deferring review");
-      return;
-    }
-
     // Check if review is enabled — if not, complete immediately
     var reviewEnabled = agentdesk.config.get("review_enabled");
     if (reviewEnabled === "false" || reviewEnabled === false) {
@@ -105,6 +93,14 @@ var reviewAutomation = {
 
     // #117: Update canonical card_review_state
     agentdesk.reviewState.sync(card.id, "reviewing", { review_round: newRound });
+
+    // Guard: don't create review dispatch if implementation/rework is still active.
+    // The card has already entered review canonically, so preserve the fresh
+    // round/state while deferring only the counter-model dispatch creation.
+    if (agentdesk.review.hasActiveWork(card.id)) {
+      agentdesk.log.info("[review] Card " + card.id + " has active work dispatch — deferring review dispatch creation");
+      return;
+    }
 
     // Check review round limit — exceed → dilemma_pending with deadlock-manager notification
     var maxRounds = agentdesk.config.get("max_review_rounds") || 3;
@@ -234,8 +230,13 @@ var reviewAutomation = {
       var completeTerminalState = agentdesk.pipeline.terminalState(completeCfg);
       var completeInitialState = agentdesk.pipeline.kickoffState(completeCfg);
       var completeInProgressState = agentdesk.pipeline.nextGatedTarget(completeInitialState, completeCfg);
-      var completeReviewState = agentdesk.pipeline.nextGatedTarget(completeInProgressState, completeCfg);
-      var completeReviewPassTarget = agentdesk.pipeline.nextGatedTargetWithGate(completeReviewState, "review_passed", completeCfg) || completeTerminalState;
+      var completeReviewPassTransition = findGateTransition(completeCfg, "review_passed");
+      var completeReviewState = completeReviewPassTransition
+        ? completeReviewPassTransition.from
+        : agentdesk.pipeline.nextGatedTarget(completeInProgressState, completeCfg);
+      var completeReviewPassTarget = completeReviewPassTransition
+        ? completeReviewPassTransition.to
+        : completeTerminalState;
       var lifecycleRows = agentdesk.db.query(
         "SELECT status FROM kanban_cards WHERE id = ?",
         [dispatch.kanban_card_id]
@@ -255,13 +256,13 @@ var reviewAutomation = {
         return;
       }
 
+      if (currentStatus === completeReviewState) {
+        agentdesk.kanban.setStatus(dispatch.kanban_card_id, completeReviewPassTarget, true);
+      }
       agentdesk.db.execute(
         "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = ?",
         [dispatch.kanban_card_id]
       );
-      if (currentStatus === completeReviewState) {
-        agentdesk.kanban.setStatus(dispatch.kanban_card_id, completeReviewPassTarget, true);
-      }
       agentdesk.log.info(
         "[review] Create-PR completed for card " + dispatch.kanban_card_id +
         " → wait-ci on PR #" + pr.number +
@@ -437,6 +438,8 @@ function setNormalSuggestionPending(cardId, verdict) {
 
 function parseJsonObject(raw) {
   if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw !== "string") return {};
   try {
     return JSON.parse(raw) || {};
   } catch (e) {
@@ -579,11 +582,24 @@ function loadLatestReviewDispatchContext(cardId, dispatchId) {
     "SELECT context FROM task_dispatches " +
     "WHERE kanban_card_id = ? AND dispatch_type = 'review' " +
     "ORDER BY CASE WHEN status IN ('pending', 'dispatched') THEN 0 ELSE 1 END ASC, " +
-    "COALESCE(dispatched_at, completed_at, updated_at, created_at) DESC, rowid DESC LIMIT 1",
+    "COALESCE(completed_at, updated_at, created_at) DESC, rowid DESC LIMIT 1",
     [cardId]
   );
   if (rows.length === 0) return {};
   return parseJsonObject(rows[0].context);
+}
+
+function findGateTransition(config, gateName) {
+  var cfg = config || agentdesk.pipeline.getConfig();
+  if (!cfg || !cfg.transitions) return null;
+  for (var i = 0; i < cfg.transitions.length; i++) {
+    var t = cfg.transitions[i];
+    if (t.type !== "gated" || !t.gates) continue;
+    for (var gi = 0; gi < t.gates.length; gi++) {
+      if (t.gates[gi] === gateName) return t;
+    }
+  }
+  return null;
 }
 
 function processVerdict(cardId, verdict, result, options) {
@@ -594,9 +610,13 @@ function processVerdict(cardId, verdict, result, options) {
   var terminalState = agentdesk.pipeline.terminalState(cfg);
   var initialState = agentdesk.pipeline.kickoffState(cfg);
   var inProgressState = agentdesk.pipeline.nextGatedTarget(initialState, cfg);
-  var reviewState = agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
-  var reviewPassTarget = agentdesk.pipeline.nextGatedTargetWithGate(reviewState, "review_passed", cfg) || terminalState;
-  var reviewReworkTarget = agentdesk.pipeline.nextGatedTargetWithGate(reviewState, "review_rework", cfg) || inProgressState;
+  var reviewPassTransition = findGateTransition(cfg, "review_passed");
+  var reviewReworkTransition = findGateTransition(cfg, "review_rework");
+  var reviewState = reviewPassTransition
+    ? reviewPassTransition.from
+    : agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
+  var reviewPassTarget = reviewPassTransition ? reviewPassTransition.to : terminalState;
+  var reviewReworkTarget = reviewReworkTransition ? reviewReworkTransition.to : inProgressState;
 
   var cardCheck = agentdesk.db.query(
     "SELECT status FROM kanban_cards WHERE id = ?", [cardId]
@@ -782,6 +802,7 @@ function processVerdict(cardId, verdict, result, options) {
               "create-pr",
               "[PR 생성] #" + issueNum + " " + prCardInfo[0].title,
               {
+                sidecar_dispatch: true,
                 worktree_path: latestWorkTarget.worktree_path,
                 worktree_branch: latestWorkTarget.branch,
                 branch: latestWorkTarget.branch
