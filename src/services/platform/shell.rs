@@ -146,8 +146,7 @@ pub(crate) fn looks_like_explicit_repo_path(raw: &str) -> bool {
         return false;
     }
 
-    if trimmed.starts_with(r"\\?\UNC\") || trimmed.starts_with(r"\\") || trimmed.starts_with("//")
-    {
+    if trimmed.starts_with(r"\\?\UNC\") || trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
         return true;
     }
 

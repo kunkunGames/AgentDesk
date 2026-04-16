@@ -264,7 +264,7 @@
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 878 |  |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
-| `services::platform::shell` | `src/services/platform/shell.rs` | 1205 | giant-file |
+| `services::platform::shell` | `src/services/platform/shell.rs` | 1220 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 184 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
 | `services::provider` | `src/services/provider.rs` | 1962 | giant-file |
