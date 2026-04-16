@@ -55,7 +55,7 @@
 | `cli::migrate::source` | `src/cli/migrate/source.rs` | 1612 | giant-file |
 | `cli::run` | `src/cli/run.rs` | 386 |  |
 | `cli::utils` | `src/cli/utils.rs` | 271 |  |
-| `config` | `src/config.rs` | 1525 | giant-file |
+| `config` | `src/config.rs` | 1553 | giant-file |
 | `crate` | `src/main.rs` | 42 |  |
 | `credential` | `src/credential.rs` | 24 |  |
 | `db` | `src/db/mod.rs` | 127 |  |
@@ -157,7 +157,7 @@
 | `server::routes::meetings` | `src/server/routes/meetings.rs` | 2210 | giant-file |
 | `server::routes::messages` | `src/server/routes/messages.rs` | 192 |  |
 | `server::routes::offices` | `src/server/routes/offices.rs` | 458 |  |
-| `server::routes::onboarding` | `src/server/routes/onboarding.rs` | 4312 | giant-file |
+| `server::routes::onboarding` | `src/server/routes/onboarding.rs` | 4298 | giant-file |
 | `server::routes::pipeline` | `src/server/routes/pipeline.rs` | 932 |  |
 | `server::routes::queue_api` | `src/server/routes/queue_api.rs` | 214 |  |
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 139 |  |
@@ -256,7 +256,7 @@
 | `services::dispatches` | `src/services/dispatches.rs` | 344 |  |
 | `services::gemini` | `src/services/gemini.rs` | 2546 | giant-file |
 | `services::kanban` | `src/services/kanban.rs` | 145 |  |
-| `services::mcp_config` | `src/services/mcp_config.rs` | 607 |  |
+| `services::mcp_config` | `src/services/mcp_config.rs` | 625 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 346 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 113 |  |
 | `services::memory::mem0` | `src/services/memory/mem0.rs` | 1011 | giant-file |
