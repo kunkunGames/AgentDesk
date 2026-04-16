@@ -34,6 +34,13 @@ fn resolve_claude_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("claude")
 }
 
+fn append_claude_mcp_config_arg(args: &mut Vec<String>) {
+    if let Some(config_json) = crate::services::mcp_config::claude_mcp_config_arg() {
+        args.push("--mcp-config".to_string());
+        args.push(config_json);
+    }
+}
+
 fn build_tmux_launch_env_lines(
     exec_path: Option<&str>,
     report_channel_id: Option<u64>,
@@ -178,6 +185,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use headers (## Title) to organize longer responses
 - Keep formatting minimal and terminal-friendly"#.to_string(),
     ];
+    append_claude_mcp_config_arg(&mut args);
 
     // Resume session if available
     if let Some(sid) = session_id {
@@ -470,6 +478,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         "--output-format".to_string(),
         "stream-json".to_string(),
     ];
+    append_claude_mcp_config_arg(&mut args);
 
     // Apply model override if specified (e.g. "opus", "sonnet", "haiku")
     if let Some(model) = model_override {
@@ -1807,6 +1816,23 @@ mod tests {
         assert!(env_lines.contains("export PATH='/tmp/provider:/usr/bin'"));
         assert!(env_lines.contains(&format!("export {}=7", RESTART_REPORT_CHANNEL_ENV)));
         assert!(env_lines.contains(&format!("export {}=claude", RESTART_REPORT_PROVIDER_ENV)));
+    }
+
+    #[test]
+    fn test_append_claude_mcp_config_arg_skips_when_no_runtime_config() {
+        let _guard = crate::services::discord::runtime_store::lock_test_env();
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+
+        let mut args = vec!["-p".to_string()];
+        append_claude_mcp_config_arg(&mut args);
+
+        assert_eq!(args, vec!["-p".to_string()]);
+
+        match previous_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
     }
 
     #[test]

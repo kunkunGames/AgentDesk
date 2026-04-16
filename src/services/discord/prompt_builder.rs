@@ -472,6 +472,7 @@ fn proactive_memory_guidance(
     channel_id: ChannelId,
     role_binding: Option<&RoleBinding>,
     profile: DispatchProfile,
+    memento_mcp_available: bool,
 ) -> Option<String> {
     if profile != DispatchProfile::Full {
         return None;
@@ -491,6 +492,7 @@ fn proactive_memory_guidance(
             "`add_memories` MCP tool",
             String::new(),
         ),
+        MemoryBackendKind::Memento if !memento_mcp_available => return None,
         MemoryBackendKind::Memento => {
             let role_id = role_binding
                 .map(|binding| binding.role_id.as_str())
@@ -578,6 +580,7 @@ pub(super) fn build_system_prompt(
     shared_knowledge: Option<&str>,
     longterm_catalog: Option<&str>,
     memory_settings: Option<&ResolvedMemorySettings>,
+    memento_mcp_available: bool,
 ) -> String {
     let narration_guidance = if narrate_progress {
         "\n\nAlways keep the user informed about what you are doing. Briefly explain each step as you work \
@@ -726,6 +729,7 @@ pub(super) fn build_system_prompt(
         channel_id,
         role_binding,
         profile,
+        memento_mcp_available,
     ) {
         system_prompt_owned.push_str(&memory_guidance);
     }
@@ -783,11 +787,12 @@ mod tests {
             None,  // role_binding
             false, // queued_turn
             DispatchProfile::Full,
-            None, // dispatch_type
-            None, // current_task
-            None, // shared_knowledge
-            None, // longterm_catalog
-            None, // memory_settings
+            None,  // dispatch_type
+            None,  // current_task
+            None,  // shared_knowledge
+            None,  // longterm_catalog
+            None,  // memory_settings
+            false, // memento_mcp_available
         )
     }
 
@@ -888,6 +893,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(!output.contains("Always keep the user informed about what you are doing."));
@@ -944,6 +950,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(!prompt.contains("Available skills"));
@@ -968,6 +975,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(!prompt.contains("[Context Compression]"));
@@ -992,6 +1000,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(prompt.contains("[Tool Output Efficiency]"));
@@ -1025,6 +1034,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let decision_prompt = build_system_prompt(
             "ctx",
@@ -1041,6 +1051,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         // review should NOT contain decision API
         assert!(!review_prompt.contains("/api/review-decision"));
@@ -1080,6 +1091,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(!prompt.contains("[Peer Agent Directory]"));
@@ -1114,6 +1126,7 @@ mod tests {
             None,
             Some("- facts.md: deployment notes"),
             None,
+            false,
         );
 
         assert!(prompt.contains("[Long-term Memory]"));
@@ -1140,6 +1153,7 @@ mod tests {
                 backend: MemoryBackendKind::Mem0,
                 ..ResolvedMemorySettings::default()
             }),
+            false,
         );
 
         assert!(prompt.contains("[Proactive Memory Guidance]"));
@@ -1178,6 +1192,7 @@ mod tests {
                 backend: MemoryBackendKind::Memento,
                 ..ResolvedMemorySettings::default()
             }),
+            true,
         );
 
         assert!(prompt.contains("[Proactive Memory Guidance]"));
@@ -1193,6 +1208,34 @@ mod tests {
         );
         assert!(prompt.contains("workspace 스코프 이름은 `agentdesk`"));
         assert!(!prompt.contains("tool_feedback("));
+    }
+
+    #[test]
+    fn test_full_prompt_omits_memento_memory_guidance_without_mcp() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "/Users/test/.adk/release/workspaces/agentdesk",
+            ChannelId::new(1),
+            "tok",
+            "",
+            true,
+            None,
+            false,
+            DispatchProfile::Full,
+            None,
+            None,
+            None,
+            None,
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::Memento,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+
+        assert!(!prompt.contains("[Proactive Memory Guidance]"));
+        assert!(!prompt.contains("`recall` MCP tool"));
+        assert!(!prompt.contains("`remember` MCP tool"));
     }
 
     #[test]
@@ -1215,6 +1258,7 @@ mod tests {
                 backend: MemoryBackendKind::Mem0,
                 ..ResolvedMemorySettings::default()
             }),
+            false,
         );
 
         assert!(!prompt.contains("[Proactive Memory Guidance]"));
@@ -1253,6 +1297,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         let queued_index = prompt.find("[Queued Turn Rules]").unwrap();
@@ -1310,6 +1355,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(prompt.contains("Review Mode: noop_verification"));
@@ -1338,6 +1384,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(prompt.contains("[Current Task]"));
@@ -1368,6 +1415,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert!(prompt.contains("[Dispatch Contract]"));

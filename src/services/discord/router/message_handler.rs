@@ -1079,6 +1079,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             deferred_dod: info.deferred_dod.as_ref(),
         }
     });
+    let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
 
     let system_prompt_owned = build_system_prompt(
         &discord_context,
@@ -1095,6 +1096,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         sak_for_system,
         longterm_catalog_for_prompt,
         Some(&memory_settings),
+        memento_mcp_available,
     );
     if sak_for_system.is_some() {
         let ts = chrono::Local::now().format("%H:%M:%S");
