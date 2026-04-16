@@ -1504,9 +1504,11 @@ fn extract_gemini_quota_limits(data: &serde_json::Value) -> (i64, i64) {
 
                         if let Some(min_val) = min_positive {
                             if is_per_minute {
-                                rpm_limit = Some(rpm_limit.map_or(min_val, |current| current.min(min_val)));
+                                rpm_limit =
+                                    Some(rpm_limit.map_or(min_val, |current| current.min(min_val)));
                             } else if is_per_day {
-                                rpd_limit = Some(rpd_limit.map_or(min_val, |current| current.min(min_val)));
+                                rpd_limit =
+                                    Some(rpd_limit.map_or(min_val, |current| current.min(min_val)));
                             }
                         }
                     }
@@ -1515,10 +1517,7 @@ fn extract_gemini_quota_limits(data: &serde_json::Value) -> (i64, i64) {
         }
     }
 
-    (
-        rpm_limit.unwrap_or(15),
-        rpd_limit.unwrap_or(1500),
-    )
+    (rpm_limit.unwrap_or(15), rpd_limit.unwrap_or(1500))
 }
 
 fn build_gemini_rate_limit_buckets(rpm_limit: i64, rpd_limit: i64) -> Vec<serde_json::Value> {

@@ -7201,7 +7201,7 @@ done
         });
 
         match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
-            crate::services::agent_protocol::StreamMessage::Init { session_id } => {
+            crate::services::agent_protocol::StreamMessage::Init { session_id, .. } => {
                 assert_eq!(session_id, "latest");
             }
             other => panic!("expected Init, got {:?}", other),

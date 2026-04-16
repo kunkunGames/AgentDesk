@@ -957,6 +957,7 @@ fn handle_codex_json_line(
                 *current_thread_id = Some(thread_id.to_string());
                 let _ = sender.send(StreamMessage::Init {
                     session_id: thread_id.to_string(),
+                    raw_session_id: None,
                 });
             }
         }

@@ -9163,6 +9163,69 @@ async fn hook_session_normalizes_empty_claude_session_id_to_null() {
     );
 }
 
+#[tokio::test]
+async fn hook_session_persists_raw_provider_session_id_separately() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/hook/session")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"session_key":"test:gemini-raw","status":"working","provider":"gemini","claude_session_id":"latest","session_id":"aa678e6b-c6d3-4dd2-9197-58580c00cc6c"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    {
+        let conn = db.lock().unwrap();
+        let stored: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT claude_session_id, raw_provider_session_id
+                 FROM sessions
+                 WHERE session_key = 'test:gemini-raw'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0.as_deref(), Some("latest"));
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("aa678e6b-c6d3-4dd2-9197-58580c00cc6c")
+        );
+    }
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatched-sessions/claude-session-id?session_key=test:gemini-raw&provider=gemini")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["claude_session_id"], "latest");
+    assert_eq!(json["session_id"], "latest");
+    assert_eq!(
+        json["raw_provider_session_id"],
+        "aa678e6b-c6d3-4dd2-9197-58580c00cc6c"
+    );
+}
+
 // ── #140: Parallel thread group auto-queue tests ──────────────────
 
 /// Helper: seed kanban cards for the parallel dispatch test scenario.
