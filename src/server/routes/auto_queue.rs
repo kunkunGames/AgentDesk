@@ -77,6 +77,7 @@ pub struct ReorderBody {
 pub struct UpdateRunBody {
     pub status: Option<String>,
     pub unified_thread: Option<bool>,
+    pub max_concurrent_threads: Option<i64>,
     pub deploy_phases: Option<Vec<i64>>,
 }
 
@@ -104,6 +105,7 @@ pub struct DispatchBody {
 #[derive(Debug, Deserialize)]
 pub struct UpdateEntryBody {
     pub thread_group: Option<i64>,
+    pub batch_phase: Option<i64>,
     pub priority_rank: Option<i64>,
     pub status: Option<String>,
 }
@@ -4571,7 +4573,11 @@ pub async fn update_entry(
     Path(id): Path<String>,
     Json(body): Json<UpdateEntryBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if body.thread_group.is_none() && body.priority_rank.is_none() && body.status.is_none() {
+    if body.thread_group.is_none()
+        && body.batch_phase.is_none()
+        && body.priority_rank.is_none()
+        && body.status.is_none()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no fields to update"})),
@@ -4590,6 +4596,14 @@ pub async fn update_entry(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "priority_rank must be >= 0"})),
+            );
+        }
+    }
+    if let Some(batch_phase) = body.batch_phase {
+        if batch_phase < 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "batch_phase must be >= 0"})),
             );
         }
     }
@@ -4680,7 +4694,7 @@ pub async fn update_entry(
         }
     }
 
-    if body.thread_group.is_some() || body.priority_rank.is_some() {
+    if body.thread_group.is_some() || body.batch_phase.is_some() || body.priority_rank.is_some() {
         if effective_status != crate::db::auto_queue::ENTRY_STATUS_PENDING {
             return (
                 StatusCode::CONFLICT,
@@ -4692,10 +4706,11 @@ pub async fn update_entry(
             .execute(
                 "UPDATE auto_queue_entries
                  SET thread_group = COALESCE(?1, thread_group),
-                     priority_rank = COALESCE(?2, priority_rank)
-                 WHERE id = ?3
+                     batch_phase = COALESCE(?2, batch_phase),
+                     priority_rank = COALESCE(?3, priority_rank)
+                 WHERE id = ?4
                    AND status = 'pending'",
-                rusqlite::params![body.thread_group, body.priority_rank, id],
+                rusqlite::params![body.thread_group, body.batch_phase, body.priority_rank, id],
             )
             .unwrap_or(0);
         if changed == 0 {
@@ -5224,6 +5239,15 @@ pub async fn update_run(
     Path(id): Path<String>,
     Json(body): Json<UpdateRunBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(max_concurrent_threads) = body.max_concurrent_threads {
+        if max_concurrent_threads < 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "max_concurrent_threads must be >= 1"})),
+            );
+        }
+    }
+
     let conn = match state.db.separate_conn() {
         Ok(c) => c,
         Err(e) => {
@@ -5262,8 +5286,22 @@ pub async fn update_run(
         }
     }
 
+    if let Some(max_concurrent_threads) = body.max_concurrent_threads {
+        changed += conn
+            .execute(
+                "UPDATE auto_queue_runs SET max_concurrent_threads = ?1 WHERE id = ?2",
+                rusqlite::params![max_concurrent_threads, id],
+            )
+            .unwrap_or(0);
+    }
+
     let ignored_unified_thread = body.unified_thread.is_some();
-    if changed == 0 && body.status.is_none() && !ignored_unified_thread {
+    if changed == 0
+        && body.status.is_none()
+        && body.max_concurrent_threads.is_none()
+        && body.deploy_phases.is_none()
+        && !ignored_unified_thread
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "no fields to update"})),
