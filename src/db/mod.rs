@@ -40,9 +40,7 @@ impl DbPool {
             &self.path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
-        conn.execute_batch(
-            "PRAGMA query_only=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;",
-        )?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")?;
         Ok(conn)
     }
 

@@ -2692,6 +2692,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn scenario_6d_review_verdict_pass_uses_current_review_state_gate_targets() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/multi-review");
+
+        let multi_review_override = serde_json::json!({
+            "states": [
+                {"id": "backlog", "label": "Backlog"},
+                {"id": "ready", "label": "Ready"},
+                {"id": "requested", "label": "Requested"},
+                {"id": "in_progress", "label": "In Progress"},
+                {"id": "review_stage_one", "label": "Review Stage One"},
+                {"id": "qa_test", "label": "QA Test"},
+                {"id": "review_stage_two", "label": "Review Stage Two"},
+                {"id": "done", "label": "Done", "terminal": true}
+            ],
+            "transitions": [
+                {"from": "backlog", "to": "ready", "type": "free"},
+                {"from": "ready", "to": "requested", "type": "free"},
+                {"from": "requested", "to": "in_progress", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "in_progress", "to": "review_stage_one", "type": "gated", "gates": ["active_dispatch"]},
+                {"from": "review_stage_one", "to": "qa_test", "type": "gated", "gates": ["review_passed"]},
+                {"from": "review_stage_one", "to": "in_progress", "type": "gated", "gates": ["review_rework"]},
+                {"from": "qa_test", "to": "review_stage_two", "type": "free"},
+                {"from": "review_stage_two", "to": "done", "type": "gated", "gates": ["review_passed"]},
+                {"from": "review_stage_two", "to": "qa_test", "type": "gated", "gates": ["review_rework"]}
+            ],
+            "gates": {
+                "active_dispatch": {"type": "builtin", "check": "has_active_dispatch"},
+                "review_passed": {"type": "builtin", "check": "review_verdict_pass"},
+                "review_rework": {"type": "builtin", "check": "review_verdict_rework"}
+            },
+            "hooks": {},
+            "clocks": {},
+            "events": {},
+            "timeouts": {}
+        });
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE github_repos SET pipeline_config = ?1 WHERE id = 'test/multi-review'",
+                [multi_review_override.to_string()],
+            )
+            .unwrap();
+        }
+
+        seed_card_with_repo(
+            &db,
+            "card-s6d",
+            "review_stage_two",
+            "test/multi-review",
+            697,
+            None,
+        );
+        seed_dispatch(&db, "review-s6d", "card-s6d", "review", "pending");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET review_status = 'reviewing' WHERE id = 'card-s6d'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let state = AppState::test_state(db.clone(), engine);
+        let (status, body) = crate::server::routes::review_verdict::submit_verdict(
+            axum::extract::State(state),
+            axum::Json(crate::server::routes::review_verdict::SubmitVerdictBody {
+                dispatch_id: "review-s6d".to_string(),
+                overall: "pass".to_string(),
+                items: None,
+                notes: Some("multi-review branch pass".to_string()),
+                feedback: None,
+                commit: None,
+                provider: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "pass verdict should succeed on later review branch: {body:?}"
+        );
+
+        let conn = db.lock().unwrap();
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-s6d'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let review_dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'review-s6d'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            review_dispatch_status, "completed",
+            "review dispatch must complete after the verdict"
+        );
+        assert_eq!(
+            card_status, "done",
+            "pass verdict must follow the current review state's review_passed gate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn scenario_655_noop_review_pass_skips_create_pr_and_closes_issue() {
         let gh = install_mock_gh(&[MockGhReply {
             key: "issue:close",

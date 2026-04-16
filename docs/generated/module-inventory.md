@@ -58,7 +58,7 @@
 | `config` | `src/config.rs` | 1525 | giant-file |
 | `crate` | `src/main.rs` | 42 |  |
 | `credential` | `src/credential.rs` | 24 |  |
-| `db` | `src/db/mod.rs` | 129 |  |
+| `db` | `src/db/mod.rs` | 127 |  |
 | `db::agents` | `src/db/agents.rs` | 539 |  |
 | `db::auto_queue` | `src/db/auto_queue.rs` | 3423 | giant-file |
 | `db::cron_history` | `src/db/cron_history.rs` | 74 |  |

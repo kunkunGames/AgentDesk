@@ -603,19 +603,6 @@ function loadLatestReviewDispatchContext(cardId, dispatchId) {
   return parseJsonObject(rows[0].context);
 }
 
-function findGateTransition(config, gateName) {
-  var cfg = config || agentdesk.pipeline.getConfig();
-  if (!cfg || !cfg.transitions) return null;
-  for (var i = 0; i < cfg.transitions.length; i++) {
-    var t = cfg.transitions[i];
-    if (t.type !== "gated" || !t.gates) continue;
-    for (var gi = 0; gi < t.gates.length; gi++) {
-      if (t.gates[gi] === gateName) return t;
-    }
-  }
-  return null;
-}
-
 function processVerdict(cardId, verdict, result, options) {
   var opts = options || {};
   // Guard: skip processing for terminal cards — prevents stale dispatches from
@@ -624,13 +611,6 @@ function processVerdict(cardId, verdict, result, options) {
   var terminalState = agentdesk.pipeline.terminalState(cfg);
   var initialState = agentdesk.pipeline.kickoffState(cfg);
   var inProgressState = agentdesk.pipeline.nextGatedTarget(initialState, cfg);
-  var reviewPassTransition = findGateTransition(cfg, "review_passed");
-  var reviewReworkTransition = findGateTransition(cfg, "review_rework");
-  var reviewState = reviewPassTransition
-    ? reviewPassTransition.from
-    : agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
-  var reviewPassTarget = reviewPassTransition ? reviewPassTransition.to : terminalState;
-  var reviewReworkTarget = reviewReworkTransition ? reviewReworkTransition.to : inProgressState;
 
   var cardCheck = agentdesk.db.query(
     "SELECT status FROM kanban_cards WHERE id = ?", [cardId]
@@ -639,6 +619,20 @@ function processVerdict(cardId, verdict, result, options) {
     agentdesk.log.info("[review] processVerdict skipped — card " + cardId + " already terminal");
     return;
   }
+
+  var fallbackReviewState = agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
+  var currentState = cardCheck.length > 0 ? cardCheck[0].status : null;
+  var currentReviewPassTarget = currentState
+    ? agentdesk.pipeline.nextGatedTargetWithGate(currentState, "review_passed", cfg)
+    : null;
+  var currentReviewReworkTarget = currentState
+    ? agentdesk.pipeline.nextGatedTargetWithGate(currentState, "review_rework", cfg)
+    : null;
+  var reviewState = (currentReviewPassTarget || currentReviewReworkTarget)
+    ? currentState
+    : fallbackReviewState;
+  var reviewPassTarget = agentdesk.pipeline.nextGatedTargetWithGate(reviewState, "review_passed", cfg) || terminalState;
+  var reviewReworkTarget = agentdesk.pipeline.nextGatedTargetWithGate(reviewState, "review_rework", cfg) || inProgressState;
 
   var latestReviewContext = loadLatestReviewDispatchContext(cardId, opts.review_dispatch_id);
   var noopVerification = latestReviewContext.review_mode === "noop_verification";
