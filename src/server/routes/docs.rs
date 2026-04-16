@@ -1665,13 +1665,17 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 body_param("number", false, "Move the entry to another thread group"),
             ),
             (
+                "batch_phase",
+                body_param("number", false, "Move the entry to another batch phase"),
+            ),
+            (
                 "priority_rank",
                 body_param("number", false, "Set the entry's rank within its group"),
             ),
         ])
         .with_example(
-            json!({"path": {"id": "entry-1"}, "body": {"thread_group": 1, "priority_rank": 0}}),
-            json!({"ok": true, "entry": {"id": "entry-1", "thread_group": 1, "priority_rank": 0, "status": "pending"}}),
+            json!({"path": {"id": "entry-1"}, "body": {"thread_group": 1, "batch_phase": 2, "priority_rank": 0}}),
+            json!({"ok": true, "entry": {"id": "entry-1", "thread_group": 1, "batch_phase": 2, "priority_rank": 0, "status": "pending"}}),
         ),
         ep(
             "PATCH",
@@ -1697,6 +1701,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 body_param("string", false, "New run status"),
             ),
             (
+                "max_concurrent_threads",
+                body_param("number", false, "Set the run's concurrency limit"),
+            ),
+            (
                 "unified_thread",
                 body_param(
                     "boolean",
@@ -1706,7 +1714,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             ),
         ])
         .with_example(
-            json!({"path": {"id": "run-1"}, "body": {"status": "completed", "unified_thread": true}}),
+            json!({"path": {"id": "run-1"}, "body": {"status": "completed", "max_concurrent_threads": 4, "unified_thread": true}}),
             json!({"ok": true, "ignored": ["unified_thread"]}),
         ),
         ep(

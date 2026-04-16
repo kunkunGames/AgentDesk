@@ -1774,6 +1774,91 @@ async fn kanban_get_card() {
 }
 
 #[tokio::test]
+async fn kanban_list_and_get_include_latest_dispatch_result_summary() {
+    let db = test_db();
+    seed_test_agents(&db);
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at)
+             VALUES ('card-summary', 'Card Summary', 'in_progress', 'medium', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at
+             ) VALUES (
+                'dispatch-rework-summary', 'card-summary', 'agent-1', 'rework', 'pending',
+                'Rework requested', ?1, datetime('now'), datetime('now')
+             )",
+            [json!({
+                "pm_decision": "rework",
+                "comment": "Handle the race condition"
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE kanban_cards SET latest_dispatch_id = 'dispatch-rework-summary' WHERE id = 'card-summary'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine.clone(), None);
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let listed_card = list_json["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["id"] == "card-summary")
+        .expect("card-summary must be present in kanban list");
+    assert_eq!(
+        listed_card["latest_dispatch_result_summary"],
+        "PM requested rework: Handle the race condition"
+    );
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/kanban-cards/card-summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+    assert_eq!(
+        get_json["card"]["latest_dispatch_result_summary"],
+        "PM requested rework: Handle the race condition"
+    );
+    assert_eq!(get_json["card"]["latest_dispatch_type"], "rework");
+}
+
+#[tokio::test]
 async fn kanban_get_card_not_found() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -3113,6 +3198,113 @@ async fn dispatch_list_with_filter() {
     let dispatches = json["dispatches"].as_array().unwrap();
     assert_eq!(dispatches.len(), 1);
     assert_eq!(dispatches[0]["id"], "d1");
+}
+
+#[tokio::test]
+async fn dispatch_endpoints_include_normalized_result_summary() {
+    let db = test_db();
+    seed_test_agents(&db);
+    let engine = test_engine(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at)
+             VALUES ('card-dispatch-summary', 'Dispatch Summary Card', 'review', 'medium', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-cancel-summary', 'card-dispatch-summary', 'agent-1', 'implementation', 'cancelled',
+                'Cancelled dispatch', ?1, datetime('now', '-1 minute'), datetime('now', '-1 minute')
+             )",
+            [json!({
+                "reason": "auto_cancelled_on_terminal_card"
+            })
+            .to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-review-summary', 'card-dispatch-summary', 'agent-1', 'review-decision', 'completed',
+                'Review decision', ?1, datetime('now'), datetime('now')
+             )",
+            [json!({
+                "decision": "accept",
+                "comment": "Looks good"
+            })
+            .to_string()],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine.clone(), None);
+    let list_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dispatches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let dispatches = list_json["dispatches"].as_array().unwrap();
+
+    let cancelled = dispatches
+        .iter()
+        .find(|dispatch| dispatch["id"] == "dispatch-cancel-summary")
+        .expect("cancelled dispatch must be returned");
+    assert_eq!(
+        cancelled["result_summary"],
+        "Cancelled: terminal card cleanup"
+    );
+    assert_eq!(
+        cancelled["result"]["reason"],
+        serde_json::Value::String("auto_cancelled_on_terminal_card".to_string())
+    );
+
+    let review_decision = dispatches
+        .iter()
+        .find(|dispatch| dispatch["id"] == "dispatch-review-summary")
+        .expect("review decision dispatch must be returned");
+    assert_eq!(
+        review_decision["result_summary"],
+        "Accepted review feedback: Looks good"
+    );
+    assert_eq!(review_decision["result"]["decision"], "accept");
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dispatches/dispatch-review-summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+    assert_eq!(
+        get_json["dispatch"]["result_summary"],
+        "Accepted review feedback: Looks good"
+    );
+    assert_eq!(get_json["dispatch"]["result"]["comment"], "Looks good");
 }
 
 // ── GitHub Repos API tests ────────────────────────────────────
@@ -7080,6 +7272,211 @@ async fn auto_queue_update_entry_restores_skipped_entry_to_pending() {
     assert!(completed_at.is_none());
     assert_eq!(thread_group, 2);
     assert_eq!(priority_rank, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_update_entry_updates_batch_phase_only_and_with_priority_rank() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_agent(&db, "agent-update-phase");
+    seed_auto_queue_card(
+        &db,
+        "card-update-phase",
+        1810,
+        "ready",
+        "agent-update-phase",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-update-phase', 'test-repo', 'agent-update-phase', 'generated', 1, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, batch_phase
+            ) VALUES (
+                'entry-update-phase', 'run-update-phase', 'card-update-phase',
+                'agent-update-phase', 'pending', 3, 0, 0
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/auto-queue/entries/entry-update-phase")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "batch_phase": 2
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["entry"]["batch_phase"], 2);
+
+    {
+        let conn = db.lock().unwrap();
+        let batch_phase: i64 = conn
+            .query_row(
+                "SELECT batch_phase FROM auto_queue_entries WHERE id = 'entry-update-phase'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(batch_phase, 2);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/auto-queue/entries/entry-update-phase")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "batch_phase": 1,
+                        "priority_rank": 0
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["entry"]["batch_phase"], 1);
+    assert_eq!(json["entry"]["priority_rank"], 0);
+
+    let conn = db.lock().unwrap();
+    let entry_meta: (i64, i64) = conn
+        .query_row(
+            "SELECT batch_phase, priority_rank
+             FROM auto_queue_entries
+             WHERE id = 'entry-update-phase'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(entry_meta, (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_update_run_updates_max_concurrent_threads_only_and_with_status() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-update-max', 'test-repo', 'generated', 1, 4
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/auto-queue/runs/run-update-max")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "max_concurrent_threads": 4
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let conn = db.lock().unwrap();
+        let max_concurrent_threads: i64 = conn
+            .query_row(
+                "SELECT max_concurrent_threads
+                 FROM auto_queue_runs
+                 WHERE id = 'run-update-max'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_concurrent_threads, 4);
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/auto-queue/runs/run-update-max")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "status": "completed",
+                        "max_concurrent_threads": 2
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let conn = db.lock().unwrap();
+    let run_meta: (String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT status, max_concurrent_threads, completed_at
+             FROM auto_queue_runs
+             WHERE id = 'run-update-max'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(run_meta.0, "completed");
+    assert_eq!(run_meta.1, 2);
+    assert!(run_meta.2.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

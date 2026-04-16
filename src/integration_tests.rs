@@ -4372,6 +4372,7 @@ mod tests {
         assert_eq!(body["cancelled_runs"].as_u64(), Some(1));
         assert_eq!(body["cancelled_dispatches"].as_u64(), Some(1));
         assert_eq!(body["cancelled_entries"].as_u64(), Some(2));
+        assert_eq!(body["rolled_back_cards"].as_u64(), Some(1));
         assert_eq!(body["released_slots"].as_u64(), Some(1));
         assert_eq!(body["cleared_slot_sessions"].as_u64(), Some(1));
         drop(conn);
@@ -4382,6 +4383,13 @@ mod tests {
                 "SELECT status FROM auto_queue_runs WHERE id = 'run-cancel-cleanup'",
                 [],
                 |row| row.get(0),
+            )
+            .unwrap();
+        let (card_status, latest_dispatch_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, latest_dispatch_id FROM kanban_cards WHERE id = 'card-cancel-live'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let entry_statuses: Vec<(String, String)> = conn
@@ -4426,11 +4434,184 @@ mod tests {
             "cancel should skip both in-flight and pending entries after cleanup"
         );
         assert_eq!(dispatch_status, "cancelled");
+        assert_eq!(
+            card_status, "ready",
+            "cancelled run should roll back an in-progress card to ready"
+        );
+        assert!(
+            latest_dispatch_id.is_none(),
+            "cancelled run rollback should clear latest_dispatch_id"
+        );
         assert!(assigned_run_id.is_none());
         assert!(assigned_thread_group.is_none());
         assert_eq!(session_status, "idle");
         assert!(active_dispatch_id.is_none());
         assert_eq!(session_info.as_deref(), Some("Slot thread reset"));
+    }
+
+    #[test]
+    fn auto_queue_cancel_rolls_back_requested_and_in_progress_cards_but_not_review() {
+        let db = test_db();
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-cancel-requested", "requested");
+        seed_card(&db, "card-cancel-progress", "in_progress");
+        seed_card(&db, "card-cancel-review", "review");
+        seed_dispatch(
+            &db,
+            "dispatch-cancel-requested",
+            "card-cancel-requested",
+            "implementation",
+            "dispatched",
+        );
+        seed_dispatch(
+            &db,
+            "dispatch-cancel-progress",
+            "card-cancel-progress",
+            "implementation",
+            "dispatched",
+        );
+        seed_dispatch(
+            &db,
+            "dispatch-cancel-review",
+            "card-cancel-review",
+            "review",
+            "dispatched",
+        );
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards
+                 SET review_status = 'pending', blocked_reason = 'manual:waiting'
+                 WHERE id IN ('card-cancel-requested', 'card-cancel-progress')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-cancel-rollback', 'repo-1', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-cancel-requested', 'run-cancel-rollback', 'card-cancel-requested', 'agent-1', 'dispatched', 'dispatch-cancel-requested', 0, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-cancel-progress', 'run-cancel-rollback', 'card-cancel-progress', 'agent-1', 'dispatched', 'dispatch-cancel-progress', 1, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, priority_rank, dispatched_at, created_at) \
+                 VALUES ('entry-cancel-review', 'run-cancel-rollback', 'card-cancel-review', 'agent-1', 'dispatched', 'dispatch-cancel-review', 2, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = db.separate_conn().expect("separate conn");
+        let body = crate::server::routes::auto_queue::cancel_with_conn(None, &conn);
+        assert_eq!(body["cancelled_runs"].as_u64(), Some(1));
+        assert_eq!(body["cancelled_dispatches"].as_u64(), Some(3));
+        assert_eq!(body["cancelled_entries"].as_u64(), Some(3));
+        assert_eq!(body["rolled_back_cards"].as_u64(), Some(2));
+        drop(conn);
+
+        let conn = db.lock().unwrap();
+        let requested_card: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, review_status, blocked_reason, latest_dispatch_id
+                 FROM kanban_cards WHERE id = 'card-cancel-requested'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let in_progress_card: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, review_status, blocked_reason, latest_dispatch_id
+                 FROM kanban_cards WHERE id = 'card-cancel-progress'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let review_card: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, review_status, blocked_reason, latest_dispatch_id
+                 FROM kanban_cards WHERE id = 'card-cancel-review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let requested_live_dispatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches
+                 WHERE kanban_card_id = 'card-cancel-requested' AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let in_progress_live_dispatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches
+                 WHERE kanban_card_id = 'card-cancel-progress' AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            requested_card.0, "ready",
+            "cancelled requested card should roll back to ready"
+        );
+        assert_eq!(
+            in_progress_card.0, "ready",
+            "cancelled in-progress card should roll back to ready"
+        );
+        assert_eq!(
+            requested_card.1, None,
+            "rollback should clear requested-card review_status"
+        );
+        assert_eq!(
+            in_progress_card.1, None,
+            "rollback should clear in-progress-card review_status"
+        );
+        assert_eq!(
+            requested_card.2, None,
+            "rollback should clear requested-card blocked_reason"
+        );
+        assert_eq!(
+            in_progress_card.2, None,
+            "rollback should clear in-progress-card blocked_reason"
+        );
+        assert!(
+            requested_card.3.is_none(),
+            "rollback should clear requested-card latest_dispatch_id"
+        );
+        assert!(
+            in_progress_card.3.is_none(),
+            "rollback should clear in-progress-card latest_dispatch_id"
+        );
+        assert_eq!(
+            requested_live_dispatches, 0,
+            "requested card should not keep a live dispatch after run cancel"
+        );
+        assert_eq!(
+            in_progress_live_dispatches, 0,
+            "in-progress card should not keep a live dispatch after run cancel"
+        );
+        assert_eq!(
+            review_card.0, "review",
+            "review card must not be rolled back by run cancel"
+        );
+        assert!(
+            review_card.3.is_some(),
+            "review card should keep its latest_dispatch_id because rollback is skipped"
+        );
     }
 
     #[test]
@@ -5833,6 +6014,150 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scenario_211_terminal_direct_merge_push_rejected_falls_back_to_pr_and_resets_main() {
+        let (repo, remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-push-rejected"),
+                stdout: "https://github.com/test/repo/pull/904",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-push-rejected",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-push-rejected"]);
+
+        let worktree_path = worktrees_dir.join("card-211-push-rejected");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-push-rejected",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "feature\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: push rejected fallback #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let remote_clone = tempfile::tempdir().unwrap();
+        let clone_output = Command::new("git")
+            .args([
+                "clone",
+                remote.path().to_str().unwrap(),
+                remote_clone.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            clone_output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        run_git(
+            remote_clone.path(),
+            &["config", "user.email", "test@test.com"],
+        );
+        run_git(remote_clone.path(), &["config", "user.name", "Remote Test"]);
+        fs::write(remote_clone.path().join("remote-only.txt"), "remote\n").unwrap();
+        run_git(remote_clone.path(), &["add", "remote-only.txt"]);
+        run_git(
+            remote_clone.path(),
+            &["commit", "-m", "remote main advance"],
+        );
+        run_git(remote_clone.path(), &["push", "origin", "main"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-211-push-rejected",
+            "done",
+            "test/repo",
+            217,
+            None,
+        );
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-push-rejected",
+            "card-211-push-rejected",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-push-rejected",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-push-rejected"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(get_card_status(&db, "card-211-push-rejected"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-push-rejected").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(
+            pr_tracking_pr_number(&db, "card-211-push-rejected"),
+            Some(904)
+        );
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-push-rejected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        let merged = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &feature_commit,
+                "origin/main",
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(
+            !merged.success(),
+            "push-rejected fallback must leave the feature commit out of origin/main"
+        );
+        assert_eq!(
+            run_git_output(repo.path(), &["rev-list", "--count", "origin/main..main"]),
+            "0",
+            "local main must be reset after a rejected direct push"
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains("pr create --repo test/repo --base main --head wt/card-211-push-rejected"),
+            "push-rejected direct merge must fall back to PR creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scenario_211_pr_always_creates_pr_without_direct_merge_and_waits_for_codex_approval() {
         let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
             MockGhReply {
@@ -6097,6 +6422,148 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn scenario_211_terminal_direct_merge_rebase_conflict_falls_back_to_pr() {
+        let (repo, remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-rebase-conflict"),
+                stdout: "https://github.com/test/repo/pull/906",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-rebase-conflict",
+            },
+        ]);
+        fs::write(repo.path().join("shared.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "shared.txt"]);
+        run_git(repo.path(), &["commit", "-m", "base shared file"]);
+        run_git(repo.path(), &["push", "origin", "main"]);
+
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-rebase-conflict"]);
+
+        let worktree_path = worktrees_dir.join("card-211-rebase-conflict");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-rebase-conflict",
+            ],
+        );
+        fs::write(worktree_path.join("shared.txt"), "feature version\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "shared.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feature rebase conflict change #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let remote_clone = tempfile::tempdir().unwrap();
+        let clone_output = Command::new("git")
+            .args([
+                "clone",
+                remote.path().to_str().unwrap(),
+                remote_clone.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            clone_output.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        );
+        run_git(
+            remote_clone.path(),
+            &["config", "user.email", "test@test.com"],
+        );
+        run_git(remote_clone.path(), &["config", "user.name", "Remote Test"]);
+        fs::write(remote_clone.path().join("shared.txt"), "main version\n").unwrap();
+        run_git(remote_clone.path(), &["add", "shared.txt"]);
+        run_git(
+            remote_clone.path(),
+            &["commit", "-m", "remote main conflicting advance"],
+        );
+        run_git(remote_clone.path(), &["push", "origin", "main"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-211-rebase-conflict",
+            "done",
+            "test/repo",
+            219,
+            None,
+        );
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-rebase-conflict",
+            "card-211-rebase-conflict",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-rebase-conflict",
+            &feature_commit,
+        );
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTerminal",
+                serde_json::json!({"card_id": "card-211-rebase-conflict"}),
+            )
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(get_card_status(&db, "card-211-rebase-conflict"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-rebase-conflict").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(
+            pr_tracking_pr_number(&db, "card-211-rebase-conflict"),
+            Some(906)
+        );
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-rebase-conflict'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        run_git(repo.path(), &["fetch", "origin", "main"]);
+        assert_eq!(
+            run_git_output(repo.path(), &["show", "origin/main:shared.txt"]),
+            "main version",
+            "rebase-conflict fallback must keep origin/main on the remote-advanced contents"
+        );
+        assert_eq!(
+            run_git_output(repo.path(), &["show", "main:shared.txt"]),
+            "base",
+            "local main must reset to the pre-merge HEAD after rebase conflict fallback"
+        );
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains(
+                "pr create --repo test/repo --base main --head wt/card-211-rebase-conflict"
+            ),
+            "rebase conflicts must fall back to PR creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scenario_211_terminal_direct_merge_conflict_creates_pr_and_wait_ci() {
         let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
             MockGhReply {
@@ -6188,6 +6655,119 @@ mod tests {
         assert!(
             log.contains("pr create --repo test/repo --base main --head wt/card-211-conflict"),
             "conflict fallback must create a PR for the tracked branch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_211_tick5min_retries_create_pr_rows_until_wait_ci() {
+        let (repo, _remote, gh) = setup_test_repo_with_origin_and_mock_gh(&[
+            MockGhReply {
+                key: "pr:create",
+                contains: Some("--head wt/card-211-create-pr-retry"),
+                stdout: "https://github.com/test/repo/pull/905",
+            },
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "feature-sha-211-create-pr-retry",
+            },
+        ]);
+        let worktrees_dir = repo.path().join("worktrees");
+        fs::create_dir_all(&worktrees_dir).unwrap();
+        run_git(repo.path(), &["branch", "wt/card-211-create-pr-retry"]);
+
+        let worktree_path = worktrees_dir.join("card-211-create-pr-retry");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt/card-211-create-pr-retry",
+            ],
+        );
+        fs::write(worktree_path.join("feature.txt"), "retry\n").unwrap();
+        run_git(worktree_path.as_path(), &["add", "feature.txt"]);
+        run_git(
+            worktree_path.as_path(),
+            &["commit", "-m", "feat: create-pr retry path #211"],
+        );
+        let feature_commit = run_git_output(worktree_path.as_path(), &["rev-parse", "HEAD"]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-211-create-pr-retry",
+            "done",
+            "test/repo",
+            218,
+            None,
+        );
+        set_kv(&db, "merge_automation_enabled", "true");
+        seed_completed_work_dispatch_target(
+            &db,
+            "impl-211-create-pr-retry",
+            "card-211-create-pr-retry",
+            "implementation",
+            worktree_path.to_str().unwrap(),
+            "wt/card-211-create-pr-retry",
+            &feature_commit,
+        );
+        seed_pr_tracking(
+            &db,
+            "card-211-create-pr-retry",
+            "test/repo",
+            Some(worktree_path.to_str().unwrap()),
+            "wt/card-211-create-pr-retry",
+            None,
+            Some(feature_commit.as_str()),
+            "create-pr",
+        );
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed' WHERE id = 'card-211-create-pr-retry'",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .try_fire_hook_by_name("OnTick5min", serde_json::json!({}))
+            .unwrap();
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(get_card_status(&db, "card-211-create-pr-retry"), "done");
+        assert_eq!(
+            pr_tracking_state(&db, "card-211-create-pr-retry").as_deref(),
+            Some("wait-ci")
+        );
+        assert_eq!(
+            pr_tracking_pr_number(&db, "card-211-create-pr-retry"),
+            Some(905)
+        );
+
+        let conn = db.lock().unwrap();
+        let blocked_reason: Option<String> = conn
+            .query_row(
+                "SELECT blocked_reason FROM kanban_cards WHERE id = 'card-211-create-pr-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_reason.as_deref(), Some("ci:waiting"));
+        drop(conn);
+
+        let log = gh_log(&gh._gh);
+        assert!(
+            log.contains(
+                "pr create --repo test/repo --base main --head wt/card-211-create-pr-retry"
+            ),
+            "create-pr rows must be retried on OnTick5min"
         );
     }
 

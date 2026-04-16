@@ -94,10 +94,11 @@ pub(super) fn dispatch_context_worktree_target(
         return Ok(None);
     };
     if !std::path::Path::new(path).is_dir() {
-        anyhow::bail!(
-            "Cannot create dispatch with explicit worktree_path '{}': path does not exist or is not a directory",
+        tracing::warn!(
+            "[dispatch] Ignoring explicit worktree_path '{}' because the path does not exist or is not a directory; falling back to canonical worktree resolution",
             path
         );
+        return Ok(None);
     }
 
     let branch = json_string_field(context, "worktree_branch")
@@ -327,6 +328,126 @@ pub(crate) fn commit_belongs_to_card_issue(
     let subject = String::from_utf8_lossy(&output.stdout);
     let pattern = format!("(#{})", issue_number);
     subject.contains(&pattern)
+}
+
+fn git_commit_exists(dir: &str, commit_sha: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{commit_sha}^{{commit}}")])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success())
+}
+
+fn resolve_review_target_branch(
+    db: &Db,
+    card_id: &str,
+    dir: &str,
+    reviewed_commit: &str,
+    preferred_branch: Option<&str>,
+) -> Option<String> {
+    let issue_branch_hint = load_card_issue_repo(db, card_id)
+        .and_then(|(issue_number, _)| issue_number.map(|value| value.to_string()));
+    crate::services::platform::shell::git_branch_containing_commit(
+        dir,
+        reviewed_commit,
+        preferred_branch,
+        issue_branch_hint.as_deref(),
+    )
+    .or_else(|| preferred_branch.map(str::to_string))
+    .or_else(|| crate::services::platform::shell::git_branch_name(dir))
+}
+
+fn refresh_review_target_worktree(
+    db: &Db,
+    card_id: &str,
+    context: &serde_json::Value,
+    target: &DispatchExecutionTarget,
+) -> Result<Option<DispatchExecutionTarget>> {
+    if target
+        .worktree_path
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path).is_dir())
+    {
+        return Ok(Some(target.clone()));
+    }
+
+    if let Some(stale_path) = target.worktree_path.as_deref() {
+        tracing::warn!(
+            "[dispatch] Review dispatch for card {}: latest work target path '{}' no longer exists — attempting fallback",
+            card_id,
+            stale_path
+        );
+    }
+
+    if let Some((wt_path, wt_branch, _wt_commit)) =
+        resolve_card_worktree(db, card_id, Some(context))?
+    {
+        if git_commit_exists(&wt_path, &target.reviewed_commit) {
+            let branch = resolve_review_target_branch(
+                db,
+                card_id,
+                &wt_path,
+                &target.reviewed_commit,
+                target.branch.as_deref().or(Some(wt_branch.as_str())),
+            )
+            .or(Some(wt_branch));
+            tracing::info!(
+                "[dispatch] Review dispatch for card {}: refreshed worktree path to active issue worktree '{}' for commit {}",
+                card_id,
+                wt_path,
+                &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
+            );
+            return Ok(Some(DispatchExecutionTarget {
+                reviewed_commit: target.reviewed_commit.clone(),
+                branch,
+                worktree_path: Some(wt_path),
+                target_repo: target.target_repo.clone(),
+            }));
+        }
+
+        tracing::warn!(
+            "[dispatch] Review dispatch for card {}: active issue worktree does not contain commit {} — skipping path refresh",
+            card_id,
+            &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
+        );
+    }
+
+    if let Some(repo_dir) = resolve_card_repo_dir_with_context(
+        db,
+        card_id,
+        Some(context),
+        "recover review target repo",
+    )? {
+        if git_commit_exists(&repo_dir, &target.reviewed_commit) {
+            let branch = resolve_review_target_branch(
+                db,
+                card_id,
+                &repo_dir,
+                &target.reviewed_commit,
+                target.branch.as_deref(),
+            );
+            tracing::info!(
+                "[dispatch] Review dispatch for card {}: falling back to repo dir '{}' for commit {} after stale worktree cleanup",
+                card_id,
+                repo_dir,
+                &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
+            );
+            return Ok(Some(DispatchExecutionTarget {
+                reviewed_commit: target.reviewed_commit.clone(),
+                branch,
+                worktree_path: Some(repo_dir),
+                target_repo: target.target_repo.clone(),
+            }));
+        }
+    }
+
+    tracing::warn!(
+        "[dispatch] Review dispatch for card {}: no usable worktree or repo path contains commit {} after stale worktree cleanup",
+        card_id,
+        &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
+    );
+    Ok(None)
 }
 
 fn latest_completed_work_dispatch_target(
@@ -783,24 +904,30 @@ pub(super) fn build_review_context(
     if let Some(obj) = ctx_val.as_object_mut() {
         if !is_noop_verification && !obj.contains_key("reviewed_commit") {
             let latest_work_target = latest_completed_work_dispatch_target(db, kanban_card_id);
-            let validated_work_target = latest_work_target.as_ref().filter(|t| {
+            let validated_work_target = if let Some(target) = latest_work_target.as_ref() {
                 let valid = commit_belongs_to_card_issue(
                     db,
                     kanban_card_id,
-                    &t.reviewed_commit,
-                    t.target_repo.as_deref().or(target_repo.as_deref()),
+                    &target.reviewed_commit,
+                    target.target_repo.as_deref().or(target_repo.as_deref()),
                 );
                 if !valid {
                     tracing::warn!(
                         "[dispatch] Review dispatch for card {}: work target commit {} doesn't match card issue — skipping to next fallback",
                         kanban_card_id,
-                        &t.reviewed_commit[..8.min(t.reviewed_commit.len())]
+                        &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
                     );
                 }
-                valid
-            });
+                if valid {
+                    refresh_review_target_worktree(db, kanban_card_id, &ctx_snapshot, target)?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(target) = validated_work_target {
-                apply_review_target_context(target, obj);
+                apply_review_target_context(&target, obj);
                 tracing::info!(
                     "[dispatch] Review dispatch for card {}: reusing latest work target (commit {}, branch: {:?}, path: {:?})",
                     kanban_card_id,
@@ -906,4 +1033,277 @@ pub(super) fn build_review_context(
         }
     }
     Ok(serde_json::to_string(&ctx_val)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::engine::PolicyEngine;
+    use serde_json::json;
+    use std::process::Command;
+    use std::sync::MutexGuard;
+
+    struct RepoDirOverride {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl RepoDirOverride {
+        fn new(path: &str) -> Self {
+            let lock = crate::services::discord::runtime_store::lock_test_env();
+            let previous = std::env::var("AGENTDESK_REPO_DIR").ok();
+            unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) };
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for RepoDirOverride {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_deref() {
+                unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) };
+            } else {
+                unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
+            }
+        }
+    }
+
+    fn test_db() -> Db {
+        let db = crate::db::test_db();
+        let conn = db.separate_conn().unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO agents (id, name, discord_channel_id, discord_channel_alt)
+                 VALUES ('agent-1', 'Agent 1', '111', '222');",
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
+    fn test_engine(db: &Db) -> PolicyEngine {
+        let config = crate::config::Config::default();
+        PolicyEngine::new(&config, db.clone()).unwrap()
+    }
+
+    fn run_git(dir: &str, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_test_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap();
+        run_git(repo_dir, &["init", "-b", "main"]);
+        run_git(repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(repo_dir, &["config", "user.name", "Test"]);
+        run_git(repo_dir, &["commit", "--allow-empty", "-m", "initial"]);
+        repo
+    }
+
+    fn setup_test_repo() -> (tempfile::TempDir, RepoDirOverride) {
+        let repo = init_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let repo_override = RepoDirOverride::new(repo_dir);
+        (repo, repo_override)
+    }
+
+    fn git_commit(dir: &str, message: &str) -> String {
+        run_git(dir, &["commit", "--allow-empty", "-m", message]);
+        crate::services::platform::git_head_commit(dir).unwrap()
+    }
+
+    fn canonicalize_path(path: &str) -> String {
+        std::fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn seed_card(db: &Db, card_id: &str, issue_number: i64, status: &str) {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, github_issue_number, created_at, updated_at
+             ) VALUES (
+                ?1, 'Test Card', ?2, ?3, datetime('now'), datetime('now')
+             )",
+            rusqlite::params![card_id, status, issue_number],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dispatch_context_worktree_target_ignores_stale_explicit_path() {
+        let context = json!({
+            "worktree_path": "/tmp/agentdesk-stale-dispatch-context-worktree",
+            "worktree_branch": "wt/stale-693"
+        });
+
+        let target = dispatch_context_worktree_target(&context).unwrap();
+
+        assert!(
+            target.is_none(),
+            "stale explicit worktree_path must fall through to later recovery"
+        );
+    }
+
+    #[test]
+    fn create_dispatch_falls_back_after_stale_explicit_worktree_path() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_card(&db, "card-dispatch-stale-explicit", 693, "ready");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let stale_wt_dir = repo.path().join("wt-693-stale");
+        let stale_wt_path = stale_wt_dir.to_str().unwrap();
+        run_git(
+            repo_dir,
+            &["worktree", "add", "-b", "wt/693-stale", stale_wt_path],
+        );
+        let reviewed_commit = git_commit(stale_wt_path, "fix: stale explicit worktree (#693)");
+        run_git(repo_dir, &["worktree", "remove", "--force", stale_wt_path]);
+        run_git(repo_dir, &["branch", "-D", "wt/693-stale"]);
+
+        let live_wt_dir = repo.path().join("wt-693-live");
+        let live_wt_path = live_wt_dir.to_str().unwrap();
+        run_git(repo_dir, &["branch", "wt/693-live", &reviewed_commit]);
+        run_git(repo_dir, &["worktree", "add", live_wt_path, "wt/693-live"]);
+
+        let dispatch = crate::dispatch::create_dispatch(
+            &db,
+            &engine,
+            "card-dispatch-stale-explicit",
+            "agent-1",
+            "implementation",
+            "Recover stale explicit worktree",
+            &json!({
+                "worktree_path": stale_wt_path
+            }),
+        )
+        .expect("stale explicit worktree_path should not block dispatch creation");
+
+        let context = &dispatch["context"];
+        assert_eq!(
+            canonicalize_path(context["worktree_path"].as_str().unwrap()),
+            canonicalize_path(live_wt_path)
+        );
+        assert_eq!(context["worktree_branch"], "wt/693-live");
+    }
+
+    #[test]
+    fn refresh_review_target_worktree_recovers_active_issue_worktree() {
+        let db = test_db();
+        seed_card(&db, "card-review-active-refresh", 701, "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let stale_wt_dir = repo.path().join("wt-701-stale");
+        let stale_wt_path = stale_wt_dir.to_str().unwrap();
+        run_git(
+            repo_dir,
+            &["worktree", "add", "-b", "wt/701-stale", stale_wt_path],
+        );
+        let reviewed_commit = git_commit(stale_wt_path, "fix: review fallback target (#701)");
+        run_git(repo_dir, &["worktree", "remove", "--force", stale_wt_path]);
+        run_git(repo_dir, &["branch", "-D", "wt/701-stale"]);
+
+        let live_wt_dir = repo.path().join("wt-701-live");
+        let live_wt_path = live_wt_dir.to_str().unwrap();
+        run_git(repo_dir, &["branch", "wt/701-live", &reviewed_commit]);
+        run_git(repo_dir, &["worktree", "add", live_wt_path, "wt/701-live"]);
+
+        let refreshed = refresh_review_target_worktree(
+            &db,
+            "card-review-active-refresh",
+            &json!({}),
+            &DispatchExecutionTarget {
+                reviewed_commit: reviewed_commit.clone(),
+                branch: Some("wt/701-stale".to_string()),
+                worktree_path: Some(stale_wt_path.to_string()),
+                target_repo: None,
+            },
+        )
+        .unwrap()
+        .expect("active issue worktree should replace stale path");
+
+        assert_eq!(refreshed.reviewed_commit, reviewed_commit);
+        assert_eq!(
+            refreshed.worktree_path.as_deref().map(canonicalize_path),
+            Some(canonicalize_path(live_wt_path))
+        );
+        assert_eq!(refreshed.branch.as_deref(), Some("wt/701-live"));
+    }
+
+    #[test]
+    fn refresh_review_target_worktree_falls_back_to_repo_dir() {
+        let db = test_db();
+        seed_card(&db, "card-review-repo-refresh", 702, "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap();
+        let reviewed_commit = git_commit(repo_dir, "fix: repo fallback target (#702)");
+        let stale_wt_path = repo.path().join("wt-702-missing");
+
+        let refreshed = refresh_review_target_worktree(
+            &db,
+            "card-review-repo-refresh",
+            &json!({}),
+            &DispatchExecutionTarget {
+                reviewed_commit: reviewed_commit.clone(),
+                branch: Some("wt/702-missing".to_string()),
+                worktree_path: Some(stale_wt_path.to_string_lossy().into_owned()),
+                target_repo: None,
+            },
+        )
+        .unwrap()
+        .expect("repo dir should be used when no active issue worktree exists");
+
+        assert_eq!(refreshed.reviewed_commit, reviewed_commit);
+        assert_eq!(
+            refreshed.worktree_path.as_deref().map(canonicalize_path),
+            Some(canonicalize_path(repo_dir))
+        );
+        assert_eq!(refreshed.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn refresh_review_target_worktree_returns_none_when_no_fallback_contains_commit() {
+        let db = test_db();
+        seed_card(&db, "card-review-refresh-miss", 703, "review");
+
+        let (repo, _repo_override) = setup_test_repo();
+        let stale_wt_path = repo.path().join("wt-703-missing");
+        let missing_commit = "1111111111111111111111111111111111111111".to_string();
+
+        let refreshed = refresh_review_target_worktree(
+            &db,
+            "card-review-refresh-miss",
+            &json!({}),
+            &DispatchExecutionTarget {
+                reviewed_commit: missing_commit,
+                branch: Some("wt/703-missing".to_string()),
+                worktree_path: Some(stale_wt_path.to_string_lossy().into_owned()),
+                target_repo: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            refreshed.is_none(),
+            "refresh must report failure when neither worktree nor repo dir has the commit"
+        );
+    }
 }
