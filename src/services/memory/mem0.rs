@@ -425,6 +425,7 @@ fn format_search_payload_for_external_recall(
 
     format_external_recall(&memory_lines, &relation_lines)
 }
+
 impl MemoryBackend for Mem0Backend {
     fn recall<'a>(&'a self, request: RecallRequest) -> MemoryFuture<'a, RecallResponse> {
         Box::pin(async move {
@@ -750,6 +751,7 @@ mod tests {
         assert!(formatted.contains("Planner uses Neo4j for architecture notes."));
         assert!(formatted.contains("planner -- uses -- neo4j"));
     }
+
     #[tokio::test]
     async fn test_mem0_recall_falls_back_to_local_when_env_missing() {
         let (_guard, prev_api_key, prev_base_url) = clear_mem0_env();

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
 # build-release.sh — Build AgentDesk release artifact for GitHub Releases
-# Official release-only build entrypoint for local deploy/promotion flows
 #
 # Usage:
 #   ./scripts/build-release.sh              # full build + package

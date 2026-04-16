@@ -38,6 +38,8 @@ home_dir="\${HOME:-$HOME_DIR}"
 candidates=(
   "\$home_dir/.adk/release/bin/agentdesk"
   "\$home_dir/.adk/release/agentdesk"
+  "\$home_dir/.adk/dev/bin/agentdesk"
+  "\$home_dir/.adk/dev/agentdesk"
 )
 
 for candidate in "\${candidates[@]}"; do

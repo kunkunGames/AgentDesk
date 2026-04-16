@@ -573,11 +573,11 @@ fn audit_db_agents(
     }
 
     match crate::db::agents::sync_agents_from_config(db, &config.agents) {
-        Ok(result) => {
-            report.db.synced_agents = Some(result.upserted);
+        Ok(count) => {
+            report.db.synced_agents = Some(count);
             report.actions.push(format!(
                 "synced {} agent definitions from agentdesk.yaml into the agents table",
-                result.upserted
+                count
             ));
         }
         Err(err) => report.warnings.push(format!(

@@ -916,26 +916,14 @@ async fn reset_stale_slot_thread_if_needed(
         total_message_sent,
         age_limit_hit,
     );
-    match reset_slot_thread_bindings_excluding(
+    reset_slot_thread_bindings_excluding(
         db,
         &slot_binding.agent_id,
         slot_binding.slot_index,
         Some(dispatch_id),
     )
-    .await
-    {
-        Ok(_) => Ok(true),
-        Err(err) => {
-            tracing::warn!(
-                "[dispatch] stale slot thread reset failed for dispatch {}: agent={} slot={} error={}",
-                dispatch_id,
-                slot_binding.agent_id,
-                slot_binding.slot_index,
-                err
-            );
-            Ok(false)
-        }
-    }
+    .await?;
+    Ok(true)
 }
 
 async fn archive_duplicate_slot_threads(
@@ -2400,9 +2388,10 @@ mod tests {
                     .into_response();
             }
 
-            let (archived, thread_name, parent_id) = {
+            let (archived, thread_name, parent_id, total_message_sent) = {
                 let mut state = state.lock().unwrap();
                 state.calls.push(format!("GET /channels/{thread_id}"));
+                let total_message_sent = if thread_id == "thread-stale" { 501 } else { 0 };
                 (
                     state.archived,
                     state
@@ -2415,6 +2404,7 @@ mod tests {
                         .get(&thread_id)
                         .cloned()
                         .unwrap_or_else(|| "123".to_string()),
+                    total_message_sent,
                 )
             };
             (
@@ -2423,6 +2413,7 @@ mod tests {
                     "id": thread_id,
                     "name": thread_name,
                     "parent_id": parent_id,
+                    "total_message_sent": total_message_sent,
                     "thread_metadata": {
                         "archived": archived,
                     }
@@ -3367,6 +3358,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(thread_id.as_deref(), Some("thread-created"));
+    }
+
+    #[tokio::test]
+    async fn stale_slot_thread_reset_failure_fails_closed() {
+        let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Agent 1', '123')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (
+                    id, title, status, assigned_agent_id, latest_dispatch_id, created_at, updated_at
+                ) VALUES (
+                    'card-current', 'Stale reset card', 'requested', 'agent-1', 'dispatch-current',
+                    datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (
+                    id, title, status, assigned_agent_id, latest_dispatch_id, created_at, updated_at
+                ) VALUES (
+                    'card-other', 'Conflicting card', 'in_progress', 'agent-1', 'dispatch-other',
+                    datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, context,
+                    created_at, updated_at
+                ) VALUES (
+                    'dispatch-current', 'card-current', 'agent-1', 'implementation', 'pending',
+                    'Stale reset card', '{\"slot_index\":1}', datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, context,
+                    created_at, updated_at
+                ) VALUES (
+                    'dispatch-other', 'card-other', 'agent-1', 'implementation', 'dispatched',
+                    'Conflicting card', '{\"slot_index\":1}', datetime('now'), datetime('now')
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
+                 VALUES ('agent-1', 1, '{\"123\":\"thread-stale\"}')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let error = send_dispatch_to_discord_inner_with_context(
+            &db,
+            "agent-1",
+            "Stale reset card",
+            "card-current",
+            "dispatch-current",
+            "announce-token",
+            &base_url,
+            None,
+        )
+        .await
+        .expect_err("stale slot thread reset failures must fail closed");
+
+        server_handle.abort();
+
+        assert!(error.contains("has active dispatch"));
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.calls,
+            vec!["GET /channels/thread-stale".to_string()],
+            "reset failure must not continue into new-thread creation or reuse writes"
+        );
     }
 
     #[tokio::test]

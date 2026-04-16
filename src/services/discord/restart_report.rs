@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::formatting::send_long_message_raw;
 use super::runtime_store::{atomic_write, discord_restart_reports_root};
-use super::settings::{BotChannelRoutingGuardFailure, validate_bot_channel_routing};
+use super::settings::validate_bot_channel_routing;
 use super::{SharedData, mailbox_has_active_turn, mailbox_snapshot};
 use crate::services::provider::ProviderKind;
 
@@ -214,10 +214,6 @@ fn report_age(report: &RestartCompletionReport) -> Option<Duration> {
     delta.to_std().ok()
 }
 
-fn should_clear_restart_report_on_routing_failure(reason: BotChannelRoutingGuardFailure) -> bool {
-    !reason.is_expected_cross_bot_skip()
-}
-
 fn is_unrecoverable_flush_error(error: &str) -> bool {
     error.contains("Unknown Channel")
 }
@@ -410,9 +406,7 @@ mod tests {
     use super::{
         RESTART_REPORT_VERSION, RestartCompletionReport, is_unrecoverable_flush_error,
         load_restart_reports_in_root, save_restart_report_in_root,
-        should_clear_restart_report_on_routing_failure,
     };
-    use crate::services::discord::settings::BotChannelRoutingGuardFailure;
     use crate::services::provider::ProviderKind;
     use tempfile::TempDir;
 
@@ -490,18 +484,5 @@ mod tests {
     fn test_unknown_channel_is_unrecoverable() {
         assert!(is_unrecoverable_flush_error("Unknown Channel"));
         assert!(!is_unrecoverable_flush_error("temporary network error"));
-    }
-
-    #[test]
-    fn test_expected_cross_bot_skip_preserves_restart_report() {
-        assert!(!should_clear_restart_report_on_routing_failure(
-            BotChannelRoutingGuardFailure::ChannelNotAllowed
-        ));
-        assert!(!should_clear_restart_report_on_routing_failure(
-            BotChannelRoutingGuardFailure::AgentMismatch
-        ));
-        assert!(should_clear_restart_report_on_routing_failure(
-            BotChannelRoutingGuardFailure::ProviderMismatch
-        ));
     }
 }

@@ -22,18 +22,21 @@ export function useNotifications(maxItems = 50) {
   );
 
   const updateNotification = useCallback(
-    (id: string, message: string, type: Notification["type"] = "info") => {
-      setNotifications((prev) => {
-        const index = prev.findIndex((notification) => notification.id === id);
-        if (index === -1) {
-          return [{ id, message, type, ts: Date.now() }, ...prev].slice(0, maxItems);
-        }
-        const next = [...prev];
-        next[index] = { ...next[index], message, type, ts: Date.now() };
-        return next;
-      });
+    (id: string, message: string, type?: Notification["type"]) => {
+      setNotifications((prev) =>
+        prev.map((notification) =>
+          notification.id === id
+            ? {
+                ...notification,
+                message,
+                type: type ?? notification.type,
+                ts: Date.now(),
+              }
+            : notification,
+        ),
+      );
     },
-    [maxItems],
+    [],
   );
 
   const dismissNotification = useCallback((id: string) => {

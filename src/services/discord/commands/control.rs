@@ -106,13 +106,13 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
-) -> bool {
+) {
     if shared
         .model_session_reset_pending
         .remove(&channel_id)
         .is_none()
     {
-        return false;
+        return;
     }
 
     let tmux_name = {
@@ -140,8 +140,6 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
         }
         ManagedSessionResetBehavior::Noop => {}
     }
-
-    true
 }
 
 pub(in crate::services::discord) async fn clear_channel_session_state(
@@ -413,6 +411,7 @@ mod tests {
             ManagedSessionResetBehavior::Noop
         );
     }
+
     #[test]
     fn fallback_channel_name_for_clear_uses_synthetic_thread_name() {
         let channel_id = ChannelId::new(12345);

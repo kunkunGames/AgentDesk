@@ -72,8 +72,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     effective_rounds    INTEGER,
     started_at          DATETIME,
     completed_at        DATETIME,
-    summary             TEXT,
-    selection_reason    TEXT
+    summary             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS meeting_transcripts (

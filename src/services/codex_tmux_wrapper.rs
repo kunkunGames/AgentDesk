@@ -211,13 +211,18 @@ fn cleanup(output_file: &str, input_fifo: &str) {
     let _ = std::fs::remove_file(input_fifo);
 }
 
-fn build_run_turn_args(
+fn run_turn(
+    output: &mut std::fs::File,
+    codex_bin: &str,
     codex_model: Option<&str>,
     reasoning_effort: Option<&str>,
-    thread_id: Option<&str>,
-    compact_token_limit: Option<u64>,
+    working_dir: &str,
     prompt: &str,
-) -> Vec<String> {
+    thread_id: &mut Option<String>,
+    compact_token_limit: Option<u64>,
+) -> Result<(), String> {
+    emit_status("[sending...]");
+
     let mut args = Vec::new();
     if let Some(model) = codex_model.map(str::trim).filter(|value| !value.is_empty()) {
         let effort = reasoning_effort
@@ -234,7 +239,7 @@ fn build_run_turn_args(
         args.push(format!("model_auto_compact_token_limit={}", limit));
     }
     args.push("exec".to_string());
-    if let Some(existing_thread_id) = thread_id {
+    if let Some(existing_thread_id) = thread_id.as_deref() {
         args.push("resume".to_string());
         args.push(existing_thread_id.to_string());
     }
@@ -242,31 +247,8 @@ fn build_run_turn_args(
         "--skip-git-repo-check".to_string(),
         "--json".to_string(),
         "--dangerously-bypass-approvals-and-sandbox".to_string(),
-        "--".to_string(),
         prompt.to_string(),
     ]);
-    args
-}
-
-fn run_turn(
-    output: &mut std::fs::File,
-    codex_bin: &str,
-    codex_model: Option<&str>,
-    reasoning_effort: Option<&str>,
-    working_dir: &str,
-    prompt: &str,
-    thread_id: &mut Option<String>,
-    compact_token_limit: Option<u64>,
-) -> Result<(), String> {
-    emit_status("[sending...]");
-
-    let args = build_run_turn_args(
-        codex_model,
-        reasoning_effort,
-        thread_id.as_deref(),
-        compact_token_limit,
-        prompt,
-    );
 
     let mut cmd = Command::new(codex_bin);
     crate::services::platform::augment_exec_path(&mut cmd, codex_bin);
@@ -407,7 +389,7 @@ fn run_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_run_turn_args, decode_external_prompt, normalize_resume_session_id};
+    use super::{decode_external_prompt, normalize_resume_session_id};
 
     #[test]
     fn test_decode_external_prompt_keeps_plain_line() {
@@ -428,35 +410,6 @@ mod tests {
         );
         assert_eq!(normalize_resume_session_id(Some("   ")), None);
         assert_eq!(normalize_resume_session_id(None), None);
-    }
-
-    #[test]
-    fn test_build_run_turn_args_puts_prompt_after_separator() {
-        let args = build_run_turn_args(
-            Some("gpt-5-codex"),
-            Some("high"),
-            Some("thread-123"),
-            Some(120000),
-            "- prompt starts like option",
-        );
-        assert!(args.starts_with(&[
-            "-c".to_string(),
-            r#"model_reasoning_effort="high""#.to_string(),
-            "-m".to_string(),
-            "gpt-5-codex".to_string(),
-        ]));
-        assert!(
-            args.windows(3)
-                .any(|window| window == ["exec", "resume", "thread-123"])
-        );
-        let separator_index = args
-            .iter()
-            .position(|arg| arg == "--")
-            .expect("prompt separator should be present");
-        assert_eq!(
-            args.get(separator_index + 1).map(String::as_str),
-            Some("- prompt starts like option")
-        );
     }
 }
 
