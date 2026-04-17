@@ -68,7 +68,7 @@
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 262 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 788 |  |
 | `db::turns` | `src/db/turns.rs` | 451 |  |
-| `dispatch` | `src/dispatch/mod.rs` | 3247 | giant-file |
+| `dispatch` | `src/dispatch/mod.rs` | 3246 | giant-file |
 | `dispatch::dispatch_channel` | `src/dispatch/dispatch_channel.rs` | 23 |  |
 | `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 1375 | giant-file |
 | `dispatch::dispatch_create` | `src/dispatch/dispatch_create.rs` | 632 |  |
