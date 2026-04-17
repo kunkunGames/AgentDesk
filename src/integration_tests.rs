@@ -2203,14 +2203,16 @@ mod tests {
                     )
                     .unwrap();
                 let observed_dispatch_status =
-                    observed_latest_dispatch_id.as_deref().and_then(|dispatch_id| {
-                        conn.query_row(
-                            "SELECT status FROM task_dispatches WHERE id = ?1",
-                            [dispatch_id],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                    });
+                    observed_latest_dispatch_id
+                        .as_deref()
+                        .and_then(|dispatch_id| {
+                            conn.query_row(
+                                "SELECT status FROM task_dispatches WHERE id = ?1",
+                                [dispatch_id],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                        });
                 let observed_entry_dispatch_id: Option<String> = conn
                     .query_row(
                         "SELECT dispatch_id FROM auto_queue_entries WHERE id = 'entry-aq-concurrent'",
