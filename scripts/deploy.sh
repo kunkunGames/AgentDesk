@@ -10,7 +10,9 @@
 #   5. Smoke test (health check)
 #
 # Usage:
-#   ./scripts/deploy.sh [--skip-dashboard] [--skip-build]
+#   ./scripts/deploy.sh [--skip-dashboard] [--skip-build] \
+#     [--codesign-mode=auto|developer-id|adhoc|skip] \
+#     [--codesign-identity="Developer ID Application: ..."]
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -31,17 +33,123 @@ OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 
 SKIP_BUILD=false
 SKIP_DASHBOARD=false
+CODESIGN_MODE="${AGENTDESK_CODESIGN_MODE:-auto}"
+CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
+CODESIGN_IDENTIFIER="${AGENTDESK_CODESIGN_IDENTIFIER:-com.itismyfield.agentdesk}"
+RAW_CODESIGN_MODE="$CODESIGN_MODE"
 
 for arg in "$@"; do
   case "$arg" in
     --skip-build)     SKIP_BUILD=true ;;
     --skip-dashboard) SKIP_DASHBOARD=true ;;
+    --codesign-mode=*) CODESIGN_MODE="${arg#*=}"; RAW_CODESIGN_MODE="$CODESIGN_MODE" ;;
+    --codesign-identity=*) CODESIGN_IDENTITY="${arg#*=}" ;;
   esac
 done
 
 info()  { printf "\033[1;34m[deploy]\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m[deploy]\033[0m %s\n" "$*"; }
 fail()  { printf "\033[1;31m[deploy]\033[0m %s\n" "$*"; exit 1; }
+
+normalize_codesign_mode() {
+  local raw_mode="${1:-}"
+  raw_mode="$(printf '%s' "$raw_mode" | tr '[:upper:]' '[:lower:]')"
+  case "$raw_mode" in
+    auto|"")
+      printf 'auto\n'
+      ;;
+    developer-id|developer_id|developerid|developer)
+      printf 'developer-id\n'
+      ;;
+    adhoc|ad-hoc|ad_hoc)
+      printf 'adhoc\n'
+      ;;
+    skip|none|preserve|existing)
+      printf 'skip\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+codesign_identity_available() {
+  local identity="$1"
+  if [ "$OS" != "darwin" ] || [ -z "$identity" ]; then
+    return 1
+  fi
+
+  security find-identity -v -p codesigning 2>/dev/null | grep -F -- "$identity" >/dev/null
+}
+
+resolve_macos_codesign_mode() {
+  case "$CODESIGN_MODE" in
+    developer-id|adhoc|skip)
+      printf '%s\n' "$CODESIGN_MODE"
+      ;;
+    auto)
+      if [ "$CODESIGN_IDENTITY" = "-" ]; then
+        printf 'adhoc\n'
+      elif codesign_identity_available "$CODESIGN_IDENTITY"; then
+        printf 'developer-id\n'
+      else
+        printf 'adhoc\n'
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+codesign_real_binary_if_needed() {
+  local resolved_mode="$1"
+
+  if [ "$OS" != "darwin" ]; then
+    return 0
+  fi
+
+  case "$resolved_mode" in
+    developer-id)
+      [ -n "$CODESIGN_IDENTITY" ] || fail "Developer ID signing requested but no identity was provided"
+      codesign_identity_available "$CODESIGN_IDENTITY" \
+        || fail "Developer ID identity not found in keychain: $CODESIGN_IDENTITY"
+      info "Signing $REAL_BIN with Developer ID identity"
+      codesign \
+        -s "$CODESIGN_IDENTITY" \
+        --options runtime \
+        --identifier "$CODESIGN_IDENTIFIER" \
+        --force \
+        "$REAL_BIN"
+      codesign -v "$REAL_BIN" 2>/dev/null \
+        || fail "Developer ID codesign verification failed — aborting"
+      ;;
+    adhoc)
+      info "Signing $REAL_BIN with ad-hoc identity"
+      codesign \
+        -s - \
+        --identifier "$CODESIGN_IDENTIFIER" \
+        --force \
+        "$REAL_BIN"
+      codesign -v "$REAL_BIN" 2>/dev/null \
+        || fail "Ad-hoc codesign verification failed — aborting"
+      ;;
+    skip)
+      info "Skipping re-sign for $REAL_BIN; preserving existing signature state"
+      ;;
+    *)
+      fail "Unsupported resolved codesign mode: $resolved_mode"
+      ;;
+  esac
+}
+
+if ! CODESIGN_MODE="$(normalize_codesign_mode "$CODESIGN_MODE")"; then
+  fail "Unsupported --codesign-mode: $RAW_CODESIGN_MODE"
+fi
+
+if [ "$CODESIGN_IDENTITY" = "-" ] && [ "$CODESIGN_MODE" = "developer-id" ]; then
+  fail "Developer ID mode cannot use '-' identity; use --codesign-mode=adhoc instead"
+fi
 
 BACKUP_WRAPPER=""
 BACKUP_REAL=""
@@ -183,10 +291,10 @@ if [ -e "$REAL_BIN" ]; then
 fi
 install_file_atomically "$PROJECT_DIR/target/release/agentdesk" "$REAL_BIN" 755
 if [ "$OS" = "darwin" ]; then
-  codesign -s "Developer ID Application: Wonchang Oh (A7LJY7HNGA)" --options runtime --identifier "com.itismyfield.agentdesk" --force "$REAL_BIN" 2>/dev/null || true
-  if ! codesign -v "$REAL_BIN" 2>/dev/null; then
-    fail "Codesign verification failed — aborting"
-  fi
+  RESOLVED_CODESIGN_MODE="$(resolve_macos_codesign_mode)" \
+    || fail "Could not resolve macOS codesign mode from: $CODESIGN_MODE"
+  info "Resolved macOS codesign mode: $RESOLVED_CODESIGN_MODE"
+  codesign_real_binary_if_needed "$RESOLVED_CODESIGN_MODE"
 fi
 write_wrapper_script
 ok "Binary wrapper: $WRAPPER_BIN -> $REAL_BIN"
