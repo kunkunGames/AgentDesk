@@ -68,11 +68,11 @@
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 262 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 788 |  |
 | `db::turns` | `src/db/turns.rs` | 451 |  |
-| `dispatch` | `src/dispatch/mod.rs` | 3121 | giant-file |
+| `dispatch` | `src/dispatch/mod.rs` | 3247 | giant-file |
 | `dispatch::dispatch_channel` | `src/dispatch/dispatch_channel.rs` | 23 |  |
-| `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 1424 | giant-file |
+| `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 1375 | giant-file |
 | `dispatch::dispatch_create` | `src/dispatch/dispatch_create.rs` | 632 |  |
-| `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 438 |  |
+| `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 557 |  |
 | `engine` | `src/engine/mod.rs` | 1492 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 |  |
 | `engine::intent` | `src/engine/intent.rs` | 812 |  |
@@ -215,7 +215,7 @@
 | `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 424 |  |
 | `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 984 |  |
 | `services::discord::org_writer` | `src/services/discord/org_writer.rs` | 239 |  |
-| `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 1554 | giant-file |
+| `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 1472 | giant-file |
 | `services::discord::queue_io` | `src/services/discord/queue_io.rs` | 565 |  |
 | `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 1959 | giant-file |
 | `services::discord::restart_ctrl` | `src/services/discord/restart_ctrl.rs` | 113 |  |
@@ -224,7 +224,7 @@
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 13 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
 | `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 1057 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 3494 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 3492 | giant-file |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 129 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 1340 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 329 |  |
