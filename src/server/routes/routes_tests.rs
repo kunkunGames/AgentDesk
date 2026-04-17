@@ -198,7 +198,7 @@ fn git_commit(repo_dir: &std::path::Path, message: &str) -> String {
 }
 
 #[tokio::test]
-async fn protected_domain_router_keeps_internal_and_hook_auth_exemptions() {
+async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
     let db = test_db();
     let engine = test_engine(&db);
     let mut config = crate::config::Config::default();
@@ -214,6 +214,8 @@ async fn protected_domain_router_keeps_internal_and_hook_auth_exemptions() {
                 "/hook/session",
                 axum::routing::post(|| async { StatusCode::CREATED }),
             )
+            .route("/send", axum::routing::post(|| async { StatusCode::OK }))
+            .route("/senddm", axum::routing::post(|| async { StatusCode::OK }))
             .route("/settings", axum::routing::get(|| async { StatusCode::OK })),
         state.clone(),
     )
@@ -245,6 +247,7 @@ async fn protected_domain_router_keeps_internal_and_hook_auth_exemptions() {
     assert_eq!(hook_response.status(), StatusCode::CREATED);
 
     let protected_response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/settings")
@@ -254,6 +257,73 @@ async fn protected_domain_router_keeps_internal_and_hook_auth_exemptions() {
         .await
         .unwrap();
     assert_eq!(protected_response.status(), StatusCode::UNAUTHORIZED);
+
+    let send_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(send_response.status(), StatusCode::UNAUTHORIZED);
+
+    let senddm_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/senddm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(senddm_response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn discord_control_endpoints_require_auth_token_on_non_loopback_host() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn discord_control_endpoints_allow_loopback_without_auth_token() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let mut config = crate::config::Config::default();
+    config.server.host = "127.0.0.1".to_string();
+    let app = test_api_router_with_config(db, engine, config, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -4599,6 +4669,45 @@ async fn force_transition_succeeds_with_correct_channel() {
 }
 
 #[tokio::test]
+async fn force_transition_rejects_mismatched_channel_when_pmd_channel_is_configured() {
+    let _lock = env_lock();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_card_with_status(&db, "card-ft4", "requested");
+
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.kanban.manager_channel_id = Some("pmd-chan-123".to_string());
+    let config_path = config_dir.path().join("agentdesk.yaml");
+    crate::config::save_to_path(&config_path, &config).unwrap();
+    let _config_guard = EnvVarGuard::set_path("AGENTDESK_CONFIG", &config_path);
+
+    let app = test_api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-ft4/force-transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "wrong-channel")
+                .body(Body::from(r#"{"status":"done"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "force-transition requires PMD channel authorization"
+    );
+}
+
+#[tokio::test]
 async fn force_transition_to_done_merges_from_live_work_dispatch_and_cleans_it_up() {
     crate::pipeline::ensure_loaded();
     let (repo, _repo_override) = setup_test_repo();
@@ -6590,6 +6699,54 @@ async fn auto_queue_dispatch_prepares_backlog_cards_and_auto_assigns_agent() {
 }
 
 #[tokio::test]
+async fn auto_queue_dispatch_rejects_deploy_phases_when_auth_token_is_not_configured() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "project-agentdesk");
+    ensure_auto_queue_tables(&db);
+    seed_auto_queue_card(
+        &db,
+        "card-dq-deploy-phase-reject",
+        7401,
+        "ready",
+        "project-agentdesk",
+    );
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/dispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "project-agentdesk",
+                        "groups": [{"issues": [7401]}],
+                        "deploy_phases": [1],
+                        "activate": false
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "deploy_phases requires server.auth_token to be configured"
+    );
+}
+
+#[tokio::test]
 async fn auto_queue_dispatch_rejects_when_live_run_exists_without_force() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -7033,6 +7190,41 @@ async fn auto_queue_add_run_entry_rejects_non_active_runs() {
             .unwrap_or("")
             .contains("status=cancelled"),
         "inactive runs must be rejected with status details: {json}"
+    );
+}
+
+#[tokio::test]
+async fn auto_queue_update_run_rejects_deploy_phases_when_auth_token_is_not_configured() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+
+    let app = test_api_router(db, engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/auto-queue/runs/run-does-not-matter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "deploy_phases": [2]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "deploy_phases requires server.auth_token to be configured"
     );
 }
 

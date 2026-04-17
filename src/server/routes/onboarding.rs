@@ -160,6 +160,15 @@ impl OnboardingDraft {
         }
         Ok(self)
     }
+
+    fn redact_secrets(mut self) -> Self {
+        for bot in &mut self.command_bots {
+            bot.token.clear();
+        }
+        self.announce_token.clear();
+        self.notify_token.clear();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -225,8 +234,8 @@ fn sanitize_draft_owner_id(owner_id: &str) -> String {
 
 fn onboarding_draft_secret_policy_value() -> serde_json::Value {
     json!({
-        "stores_raw_tokens": true,
-        "returns_raw_tokens_in_draft": true,
+        "stores_raw_tokens": false,
+        "returns_raw_tokens_in_draft": false,
         "masked_in_status_after_completion": true,
         "cleared_on_complete": true,
         "cleared_on_delete": true,
@@ -346,20 +355,9 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<serde_js
     let setup_mode = onboarding_setup_mode(completed);
     let resume_state = onboarding_resume_state(draft_available, completion_state.as_ref());
 
-    // Mask tokens after onboarding is complete to prevent unauthenticated leakage.
-    // Only show full tokens during initial setup (before completion).
-    let mask = |t: Option<String>| -> Option<String> {
-        if !completed {
-            return t;
-        }
-        t.map(|s| {
-            if s.len() > 8 {
-                format!("{}…{}", &s[..4], &s[s.len() - 4..])
-            } else {
-                "***".to_string()
-            }
-        })
-    };
+    // Never return raw onboarding tokens from status.
+    // This endpoint can be reachable without auth, so redact all token values.
+    let redact = |_t: Option<String>| -> Option<String> { None };
 
     (
         StatusCode::OK,
@@ -367,10 +365,10 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<serde_js
             "completed": completed,
             "agent_count": agent_count,
             "bot_tokens": {
-                "command": mask(bot_token),
-                "announce": mask(announce_token),
-                "notify": mask(notify_token),
-                "command2": mask(command_token_2),
+                "command": redact(bot_token),
+                "announce": redact(announce_token),
+                "notify": redact(notify_token),
+                "command2": redact(command_token_2),
             },
             "bot_providers": {
                 "command": primary_provider,
@@ -429,7 +427,8 @@ pub async fn draft_get(State(state): State<AppState>) -> (StatusCode, Json<serde
                 Json(json!({"error": error})),
             );
         }
-    };
+    }
+    .map(OnboardingDraft::redact_secrets);
     let completion_state = match load_onboarding_completion_state(&root) {
         Ok(state) => state,
         Err(error) => {
@@ -478,6 +477,7 @@ pub async fn draft_put(Json(body): Json<OnboardingDraft>) -> (StatusCode, Json<s
             return (StatusCode::BAD_REQUEST, Json(json!({"error": error})));
         }
     };
+    let draft = draft.redact_secrets();
 
     if let Err(error) = save_onboarding_draft(&root, &draft) {
         return (
@@ -3325,7 +3325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn draft_api_round_trip_exposes_resume_state_and_secret_policy() {
+    async fn draft_api_round_trip_redacts_tokens_and_exposes_resume_state() {
         let temp = tempfile::tempdir().unwrap();
         let _runtime = RuntimeRootGuard::new(temp.path());
         let db = test_db();
@@ -3358,10 +3358,9 @@ mod tests {
             .unwrap();
         let put_json: serde_json::Value = serde_json::from_slice(&put_body).unwrap();
         assert_eq!(put_json["ok"], json!(true));
-        assert_eq!(
-            put_json["draft"]["command_bots"][0]["token"],
-            json!("command-token")
-        );
+        assert_eq!(put_json["draft"]["command_bots"][0]["token"], json!(""));
+        assert_eq!(put_json["draft"]["announce_token"], json!(""));
+        assert_eq!(put_json["draft"]["notify_token"], json!(""));
         assert_eq!(put_json["draft"]["updated_at_ms"], json!(1));
         assert_eq!(
             put_json["secret_policy"]["cleared_on_complete"],
@@ -3403,8 +3402,15 @@ mod tests {
             .unwrap();
         let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
         assert_eq!(get_json["available"], json!(true));
+        assert_eq!(get_json["draft"]["command_bots"][0]["token"], json!(""));
+        assert_eq!(get_json["draft"]["announce_token"], json!(""));
+        assert_eq!(get_json["draft"]["notify_token"], json!(""));
         assert_eq!(get_json["draft"]["selected_template"], json!("operations"));
-        assert_eq!(get_json["secret_policy"]["stores_raw_tokens"], json!(true));
+        assert_eq!(get_json["secret_policy"]["stores_raw_tokens"], json!(false));
+        assert_eq!(
+            get_json["secret_policy"]["returns_raw_tokens_in_draft"],
+            json!(false)
+        );
 
         let delete_response = app
             .clone()
