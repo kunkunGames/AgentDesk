@@ -99,7 +99,7 @@
 | `engine::sql_guard` | `src/engine/sql_guard.rs` | 230 |  |
 | `engine::transition` | `src/engine/transition.rs` | 1461 | giant-file |
 | `error` | `src/error.rs` | 188 |  |
-| `github` | `src/github/mod.rs` | 737 |  |
+| `github` | `src/github/mod.rs` | 773 |  |
 | `github::dod` | `src/github/dod.rs` | 395 |  |
 | `github::sync` | `src/github/sync.rs` | 496 |  |
 | `github::triage` | `src/github/triage.rs` | 247 |  |
