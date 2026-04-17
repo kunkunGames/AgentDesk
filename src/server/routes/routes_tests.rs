@@ -138,14 +138,10 @@ fn install_mock_gh_pr_tracking(
 ) -> MockGhOverride {
     let dir = tempfile::tempdir().unwrap();
     let gh_path = dir.path().join("gh.cmd");
-    let gh_ps1_path = dir.path().join("gh.ps1");
-    let wrapper =
-        "@echo off\r\npwsh -NoProfile -ExecutionPolicy Bypass -File \"%~dp0gh.ps1\" %*\r\n";
     let script = format!(
-        "$stateFile = Join-Path $PSScriptRoot 'created.flag'\n$joined = $args -join ' '\nif ($args.Count -gt 0 -and $args[0] -eq '--version') {{\n  Write-Output 'gh mock 1.0'\n  exit 0\n}}\nif ($args.Count -ge 2 -and $args[0] -eq 'pr' -and $args[1] -eq 'list' -and $joined.Contains('--repo {repo}') -and $joined.Contains('--head {branch}')) {{\n  if (Test-Path $stateFile) {{\n@'\n[{{\"number\":{pr_number},\"headRefName\":\"{branch}\",\"headRefOid\":\"{head_sha}\"}}]\n'@ | Write-Output\n  }} else {{\n    '[]' | Write-Output\n  }}\n  exit 0\n}}\nif ($args.Count -ge 2 -and $args[0] -eq 'pr' -and $args[1] -eq 'create' -and $joined.Contains('--repo {repo}') -and $joined.Contains('--head {branch}')) {{\n  New-Item -ItemType File -Path $stateFile -Force | Out-Null\n  'https://github.com/{repo}/pull/{pr_number}' | Write-Output\n  exit 0\n}}\nif ($args.Count -ge 3 -and $args[0] -eq 'pr' -and $args[1] -eq 'view' -and $args[2] -eq '{pr_number}' -and $joined.Contains('--repo {repo}') -and $joined.Contains('--json headRefOid') -and $joined.Contains('--jq .headRefOid')) {{\n  '{head_sha}' | Write-Output\n  exit 0\n}}\nWrite-Error \"gh mock: unexpected args: $joined\"\nexit 1\n"
+        "@echo off\r\nsetlocal EnableExtensions\r\nset \"STATE_FILE=%~dp0created.flag\"\r\nif /I \"%~1\"==\"--version\" (\r\n  echo gh mock 1.0\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"pr\" if /I \"%~2\"==\"list\" if /I \"%~3\"==\"--head\" if /I \"%~4\"==\"{branch}\" (\r\n  if exist \"%STATE_FILE%\" (\r\n    echo [{{\"number\":{pr_number},\"headRefName\":\"{branch}\",\"headRefOid\":\"{head_sha}\"}}]\r\n  ) else (\r\n    echo []\r\n  )\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"pr\" if /I \"%~2\"==\"create\" if /I \"%~3\"==\"--repo\" if /I \"%~4\"==\"{repo}\" if /I \"%~7\"==\"--head\" if /I \"%~8\"==\"{branch}\" (\r\n  type nul > \"%STATE_FILE%\"\r\n  echo https://github.com/{repo}/pull/{pr_number}\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"pr\" if /I \"%~2\"==\"view\" if /I \"%~3\"==\"{pr_number}\" if /I \"%~4\"==\"--json\" if /I \"%~5\"==\"headRefOid\" if /I \"%~6\"==\"--jq\" if /I \"%~7\"==\".headRefOid\" (\r\n  echo {head_sha}\r\n  exit /b 0\r\n)\r\necho gh mock: unexpected args: %* 1>&2\r\nexit /b 1\r\n"
     );
-    fs::write(&gh_path, wrapper).unwrap();
-    fs::write(&gh_ps1_path, script).unwrap();
+    fs::write(&gh_path, script).unwrap();
     let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
     MockGhOverride {
         _dir: dir,
