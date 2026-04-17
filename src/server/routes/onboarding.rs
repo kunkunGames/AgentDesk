@@ -145,6 +145,8 @@ impl OnboardingDraft {
                 "onboarding draft exceeds max provider statuses ({MAX_ONBOARDING_DRAFT_PROVIDER_STATUSES})"
             ));
         }
+        self.owner_id = self.owner_id.trim().to_string();
+        parse_owner_id(Some(self.owner_id.as_str()))?;
         let payload_size = serde_json::to_vec(&self)
             .map_err(|error| {
                 format!("failed to serialize onboarding draft for validation: {error}")
@@ -3941,6 +3943,44 @@ mod tests {
                 .unwrap_or_default()
                 .contains("max agents")
         );
+    }
+
+    #[tokio::test]
+    async fn draft_put_rejects_invalid_owner_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let _runtime = RuntimeRootGuard::new(temp.path());
+        let db = test_db();
+        let state = AppState::test_state(db.clone(), test_engine(&db));
+        let app = Router::new()
+            .route("/draft", axum::routing::put(draft_put))
+            .with_state(state);
+
+        let mut draft = sample_draft();
+        draft.owner_id = "42".to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/draft")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&draft).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("owner_id must be a Discord user id")
+        );
+        assert!(load_onboarding_draft(temp.path()).unwrap().is_none());
     }
 
     #[test]
