@@ -1451,6 +1451,35 @@ agents:
     }
 
     #[test]
+    fn test_save_bot_settings_does_not_overwrite_yaml_owner_for_unconfigured_bot() {
+        with_temp_home(|temp_home: &TempDir| {
+            let configured_token = "configured-token";
+            let unconfigured_token = "unconfigured-token";
+            write_agentdesk_yaml(
+                temp_home,
+                &format!(
+                    "server:\n  port: 8791\ndiscord:\n  owner_id: 7\n  bots:\n    command:\n      token: \"{configured_token}\"\n"
+                ),
+            );
+
+            let mut settings = super::super::DiscordBotSettings::default();
+            settings.owner_user_id = Some(42);
+            save_bot_settings(unconfigured_token, &settings);
+
+            let yaml_after = fs::read_to_string(
+                temp_home
+                    .path()
+                    .join(".adk")
+                    .join("config")
+                    .join("agentdesk.yaml"),
+            )
+            .unwrap();
+            assert!(yaml_after.contains("owner_id: 7"));
+            assert!(!yaml_after.contains("owner_id: 42"));
+        });
+    }
+
+    #[test]
     fn test_save_bot_settings_rolls_back_yaml_and_json_when_runtime_write_fails() {
         with_temp_home(|temp_home: &TempDir| {
             struct ResetRuntimeWriteFailureFlag;
@@ -2286,6 +2315,48 @@ channels:
                 parent_result,
                 Err(BotChannelRoutingGuardFailure::ChannelNotAllowed)
             );
+        });
+    }
+
+    #[test]
+    fn test_validate_bot_channel_routing_with_provider_channel_ignores_thread_name_binding() {
+        with_temp_home(|temp_home: &TempDir| {
+            let settings_dir = temp_home.path().join(".adk").join("config");
+            fs::create_dir_all(&settings_dir).unwrap();
+            fs::write(
+                settings_dir.join("org.yaml"),
+                r#"
+version: 1
+name: "Test Org"
+agents:
+  privileged-agent:
+    display_name: "Privileged"
+    provider: codex
+channels:
+  by_name:
+    enabled: true
+    mappings:
+      privileged-thread:
+        agent: privileged-agent
+"#,
+            )
+            .unwrap();
+
+            let mut settings = super::super::DiscordBotSettings::default();
+            settings.provider = ProviderKind::Codex;
+            settings.agent = Some("privileged-agent".to_string());
+            settings.allowed_channel_ids = vec![1470034105176424533];
+
+            let result = validate_bot_channel_routing_with_provider_channel(
+                &settings,
+                &ProviderKind::Codex,
+                ChannelId::new(1470034105176424533),
+                Some("privileged-thread"),
+                Some("team-general"),
+                false,
+            );
+
+            assert_eq!(result, Err(BotChannelRoutingGuardFailure::AgentMismatch));
         });
     }
 
