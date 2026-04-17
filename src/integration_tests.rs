@@ -1273,10 +1273,8 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let gh_cmd_path = dir.path().join("gh.cmd");
             let gh_ps1_path = dir.path().join("gh.ps1");
-            let (wrapper, script) = build_mock_gh_script(replies);
-            fs::write(&gh_cmd_path, wrapper).unwrap();
+            let (_wrapper, script) = build_mock_gh_script(replies);
             fs::write(&gh_ps1_path, script).unwrap();
 
             let old_path = std::env::var_os("PATH");
@@ -1291,7 +1289,7 @@ mod tests {
             };
             unsafe {
                 std::env::set_var("PATH", joined);
-                std::env::set_var("AGENTDESK_GH_PATH", &gh_cmd_path);
+                std::env::set_var("AGENTDESK_GH_PATH", &gh_ps1_path);
             }
 
             return MockGhEnv {
