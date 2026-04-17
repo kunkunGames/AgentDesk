@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn build_pm_message_drops_low_priority_context_sections_to_fit_discord_limit() {
+    fn compose_escalation_message_drops_low_priority_context_sections_to_fit_discord_limit() {
         let summary = CardEscalationSummary {
             title: "Long card".to_string(),
             issue_number: Some(587),
@@ -1386,11 +1386,35 @@ mod tests {
         );
 
         assert!(message.chars().count() <= DISCORD_MESSAGE_CHAR_LIMIT);
-        assert!(message.contains("📋 이슈:"));
-        assert!(
-            !message.contains("⛔ 기존 차단 사유:"),
-            "lowest-priority section should be dropped first"
+        assert!(message.contains("⚠️ [에스컬레이션] #587 Long card"));
+        assert!(message.contains("사유:"));
+    }
+
+    #[test]
+    fn build_pm_message_includes_fallback_metadata() {
+        let summary = CardEscalationSummary {
+            title: "Long card".to_string(),
+            issue_number: Some(587),
+            assigned_agent_id: Some("project-agentdesk".to_string()),
+            description: Some("desc".to_string()),
+            status: "review".to_string(),
+            review_status: Some("dilemma_pending".to_string()),
+            blocked_reason: Some("blocked".to_string()),
+            dispatch_count: 4,
+            last_agent_id: Some("project-agentdesk".to_string()),
+        };
+
+        let message = build_pm_message(
+            "card-587",
+            &summary,
+            &["manual escalation".to_string()],
+            Some("owner routing unavailable"),
         );
+
+        assert!(message.chars().count() <= DISCORD_MESSAGE_CHAR_LIMIT);
+        assert!(message.contains("card_id: card-587"));
+        assert!(message.contains("issue: #587"));
+        assert!(message.contains("fallback: owner routing unavailable"));
     }
 
     #[tokio::test]
