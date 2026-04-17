@@ -78,23 +78,25 @@ pub fn shared_prompt_path(root: &Path) -> PathBuf {
 }
 
 pub fn managed_memories_root(root: &Path) -> PathBuf {
-    config_dir(root).join("memories")
+    config_dir(root).join(crate::memory_import_guardrails::MANAGED_MEMORIES_DIR_NAME)
 }
 
 pub fn shared_agent_knowledge_dir(root: &Path) -> PathBuf {
-    managed_memories_root(root).join("shared-agent-knowledge")
+    managed_memories_root(root)
+        .join(crate::memory_import_guardrails::SHARED_AGENT_KNOWLEDGE_DIR_NAME)
 }
 
 pub(super) fn default_shared_agent_knowledge_path(root: &Path) -> PathBuf {
-    shared_agent_knowledge_dir(root).join("shared_knowledge.md")
+    shared_agent_knowledge_dir(root)
+        .join(crate::memory_import_guardrails::SHARED_AGENT_KNOWLEDGE_FILE_NAME)
 }
 
 pub(super) fn default_shared_agent_memory_root(root: &Path) -> PathBuf {
-    managed_memories_root(root).join("shared-agent-memory")
+    managed_memories_root(root).join(crate::memory_import_guardrails::SHARED_AGENT_MEMORY_DIR_NAME)
 }
 
 pub(super) fn default_long_term_memory_root(root: &Path) -> PathBuf {
-    managed_memories_root(root).join("long-term")
+    managed_memories_root(root).join(crate::memory_import_guardrails::LONG_TERM_MEMORY_DIR_NAME)
 }
 
 pub fn memories_archive_root(root: &Path) -> PathBuf {

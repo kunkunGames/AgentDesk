@@ -21,7 +21,7 @@ use crate::services::remote::RemoteProfile;
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 const GEMINI_RESUME_LATEST: &str = "latest";
 const GEMINI_SESSION_DEAD_MESSAGE: &str = "Gemini stream ended without a terminal result";
-const GEMINI_INVALID_RESUME_SELECTOR_MESSAGE: &str = "InvalidArgument: Gemini resume selector must be `latest`, a numeric session index, or a UUID-like Gemini session reference";
+const GEMINI_INVALID_RESUME_SELECTOR_MESSAGE: &str = "InvalidArgument: Gemini executable resume selector must be `latest` or a numeric session index";
 const GEMINI_NO_PREVIOUS_SESSIONS_MESSAGE: &str = "No previous sessions found for this project.";
 const GEMINI_NO_SESSIONS_FOUND_MESSAGE: &str = "No sessions found for this project.";
 const GEMINI_DELETE_CURRENT_SESSION_MESSAGE: &str = "Cannot delete the current active session.";
@@ -1104,9 +1104,8 @@ fn normalize_resume_selector_with_source(
     }
 
     if looks_like_uuid(session_id) {
-        // Gemini 0.38.0 documents UUID-like references, but live runtime probes show
-        // that `--resume <missing-uuid>` exits 0 and silently creates a fresh session.
-        // Keep the raw UUID for telemetry/persistence while coercing execution to a
+        // Keep raw UUID-like values out of the executable selector path. We still
+        // retain them for telemetry/persistence, but execution is coerced to a
         // verified selector that will not silently fork history.
         return Ok((
             Some(GEMINI_RESUME_LATEST.to_string()),

@@ -15,11 +15,7 @@ use super::{
     AppState, skill_usage_analytics::collect_skill_usage, skills_api::sync_skills_from_disk,
 };
 
-const UNSUPPORTED_RATE_LIMIT_PROVIDERS: &[(&str, &str)] = &[(
-    "qwen",
-    "No Qwen rate-limit telemetry source is implemented yet.",
-)];
-const UNSUPPORTED_RATE_LIMIT_USAGE_LOOKBACK_SECONDS: i64 = 30 * 24 * 60 * 60;
+const RATE_LIMIT_USAGE_LOOKBACK_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 fn sqlite_datetime_to_millis(value: &str) -> Option<i64> {
     if let Ok(ts) = DateTime::parse_from_rfc3339(value) {
@@ -627,7 +623,7 @@ fn build_rate_limit_provider_payloads(
         .prepare("SELECT provider, data, fetched_at FROM rate_limit_cache ORDER BY provider")
     {
         Ok(s) => s,
-        Err(_) => return build_unsupported_rate_limit_entries(conn, now),
+        Err(_) => return build_degraded_rate_limit_fallback_entries(conn, now),
     };
 
     let mut seen = HashSet::new();
@@ -643,6 +639,7 @@ fn build_rate_limit_provider_payloads(
             rows.filter_map(|r| r.ok())
                 .filter_map(|(provider, data, fetched_at)| {
                     let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+                    let provider_key = provider.to_lowercase();
                     let buckets = parsed
                         .get("buckets")
                         .and_then(|value| value.as_array())
@@ -656,14 +653,23 @@ fn build_rate_limit_provider_payloads(
                         .get("reason")
                         .and_then(|value| value.as_str())
                         .map(str::to_string);
+                    let degraded = parsed
+                        .get("degraded")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
                     let stale = (now - fetched_at) > stale_sec;
-                    seen.insert(provider.to_lowercase());
+                    if provider_key == "qwen" && unsupported && buckets.is_empty() {
+                        return None;
+                    }
+                    seen.insert(provider_key);
                     Some(json!({
                         "provider": provider,
+                        "visible": true,
                         "buckets": buckets,
                         "fetched_at": fetched_at,
                         "stale": stale,
                         "unsupported": unsupported,
+                        "degraded": degraded,
                         "reason": reason,
                     }))
                 })
@@ -671,21 +677,8 @@ fn build_rate_limit_provider_payloads(
         })
         .unwrap_or_default();
 
-    for (provider, reason) in UNSUPPORTED_RATE_LIMIT_PROVIDERS {
-        if seen.contains(*provider) {
-            continue;
-        }
-        if !provider_has_recent_session_usage(conn, provider, now) {
-            continue;
-        }
-        providers.push(json!({
-            "provider": provider,
-            "buckets": [],
-            "fetched_at": now,
-            "stale": false,
-            "unsupported": true,
-            "reason": reason,
-        }));
+    if !seen.contains("gemini") && provider_has_recent_session_usage(conn, "gemini", now) {
+        providers.push(build_gemini_degraded_rate_limit_entry(conn, now));
     }
 
     providers.sort_by_key(|entry| {
@@ -711,7 +704,7 @@ fn provider_has_recent_session_usage(
     provider: &str,
     now: i64,
 ) -> bool {
-    let threshold = now.saturating_sub(UNSUPPORTED_RATE_LIMIT_USAGE_LOOKBACK_SECONDS);
+    let threshold = now.saturating_sub(RATE_LIMIT_USAGE_LOOKBACK_SECONDS);
     conn.query_row(
         "SELECT 1
          FROM sessions
@@ -728,24 +721,57 @@ fn provider_has_recent_session_usage(
     .is_ok()
 }
 
-fn build_unsupported_rate_limit_entries(
+fn build_degraded_rate_limit_fallback_entries(
     conn: &rusqlite::Connection,
     now: i64,
 ) -> Vec<serde_json::Value> {
-    UNSUPPORTED_RATE_LIMIT_PROVIDERS
-        .iter()
-        .filter(|(provider, _reason)| provider_has_recent_session_usage(conn, provider, now))
-        .map(|(provider, reason)| {
-            json!({
-                "provider": provider,
-                "buckets": [],
-                "fetched_at": now,
-                "stale": false,
-                "unsupported": true,
-                "reason": reason,
-            })
-        })
-        .collect()
+    if provider_has_recent_session_usage(conn, "gemini", now) {
+        vec![build_gemini_degraded_rate_limit_entry(conn, now)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn build_gemini_degraded_rate_limit_entry(
+    conn: &rusqlite::Connection,
+    now: i64,
+) -> serde_json::Value {
+    let reason = if gemini_rate_limit_fetch_failed(conn) {
+        crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED
+    } else {
+        "no_cache_row"
+    };
+    json!({
+        "provider": "gemini",
+        "visible": true,
+        "buckets": [],
+        "fetched_at": now,
+        "stale": false,
+        "unsupported": false,
+        "degraded": true,
+        "utilization": serde_json::Value::Null,
+        "used": serde_json::Value::Null,
+        "remaining": serde_json::Value::Null,
+        "reason": reason,
+    })
+}
+
+fn gemini_rate_limit_fetch_failed(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM kv_meta WHERE key = ?1",
+        rusqlite::params![crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    .and_then(|value| {
+        value
+            .get("status")
+            .and_then(|status| status.as_str())
+            .map(str::to_string)
+    })
+    .as_deref()
+        == Some(crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED)
 }
 
 /// GET /api/skills-trend?days=30
@@ -834,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn build_rate_limit_provider_payloads_shows_recent_unsupported_qwen_only_when_used() {
+    fn build_rate_limit_provider_payloads_hides_recent_unsupported_qwen_without_buckets() {
         let conn = test_conn();
         conn.execute(
             "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
@@ -850,9 +876,151 @@ mod tests {
 
         let providers = build_rate_limit_provider_payloads(&conn, 1_700_000_100);
 
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn build_rate_limit_provider_payloads_hides_cached_unsupported_qwen_without_buckets() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "qwen",
+                serde_json::json!({
+                    "buckets": [],
+                    "unsupported": true,
+                    "reason": "No Qwen rate-limit telemetry source is implemented yet."
+                })
+                .to_string(),
+                1_700_000_000_i64
+            ],
+        )
+        .unwrap();
+
+        let providers = build_rate_limit_provider_payloads(&conn, 1_700_000_100);
+
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn build_rate_limit_provider_payloads_adds_degraded_gemini_when_recent_usage_has_no_cache_row()
+    {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
+             VALUES (?1, ?2, 'completed', ?3, ?4)",
+            rusqlite::params![
+                "gemini-session-1",
+                "gemini",
+                "2023-11-14 22:00:00",
+                "2023-11-14 22:10:00"
+            ],
+        )
+        .unwrap();
+
+        let providers = build_rate_limit_provider_payloads(&conn, 1_700_000_100);
+
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0]["provider"], json!("qwen"));
-        assert_eq!(providers[0]["unsupported"], json!(true));
+        assert_eq!(providers[0]["provider"], json!("gemini"));
+        assert_eq!(providers[0]["degraded"], json!(true));
+        assert_eq!(providers[0]["utilization"], serde_json::Value::Null);
+        assert_eq!(providers[0]["reason"], json!("no_cache_row"));
         assert_eq!(providers[0]["buckets"], json!([]));
+    }
+
+    #[test]
+    fn build_rate_limit_provider_payloads_marks_gemini_fetch_failures_as_degraded() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
+             VALUES (?1, ?2, 'completed', ?3, ?4)",
+            rusqlite::params![
+                "gemini-session-1",
+                "gemini",
+                "2023-11-14 22:00:00",
+                "2023-11-14 22:10:00"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kv_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_KEY,
+                serde_json::json!({
+                    "status": crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED,
+                    "updated_at": 1_700_000_000_i64,
+                    "error": "oauth refresh failed"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+
+        let providers = build_rate_limit_provider_payloads(&conn, 1_700_000_100);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["provider"], json!("gemini"));
+        assert_eq!(providers[0]["degraded"], json!(true));
+        assert_eq!(
+            providers[0]["reason"],
+            json!(crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED)
+        );
+    }
+
+    #[test]
+    fn build_rate_limit_provider_payloads_prefers_cached_gemini_buckets_over_degraded_fallback() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
+             VALUES (?1, ?2, 'completed', ?3, ?4)",
+            rusqlite::params![
+                "gemini-session-1",
+                "gemini",
+                "2023-11-14 22:00:00",
+                "2023-11-14 22:10:00"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rate_limit_cache (provider, data, fetched_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "gemini",
+                serde_json::json!({
+                    "buckets": [{
+                        "name": "rpm",
+                        "limit": 15,
+                        "used": -1,
+                        "remaining": -1,
+                        "utilization": serde_json::Value::Null,
+                        "reset": 0
+                    }]
+                })
+                .to_string(),
+                1_700_000_000_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kv_meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_KEY,
+                serde_json::json!({
+                    "status": crate::server::GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED,
+                    "updated_at": 1_700_000_050_i64,
+                    "error": "network timeout"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+
+        let providers = build_rate_limit_provider_payloads(&conn, 1_700_000_700);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0]["provider"], json!("gemini"));
+        assert_eq!(providers[0]["degraded"], json!(false));
+        assert_eq!(providers[0]["stale"], json!(true));
+        assert_eq!(providers[0]["buckets"][0]["used"], json!(-1));
+        assert_eq!(providers[0]["reason"], serde_json::Value::Null);
     }
 }

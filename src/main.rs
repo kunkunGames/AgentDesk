@@ -12,6 +12,7 @@ pub(crate) mod kanban;
 mod launch;
 mod logging;
 pub(crate) mod manual_intervention;
+mod memory_import_guardrails;
 pub(crate) mod pipeline;
 pub(crate) mod receipt;
 pub(crate) mod reconcile;

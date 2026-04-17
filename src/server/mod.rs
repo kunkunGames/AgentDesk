@@ -21,6 +21,8 @@ const MEMORY_HEALTH_STARTUP_REASON: &str = "startup";
 const MEMORY_HEALTH_FIVE_MIN_REASON: &str = "OnTick5min";
 const FIVE_MIN_POLICY_TICK_INTERVAL: u64 = 10;
 const ESCALATION_PENDING_TTL_SEC: i64 = 600;
+pub(crate) const GEMINI_RATE_LIMIT_FETCH_STATUS_KEY: &str = "rateLimitStatus:gemini";
+pub(crate) const GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED: &str = "fetch_failed";
 
 static DEPLOY_GATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -553,7 +555,7 @@ async fn rate_limit_sync_loop(db: Db) {
 
         // --- Gemini rate limits ---
         // Uses OAuth2 creds from ~/.gemini/oauth_creds.json.
-        // Returns RPM/RPD buckets with known quota limits; usage fields are -1 (unavailable).
+        // Returns RPM/RPD buckets with known quota limits, but usage is unknown.
         match fetch_gemini_rate_limits().await {
             Ok(buckets) => {
                 let n = buckets.len();
@@ -565,14 +567,41 @@ async fn rate_limit_sync_loop(db: Db) {
                         rusqlite::params!["gemini", data, now],
                     )
                     .ok();
+                    clear_gemini_rate_limit_fetch_failure(&conn);
                 }
                 tracing::info!("[rate-limit-sync] Gemini: {} buckets cached", n);
             }
             Err(e) => {
+                if let Ok(conn) = db.lock() {
+                    record_gemini_rate_limit_fetch_failure(
+                        &conn,
+                        chrono::Utc::now().timestamp(),
+                        &e.to_string(),
+                    );
+                }
                 tracing::warn!("[rate-limit-sync] Gemini rate_limit fetch failed: {e}");
             }
         }
     }
+}
+
+fn clear_gemini_rate_limit_fetch_failure(conn: &Connection) {
+    let _ = conn.execute(
+        "DELETE FROM kv_meta WHERE key = ?1",
+        rusqlite::params![GEMINI_RATE_LIMIT_FETCH_STATUS_KEY],
+    );
+}
+
+fn record_gemini_rate_limit_fetch_failure(conn: &Connection, now: i64, error: &str) {
+    let payload = serde_json::json!({
+        "status": GEMINI_RATE_LIMIT_FETCH_STATUS_FAILED,
+        "updated_at": now,
+        "error": error,
+    });
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![GEMINI_RATE_LIMIT_FETCH_STATUS_KEY, payload.to_string()],
+    );
 }
 
 #[cfg(test)]
@@ -697,13 +726,15 @@ mod tests {
     }
 
     #[test]
-    fn build_gemini_rate_limit_buckets_uses_non_negative_usage_placeholders() {
+    fn build_gemini_rate_limit_buckets_preserves_unknown_utilization_contract() {
         let buckets = build_gemini_rate_limit_buckets(15, 1500);
 
-        assert_eq!(buckets[0]["used"], json!(0));
-        assert_eq!(buckets[0]["remaining"], json!(15));
-        assert_eq!(buckets[1]["used"], json!(0));
-        assert_eq!(buckets[1]["remaining"], json!(1500));
+        assert_eq!(buckets[0]["used"], json!(-1));
+        assert_eq!(buckets[0]["remaining"], json!(-1));
+        assert_eq!(buckets[0]["utilization"], serde_json::Value::Null);
+        assert_eq!(buckets[1]["used"], json!(-1));
+        assert_eq!(buckets[1]["remaining"], json!(-1));
+        assert_eq!(buckets[1]["utilization"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -1563,15 +1594,17 @@ fn build_gemini_rate_limit_buckets(rpm_limit: i64, rpd_limit: i64) -> Vec<serde_
         serde_json::json!({
             "name": "rpm",
             "limit": rpm_limit,
-            "used": 0_i64,
-            "remaining": rpm_limit,
+            "used": -1_i64,
+            "remaining": -1_i64,
+            "utilization": serde_json::Value::Null,
             "reset": 0_i64,
         }),
         serde_json::json!({
             "name": "rpd",
             "limit": rpd_limit,
-            "used": 0_i64,
-            "remaining": rpd_limit,
+            "used": -1_i64,
+            "remaining": -1_i64,
+            "utilization": serde_json::Value::Null,
             "reset": 0_i64,
         }),
     ]
@@ -1581,8 +1614,8 @@ fn build_gemini_rate_limit_buckets(rpm_limit: i64, rpd_limit: i64) -> Vec<serde_
 ///
 /// Returns RPM and RPD buckets sourced from `generate_content_free_tier_requests`
 /// quota metrics. The API does not expose real-time usage counters, so the
-/// returned buckets use non-negative placeholder usage (`used = 0`,
-/// `remaining = limit`) to keep downstream UI math stable.
+/// returned buckets preserve unknown utilization with explicit null/sentinel
+/// values instead of synthetic "0%" placeholders.
 async fn fetch_gemini_rate_limits() -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let token = load_gemini_access_token().await?;
     let project_id = discover_gemini_project_id(&token).await?;
