@@ -130,6 +130,9 @@ resolve_macos_codesign_mode() {
     auto)
       if [ "$CODESIGN_IDENTITY" = "-" ]; then
         RESOLVED_CODESIGN_MODE="adhoc"
+      elif [ -n "$CODESIGN_IDENTITY" ]; then
+        RESOLVED_CODESIGN_IDENTITY="$(resolve_developer_id_identity)" || return 1
+        RESOLVED_CODESIGN_MODE="developer-id"
       elif RESOLVED_CODESIGN_IDENTITY="$(resolve_developer_id_identity 2>/dev/null)"; then
         RESOLVED_CODESIGN_MODE="developer-id"
       else
