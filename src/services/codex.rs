@@ -595,6 +595,7 @@ fn execute_streaming_local_tmux(
             .map(|value| format!(" \\\n  --resume-session-id {}", shell_escape(value)))
             .unwrap_or_default(),
         fast_mode_arg = render_fast_mode_wrapper_arg(fast_mode_enabled),
+        fast_mode_arg = render_fast_mode_wrapper_arg(fast_mode_enabled),
     );
 
     std::fs::write(&script_path, &script_content)
@@ -964,6 +965,7 @@ fn base_exec_args(
         args.push("-m".to_string());
         args.push(model.to_string());
     }
+    append_fast_mode_args(&mut args, fast_mode_enabled);
     append_fast_mode_args(&mut args, fast_mode_enabled);
     args.push("exec".to_string());
     if let Some(existing_thread_id) = session_id {
@@ -1493,6 +1495,7 @@ mod tests {
             "- starts like option",
             Some("gpt-5-codex"),
             false,
+            Some(true),
             Some(true),
         );
         assert!(args.starts_with(&[

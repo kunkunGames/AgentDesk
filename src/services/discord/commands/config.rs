@@ -224,6 +224,8 @@ pub(in crate::services::discord) async fn update_channel_model_override(
 
     if reset_required {
         shared.session_reset_pending.insert(channel_id);
+    } else {
+        shared.session_reset_pending.remove(&channel_id);
     }
 
     true
