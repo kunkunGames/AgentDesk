@@ -220,15 +220,15 @@ fn default_memory_backend() -> String {
 }
 
 fn default_sak_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_KNOWLEDGE_RELATIVE_PATH.to_string()
+    "memories/shared-agent-knowledge/shared_knowledge.md".to_string()
 }
 
 fn default_sam_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_MEMORY_RELATIVE_ROOT.to_string()
+    "memories/shared-agent-memory".to_string()
 }
 
 fn default_ltm_root() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_LONG_TERM_RELATIVE_ROOT.to_string()
+    "memories/long-term".to_string()
 }
 
 fn default_auto_memory_root() -> String {
