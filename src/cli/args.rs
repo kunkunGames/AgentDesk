@@ -208,6 +208,9 @@ pub(crate) enum Commands {
         /// Optional resume session id for the first turn
         #[arg(long)]
         resume_session_id: Option<String>,
+        /// Enable Codex native fast mode for every turn in this wrapper session
+        #[arg(long, default_value_t = false)]
+        fast_mode: bool,
         /// Working directory (defaults to ".")
         #[arg(long, default_value = ".")]
         cwd: String,

@@ -220,6 +220,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             codex_model,
             reasoning_effort,
             resume_session_id,
+            fast_mode,
             cwd,
             input_mode,
             compact_token_limit,
@@ -237,6 +238,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 codex_model.as_deref(),
                 reasoning_effort.as_deref(),
                 resume_session_id.as_deref(),
+                fast_mode,
                 mode,
                 compact_token_limit,
             );

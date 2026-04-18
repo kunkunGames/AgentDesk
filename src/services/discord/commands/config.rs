@@ -223,11 +223,51 @@ pub(in crate::services::discord) async fn update_channel_model_override(
     }
 
     if reset_required {
-        shared.model_session_reset_pending.insert(channel_id);
+        shared.session_reset_pending.insert(channel_id);
     } else {
-        shared.model_session_reset_pending.remove(&channel_id);
+        shared.session_reset_pending.remove(&channel_id);
     }
 
+    true
+}
+
+pub(in crate::services::discord) fn channel_fast_mode_enabled(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    shared.fast_mode_channels.contains(&channel_id)
+}
+
+pub(in crate::services::discord) async fn update_channel_fast_mode(
+    shared: &Arc<SharedData>,
+    token: &str,
+    channel_id: serenity::ChannelId,
+    enabled: bool,
+) -> bool {
+    let current_enabled = channel_fast_mode_enabled(shared, channel_id);
+    if current_enabled == enabled {
+        return false;
+    }
+
+    if enabled {
+        shared.fast_mode_channels.insert(channel_id);
+    } else {
+        shared.fast_mode_channels.remove(&channel_id);
+    }
+
+    let mut settings = shared.settings.write().await;
+    if enabled {
+        settings
+            .channel_fast_modes
+            .insert(channel_id.get().to_string(), true);
+    } else {
+        settings
+            .channel_fast_modes
+            .remove(&channel_id.get().to_string());
+    }
+    save_bot_settings(token, &settings);
+
+    shared.session_reset_pending.insert(channel_id);
     true
 }
 

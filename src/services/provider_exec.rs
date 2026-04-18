@@ -99,6 +99,7 @@ pub async fn execute_structured(
                 None,
                 None,
                 model_ref,
+                false,
                 None,
             ),
             ProviderKind::Codex => codex::execute_command_streaming(
@@ -114,6 +115,7 @@ pub async fn execute_structured(
                 None,
                 None,
                 model_ref,
+                false,
                 None,
             ),
             ProviderKind::Gemini => gemini::execute_command_streaming(

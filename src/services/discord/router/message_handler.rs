@@ -1455,6 +1455,8 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     let model_for_turn =
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
+    let native_fast_mode_enabled = matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+        && shared.fast_mode_channels.contains(&channel_id);
 
     // Fetch context compact percent from ADK settings (provider-specific)
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
@@ -1491,6 +1493,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
+                        native_fast_mode_enabled,
                         compact_percent_for_claude,
                     ),
                     ProviderKind::Codex => codex::execute_command_streaming(
@@ -1506,6 +1509,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
+                        native_fast_mode_enabled,
                         compact_token_limit_for_codex,
                     ),
                     ProviderKind::Gemini => gemini::execute_command_streaming(
