@@ -751,10 +751,10 @@ pub(in crate::services::discord) async fn cmd_allowall(
 
 #[cfg(test)]
 mod tests {
+    use crate::services::discord::make_shared_data_for_tests;
     use crate::services::discord::model_catalog::{
         DEFAULT_PICKER_VALUE, known_models, validate_model_input,
     };
-    use crate::services::discord::make_shared_data_for_tests;
 
     use super::super::model_ui::{
         build_model_picker_option_specs, build_model_picker_summary_lines,
