@@ -38,6 +38,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "launch.rs": "Starts the Tokio runtime and hands off to server boot.",
     "logging.rs": "Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs.",
     "main.rs": "Binary entry point. Dispatches CLI commands or boots the server runtime.",
+    "memory_import_guardrails.rs": "Canonical allowlist and exclusion constants for direct memory imports into the managed layout.",
     "pipeline.rs": "Pipeline stage loading, resolution, and transition helpers.",
     "receipt.rs": "Receipt parsing and workspace attribution helpers.",
     "reconcile.rs": "Boot-time reconciliation for persisted state and dispatch-runtime drift.",

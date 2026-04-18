@@ -299,6 +299,7 @@ src/
 ├── logging.rs
 ├── main.rs
 ├── manual_intervention.rs
+├── memory_import_guardrails.rs
 ├── pipeline.rs
 ├── receipt.rs
 ├── reconcile.rs
@@ -339,6 +340,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/logging.rs` | Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs. |
 | `src/main.rs` | Binary entry point. Dispatches CLI commands or boots the server runtime. |
 | `src/manual_intervention.rs` | Manual intervention parsing and helpers shared by Discord reply/requeue flows. |
+| `src/memory_import_guardrails.rs` | Canonical allowlist and exclusion constants for direct memory imports into the managed layout. |
 | `src/pipeline.rs` | Pipeline stage loading, resolution, and transition helpers. |
 | `src/receipt.rs` | Receipt parsing and workspace attribution helpers. |
 | `src/reconcile.rs` | Boot-time reconciliation for persisted state and dispatch-runtime drift. |
