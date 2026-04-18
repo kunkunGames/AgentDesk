@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod diagnostics;
+mod fast_mode;
 mod help;
 mod meeting_cmd;
 mod model_picker;
@@ -31,6 +32,7 @@ pub(super) use diagnostics::{
     cmd_debug, cmd_deletesession, cmd_health, cmd_inflight, cmd_metrics, cmd_queue, cmd_sessions,
     cmd_status,
 };
+pub(super) use fast_mode::cmd_fast;
 pub(super) use help::cmd_help;
 pub(super) use meeting_cmd::cmd_meeting;
 pub(super) use model_picker::cmd_model;
