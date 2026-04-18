@@ -242,6 +242,10 @@ pub(crate) async fn process_outbox_batch<N: OutboxNotifier>(
                     .await
             }
             "status_reaction" => {
+                // #750: narrow-path sync — sync_dispatch_status_reaction only
+                // writes ❌ on failed/cancelled dispatches (command bot owns
+                // ⏳/✅). Drains legacy rows correctly and covers repair paths
+                // that bypass turn_bridge (queue/API cancel, orphan recovery).
                 notifier
                     .sync_status_reaction(db.clone(), dispatch_id.clone())
                     .await
@@ -1343,8 +1347,12 @@ mod tests {
         }
     }
 
+    /// #750: status_reaction outbox rows route through notifier.sync_status_reaction.
+    /// The real notifier's sync is narrowed to write ❌ only for failed/cancelled
+    /// dispatches (command bot's ⏳/✅ covers normal lifecycle); mock captures
+    /// every invocation so we can assert the action is wired through.
     #[tokio::test]
-    async fn process_outbox_batch_handles_status_reaction_action() {
+    async fn process_outbox_batch_routes_status_reaction_through_notifier() {
         let db = test_db();
         {
             let conn = db.lock().unwrap();
@@ -1359,8 +1367,9 @@ mod tests {
         let processed = process_outbox_batch(&db, &notifier).await;
         assert_eq!(processed, 1);
         assert_eq!(
-            notifier.calls.lock().unwrap().as_slice(),
-            ["status_reaction:dispatch-status"]
+            *notifier.calls.lock().unwrap(),
+            vec!["status_reaction:dispatch-status".to_string()],
+            "#750: status_reaction action must flow through notifier.sync_status_reaction"
         );
 
         let conn = db.lock().unwrap();

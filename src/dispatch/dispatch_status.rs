@@ -8,6 +8,18 @@ use crate::engine::PolicyEngine;
 use super::dispatch_context::validate_dispatch_completion_evidence_on_conn;
 use super::query_dispatch_row;
 
+/// #750: Sources whose completion path already writes ✅ to the Discord
+/// message via the command bot (turn_bridge / tmux watcher). For those, the
+/// announce-bot sync would only bump the reaction count; skip the enqueue.
+///
+/// Non-live paths (api, recovery_*, supervisor_*, test_*, cli, etc.) bypass
+/// the command bot entirely and need the announce-bot ✅ as the only
+/// terminal-state signal on the original dispatch message.
+fn transition_source_is_live_command_bot(transition_source: &str) -> bool {
+    let src = transition_source.trim();
+    src.starts_with("turn_bridge") || src.starts_with("watcher")
+}
+
 /// Ensure a durable notify outbox row exists for a dispatch.
 ///
 /// Used both by the authoritative dispatch creation transaction and by
@@ -62,25 +74,33 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
 /// Discord side-effect reads the latest dispatch status from `task_dispatches`.
 /// Once an older row is already `done` or `failed`, a later transition should
 /// enqueue a fresh row.
+///
+/// #750: announce bot no longer writes ✅ on completed dispatches (command
+/// bot's turn-lifecycle ✅ is the single source of truth for success). The
+/// announce-bot path is preserved ONLY to write ❌ on failed/cancelled
+/// dispatches, because command bot's turn_bridge unconditionally adds ✅ when
+/// a response was delivered (see turn_bridge/mod.rs:1537) — a failed dispatch
+/// that returned any text would otherwise show a false green check. This
+/// enqueue is also the only repair path for status transitions that bypass
+/// turn_bridge entirely (queue/API cancellation, orphan recovery).
 pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
     conn: &rusqlite::Connection,
     dispatch_id: &str,
 ) -> rusqlite::Result<bool> {
-    let exists: bool = conn.query_row(
-        "SELECT COUNT(*) > 0
-         FROM dispatch_outbox
-         WHERE dispatch_id = ?1
-           AND action = 'status_reaction'
-           AND status IN ('pending', 'processing')",
-        [dispatch_id],
-        |row| row.get(0),
-    )?;
-    if exists {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT status FROM dispatch_outbox \
+             WHERE dispatch_id = ?1 AND action = 'status_reaction' \
+             ORDER BY id DESC LIMIT 1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if matches!(existing.as_deref(), Some("pending")) {
         return Ok(false);
     }
-
     conn.execute(
-        "INSERT INTO dispatch_outbox (dispatch_id, action) VALUES (?1, 'status_reaction')",
+        "INSERT INTO dispatch_outbox (dispatch_id, action, status) VALUES (?1, 'status_reaction', 'pending')",
         [dispatch_id],
     )?;
     Ok(true)
@@ -208,10 +228,27 @@ pub(crate) fn set_dispatch_status_on_conn(
                 result,
             )?;
 
-            if matches!(
-                to_status,
-                "dispatched" | "completed" | "failed" | "cancelled"
-            ) {
+            // #750: narrowed enqueue — the announce-bot reaction sync now runs
+            // only when it actually has something to write:
+            // - 'failed' / 'cancelled': always. Command bot's turn_bridge
+            //   unconditionally adds ✅ when a response is delivered, so the
+            //   announce-bot sync has to clean that ✅ and add ❌. Also covers
+            //   queue/API cancellation + orphan recovery which bypass
+            //   turn_bridge entirely.
+            // - 'completed': only when the completion path is NOT the command
+            //   bot's live reaction path. turn_bridge / tmux watcher already
+            //   added ✅ on response delivery; re-adding it via the announce
+            //   bot would just bump the reaction count. For non-live paths
+            //   (api, recovery, supervisor orphan) the announce-bot sync is
+            //   the ONLY source of the terminal ✅.
+            // - pending / dispatched: skipped. Command bot is now the single
+            //   source of ⏳ (see should_add_turn_pending_reaction).
+            let enqueue = match to_status {
+                "failed" | "cancelled" => true,
+                "completed" => !transition_source_is_live_command_bot(transition_source),
+                _ => false,
+            };
+            if enqueue {
                 ensure_dispatch_status_reaction_outbox_on_conn(conn, dispatch_id)?;
             }
         }
