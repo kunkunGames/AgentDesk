@@ -951,6 +951,14 @@ function markPrCreateFailed(cardId, reason, stampGen) {
     } catch (e) {
       agentdesk.log.warn("[review] escalateToManualIntervention failed: " + e);
     }
+    // Non-review escalation writes a human-readable blocked_reason. Restore the
+    // machine-readable marker afterward so merge automation stays in the
+    // create-pr failure lane.
+    agentdesk.db.execute(
+      "UPDATE kanban_cards SET blocked_reason = 'pr:create_failed_escalated:max_retries', " +
+      "updated_at = datetime('now') WHERE id = ?",
+      [cardId]
+    );
   } else {
     var blockedReason = "pr:create_failed:" + errorMsg;
     agentdesk.db.execute(
