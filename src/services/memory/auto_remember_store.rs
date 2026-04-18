@@ -3,11 +3,15 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+pub(crate) const AUTO_REMEMBER_MAX_RETRIES: u32 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutoRememberMemoryStatus {
     Remembered,
     DuplicateSkip,
+    ValidationSkipped,
     RememberFailed,
+    AbandonedAfterRetries,
 }
 
 impl AutoRememberMemoryStatus {
@@ -15,7 +19,9 @@ impl AutoRememberMemoryStatus {
         match self {
             Self::Remembered => "remembered",
             Self::DuplicateSkip => "duplicate_skip",
+            Self::ValidationSkipped => "validation_skipped",
             Self::RememberFailed => "remember_failed",
+            Self::AbandonedAfterRetries => "abandoned_after_retries",
         }
     }
 
@@ -23,13 +29,42 @@ impl AutoRememberMemoryStatus {
         match raw {
             "remembered" => Some(Self::Remembered),
             "duplicate_skip" => Some(Self::DuplicateSkip),
+            "validation_skipped" => Some(Self::ValidationSkipped),
             "remember_failed" => Some(Self::RememberFailed),
+            "abandoned_after_retries" => Some(Self::AbandonedAfterRetries),
             _ => None,
         }
     }
 
     pub(crate) fn suppresses_repeat(self) -> bool {
-        matches!(self, Self::Remembered | Self::DuplicateSkip)
+        matches!(
+            self,
+            Self::Remembered
+                | Self::DuplicateSkip
+                | Self::ValidationSkipped
+                | Self::AbandonedAfterRetries
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoRememberStage {
+    Extract,
+    Validate,
+    RecallLookup,
+    Remember,
+    Dedupe,
+}
+
+impl AutoRememberStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Extract => "extract",
+            Self::Validate => "validate",
+            Self::RecallLookup => "recall_lookup",
+            Self::Remember => "remember",
+            Self::Dedupe => "dedupe",
+        }
     }
 }
 
@@ -39,8 +74,16 @@ pub(crate) struct AutoRememberAuditEntry<'a> {
     pub(crate) candidate_hash: &'a str,
     pub(crate) signal_kind: &'a str,
     pub(crate) workspace: &'a str,
+    pub(crate) stage: AutoRememberStage,
     pub(crate) status: AutoRememberMemoryStatus,
+    pub(crate) retry_count: u32,
     pub(crate) error: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AutoRememberAuditRecord {
+    pub(crate) status: AutoRememberMemoryStatus,
+    pub(crate) retry_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -64,7 +107,9 @@ impl AutoRememberStore {
                     candidate_hash TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
                     signal_kind TEXT NOT NULL,
+                    stage TEXT NOT NULL,
                     memory_status TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (workspace, candidate_hash)
@@ -79,24 +124,33 @@ impl AutoRememberStore {
         &self.path
     }
 
-    pub(crate) fn lookup_status(
+    pub(crate) fn lookup_record(
         &self,
         workspace: &str,
         candidate_hash: &str,
-    ) -> Result<Option<AutoRememberMemoryStatus>, String> {
+    ) -> Result<Option<AutoRememberAuditRecord>, String> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT memory_status
+                "SELECT memory_status, retry_count
                  FROM auto_remember_audit
                  WHERE workspace = ?1 AND candidate_hash = ?2",
                 params![workspace, candidate_hash],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    let status = row.get::<_, String>(0)?;
+                    let retry_count = row.get::<_, u32>(1)?;
+                    Ok((status, retry_count))
+                },
             )
             .optional()
-            .map(|status| {
-                status
-                    .as_deref()
-                    .and_then(AutoRememberMemoryStatus::from_str)
+            .map(|record| {
+                record.and_then(|(status, retry_count)| {
+                    AutoRememberMemoryStatus::from_str(&status).map(|status| {
+                        AutoRememberAuditRecord {
+                            status,
+                            retry_count,
+                        }
+                    })
+                })
             })
         })
     }
@@ -114,14 +168,18 @@ impl AutoRememberStore {
                     candidate_hash,
                     turn_id,
                     signal_kind,
+                    stage,
                     memory_status,
+                    retry_count,
                     error,
                     created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(workspace, candidate_hash) DO UPDATE SET
                     turn_id = excluded.turn_id,
                     signal_kind = excluded.signal_kind,
+                    stage = excluded.stage,
                     memory_status = excluded.memory_status,
+                    retry_count = excluded.retry_count,
                     error = excluded.error,
                     created_at = excluded.created_at",
                 params![
@@ -129,13 +187,40 @@ impl AutoRememberStore {
                     entry.candidate_hash,
                     entry.turn_id,
                     entry.signal_kind,
+                    entry.stage.as_str(),
                     entry.status.as_str(),
+                    entry.retry_count,
                     error,
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
                 ],
             )?;
             Ok(())
         })
+    }
+
+    pub(crate) fn next_retry_count(
+        &self,
+        workspace: &str,
+        candidate_hash: &str,
+    ) -> Result<u32, String> {
+        Ok(self
+            .lookup_record(workspace, candidate_hash)?
+            .map(|record| record.retry_count.saturating_add(1))
+            .unwrap_or(1))
+    }
+
+    pub(crate) fn next_failure_status(
+        &self,
+        workspace: &str,
+        candidate_hash: &str,
+    ) -> Result<(AutoRememberMemoryStatus, u32), String> {
+        let retry_count = self.next_retry_count(workspace, candidate_hash)?;
+        let status = if retry_count >= AUTO_REMEMBER_MAX_RETRIES {
+            AutoRememberMemoryStatus::AbandonedAfterRetries
+        } else {
+            AutoRememberMemoryStatus::RememberFailed
+        };
+        Ok((status, retry_count))
     }
 
     fn with_conn<T>(
@@ -177,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_store_uses_workspace_hash_dedup_key() {
+    fn sidecar_store_tracks_retry_count_and_status() {
         with_temp_root(|temp| {
             let store = AutoRememberStore::open().unwrap();
             assert_eq!(
@@ -191,36 +276,30 @@ mod tests {
                     candidate_hash: "hash-1",
                     signal_kind: "technical_decision",
                     workspace: "agentdesk-default",
-                    status: AutoRememberMemoryStatus::Remembered,
-                    error: None,
+                    stage: AutoRememberStage::Remember,
+                    status: AutoRememberMemoryStatus::RememberFailed,
+                    retry_count: 1,
+                    error: Some("network error"),
                 })
                 .unwrap();
 
-            assert_eq!(
-                store.lookup_status("agentdesk-default", "hash-1").unwrap(),
-                Some(AutoRememberMemoryStatus::Remembered)
-            );
-
-            store
-                .upsert_audit(AutoRememberAuditEntry {
-                    turn_id: "turn-2",
-                    candidate_hash: "hash-1",
-                    signal_kind: "technical_decision",
-                    workspace: "agentdesk-default",
-                    status: AutoRememberMemoryStatus::DuplicateSkip,
-                    error: None,
-                })
+            let record = store
+                .lookup_record("agentdesk-default", "hash-1")
+                .unwrap()
                 .unwrap();
-
+            assert_eq!(record.status, AutoRememberMemoryStatus::RememberFailed);
+            assert_eq!(record.retry_count, 1);
             assert_eq!(
-                store.lookup_status("agentdesk-default", "hash-1").unwrap(),
-                Some(AutoRememberMemoryStatus::DuplicateSkip)
+                store
+                    .next_failure_status("agentdesk-default", "hash-1")
+                    .unwrap(),
+                (AutoRememberMemoryStatus::RememberFailed, 2)
             );
         });
     }
 
     #[test]
-    fn remember_failed_status_does_not_suppress_retries() {
+    fn remember_failed_status_abandons_after_max_retries() {
         with_temp_root(|_| {
             let store = AutoRememberStore::open().unwrap();
             store
@@ -229,14 +308,19 @@ mod tests {
                     candidate_hash: "hash-2",
                     signal_kind: "config_change",
                     workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Remember,
                     status: AutoRememberMemoryStatus::RememberFailed,
+                    retry_count: AUTO_REMEMBER_MAX_RETRIES - 1,
                     error: Some("network error"),
                 })
                 .unwrap();
 
-            let status = store.lookup_status("agentdesk-default", "hash-2").unwrap();
-            assert_eq!(status, Some(AutoRememberMemoryStatus::RememberFailed));
-            assert!(!status.unwrap().suppresses_repeat());
+            let (status, retry_count) = store
+                .next_failure_status("agentdesk-default", "hash-2")
+                .unwrap();
+            assert_eq!(status, AutoRememberMemoryStatus::AbandonedAfterRetries);
+            assert_eq!(retry_count, AUTO_REMEMBER_MAX_RETRIES);
+            assert!(status.suppresses_repeat());
         });
     }
 }

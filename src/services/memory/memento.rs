@@ -45,12 +45,13 @@ struct ExternalRecallFetchResult {
     token_usage: TokenUsage,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct MementoRememberRequest {
     pub content: String,
     pub topic: String,
     pub kind: String,
     pub keywords: Vec<String>,
+    pub importance: Option<f64>,
     pub source: Option<String>,
     pub workspace: Option<String>,
     pub agent_id: Option<String>,
@@ -61,6 +62,7 @@ pub(crate) struct MementoRememberRequest {
     pub resolution_status: Option<String>,
     pub assertion_status: Option<String>,
     pub context_summary: Option<String>,
+    pub supersedes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -419,6 +421,12 @@ impl MementoBackend {
         if !keywords.is_empty() {
             args.insert("keywords".to_string(), json!(keywords));
         }
+        if let Some(importance) = request
+            .importance
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        {
+            args.insert("importance".to_string(), json!(importance));
+        }
 
         insert_optional_arg(&mut args, "source", request.source);
         insert_optional_arg(
@@ -436,10 +444,49 @@ impl MementoBackend {
         insert_optional_arg(&mut args, "resolutionStatus", request.resolution_status);
         insert_optional_arg(&mut args, "assertionStatus", request.assertion_status);
         insert_optional_arg(&mut args, "contextSummary", request.context_summary);
+        let supersedes = request
+            .supersedes
+            .into_iter()
+            .map(|value| normalize_whitespace(&value))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if !supersedes.is_empty() {
+            args.insert("supersedes".to_string(), json!(supersedes));
+        }
 
         self.call_tool(&config, "remember", Value::Object(args))
             .await
             .map(|result| result.token_usage)
+    }
+
+    pub(crate) async fn lookup_fragment_ids(
+        &self,
+        workspace: &str,
+        topic: &str,
+        keywords: &[String],
+    ) -> Result<(Vec<String>, TokenUsage), String> {
+        let config = self.runtime_config()?;
+        let mut args = Map::new();
+        args.insert("agentId".to_string(), json!("default"));
+        args.insert("workspace".to_string(), json!(workspace));
+        args.insert("topic".to_string(), json!(topic));
+        args.insert("excludeSeen".to_string(), json!(false));
+        args.insert("pageSize".to_string(), json!(5));
+        args.insert("tokenBudget".to_string(), json!(500));
+
+        let keywords = keywords
+            .iter()
+            .map(|value| normalize_whitespace(value))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if !keywords.is_empty() {
+            args.insert("keywords".to_string(), json!(keywords));
+        }
+
+        let result = self
+            .call_tool(&config, "recall", Value::Object(args))
+            .await?;
+        Ok((recall_fragment_ids(&result.payload), result.token_usage))
     }
 
     pub(crate) async fn tool_feedback(
@@ -621,6 +668,18 @@ pub(crate) fn sanitize_memento_workspace_segment(value: &str) -> String {
 
 fn normalize_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn recall_fragment_ids(payload: &Value) -> Vec<String> {
+    payload
+        .get("fragments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fragment| fragment.get("id").and_then(Value::as_str))
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn insert_optional_arg(args: &mut Map<String, Value>, key: &str, value: Option<String>) {
@@ -1436,6 +1495,36 @@ mod tests {
     }
 
     #[test]
+    fn test_format_context_payload_for_external_recall_caps_ranked_lines() {
+        let ranked_items = (1..=10)
+            .map(|idx| {
+                json!({
+                    "content": format!("Ranked memory #{idx}"),
+                    "type": "procedure",
+                    "score": 1.0 - (idx as f64 * 0.01)
+                })
+            })
+            .collect::<Vec<_>>();
+        let formatted = format_context_payload_for_external_recall(&json!({
+            "rankedInjection": {
+                "items": ranked_items
+            }
+        }))
+        .expect("formatted external recall should exist");
+
+        assert_eq!(
+            formatted
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            MAX_MEMORY_LINES
+        );
+        assert!(formatted.contains("Ranked memory #1"));
+        assert!(formatted.contains("Ranked memory #6"));
+        assert!(!formatted.contains("Ranked memory #7"));
+    }
+
+    #[test]
     fn test_format_recall_payload_for_external_recall_renders_fragments_and_hint() {
         let formatted = format_recall_payload_for_external_recall(&json!({
             "fragments": [
@@ -1672,6 +1761,8 @@ mod tests {
         assert!(requests[1].contains("\"agentId\":\"project-agentdesk\""));
         assert!(requests[1].contains("\"sessionId\":\"session-1\""));
         assert!(requests[1].contains("\"excludeSeen\":true"));
+        assert!(requests[1].contains("\"pageSize\":8"));
+        assert!(requests[1].contains("\"tokenBudget\":1200"));
         assert!(requests[1].contains("\"text\":\"How should I deploy the service safely?\""));
         assert!(
             requests[1].contains("\"contextText\":\"How should I deploy the service safely?\"")
@@ -1891,6 +1982,7 @@ mod tests {
                 topic: "issue-418".to_string(),
                 kind: "episode".to_string(),
                 keywords: vec!["issue-418".to_string(), "success".to_string()],
+                importance: Some(0.9),
                 source: Some("card:card-418/dispatch:dispatch-418".to_string()),
                 workspace: Some("agentdesk".to_string()),
                 agent_id: Some("default".to_string()),
@@ -1901,6 +1993,7 @@ mod tests {
                 resolution_status: Some("resolved".to_string()),
                 assertion_status: Some("verified".to_string()),
                 context_summary: Some("Completed implementation card summary".to_string()),
+                supersedes: vec!["frag-legacy-1".to_string()],
             })
             .await
             .unwrap();
@@ -1921,11 +2014,13 @@ mod tests {
         assert!(requests[1].contains("\"workspace\":\"agentdesk\""));
         assert!(requests[1].contains("\"agentId\":\"default\""));
         assert!(requests[1].contains("\"caseId\":\"issue-418\""));
+        assert!(requests[1].contains("\"importance\":0.9"));
         assert!(requests[1].contains("\"resolutionStatus\":\"resolved\""));
         assert!(requests[1].contains("\"assertionStatus\":\"verified\""));
         assert!(
             requests[1].contains("\"contextSummary\":\"Completed implementation card summary\"")
         );
+        assert!(requests[1].contains("\"supersedes\":[\"frag-legacy-1\"]"));
         assert_eq!(
             usage,
             crate::services::memory::TokenUsage {

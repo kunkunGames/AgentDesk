@@ -674,12 +674,12 @@ impl EscalationConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MemoryConfig {
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    #[serde(default)]
+    #[serde(default = "default_query_recall_after_bootstrap")]
     pub query_recall_after_bootstrap: bool,
     #[serde(default)]
     pub file: FileMemoryConfig,
@@ -687,6 +687,18 @@ pub struct MemoryConfig {
     pub mcp: McpMemoryConfig,
     #[serde(default)]
     pub auto_remember: AutoRememberConfig,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_memory_backend(),
+            query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
+            file: FileMemoryConfig::default(),
+            mcp: McpMemoryConfig::default(),
+            auto_remember: AutoRememberConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -724,6 +736,10 @@ impl Default for FileMemoryConfig {
 pub struct McpMemoryConfig {
     pub endpoint: String,
     pub access_key_env: String,
+}
+
+const fn default_query_recall_after_bootstrap() -> bool {
+    false
 }
 
 /// Compile-time defaults loaded from the project-root `defaults.json`.

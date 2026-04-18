@@ -37,6 +37,10 @@ pub use paths::{
 pub const MEMORY_LAYOUT_VERSION: u32 = 2;
 const DEFAULT_MEMORY_BACKEND: &str = "auto";
 
+const fn default_query_recall_after_bootstrap() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryBackendConfig {
@@ -44,7 +48,7 @@ pub struct MemoryBackendConfig {
     pub version: u32,
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    #[serde(default)]
+    #[serde(default = "default_query_recall_after_bootstrap")]
     pub query_recall_after_bootstrap: bool,
     #[serde(default)]
     pub file: FileMemoryBackendConfig,
@@ -65,7 +69,7 @@ impl Default for MemoryBackendConfig {
         Self {
             version: default_memory_layout_version(),
             backend: default_memory_backend(),
-            query_recall_after_bootstrap: false,
+            query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
             file: FileMemoryBackendConfig::default(),
             mcp: McpMemoryBackendConfig::default(),
             auto_remember: AutoRememberConfig::default(),
@@ -821,6 +825,7 @@ mod tests {
         let backend = load_memory_backend(root);
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "auto");
+        assert!(!backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, default_sak_path());
         assert_eq!(backend.file.sam_path, default_sam_path());
         assert_eq!(backend.file.ltm_root, default_ltm_root());
@@ -1139,7 +1144,7 @@ memory:
 
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "memento");
-        assert!(backend.query_recall_after_bootstrap);
+        assert!(!backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/yaml/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/yaml/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/yaml/ltm");
@@ -1223,6 +1228,7 @@ memory:
 
         assert_eq!(backend.version, 1);
         assert_eq!(backend.backend, "auto");
+        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/legacy/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/legacy/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/legacy/ltm");

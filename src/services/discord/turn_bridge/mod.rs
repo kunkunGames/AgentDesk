@@ -148,8 +148,15 @@ fn build_background_memory_jobs(
     reflect_request: Option<ReflectRequest>,
 ) -> Vec<TurnEndMemoryJob> {
     let mut jobs = Vec::new();
-    if let Some(reflect_request) = reflect_request {
-        jobs.push(TurnEndMemoryJob::Reflect(reflect_request));
+    if should_spawn_auto_remember {
+        jobs.push(TurnEndMemoryJob::AutoRemember(AutoRememberTurnRequest {
+            turn_id: turn_id.to_string(),
+            role_id: memory_role_id.to_string(),
+            channel_id: channel_id.get(),
+            user_text: user_text.to_string(),
+            assistant_text: assistant_text.to_string(),
+            transcript_events: transcript_events.to_vec(),
+        }));
     }
     if should_spawn_memory_capture {
         jobs.push(TurnEndMemoryJob::Capture(CaptureRequest {
@@ -162,15 +169,8 @@ fn build_background_memory_jobs(
             assistant_text: assistant_text.to_string(),
         }));
     }
-    if should_spawn_auto_remember {
-        jobs.push(TurnEndMemoryJob::AutoRemember(AutoRememberTurnRequest {
-            turn_id: turn_id.to_string(),
-            role_id: memory_role_id.to_string(),
-            channel_id: channel_id.get(),
-            user_text: user_text.to_string(),
-            assistant_text: assistant_text.to_string(),
-            transcript_events: transcript_events.to_vec(),
-        }));
+    if let Some(reflect_request) = reflect_request {
+        jobs.push(TurnEndMemoryJob::Reflect(reflect_request));
     }
     jobs
 }
