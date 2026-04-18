@@ -5128,18 +5128,11 @@ mod tests {
                 .contains(&"POST /channels/thread-created/messages".to_string()),
             "pg delivery should post the dispatch message into the created thread"
         );
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9C%85/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9D%8C/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"PUT /channels/thread-created/messages/message-thread-created/reactions/%E2%8F%B3/@me"
-                .to_string()
-        ));
+        assert!(
+            !state.calls.iter().any(|call| call.contains("/reactions/")),
+            "#750: announce bot must not write dispatch-lifecycle emoji reactions, got {:?}",
+            state.calls
+        );
 
         let thread_id: Option<String> =
             sqlx::query_scalar("SELECT thread_id FROM task_dispatches WHERE id = $1")

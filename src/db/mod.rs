@@ -138,13 +138,14 @@ pub fn wrap_conn(conn: Connection) -> Db {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("agentdesk_wrap_conn_{id}.sqlite3"));
     let _ = std::fs::remove_file(&path);
-    schema::migrate(&conn).expect("failed to migrate source sqlite db");
     let escaped_path = path.display().to_string().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))
         .expect("failed to checkpoint sqlite test db");
     drop(conn);
 
-    drop(open_write_connection(&path).expect("failed to reopen wrapped sqlite db"));
+    let reopened = open_write_connection(&path).expect("failed to reopen wrapped sqlite db");
+    schema::migrate(&reopened).expect("failed to migrate wrapped sqlite db");
+    drop(reopened);
 
     Arc::new(DbPool {
         path,

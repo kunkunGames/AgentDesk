@@ -16,7 +16,6 @@ use tower::ServiceExt;
 fn test_db() -> Db {
     let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-    crate::db::schema::migrate(&conn).unwrap();
     crate::db::wrap_conn(conn)
 }
 
@@ -13649,10 +13648,17 @@ async fn auto_queue_add_run_entry_pg_creates_pending_entry_for_active_run() {
 
 #[tokio::test]
 async fn auto_queue_submit_order_pg_activates_pending_run_and_skips_non_dispatchable_cards() {
+    crate::pipeline::ensure_loaded();
     let db = test_db();
     let engine = test_engine(&db);
     let pg_db = TestPostgresDb::create().await;
     let pg_pool = pg_db.connect_and_migrate().await;
+    let dispatchable_state = crate::pipeline::get()
+        .dispatchable_states()
+        .into_iter()
+        .next()
+        .expect("default pipeline should expose at least one dispatchable state")
+        .to_string();
 
     sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
         .bind("test-repo")
@@ -13667,9 +13673,17 @@ async fn auto_queue_submit_order_pg_activates_pending_run_and_skips_non_dispatch
         .unwrap();
 
     for (card_id, issue_number, status) in [
-        ("card-order-backlog-pg", 7421_i64, "backlog"),
-        ("card-order-ready-a-pg", 7422_i64, "ready"),
-        ("card-order-ready-b-pg", 7423_i64, "ready"),
+        ("card-order-backlog-pg", 7421_i64, "backlog".to_string()),
+        (
+            "card-order-ready-a-pg",
+            7422_i64,
+            dispatchable_state.clone(),
+        ),
+        (
+            "card-order-ready-b-pg",
+            7423_i64,
+            dispatchable_state.clone(),
+        ),
     ] {
         sqlx::query(
             "INSERT INTO kanban_cards (
