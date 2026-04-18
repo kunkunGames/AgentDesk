@@ -192,7 +192,7 @@
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 722 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 978 |  |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 43 |  |
-| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1224 | giant-file |
+| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1223 | giant-file |
 | `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 530 |  |
 | `services::discord::commands::diagnostics` | `src/services/discord/commands/diagnostics.rs` | 1037 | giant-file |
 | `services::discord::commands::fast_mode` | `src/services/discord/commands/fast_mode.rs` | 113 |  |
