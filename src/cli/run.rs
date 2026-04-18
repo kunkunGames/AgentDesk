@@ -220,7 +220,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             codex_model,
             reasoning_effort,
             resume_session_id,
-            fast_mode,
+            fast_mode_state,
             cwd,
             input_mode,
             compact_token_limit,
@@ -229,6 +229,10 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 super::args::InputModeArg::Pipe => crate::services::tmux_wrapper::InputMode::Pipe,
                 super::args::InputModeArg::Fifo => crate::services::tmux_wrapper::InputMode::Fifo,
             };
+            let fast_mode_override = fast_mode_state.map(|state| match state {
+                super::args::FastModeStateArg::Enabled => true,
+                super::args::FastModeStateArg::Disabled => false,
+            });
             crate::services::codex_tmux_wrapper::run(
                 &output_file,
                 &input_fifo,
@@ -238,7 +242,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 codex_model.as_deref(),
                 reasoning_effort.as_deref(),
                 resume_session_id.as_deref(),
-                fast_mode,
+                fast_mode_override,
                 mode,
                 compact_token_limit,
             );

@@ -41,9 +41,13 @@ fn append_claude_mcp_config_arg(args: &mut Vec<String>) {
     }
 }
 
-fn append_claude_fast_mode_arg(args: &mut Vec<String>, fast_mode_enabled: bool) {
+fn append_claude_fast_mode_arg(args: &mut Vec<String>, fast_mode_enabled: Option<bool>) {
+    let Some(enabled) = fast_mode_enabled else {
+        return;
+    };
+
     args.push("--settings".to_string());
-    args.push(format!(r#"{{"fastMode":{fast_mode_enabled}}}"#));
+    args.push(format!(r#"{{"fastMode":{enabled}}}"#));
 }
 
 fn build_tmux_launch_env_lines(
@@ -448,7 +452,7 @@ pub fn execute_command_streaming(
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
     model_override: Option<&str>,
-    fast_mode_enabled: bool,
+    fast_mode_enabled: Option<bool>,
     compact_percent: Option<u64>,
 ) -> Result<(), String> {
     debug_log("========================================");
@@ -1869,14 +1873,14 @@ mod tests {
     #[test]
     fn test_append_claude_fast_mode_arg_sets_explicit_state() {
         let mut args = Vec::new();
-        append_claude_fast_mode_arg(&mut args, true);
+        append_claude_fast_mode_arg(&mut args, Some(true));
         assert_eq!(
             args,
             vec!["--settings".to_string(), r#"{"fastMode":true}"#.to_string(),]
         );
 
         let mut disabled_args = Vec::new();
-        append_claude_fast_mode_arg(&mut disabled_args, false);
+        append_claude_fast_mode_arg(&mut disabled_args, Some(false));
         assert_eq!(
             disabled_args,
             vec![
@@ -1884,6 +1888,13 @@ mod tests {
                 r#"{"fastMode":false}"#.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_append_claude_fast_mode_arg_skips_when_unset() {
+        let mut args = Vec::new();
+        append_claude_fast_mode_arg(&mut args, None);
+        assert!(args.is_empty());
     }
 
     #[test]
