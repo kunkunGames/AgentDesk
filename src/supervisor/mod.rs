@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rusqlite::OptionalExtension;
+use libsql_rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -333,7 +333,7 @@ impl RuntimeSupervisor {
 
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, marker_json],
+            libsql_rusqlite::params![key, marker_json],
         )
         .map_err(|e| format!("store orphan marker: {e}"))?;
         Ok(false)
@@ -410,7 +410,7 @@ impl RuntimeSupervisor {
             "INSERT INTO runtime_decisions
              (signal, evidence_json, chosen_action, actor, session_key, dispatch_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
+            libsql_rusqlite::params![
                 signal.to_string(),
                 evidence.to_string(),
                 chosen_action.to_string(),
@@ -479,7 +479,7 @@ impl RuntimeSupervisor {
             .ok();
         conn.execute(
             "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![override_status, card_id],
+            libsql_rusqlite::params![override_status, card_id],
         )
         .ok();
     }
@@ -616,7 +616,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)

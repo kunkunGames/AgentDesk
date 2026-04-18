@@ -1040,6 +1040,7 @@ pub struct StatusEntryRecord {
     pub priority_rank: i64,
     pub reason: Option<String>,
     pub status: String,
+    pub retry_count: i64,
     pub created_at: i64,
     pub dispatched_at: Option<i64>,
     pub completed_at: Option<i64>,
@@ -1195,6 +1196,7 @@ pub fn get_status_entry(
 ) -> libsql_rusqlite::Result<Option<StatusEntryRecord>> {
     conn.query_row(
         "SELECT e.id, e.agent_id, e.kanban_card_id, e.priority_rank, e.reason, e.status,
+                COALESCE(e.retry_count, 0),
                 CAST(strftime('%s', e.created_at) AS INTEGER) * 1000,
                 CASE WHEN e.dispatched_at IS NOT NULL THEN CAST(strftime('%s', e.dispatched_at) AS INTEGER) * 1000 END,
                 CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
@@ -1223,6 +1225,7 @@ pub async fn get_status_entry_pg(
                 e.priority_rank::BIGINT AS priority_rank,
                 e.reason,
                 e.status,
+                COALESCE(e.retry_count, 0)::BIGINT AS retry_count,
                 EXTRACT(EPOCH FROM e.created_at)::BIGINT * 1000 AS created_at,
                 CASE WHEN e.dispatched_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM e.dispatched_at)::BIGINT * 1000
@@ -1260,6 +1263,7 @@ pub fn list_status_entries(
 ) -> libsql_rusqlite::Result<Vec<StatusEntryRecord>> {
     let mut sql = String::from(
         "SELECT e.id, e.agent_id, e.kanban_card_id, e.priority_rank, e.reason, e.status,
+                COALESCE(e.retry_count, 0),
                 CAST(strftime('%s', e.created_at) AS INTEGER) * 1000,
                 CASE WHEN e.dispatched_at IS NOT NULL THEN CAST(strftime('%s', e.dispatched_at) AS INTEGER) * 1000 END,
                 CASE WHEN e.completed_at IS NOT NULL THEN CAST(strftime('%s', e.completed_at) AS INTEGER) * 1000 END,
@@ -1306,6 +1310,7 @@ pub async fn list_status_entries_pg(
                 e.priority_rank::BIGINT AS priority_rank,
                 e.reason,
                 e.status,
+                COALESCE(e.retry_count, 0)::BIGINT AS retry_count,
                 EXTRACT(EPOCH FROM e.created_at)::BIGINT * 1000 AS created_at,
                 CASE WHEN e.dispatched_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM e.dispatched_at)::BIGINT * 1000
@@ -3455,19 +3460,20 @@ fn map_status_entry_row(
         priority_rank: row.get(3)?,
         reason: row.get(4)?,
         status: row.get(5)?,
-        created_at: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-        dispatched_at: row.get(7)?,
-        completed_at: row.get(8)?,
-        card_title: row.get(9)?,
-        github_issue_number: row.get(10)?,
-        github_repo: row.get(11)?,
-        thread_group: row.get(12)?,
-        slot_index: row.get(13)?,
-        batch_phase: row.get(14)?,
-        channel_thread_map: row.get(15)?,
-        active_thread_id: row.get(16)?,
-        card_status: row.get(17)?,
-        review_round: row.get::<_, Option<i64>>(18)?.unwrap_or(0),
+        retry_count: row.get(6)?,
+        created_at: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+        dispatched_at: row.get(8)?,
+        completed_at: row.get(9)?,
+        card_title: row.get(10)?,
+        github_issue_number: row.get(11)?,
+        github_repo: row.get(12)?,
+        thread_group: row.get(13)?,
+        slot_index: row.get(14)?,
+        batch_phase: row.get(15)?,
+        channel_thread_map: row.get(16)?,
+        active_thread_id: row.get(17)?,
+        card_status: row.get(18)?,
+        review_round: row.get::<_, Option<i64>>(19)?.unwrap_or(0),
     })
 }
 
@@ -3500,6 +3506,7 @@ fn status_entry_record_from_pg_row(
         priority_rank: row.try_get("priority_rank")?,
         reason: row.try_get("reason")?,
         status: row.try_get("status")?,
+        retry_count: row.try_get("retry_count")?,
         created_at: row.try_get("created_at")?,
         dispatched_at: row.try_get("dispatched_at")?,
         completed_at: row.try_get("completed_at")?,

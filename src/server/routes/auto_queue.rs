@@ -3149,7 +3149,10 @@ where
     }
 }
 
-fn effective_max_entry_retries(conn: &rusqlite::Connection, deps: &AutoQueueActivateDeps) -> i64 {
+fn effective_max_entry_retries(
+    conn: &libsql_rusqlite::Connection,
+    deps: &AutoQueueActivateDeps,
+) -> i64 {
     crate::services::settings::runtime_config_u64(conn, deps.config.as_ref(), "maxEntryRetries")
         .unwrap_or(3)
         .max(1)
@@ -3157,7 +3160,7 @@ fn effective_max_entry_retries(conn: &rusqlite::Connection, deps: &AutoQueueActi
 }
 
 fn human_alert_target_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     deps: &AutoQueueActivateDeps,
 ) -> Option<String> {
     let channel = conn
@@ -3191,7 +3194,7 @@ fn compact_failure_summary(message: &str) -> String {
 }
 
 fn queue_failed_entry_escalation_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     entry_id: &str,
@@ -3201,7 +3204,7 @@ fn queue_failed_entry_escalation_on_conn(
     retry_count: i64,
     retry_limit: i64,
     cause: &str,
-) -> rusqlite::Result<bool> {
+) -> libsql_rusqlite::Result<bool> {
     let Some(target) = human_alert_target_on_conn(conn, deps) else {
         return Ok(false);
     };
@@ -3213,7 +3216,7 @@ fn queue_failed_entry_escalation_on_conn(
     );
     conn.execute(
         "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
-        rusqlite::params![target, content],
+        libsql_rusqlite::params![target, content],
     )?;
     Ok(true)
 }

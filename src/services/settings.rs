@@ -199,7 +199,7 @@ pub fn runtime_config_defaults(config: &crate::config::Config) -> Value {
 }
 
 pub fn runtime_config_u64(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     config: &crate::config::Config,
     key: &str,
 ) -> Option<u64> {
