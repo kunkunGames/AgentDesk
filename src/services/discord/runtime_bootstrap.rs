@@ -1792,7 +1792,10 @@ mod tests {
             "second runtime pool must be fenced while first holder is alive"
         );
 
-        drop(holder_a);
+        holder_a
+            .unlock()
+            .await
+            .expect("unlock discord gateway lease on runtime pool A");
 
         let holder_b = try_acquire_discord_gateway_lease(&pool_b, token_hash, &ProviderKind::Codex)
             .await
