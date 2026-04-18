@@ -560,34 +560,41 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     let token_owned = token.to_string();
     let shared_clone = shared.clone();
 
+    let mut slash_commands = vec![
+        commands::cmd_start(),
+        commands::cmd_pwd(),
+        commands::cmd_status(),
+        commands::cmd_inflight(),
+        commands::cmd_clear(),
+        commands::cmd_stop(),
+        commands::cmd_down(),
+        commands::cmd_shell(),
+        commands::cmd_cc(),
+        commands::cmd_metrics(),
+        commands::cmd_model(),
+    ];
+    if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+        slash_commands.push(commands::cmd_fast());
+    }
+    slash_commands.extend([
+        commands::cmd_queue(),
+        commands::cmd_health(),
+        commands::cmd_sessions(),
+        commands::cmd_deletesession(),
+        commands::cmd_allowedtools(),
+        commands::cmd_allowed(),
+        commands::cmd_debug(),
+        commands::cmd_allowall(),
+        commands::cmd_adduser(),
+        commands::cmd_removeuser(),
+        commands::cmd_receipt(),
+        commands::cmd_help(),
+        commands::cmd_meeting(),
+    ]);
+
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![
-                commands::cmd_start(),
-                commands::cmd_pwd(),
-                commands::cmd_status(),
-                commands::cmd_inflight(),
-                commands::cmd_clear(),
-                commands::cmd_stop(),
-                commands::cmd_down(),
-                commands::cmd_shell(),
-                commands::cmd_cc(),
-                commands::cmd_metrics(),
-                commands::cmd_model(),
-                commands::cmd_queue(),
-                commands::cmd_health(),
-                commands::cmd_sessions(),
-                commands::cmd_deletesession(),
-                commands::cmd_allowedtools(),
-                commands::cmd_allowed(),
-                commands::cmd_debug(),
-                commands::cmd_allowall(),
-                commands::cmd_adduser(),
-                commands::cmd_removeuser(),
-                commands::cmd_receipt(),
-                commands::cmd_help(),
-                commands::cmd_meeting(),
-            ],
+            commands: slash_commands,
             command_check: Some(|ctx| {
                 Box::pin(async move {
                     let settings_snapshot = { ctx.data().shared.settings.read().await.clone() };
