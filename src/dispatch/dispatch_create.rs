@@ -579,7 +579,7 @@ fn apply_dispatch_attached_intents(
 /// This variant exists so bridge ops like `handoffCreatePr` (#743) can compose
 /// dispatch creation with surrounding pr_tracking/kanban_cards updates in a
 /// single atomic transaction.
-fn apply_dispatch_attached_intents_on_conn(
+pub(crate) fn apply_dispatch_attached_intents_on_conn(
     conn: &rusqlite::Connection,
     card_id: &str,
     to_agent_id: &str,
