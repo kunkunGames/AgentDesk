@@ -162,7 +162,7 @@ fn extract_result_error_text(value: &serde_json::Value) -> String {
 }
 
 fn load_restored_session_cwd_from_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     session_keys: &[String],
 ) -> Option<String> {
     session_keys.iter().find_map(|session_key| {
@@ -225,7 +225,7 @@ fn load_restored_provider_session_id(
             session_keys.iter().find_map(|session_key| {
                 conn.query_row(
                     "SELECT claude_session_id FROM sessions WHERE session_key = ?1 AND provider = ?2",
-                    rusqlite::params![session_key, provider.as_str()],
+                    libsql_rusqlite::params![session_key, provider.as_str()],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .ok()
@@ -259,7 +259,7 @@ fn refresh_session_heartbeat_from_tmux_output(
             "UPDATE sessions
              SET last_heartbeat = datetime('now')
              WHERE session_key = ?1 OR session_key = ?2",
-            rusqlite::params![session_keys[0].as_str(), session_keys[1].as_str()],
+            libsql_rusqlite::params![session_keys[0].as_str(), session_keys[1].as_str()],
         )
         .unwrap_or(0);
     if updated > 0 {
@@ -273,7 +273,7 @@ fn refresh_session_heartbeat_from_tmux_output(
              WHERE provider = ?1
                AND thread_channel_id = ?2
                AND status IN ('idle', 'working')",
-            rusqlite::params![provider.as_str(), thread_channel_id.to_string()],
+            libsql_rusqlite::params![provider.as_str(), thread_channel_id.to_string()],
         )
         .unwrap_or(0)
             > 0
@@ -756,7 +756,7 @@ pub(super) async fn tmux_output_watcher(
                                 if let Ok(conn) = db.lock() {
                                     let _ = conn.execute(
                                         "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
-                                        rusqlite::params![
+                                        libsql_rusqlite::params![
                                             format!("channel:{}", channel_id.get()),
                                             "🗜️ 자동 컨텍스트 압축 감지",
                                         ],
@@ -1774,7 +1774,7 @@ pub(super) async fn tmux_output_watcher(
                             .as_secs();
                         conn.execute(
                             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                            rusqlite::params![cooldown_key, now.to_string()],
+                            libsql_rusqlite::params![cooldown_key, now.to_string()],
                         )
                         .ok();
                     }
@@ -1784,7 +1784,7 @@ pub(super) async fn tmux_output_watcher(
                     if let Ok(conn) = db.lock() {
                         let _ = conn.execute(
                             "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
-                            rusqlite::params![
+                            libsql_rusqlite::params![
                                 format!("channel:{}", channel_id.get()),
                                 format!("🗜️ 자동 컨텍스트 압축 (사용률: {pct}%)"),
                             ],
@@ -2816,7 +2816,7 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO sessions (session_key, provider, claude_session_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![session_key, provider.as_str(), "persisted-sid-1"],
+                libsql_rusqlite::params![session_key, provider.as_str(), "persisted-sid-1"],
             )
             .unwrap();
 
@@ -2838,7 +2838,7 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO sessions (session_key, provider, claude_session_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![session_key, provider.as_str(), "legacy-sid-1"],
+                libsql_rusqlite::params![session_key, provider.as_str(), "legacy-sid-1"],
             )
             .unwrap();
 
@@ -2864,7 +2864,7 @@ mod tests {
                 "INSERT INTO sessions
                  (session_key, provider, status, thread_channel_id, last_heartbeat, created_at)
                  VALUES (?1, ?2, 'idle', '1485506232256168011', '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
-                rusqlite::params![session_key.as_str(), provider.as_str()],
+                libsql_rusqlite::params![session_key.as_str(), provider.as_str()],
             )
             .unwrap();
 
@@ -2965,7 +2965,7 @@ mod tests {
                 "INSERT INTO sessions
                  (session_key, provider, status, thread_channel_id, last_heartbeat, created_at)
                  VALUES (?1, ?2, 'idle', '1485506232256168011', '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
-                rusqlite::params![session_key.as_str(), provider.as_str()],
+                libsql_rusqlite::params![session_key.as_str(), provider.as_str()],
             )
             .unwrap();
 
