@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::PgPool;
 
 use super::AppState;
 use super::session_activity::SessionActivityResolver;
@@ -13,7 +14,9 @@ use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
     parse_thread_channel_name, resolve_agent_id_for_session as resolve_session_agent_id,
 };
-use crate::services::message_outbox::enqueue_lifecycle_notification;
+use crate::services::message_outbox::{
+    enqueue_lifecycle_notification, enqueue_lifecycle_notification_pg,
+};
 use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 
@@ -21,7 +24,10 @@ const STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL: &str = "-6 hours";
 const STALE_THREAD_SESSION_MAX_AGE_SQL: &str = "-1 hour";
 const STALE_THREAD_SESSION_ACTIVE_DISPATCH_MAX_AGE_SQL: &str = "-3 hours";
 
-fn load_dispatch_thread_id(conn: &rusqlite::Connection, dispatch_id: &str) -> Option<String> {
+fn load_dispatch_thread_id(
+    conn: &libsql_rusqlite::Connection,
+    dispatch_id: &str,
+) -> Option<String> {
     let thread_id: Option<String> = conn
         .query_row(
             "SELECT thread_id FROM task_dispatches WHERE id = ?1",
@@ -339,7 +345,7 @@ pub async fn hook_session(
            claude_session_id = COALESCE(excluded.claude_session_id, sessions.claude_session_id),
            raw_provider_session_id = COALESCE(excluded.raw_provider_session_id, sessions.raw_provider_session_id),
            last_heartbeat = datetime('now')",
-        rusqlite::params![
+        libsql_rusqlite::params![
             body.session_key,
             agent_id,
             provider,
@@ -464,7 +470,7 @@ pub async fn hook_session(
                          FROM agents a LEFT JOIN sessions s ON s.agent_id = a.id \
                          AND s.session_key = ?2 \
                          WHERE a.id = ?1",
-                        rusqlite::params![aid, body.session_key],
+                        libsql_rusqlite::params![aid, body.session_key],
                         |row| {
                             Ok(json!({
                                 "id": row.get::<_, String>(0)?,
@@ -619,7 +625,7 @@ pub async fn get_claude_session_id(
             "SELECT claude_session_id, raw_provider_session_id
              FROM sessions
              WHERE session_key = ?1 AND provider = ?2",
-            rusqlite::params![&params.session_key, provider],
+            libsql_rusqlite::params![&params.session_key, provider],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
@@ -651,7 +657,7 @@ pub async fn get_claude_session_id(
                 "raw_provider_session_id": raw_provider_session_id,
             })),
         ),
-        Err(rusqlite::Error::QueryReturnedNoRows) => (
+        Err(libsql_rusqlite::Error::QueryReturnedNoRows) => (
             StatusCode::OK,
             Json(json!({
                 "claude_session_id": null,
@@ -738,7 +744,7 @@ pub async fn clear_session_id_by_key(
     (StatusCode::OK, Json(json!({"cleared": changes})))
 }
 
-fn backfill_legacy_thread_channel_ids(conn: &rusqlite::Connection) -> usize {
+fn backfill_legacy_thread_channel_ids(conn: &libsql_rusqlite::Connection) -> usize {
     let legacy_rows: Vec<(String, Option<String>)> = {
         let mut stmt = match conn.prepare(
             "SELECT session_key, active_dispatch_id
@@ -777,15 +783,15 @@ fn backfill_legacy_thread_channel_ids(conn: &rusqlite::Connection) -> usize {
                 "UPDATE sessions
                  SET thread_channel_id = ?1
                  WHERE session_key = ?2 AND thread_channel_id IS NULL",
-                rusqlite::params![thread_channel_id, session_key],
+                libsql_rusqlite::params![thread_channel_id, session_key],
             )
             .unwrap_or(0)
         })
         .sum()
 }
 
-fn collect_stale_fixed_session_dispatch_ids<P: rusqlite::Params>(
-    conn: &rusqlite::Connection,
+fn collect_stale_fixed_session_dispatch_ids<P: libsql_rusqlite::Params>(
+    conn: &libsql_rusqlite::Connection,
     sql: &str,
     params: P,
     log_context: &str,
@@ -823,7 +829,7 @@ fn collect_stale_fixed_session_dispatch_ids<P: rusqlite::Params>(
 }
 
 fn mark_stale_fixed_session_dispatches_failed(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     dispatch_ids: &[String],
     transition_source: &str,
 ) {
@@ -857,7 +863,7 @@ fn mark_stale_fixed_session_dispatches_failed(
 /// after 1 hour. Rows that still carry an active_dispatch_id are preserved
 /// until the 3-hour safety TTL so warm-resume sessions cannot lose their DB
 /// ownership before idle-kill has a chance to reap them.
-pub fn gc_stale_thread_sessions_db(conn: &rusqlite::Connection) -> usize {
+pub fn gc_stale_thread_sessions_db(conn: &libsql_rusqlite::Connection) -> usize {
     let _ = backfill_legacy_thread_channel_ids(conn);
     conn.execute(
         "DELETE FROM sessions
@@ -868,7 +874,7 @@ pub fn gc_stale_thread_sessions_db(conn: &rusqlite::Connection) -> usize {
                AND COALESCE(last_heartbeat, created_at) < datetime('now', ?1))
              OR COALESCE(last_heartbeat, created_at) < datetime('now', ?2)
            )",
-        rusqlite::params![
+        libsql_rusqlite::params![
             STALE_THREAD_SESSION_MAX_AGE_SQL,
             STALE_THREAD_SESSION_ACTIVE_DISPATCH_MAX_AGE_SQL,
         ],
@@ -876,9 +882,81 @@ pub fn gc_stale_thread_sessions_db(conn: &rusqlite::Connection) -> usize {
     .unwrap_or(0)
 }
 
+async fn backfill_legacy_thread_channel_ids_pg(pool: &PgPool) -> usize {
+    let session_keys = match sqlx::query_scalar::<_, String>(
+        "SELECT session_key
+         FROM sessions
+         WHERE thread_channel_id IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                "[dispatched-sessions] backfill_legacy_thread_channel_ids_pg: failed to load session keys: {error}"
+            );
+            return 0;
+        }
+    };
+
+    let mut updated = 0usize;
+    for session_key in session_keys {
+        let Some(thread_channel_id) = parse_thread_channel_id_from_session_key(&session_key) else {
+            continue;
+        };
+
+        match sqlx::query(
+            "UPDATE sessions
+             SET thread_channel_id = $1
+             WHERE session_key = $2
+               AND thread_channel_id IS NULL",
+        )
+        .bind(&thread_channel_id)
+        .bind(&session_key)
+        .execute(pool)
+        .await
+        {
+            Ok(result) => updated += result.rows_affected() as usize,
+            Err(error) => tracing::warn!(
+                "[dispatched-sessions] backfill_legacy_thread_channel_ids_pg: failed to update {}: {}",
+                session_key,
+                error
+            ),
+        }
+    }
+
+    updated
+}
+
+pub async fn gc_stale_thread_sessions_pg(pool: &PgPool) -> usize {
+    let _ = backfill_legacy_thread_channel_ids_pg(pool).await;
+    match sqlx::query(
+        "DELETE FROM sessions
+         WHERE thread_channel_id IS NOT NULL
+           AND status IN ('idle', 'disconnected')
+           AND (
+             (active_dispatch_id IS NULL
+               AND COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '1 hour')
+             OR COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '3 hours'
+           )",
+    )
+    .execute(pool)
+    .await
+    {
+        Ok(result) => result.rows_affected() as usize,
+        Err(error) => {
+            tracing::warn!(
+                "[dispatched-sessions] gc_stale_thread_sessions_pg: failed to delete stale sessions: {error}"
+            );
+            0
+        }
+    }
+}
+
 /// Mark stale fixed-channel working sessions as disconnected so they cannot
 /// keep restoring dead provider session IDs after restart.
-pub fn gc_stale_fixed_working_sessions_db(conn: &rusqlite::Connection) -> usize {
+pub fn gc_stale_fixed_working_sessions_db(conn: &libsql_rusqlite::Connection) -> usize {
     let stale_dispatches = collect_stale_fixed_session_dispatch_ids(
         conn,
         "SELECT active_dispatch_id
@@ -910,8 +988,73 @@ pub fn gc_stale_fixed_working_sessions_db(conn: &rusqlite::Connection) -> usize 
     .unwrap_or(0)
 }
 
+pub async fn gc_stale_fixed_working_sessions_db_pg(pool: &PgPool) -> usize {
+    let stale_dispatches = match sqlx::query_scalar::<_, String>(
+        "SELECT active_dispatch_id
+         FROM sessions
+         WHERE thread_channel_id IS NULL
+           AND status = 'working'
+           AND active_dispatch_id IS NOT NULL
+           AND COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '6 hours'",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                "[dispatched-sessions] gc_stale_fixed_working_sessions_db_pg: failed to load stale dispatches: {error}"
+            );
+            return 0;
+        }
+    };
+
+    for dispatch_id in stale_dispatches {
+        if let Err(error) = sqlx::query(
+            "UPDATE task_dispatches
+             SET status = 'failed',
+                 updated_at = NOW(),
+                 completed_at = COALESCE(completed_at, NOW())
+             WHERE id = $1
+               AND status IN ('pending', 'dispatched')",
+        )
+        .bind(&dispatch_id)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(
+                "[dispatched-sessions] gc_stale_fixed_working_sessions_db_pg: failed to mark stale dispatch {} as failed: {}",
+                dispatch_id,
+                error
+            );
+        }
+    }
+
+    match sqlx::query(
+        "UPDATE sessions
+         SET status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL,
+             raw_provider_session_id = NULL
+         WHERE thread_channel_id IS NULL
+           AND status = 'working'
+           AND COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '6 hours'",
+    )
+    .execute(pool)
+    .await
+    {
+        Ok(result) => result.rows_affected() as usize,
+        Err(error) => {
+            tracing::warn!(
+                "[dispatched-sessions] gc_stale_fixed_working_sessions_db_pg: failed to disconnect stale sessions: {error}"
+            );
+            0
+        }
+    }
+}
+
 fn disconnect_stale_fixed_session_by_key_db(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     session_key: &str,
 ) -> usize {
     let stale_dispatches = collect_stale_fixed_session_dispatch_ids(
@@ -923,7 +1066,7 @@ fn disconnect_stale_fixed_session_by_key_db(
            AND status = 'working'
            AND active_dispatch_id IS NOT NULL
            AND COALESCE(last_heartbeat, created_at) < datetime('now', ?2)",
-        rusqlite::params![session_key, STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
+        libsql_rusqlite::params![session_key, STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
         "disconnect_stale_fixed_session_by_key",
     );
     mark_stale_fixed_session_dispatches_failed(
@@ -942,7 +1085,7 @@ fn disconnect_stale_fixed_session_by_key_db(
            AND thread_channel_id IS NULL
            AND status = 'working'
            AND COALESCE(last_heartbeat, created_at) < datetime('now', ?2)",
-        rusqlite::params![session_key, STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
+        libsql_rusqlite::params![session_key, STALE_FIXED_WORKING_SESSION_MAX_AGE_SQL],
     )
     .unwrap_or(0)
 }
@@ -964,7 +1107,7 @@ pub async fn update_dispatched_session(
     };
 
     let mut sets: Vec<String> = Vec::new();
-    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut values: Vec<Box<dyn libsql_rusqlite::types::ToSql>> = Vec::new();
     let mut idx = 1;
 
     if let Some(ref status) = body.status {
@@ -1012,7 +1155,8 @@ pub async fn update_dispatched_session(
     );
     values.push(Box::new(id));
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+    let params_ref: Vec<&dyn libsql_rusqlite::types::ToSql> =
+        values.iter().map(|v| v.as_ref()).collect();
     match conn.execute(&sql, params_ref.as_slice()) {
         Ok(0) => (
             StatusCode::NOT_FOUND,
@@ -1156,7 +1300,7 @@ pub(crate) async fn force_kill_session_impl_with_reason(
                     session_provider,
                 )
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(libsql_rusqlite::Error::QueryReturnedNoRows) => {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "session not found"})),
@@ -1297,7 +1441,7 @@ pub(crate) async fn force_kill_session_impl_with_reason(
                 if let Ok(conn) = state.db.lock() {
                     conn.execute(
                         "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
-                        rusqlite::params![retry_count + 1, new_id],
+                        libsql_rusqlite::params![retry_count + 1, new_id],
                     )
                     .ok();
                 }
@@ -1367,13 +1511,24 @@ pub(crate) async fn force_kill_session_impl_with_reason(
                 }
             })
             .unwrap_or_else(|| lifecycle.lifecycle_path.to_string());
-        enqueue_lifecycle_notification(
-            &state.db,
-            &format!("channel:{channel_id_str}"),
-            Some(session_key),
-            lifecycle_reason_code,
-            &format!("🔴 세션 종료: {agent_label}\n사유: {exit_reason}"),
-        );
+        if let Some(pool) = state.pg_pool.as_ref() {
+            let _ = enqueue_lifecycle_notification_pg(
+                pool,
+                &format!("channel:{channel_id_str}"),
+                Some(session_key),
+                lifecycle_reason_code,
+                &format!("🔴 세션 종료: {agent_label}\n사유: {exit_reason}"),
+            )
+            .await;
+        } else {
+            enqueue_lifecycle_notification(
+                &state.db,
+                &format!("channel:{channel_id_str}"),
+                Some(session_key),
+                lifecycle_reason_code,
+                &format!("🔴 세션 종료: {agent_label}\n사유: {exit_reason}"),
+            );
+        }
     }
 
     (
@@ -1441,7 +1596,7 @@ mod tests {
     use std::sync::MutexGuard;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -1478,17 +1633,22 @@ mod tests {
         }
     }
 
-    fn seed_card(conn: &rusqlite::Connection, card_id: &str, dispatch_id: &str, status: &str) {
+    fn seed_card(
+        conn: &libsql_rusqlite::Connection,
+        card_id: &str,
+        dispatch_id: &str,
+        status: &str,
+    ) {
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
              VALUES (?1, 'Force Kill Card', ?2, ?3, datetime('now'), datetime('now'))",
-            rusqlite::params![card_id, status, dispatch_id],
+            libsql_rusqlite::params![card_id, status, dispatch_id],
         )
         .unwrap();
     }
 
     fn seed_dispatch(
-        conn: &rusqlite::Connection,
+        conn: &libsql_rusqlite::Connection,
         dispatch_id: &str,
         card_id: &str,
         agent_id: &str,
@@ -1497,22 +1657,22 @@ mod tests {
             "INSERT INTO task_dispatches
              (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, retry_count, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'implementation', 'pending', 'Recover me', '{}', 0, datetime('now'), datetime('now'))",
-            rusqlite::params![dispatch_id, card_id, agent_id],
+            libsql_rusqlite::params![dispatch_id, card_id, agent_id],
         )
         .unwrap();
     }
 
-    fn seed_agent(conn: &rusqlite::Connection, agent_id: &str) {
+    fn seed_agent(conn: &libsql_rusqlite::Connection, agent_id: &str) {
         conn.execute(
             "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
              VALUES (?1, ?2, 'codex', ?3, datetime('now'), datetime('now'))",
-            rusqlite::params![agent_id, format!("Agent {agent_id}"), "123456789012345678"],
+            libsql_rusqlite::params![agent_id, format!("Agent {agent_id}"), "123456789012345678"],
         )
         .unwrap();
     }
 
     fn seed_session(
-        conn: &rusqlite::Connection,
+        conn: &libsql_rusqlite::Connection,
         session_key: &str,
         agent_id: &str,
         dispatch_id: &str,
@@ -1521,13 +1681,13 @@ mod tests {
             "INSERT INTO sessions
              (session_key, agent_id, status, active_dispatch_id, last_heartbeat, created_at)
              VALUES (?1, ?2, 'working', ?3, datetime('now'), datetime('now'))",
-            rusqlite::params![session_key, agent_id, dispatch_id],
+            libsql_rusqlite::params![session_key, agent_id, dispatch_id],
         )
         .unwrap();
     }
 
     fn seed_session_without_dispatch(
-        conn: &rusqlite::Connection,
+        conn: &libsql_rusqlite::Connection,
         session_key: &str,
         agent_id: &str,
     ) {
@@ -1535,7 +1695,7 @@ mod tests {
             "INSERT INTO sessions
              (session_key, agent_id, status, last_heartbeat, created_at)
              VALUES (?1, ?2, 'working', datetime('now'), datetime('now'))",
-            rusqlite::params![session_key, agent_id],
+            libsql_rusqlite::params![session_key, agent_id],
         )
         .unwrap();
     }
@@ -1544,12 +1704,12 @@ mod tests {
         resp.0
     }
 
-    fn count_message_outbox_rows(conn: &rusqlite::Connection) -> i64 {
+    fn count_message_outbox_rows(conn: &libsql_rusqlite::Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM message_outbox", [], |row| row.get(0))
             .unwrap()
     }
 
-    fn count_termination_events(conn: &rusqlite::Connection, session_key: &str) -> i64 {
+    fn count_termination_events(conn: &libsql_rusqlite::Connection, session_key: &str) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM session_termination_events WHERE session_key = ?1",
             [session_key],
@@ -1623,6 +1783,138 @@ mod tests {
             .unwrap();
         assert_eq!(new_dispatch.0, "pending");
         assert_eq!(new_dispatch.1, 1);
+    }
+
+    #[tokio::test]
+    async fn force_kill_session_path_route_retries_active_dispatch_pg_path() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        let mut state = AppState::test_state(db, engine);
+        state.pg_pool = Some(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
+             VALUES ($1, $2, 'codex', $3, NOW(), NOW())",
+        )
+        .bind("agent-force-pg")
+        .bind("Agent agent-force-pg")
+        .bind("123456789012345678")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
+             VALUES ($1, 'Force Kill Card', 'requested', $2, NOW(), NOW())",
+        )
+        .bind("card-force-pg")
+        .bind("dispatch-force-pg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id,
+                kanban_card_id,
+                to_agent_id,
+                dispatch_type,
+                status,
+                title,
+                context,
+                retry_count,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, 'implementation', 'pending', 'Recover me', '{}', 0, NOW(), NOW())",
+        )
+        .bind("dispatch-force-pg")
+        .bind("card-force-pg")
+        .bind("agent-force-pg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO sessions (
+                session_key,
+                agent_id,
+                status,
+                active_dispatch_id,
+                provider,
+                last_heartbeat,
+                created_at
+            ) VALUES ($1, $2, 'working', $3, 'codex', NOW(), NOW())",
+        )
+        .bind("host:codex-agent-force-pg")
+        .bind("agent-force-pg")
+        .bind("dispatch-force-pg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = force_kill_session(
+            State(state),
+            Path("host:codex-agent-force-pg".to_string()),
+            Json(ForceKillOptions {
+                retry: true,
+                reason: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let body = response_json(body);
+        let retry_dispatch_id = body["retry_dispatch_id"].as_str().unwrap().to_string();
+        assert!(!retry_dispatch_id.is_empty());
+        assert_eq!(body["queue_activation_requested"], false);
+
+        let session_state = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, active_dispatch_id
+             FROM sessions
+             WHERE session_key = $1",
+        )
+        .bind("host:codex-agent-force-pg")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(session_state.0, "disconnected");
+        assert!(session_state.1.is_none());
+
+        let old_dispatch_status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM task_dispatches WHERE id = $1")
+                .bind("dispatch-force-pg")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old_dispatch_status, "failed");
+
+        let new_dispatch = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, retry_count::BIGINT FROM task_dispatches WHERE id = $1",
+        )
+        .bind(&retry_dispatch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(new_dispatch.0, "pending");
+        assert_eq!(new_dispatch.1, 1);
+
+        let latest_dispatch_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1",
+        )
+        .bind("card-force-pg")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            latest_dispatch_id.as_deref(),
+            Some(retry_dispatch_id.as_str())
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]
@@ -1849,13 +2141,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
                  VALUES (?1, 'Test Card', 'requested', ?2, datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, dispatch_id],
+                libsql_rusqlite::params![card_id, dispatch_id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
                  VALUES (?1, ?2, 'ch-td', 'implementation', 'pending', 'Test Card', '{}', datetime('now'), datetime('now'))",
-                rusqlite::params![dispatch_id, card_id],
+                libsql_rusqlite::params![dispatch_id, card_id],
             )
             .unwrap();
         }
@@ -1957,13 +2249,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
                  VALUES (?1, 'Audit Card', 'requested', ?2, datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, dispatch_id],
+                libsql_rusqlite::params![card_id, dispatch_id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
                  VALUES (?1, ?2, 'project-agentdesk', 'implementation', 'pending', 'Audit Card', '{}', datetime('now'), datetime('now'))",
-                rusqlite::params![dispatch_id, card_id],
+                libsql_rusqlite::params![dispatch_id, card_id],
             )
             .unwrap();
         }
@@ -2026,13 +2318,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
                  VALUES (?1, 'Rework Card', 'rework', ?2, datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, dispatch_id],
+                libsql_rusqlite::params![card_id, dispatch_id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
                  VALUES (?1, ?2, 'ch-td', 'rework', 'pending', 'Rework Card', '{}', datetime('now'), datetime('now'))",
-                rusqlite::params![dispatch_id, card_id],
+                libsql_rusqlite::params![dispatch_id, card_id],
             )
             .unwrap();
         }
@@ -2131,13 +2423,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, created_at, updated_at)
                  VALUES (?1, 'Review Card', 'review', ?2, datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, dispatch_id],
+                libsql_rusqlite::params![card_id, dispatch_id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
                  VALUES (?1, ?2, 'project-agentdesk', 'review', 'pending', '[Review R1] Review Card', '{}', datetime('now'), datetime('now'))",
-                rusqlite::params![dispatch_id, card_id],
+                libsql_rusqlite::params![dispatch_id, card_id],
             )
             .unwrap();
         }
@@ -2230,13 +2522,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, latest_dispatch_id, review_status, created_at, updated_at)
                  VALUES (?1, 'Review Decision Card', 'review', ?2, 'suggestion_pending', datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, dispatch_id],
+                libsql_rusqlite::params![card_id, dispatch_id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, created_at, updated_at)
                  VALUES (?1, ?2, 'project-agentdesk', 'review-decision', 'pending', '[Review Decision] Review Decision Card', '{}', datetime('now'), datetime('now'))",
-                rusqlite::params![dispatch_id, card_id],
+                libsql_rusqlite::params![dispatch_id, card_id],
             )
             .unwrap();
         }
@@ -2580,7 +2872,7 @@ mod tests {
     }
 
     fn insert_gc_candidate_session(
-        conn: &rusqlite::Connection,
+        conn: &libsql_rusqlite::Connection,
         session_key: &str,
         status: &str,
         thread_channel_id: Option<&str>,
@@ -2591,7 +2883,7 @@ mod tests {
             "INSERT INTO sessions
              (session_key, provider, status, thread_channel_id, active_dispatch_id, last_heartbeat, created_at)
              VALUES (?1, 'codex', ?2, ?3, ?4, datetime('now', ?5), datetime('now', ?5))",
-            rusqlite::params![
+            libsql_rusqlite::params![
                 session_key,
                 status,
                 thread_channel_id,
@@ -3338,7 +3630,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO sessions (session_key, agent_id, provider, status, session_info, active_dispatch_id, last_heartbeat)
                  VALUES (?1, 'ch-ad', 'claude', 'working', 'stale session', 'dispatch-stale', datetime('now'))",
-                rusqlite::params![session_key],
+                libsql_rusqlite::params![session_key],
             )
             .unwrap();
         }
