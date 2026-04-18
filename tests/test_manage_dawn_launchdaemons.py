@@ -4,9 +4,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
-SCRIPT_PATH = Path("/Users/kunkun/kunkunGames/agentdesk/scripts/manage_dawn_launchdaemons.py")
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "manage_dawn_launchdaemons.py"
 SPEC = importlib.util.spec_from_file_location("manage_dawn_launchdaemons", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -62,11 +64,29 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
         self.assertTrue(MODULE.access_denied("sudo: a password is required"))
         self.assertFalse(MODULE.access_denied("launchd status requires attention"))
 
+    def test_sudo_probe_access_ready_requires_success_exit_code(self) -> None:
+        denied = MODULE.subprocess.CompletedProcess(["sudo"], 1, stdout="", stderr="sudo: a password is required")
+        failed = MODULE.subprocess.CompletedProcess(["sudo"], 1, stdout="", stderr="launchd status failed")
+        ready = MODULE.subprocess.CompletedProcess(["sudo"], 0, stdout="ok", stderr="")
+
+        self.assertFalse(MODULE.sudo_probe_access_ready(denied))
+        self.assertFalse(MODULE.sudo_probe_access_ready(failed))
+        self.assertTrue(MODULE.sudo_probe_access_ready(ready))
+
     def test_status_is_not_forced_through_sudo(self) -> None:
         self.assertFalse(MODULE.action_needs_privileged_reexec("status"))
         self.assertTrue(MODULE.action_needs_privileged_reexec("bootstrap"))
         self.assertTrue(MODULE.action_needs_privileged_reexec("install"))
         self.assertTrue(MODULE.action_needs_privileged_reexec("uninstall"))
+
+    def test_default_skills_roots_use_invoking_user_home_under_sudo(self) -> None:
+        fake_user = SimpleNamespace(pw_dir="/Users/operator")
+        with mock.patch.dict(MODULE.os.environ, {"SUDO_USER": "operator"}, clear=True):
+            with mock.patch.object(MODULE.pwd, "getpwnam", return_value=fake_user):
+                roots = MODULE.default_skills_roots()
+
+        self.assertIn(Path("/Users/operator/.codex/skills"), roots)
+        self.assertIn(Path("/Users/operator/.adk/release/skills"), roots)
 
     def test_resolve_job_artifacts_prefers_existing_skills_root(self) -> None:
         spec = MODULE.JOB_SPECS["memory-dream"]

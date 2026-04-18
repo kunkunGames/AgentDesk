@@ -100,6 +100,16 @@ def current_user_name() -> str:
         return "agentdesk"
 
 
+def invoking_user_home() -> Path:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass
+    return Path.home()
+
+
 def split_env_roots(raw: str | None) -> list[Path]:
     if not raw:
         return []
@@ -124,14 +134,15 @@ def unique_paths(paths: Sequence[Path]) -> list[Path]:
 
 
 def default_skills_roots() -> list[Path]:
-    # Search the most common local runtime layouts before falling back to repo-local skills.
+    # Under sudo, prefer the invoking operator's home instead of /var/root.
+    caller_home = invoking_user_home()
     roots: list[Path] = []
     roots.extend(split_env_roots(os.environ.get("AGENTDESK_SKILLS_ROOT")))
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
         roots.append(Path(codex_home).expanduser() / "skills")
-    roots.append(Path.home() / ".codex/skills")
-    roots.append(Path.home() / ".adk/release/skills")
+    roots.append(caller_home / ".codex/skills")
+    roots.append(caller_home / ".adk/release/skills")
     roots.append(REPO_ROOT / "skills")
     return unique_paths(roots)
 
@@ -471,6 +482,10 @@ def access_denied(stderr: str) -> bool:
     return any(fragment in lowered for fragment in fragments)
 
 
+def sudo_probe_access_ready(result: subprocess.CompletedProcess) -> bool:
+    return result.returncode == 0 and not access_denied(result.stderr or "")
+
+
 def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
     python_bin = Path(args.python_bin)
     skills_roots = candidate_skills_roots(args)
@@ -532,7 +547,7 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
     probe_job_name = jobs[0][0]
     probe_command = ["sudo", "-n"] + build_self_command(args, action="status", as_root=False, job_names=[probe_job_name])
     probe_result = run_command(probe_command)
-    probe_access = not access_denied(probe_result.stderr or "")
+    probe_access = sudo_probe_access_ready(probe_result)
     lines.extend(
         [
             "## sudo_probe",
