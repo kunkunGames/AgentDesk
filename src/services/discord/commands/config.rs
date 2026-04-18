@@ -224,8 +224,6 @@ pub(in crate::services::discord) async fn update_channel_model_override(
 
     if reset_required {
         shared.session_reset_pending.insert(channel_id);
-    } else {
-        shared.session_reset_pending.remove(&channel_id);
     }
 
     true
@@ -756,6 +754,7 @@ mod tests {
     use crate::services::discord::model_catalog::{
         DEFAULT_PICKER_VALUE, known_models, validate_model_input,
     };
+    use crate::services::discord::make_shared_data_for_tests;
 
     use super::super::model_ui::{
         build_model_picker_option_specs, build_model_picker_summary_lines,
@@ -923,6 +922,33 @@ mod tests {
         assert_eq!(
             runtime_model_for_turn(&ProviderKind::Gemini, "default", PROVIDER_DEFAULT_SOURCE),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_model_override_preserves_pending_fast_mode_reset() {
+        let shared = make_shared_data_for_tests();
+        let channel_id = serenity::ChannelId::new(42);
+        shared
+            .model_overrides
+            .insert(channel_id, "gpt-5.4-mini".to_string());
+
+        assert!(update_channel_fast_mode(&shared, "test-token", channel_id, true).await);
+        assert!(shared.session_reset_pending.contains(&channel_id));
+
+        assert!(
+            update_channel_model_override(
+                &shared,
+                "test-token",
+                channel_id,
+                &ProviderKind::Codex,
+                None,
+            )
+            .await
+        );
+        assert!(
+            shared.session_reset_pending.contains(&channel_id),
+            "clearing a model override must not discard a pending reset requested by /fast"
         );
     }
 
