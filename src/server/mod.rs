@@ -9,9 +9,9 @@ use axum::Router;
 use axum::routing::get;
 use libsql_rusqlite::Connection;
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres, Row};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tower_http::services::ServeDir;
 
