@@ -125,65 +125,28 @@ fn handoff_create_pr_raw(db: &Db, payload_json: &str) -> String {
     }
 }
 
-fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<serde_json::Value> {
-    let mut conn = db
-        .separate_conn()
-        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
-    let tx = conn.transaction()?;
+fn lookup_active_create_pr_dispatch(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT id, COALESCE(json_extract(COALESCE(context, '{}'), '$.dispatch_generation'), '') \
+         FROM task_dispatches \
+         WHERE kanban_card_id = ?1 AND dispatch_type = 'create-pr' \
+           AND status IN ('pending', 'dispatched') \
+         ORDER BY rowid DESC LIMIT 1",
+        [card_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
 
-    // 1. Idempotent reuse — if an active create-pr dispatch already exists for
-    //    this card, return its id and the stored generation rather than erroring.
-    //    This preserves the existing dedupe contract (C5).
-    let existing: Option<(String, String)> = tx
-        .query_row(
-            "SELECT td.id, COALESCE(pt.dispatch_generation, '')
-             FROM task_dispatches td
-             LEFT JOIN pr_tracking pt ON pt.card_id = td.kanban_card_id
-             WHERE td.kanban_card_id = ?1
-               AND td.dispatch_type = 'create-pr'
-               AND td.status IN ('pending', 'dispatched')
-             ORDER BY td.rowid DESC LIMIT 1",
-            [&payload.card_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((dispatch_id, generation)) = existing {
-        return Ok(json!({
-            "ok": true,
-            "reused": true,
-            "dispatch_id": dispatch_id,
-            "generation": generation,
-        }));
-    }
-
-    // 2. Read card row for pipeline resolution + current status.
-    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = tx
-        .query_row(
-            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
-            [&payload.card_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| anyhow::anyhow!("card not found: {e}"))?;
-
-    // 3. Read current review_round (observability stamp).
-    let current_round: i64 = tx
-        .query_row(
-            "SELECT review_round FROM card_review_state WHERE card_id = ?1",
-            [&payload.card_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    // 4. Resolve pipeline for TransitionContext.
-    crate::pipeline::ensure_loaded();
-    let effective =
-        crate::pipeline::resolve_for_card(&tx, card_repo_id.as_deref(), card_agent_id.as_deref());
-
-    // 5. Mint fresh generation + dispatch id.
-    let generation = Uuid::new_v4().to_string();
-    let dispatch_id = Uuid::new_v4().to_string();
-
-    // 6. pr_tracking upsert with stamp.
+fn upsert_pr_tracking_handoff_state(
+    tx: &rusqlite::Transaction<'_>,
+    payload: &HandoffPayload,
+    generation: &str,
+    current_round: i64,
+) -> anyhow::Result<()> {
     tx.execute(
         "INSERT INTO pr_tracking \
          (card_id, repo_id, worktree_path, branch, head_sha, state, last_error, \
@@ -210,6 +173,66 @@ fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<ser
             current_round,
         ],
     )?;
+    Ok(())
+}
+
+fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<serde_json::Value> {
+    let mut conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+    let tx = conn.transaction()?;
+
+    // 1. Read current review_round (observability stamp) early so both fresh
+    //    handoff and reuse paths can keep pr_tracking aligned with the winner.
+    let current_round: i64 = tx
+        .query_row(
+            "SELECT review_round FROM card_review_state WHERE card_id = ?1",
+            [&payload.card_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    // 2. Idempotent reuse — if an active create-pr dispatch already exists for
+    //    this card, return its id and the dispatch-stamped generation rather
+    //    than erroring. Also refresh pr_tracking so stale generations do not
+    //    leak into the retry lane.
+    let existing = lookup_active_create_pr_dispatch(&tx, &payload.card_id);
+    if let Some((dispatch_id, generation)) = existing {
+        upsert_pr_tracking_handoff_state(&tx, payload, &generation, current_round)?;
+        tx.execute(
+            "UPDATE kanban_cards SET blocked_reason = 'pr:creating', updated_at = datetime('now') \
+             WHERE id = ?1",
+            [&payload.card_id],
+        )?;
+        tx.commit()?;
+        return Ok(json!({
+            "ok": true,
+            "reused": true,
+            "dispatch_id": dispatch_id,
+            "generation": generation,
+        }));
+    }
+
+    // 3. Read card row for pipeline resolution + current status.
+    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = tx
+        .query_row(
+            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
+            [&payload.card_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| anyhow::anyhow!("card not found: {e}"))?;
+
+    // 4. Resolve pipeline for TransitionContext.
+    crate::pipeline::ensure_loaded();
+    let effective =
+        crate::pipeline::resolve_for_card(&tx, card_repo_id.as_deref(), card_agent_id.as_deref());
+
+    // 5. Mint fresh generation + dispatch id.
+    let generation = Uuid::new_v4().to_string();
+    let dispatch_id = Uuid::new_v4().to_string();
+
+    // 6. pr_tracking upsert with stamp.
+    upsert_pr_tracking_handoff_state(&tx, payload, &generation, current_round)?;
 
     // 7. Build dispatch context with stamps.
     let context = json!({
@@ -224,24 +247,48 @@ fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<ser
 
     // 8. Insert the create-pr dispatch using the on-conn variant so the whole
     //    handoff stays in one transaction.
-    apply_dispatch_attached_intents_on_conn(
-        &tx,
-        &payload.card_id,
-        &payload.agent_id,
-        &dispatch_id,
-        "create-pr",
-        false, // is_review_type
-        &old_status,
-        &effective,
-        &payload.title,
-        &context_str,
-        None, // parent_dispatch_id
-        0,    // chain_depth
-        DispatchCreateOptions {
-            sidecar_dispatch: true,
-            ..Default::default()
-        },
-    )?;
+    let (result_dispatch_id, result_generation, reused) =
+        match apply_dispatch_attached_intents_on_conn(
+            &tx,
+            &payload.card_id,
+            &payload.agent_id,
+            &dispatch_id,
+            "create-pr",
+            false, // is_review_type
+            &old_status,
+            &effective,
+            &payload.title,
+            &context_str,
+            None, // parent_dispatch_id
+            0,    // chain_depth
+            DispatchCreateOptions {
+                sidecar_dispatch: true,
+                ..Default::default()
+            },
+        ) {
+            Ok(()) => (dispatch_id, generation, false),
+            Err(e) => {
+                if e.to_string()
+                    .contains("concurrent race prevented by DB constraint")
+                {
+                    if let Some((winner_dispatch_id, winner_generation)) =
+                        lookup_active_create_pr_dispatch(&tx, &payload.card_id)
+                    {
+                        upsert_pr_tracking_handoff_state(
+                            &tx,
+                            payload,
+                            &winner_generation,
+                            current_round,
+                        )?;
+                        (winner_dispatch_id, winner_generation, true)
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
 
     // 9. Stamp blocked_reason='pr:creating' so timeouts/escalation treat the
     //    in-flight handoff as benign progress (manual_intervention.rs benign
@@ -256,9 +303,9 @@ fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<ser
 
     Ok(json!({
         "ok": true,
-        "reused": false,
-        "dispatch_id": dispatch_id,
-        "generation": generation,
+        "reused": reused,
+        "dispatch_id": result_dispatch_id,
+        "generation": result_generation,
     }))
 }
 
