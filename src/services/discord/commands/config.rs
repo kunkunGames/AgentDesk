@@ -223,9 +223,8 @@ pub(in crate::services::discord) async fn update_channel_model_override(
     }
 
     if reset_required {
+        // Preserve pending resets requested by other channel-level toggles like /fast.
         shared.session_reset_pending.insert(channel_id);
-    } else {
-        shared.session_reset_pending.remove(&channel_id);
     }
 
     true

@@ -1499,7 +1499,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
                         Some(native_fast_mode_enabled),
-                        Some(native_fast_mode_enabled),
                         compact_percent_for_claude,
                     ),
                     ProviderKind::Codex => codex::execute_command_streaming(
@@ -1515,7 +1514,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
-                        Some(native_fast_mode_enabled),
                         Some(native_fast_mode_enabled),
                         compact_token_limit_for_codex,
                     ),
