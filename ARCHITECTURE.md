@@ -11,6 +11,17 @@ High-signal navigation guide for contributors. The generated inventories under `
 - `docs/generated/route-inventory.md` — generated HTTP/WebSocket route inventory.
 - `docs/generated/worker-inventory.md` — generated supervised worker inventory.
 
+## Memory Flow
+
+- `src/services/memory/mod.rs` defines the shared recall contract across `file`, `mem0`, and `memento` backends.
+- `src/services/memory/memento.rs` intentionally splits Memento recall into two modes:
+  - bootstrap mode calls `context(structured=true)` to load stable session context
+  - query mode calls `recall(text=user_text, contextText=user_text, sessionId, excludeSeen=true)` for task-conditioned memory
+- `src/services/discord/router/message_handler.rs` chooses bootstrap mode for the first Memento-backed turn, then switches to query mode only when `memory.query_recall_after_bootstrap` is enabled.
+- `src/services/discord/meeting_orchestrator.rs` uses the same gate so meetings can reuse bootstrap behavior by default or opt into query recall with `agenda + transcript` as the actual retrieval text.
+- `src/services/memory/memento.rs` deduplicates `rankedInjection`, `core`, `working`, and `anchors` before serializing external recall text so the same memory line is not injected multiple times.
+- Compatibility rule: `memory.query_recall_after_bootstrap` defaults to `false` in `src/config.rs` and `src/services/discord/settings.rs`, so older deployments keep the prior bootstrap-only behavior until operators explicitly opt in.
+
 ## Generated `src/` Tree
 
 This block is generated from the filesystem and is checked in CI for drift.
