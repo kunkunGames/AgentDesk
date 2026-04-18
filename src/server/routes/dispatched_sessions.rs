@@ -6,10 +6,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
+use sqlx::Row;
 
 use super::AppState;
 use super::session_activity::SessionActivityResolver;
 use crate::db::agents::resolve_agent_channel_for_provider_on_conn;
+use crate::db::agents::resolve_agent_channel_for_provider_pg;
 use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
     parse_thread_channel_name, resolve_agent_id_for_session as resolve_session_agent_id,
@@ -37,6 +39,277 @@ fn load_dispatch_thread_id(
         .ok()
         .flatten();
     normalize_thread_channel_id(thread_id.as_deref())
+}
+
+#[derive(Debug)]
+struct RetryDispatchMeta {
+    card_id: String,
+    to_agent_id: Option<String>,
+    dispatch_type: Option<String>,
+    title: Option<String>,
+    context: Option<String>,
+    retry_count: i64,
+}
+
+async fn load_force_kill_session_pg(
+    pool: &PgPool,
+    session_key: &str,
+    provider_name: Option<&str>,
+) -> Result<
+    Option<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>,
+    String,
+> {
+    let row = sqlx::query(
+        "SELECT active_dispatch_id, agent_id, thread_channel_id, provider
+         FROM sessions
+         WHERE session_key = $1",
+    )
+    .bind(session_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("load postgres session {session_key}: {error}"))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let active_dispatch_id: Option<String> = row
+        .try_get("active_dispatch_id")
+        .map_err(|error| format!("decode active_dispatch_id for {session_key}: {error}"))?;
+    let agent_id: Option<String> = row
+        .try_get("agent_id")
+        .map_err(|error| format!("decode agent_id for {session_key}: {error}"))?;
+    let thread_channel_id: Option<String> = row
+        .try_get("thread_channel_id")
+        .map_err(|error| format!("decode thread_channel_id for {session_key}: {error}"))?;
+    let session_provider: Option<String> = row
+        .try_get("provider")
+        .map_err(|error| format!("decode provider for {session_key}: {error}"))?;
+
+    let effective_provider = provider_name.or(session_provider.as_deref());
+    let runtime_channel_id =
+        if let Some(channel_id) = normalize_thread_channel_id(thread_channel_id.as_deref()) {
+            Some(channel_id)
+        } else if let Some(agent_id) = agent_id.as_deref() {
+            resolve_agent_channel_for_provider_pg(pool, agent_id, effective_provider)
+            .await
+            .map_err(|error| {
+                format!(
+                    "resolve postgres channel for session {session_key} / agent {agent_id}: {error}"
+                )
+            })?
+            .and_then(|channel| normalize_thread_channel_id(Some(channel.as_str())))
+        } else {
+            None
+        };
+
+    Ok(Some((
+        active_dispatch_id,
+        agent_id,
+        runtime_channel_id,
+        session_provider,
+    )))
+}
+
+async fn disconnect_session_and_prepare_retry_pg(
+    pool: &PgPool,
+    session_key: &str,
+    active_dispatch_id: Option<&str>,
+    retry: bool,
+) -> Result<Option<RetryDispatchMeta>, String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin postgres force-kill transaction: {error}"))?;
+
+    sqlx::query(
+        "UPDATE sessions
+         SET status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL,
+             raw_provider_session_id = NULL
+         WHERE session_key = $1",
+    )
+    .bind(session_key)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("disconnect postgres session {session_key}: {error}"))?;
+
+    let mut retry_meta = None;
+    if let Some(dispatch_id) = active_dispatch_id {
+        let current_status = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT status
+             FROM task_dispatches
+             WHERE id = $1",
+        )
+        .bind(dispatch_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| format!("load postgres dispatch status {dispatch_id}: {error}"))?
+        .flatten();
+
+        if current_status.as_deref() != Some("completed") {
+            sqlx::query(
+                "UPDATE task_dispatches
+                 SET status = 'failed',
+                     updated_at = NOW(),
+                     completed_at = COALESCE(completed_at, NOW())
+                 WHERE id = $1",
+            )
+            .bind(dispatch_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("mark postgres dispatch {dispatch_id} failed: {error}"))?;
+        }
+
+        if retry {
+            retry_meta = sqlx::query(
+                "SELECT
+                    kanban_card_id,
+                    to_agent_id,
+                    dispatch_type,
+                    title,
+                    context,
+                    COALESCE(retry_count, 0)::BIGINT AS retry_count
+                 FROM task_dispatches
+                 WHERE id = $1",
+            )
+            .bind(dispatch_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| format!("load postgres retry metadata {dispatch_id}: {error}"))?
+            .map(|row| {
+                Ok(RetryDispatchMeta {
+                    card_id: row.try_get("kanban_card_id")?,
+                    to_agent_id: row.try_get("to_agent_id")?,
+                    dispatch_type: row.try_get("dispatch_type")?,
+                    title: row.try_get("title")?,
+                    context: row.try_get("context")?,
+                    retry_count: row.try_get("retry_count")?,
+                })
+            })
+            .transpose()
+            .map_err(|error: sqlx::Error| {
+                format!("decode postgres retry metadata {dispatch_id}: {error}")
+            })?;
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit postgres force-kill transaction: {error}"))?;
+
+    Ok(retry_meta)
+}
+
+async fn create_retry_dispatch_pg(
+    pool: &PgPool,
+    meta: &RetryDispatchMeta,
+) -> Result<String, String> {
+    let dispatch_id = uuid::Uuid::new_v4().to_string();
+    let dispatch_type = meta
+        .dispatch_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("implementation");
+    let title = meta
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("retry dispatch");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin postgres retry dispatch transaction: {error}"))?;
+
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id,
+            kanban_card_id,
+            to_agent_id,
+            dispatch_type,
+            status,
+            title,
+            context,
+            retry_count,
+            created_at,
+            updated_at
+        ) VALUES (
+            $1, $2, $3, $4, 'pending', $5, $6, $7, NOW(), NOW()
+        )",
+    )
+    .bind(&dispatch_id)
+    .bind(&meta.card_id)
+    .bind(meta.to_agent_id.as_deref())
+    .bind(dispatch_type)
+    .bind(title)
+    .bind(meta.context.as_deref().unwrap_or("{}"))
+    .bind(meta.retry_count + 1)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("insert postgres retry dispatch {dispatch_id}: {error}"))?;
+
+    sqlx::query(
+        "INSERT INTO dispatch_events (
+            dispatch_id,
+            kanban_card_id,
+            dispatch_type,
+            from_status,
+            to_status,
+            transition_source,
+            payload_json
+        ) VALUES (
+            $1, $2, $3, NULL, 'pending', 'force_kill_session_retry', NULL
+        )",
+    )
+    .bind(&dispatch_id)
+    .bind(&meta.card_id)
+    .bind(dispatch_type)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("insert postgres retry dispatch event {dispatch_id}: {error}"))?;
+
+    sqlx::query(
+        "INSERT INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title)
+         VALUES ($1, 'notify', $2, $3, $4)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&dispatch_id)
+    .bind(meta.to_agent_id.as_deref())
+    .bind(&meta.card_id)
+    .bind(title)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("insert postgres retry dispatch outbox {dispatch_id}: {error}"))?;
+
+    sqlx::query(
+        "UPDATE kanban_cards
+         SET latest_dispatch_id = $1,
+             updated_at = NOW()
+         WHERE id = $2",
+    )
+    .bind(&dispatch_id)
+    .bind(&meta.card_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        format!(
+            "update postgres card latest_dispatch_id for {}: {error}",
+            meta.card_id
+        )
+    })?;
+
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit postgres retry dispatch {dispatch_id}: {error}"))?;
+
+    Ok(dispatch_id)
 }
 
 fn spawn_auto_queue_activate_for_agent(state: AppState, agent_id: String) {
@@ -1252,8 +1525,29 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     let provider_info =
         crate::services::provider::parse_provider_and_channel_from_tmux_name(&tmux_name);
 
-    // Query session from DB
-    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider) = {
+    // Query session from the authoritative store.
+    let provider_name = provider_info
+        .as_ref()
+        .map(|(provider, _)| provider.as_str());
+    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider) = if let Some(pool) =
+        state.pg_pool.as_ref()
+    {
+        match load_force_kill_session_pg(pool, session_key, provider_name).await {
+            Ok(Some(tuple)) => tuple,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "session not found"})),
+                );
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": error})),
+                );
+            }
+        }
+    } else {
         let conn = match state.db.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -1265,54 +1559,51 @@ pub(crate) async fn force_kill_session_impl_with_reason(
         };
 
         match conn.query_row(
-            "SELECT active_dispatch_id, agent_id, thread_channel_id, provider FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        ) {
-            Ok((active_dispatch_id, agent_id, thread_channel_id, session_provider)) => {
-                let provider_name = provider_info
-                    .as_ref()
-                    .map(|(provider, _)| provider.as_str())
-                    .or(session_provider.as_deref());
-                let runtime_channel_id = normalize_thread_channel_id(thread_channel_id.as_deref())
-                    .or_else(|| {
-                        agent_id.as_deref().and_then(|agent_id| {
-                            resolve_agent_channel_for_provider_on_conn(
-                                &conn,
-                                agent_id,
-                                provider_name,
-                            )
-                            .ok()
-                            .flatten()
-                        })
-                    });
-                (
-                    active_dispatch_id,
-                    agent_id,
-                    runtime_channel_id,
-                    session_provider,
-                )
+                "SELECT active_dispatch_id, agent_id, thread_channel_id, provider FROM sessions WHERE session_key = ?1",
+                [session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            ) {
+                Ok((active_dispatch_id, agent_id, thread_channel_id, session_provider)) => {
+                    let provider_name = provider_name.or(session_provider.as_deref());
+                    let runtime_channel_id =
+                        normalize_thread_channel_id(thread_channel_id.as_deref()).or_else(|| {
+                            agent_id.as_deref().and_then(|agent_id| {
+                                resolve_agent_channel_for_provider_on_conn(
+                                    &conn,
+                                    agent_id,
+                                    provider_name,
+                                )
+                                .ok()
+                                .flatten()
+                            })
+                        });
+                    (
+                        active_dispatch_id,
+                        agent_id,
+                        runtime_channel_id,
+                        session_provider,
+                    )
+                }
+                Err(libsql_rusqlite::Error::QueryReturnedNoRows) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": "session not found"})),
+                    );
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{e}")})),
+                    );
+                }
             }
-            Err(libsql_rusqlite::Error::QueryReturnedNoRows) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "session not found"})),
-                );
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        }
     };
 
     let (termination_reason_code, lifecycle_reason_code) =
@@ -1354,7 +1645,35 @@ pub(crate) async fn force_kill_session_impl_with_reason(
         Option<String>,
         i64,
     )> = None;
-    {
+    if let Some(pool) = state.pg_pool.as_ref() {
+        match disconnect_session_and_prepare_retry_pg(
+            pool,
+            session_key,
+            active_dispatch_id.as_deref(),
+            retry,
+        )
+        .await
+        {
+            Ok(meta) => {
+                retry_meta = meta.map(|meta| {
+                    (
+                        meta.card_id,
+                        meta.to_agent_id,
+                        meta.dispatch_type,
+                        meta.title,
+                        meta.context,
+                        meta.retry_count,
+                    )
+                });
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": error})),
+                );
+            }
+        }
+    } else {
         let conn = match state.db.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -1393,7 +1712,6 @@ pub(crate) async fn force_kill_session_impl_with_reason(
                 .ok();
             }
 
-            // Prepare retry metadata from the failed dispatch (read while lock held)
             if retry {
                 retry_meta = conn
                     .query_row(
@@ -1426,32 +1744,53 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| json!({}));
 
-        match crate::dispatch::create_dispatch(
-            &state.db,
-            &state.engine,
-            &card_id,
-            agent,
-            dtype,
-            dtitle,
-            &ctx,
-        ) {
-            Ok(dispatch_row) => {
-                // Stamp retry_count on the new dispatch
-                let new_id = dispatch_row["id"].as_str().unwrap_or("").to_string();
-                if let Ok(conn) = state.db.lock() {
-                    conn.execute(
-                        "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
-                        libsql_rusqlite::params![retry_count + 1, new_id],
-                    )
-                    .ok();
+        if let Some(pool) = state.pg_pool.as_ref() {
+            let meta = RetryDispatchMeta {
+                card_id,
+                to_agent_id,
+                dispatch_type,
+                title,
+                context: Some(ctx.to_string()),
+                retry_count,
+            };
+            match create_retry_dispatch_pg(pool, &meta).await {
+                Ok(new_id) => {
+                    retry_dispatch_id = Some(new_id);
                 }
-                retry_dispatch_id = Some(new_id.clone());
+                Err(e) => {
+                    tracing::warn!(
+                        "[force-kill] retry dispatch creation via postgres path failed for card {}: {e}",
+                        meta.card_id
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    "[force-kill] retry dispatch creation via central path failed for card {}: {e}",
-                    card_id
-                );
+        } else {
+            match crate::dispatch::create_dispatch(
+                &state.db,
+                &state.engine,
+                &card_id,
+                agent,
+                dtype,
+                dtitle,
+                &ctx,
+            ) {
+                Ok(dispatch_row) => {
+                    let new_id = dispatch_row["id"].as_str().unwrap_or("").to_string();
+                    if let Ok(conn) = state.db.lock() {
+                        conn.execute(
+                            "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
+                            libsql_rusqlite::params![retry_count + 1, new_id],
+                        )
+                        .ok();
+                    }
+                    retry_dispatch_id = Some(new_id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[force-kill] retry dispatch creation via central path failed for card {}: {e}",
+                        card_id
+                    );
+                }
             }
         }
     }
@@ -1478,8 +1817,9 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     );
 
     if tmux_killed && !lifecycle.termination_recorded {
-        crate::services::termination_audit::record_termination_with_db(
+        crate::services::termination_audit::record_termination_with_handles(
             &state.db,
+            state.pg_pool.as_ref(),
             session_key,
             active_dispatch_id.as_deref(),
             "force_kill_api",

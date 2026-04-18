@@ -451,6 +451,7 @@ CREATE TABLE IF NOT EXISTS auto_queue_entries (
     priority_rank  INTEGER DEFAULT 0,
     reason         TEXT,
     status         TEXT DEFAULT 'pending',
+    retry_count    INTEGER NOT NULL DEFAULT 0,
     dispatch_id    TEXT,
     slot_index     INTEGER,
     thread_group   INTEGER DEFAULT 0,
