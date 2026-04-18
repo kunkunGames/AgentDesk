@@ -2169,7 +2169,7 @@ mod tests {
         let mut dispatch_status: Option<String> = None;
         let mut entry_dispatch_id: Option<String> = None;
 
-        for attempt in 0..20 {
+        for attempt in 0..80 {
             kanban::drain_hook_side_effects(&db, &engine);
 
             let (
@@ -2246,8 +2246,8 @@ mod tests {
                 break;
             }
 
-            if attempt < 19 {
-                std::thread::sleep(std::time::Duration::from_millis(25));
+            if attempt < 79 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
 
@@ -2663,7 +2663,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn scenario_6c_review_verdict_pass_closes_issue_and_completes_auto_queue_run() {
+    async fn scenario_6c_review_verdict_pass_closes_issue_and_creates_phase_gate_for_single_phase_run()
+     {
         let gh = install_mock_gh(&[MockGhReply {
             key: "issue:close",
             contains: Some("--repo test/repo"),
@@ -2741,6 +2742,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let phase_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-s6c' \
+                   AND dispatch_type = 'phase-gate' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         drop(conn);
 
         assert_eq!(card_status, "done");
@@ -2748,10 +2759,20 @@ mod tests {
             entry_status, "done",
             "pass verdict terminal transition must close the active auto-queue entry"
         );
+        let phase_gate_json =
+            phase_gate_state(&db, "run-s6c", 0).expect("single-phase run must persist gate state");
         assert_eq!(
-            run_status, "completed",
-            "pass verdict terminal transition must still fire OnCardTerminal auto-queue completion"
+            run_status, "paused",
+            "pass verdict terminal transition must pause for a single-phase gate"
         );
+        assert_eq!(
+            phase_gate_count, 1,
+            "pass verdict terminal transition must create a single-phase gate dispatch"
+        );
+        assert_eq!(phase_gate_json["status"], "pending");
+        assert_eq!(phase_gate_json["batch_phase"], 0);
+        assert_eq!(phase_gate_json["next_phase"], serde_json::Value::Null);
+        assert_eq!(phase_gate_json["final_phase"], true);
 
         let log = gh_log(&gh);
         assert!(
@@ -2877,7 +2898,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn scenario_655_noop_review_pass_skips_create_pr_and_closes_issue() {
+    async fn scenario_655_noop_review_pass_skips_create_pr_and_creates_phase_gate() {
         let gh = install_mock_gh(&[MockGhReply {
             key: "issue:close",
             contains: Some("--repo test/repo"),
@@ -3003,6 +3024,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let phase_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-655-pass' \
+                   AND dispatch_type = 'phase-gate' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         drop(conn);
 
         assert_eq!(card_status, "done");
@@ -3014,10 +3045,20 @@ mod tests {
             entry_status, "done",
             "#655: noop verification pass must still close the active auto-queue entry"
         );
+        let phase_gate_json = phase_gate_state(&db, "run-655-pass", 0)
+            .expect("#655: single-phase noop pass must persist gate state");
         assert_eq!(
-            run_status, "completed",
-            "#655: noop verification pass must still complete the auto-queue run via terminal review flow"
+            run_status, "paused",
+            "#655: noop verification pass must pause the run for the single-phase gate"
         );
+        assert_eq!(
+            phase_gate_count, 1,
+            "#655: noop verification pass must create a phase-gate dispatch after review passes"
+        );
+        assert_eq!(phase_gate_json["status"], "pending");
+        assert_eq!(phase_gate_json["batch_phase"], 0);
+        assert_eq!(phase_gate_json["next_phase"], serde_json::Value::Null);
+        assert_eq!(phase_gate_json["final_phase"], true);
 
         let log = gh_log(&gh);
         assert!(
@@ -4211,7 +4252,8 @@ mod tests {
     }
 
     #[test]
-    fn scenario_review_disabled_on_review_enter_closes_issue_and_completes_auto_queue_run() {
+    fn scenario_review_disabled_on_review_enter_closes_issue_and_creates_phase_gate_for_single_phase_run()
+     {
         let gh = install_mock_gh(&[MockGhReply {
             key: "issue:close",
             contains: Some("--repo test/repo"),
@@ -4261,6 +4303,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let phase_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-review-disabled-gh' \
+                   AND dispatch_type = 'phase-gate' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let entry_status: String = conn
             .query_row(
                 "SELECT status FROM auto_queue_entries WHERE id = 'entry-review-disabled-gh'",
@@ -4274,10 +4326,20 @@ mod tests {
             entry_status, "done",
             "terminal review-disabled transition must close the active auto-queue entry"
         );
+        let phase_gate_json = phase_gate_state(&db, "run-review-disabled-gh", 0)
+            .expect("single-phase review-disabled run must persist gate state");
         assert_eq!(
-            run_status, "completed",
-            "review-disabled JS terminal path must still fire OnCardTerminal auto-queue completion"
+            run_status, "paused",
+            "review-disabled JS terminal path must pause the run for single-phase gate"
         );
+        assert_eq!(
+            phase_gate_count, 1,
+            "review-disabled single-phase terminal transition must create a phase-gate dispatch"
+        );
+        assert_eq!(phase_gate_json["status"], "pending");
+        assert_eq!(phase_gate_json["batch_phase"], 0);
+        assert_eq!(phase_gate_json["next_phase"], serde_json::Value::Null);
+        assert_eq!(phase_gate_json["final_phase"], true);
 
         let log = gh_log(&gh);
         assert!(
@@ -4354,6 +4416,75 @@ mod tests {
         assert_eq!(phase_gate_json["status"], "pending");
         assert_eq!(phase_gate_json["batch_phase"], 1);
         assert_eq!(phase_gate_json["next_phase"], 2);
+    }
+
+    #[test]
+    fn continue_run_after_entry_creates_phase_gate_for_single_phase_run() {
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        ensure_auto_queue_tables(&db);
+        seed_card(&db, "card-single-phase-gate", "done");
+
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+                 VALUES ('run-single-phase-gate', 'test/repo', 'agent-1', 'active', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, batch_phase, created_at, completed_at) \
+                 VALUES ('entry-single-phase-gate', 'run-single-phase-gate', 'card-single-phase-gate', 'agent-1', 'done', 0, 0, datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        engine
+            .eval_js::<String>(
+                r#"(() => {
+                    continueRunAfterEntry("run-single-phase-gate", "agent-1", 0, 0, "card-single-phase-gate");
+                    return "ok";
+                })()"#,
+            )
+            .expect("single-phase continueRunAfterEntry should evaluate");
+
+        let conn = db.lock().unwrap();
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-single-phase-gate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let phase_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-single-phase-gate' \
+                   AND dispatch_type = 'phase-gate' \
+                   AND status IN ('pending', 'dispatched')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let phase_gate_json = phase_gate_state(&db, "run-single-phase-gate", 0)
+            .expect("phase gate state must exist for single-phase runs");
+        assert_eq!(
+            run_status, "paused",
+            "single-phase completion must pause the run for phase gate"
+        );
+        assert_eq!(
+            phase_gate_count, 1,
+            "single-phase completion must create a phase-gate dispatch"
+        );
+        assert_eq!(phase_gate_json["status"], "pending");
+        assert_eq!(phase_gate_json["batch_phase"], 0);
+        assert_eq!(phase_gate_json["next_phase"], serde_json::Value::Null);
+        assert_eq!(phase_gate_json["final_phase"], true);
     }
 
     #[test]
@@ -7909,7 +8040,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn scenario_690_code_failure_does_not_redispatch_same_run_after_rework_cycle() {
+    fn scenario_690_code_failure_duplicate_run_is_suppressed_after_review_reentry() {
         let repo = tempfile::tempdir().unwrap();
         let gh = install_mock_gh(&[
             MockGhReply {
@@ -7971,23 +8102,166 @@ mod tests {
             "first CI failure should create exactly one active rework dispatch"
         );
 
+        let rework_dispatch_id: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT id FROM task_dispatches \
+                 WHERE kanban_card_id = 'card-690-loop' AND dispatch_type = 'rework' \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        seed_assistant_response_for_dispatch(
+            &db,
+            &rework_dispatch_id,
+            "attempted CI fix without creating a new commit",
+        );
+        let result = dispatch::complete_dispatch(
+            &db,
+            &engine,
+            &rework_dispatch_id,
+            &serde_json::json!({"completion_source": "test_harness"}),
+        );
+        assert!(
+            result.is_ok(),
+            "rework completion should succeed: {:?}",
+            result.err()
+        );
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            get_card_status(&db, "card-690-loop"),
+            "review",
+            "real rework completion should return the card to review"
+        );
         {
             let conn = db.lock().unwrap();
             conn.execute(
-                "UPDATE task_dispatches \
-                 SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now') \
-                 WHERE kanban_card_id = 'card-690-loop' AND dispatch_type = 'rework'",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE kanban_cards \
-                 SET status = 'review', blocked_reason = NULL, updated_at = datetime('now') \
-                 WHERE id = 'card-690-loop'",
+                "DELETE FROM kv_meta WHERE key = 'ci:card-690-loop:last_run_id'",
                 [],
             )
             .unwrap();
         }
+
+        {
+            engine
+                .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
+                .unwrap();
+        }
+        kanban::drain_hook_side_effects(&db, &engine);
+
+        assert_eq!(
+            count_dispatches_by_type(&db, "card-690-loop", "rework"),
+            1,
+            "same completed CI run must not spawn another rework dispatch after the card re-enters review"
+        );
+        assert_eq!(
+            get_card_status(&db, "card-690-loop"),
+            "review",
+            "duplicate failed run suppression must keep the card in review instead of looping back to rework"
+        );
+        let log = gh_log(&gh);
+        assert_eq!(
+            log.matches("issue comment 696 --repo test/repo --body")
+                .count(),
+            1,
+            "same failed CI run must not accumulate duplicate review-status comments"
+        );
+        assert!(
+            !log.contains("run rerun 6910"),
+            "same failed CI run should be deduped rather than rerun or redispatched"
+        );
+
+        let metadata_json: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT metadata FROM kanban_cards WHERE id = 'card-690-loop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(
+            metadata["loop_guard"]["ci_recovery"]["status"],
+            "suppressed"
+        );
+        assert_eq!(metadata["loop_guard"]["ci_recovery"]["suppress_count"], 1);
+        assert_eq!(
+            metadata["loop_guard"]["ci_recovery"]["classification"],
+            "code_failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_690_new_failed_run_is_not_blocked_by_prior_loop_fingerprint() {
+        let repo = tempfile::tempdir().unwrap();
+        let _gh = install_mock_gh(&[
+            MockGhReply {
+                key: "pr:view",
+                contains: Some("--json headRefOid"),
+                stdout: "sha-dashboard-new-run",
+            },
+            MockGhReply {
+                key: "run:list",
+                contains: Some("--branch wt/card-690-new-run"),
+                stdout: r#"[{"databaseId":6911,"status":"completed","conclusion":"failure","headSha":"sha-dashboard-new-run","event":"pull_request"}]"#,
+            },
+            MockGhReply {
+                key: "run:view",
+                contains: Some("--json jobs"),
+                stdout: r#"{"jobs":[{"name":"Script checks","conclusion":"failure"}]}"#,
+            },
+            MockGhReply {
+                key: "run:view",
+                contains: Some("--log-failed"),
+                stdout: "generated docs are stale; rerun scripts/generate_inventory_docs.py",
+            },
+        ]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(&db, "card-690-new-run", "review", "test/repo", 697, None);
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE kanban_cards SET blocked_reason = 'ci:waiting' WHERE id = 'card-690-new-run'",
+                [],
+            )
+            .unwrap();
+        }
+        seed_pr_tracking(
+            &db,
+            "card-690-new-run",
+            "test/repo",
+            Some(repo.path().to_str().unwrap()),
+            "wt/card-690-new-run",
+            Some(697),
+            Some("sha-dashboard-new-run"),
+            "wait-ci",
+        );
+        set_kv(&db, "ci:card-690-new-run:last_run_id", "6910");
+        set_kv(
+            &db,
+            "loop_guard:ci_recovery:card-690-new-run",
+            &serde_json::json!({
+                "status": "active",
+                "action": "rework_dispatched",
+                "fingerprint": "card-690-new-run::sha-dashboard-new-run::6910::code_failure",
+                "base_fingerprint": "card-690-new-run::sha-dashboard-new-run::6910",
+                "classification": "code_failure",
+                "run_id": "6910",
+                "head_sha": "sha-dashboard-new-run",
+                "suppress_count": 2,
+                "last_reason": "code_job_match: failed jobs=Script checks"
+            })
+            .to_string(),
+        );
 
         engine
             .try_fire_hook_by_name("OnTick1min", serde_json::json!({}))
@@ -7995,18 +8269,153 @@ mod tests {
         kanban::drain_hook_side_effects(&db, &engine);
 
         assert_eq!(
-            count_dispatches_by_type(&db, "card-690-loop", "rework"),
+            count_active_dispatches_by_type(&db, "card-690-new-run", "rework"),
             1,
-            "same completed CI run must not spawn another rework dispatch without a new head SHA"
+            "a new failed run_id must still create a fresh rework dispatch"
+        );
+
+        let metadata_json: String = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT metadata FROM kanban_cards WHERE id = 'card-690-new-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["loop_guard"]["ci_recovery"]["run_id"], "6911");
+        assert_eq!(metadata["loop_guard"]["ci_recovery"]["status"], "active");
+        assert_eq!(
+            metadata["loop_guard"]["ci_recovery"]["action"],
+            "rework_dispatched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scenario_741_review_loop_guard_escalates_same_head_review_churn() {
+        let gh = install_mock_gh(&[]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-741-review-loop",
+            "in_progress",
+            "test/repo",
+            741,
+            None,
+        );
+        seed_pr_tracking(
+            &db,
+            "card-741-review-loop",
+            "test/repo",
+            None,
+            "wt/card-741-review-loop",
+            Some(741),
+            Some("sha-review-loop"),
+            "wait-ci",
+        );
+
+        for idx in 1..=3 {
+            let dispatch_id = format!("rw-741-loop-{idx}");
+            seed_dispatch(
+                &db,
+                &dispatch_id,
+                "card-741-review-loop",
+                "rework",
+                "pending",
+            );
+            seed_assistant_response_for_dispatch(&db, &dispatch_id, "repeat review loop");
+
+            let result = dispatch::complete_dispatch(
+                &db,
+                &engine,
+                &dispatch_id,
+                &serde_json::json!({"completion_source": "test_harness"}),
+            );
+            assert!(
+                result.is_ok(),
+                "rework completion should succeed on loop attempt {idx}: {:?}",
+                result.err()
+            );
+            kanban::drain_hook_side_effects(&db, &engine);
+
+            if idx < 3 {
+                let conn = db.lock().unwrap();
+                conn.execute(
+                    "UPDATE task_dispatches \
+                     SET status = 'completed', completed_at = COALESCE(completed_at, datetime('now')), updated_at = datetime('now') \
+                     WHERE kanban_card_id = 'card-741-review-loop' AND dispatch_type = 'review' \
+                     AND status IN ('pending', 'dispatched')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE kanban_cards \
+                     SET status = 'in_progress', review_status = NULL, blocked_reason = NULL, updated_at = datetime('now') \
+                     WHERE id = 'card-741-review-loop'",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+
+        let (review_status, blocked_reason, metadata_json): (
+            Option<String>,
+            Option<String>,
+            String,
+        ) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT review_status, blocked_reason, metadata FROM kanban_cards WHERE id = 'card-741-review-loop'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(review_status.as_deref(), Some("dilemma_pending"));
+        assert!(
+            blocked_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Review loop guard"),
+            "loop guard escalation must explain itself in blocked_reason"
         );
         assert_eq!(
-            count_active_dispatches_by_type(&db, "card-690-loop", "rework"),
+            count_active_dispatches_by_type(&db, "card-741-review-loop", "review"),
             0,
-            "rework dispatch should stay completed until a new CI run appears"
+            "once review churn is escalated, a new review dispatch must not remain active"
+        );
+
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(
+            metadata["loop_guard"]["review_churn"]["status"],
+            "escalated"
         );
         assert!(
-            !gh_log(&gh).contains("run rerun 6910"),
-            "same failed CI run should be deduped rather than rerun or redispatched"
+            metadata["loop_guard"]["review_churn"]["enter_count"]
+                .as_i64()
+                .unwrap_or_default()
+                >= 3,
+            "review churn guard must record that the same head crossed the escalation threshold"
+        );
+        assert!(
+            metadata["loop_guard"]["review_churn"]["escalation_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Review loop guard")
+        );
+
+        let log = gh_log(&gh);
+        assert_eq!(
+            log.matches("issue comment 741 --repo test/repo --body")
+                .count(),
+            3,
+            "review churn test must observe the repeated review-status comment path before escalating"
         );
     }
 
