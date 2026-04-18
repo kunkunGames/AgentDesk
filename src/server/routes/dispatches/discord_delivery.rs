@@ -71,6 +71,12 @@ fn context_reset_slot_thread_before_reuse(dispatch_context: Option<&serde_json::
         .unwrap_or(false)
 }
 
+/// #750: announce-bot reaction sync target. Command bot owns `⏳` (added at
+/// turn start, removed at turn end) and adds `✅` on response delivery; the
+/// announce-bot sync runs only for (a) failed/cancelled dispatches — to clean
+/// stale `✅`/`⏳` and add `❌` — and (b) completions that did not pass
+/// through the live command-bot path (api / recovery / supervisor), where
+/// the announce-bot `✅` is the only terminal-state signal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DispatchMessageTarget {
     channel_id: String,
@@ -78,10 +84,124 @@ pub(super) struct DispatchMessageTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DispatchStatusReactionState {
-    InProgress,
+enum DispatchStatusReactionState {
     Succeeded,
     Failed,
+}
+
+fn dispatch_reaction_emoji_path(emoji: char) -> Option<&'static str> {
+    match emoji {
+        '⏳' => Some("%E2%8F%B3"),
+        '✅' => Some("%E2%9C%85"),
+        '❌' => Some("%E2%9D%8C"),
+        _ => None,
+    }
+}
+
+fn parse_dispatch_message_target(dispatch_context: Option<&str>) -> Option<DispatchMessageTarget> {
+    let context = dispatch_context_value(dispatch_context)?;
+    let channel_id = context
+        .get("discord_message_channel_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let message_id = context
+        .get("discord_message_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(DispatchMessageTarget {
+        channel_id: channel_id.to_string(),
+        message_id: message_id.to_string(),
+    })
+}
+
+async fn update_dispatch_reaction_presence(
+    client: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    target: &DispatchMessageTarget,
+    emoji: char,
+    present: bool,
+) -> Result<(), String> {
+    let encoded_emoji = dispatch_reaction_emoji_path(emoji)
+        .ok_or_else(|| format!("unsupported dispatch reaction emoji: {emoji}"))?;
+    let url = discord_api_url(
+        base_url,
+        &format!(
+            "/channels/{}/messages/{}/reactions/{}/@me",
+            target.channel_id, target.message_id, encoded_emoji
+        ),
+    );
+    let response = if present {
+        client
+            .put(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to add reaction {emoji} to dispatch message {}: {error}",
+                    target.message_id
+                )
+            })?
+    } else {
+        client
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to remove reaction {emoji} from dispatch message {}: {error}",
+                    target.message_id
+                )
+            })?
+    };
+
+    // Discord returns 404 when we try to remove a reaction that isn't present.
+    // That's expected when announce bot never added the emoji in the first
+    // place (the common case now that command bot owns ⏳), so treat
+    // 404-on-remove as success.
+    if response.status().is_success() || (!present && response.status().as_u16() == 404) {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let action = if present { "add" } else { "remove" };
+    Err(format!(
+        "failed to {action} reaction {emoji} for dispatch message {}: {status} {body}",
+        target.message_id
+    ))
+}
+
+async fn apply_dispatch_status_reaction_state(
+    client: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    target: &DispatchMessageTarget,
+    state: DispatchStatusReactionState,
+) -> Result<(), String> {
+    match state {
+        DispatchStatusReactionState::Succeeded => {
+            // Clean announce-bot's own ⏳/❌ (404-tolerant) then add ✅.
+            // Command bot's separate ✅ (if any) is not touched.
+            update_dispatch_reaction_presence(client, token, base_url, target, '⏳', false).await?;
+            update_dispatch_reaction_presence(client, token, base_url, target, '❌', false).await?;
+            update_dispatch_reaction_presence(client, token, base_url, target, '✅', true).await
+        }
+        DispatchStatusReactionState::Failed => {
+            // Clean announce-bot's own ⏳/✅ (404-tolerant) then add ❌.
+            // Command bot's ✅ added on response delivery (turn_bridge:1537)
+            // is a separate @user reaction and will still render alongside
+            // ❌ — inevitable cross-bot collision on failed turns that
+            // returned text. ❌ remains the authoritative failure signal.
+            update_dispatch_reaction_presence(client, token, base_url, target, '⏳', false).await?;
+            update_dispatch_reaction_presence(client, token, base_url, target, '✅', false).await?;
+            update_dispatch_reaction_presence(client, token, base_url, target, '❌', true).await
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,32 +353,11 @@ impl DispatchTransport for HttpDispatchTransport {
     }
 }
 
-fn dispatch_reaction_emoji_path(emoji: char) -> Option<&'static str> {
-    match emoji {
-        '⏳' => Some("%E2%8F%B3"),
-        '✅' => Some("%E2%9C%85"),
-        '❌' => Some("%E2%9D%8C"),
-        _ => None,
-    }
-}
-
-fn parse_dispatch_message_target(dispatch_context: Option<&str>) -> Option<DispatchMessageTarget> {
-    let context = dispatch_context_value(dispatch_context)?;
-    let channel_id = context
-        .get("discord_message_channel_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let message_id = context
-        .get("discord_message_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(DispatchMessageTarget {
-        channel_id: channel_id.to_string(),
-        message_id: message_id.to_string(),
-    })
-}
+// #750: dispatch_reaction_emoji_path + parse_dispatch_message_target removed.
+// They fed the announce-bot lifecycle emoji writer that now no-ops. The
+// `discord_message_channel_id` / `discord_message_id` context fields are
+// still persisted by persist_dispatch_message_target_on_conn (used by the
+// message post path) — reading them is just no longer needed here.
 
 pub(super) fn persist_dispatch_message_target_on_conn(
     conn: &rusqlite::Connection,
@@ -291,87 +390,10 @@ pub(super) fn persist_dispatch_message_target_on_conn(
     Ok(())
 }
 
-async fn update_dispatch_reaction_presence(
-    client: &reqwest::Client,
-    token: &str,
-    base_url: &str,
-    target: &DispatchMessageTarget,
-    emoji: char,
-    present: bool,
-) -> Result<(), String> {
-    let encoded_emoji = dispatch_reaction_emoji_path(emoji)
-        .ok_or_else(|| format!("unsupported dispatch reaction emoji: {emoji}"))?;
-    let url = discord_api_url(
-        base_url,
-        &format!(
-            "/channels/{}/messages/{}/reactions/{}/@me",
-            target.channel_id, target.message_id, encoded_emoji
-        ),
-    );
-    let response = if present {
-        client
-            .put(&url)
-            .header("Authorization", format!("Bot {}", token))
-            .send()
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to add reaction {emoji} to dispatch message {}: {error}",
-                    target.message_id
-                )
-            })?
-    } else {
-        client
-            .delete(&url)
-            .header("Authorization", format!("Bot {}", token))
-            .send()
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to remove reaction {emoji} from dispatch message {}: {error}",
-                    target.message_id
-                )
-            })?
-    };
-
-    if response.status().is_success() || (!present && response.status().as_u16() == 404) {
-        return Ok(());
-    }
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let action = if present { "add" } else { "remove" };
-    Err(format!(
-        "failed to {action} reaction {emoji} for dispatch message {}: {status} {body}",
-        target.message_id
-    ))
-}
-
-async fn apply_dispatch_status_reaction_state(
-    client: &reqwest::Client,
-    token: &str,
-    base_url: &str,
-    target: &DispatchMessageTarget,
-    state: DispatchStatusReactionState,
-) -> Result<(), String> {
-    match state {
-        DispatchStatusReactionState::InProgress => {
-            update_dispatch_reaction_presence(client, token, base_url, target, '✅', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '❌', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '⏳', true).await
-        }
-        DispatchStatusReactionState::Succeeded => {
-            update_dispatch_reaction_presence(client, token, base_url, target, '⏳', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '❌', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '✅', true).await
-        }
-        DispatchStatusReactionState::Failed => {
-            update_dispatch_reaction_presence(client, token, base_url, target, '⏳', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '✅', false).await?;
-            update_dispatch_reaction_presence(client, token, base_url, target, '❌', true).await
-        }
-    }
-}
+// #750: update_dispatch_reaction_presence + apply_dispatch_status_reaction_state
+// removed. They were the Discord REST wrappers used by the announce-bot
+// lifecycle emoji path; with sync_dispatch_status_reaction now a no-op they
+// have no callers.
 
 fn is_discord_length_error(status: reqwest::StatusCode, body: &str) -> bool {
     if status != reqwest::StatusCode::BAD_REQUEST {
@@ -487,49 +509,48 @@ pub(super) async fn post_dispatch_message_to_channel(
     }
 }
 
+/// #750: persists the posted dispatch message target (channel_id + message_id)
+/// so downstream consumers can locate the original dispatch post, but no
+/// longer adds the `⏳` pending emoji reaction. The announce bot reaction
+/// path was retired; the command bot's turn-lifecycle emojis remain the
+/// single source of truth. The helper signature is unchanged so callers
+/// don't need to re-thread http client/token availability through.
 pub(super) async fn persist_dispatch_message_target_and_add_pending_reaction(
     db: &crate::db::Db,
-    client: &reqwest::Client,
-    token: &str,
-    base_url: &str,
+    _client: &reqwest::Client,
+    _token: &str,
+    _base_url: &str,
     dispatch_id: &str,
     channel_id: &str,
     message_id: &str,
 ) -> Result<(), String> {
-    {
-        let conn = db
-            .lock()
-            .map_err(|_| format!("db lock failed while saving message target for {dispatch_id}"))?;
-        persist_dispatch_message_target_on_conn(&conn, dispatch_id, channel_id, message_id)
-            .map_err(|error| {
-                format!("persist dispatch message target for {dispatch_id}: {error}")
-            })?;
-    }
-
-    let target = DispatchMessageTarget {
-        channel_id: channel_id.to_string(),
-        message_id: message_id.to_string(),
-    };
-    if let Err(error) = apply_dispatch_status_reaction_state(
-        client,
-        token,
-        base_url,
-        &target,
-        DispatchStatusReactionState::InProgress,
-    )
-    .await
-    {
-        tracing::warn!(
-            "[dispatch] Failed to add pending reaction to message {} for dispatch {}: {}",
-            message_id,
-            dispatch_id,
-            error
-        );
-    }
-
+    let conn = db
+        .lock()
+        .map_err(|_| format!("db lock failed while saving message target for {dispatch_id}"))?;
+    persist_dispatch_message_target_on_conn(&conn, dispatch_id, channel_id, message_id)
+        .map_err(|error| format!("persist dispatch message target for {dispatch_id}: {error}"))?;
     Ok(())
 }
 
+/// #750: narrow-path dispatch-status reaction sync.
+///
+/// Command bot owns ⏳ (stop control) and ✅ on response delivery for live
+/// turns. This function runs only for terminal states where the announce-bot
+/// reaction is still meaningful:
+///
+/// - `completed`: enqueue is gated on the transition source in
+///   `set_dispatch_status_on_conn`; only non-live paths (api, recovery,
+///   supervisor) reach this function, and they need the terminal ✅ here
+///   because command bot was never involved.
+/// - `failed` / `cancelled`: always reached. Command bot unconditionally
+///   adds ✅ whenever a response was delivered (turn_bridge:1537), so a
+///   failing dispatch that returned any text would otherwise show a false
+///   green check. The full-state reconcile (404-tolerant cleanup of
+///   announce-bot's own stale ⏳/✅ plus a fresh ❌) is the authoritative
+///   failure signal.
+///
+/// `pending` / `dispatched` are never enqueued — command bot's ⏳ is the
+/// single ⏳ source.
 pub(crate) async fn sync_dispatch_status_reaction(
     db: &crate::db::Db,
     dispatch_id: &str,
@@ -537,7 +558,7 @@ pub(crate) async fn sync_dispatch_status_reaction(
     let (status, target) = {
         let conn = db
             .lock()
-            .map_err(|_| format!("db lock failed for dispatch reaction sync {dispatch_id}"))?;
+            .map_err(|_| format!("db lock failed for {dispatch_id} status reaction"))?;
         let row: Option<(String, Option<String>)> = conn
             .query_row(
                 "SELECT status, context FROM task_dispatches WHERE id = ?1",
@@ -545,28 +566,26 @@ pub(crate) async fn sync_dispatch_status_reaction(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| format!("load dispatch reaction target for {dispatch_id}: {error}"))?;
+            .map_err(|error| format!("lookup dispatch {dispatch_id}: {error}"))?;
         let Some((status, context)) = row else {
             return Ok(());
         };
         (status, parse_dispatch_message_target(context.as_deref()))
     };
 
+    let state = match status.as_str() {
+        "completed" => DispatchStatusReactionState::Succeeded,
+        "failed" | "cancelled" => DispatchStatusReactionState::Failed,
+        _ => return Ok(()),
+    };
+
     let Some(target) = target else {
         return Ok(());
     };
 
-    let Some(state) = (match status.as_str() {
-        "pending" | "dispatched" => Some(DispatchStatusReactionState::InProgress),
-        "completed" => Some(DispatchStatusReactionState::Succeeded),
-        "failed" | "cancelled" => Some(DispatchStatusReactionState::Failed),
-        _ => None,
-    }) else {
-        return Ok(());
+    let Some(token) = crate::credential::read_bot_token("announce") else {
+        return Err("no announce bot token".to_string());
     };
-
-    let token = crate::credential::read_bot_token("announce")
-        .ok_or_else(|| "no announce bot token".to_string())?;
     let base_url = discord_api_base_url();
     apply_dispatch_status_reaction_state(
         shared_discord_http_client(),
@@ -2815,18 +2834,17 @@ mod tests {
                 .calls
                 .contains(&"POST /channels/thread-created/messages".to_string())
         );
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9C%85/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9D%8C/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"PUT /channels/thread-created/messages/message-thread-created/reactions/%E2%8F%B3/@me"
-                .to_string()
-        ));
+        // #750: announce bot no longer writes dispatch-lifecycle emoji
+        // reactions — no PUT/DELETE reaction calls should have been issued.
+        assert!(
+            !state.calls.iter().any(|call| call.contains("/reactions/")),
+            "#750: expected no emoji reaction HTTP calls, got {:?}",
+            state
+                .calls
+                .iter()
+                .filter(|c| c.contains("/reactions/"))
+                .collect::<Vec<_>>()
+        );
 
         let conn = db.lock().unwrap();
         let thread_id: Option<String> = conn
@@ -2896,18 +2914,11 @@ mod tests {
                 .calls
                 .contains(&"POST /channels/thread-created/messages".to_string())
         );
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9C%85/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9D%8C/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"PUT /channels/thread-created/messages/message-thread-created/reactions/%E2%8F%B3/@me"
-                .to_string()
-        ));
+        // #750: no emoji reaction calls — see other tests in this file for rationale.
+        assert!(
+            !state.calls.iter().any(|call| call.contains("/reactions/")),
+            "#750: no emoji reaction HTTP calls expected"
+        );
         assert!(
             state
                 .calls
@@ -2990,15 +3001,9 @@ mod tests {
         server_handle.abort();
 
         let state = state.lock().unwrap();
-        assert_eq!(
-            state.calls,
-            vec![
-                "POST /channels/123/messages",
-                "DELETE /channels/123/messages/message-123/reactions/%E2%9C%85/@me",
-                "DELETE /channels/123/messages/message-123/reactions/%E2%9D%8C/@me",
-                "PUT /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
-            ]
-        );
+        // #750: phase-gate post → no emoji reaction calls (announce bot
+        // writer retired). Only the message POST should have hit Discord.
+        assert_eq!(state.calls, vec!["POST /channels/123/messages".to_string()]);
         assert!(
             !state.calls.iter().any(|call| call.contains("/threads")),
             "phase-gate dispatch must not create or reuse a Discord thread"
@@ -3096,18 +3101,11 @@ mod tests {
                 .calls
                 .contains(&"POST /channels/thread-created/messages".to_string())
         );
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9C%85/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"DELETE /channels/thread-created/messages/message-thread-created/reactions/%E2%9D%8C/@me"
-                .to_string()
-        ));
-        assert!(state.calls.contains(
-            &"PUT /channels/thread-created/messages/message-thread-created/reactions/%E2%8F%B3/@me"
-                .to_string()
-        ));
+        assert!(
+            !state.calls.iter().any(|call| call.contains("/reactions/")),
+            "#750: announce bot must not write dispatch-lifecycle emoji reactions, got {:?}",
+            state.calls
+        );
 
         let conn = db.lock().unwrap();
         let thread_id: Option<String> = conn
@@ -3205,10 +3203,12 @@ mod tests {
                 "GET /channels/thread-history",
                 "PATCH /channels/thread-history",
                 "POST /channels/thread-history/messages",
-                "DELETE /channels/thread-history/messages/message-thread-history/reactions/%E2%9C%85/@me",
-                "DELETE /channels/thread-history/messages/message-thread-history/reactions/%E2%9D%8C/@me",
-                "PUT /channels/thread-history/messages/message-thread-history/reactions/%E2%8F%B3/@me",
             ]
+        );
+        assert!(
+            !state.calls.iter().any(|call| call.contains("/reactions/")),
+            "#750: announce bot must not write dispatch-lifecycle emoji reactions, got {:?}",
+            state.calls
         );
         assert_eq!(
             state.thread_names.get("thread-history").map(String::as_str),
@@ -3467,8 +3467,13 @@ mod tests {
         );
     }
 
+    /// #750: completed dispatches reach sync_dispatch_status_reaction only
+    /// for non-live completion paths (api/recovery/supervisor — gated by
+    /// `transition_source_is_live_command_bot` in set_dispatch_status_on_conn).
+    /// For those, the announce bot's ✅ is the only terminal signal, so the
+    /// sync runs the full reconcile: DELETE ⏳/❌ (@me, 404-tolerant), PUT ✅.
     #[tokio::test]
-    async fn sync_dispatch_status_reaction_marks_completed_dispatch_success() {
+    async fn sync_dispatch_status_reaction_writes_success_cycle_for_completed_dispatch() {
         let _env_lock = env_lock();
         let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
         let _api_base = EnvVarGuard::set("AGENTDESK_DISCORD_API_BASE_URL", &base_url);
@@ -3513,26 +3518,29 @@ mod tests {
 
         server_handle.abort();
         let state = state.lock().unwrap();
-        // Filter to reaction calls only: on some platforms (Windows) background
-        // thread/channel PATCH requests may also hit the mock server.
         let reaction_calls: Vec<String> = state
             .calls
             .iter()
-            .filter(|call| call.contains("/channels/123/messages/message-123/reactions/"))
+            .filter(|call| call.contains("/reactions/"))
             .cloned()
             .collect();
         assert_eq!(
             reaction_calls,
             vec![
-                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
-                "DELETE /channels/123/messages/message-123/reactions/%E2%9D%8C/@me",
-                "PUT /channels/123/messages/message-123/reactions/%E2%9C%85/@me",
-            ]
+                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me".to_string(),
+                "DELETE /channels/123/messages/message-123/reactions/%E2%9D%8C/@me".to_string(),
+                "PUT /channels/123/messages/message-123/reactions/%E2%9C%85/@me".to_string(),
+            ],
+            "#750: completed dispatch (non-live source) must DELETE announce-bot's own ⏳/❌ then PUT ✅"
         );
     }
 
+    /// #750: failed dispatches get the full failure reconcile — DELETE
+    /// announce-bot's own ⏳/✅ (404-tolerant) then PUT ❌. Command bot's
+    /// own ✅ (if added via turn_bridge:1537) is untouched (@me-scoped
+    /// deletes), but ❌ is the authoritative failure signal.
     #[tokio::test]
-    async fn sync_dispatch_status_reaction_marks_failed_dispatch_error() {
+    async fn sync_dispatch_status_reaction_writes_failure_cycle_for_failed_dispatch() {
         let _env_lock = env_lock();
         let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
         let _api_base = EnvVarGuard::set("AGENTDESK_DISCORD_API_BASE_URL", &base_url);
@@ -3580,16 +3588,17 @@ mod tests {
         let reaction_calls: Vec<String> = state
             .calls
             .iter()
-            .filter(|call| call.contains("/channels/123/messages/message-123/reactions/"))
+            .filter(|call| call.contains("/reactions/"))
             .cloned()
             .collect();
         assert_eq!(
             reaction_calls,
             vec![
-                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
-                "DELETE /channels/123/messages/message-123/reactions/%E2%9C%85/@me",
-                "PUT /channels/123/messages/message-123/reactions/%E2%9D%8C/@me",
-            ]
+                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me".to_string(),
+                "DELETE /channels/123/messages/message-123/reactions/%E2%9C%85/@me".to_string(),
+                "PUT /channels/123/messages/message-123/reactions/%E2%9D%8C/@me".to_string(),
+            ],
+            "#750: failed dispatch must DELETE announce-bot's own ⏳/✅ then PUT ❌ (clean signal, not mixed state)"
         );
     }
 
