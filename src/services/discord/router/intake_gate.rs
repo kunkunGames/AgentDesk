@@ -320,7 +320,7 @@ async fn handle_reaction_remove(
                 super::message_handler::TextStopLookup::Stop(token) => {
                     super::super::turn_bridge::cancel_active_token(
                         &token,
-                        true,
+                        super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                         "reaction remove ⏳",
                     );
                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -329,6 +329,14 @@ async fn handle_reaction_remove(
                         removed_reaction.message_id,
                         channel_id
                     );
+                    super::super::commands::notify_turn_stop(
+                        &ctx.http,
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        "reaction remove ⏳",
+                    )
+                    .await;
                     send_reaction_control_reply(
                         ctx,
                         &data.shared,
@@ -591,11 +599,14 @@ pub(in crate::services::discord) async fn handle_event(
             }
 
             let text = new_message.content.trim();
+            let announce_bot_id = super::super::resolve_announce_bot_user_id(&data.shared).await;
 
-            let is_allowed_bot_sender = settings_snapshot.allowed_bot_ids.contains(&user_id.get());
+            let is_allowed_bot_sender = settings_snapshot.allowed_bot_ids.contains(&user_id.get())
+                || announce_bot_id.is_some_and(|id| id == user_id.get());
             if is_allowed_bot_sender
                 && !super::super::is_allowed_turn_sender(
                     &settings_snapshot.allowed_bot_ids,
+                    announce_bot_id,
                     user_id.get(),
                     new_message.author.bot,
                     text,

@@ -2431,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_queue_on_tick_recovers_orphan_dispatched_entry_to_pending() {
+    fn auto_queue_on_tick_recovery_counts_failures_and_fails_at_retry_limit() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -2447,6 +2447,11 @@ mod tests {
             )
             .unwrap();
             conn.execute(
+                "INSERT INTO kv_meta (key, value) VALUES ('kanban_human_alert_channel_id', 'human-alert')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
                 "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, dispatched_at, created_at) \
                  VALUES ('entry-aq-orphan', 'run-aq-orphan', 'card-aq-orphan', 'agent-1', 'dispatched', 0, datetime('now', '-5 minutes'), datetime('now', '-5 minutes'))",
                 [],
@@ -2454,34 +2459,78 @@ mod tests {
             .unwrap();
         }
 
-        engine
-            .try_fire_hook_by_name("OnTick1min", json!({}))
-            .unwrap();
+        for expected_retry_count in 1..=3 {
+            engine
+                .try_fire_hook_by_name("OnTick1min", json!({}))
+                .unwrap();
 
-        let conn = db.lock().unwrap();
-        let (status, dispatch_id): (String, Option<String>) = conn
-            .query_row(
-                "SELECT status, dispatch_id FROM auto_queue_entries WHERE id = 'entry-aq-orphan'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let transition_source: String = conn
-            .query_row(
-                "SELECT trigger_source FROM auto_queue_entry_transitions \
-                 WHERE entry_id = 'entry-aq-orphan' ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, "pending");
-        assert!(
-            dispatch_id.is_none(),
-            "orphan recovery must not invent a replacement dispatch id"
-        );
+            let conn = db.lock().unwrap();
+            let (status, retry_count, dispatch_id): (String, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT status, retry_count, dispatch_id
+                     FROM auto_queue_entries
+                     WHERE id = 'entry-aq-orphan'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let transition_source: String = conn
+                .query_row(
+                    "SELECT trigger_source FROM auto_queue_entry_transitions \
+                     WHERE entry_id = 'entry-aq-orphan' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            drop(conn);
+
+            let expected_status = if expected_retry_count >= 3 {
+                "failed"
+            } else {
+                "pending"
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(retry_count, expected_retry_count);
+            assert!(
+                dispatch_id.is_none(),
+                "orphan recovery must not invent a replacement dispatch id"
+            );
+            assert_eq!(
+                transition_source, "tick_recovery",
+                "orphan recovery should record the periodic recovery source"
+            );
+
+            if expected_retry_count < 3 {
+                let conn = db.lock().unwrap();
+                crate::db::auto_queue::update_entry_status_on_conn(
+                    &conn,
+                    "entry-aq-orphan",
+                    crate::db::auto_queue::ENTRY_STATUS_DISPATCHED,
+                    "test_rearm_orphan_dispatch",
+                    &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE auto_queue_entries
+                     SET dispatched_at = datetime('now', '-5 minutes')
+                     WHERE id = 'entry-aq-orphan'",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+
+        let messages = message_outbox_rows(&db);
+        let auto_queue_alerts: Vec<_> = messages
+            .into_iter()
+            .filter(|(target, content)| {
+                target == "channel:human-alert" && content.contains("[Auto Queue]")
+            })
+            .collect();
         assert_eq!(
-            transition_source, "tick_recovery",
-            "orphan recovery should record the periodic recovery source"
+            auto_queue_alerts.len(),
+            1,
+            "terminal tick recovery should emit exactly one auto-queue human alert"
         );
     }
 
@@ -8869,6 +8918,139 @@ mod tests {
                 .count(),
             3,
             "review churn test must observe the repeated review-status comment path before escalating"
+        );
+    }
+
+    /// #751 (Codex follow-up on PR #749): reviewLoopFingerprintInfo must
+    /// source head_sha from the latest completed work dispatch first, not
+    /// pr_tracking. pr_tracking.head_sha is refreshed only by the CI
+    /// recovery polling path (onTick1min) and lags fast rework/review
+    /// cycles — if the guard used the stale pr_tracking value, three
+    /// *distinct* rework completions (each with a different head_sha)
+    /// would still share a fingerprint and incorrectly trip the
+    /// same-head loop guard.
+    ///
+    /// This test seeds a stale pr_tracking.head_sha and three rework
+    /// completions with distinct head_shas; the loop guard must NOT
+    /// escalate — each fingerprint is unique.
+    #[cfg(unix)]
+    #[test]
+    fn scenario_751_review_loop_fingerprint_uses_latest_work_head_not_stale_pr_tracking() {
+        let _gh = install_mock_gh(&[]);
+
+        let db = test_db();
+        let engine = test_engine(&db);
+        seed_agent(&db);
+        seed_repo(&db, "test/repo");
+        seed_card_with_repo(
+            &db,
+            "card-751-fresh-head",
+            "in_progress",
+            "test/repo",
+            751,
+            None,
+        );
+        // Stale pr_tracking — NEVER advances in this test. If the guard
+        // fingerprints off this value, all 3 cycles share a fingerprint.
+        seed_pr_tracking(
+            &db,
+            "card-751-fresh-head",
+            "test/repo",
+            None,
+            "wt/card-751-fresh-head",
+            Some(751),
+            Some("sha-stale-tracking-never-refreshes"),
+            "wait-ci",
+        );
+
+        for idx in 1..=3 {
+            let dispatch_id = format!("rw-751-fresh-{idx}");
+            // Distinct head_sha per iteration — simulates fast rework
+            // cycles producing new commits before CI recovery polls.
+            let fresh_head = format!("sha-fresh-rework-{idx}");
+
+            seed_dispatch(
+                &db,
+                &dispatch_id,
+                "card-751-fresh-head",
+                "rework",
+                "pending",
+            );
+            seed_assistant_response_for_dispatch(&db, &dispatch_id, "fresh rework head");
+
+            // Pass completed_commit via the completion result so
+            // loadLatestCompletedWorkTarget surfaces the fresh head when
+            // reviewLoopFingerprintInfo runs inside OnDispatchCompleted.
+            let result = dispatch::complete_dispatch(
+                &db,
+                &engine,
+                &dispatch_id,
+                &serde_json::json!({
+                    "completion_source": "test_harness",
+                    "completed_commit": fresh_head,
+                    "completed_branch": "wt/card-751-fresh-head",
+                }),
+            );
+            assert!(
+                result.is_ok(),
+                "rework completion should succeed on fresh-head attempt {idx}: {:?}",
+                result.err()
+            );
+            kanban::drain_hook_side_effects(&db, &engine);
+
+            if idx < 3 {
+                let conn = db.lock().unwrap();
+                conn.execute(
+                    "UPDATE task_dispatches \
+                     SET status = 'completed', completed_at = COALESCE(completed_at, datetime('now')), updated_at = datetime('now') \
+                     WHERE kanban_card_id = 'card-751-fresh-head' AND dispatch_type = 'review' \
+                     AND status IN ('pending', 'dispatched')",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE kanban_cards \
+                     SET status = 'in_progress', review_status = NULL, blocked_reason = NULL, updated_at = datetime('now') \
+                     WHERE id = 'card-751-fresh-head'",
+                    [],
+                )
+                .unwrap();
+            }
+        }
+
+        let (review_status, metadata_json): (Option<String>, String) = {
+            let conn = db.lock().unwrap();
+            conn.query_row(
+                "SELECT review_status, metadata FROM kanban_cards WHERE id = 'card-751-fresh-head'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        // NOT escalated — each rework had a distinct head_sha so the guard
+        // must treat them as separate fingerprints.
+        assert_ne!(
+            review_status.as_deref(),
+            Some("dilemma_pending"),
+            "distinct-head rework cycles must NOT be escalated as same-head churn"
+        );
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        // enter_count should be 1 (latest fingerprint, not accumulated).
+        let enter_count = metadata["loop_guard"]["review_churn"]["enter_count"]
+            .as_i64()
+            .unwrap_or(0);
+        assert!(
+            enter_count < 3,
+            "distinct-head fingerprints must not accumulate into same-head churn (enter_count={})",
+            enter_count
+        );
+        let guard_head = metadata["loop_guard"]["review_churn"]["head_sha"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            guard_head.starts_with("sha-fresh-rework-"),
+            "loop guard must source head_sha from the latest completed work, not stale pr_tracking (got '{}')",
+            guard_head
         );
     }
 

@@ -601,11 +601,33 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             content    TEXT NOT NULL,
             bot        TEXT NOT NULL DEFAULT 'announce',
             source     TEXT NOT NULL DEFAULT 'system',
+            reason_code TEXT,
+            session_key TEXT,
             status     TEXT NOT NULL DEFAULT 'pending',
             created_at DATETIME DEFAULT (datetime('now')),
             sent_at    DATETIME,
             error      TEXT
         );",
+    )?;
+    {
+        let has_reason_code: bool = conn
+            .prepare("SELECT reason_code FROM message_outbox LIMIT 0")
+            .is_ok();
+        if !has_reason_code {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN reason_code TEXT;")?;
+        }
+    }
+    {
+        let has_session_key: bool = conn
+            .prepare("SELECT session_key FROM message_outbox LIMIT 0")
+            .is_ok();
+        if !has_session_key {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN session_key TEXT;")?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_message_outbox_lifecycle_dedupe
+         ON message_outbox(target, reason_code, session_key, created_at);",
     )?;
 
     // #144: Dispatch notification outbox — durable queue for Discord side-effects.
@@ -935,6 +957,7 @@ pub(crate) fn ensure_auto_queue_schema(conn: &Connection) -> Result<()> {
             reason          TEXT,
             status          TEXT DEFAULT 'pending',
             dispatch_id     TEXT,
+            retry_count     INTEGER NOT NULL DEFAULT 0,
             slot_index      INTEGER,
             thread_group    INTEGER DEFAULT 0,
             batch_phase     INTEGER DEFAULT 0,
@@ -1050,6 +1073,12 @@ pub(crate) fn ensure_auto_queue_schema(conn: &Connection) -> Result<()> {
         "auto_queue_entries",
         "dispatch_id",
         "ALTER TABLE auto_queue_entries ADD COLUMN dispatch_id TEXT;",
+    )?;
+    ensure_auto_queue_column(
+        conn,
+        "auto_queue_entries",
+        "retry_count",
+        "ALTER TABLE auto_queue_entries ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;",
     )?;
     ensure_auto_queue_column(
         conn,
