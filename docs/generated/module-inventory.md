@@ -228,7 +228,7 @@
 | `services::discord::org_writer` | `src/services/discord/org_writer.rs` | 239 |  |
 | `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 1407 | giant-file |
 | `services::discord::queue_io` | `src/services/discord/queue_io.rs` | 565 |  |
-| `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 2011 | giant-file |
+| `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 2021 | giant-file |
 | `services::discord::restart_ctrl` | `src/services/discord/restart_ctrl.rs` | 113 |  |
 | `services::discord::restart_report` | `src/services/discord/restart_report.rs` | 488 |  |
 | `services::discord::role_map` | `src/services/discord/role_map.rs` | 908 |  |
