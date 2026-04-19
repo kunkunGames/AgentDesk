@@ -1,5 +1,5 @@
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateMessage, EditMessage, MessageId};
+use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -10,6 +10,11 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, super::Data, Error>;
 const STREAMING_PLACEHOLDER_MARGIN: usize = 10;
 const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
+
+/// Byte budget for the inline preview kept alongside a .txt attachment when a
+/// message would otherwise have to be split. Leaves ~300 bytes of DISCORD_MSG_LIMIT
+/// for a truncation footer and any code-fence closure.
+const ATTACHMENT_PREVIEW_BYTES: usize = 1700;
 
 /// All available tools with (name, description, is_destructive)
 pub(super) const ALL_TOOLS: &[(&str, &str, bool)] = &[
@@ -344,6 +349,57 @@ mod tests {
         for chunk in &chunks {
             assert!(chunk.len() <= DISCORD_MSG_LIMIT + 50);
         }
+    }
+
+    #[test]
+    fn test_build_long_message_attachment_preview_fits_limit() {
+        use super::{ATTACHMENT_PREVIEW_BYTES, DISCORD_MSG_LIMIT, build_long_message_attachment};
+
+        let long: String = "A".repeat(DISCORD_MSG_LIMIT + 5000);
+        let (preview, _attachment) = build_long_message_attachment(&long);
+
+        assert!(preview.len() <= DISCORD_MSG_LIMIT);
+        assert!(preview.contains("📎 전문 첨부"));
+        // The preview is anchored near the preview budget, not the full length.
+        assert!(preview.len() >= ATTACHMENT_PREVIEW_BYTES / 2);
+    }
+
+    #[test]
+    fn test_build_long_message_attachment_closes_open_code_fence() {
+        use super::{DISCORD_MSG_LIMIT, build_attachment_preview};
+
+        // Open a fenced block near the top so the preview cut falls inside it.
+        let head = "```rust\n";
+        let body = "let x = 1;\n".repeat(500);
+        let tail = "```\nepilogue\n";
+        let text = format!("{head}{body}{tail}");
+        assert!(text.len() > DISCORD_MSG_LIMIT);
+
+        let preview = build_attachment_preview(&text);
+        // Even-number of fences means the preview does not leave an open block.
+        let fence_count = preview
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert!(
+            fence_count % 2 == 0,
+            "preview has an unclosed code fence: {fence_count}"
+        );
+        assert!(preview.ends_with("생략)"));
+    }
+
+    #[test]
+    fn test_build_long_message_attachment_utf8_safe_boundary() {
+        use super::{DISCORD_MSG_LIMIT, build_long_message_attachment};
+
+        // Multi-byte characters that could straddle the preview budget.
+        let text: String = "한글🙂".repeat(1500);
+        assert!(text.len() > DISCORD_MSG_LIMIT);
+
+        let (preview, _attachment) = build_long_message_attachment(&text);
+        // Preview must remain valid UTF-8 and fit the limit.
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(preview.len() <= DISCORD_MSG_LIMIT);
     }
 
     #[test]
@@ -1211,7 +1267,10 @@ pub(super) async fn replace_long_message_raw(
 }
 
 /// Split a message into chunks that fit within Discord's 2000 char limit.
-/// Handles code block boundaries correctly.
+/// Handles code block boundaries correctly. Used by stream/slash-command/recovery
+/// paths where overflow is delivered as additional inline messages. The
+/// agent-to-agent `/api/send` path uses [`build_long_message_attachment`]
+/// instead so recipient bots receive a single self-contained message + `.txt`.
 pub(super) fn split_message(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut remaining = text;
@@ -1280,6 +1339,63 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
     }
 
     chunks
+}
+
+/// Build an `(inline_preview, attachment)` pair for content that exceeds
+/// `DISCORD_MSG_LIMIT`. The preview contains the first safe-boundary-aligned
+/// prefix of `text` plus a footer indicating the omitted byte count; the
+/// attachment carries the full unmodified `text` as a `.txt` file.
+pub(super) fn build_long_message_attachment(text: &str) -> (String, CreateAttachment) {
+    let filename = format!(
+        "response-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let attachment = CreateAttachment::bytes(text.as_bytes().to_vec(), filename);
+    let preview = build_attachment_preview(text);
+    (preview, attachment)
+}
+
+fn build_attachment_preview(text: &str) -> String {
+    let preview_budget = ATTACHMENT_PREVIEW_BYTES.min(text.len());
+    let safe_end = floor_char_boundary(text, preview_budget);
+    // Prefer to cut at a line boundary within the budget; fall back to the raw
+    // char-boundary offset if there is no newline in range.
+    let split_at = text[..safe_end].rfind('\n').map_or(safe_end, |idx| idx + 1);
+    let (head, _) = text.split_at(split_at);
+    let mut preview = head.to_string();
+
+    // Close any unterminated fenced code block so Discord does not swallow the
+    // footer into a code block.
+    if count_code_fences(&preview) % 2 == 1 {
+        if !preview.ends_with('\n') {
+            preview.push('\n');
+        }
+        preview.push_str("```");
+    }
+
+    let omitted_bytes = text.len() - split_at;
+    let footer = format!(
+        "\n\n📎 전문 첨부 ({} bytes 중 {} bytes 생략)",
+        text.len(),
+        omitted_bytes
+    );
+
+    // Defensive: ensure preview + footer fits below DISCORD_MSG_LIMIT even in
+    // pathological inputs (long codepoints, many code fences).
+    let total_len = preview.len() + footer.len();
+    if total_len > DISCORD_MSG_LIMIT {
+        let trim_target = DISCORD_MSG_LIMIT.saturating_sub(footer.len());
+        let trimmed = floor_char_boundary(&preview, trim_target);
+        preview.truncate(trimmed);
+    }
+    preview.push_str(&footer);
+    preview
+}
+
+fn count_code_fences(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count()
 }
 
 /// Add reaction using raw HTTP reference

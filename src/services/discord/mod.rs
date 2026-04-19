@@ -10,6 +10,7 @@ mod handoff;
 pub(crate) mod health;
 mod inflight;
 pub(crate) mod internal_api;
+mod mcp_credential_watcher;
 pub(crate) mod meeting_orchestrator;
 mod metrics;
 mod model_catalog;
@@ -145,6 +146,17 @@ pub(in crate::services::discord) async fn resolve_announce_bot_user_id(
 ) -> Option<u64> {
     let registry = shared.health_registry()?;
     registry.utility_bot_user_id("announce").await
+}
+
+/// Cached lookup for the notify bot's Discord user id. Used by the message
+/// router to classify incoming messages as `BackgroundTrigger` turns —
+/// see `TurnKind` in `router/message_handler.rs` and the race-handler
+/// preservation rule from #796.
+pub(in crate::services::discord) async fn resolve_notify_bot_user_id(
+    shared: &SharedData,
+) -> Option<u64> {
+    let registry = shared.health_registry()?;
+    registry.utility_bot_user_id("notify").await
 }
 
 pub(in crate::services::discord) fn is_allowed_turn_sender(
@@ -1368,6 +1380,10 @@ pub(super) async fn kickoff_idle_queues(
             intervention.reply_context.clone(),
             intervention.has_reply_boundary,
             None,
+            // Queued interventions kicked off after a previous turn already
+            // own their own placeholder; they're never racing for it.
+            // Foreground keeps legacy behavior.
+            router::TurnKind::Foreground,
         )
         .await
         {
