@@ -170,7 +170,8 @@ pub fn execute_intents(
                 bot,
                 source,
             } => {
-                if let Err(e) = execute_queue_message(db, &target, &content, &bot, &source) {
+                if let Err(e) = execute_queue_message(db, engine, &target, &content, &bot, &source)
+                {
                     tracing::warn!(target, bot, source, error = %e, "queue-message intent failed");
                     result.errors += 1;
                 }
@@ -286,7 +287,7 @@ fn execute_transition(
     let sql = format!(
         "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now'){extra} WHERE id = ?2"
     );
-    conn.execute(&sql, rusqlite::params![to, card_id])?;
+    conn.execute(&sql, libsql_rusqlite::params![to, card_id])?;
 
     // Auto-queue sync for terminal states
     if pipeline.is_terminal(to) {
@@ -402,21 +403,23 @@ fn execute_activate_auto_queue(
     Ok(())
 }
 
-fn json_to_sqlite(val: &serde_json::Value) -> rusqlite::types::Value {
+fn json_to_sqlite(val: &serde_json::Value) -> libsql_rusqlite::types::Value {
     match val {
-        serde_json::Value::Null => rusqlite::types::Value::Null,
-        serde_json::Value::Bool(b) => rusqlite::types::Value::Integer(if *b { 1 } else { 0 }),
+        serde_json::Value::Null => libsql_rusqlite::types::Value::Null,
+        serde_json::Value::Bool(b) => {
+            libsql_rusqlite::types::Value::Integer(if *b { 1 } else { 0 })
+        }
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                rusqlite::types::Value::Integer(i)
+                libsql_rusqlite::types::Value::Integer(i)
             } else if let Some(f) = n.as_f64() {
-                rusqlite::types::Value::Real(f)
+                libsql_rusqlite::types::Value::Real(f)
             } else {
-                rusqlite::types::Value::Null
+                libsql_rusqlite::types::Value::Null
             }
         }
-        serde_json::Value::String(s) => rusqlite::types::Value::Text(s.clone()),
-        _ => rusqlite::types::Value::Text(val.to_string()),
+        serde_json::Value::String(s) => libsql_rusqlite::types::Value::Text(s.clone()),
+        _ => libsql_rusqlite::types::Value::Text(val.to_string()),
     }
 }
 
@@ -427,10 +430,10 @@ fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> a
     }
 
     let conn = db.separate_conn()?;
-    let bind: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = bind
+    let bind: Vec<libsql_rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
+    let params_ref: Vec<&dyn libsql_rusqlite::types::ToSql> = bind
         .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .map(|v| v as &dyn libsql_rusqlite::types::ToSql)
         .collect();
     conn.execute(sql, params_ref.as_slice())?;
     Ok(())
@@ -438,17 +441,21 @@ fn execute_sql(db: &crate::db::Db, sql: &str, params: &[serde_json::Value]) -> a
 
 fn execute_queue_message(
     db: &crate::db::Db,
+    engine: Option<&crate::engine::PolicyEngine>,
     target: &str,
     content: &str,
     bot: &str,
     source: &str,
 ) -> anyhow::Result<()> {
-    let conn = db.separate_conn()?;
-    conn.execute(
-        "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![target, content, bot, source],
-    )?;
-    let id = conn.last_insert_rowid();
+    let id = crate::engine::ops::message_ops::queue_message(
+        db,
+        engine.and_then(|engine| engine.pg_pool()),
+        target,
+        content,
+        bot,
+        source,
+    )
+    .map_err(anyhow::Error::msg)?;
     tracing::info!(
         target,
         bot,
@@ -488,12 +495,12 @@ fn execute_set_kv(
             &format!(
                 "INSERT OR REPLACE INTO kv_meta (key, value, expires_at) VALUES (?1, ?2, datetime('now', '+{ttl_seconds} seconds'))"
             ),
-            rusqlite::params![key, value],
+            libsql_rusqlite::params![key, value],
         )?;
     } else {
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value, expires_at) VALUES (?1, ?2, NULL)",
-            rusqlite::params![key, value],
+            libsql_rusqlite::params![key, value],
         )?;
     }
     Ok(())
@@ -510,7 +517,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> crate::db::Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -645,7 +652,7 @@ mod tests {
 
     // ── #158: card_review_state guard tests ─────────────────────
 
-    fn insert_test_card(conn: &rusqlite::Connection, card_id: &str) {
+    fn insert_test_card(conn: &libsql_rusqlite::Connection, card_id: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Test', '111')",
             [],

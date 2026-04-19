@@ -5,7 +5,11 @@ pub mod ops;
 pub mod sql_guard;
 pub mod transition;
 
-use std::sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool, mpsc};
+use std::sync::{
+    Arc, Mutex, OnceLock, Weak,
+    atomic::{AtomicBool, AtomicUsize},
+    mpsc,
+};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
@@ -44,6 +48,11 @@ struct PolicyEngineActor {
     tx: mpsc::Sender<EngineCommand>,
     thread_id: Arc<OnceLock<ThreadId>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    /// Approximate queue depth: incremented when a command is sent, decremented
+    /// when the actor pops one off the channel. Exposed for observability (#747).
+    queue_depth: Arc<AtomicUsize>,
+    /// Short name used in log messages (e.g. "main", "tick").
+    label: &'static str,
 }
 
 enum EngineCommand {
@@ -81,21 +90,34 @@ enum EngineCommand {
 impl PolicyEngineActor {
     fn spawn(
         inner: Arc<Mutex<PolicyEngineInner>>,
-        db: Db,
+        runtime_deps: Arc<PolicyEngineCompatDeps>,
         tick_hook_in_flight: Arc<AtomicBool>,
+        label: &'static str,
     ) -> Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel();
         let thread_id = Arc::new(OnceLock::new());
+        let queue_depth = Arc::new(AtomicUsize::new(0));
         let actor = Arc::new(Self {
             tx,
             thread_id: thread_id.clone(),
             join: Mutex::new(None),
+            queue_depth: queue_depth.clone(),
+            label,
         });
         let actor_weak = Arc::downgrade(&actor);
+        let thread_name = format!("policy-engine-actor-{label}");
         let handle = thread::Builder::new()
-            .name("policy-engine-actor".to_string())
+            .name(thread_name)
             .spawn(move || {
-                Self::run_loop(actor_weak, inner, db, tick_hook_in_flight, thread_id, rx)
+                Self::run_loop(
+                    actor_weak,
+                    inner,
+                    runtime_deps,
+                    tick_hook_in_flight,
+                    thread_id,
+                    queue_depth,
+                    rx,
+                )
             })
             .map_err(|e| anyhow::anyhow!("failed to spawn policy engine actor: {e}"))?;
         *actor
@@ -108,9 +130,10 @@ impl PolicyEngineActor {
     fn run_loop(
         actor_weak: Weak<Self>,
         inner: Arc<Mutex<PolicyEngineInner>>,
-        db: Db,
+        runtime_deps: Arc<PolicyEngineCompatDeps>,
         tick_hook_in_flight: Arc<AtomicBool>,
         thread_id: Arc<OnceLock<ThreadId>>,
+        queue_depth: Arc<AtomicUsize>,
         rx: mpsc::Receiver<EngineCommand>,
     ) {
         let _ = thread_id.set(thread::current().id());
@@ -122,6 +145,16 @@ impl PolicyEngineActor {
         let _runtime_guard = runtime.as_ref().map(|rt| rt.enter());
 
         while let Ok(command) = rx.recv() {
+            // We popped a command off the channel, so approximate queue depth
+            // should drop. saturating_sub guards against any accidental skew.
+            queue_depth
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |d| Some(d.saturating_sub(1)),
+                )
+                .ok();
+
             if matches!(command, EngineCommand::Shutdown) {
                 break;
             }
@@ -132,7 +165,7 @@ impl PolicyEngineActor {
             let engine = PolicyEngine {
                 inner: inner.clone(),
                 actor,
-                db: db.clone(),
+                runtime_deps: runtime_deps.clone(),
                 tick_hook_in_flight: tick_hook_in_flight.clone(),
             };
 
@@ -200,13 +233,19 @@ impl Drop for PolicyEngineActor {
     }
 }
 
+#[derive(Clone)]
+struct PolicyEngineCompatDeps {
+    sqlite_db: Db,
+    pg_pool: Option<sqlx::PgPool>,
+}
+
 /// Thread-safe handle to the policy engine. Cheap to clone.
 #[derive(Clone)]
 pub struct PolicyEngine {
     inner: Arc<Mutex<PolicyEngineInner>>,
     actor: Arc<PolicyEngineActor>,
-    /// DB handle used by bridge ops and compatibility startup replay.
-    db: crate::db::Db,
+    /// Transitional runtime deps kept only while SQLite compatibility remains.
+    runtime_deps: Arc<PolicyEngineCompatDeps>,
     tick_hook_in_flight: Arc<AtomicBool>,
 }
 
@@ -214,7 +253,7 @@ pub struct PolicyEngine {
 pub struct PolicyEngineHandle {
     inner: Weak<Mutex<PolicyEngineInner>>,
     actor: Weak<PolicyEngineActor>,
-    db: crate::db::Db,
+    runtime_deps: Weak<PolicyEngineCompatDeps>,
     tick_hook_in_flight: Arc<AtomicBool>,
 }
 
@@ -230,6 +269,36 @@ pub struct PolicyInfo {
 impl PolicyEngine {
     /// Create a new policy engine, initializing QuickJS and loading policies.
     pub fn new(config: &Config, db: Db) -> Result<Self> {
+        Self::new_with_pg_and_label(config, db, None, "main")
+    }
+
+    /// Create a dedicated policy engine for the tick loop (#747).
+    ///
+    /// The tick engine has its own QuickJS runtime, policy actor thread,
+    /// and hot-reload watcher — fully isolated from the main engine so that
+    /// a long-running or stuck tick hook cannot back up the main engine's
+    /// actor queue and starve HTTP/Discord hook paths.
+    ///
+    /// Both engines load the same policies directory (so any policy that
+    /// registers `onTick*` hooks is executed by this engine).
+    pub fn new_for_tick(config: &Config, db: Db) -> Result<Self> {
+        Self::new_with_pg_and_label(config, db, None, "tick")
+    }
+
+    pub fn new_with_pg(config: &Config, db: Db, pg_pool: Option<sqlx::PgPool>) -> Result<Self> {
+        Self::new_with_pg_and_label(config, db, pg_pool, "main")
+    }
+
+    fn new_with_pg_and_label(
+        config: &Config,
+        db: Db,
+        pg_pool: Option<sqlx::PgPool>,
+        label: &'static str,
+    ) -> Result<Self> {
+        let runtime_deps = Arc::new(PolicyEngineCompatDeps {
+            sqlite_db: db.clone(),
+            pg_pool: pg_pool.clone(),
+        });
         let supervisor_bridge = crate::supervisor::BridgeHandle::new();
         let runtime =
             Runtime::new().map_err(|e| anyhow::anyhow!("QuickJS runtime creation failed: {e}"))?;
@@ -238,8 +307,13 @@ impl PolicyEngine {
 
         // Register bridge ops (agentdesk.*)
         context.with(|ctx| {
-            ops::register_globals_with_supervisor(&ctx, db.clone(), supervisor_bridge.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to register bridge ops: {e}"))
+            ops::register_globals_with_supervisor_and_pg(
+                &ctx,
+                runtime_deps.sqlite_db.clone(),
+                runtime_deps.pg_pool.clone(),
+                supervisor_bridge.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to register bridge ops: {e}"))
         })?;
 
         // Load policies from directory
@@ -257,19 +331,29 @@ impl PolicyEngine {
 
             // Register bridge ops in the reload context too
             reload_ctx.with(|ctx| {
-                ops::register_globals_with_supervisor(&ctx, db.clone(), supervisor_bridge.clone())
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to register bridge ops in reload ctx: {e}")
-                    })
+                ops::register_globals_with_supervisor_and_pg(
+                    &ctx,
+                    runtime_deps.sqlite_db.clone(),
+                    runtime_deps.pg_pool.clone(),
+                    supervisor_bridge.clone(),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to register bridge ops in reload ctx: {e}"))
             })?;
 
             match loader::start_hot_reload(policies_dir.clone(), reload_ctx, store.clone()) {
                 Ok(w) => {
-                    tracing::info!("Policy hot-reload enabled for {}", policies_dir.display());
+                    tracing::info!(
+                        engine_label = label,
+                        "Policy hot-reload enabled for {}",
+                        policies_dir.display()
+                    );
                     Some(w)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to start policy hot-reload: {e}");
+                    tracing::warn!(
+                        engine_label = label,
+                        "Failed to start policy hot-reload: {e}"
+                    );
                     None
                 }
             }
@@ -278,6 +362,7 @@ impl PolicyEngine {
         };
 
         tracing::info!(
+            engine_label = label,
             "Policy engine initialized (policies_dir={}, loaded={policy_count})",
             policies_dir.display()
         );
@@ -289,12 +374,16 @@ impl PolicyEngine {
             _watcher: watcher,
         }));
         let tick_hook_in_flight = Arc::new(AtomicBool::new(false));
-        let actor =
-            PolicyEngineActor::spawn(inner.clone(), db.clone(), tick_hook_in_flight.clone())?;
+        let actor = PolicyEngineActor::spawn(
+            inner.clone(),
+            runtime_deps.clone(),
+            tick_hook_in_flight.clone(),
+            label,
+        )?;
         let engine = Self {
             inner,
             actor,
-            db: db.clone(),
+            runtime_deps,
             tick_hook_in_flight,
         };
         supervisor_bridge.attach_engine(&engine);
@@ -302,11 +391,26 @@ impl PolicyEngine {
         Ok(engine)
     }
 
+    /// Approximate number of commands waiting in the actor queue (#747).
+    /// Zero when idle. Reported for observability when a tick hook times out
+    /// so operators can tell whether the stuck worker is also holding up
+    /// queued callers.
+    pub fn actor_queue_depth(&self) -> usize {
+        self.actor
+            .queue_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Short label identifying this engine instance (e.g. "main", "tick").
+    pub fn actor_label(&self) -> &'static str {
+        self.actor.label
+    }
+
     pub fn downgrade(&self) -> PolicyEngineHandle {
         PolicyEngineHandle {
             inner: Arc::downgrade(&self.inner),
             actor: Arc::downgrade(&self.actor),
-            db: self.db.clone(),
+            runtime_deps: Arc::downgrade(&self.runtime_deps),
             tick_hook_in_flight: self.tick_hook_in_flight.clone(),
         }
     }
@@ -319,12 +423,34 @@ impl PolicyEngine {
         self.tick_hook_in_flight.clone()
     }
 
+    pub(crate) fn pg_pool(&self) -> Option<&sqlx::PgPool> {
+        self.runtime_deps.pg_pool.as_ref()
+    }
+
+    fn sqlite_db(&self) -> &Db {
+        &self.runtime_deps.sqlite_db
+    }
+
     fn roundtrip<T>(&self, command: impl FnOnce(mpsc::Sender<T>) -> EngineCommand) -> Result<T> {
         let (reply_tx, reply_rx) = mpsc::channel();
+        // Approximate queue depth is bumped before the send. The actor drops it
+        // back down when it pops the command off the channel (#747).
         self.actor
-            .tx
-            .send(command(reply_tx))
-            .map_err(|_| anyhow::anyhow!("policy engine actor is unavailable"))?;
+            .queue_depth
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Err(e) = self.actor.tx.send(command(reply_tx)) {
+            // Send failed — the actor is gone, undo our increment so the gauge
+            // does not drift upward forever.
+            self.actor
+                .queue_depth
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |d| Some(d.saturating_sub(1)),
+                )
+                .ok();
+            return Err(anyhow::anyhow!("policy engine actor is unavailable: {e}"));
+        }
         reply_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("policy engine actor response channel dropped"))
@@ -384,7 +510,7 @@ impl PolicyEngine {
         tracing::info!("[startup] draining legacy deferred hooks from DB");
 
         // Record server boot time for orphan recovery grace period
-        if let Ok(conn) = self.db.separate_conn() {
+        if let Ok(conn) = self.sqlite_db().separate_conn() {
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_boot_at', datetime('now'))",
                 [],
@@ -394,7 +520,7 @@ impl PolicyEngine {
 
         loop {
             let hooks: Vec<(i64, String, String)> = {
-                let conn = match self.db.separate_conn() {
+                let conn = match self.sqlite_db().separate_conn() {
                     Ok(c) => c,
                     Err(_) => return,
                 };
@@ -439,7 +565,7 @@ impl PolicyEngine {
 
                 if let Err(e) = fire_result {
                     tracing::warn!("[startup] deferred hook {hook_name} failed: {e}");
-                    if let Ok(conn) = self.db.separate_conn() {
+                    if let Ok(conn) = self.sqlite_db().separate_conn() {
                         let _ = conn.execute(
                             "UPDATE deferred_hooks SET status = 'pending' WHERE id = ?1",
                             [id],
@@ -448,7 +574,7 @@ impl PolicyEngine {
                     continue;
                 }
                 // Success — delete from DB
-                if let Ok(conn) = self.db.separate_conn() {
+                if let Ok(conn) = self.sqlite_db().separate_conn() {
                     let _ = conn.execute("DELETE FROM deferred_hooks WHERE id = ?1", [id]);
                 }
             }
@@ -511,7 +637,11 @@ impl PolicyEngine {
 
             for (card_id, old_status, new_status) in &transitions {
                 crate::kanban::fire_transition_hooks(
-                    &self.db, self, card_id, old_status, new_status,
+                    self.sqlite_db(),
+                    self,
+                    card_id,
+                    old_status,
+                    new_status,
                 );
             }
         }
@@ -805,7 +935,7 @@ impl PolicyEngine {
         if intents.is_empty() {
             Self::empty_intent_result()
         } else {
-            intent::execute_intents(&self.db, Some(self), intents)
+            intent::execute_intents(self.sqlite_db(), Some(self), intents)
         }
     }
 
@@ -891,7 +1021,7 @@ impl PolicyEngineHandle {
         Some(PolicyEngine {
             inner: self.inner.upgrade()?,
             actor: self.actor.upgrade()?,
-            db: self.db.clone(),
+            runtime_deps: self.runtime_deps.upgrade()?,
             tick_hook_in_flight: self.tick_hook_in_flight.clone(),
         })
     }
@@ -948,7 +1078,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -989,6 +1119,29 @@ mod tests {
         let engine = PolicyEngine::new(&config, db).unwrap();
         let result: i32 = engine.eval_js("1 + 2").unwrap();
         assert_eq!(result, 3);
+    }
+
+    #[test]
+    fn test_engine_handle_upgrade_preserves_runtime_compat_deps() {
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('h1', 'HandleBot', 'claude', 'idle', 7)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let config = test_config();
+        let engine = PolicyEngine::new(&config, db).unwrap();
+        let handle = engine.downgrade();
+        let upgraded = handle.upgrade().expect("policy engine upgrade");
+
+        let xp: i32 = upgraded
+            .eval_js(r#"agentdesk.db.query("SELECT xp FROM agents WHERE id = 'h1'")[0].xp"#)
+            .unwrap();
+        assert_eq!(xp, 7);
     }
 
     #[test]

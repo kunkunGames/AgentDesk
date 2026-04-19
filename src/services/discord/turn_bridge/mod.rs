@@ -1757,8 +1757,9 @@ pub(super) fn spawn_turn_bridge(
         let mut transcript_persisted = false;
         if should_persist_transcript && let Some(db) = shared_owned.db.as_ref() {
             let channel_id_text = channel_id.get().to_string();
-            match crate::db::session_transcripts::persist_turn(
+            match crate::db::session_transcripts::persist_turn_db(
                 db,
+                shared_owned.pg_pool.as_ref(),
                 crate::db::session_transcripts::PersistSessionTranscript {
                     turn_id: turn_id.as_str(),
                     session_key: adk_session_key.as_deref(),
@@ -1773,7 +1774,9 @@ pub(super) fn spawn_turn_bridge(
                     events: &transcript_events,
                     duration_ms: Some(turn_duration_ms(turn_start)),
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(persisted) => {
                     transcript_persisted = persisted;
                 }
