@@ -80,6 +80,17 @@ fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
     true
 }
 
+fn native_fast_mode_override_for_turn(
+    provider: &ProviderKind,
+    channel_fast_mode_enabled: bool,
+) -> Option<bool> {
+    if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) && channel_fast_mode_enabled {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn session_reset_reason_for_turn(
     session: &DiscordSession,
     now: tokio::time::Instant,
@@ -755,8 +766,10 @@ pub(in crate::services::discord) async fn start_headless_turn(
 
     let model_for_turn =
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
-    let native_fast_mode_enabled = matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
-        && shared.fast_mode_channels.contains(&channel_id);
+    let native_fast_mode_override = native_fast_mode_override_for_turn(
+        &provider,
+        shared.fast_mode_channels.contains(&channel_id),
+    );
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
     let compact_percent = ctx_thresholds.compact_pct_for(&provider);
     let model_context_window = provider.resolve_context_window(model_for_turn.as_deref());
@@ -787,7 +800,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
-                        Some(native_fast_mode_enabled),
+                        native_fast_mode_override,
                         compact_percent_for_claude,
                     ),
                     ProviderKind::Codex => codex::execute_command_streaming(
@@ -803,7 +816,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
-                        Some(native_fast_mode_enabled),
+                        native_fast_mode_override,
                         compact_token_limit_for_codex,
                     ),
                     ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -2425,8 +2438,10 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     let model_for_turn =
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
-    let native_fast_mode_enabled = matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
-        && shared.fast_mode_channels.contains(&channel_id);
+    let native_fast_mode_override = native_fast_mode_override_for_turn(
+        &provider,
+        shared.fast_mode_channels.contains(&channel_id),
+    );
 
     // Fetch context compact percent from ADK settings (provider-specific)
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
@@ -2463,7 +2478,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
-                        Some(native_fast_mode_enabled),
+                        native_fast_mode_override,
                         compact_percent_for_claude,
                     ),
                     ProviderKind::Codex => codex::execute_command_streaming(
@@ -2479,7 +2494,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(channel_id.get()),
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
-                        Some(native_fast_mode_enabled),
+                        native_fast_mode_override,
                         compact_token_limit_for_codex,
                     ),
                     ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -4240,6 +4255,22 @@ mod tests {
     #[test]
     fn regular_turns_keep_generic_pending_reaction() {
         assert!(should_add_turn_pending_reaction(None));
+    }
+
+    #[test]
+    fn native_fast_mode_override_only_applies_when_explicitly_enabled() {
+        assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Claude, true),
+            Some(true)
+        );
+        assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Claude, false),
+            None
+        );
+        assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Gemini, true),
+            None
+        );
     }
 
     #[test]
