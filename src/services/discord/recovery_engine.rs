@@ -1158,16 +1158,26 @@ pub(super) async fn restore_inflight_turns(
                     "  [{ts}] ↻ cannot reattach inflight turn for channel {} after planned restart: starting post-restart handoff",
                     state.channel_id
                 );
-                let _ = super::tmux_restart_handoff::start_restart_handoff_from_state(
-                    channel_id,
-                    http,
-                    shared,
-                    provider,
-                    state,
-                    &best_response,
-                )
-                .await;
-                continue;
+                #[cfg(unix)]
+                {
+                    let _ = super::tmux_restart_handoff::start_restart_handoff_from_state(
+                        channel_id,
+                        http,
+                        shared,
+                        provider,
+                        state,
+                        &best_response,
+                    )
+                    .await;
+                    continue;
+                }
+                #[cfg(not(unix))]
+                {
+                    tracing::info!(
+                        "  [{ts}] ↻ planned restart handoff unavailable on non-unix; falling back to stale inflight recovery for channel {}",
+                        state.channel_id
+                    );
+                }
             }
             let stale_text = stale_inflight_message(&best_response);
             let death_diag = tmux_session_name
