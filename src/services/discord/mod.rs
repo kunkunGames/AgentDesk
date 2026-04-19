@@ -342,6 +342,8 @@ pub(super) struct DiscordBotSettings {
     pub(super) channel_model_overrides: std::collections::HashMap<String, String>,
     /// channel_id (string) → native fast mode enabled
     pub(super) channel_fast_modes: std::collections::HashMap<String, bool>,
+    /// channel_id (string) → pending native fast mode reset on the next turn
+    pub(super) channel_fast_mode_reset_pending: std::collections::HashSet<String>,
     /// Discord user ID of the registered owner (must be configured explicitly)
     pub(super) owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
@@ -365,6 +367,7 @@ impl Default for DiscordBotSettings {
             require_mention_channel_ids: Vec::new(),
             channel_model_overrides: std::collections::HashMap::new(),
             channel_fast_modes: std::collections::HashMap::new(),
+            channel_fast_mode_reset_pending: std::collections::HashSet::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
             allow_all_users: false,

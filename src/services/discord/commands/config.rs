@@ -317,6 +317,9 @@ pub(in crate::services::discord) async fn update_channel_fast_mode(
             .channel_fast_modes
             .insert(channel_id.get().to_string(), false);
     }
+    settings
+        .channel_fast_mode_reset_pending
+        .insert(channel_id.get().to_string());
     save_bot_settings(token, &settings);
 
     shared.fast_mode_session_reset_pending.insert(channel_id);
@@ -1098,6 +1101,11 @@ mod tests {
                 .channel_fast_modes
                 .get(&channel_id.get().to_string()),
             Some(&false)
+        );
+        assert!(
+            settings
+                .channel_fast_mode_reset_pending
+                .contains(&channel_id.get().to_string())
         );
         drop(settings);
         assert!(shared.fast_mode_session_reset_pending.contains(&channel_id));

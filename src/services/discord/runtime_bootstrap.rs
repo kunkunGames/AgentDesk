@@ -38,8 +38,8 @@ fn restored_fast_mode_reset_channels_for_provider(
     _provider: &ProviderKind,
 ) -> Vec<ChannelId> {
     let mut channels: Vec<ChannelId> = bot_settings
-        .channel_fast_modes
-        .keys()
+        .channel_fast_mode_reset_pending
+        .iter()
         .filter_map(|channel_id| channel_id.parse::<u64>().ok().map(ChannelId::new))
         .collect();
     channels.sort_unstable_by_key(|channel_id| channel_id.get());
@@ -1546,24 +1546,21 @@ mod tests {
     }
 
     #[test]
-    fn restored_fast_mode_reset_channels_preserve_disabled_entries() {
+    fn restored_fast_mode_reset_channels_only_restore_pending_entries() {
         let mut settings = DiscordBotSettings::default();
         settings.channel_fast_modes.insert("123".to_string(), true);
         settings.channel_fast_modes.insert("456".to_string(), false);
+        settings
+            .channel_fast_mode_reset_pending
+            .insert("456".to_string());
 
         let claude_channels =
             restored_fast_mode_reset_channels_for_provider(&settings, &ProviderKind::Claude);
-        assert_eq!(
-            claude_channels,
-            vec![ChannelId::new(123), ChannelId::new(456)]
-        );
+        assert_eq!(claude_channels, vec![ChannelId::new(456)]);
 
         let gemini_channels =
             restored_fast_mode_reset_channels_for_provider(&settings, &ProviderKind::Gemini);
-        assert_eq!(
-            gemini_channels,
-            vec![ChannelId::new(123), ChannelId::new(456)]
-        );
+        assert_eq!(gemini_channels, vec![ChannelId::new(456)]);
     }
 
     struct PgTestDatabase {
