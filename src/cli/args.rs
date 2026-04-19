@@ -358,6 +358,18 @@ pub(crate) enum AutoRememberAction {
         /// Optional status filter
         #[arg(long, value_enum)]
         status: Option<AutoRememberStatusArg>,
+        /// Optional stage filter
+        #[arg(long, value_enum)]
+        stage: Option<AutoRememberStageArg>,
+        /// Optional signal kind filter
+        #[arg(long = "signal-kind")]
+        signal_kind: Option<String>,
+        /// Optional exact candidate hash filter
+        #[arg(long = "candidate-hash")]
+        candidate_hash: Option<String>,
+        /// Restrict to candidates that can be retried or manually reprocessed
+        #[arg(long)]
+        resubmittable_only: bool,
         /// Max rows to print
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -376,6 +388,39 @@ pub(crate) enum AutoRememberAction {
     },
     /// Manually resubmit a failed or abandoned candidate immediately
     Resubmit {
+        /// Workspace recorded in the audit sidecar
+        #[arg(long)]
+        workspace: String,
+        /// Candidate hash recorded in the audit sidecar
+        #[arg(long = "candidate-hash")]
+        candidate_hash: String,
+    },
+    /// Mark a candidate as operator-verified and suppress future retries
+    Verify {
+        /// Workspace recorded in the audit sidecar
+        #[arg(long)]
+        workspace: String,
+        /// Candidate hash recorded in the audit sidecar
+        #[arg(long = "candidate-hash")]
+        candidate_hash: String,
+        /// Optional note recorded into the audit row
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Mark a candidate as operator-rejected and suppress future retries
+    Reject {
+        /// Workspace recorded in the audit sidecar
+        #[arg(long)]
+        workspace: String,
+        /// Candidate hash recorded in the audit sidecar
+        #[arg(long = "candidate-hash")]
+        candidate_hash: String,
+        /// Optional note recorded into the audit row
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Requeue a candidate for the next retry drain immediately
+    Requeue {
         /// Workspace recorded in the audit sidecar
         #[arg(long)]
         workspace: String,
@@ -559,10 +604,20 @@ pub(crate) enum ReportProvider {
 pub(crate) enum AutoRememberStatusArg {
     Remembered,
     VerifiedPromoted,
+    OperatorVerified,
+    OperatorRejected,
     DuplicateSkip,
     ValidationSkipped,
     RememberFailed,
     AbandonedAfterRetries,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum AutoRememberStageArg {
+    Validate,
+    Remember,
+    Verify,
+    Dedupe,
 }
 
 #[derive(Clone, ValueEnum)]

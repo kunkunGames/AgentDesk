@@ -343,6 +343,14 @@ impl MementoBackend {
         if !workspace.trim().is_empty() {
             args.insert("workspace".to_string(), json!(workspace));
         }
+        insert_optional_arg(&mut args, "contextText", effective_context_text(request));
+        insert_optional_arg(&mut args, "caseId", request.case_id.clone());
+        insert_optional_arg(&mut args, "phase", request.phase.clone());
+        insert_optional_arg(
+            &mut args,
+            "resolutionStatus",
+            request.resolution_status.clone(),
+        );
         let result = self
             .call_tool(config, "context", Value::Object(args))
             .await?;
@@ -363,11 +371,18 @@ impl MementoBackend {
         args.insert("agentId".to_string(), json!(agent_id));
         args.insert("workspace".to_string(), json!(workspace));
         args.insert("text".to_string(), json!(request.user_text));
-        args.insert("contextText".to_string(), json!(request.user_text));
         args.insert("sessionId".to_string(), json!(request.session_id));
         args.insert("excludeSeen".to_string(), json!(true));
         args.insert("pageSize".to_string(), json!(QUERY_RECALL_PAGE_SIZE));
         args.insert("tokenBudget".to_string(), json!(QUERY_RECALL_TOKEN_BUDGET));
+        insert_optional_arg(&mut args, "contextText", effective_context_text(request));
+        insert_optional_arg(&mut args, "caseId", request.case_id.clone());
+        insert_optional_arg(&mut args, "phase", request.phase.clone());
+        insert_optional_arg(
+            &mut args,
+            "resolutionStatus",
+            request.resolution_status.clone(),
+        );
 
         let result = self
             .call_tool(config, "recall", Value::Object(args))
@@ -1038,6 +1053,71 @@ fn format_skip_line(item: &Map<String, Value>) -> Option<(String, String)> {
     Some((skip_item, line))
 }
 
+fn format_case_memory_line(item: &Map<String, Value>) -> Option<(String, String)> {
+    let case_id = item
+        .get("case_id")
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty())?;
+    let resolution_status = item
+        .get("resolution_status")
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "open".to_string());
+    let goal = item
+        .get("goal")
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty());
+    let outcome = item
+        .get("outcome")
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty());
+    let first_event_summary = item
+        .get("events")
+        .and_then(Value::as_array)
+        .and_then(|events| events.first())
+        .and_then(Value::as_object)
+        .and_then(|event| event.get("summary"))
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty());
+
+    let mut parts = vec![format!("{case_id} [{resolution_status}]")];
+    if let Some(goal) = goal {
+        parts.push(format!("goal: {goal}"));
+    }
+    if let Some(outcome) = outcome {
+        parts.push(format!("outcome: {outcome}"));
+    }
+    if parts.len() == 1 {
+        if let Some(summary) = first_event_summary {
+            parts.push(format!("hint: {summary}"));
+        }
+    }
+
+    let line = parts.join(" | ");
+    Some((line.clone(), line))
+}
+
+fn effective_context_text(request: &RecallRequest) -> Option<String> {
+    request
+        .context_text
+        .as_deref()
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let user_text = normalize_whitespace(&request.user_text);
+            if user_text.is_empty() {
+                None
+            } else {
+                Some(user_text)
+            }
+        })
+}
+
 fn format_context_payload_for_external_recall(payload: &Value) -> Option<String> {
     let mut sections = vec!["[External Recall]".to_string()];
     let mut global_seen = std::collections::HashSet::new();
@@ -1174,6 +1254,121 @@ fn format_context_payload_for_external_recall(payload: &Value) -> Option<String>
         sections.push(format!(
             "Core memory from Memento:\n- {}",
             core_memory_lines.join("\n- ")
+        ));
+    }
+
+    let learning_lines = payload
+        .get("learning")
+        .and_then(Value::as_object)
+        .and_then(|learning| learning.get("recent"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !learning_lines.is_empty() {
+        sections.push(format!(
+            "[LEARNING MEMORY]\n- {}",
+            learning_lines.join("\n- ")
+        ));
+    }
+
+    let error_playbook_lines = payload
+        .get("auxiliary")
+        .and_then(Value::as_object)
+        .and_then(|auxiliary| auxiliary.get("errorPlaybook"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !error_playbook_lines.is_empty() {
+        sections.push(format!(
+            "[ERROR PLAYBOOK]\n- {}",
+            error_playbook_lines.join("\n- ")
+        ));
+    }
+
+    let decision_memory_lines = payload
+        .get("auxiliary")
+        .and_then(Value::as_object)
+        .and_then(|auxiliary| auxiliary.get("decisionMemory"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !decision_memory_lines.is_empty() {
+        sections.push(format!(
+            "[DECISION MEMORY]\n- {}",
+            decision_memory_lines.join("\n- ")
+        ));
+    }
+
+    let open_questions_lines = payload
+        .get("auxiliary")
+        .and_then(Value::as_object)
+        .and_then(|auxiliary| auxiliary.get("openQuestionsMemory"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !open_questions_lines.is_empty() {
+        sections.push(format!(
+            "[OPEN QUESTIONS MEMORY]\n- {}",
+            open_questions_lines.join("\n- ")
+        ));
+    }
+
+    let case_memory_lines = payload
+        .get("auxiliary")
+        .and_then(Value::as_object)
+        .and_then(|auxiliary| auxiliary.get("caseMemory"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_case_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !case_memory_lines.is_empty() {
+        sections.push(format!(
+            "[CASE MEMORY]\n- {}",
+            case_memory_lines.join("\n- ")
         ));
     }
 
@@ -1610,6 +1805,62 @@ mod tests {
     }
 
     #[test]
+    fn test_format_context_payload_for_external_recall_renders_auxiliary_sections() {
+        let formatted = format_context_payload_for_external_recall(&json!({
+            "learning": {
+                "recent": [
+                    {
+                        "content": "Prefer query-aware recall when user intent is specific",
+                        "type": "decision",
+                        "score": 0.93
+                    }
+                ]
+            },
+            "auxiliary": {
+                "errorPlaybook": [
+                    {
+                        "content": "If context injection is sparse, verify `contextText` propagation first",
+                        "type": "procedure",
+                        "score": 0.92
+                    }
+                ],
+                "decisionMemory": [
+                    {
+                        "content": "Use canonical skill names in routing memory",
+                        "type": "decision",
+                        "score": 0.91
+                    }
+                ],
+                "openQuestionsMemory": [
+                    {
+                        "content": "Decide whether review-gate should map to verification or retrospective",
+                        "type": "fact",
+                        "score": 0.9
+                    }
+                ],
+                "caseMemory": [
+                    {
+                        "case_id": "issue-418",
+                        "resolution_status": "resolved",
+                        "goal": "Ship bootstrap hardening",
+                        "outcome": "ContextText threaded into context()"
+                    }
+                ]
+            }
+        }))
+        .expect("formatted external recall should exist");
+
+        assert!(formatted.contains("[LEARNING MEMORY]"));
+        assert!(formatted.contains("[ERROR PLAYBOOK]"));
+        assert!(formatted.contains("[DECISION MEMORY]"));
+        assert!(formatted.contains("[OPEN QUESTIONS MEMORY]"));
+        assert!(formatted.contains("[CASE MEMORY]"));
+        assert!(formatted.contains(
+            "issue-418 [resolved] | goal: Ship bootstrap hardening | outcome: ContextText threaded into context()"
+        ));
+    }
+
+    #[test]
     fn test_format_recall_payload_for_external_recall_renders_fragments_and_hint() {
         let formatted = format_recall_payload_for_external_recall(&json!({
             "fragments": [
@@ -1728,6 +1979,10 @@ mod tests {
                 session_id: "session-1".to_string(),
                 dispatch_profile: DispatchProfile::Full,
                 user_text: "What do we know about #344?".to_string(),
+                context_text: Some("Review issue-344 verification context".to_string()),
+                case_id: Some("issue-344".to_string()),
+                phase: Some("verification".to_string()),
+                resolution_status: Some("open".to_string()),
             })
             .await;
 
@@ -1749,6 +2004,10 @@ mod tests {
         assert!(requests[1].contains("\"agentId\":\"project-agentdesk\""));
         assert!(requests[1].contains("\"sessionId\":\"session-1\""));
         assert!(requests[1].contains("\"structured\":true"));
+        assert!(requests[1].contains("\"contextText\":\"Review issue-344 verification context\""));
+        assert!(requests[1].contains("\"caseId\":\"issue-344\""));
+        assert!(requests[1].contains("\"phase\":\"verification\""));
+        assert!(requests[1].contains("\"resolutionStatus\":\"open\""));
         let external_recall = recall.external_recall.unwrap_or_default();
         assert!(external_recall.contains("Finish #344"));
         assert!(external_recall.contains("Replace placeholder Memento backend"));
@@ -1833,6 +2092,10 @@ mod tests {
                 session_id: "session-1".to_string(),
                 dispatch_profile: DispatchProfile::Full,
                 user_text: "How should I deploy the service safely?".to_string(),
+                context_text: Some("Deploy service safely in openclaw-maker".to_string()),
+                case_id: Some("issue-418".to_string()),
+                phase: Some("debugging".to_string()),
+                resolution_status: Some("open".to_string()),
             })
             .await;
 
@@ -1850,8 +2113,11 @@ mod tests {
         assert!(requests[1].contains("\"tokenBudget\":1200"));
         assert!(requests[1].contains("\"text\":\"How should I deploy the service safely?\""));
         assert!(
-            requests[1].contains("\"contextText\":\"How should I deploy the service safely?\"")
+            requests[1].contains("\"contextText\":\"Deploy service safely in openclaw-maker\"")
         );
+        assert!(requests[1].contains("\"caseId\":\"issue-418\""));
+        assert!(requests[1].contains("\"phase\":\"debugging\""));
+        assert!(requests[1].contains("\"resolutionStatus\":\"open\""));
 
         let external_recall = recall.external_recall.unwrap_or_default();
         assert!(
@@ -1888,6 +2154,10 @@ mod tests {
                 session_id: "session-1".to_string(),
                 dispatch_profile: DispatchProfile::Full,
                 user_text: "Need previous context".to_string(),
+                context_text: None,
+                case_id: None,
+                phase: None,
+                resolution_status: None,
             })
             .await;
 
@@ -1916,6 +2186,10 @@ mod tests {
                 session_id: "session-1".to_string(),
                 dispatch_profile: DispatchProfile::ReviewLite,
                 user_text: "Review this quickly".to_string(),
+                context_text: None,
+                case_id: None,
+                phase: None,
+                resolution_status: None,
             })
             .await;
 

@@ -1,18 +1,18 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 
 pub(crate) const AUTO_REMEMBER_MAX_RETRIES: u32 = 3;
-// P0 keeps durable retry coupled to the next eligible turn instead of running a
-// dedicated worker. The sidecar queue is still durable across process restarts
-// as long as the same runtime root is reused.
+pub(crate) const AUTO_REMEMBER_RETRY_BACKOFF_MS: [i64; 2] = [30_000, 300_000];
 pub(crate) const AUTO_REMEMBER_RETRY_DRAIN_LIMIT: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutoRememberMemoryStatus {
     Remembered,
     VerifiedPromoted,
+    OperatorVerified,
+    OperatorRejected,
     DuplicateSkip,
     ValidationSkipped,
     RememberFailed,
@@ -24,6 +24,8 @@ impl AutoRememberMemoryStatus {
         match self {
             Self::Remembered => "remembered",
             Self::VerifiedPromoted => "verified_promoted",
+            Self::OperatorVerified => "operator_verified",
+            Self::OperatorRejected => "operator_rejected",
             Self::DuplicateSkip => "duplicate_skip",
             Self::ValidationSkipped => "validation_skipped",
             Self::RememberFailed => "remember_failed",
@@ -35,6 +37,8 @@ impl AutoRememberMemoryStatus {
         match raw {
             "remembered" => Some(Self::Remembered),
             "verified_promoted" => Some(Self::VerifiedPromoted),
+            "operator_verified" => Some(Self::OperatorVerified),
+            "operator_rejected" => Some(Self::OperatorRejected),
             "duplicate_skip" => Some(Self::DuplicateSkip),
             "validation_skipped" => Some(Self::ValidationSkipped),
             "remember_failed" => Some(Self::RememberFailed),
@@ -48,6 +52,8 @@ impl AutoRememberMemoryStatus {
             self,
             Self::Remembered
                 | Self::VerifiedPromoted
+                | Self::OperatorVerified
+                | Self::OperatorRejected
                 | Self::DuplicateSkip
                 | Self::ValidationSkipped
                 | Self::AbandonedAfterRetries
@@ -132,6 +138,18 @@ pub(crate) struct AutoRememberRetryRecord {
     pub(crate) supporting_evidence: Vec<String>,
     pub(crate) retry_count: u32,
     pub(crate) error: Option<String>,
+    pub(crate) available_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AutoRememberAuditFilter<'a> {
+    pub(crate) workspace: Option<&'a str>,
+    pub(crate) status: Option<AutoRememberMemoryStatus>,
+    pub(crate) stage: Option<AutoRememberStage>,
+    pub(crate) signal_kind: Option<&'a str>,
+    pub(crate) candidate_hash: Option<&'a str>,
+    pub(crate) resubmittable_only: bool,
+    pub(crate) limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +318,11 @@ impl AutoRememberStore {
         Ok((status, retry_count))
     }
 
+    pub(crate) fn next_retry_available_at_ms(&self, retry_count: u32) -> i64 {
+        let delay = retry_backoff_ms(retry_count);
+        chrono::Utc::now().timestamp_millis().saturating_add(delay)
+    }
+
     pub(crate) fn upsert_retry(&self, entry: &AutoRememberRetryRecord) -> Result<(), String> {
         let evidence_json = serde_json::to_string(&entry.supporting_evidence)
             .map_err(|err| format!("failed to encode auto-remember retry evidence: {err}"))?;
@@ -315,8 +338,9 @@ impl AutoRememberStore {
                     supporting_evidence_json,
                     retry_count,
                     error,
+                    available_at_ms,
                     updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT(workspace, candidate_hash) DO UPDATE SET
                     turn_id = excluded.turn_id,
                     signal_kind = excluded.signal_kind,
@@ -325,6 +349,7 @@ impl AutoRememberStore {
                     supporting_evidence_json = excluded.supporting_evidence_json,
                     retry_count = excluded.retry_count,
                     error = excluded.error,
+                    available_at_ms = excluded.available_at_ms,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     entry.workspace,
@@ -336,6 +361,7 @@ impl AutoRememberStore {
                     evidence_json,
                     entry.retry_count,
                     entry.error,
+                    entry.available_at_ms,
                     chrono::Utc::now().timestamp_millis(),
                 ],
             )?;
@@ -355,27 +381,34 @@ impl AutoRememberStore {
                     entity_key,
                     supporting_evidence_json,
                     retry_count,
-                    error
+                    error,
+                    available_at_ms
                  FROM auto_remember_retry_queue
-                 ORDER BY updated_at_ms ASC
-                 LIMIT ?1",
+                 WHERE available_at_ms <= ?1
+                 ORDER BY available_at_ms ASC, updated_at_ms ASC
+                 LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![AUTO_REMEMBER_RETRY_DRAIN_LIMIT as i64], |row| {
-                let evidence_json = row.get::<_, String>(6)?;
-                let supporting_evidence =
-                    serde_json::from_str::<Vec<String>>(&evidence_json).unwrap_or_default();
-                Ok(AutoRememberRetryRecord {
-                    turn_id: row.get(0)?,
-                    workspace: row.get(1)?,
-                    candidate_hash: row.get(2)?,
-                    signal_kind: row.get(3)?,
-                    raw_content: row.get(4)?,
-                    entity_key: row.get(5)?,
-                    supporting_evidence,
-                    retry_count: row.get(7)?,
-                    error: row.get(8)?,
-                })
-            })?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let rows = stmt.query_map(
+                params![now_ms, AUTO_REMEMBER_RETRY_DRAIN_LIMIT as i64],
+                |row| {
+                    let evidence_json = row.get::<_, String>(6)?;
+                    let supporting_evidence =
+                        serde_json::from_str::<Vec<String>>(&evidence_json).unwrap_or_default();
+                    Ok(AutoRememberRetryRecord {
+                        turn_id: row.get(0)?,
+                        workspace: row.get(1)?,
+                        candidate_hash: row.get(2)?,
+                        signal_kind: row.get(3)?,
+                        raw_content: row.get(4)?,
+                        entity_key: row.get(5)?,
+                        supporting_evidence,
+                        retry_count: row.get(7)?,
+                        error: row.get(8)?,
+                        available_at_ms: row.get(9)?,
+                    })
+                },
+            )?;
 
             let mut records = Vec::new();
             for row in rows {
@@ -402,123 +435,116 @@ impl AutoRememberStore {
         status: Option<AutoRememberMemoryStatus>,
         limit: usize,
     ) -> Result<Vec<AutoRememberAuditDetail>, String> {
-        let limit = limit.max(1) as i64;
+        self.list_audit_filtered(&AutoRememberAuditFilter {
+            workspace,
+            status,
+            limit,
+            ..AutoRememberAuditFilter::default()
+        })
+    }
+
+    pub(crate) fn list_audit_filtered(
+        &self,
+        filter: &AutoRememberAuditFilter<'_>,
+    ) -> Result<Vec<AutoRememberAuditDetail>, String> {
+        let limit = filter.limit.max(1) as i64;
         self.with_conn(|conn| {
+            let mut query = String::from(
+                "SELECT
+                    turn_id,
+                    workspace,
+                    candidate_hash,
+                    signal_kind,
+                    stage,
+                    memory_status,
+                    retry_count,
+                    error,
+                    raw_content,
+                    entity_key,
+                    supporting_evidence_json,
+                    created_at
+                 FROM auto_remember_audit",
+            );
+            let mut conditions = Vec::new();
+            let mut params = Vec::<SqlValue>::new();
+
+            if let Some(workspace) = filter
+                .workspace
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                conditions.push("workspace = ?");
+                params.push(SqlValue::Text(workspace.to_string()));
+            }
+            if let Some(status) = filter.status {
+                conditions.push("memory_status = ?");
+                params.push(SqlValue::Text(status.as_str().to_string()));
+            }
+            if let Some(stage) = filter.stage {
+                conditions.push("stage = ?");
+                params.push(SqlValue::Text(stage.as_str().to_string()));
+            }
+            if let Some(signal_kind) = filter
+                .signal_kind
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                conditions.push("signal_kind = ?");
+                params.push(SqlValue::Text(signal_kind.to_string()));
+            }
+            if let Some(candidate_hash) = filter
+                .candidate_hash
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                conditions.push("candidate_hash = ?");
+                params.push(SqlValue::Text(candidate_hash.to_string()));
+            }
+            if filter.resubmittable_only {
+                conditions.push("(memory_status = ? OR memory_status = ?)");
+                params.push(SqlValue::Text(
+                    AutoRememberMemoryStatus::RememberFailed
+                        .as_str()
+                        .to_string(),
+                ));
+                params.push(SqlValue::Text(
+                    AutoRememberMemoryStatus::AbandonedAfterRetries
+                        .as_str()
+                        .to_string(),
+                ));
+            }
+
+            if !conditions.is_empty() {
+                query.push_str(" WHERE ");
+                query.push_str(&conditions.join(" AND "));
+            }
+            query.push_str(" ORDER BY created_at DESC LIMIT ?");
+            params.push(SqlValue::Integer(limit));
+
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params_from_iter(params.iter()), decode_audit_detail_row)?;
             let mut records = Vec::new();
-            match (
-                workspace.map(str::trim).filter(|value| !value.is_empty()),
-                status,
-            ) {
-                (Some(workspace), Some(status)) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT
-                            turn_id,
-                            workspace,
-                            candidate_hash,
-                            signal_kind,
-                            stage,
-                            memory_status,
-                            retry_count,
-                            error,
-                            raw_content,
-                            entity_key,
-                            supporting_evidence_json,
-                            created_at
-                         FROM auto_remember_audit
-                         WHERE workspace = ?1 AND memory_status = ?2
-                         ORDER BY created_at DESC
-                         LIMIT ?3",
-                    )?;
-                    let rows = stmt
-                        .query_map(params![workspace, status.as_str(), limit], |row| {
-                            decode_audit_detail_row(row)
-                        })?;
-                    for row in rows {
-                        records.push(row?);
-                    }
-                }
-                (Some(workspace), None) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT
-                            turn_id,
-                            workspace,
-                            candidate_hash,
-                            signal_kind,
-                            stage,
-                            memory_status,
-                            retry_count,
-                            error,
-                            raw_content,
-                            entity_key,
-                            supporting_evidence_json,
-                            created_at
-                         FROM auto_remember_audit
-                         WHERE workspace = ?1
-                         ORDER BY created_at DESC
-                         LIMIT ?2",
-                    )?;
-                    let rows = stmt.query_map(params![workspace, limit], |row| {
-                        decode_audit_detail_row(row)
-                    })?;
-                    for row in rows {
-                        records.push(row?);
-                    }
-                }
-                (None, Some(status)) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT
-                            turn_id,
-                            workspace,
-                            candidate_hash,
-                            signal_kind,
-                            stage,
-                            memory_status,
-                            retry_count,
-                            error,
-                            raw_content,
-                            entity_key,
-                            supporting_evidence_json,
-                            created_at
-                         FROM auto_remember_audit
-                         WHERE memory_status = ?1
-                         ORDER BY created_at DESC
-                         LIMIT ?2",
-                    )?;
-                    let rows = stmt.query_map(params![status.as_str(), limit], |row| {
-                        decode_audit_detail_row(row)
-                    })?;
-                    for row in rows {
-                        records.push(row?);
-                    }
-                }
-                (None, None) => {
-                    let mut stmt = conn.prepare(
-                        "SELECT
-                            turn_id,
-                            workspace,
-                            candidate_hash,
-                            signal_kind,
-                            stage,
-                            memory_status,
-                            retry_count,
-                            error,
-                            raw_content,
-                            entity_key,
-                            supporting_evidence_json,
-                            created_at
-                         FROM auto_remember_audit
-                         ORDER BY created_at DESC
-                         LIMIT ?1",
-                    )?;
-                    let rows =
-                        stmt.query_map(params![limit], |row| decode_audit_detail_row(row))?;
-                    for row in rows {
-                        records.push(row?);
-                    }
-                }
+            for row in rows {
+                records.push(row?);
             }
             Ok(records)
         })
+    }
+
+    pub(crate) fn load_audit_detail(
+        &self,
+        workspace: &str,
+        candidate_hash: &str,
+    ) -> Result<Option<AutoRememberAuditDetail>, String> {
+        Ok(self
+            .list_audit_filtered(&AutoRememberAuditFilter {
+                workspace: Some(workspace),
+                candidate_hash: Some(candidate_hash),
+                limit: 1,
+                ..AutoRememberAuditFilter::default()
+            })?
+            .into_iter()
+            .next())
     }
 
     pub(crate) fn count_by_status(
@@ -608,6 +634,7 @@ impl AutoRememberStore {
                             supporting_evidence,
                             retry_count,
                             error,
+                            available_at_ms: chrono::Utc::now().timestamp_millis(),
                         })
                     },
                 )
@@ -647,6 +674,126 @@ impl AutoRememberStore {
         })
     }
 
+    pub(crate) fn set_operator_status(
+        &self,
+        workspace: &str,
+        candidate_hash: &str,
+        status: AutoRememberMemoryStatus,
+        note: Option<&str>,
+    ) -> Result<(), String> {
+        if !matches!(
+            status,
+            AutoRememberMemoryStatus::OperatorVerified | AutoRememberMemoryStatus::OperatorRejected
+        ) {
+            return Err(format!("unsupported operator status '{}'", status.as_str()));
+        }
+
+        let note = note
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| match status {
+                AutoRememberMemoryStatus::OperatorVerified => "operator verified candidate",
+                AutoRememberMemoryStatus::OperatorRejected => "operator rejected candidate",
+                _ => "operator updated candidate",
+            });
+
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE auto_remember_audit
+                 SET stage = ?3,
+                     memory_status = ?4,
+                     error = ?5,
+                     created_at = ?6
+                 WHERE workspace = ?1 AND candidate_hash = ?2",
+                params![
+                    workspace,
+                    candidate_hash,
+                    AutoRememberStage::Verify.as_str(),
+                    status.as_str(),
+                    note,
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                ],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            conn.execute(
+                "DELETE FROM auto_remember_retry_queue
+                 WHERE workspace = ?1 AND candidate_hash = ?2",
+                params![workspace, candidate_hash],
+            )?;
+            Ok(())
+        })
+        .map_err(|error| match error.as_str() {
+            "auto-remember sidecar query failed: Query returned no rows" => format!(
+                "no auto-remember candidate found for workspace='{workspace}' hash='{candidate_hash}'"
+            ),
+            _ => error,
+        })
+    }
+
+    pub(crate) fn requeue_candidate(
+        &self,
+        workspace: &str,
+        candidate_hash: &str,
+    ) -> Result<(), String> {
+        let record = self
+            .load_resubmittable_candidate(workspace, candidate_hash)?
+            .or_else(|| {
+                self.load_audit_detail(workspace, candidate_hash)
+                    .ok()
+                    .flatten()
+                    .and_then(|detail| {
+                        let raw_content = detail.raw_content?;
+                        Some(AutoRememberRetryRecord {
+                            turn_id: detail.turn_id,
+                            workspace: detail.workspace,
+                            candidate_hash: detail.candidate_hash,
+                            signal_kind: detail.signal_kind,
+                            raw_content,
+                            entity_key: detail.entity_key,
+                            supporting_evidence: detail.supporting_evidence,
+                            retry_count: 0,
+                            error: detail.error,
+                            available_at_ms: chrono::Utc::now().timestamp_millis(),
+                        })
+                    })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "no requeueable auto-remember candidate found for workspace='{workspace}' hash='{candidate_hash}'"
+                )
+            })?;
+
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE auto_remember_audit
+                 SET stage = ?3,
+                     memory_status = ?4,
+                     retry_count = 0,
+                     error = ?5,
+                     created_at = ?6
+                 WHERE workspace = ?1 AND candidate_hash = ?2",
+                params![
+                    workspace,
+                    candidate_hash,
+                    AutoRememberStage::Remember.as_str(),
+                    AutoRememberMemoryStatus::RememberFailed.as_str(),
+                    "manual requeue requested",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                ],
+            )?;
+            Ok(())
+        })?;
+
+        self.upsert_retry(&AutoRememberRetryRecord {
+            retry_count: 0,
+            available_at_ms: chrono::Utc::now().timestamp_millis(),
+            error: Some("manual requeue requested".to_string()),
+            ..record
+        })
+    }
+
     fn ensure_schema(&self) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute_batch(
@@ -675,6 +822,7 @@ impl AutoRememberStore {
                     supporting_evidence_json TEXT NOT NULL,
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
+                    available_at_ms INTEGER NOT NULL DEFAULT 0,
                     updated_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (workspace, candidate_hash)
                 );",
@@ -686,7 +834,35 @@ impl AutoRememberStore {
                 "auto_remember_audit",
                 "supporting_evidence_json",
                 "TEXT NOT NULL DEFAULT '[]'",
-            )
+            )?;
+            ensure_column(
+                conn,
+                "auto_remember_retry_queue",
+                "supporting_evidence_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                conn,
+                "auto_remember_retry_queue",
+                "available_at_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                conn,
+                "auto_remember_retry_queue",
+                "updated_at_ms",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            conn.execute(
+                "UPDATE auto_remember_retry_queue
+                 SET available_at_ms = CASE
+                     WHEN COALESCE(available_at_ms, 0) <= 0
+                         THEN COALESCE(updated_at_ms, 0)
+                     ELSE available_at_ms
+                 END",
+                [],
+            )?;
+            Ok(())
         })
     }
 
@@ -703,7 +879,79 @@ impl AutoRememberStore {
 fn sidecar_path() -> Result<PathBuf, String> {
     let root = crate::config::runtime_root()
         .ok_or_else(|| "AgentDesk runtime root is unavailable".to_string())?;
-    Ok(root.join("data").join("memory-auto-remember.sqlite"))
+    let legacy_path = runtime_local_sidecar_path(&root);
+    let target_path = configured_sidecar_path(&root);
+
+    if target_path != legacy_path && legacy_path.exists() && !target_path.exists() {
+        migrate_legacy_sidecar(&legacy_path, &target_path)?;
+    }
+
+    Ok(target_path)
+}
+
+fn configured_sidecar_path(root: &Path) -> PathBuf {
+    let configured = crate::runtime_layout::load_memory_backend(root)
+        .auto_remember
+        .sidecar_path;
+    match configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        }
+        None => runtime_local_sidecar_path(root),
+    }
+}
+
+fn runtime_local_sidecar_path(root: &Path) -> PathBuf {
+    root.join("data").join("memory-auto-remember.sqlite")
+}
+
+fn migrate_legacy_sidecar(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create auto-remember sidecar dir '{}': {err}",
+                parent.display()
+            )
+        })?;
+    }
+
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            fs::copy(from, to).map_err(|copy_error| {
+                format!(
+                    "failed to migrate auto-remember sidecar from '{}' to '{}': rename={rename_error}; copy={copy_error}",
+                    from.display(),
+                    to.display()
+                )
+            })?;
+            fs::remove_file(from).map_err(|remove_error| {
+                format!(
+                    "copied auto-remember sidecar to '{}' but failed to remove legacy file '{}': {remove_error}",
+                    to.display(),
+                    from.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn retry_backoff_ms(retry_count: u32) -> i64 {
+    let index = retry_count
+        .saturating_sub(1)
+        .min((AUTO_REMEMBER_RETRY_BACKOFF_MS.len() as u32).saturating_sub(1))
+        as usize;
+    AUTO_REMEMBER_RETRY_BACKOFF_MS[index]
 }
 
 fn decode_audit_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutoRememberAuditDetail> {
@@ -917,6 +1165,159 @@ mod tests {
             assert_eq!(status, AutoRememberMemoryStatus::AbandonedAfterRetries);
             assert_eq!(retry_count, AUTO_REMEMBER_MAX_RETRIES);
             assert!(status.suppresses_repeat());
+        });
+    }
+
+    #[test]
+    fn audit_filters_and_summary_counts_match_observable_surface() {
+        with_temp_root(|_| {
+            let store = AutoRememberStore::open().unwrap();
+
+            store
+                .upsert_audit(AutoRememberAuditEntry {
+                    turn_id: "turn-1",
+                    candidate_hash: "hash-validate",
+                    signal_kind: "technical_decision",
+                    workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Validate,
+                    status: AutoRememberMemoryStatus::ValidationSkipped,
+                    retry_count: 0,
+                    error: Some("uncertain"),
+                    raw_content: Some("AgentDesk might switch stores later."),
+                    entity_key: None,
+                    supporting_evidence: None,
+                })
+                .unwrap();
+            store
+                .upsert_audit(AutoRememberAuditEntry {
+                    turn_id: "turn-2",
+                    candidate_hash: "hash-failed",
+                    signal_kind: "technical_decision",
+                    workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Remember,
+                    status: AutoRememberMemoryStatus::RememberFailed,
+                    retry_count: 2,
+                    error: Some("temporary failure"),
+                    raw_content: Some("SQLite sidecar is the audit store."),
+                    entity_key: None,
+                    supporting_evidence: None,
+                })
+                .unwrap();
+            store
+                .upsert_audit(AutoRememberAuditEntry {
+                    turn_id: "turn-3",
+                    candidate_hash: "hash-verified",
+                    signal_kind: "config_change",
+                    workspace: "other-workspace",
+                    stage: AutoRememberStage::Verify,
+                    status: AutoRememberMemoryStatus::OperatorVerified,
+                    retry_count: 0,
+                    error: Some("operator verified candidate"),
+                    raw_content: Some("memory.backend changed from file to memento."),
+                    entity_key: Some("memory.backend"),
+                    supporting_evidence: None,
+                })
+                .unwrap();
+
+            let filtered = store
+                .list_audit_filtered(&AutoRememberAuditFilter {
+                    workspace: Some("agentdesk-default"),
+                    status: Some(AutoRememberMemoryStatus::ValidationSkipped),
+                    stage: Some(AutoRememberStage::Validate),
+                    signal_kind: Some("technical_decision"),
+                    limit: 10,
+                    ..AutoRememberAuditFilter::default()
+                })
+                .unwrap();
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].candidate_hash, "hash-validate");
+            assert_eq!(
+                filtered[0].status,
+                AutoRememberMemoryStatus::ValidationSkipped
+            );
+            assert_eq!(filtered[0].stage, AutoRememberStage::Validate);
+
+            let status_counts = store.count_by_status(Some("agentdesk-default")).unwrap();
+            assert!(
+                status_counts
+                    .iter()
+                    .any(|(status, count)| status == "remember_failed" && *count == 1)
+            );
+            assert!(
+                status_counts
+                    .iter()
+                    .any(|(status, count)| status == "validation_skipped" && *count == 1)
+            );
+
+            let skip_reason_counts = store
+                .count_validation_skip_reasons(Some("agentdesk-default"))
+                .unwrap();
+            assert_eq!(skip_reason_counts, vec![("uncertain".to_string(), 1)]);
+        });
+    }
+
+    #[test]
+    fn manual_requeue_and_operator_verify_update_audit_and_retry_views() {
+        with_temp_root(|_| {
+            let store = AutoRememberStore::open().unwrap();
+            let evidence = vec!["SQLite sidecar is the audit store.".to_string()];
+            store
+                .upsert_audit(AutoRememberAuditEntry {
+                    turn_id: "turn-4",
+                    candidate_hash: "hash-manual",
+                    signal_kind: "technical_decision",
+                    workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Remember,
+                    status: AutoRememberMemoryStatus::AbandonedAfterRetries,
+                    retry_count: 3,
+                    error: Some("temporary failure"),
+                    raw_content: Some("SQLite sidecar is the audit store."),
+                    entity_key: None,
+                    supporting_evidence: Some(evidence.as_slice()),
+                })
+                .unwrap();
+
+            store
+                .requeue_candidate("agentdesk-default", "hash-manual")
+                .unwrap();
+
+            let detail = store
+                .load_audit_detail("agentdesk-default", "hash-manual")
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.stage, AutoRememberStage::Remember);
+            assert_eq!(detail.status, AutoRememberMemoryStatus::RememberFailed);
+            assert_eq!(detail.retry_count, 0);
+            assert_eq!(detail.error.as_deref(), Some("manual requeue requested"));
+
+            let retry_batch = store.load_retry_batch().unwrap();
+            assert_eq!(retry_batch.len(), 1);
+            assert_eq!(retry_batch[0].candidate_hash, "hash-manual");
+            assert_eq!(retry_batch[0].retry_count, 0);
+
+            store
+                .set_operator_status(
+                    "agentdesk-default",
+                    "hash-manual",
+                    AutoRememberMemoryStatus::OperatorVerified,
+                    Some("operator confirmed replay result"),
+                )
+                .unwrap();
+
+            let verified_detail = store
+                .load_audit_detail("agentdesk-default", "hash-manual")
+                .unwrap()
+                .unwrap();
+            assert_eq!(verified_detail.stage, AutoRememberStage::Verify);
+            assert_eq!(
+                verified_detail.status,
+                AutoRememberMemoryStatus::OperatorVerified
+            );
+            assert_eq!(
+                verified_detail.error.as_deref(),
+                Some("operator confirmed replay result")
+            );
+            assert!(store.load_retry_batch().unwrap().is_empty());
         });
     }
 }

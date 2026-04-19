@@ -16,11 +16,15 @@ use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettin
 use crate::services::provider::ProviderKind;
 
 pub(crate) use auto_remember::{
-    AutoRememberExecutionResult, AutoRememberTurnRequest, resubmit_auto_remember_candidate,
-    run_auto_remember,
+    AutoRememberExecutionResult, AutoRememberTurnRequest, reject_auto_remember_candidate,
+    requeue_auto_remember_candidate, resubmit_auto_remember_candidate, run_auto_remember,
+    verify_auto_remember_candidate,
 };
+#[cfg(test)]
+pub(crate) use auto_remember_store::AutoRememberAuditEntry;
 pub(crate) use auto_remember_store::{
-    AutoRememberAuditDetail, AutoRememberMemoryStatus, AutoRememberStore,
+    AutoRememberAuditDetail, AutoRememberAuditFilter, AutoRememberMemoryStatus, AutoRememberStage,
+    AutoRememberStore,
 };
 pub(crate) use local::LocalMemoryBackend;
 pub(crate) use mem0::Mem0Backend;
@@ -72,6 +76,10 @@ pub(crate) struct RecallRequest {
     pub session_id: String,
     pub dispatch_profile: DispatchProfile,
     pub user_text: String,
+    pub context_text: Option<String>,
+    pub case_id: Option<String>,
+    pub phase: Option<String>,
+    pub resolution_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -1,19 +1,32 @@
 use serde_json::json;
 
 use crate::services::memory::{
-    AutoRememberAuditDetail, AutoRememberMemoryStatus, AutoRememberStore,
-    resubmit_auto_remember_candidate,
+    AutoRememberAuditDetail, AutoRememberAuditFilter, AutoRememberMemoryStatus, AutoRememberStage,
+    AutoRememberStore, reject_auto_remember_candidate, requeue_auto_remember_candidate,
+    resubmit_auto_remember_candidate, verify_auto_remember_candidate,
 };
 
 pub(crate) fn cmd_auto_remember_audit(
     workspace: Option<&str>,
     status: Option<AutoRememberMemoryStatus>,
+    stage: Option<AutoRememberStage>,
+    signal_kind: Option<&str>,
+    candidate_hash: Option<&str>,
+    resubmittable_only: bool,
     limit: usize,
     json_output: bool,
 ) -> Result<(), String> {
     let store = AutoRememberStore::open_existing()?
         .ok_or_else(|| "auto-remember sidecar does not exist for this runtime root".to_string())?;
-    let records = store.list_audit(workspace, status, limit)?;
+    let records = store.list_audit_filtered(&AutoRememberAuditFilter {
+        workspace,
+        status,
+        stage,
+        signal_kind,
+        candidate_hash,
+        resubmittable_only,
+        limit,
+    })?;
 
     if json_output {
         let payload = records.iter().map(audit_detail_json).collect::<Vec<_>>();
@@ -130,6 +143,35 @@ pub(crate) async fn cmd_auto_remember_resubmit(
     Ok(())
 }
 
+pub(crate) fn cmd_auto_remember_verify(
+    workspace: &str,
+    candidate_hash: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    verify_auto_remember_candidate(workspace, candidate_hash, note)?;
+    println!("Auto-remember candidate marked operator_verified.");
+    Ok(())
+}
+
+pub(crate) fn cmd_auto_remember_reject(
+    workspace: &str,
+    candidate_hash: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    reject_auto_remember_candidate(workspace, candidate_hash, note)?;
+    println!("Auto-remember candidate marked operator_rejected.");
+    Ok(())
+}
+
+pub(crate) fn cmd_auto_remember_requeue(
+    workspace: &str,
+    candidate_hash: &str,
+) -> Result<(), String> {
+    requeue_auto_remember_candidate(workspace, candidate_hash)?;
+    println!("Auto-remember candidate queued for retry drain.");
+    Ok(())
+}
+
 fn audit_detail_json(record: &AutoRememberAuditDetail) -> serde_json::Value {
     json!({
         "turn_id": record.turn_id,
@@ -149,4 +191,87 @@ fn audit_detail_json(record: &AutoRememberAuditDetail) -> serde_json::Value {
 
 fn truncate_hash(value: &str) -> &str {
     value.get(..12).unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::services::discord::runtime_store::lock_test_env;
+
+    fn with_temp_root<F>(f: F)
+    where
+        F: FnOnce(&TempDir),
+    {
+        let _guard = lock_test_env();
+        let temp = TempDir::new().unwrap();
+        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        f(&temp);
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+    }
+
+    #[test]
+    fn audit_and_summary_commands_accept_existing_sidecar_filters() {
+        with_temp_root(|_| {
+            let store = AutoRememberStore::open().unwrap();
+
+            store
+                .upsert_audit(crate::services::memory::AutoRememberAuditEntry {
+                    turn_id: "turn-1",
+                    candidate_hash: "hash-validation",
+                    signal_kind: "technical_decision",
+                    workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Validate,
+                    status: AutoRememberMemoryStatus::ValidationSkipped,
+                    retry_count: 0,
+                    error: Some("uncertain"),
+                    raw_content: Some("AgentDesk might switch stores later."),
+                    entity_key: None,
+                    supporting_evidence: None,
+                })
+                .unwrap();
+            store
+                .upsert_audit(crate::services::memory::AutoRememberAuditEntry {
+                    turn_id: "turn-2",
+                    candidate_hash: "hash-retry",
+                    signal_kind: "technical_decision",
+                    workspace: "agentdesk-default",
+                    stage: AutoRememberStage::Remember,
+                    status: AutoRememberMemoryStatus::RememberFailed,
+                    retry_count: 1,
+                    error: Some("temporary failure"),
+                    raw_content: Some("AgentDesk standardized on SQLite sidecar."),
+                    entity_key: None,
+                    supporting_evidence: None,
+                })
+                .unwrap();
+
+            cmd_auto_remember_audit(
+                Some("agentdesk-default"),
+                Some(AutoRememberMemoryStatus::RememberFailed),
+                Some(AutoRememberStage::Remember),
+                Some("technical_decision"),
+                None,
+                true,
+                10,
+                true,
+            )
+            .unwrap();
+            cmd_auto_remember_summary(Some("agentdesk-default"), true).unwrap();
+        });
+    }
+
+    #[test]
+    fn audit_command_errors_without_sidecar() {
+        with_temp_root(|_| {
+            let error =
+                cmd_auto_remember_audit(None, None, None, None, None, false, 5, true).unwrap_err();
+            assert!(error.contains("sidecar does not exist"));
+        });
+    }
 }

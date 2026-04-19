@@ -1,10 +1,10 @@
 use anyhow::Result;
 
 use super::args::{
-    AutoQueueAction, AutoRememberAction, AutoRememberStatusArg, CardAction, Commands, ConfigAction,
-    DispatchAction, MigrateAction, ReportProvider,
+    AutoQueueAction, AutoRememberAction, AutoRememberStageArg, AutoRememberStatusArg, CardAction,
+    Commands, ConfigAction, DispatchAction, MigrateAction, ReportProvider,
 };
-use crate::services::memory::AutoRememberMemoryStatus;
+use crate::services::memory::{AutoRememberMemoryStatus, AutoRememberStage};
 
 fn exit_for_cli(result: std::result::Result<(), String>) -> Result<()> {
     match result {
@@ -333,11 +333,19 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             AutoRememberAction::Audit {
                 workspace,
                 status,
+                stage,
+                signal_kind,
+                candidate_hash,
+                resubmittable_only,
                 limit,
                 json,
             } => super::auto_remember::cmd_auto_remember_audit(
                 workspace.as_deref(),
                 status.map(auto_remember_status_from_arg),
+                stage.map(auto_remember_stage_from_arg),
+                signal_kind.as_deref(),
+                candidate_hash.as_deref(),
+                resubmittable_only,
                 limit,
                 json,
             ),
@@ -351,6 +359,28 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 &workspace,
                 &candidate_hash,
             )),
+            AutoRememberAction::Verify {
+                workspace,
+                candidate_hash,
+                note,
+            } => super::auto_remember::cmd_auto_remember_verify(
+                &workspace,
+                &candidate_hash,
+                note.as_deref(),
+            ),
+            AutoRememberAction::Reject {
+                workspace,
+                candidate_hash,
+                note,
+            } => super::auto_remember::cmd_auto_remember_reject(
+                &workspace,
+                &candidate_hash,
+                note.as_deref(),
+            ),
+            AutoRememberAction::Requeue {
+                workspace,
+                candidate_hash,
+            } => super::auto_remember::cmd_auto_remember_requeue(&workspace, &candidate_hash),
         }),
         Commands::Api { method, path, body } => {
             exit_for_cli(super::client::cmd_api(&method, &path, body.as_deref()))
@@ -383,12 +413,23 @@ fn auto_remember_status_from_arg(value: AutoRememberStatusArg) -> AutoRememberMe
     match value {
         AutoRememberStatusArg::Remembered => AutoRememberMemoryStatus::Remembered,
         AutoRememberStatusArg::VerifiedPromoted => AutoRememberMemoryStatus::VerifiedPromoted,
+        AutoRememberStatusArg::OperatorVerified => AutoRememberMemoryStatus::OperatorVerified,
+        AutoRememberStatusArg::OperatorRejected => AutoRememberMemoryStatus::OperatorRejected,
         AutoRememberStatusArg::DuplicateSkip => AutoRememberMemoryStatus::DuplicateSkip,
         AutoRememberStatusArg::ValidationSkipped => AutoRememberMemoryStatus::ValidationSkipped,
         AutoRememberStatusArg::RememberFailed => AutoRememberMemoryStatus::RememberFailed,
         AutoRememberStatusArg::AbandonedAfterRetries => {
             AutoRememberMemoryStatus::AbandonedAfterRetries
         }
+    }
+}
+
+fn auto_remember_stage_from_arg(value: AutoRememberStageArg) -> AutoRememberStage {
+    match value {
+        AutoRememberStageArg::Validate => AutoRememberStage::Validate,
+        AutoRememberStageArg::Remember => AutoRememberStage::Remember,
+        AutoRememberStageArg::Verify => AutoRememberStage::Verify,
+        AutoRememberStageArg::Dedupe => AutoRememberStage::Dedupe,
     }
 }
 

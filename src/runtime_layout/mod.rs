@@ -215,11 +215,12 @@ fn default_auto_remember_improver_mode() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoRememberConfig {
-    /// Keeps auto-remember opt-in. Audit/dedupe state lives in a runtime-root-local
-    /// SQLite sidecar at `data/memory-auto-remember.sqlite`; moving or reinitializing
-    /// the runtime root resets that local state and can allow equivalent facts to be
-    /// written again.
+    /// Keeps auto-remember opt-in. Audit/dedupe state defaults to the runtime-root-local
+    /// SQLite sidecar at `data/memory-auto-remember.sqlite`. Set `sidecar_path` to
+    /// pin the store to a stable location across runtime-root moves; when set, AgentDesk
+    /// migrates the legacy runtime-local sidecar on first use.
     pub enabled: bool,
+    pub sidecar_path: Option<String>,
     pub improver: AutoRememberImproverConfig,
 }
 
@@ -227,6 +228,7 @@ impl Default for AutoRememberConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            sidecar_path: None,
             improver: AutoRememberImproverConfig::default(),
         }
     }
@@ -485,6 +487,7 @@ fn memory_backend_from_config(config: crate::config::MemoryConfig) -> MemoryBack
         },
         auto_remember: AutoRememberConfig {
             enabled: config.auto_remember.enabled,
+            sidecar_path: config.auto_remember.sidecar_path,
             improver: AutoRememberImproverConfig {
                 mode: config.auto_remember.improver.mode,
                 agent: AutoRememberAgentConfig {

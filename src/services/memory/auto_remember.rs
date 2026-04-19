@@ -7,7 +7,7 @@ use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEv
 use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
 
 use super::auto_remember_quality::{
-    AutoRememberQualityInput, improve_candidate, rewrite_supported,
+    AutoRememberQualityInput, improve_candidate_with_config, rewrite_supported_with_config,
 };
 use super::auto_remember_store::{
     AutoRememberAuditEntry, AutoRememberMemoryStatus, AutoRememberRetryRecord, AutoRememberStage,
@@ -217,6 +217,7 @@ pub(crate) async fn run_auto_remember(
     for queued in candidates {
         process_candidate(
             &request,
+            settings,
             &store,
             &backend,
             queued,
@@ -266,10 +267,12 @@ pub(crate) async fn resubmit_auto_remember_candidate(
 
     store.reset_retry_state(&workspace, &candidate_hash)?;
 
-    let backend = MementoBackend::new(ResolvedMemorySettings {
+    let resubmit_settings = ResolvedMemorySettings {
         backend: MemoryBackendKind::Memento,
+        auto_remember_enabled: true,
         ..ResolvedMemorySettings::default()
-    });
+    };
+    let backend = MementoBackend::new(resubmit_settings.clone());
     let request = AutoRememberTurnRequest {
         turn_id: format!(
             "manual-resubmit-{}",
@@ -286,6 +289,7 @@ pub(crate) async fn resubmit_auto_remember_candidate(
     let mut result = AutoRememberExecutionResult::default();
     process_candidate(
         &request,
+        &resubmit_settings,
         &store,
         &backend,
         AutoRememberQueuedCandidate {
@@ -297,6 +301,72 @@ pub(crate) async fn resubmit_auto_remember_candidate(
     )
     .await;
     Ok(result)
+}
+
+pub(crate) fn verify_auto_remember_candidate(
+    workspace: &str,
+    candidate_hash: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    let workspace = normalize_whitespace(workspace);
+    let candidate_hash = normalize_whitespace(candidate_hash);
+    if workspace.is_empty() {
+        return Err("auto-remember verify requires non-empty workspace".to_string());
+    }
+    if candidate_hash.is_empty() {
+        return Err("auto-remember verify requires non-empty candidate hash".to_string());
+    }
+
+    let store = AutoRememberStore::open_existing()?
+        .ok_or_else(|| "auto-remember sidecar does not exist for this runtime root".to_string())?;
+    store.set_operator_status(
+        &workspace,
+        &candidate_hash,
+        AutoRememberMemoryStatus::OperatorVerified,
+        note,
+    )
+}
+
+pub(crate) fn reject_auto_remember_candidate(
+    workspace: &str,
+    candidate_hash: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    let workspace = normalize_whitespace(workspace);
+    let candidate_hash = normalize_whitespace(candidate_hash);
+    if workspace.is_empty() {
+        return Err("auto-remember reject requires non-empty workspace".to_string());
+    }
+    if candidate_hash.is_empty() {
+        return Err("auto-remember reject requires non-empty candidate hash".to_string());
+    }
+
+    let store = AutoRememberStore::open_existing()?
+        .ok_or_else(|| "auto-remember sidecar does not exist for this runtime root".to_string())?;
+    store.set_operator_status(
+        &workspace,
+        &candidate_hash,
+        AutoRememberMemoryStatus::OperatorRejected,
+        note,
+    )
+}
+
+pub(crate) fn requeue_auto_remember_candidate(
+    workspace: &str,
+    candidate_hash: &str,
+) -> Result<(), String> {
+    let workspace = normalize_whitespace(workspace);
+    let candidate_hash = normalize_whitespace(candidate_hash);
+    if workspace.is_empty() {
+        return Err("auto-remember requeue requires non-empty workspace".to_string());
+    }
+    if candidate_hash.is_empty() {
+        return Err("auto-remember requeue requires non-empty candidate hash".to_string());
+    }
+
+    let store = AutoRememberStore::open_existing()?
+        .ok_or_else(|| "auto-remember sidecar does not exist for this runtime root".to_string())?;
+    store.requeue_candidate(&workspace, &candidate_hash)
 }
 
 fn load_retry_candidates(
@@ -340,6 +410,7 @@ fn load_retry_candidates(
 
 async fn process_candidate(
     request: &AutoRememberTurnRequest,
+    settings: &ResolvedMemorySettings,
     store: &AutoRememberStore,
     backend: &MementoBackend,
     queued: AutoRememberQueuedCandidate,
@@ -399,8 +470,8 @@ async fn process_candidate(
         }
     }
 
-    let decision = pre_validate_candidate(&raw_candidate);
-    let candidate = match materialize_candidate(&raw_candidate, decision).await {
+    let decision = pre_validate_candidate(&raw_candidate, settings);
+    let candidate = match materialize_candidate(&raw_candidate, decision, settings).await {
         Ok(Some(candidate)) => candidate,
         Ok(None) => {
             let _ = store.upsert_audit(AutoRememberAuditEntry {
@@ -682,14 +753,17 @@ fn candidate_from_unit(workspace: &str, unit: CandidateUnit) -> Option<AutoRemem
     })
 }
 
-fn pre_validate_candidate(candidate: &AutoRememberRawCandidate) -> AutoRememberDecision {
+fn pre_validate_candidate(
+    candidate: &AutoRememberRawCandidate,
+    settings: &ResolvedMemorySettings,
+) -> AutoRememberDecision {
     if candidate.workspace.trim().is_empty() {
         return AutoRememberDecision::Skip(AutoRememberSkipReason::MissingWorkspace);
     }
     if contains_uncertainty(&candidate.raw_content) {
         return AutoRememberDecision::Skip(AutoRememberSkipReason::Uncertain);
     }
-    let rewrite_supported = rewrite_supported();
+    let rewrite_supported = rewrite_supported_with_config(Some(&settings.auto_remember.improver));
 
     match candidate.signal_kind {
         AutoRememberSignalKind::ConfigChange => {
@@ -763,6 +837,7 @@ fn build_validated_candidate(
 async fn materialize_candidate(
     raw_candidate: &AutoRememberRawCandidate,
     decision: AutoRememberDecision,
+    settings: &ResolvedMemorySettings,
 ) -> Result<Option<AutoRememberValidatedCandidate>, String> {
     match decision {
         AutoRememberDecision::StoreDirectly => Ok(validate_candidate(
@@ -772,12 +847,15 @@ async fn materialize_candidate(
         )
         .map(|content| build_validated_candidate(raw_candidate, content, &[]))),
         AutoRememberDecision::RewriteNeeded => {
-            let rewritten = improve_candidate(&AutoRememberQualityInput {
-                signal_kind: raw_candidate.signal_kind.as_str().to_string(),
-                raw_content: raw_candidate.raw_content.clone(),
-                supporting_evidence: raw_candidate.supporting_evidence.clone(),
-                entity_key: raw_candidate.entity_key.clone(),
-            })
+            let rewritten = improve_candidate_with_config(
+                &AutoRememberQualityInput {
+                    signal_kind: raw_candidate.signal_kind.as_str().to_string(),
+                    raw_content: raw_candidate.raw_content.clone(),
+                    supporting_evidence: raw_candidate.supporting_evidence.clone(),
+                    entity_key: raw_candidate.entity_key.clone(),
+                },
+                Some(&settings.auto_remember.improver),
+            )
             .await?;
 
             let content = validate_candidate(
@@ -856,6 +934,7 @@ fn queue_retry_failure(
                 supporting_evidence: raw_candidate.supporting_evidence.clone(),
                 retry_count: retry_count.max(current_retry_count.saturating_add(1)),
                 error: Some(error),
+                available_at_ms: store.next_retry_available_at_ms(retry_count),
             }) {
                 result.warnings.push(store_error);
             }
@@ -1930,8 +2009,19 @@ mod tests {
         let store = AutoRememberStore::open_existing()
             .unwrap()
             .expect("retry sidecar should exist after failed remember");
-        let retry_batch = store.load_retry_batch().unwrap();
-        assert_eq!(retry_batch.len(), 1);
+        let mut retry_record = store
+            .load_resubmittable_candidate(
+                "agentdesk-default",
+                &hash_candidate(
+                    "agentdesk-default",
+                    AutoRememberSignalKind::TechnicalDecision,
+                    "AgentDesk decided to standardize on SQLite sidecar as the audit store.",
+                ),
+            )
+            .unwrap()
+            .expect("retry candidate should be recoverable from audit");
+        retry_record.available_at_ms = chrono::Utc::now().timestamp_millis();
+        store.upsert_retry(&retry_record).unwrap();
 
         let second_request = AutoRememberTurnRequest {
             turn_id: "turn-2".to_string(),
@@ -2172,7 +2262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_resubmit_replays_abandoned_candidate() {
+    async fn manual_resubmit_cli_replays_abandoned_candidate() {
         let response_health = MockHttpResponse {
             status_line: "200 OK",
             headers: vec![],
@@ -2255,11 +2345,9 @@ mod tests {
             })
             .unwrap();
 
-        let result = resubmit_auto_remember_candidate(workspace, &candidate_hash)
+        crate::cli::auto_remember::cmd_auto_remember_resubmit(workspace, &candidate_hash)
             .await
             .unwrap();
-        assert_eq!(result.remembered_count, 1);
-        assert!(result.warnings.is_empty());
         assert!(
             store
                 .load_resubmittable_candidate(workspace, &candidate_hash)

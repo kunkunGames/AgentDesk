@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::runtime_layout;
+use crate::services::discord::settings::ResolvedAutoRememberImproverSettings;
 use crate::services::provider::ProviderKind;
 
 #[cfg(test)]
@@ -97,16 +98,23 @@ static TEST_AGENT_IMPROVER: LazyLock<Mutex<Option<TestAgentImprover>>> =
 pub(crate) async fn improve_candidate(
     candidate: &AutoRememberQualityInput,
 ) -> Result<AutoRememberRewriteOutput, String> {
-    match configured_backend() {
+    improve_candidate_with_config(candidate, None).await
+}
+
+pub(crate) async fn improve_candidate_with_config(
+    candidate: &AutoRememberQualityInput,
+    override_cfg: Option<&ResolvedAutoRememberImproverSettings>,
+) -> Result<AutoRememberRewriteOutput, String> {
+    match configured_backend(override_cfg) {
         AutoRememberImproverBackend::None => Err("auto-remember improver disabled".to_string()),
         AutoRememberImproverBackend::LocalLlm => rewrite_with_local_llm(candidate).await,
-        AutoRememberImproverBackend::Agent => rewrite_with_agent(candidate).await,
+        AutoRememberImproverBackend::Agent => rewrite_with_agent(candidate, override_cfg).await,
         AutoRememberImproverBackend::Both => {
             let local_error = match rewrite_with_local_llm(candidate).await {
                 Ok(output) => return Ok(output),
                 Err(error) => error,
             };
-            rewrite_with_agent(candidate)
+            rewrite_with_agent(candidate, override_cfg)
                 .await
                 .map_err(|agent_error| {
                     format!(
@@ -118,7 +126,13 @@ pub(crate) async fn improve_candidate(
 }
 
 pub(crate) fn rewrite_supported() -> bool {
-    configured_backend() != AutoRememberImproverBackend::None
+    rewrite_supported_with_config(None)
+}
+
+pub(crate) fn rewrite_supported_with_config(
+    override_cfg: Option<&ResolvedAutoRememberImproverSettings>,
+) -> bool {
+    configured_backend(override_cfg) != AutoRememberImproverBackend::None
 }
 
 #[cfg(test)]
@@ -144,13 +158,17 @@ pub(crate) fn agent_rewrite_runtime_config_for_tests()
 
 #[cfg(test)]
 pub(crate) fn configured_backend_for_tests() -> AutoRememberImproverBackend {
-    configured_backend()
+    configured_backend(None)
 }
 
-fn configured_backend() -> AutoRememberImproverBackend {
+fn configured_backend(
+    override_cfg: Option<&ResolvedAutoRememberImproverSettings>,
+) -> AutoRememberImproverBackend {
     parse_improver_mode(
         std::env::var(AUTO_REMEMBER_IMPROVER_BACKEND_ENV).ok(),
-        configured_runtime_improver_mode(),
+        override_cfg
+            .map(|cfg| cfg.mode.clone())
+            .or_else(configured_runtime_improver_mode),
     )
 }
 
@@ -187,13 +205,22 @@ fn local_rewrite_runtime_config() -> Result<LocalRewriteRuntimeConfig, String> {
 }
 
 fn agent_rewrite_runtime_config() -> Result<AgentRewriteRuntimeConfig, String> {
+    agent_rewrite_runtime_config_with_override(None)
+}
+
+fn agent_rewrite_runtime_config_with_override(
+    override_cfg: Option<&ResolvedAutoRememberImproverSettings>,
+) -> Result<AgentRewriteRuntimeConfig, String> {
     let provider = parse_provider_override(
         std::env::var(AUTO_REMEMBER_AGENT_PROVIDER_ENV).ok(),
-        configured_runtime_agent_provider(),
+        override_cfg
+            .and_then(|cfg| cfg.agent.provider.clone())
+            .or_else(configured_runtime_agent_provider),
     )?;
     let model = std::env::var(AUTO_REMEMBER_AGENT_MODEL_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| override_cfg.and_then(|cfg| cfg.agent.model.clone()))
         .or_else(configured_runtime_agent_model)
         .map(|value| normalize_whitespace(&value))
         .filter(|value| !value.is_empty());
@@ -201,6 +228,7 @@ fn agent_rewrite_runtime_config() -> Result<AgentRewriteRuntimeConfig, String> {
         .ok()
         .map(|value| normalize_whitespace(&value))
         .filter(|value| !value.is_empty())
+        .or_else(|| override_cfg.and_then(|cfg| cfg.agent.label.clone()))
         .or_else(configured_runtime_agent_label)
         .unwrap_or_else(|| provider.as_str().to_string());
 
@@ -372,8 +400,9 @@ async fn rewrite_with_local_llm(
 
 async fn rewrite_with_agent(
     candidate: &AutoRememberQualityInput,
+    override_cfg: Option<&ResolvedAutoRememberImproverSettings>,
 ) -> Result<AutoRememberRewriteOutput, String> {
-    let config = agent_rewrite_runtime_config()?;
+    let config = agent_rewrite_runtime_config_with_override(override_cfg)?;
     let prompt = format!(
         "You are the auto-remember quality improver agent `{}`.\nReturn JSON only.\n{}",
         config.label,
