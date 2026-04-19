@@ -507,8 +507,14 @@ fn lookup_active_create_pr_dispatch(
 ) -> anyhow::Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT td.id,
-                COALESCE(json_extract(COALESCE(td.context, '{}'), '$.dispatch_generation'), '')
+                COALESCE(
+                    NULLIF(json_extract(COALESCE(td.context, '{}'), '$.dispatch_generation'), ''),
+                    pt.dispatch_generation,
+                    ''
+                )
          FROM task_dispatches td
+         LEFT JOIN pr_tracking pt
+                ON pt.card_id = td.kanban_card_id
          WHERE td.kanban_card_id = ?1
            AND td.dispatch_type = 'create-pr'
            AND td.status IN ('pending', 'dispatched')
@@ -1444,6 +1450,51 @@ mod tests {
         assert_eq!(tracked.6.as_deref(), Some("generation-new"));
         assert_eq!(tracked.7, 9);
         assert_eq!(tracked.8, 0);
+    }
+
+    #[test]
+    fn sqlite_lookup_active_create_pr_dispatch_falls_back_to_tracking_generation() {
+        let mut conn =
+            libsql_rusqlite::Connection::open_in_memory().expect("open sqlite memory db");
+        conn.execute_batch(
+            "CREATE TABLE task_dispatches (
+                id TEXT PRIMARY KEY,
+                kanban_card_id TEXT,
+                dispatch_type TEXT,
+                status TEXT,
+                context TEXT
+            );
+            CREATE TABLE pr_tracking (
+                card_id TEXT PRIMARY KEY,
+                dispatch_generation TEXT
+            );",
+        )
+        .expect("create sqlite tables");
+
+        let tx = conn.transaction().expect("open sqlite transaction");
+        tx.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, dispatch_type, status, context)
+             VALUES (?1, ?2, 'create-pr', 'pending', ?3)",
+            libsql_rusqlite::params![
+                "dispatch-sqlite-fallback",
+                "card-sqlite-fallback",
+                "{\"note\":\"legacy-context-without-generation\"}",
+            ],
+        )
+        .expect("seed sqlite dispatch row");
+        tx.execute(
+            "INSERT INTO pr_tracking (card_id, dispatch_generation)
+             VALUES (?1, ?2)",
+            libsql_rusqlite::params!["card-sqlite-fallback", "tracked-generation-42"],
+        )
+        .expect("seed sqlite tracking row");
+
+        let active = lookup_active_create_pr_dispatch(&tx, "card-sqlite-fallback")
+            .expect("lookup sqlite active dispatch")
+            .expect("active dispatch should exist");
+
+        assert_eq!(active.0, "dispatch-sqlite-fallback");
+        assert_eq!(active.1, "tracked-generation-42");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
