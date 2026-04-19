@@ -235,6 +235,21 @@ async fn refresh_pg_pr_tracking_reuse_state(
     Ok(())
 }
 
+async fn load_pg_dispatch_status(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+) -> Result<Option<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT status
+         FROM task_dispatches
+         WHERE id = $1",
+    )
+    .bind(dispatch_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("load postgres dispatch status for {dispatch_id}: {e}"))
+}
+
 async fn handoff_create_pr_pg(
     pool: &PgPool,
     payload: &HandoffPayload,
@@ -257,8 +272,20 @@ async fn handoff_create_pr_pg(
 
     let existing = sqlx::query(
         "SELECT td.id,
-                COALESCE((td.context::jsonb)->>'dispatch_generation', '') AS dispatch_generation
+                COALESCE(
+                    NULLIF(
+                        substring(
+                            COALESCE(td.context, '')
+                            FROM '\"dispatch_generation\"\\s*:\\s*\"([^\"]+)\"'
+                        ),
+                        ''
+                    ),
+                    pt.dispatch_generation,
+                    ''
+                ) AS dispatch_generation
          FROM task_dispatches td
+         LEFT JOIN pr_tracking pt
+                ON pt.card_id = td.kanban_card_id
          WHERE td.kanban_card_id = $1
            AND td.dispatch_type = 'create-pr'
            AND td.status IN ('pending', 'dispatched')
@@ -281,6 +308,31 @@ async fn handoff_create_pr_pg(
         let generation = existing
             .try_get::<String, _>("dispatch_generation")
             .map_err(|e| format!("decode active postgres create-pr generation: {e}"))?;
+        match load_pg_dispatch_status(&mut tx, &dispatch_id)
+            .await?
+            .as_deref()
+        {
+            Some("pending") | Some("dispatched") => {}
+            Some("completed") => {
+                tx.commit().await.map_err(|e| {
+                    format!(
+                        "commit postgres create-pr completed reuse for {}: {e}",
+                        payload.card_id
+                    )
+                })?;
+                return Ok(json!({
+                    "ok": true,
+                    "reused": true,
+                    "dispatch_id": dispatch_id,
+                    "generation": generation,
+                }));
+            }
+            _ => {
+                // The candidate dispatch stopped being active before we refreshed
+                // pr_tracking/blocked_reason. Fall through to the fresh handoff path
+                // instead of rewinding terminal or failed state.
+            }
+        }
         refresh_pg_pr_tracking_reuse_state(&mut tx, payload, &generation, current_round).await?;
         sqlx::query(
             "UPDATE kanban_cards
@@ -527,6 +579,21 @@ fn refresh_pr_tracking_reuse_state(
     Ok(())
 }
 
+fn load_dispatch_status(
+    tx: &libsql_rusqlite::Transaction<'_>,
+    dispatch_id: &str,
+) -> anyhow::Result<Option<String>> {
+    tx.query_row(
+        "SELECT status
+         FROM task_dispatches
+         WHERE id = ?1",
+        [dispatch_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| anyhow::anyhow!("load dispatch status for {dispatch_id}: {e}"))
+}
+
 fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<serde_json::Value> {
     let mut conn = db
         .separate_conn()
@@ -548,6 +615,22 @@ fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<ser
     if let Some((dispatch_id, generation)) =
         lookup_active_create_pr_dispatch(&tx, &payload.card_id)?
     {
+        match load_dispatch_status(&tx, &dispatch_id)?.as_deref() {
+            Some("pending") | Some("dispatched") => {}
+            Some("completed") => {
+                tx.commit()?;
+                return Ok(json!({
+                    "ok": true,
+                    "reused": true,
+                    "dispatch_id": dispatch_id,
+                    "generation": generation,
+                }));
+            }
+            _ => {
+                // The dispatch is no longer active; do not rewind card/tracking
+                // state back into create-pr reuse for a completed or failed lane.
+            }
+        }
         refresh_pr_tracking_reuse_state(&tx, payload, &generation, current_round)?;
         tx.execute(
             "UPDATE kanban_cards SET blocked_reason = 'pr:creating', updated_at = datetime('now') \
@@ -1217,6 +1300,41 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_lookup_active_create_pr_dispatch_surfaces_malformed_context_errors() {
+        let mut conn =
+            libsql_rusqlite::Connection::open_in_memory().expect("open sqlite memory db");
+        conn.execute_batch(
+            "CREATE TABLE task_dispatches (
+                id TEXT PRIMARY KEY,
+                kanban_card_id TEXT,
+                dispatch_type TEXT,
+                status TEXT,
+                context TEXT
+            );",
+        )
+        .expect("create task_dispatches table");
+
+        let tx = conn.transaction().expect("open sqlite transaction");
+        tx.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, dispatch_type, status, context)
+             VALUES (?1, ?2, 'create-pr', 'pending', ?3)",
+            libsql_rusqlite::params![
+                "dispatch-sqlite-malformed",
+                "card-sqlite-malformed",
+                "{not-json",
+            ],
+        )
+        .expect("seed malformed sqlite dispatch context");
+
+        let err = lookup_active_create_pr_dispatch(&tx, "card-sqlite-malformed")
+            .expect_err("malformed context should surface lookup error");
+        assert!(
+            err.to_string().contains("lookup active create-pr dispatch"),
+            "unexpected malformed-context error: {err}"
+        );
+    }
+
+    #[test]
     fn sqlite_reuse_refresh_preserves_existing_tracking_target_fields() {
         let mut conn =
             libsql_rusqlite::Connection::open_in_memory().expect("open sqlite memory db");
@@ -1323,6 +1441,196 @@ mod tests {
         assert_eq!(tracked.6.as_deref(), Some("generation-new"));
         assert_eq!(tracked.7, 9);
         assert_eq!(tracked.8, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_automation_pg_handoff_reuses_dispatch_with_malformed_context() {
+        let test_db = TestDatabase::create().await;
+        let pool = test_db.migrate().await;
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, status)
+             VALUES ($1, $2, 'codex', 'idle')",
+        )
+        .bind("agent-reviewer")
+        .bind("Reviewer Agent")
+        .execute(&pool)
+        .await
+        .expect("insert reviewer agent");
+
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, repo_id, assigned_agent_id)
+             VALUES ($1, $2, 'review', $3, $4)",
+        )
+        .bind("card-pg-malformed-context")
+        .bind("PG malformed create-pr context")
+        .bind("repo-tracked")
+        .bind("agent-reviewer")
+        .execute(&pool)
+        .await
+        .expect("insert kanban card");
+
+        sqlx::query(
+            "INSERT INTO card_review_state (card_id, review_round, state)
+             VALUES ($1, 7, 'in_review')",
+        )
+        .bind("card-pg-malformed-context")
+        .execute(&pool)
+        .await
+        .expect("insert card review state");
+
+        sqlx::query(
+            "INSERT INTO pr_tracking (
+                card_id,
+                repo_id,
+                worktree_path,
+                branch,
+                head_sha,
+                state,
+                last_error,
+                dispatch_generation,
+                review_round,
+                retry_count,
+                created_at,
+                updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, 'escalated', 'stale error', $6, 2, 4, NOW(), NOW()
+             )",
+        )
+        .bind("card-pg-malformed-context")
+        .bind("repo-tracked")
+        .bind("/tracked/worktree")
+        .bind("tracked/branch")
+        .bind("tracked-head")
+        .bind("tracked-generation")
+        .execute(&pool)
+        .await
+        .expect("seed tracked pr_tracking row");
+
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id,
+                kanban_card_id,
+                dispatch_type,
+                status,
+                context,
+                created_at,
+                updated_at
+             ) VALUES (
+                $1, $2, 'create-pr', 'pending', $3, NOW(), NOW()
+             )",
+        )
+        .bind("dispatch-pg-malformed-context")
+        .bind("card-pg-malformed-context")
+        .bind("{not-json")
+        .execute(&pool)
+        .await
+        .expect("seed pending dispatch with malformed context");
+
+        let payload = HandoffPayload {
+            card_id: "card-pg-malformed-context".to_string(),
+            repo_id: "repo-new".to_string(),
+            worktree_path: Some("/new/worktree".to_string()),
+            branch: "new/branch".to_string(),
+            head_sha: Some("new-head".to_string()),
+            agent_id: "agent-reviewer".to_string(),
+            title: "Create PR".to_string(),
+        };
+
+        let reused = handoff_create_pr_pg(&pool, &payload)
+            .await
+            .expect("reuse should tolerate malformed postgres context");
+        assert_eq!(reused["ok"], true);
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["dispatch_id"], "dispatch-pg-malformed-context");
+        assert_eq!(reused["generation"], "tracked-generation");
+
+        let tracking = sqlx::query(
+            "SELECT pt.repo_id,
+                    pt.worktree_path,
+                    pt.branch,
+                    pt.head_sha,
+                    pt.state,
+                    pt.last_error,
+                    pt.dispatch_generation,
+                    pt.review_round,
+                    pt.retry_count,
+                    kc.blocked_reason
+             FROM pr_tracking pt
+             JOIN kanban_cards kc ON kc.id = pt.card_id
+             WHERE pt.card_id = $1",
+        )
+        .bind("card-pg-malformed-context")
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed tracking state");
+
+        assert_eq!(
+            tracking
+                .try_get::<String, _>("repo_id")
+                .expect("decode repo_id"),
+            "repo-tracked"
+        );
+        assert_eq!(
+            tracking
+                .try_get::<Option<String>, _>("worktree_path")
+                .expect("decode worktree_path")
+                .as_deref(),
+            Some("/tracked/worktree")
+        );
+        assert_eq!(
+            tracking
+                .try_get::<String, _>("branch")
+                .expect("decode branch"),
+            "tracked/branch"
+        );
+        assert_eq!(
+            tracking
+                .try_get::<Option<String>, _>("head_sha")
+                .expect("decode head_sha")
+                .as_deref(),
+            Some("tracked-head")
+        );
+        assert_eq!(
+            tracking
+                .try_get::<String, _>("state")
+                .expect("decode state"),
+            "create-pr"
+        );
+        assert_eq!(
+            tracking
+                .try_get::<Option<String>, _>("last_error")
+                .expect("decode last_error"),
+            None
+        );
+        assert_eq!(
+            tracking
+                .try_get::<String, _>("dispatch_generation")
+                .expect("decode generation"),
+            "tracked-generation"
+        );
+        assert_eq!(
+            tracking
+                .try_get::<i32, _>("review_round")
+                .expect("decode review_round"),
+            7
+        );
+        assert_eq!(
+            tracking
+                .try_get::<i32, _>("retry_count")
+                .expect("decode retry_count"),
+            0
+        );
+        assert_eq!(
+            tracking
+                .try_get::<Option<String>, _>("blocked_reason")
+                .expect("decode blocked_reason")
+                .as_deref(),
+            Some("pr:creating")
+        );
+
+        pool.close().await;
+        test_db.drop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
