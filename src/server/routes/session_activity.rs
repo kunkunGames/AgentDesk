@@ -326,4 +326,46 @@ mod tests {
         assert_eq!(state.active_dispatch_id.as_deref(), Some("dispatch-4"));
         assert!(state.is_working);
     }
+
+    #[test]
+    fn provider_prefixed_local_ready_for_input_tmux_session_becomes_idle() {
+        let now = Utc::now();
+        let mut probe_live = |_name: &str| true;
+        let mut probe_ready = |_name: &str| true;
+        let state = resolve_effective_state_with(
+            &["itismyfieldui-macmini".to_string()].into_iter().collect(),
+            Some(
+                "codex/discord_7a14995f62164ef1/itismyfieldui-Macmini:AgentDesk-codex-adk-dash-cdx",
+            ),
+            Some("working"),
+            None,
+            Some(
+                &(now - Duration::seconds(5))
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            ),
+            now,
+            &mut probe_live,
+            &mut probe_ready,
+        );
+
+        assert_eq!(state.status, "idle");
+        assert_eq!(state.active_dispatch_id, None);
+        assert!(!state.is_working);
+    }
+
+    #[test]
+    fn parse_session_key_supports_provider_prefixed_host() {
+        let parsed = parse_session_key(
+            "codex/discord_7a14995f62164ef1/itismyfieldui-Macmini:AgentDesk-codex-adk-dash-cdx",
+        );
+
+        assert_eq!(
+            parsed,
+            Some((
+                "itismyfieldui-macmini".to_string(),
+                "AgentDesk-codex-adk-dash-cdx".to_string(),
+            ))
+        );
+    }
 }
