@@ -107,6 +107,13 @@ pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
     execute_command_simple_cancellable(prompt, None)
 }
 
+pub fn execute_command_simple_with_model(
+    prompt: &str,
+    model_override: Option<&str>,
+) -> Result<String, String> {
+    execute_command_simple_cancellable_with_model(prompt, model_override, None)
+}
+
 pub fn execute_command_simple_with_timeout(
     prompt: &str,
     timeout: Duration,
@@ -127,12 +134,20 @@ pub fn execute_command_simple_cancellable(
     prompt: &str,
     cancel_token: Option<&CancelToken>,
 ) -> Result<String, String> {
+    execute_command_simple_cancellable_with_model(prompt, None, cancel_token)
+}
+
+fn execute_command_simple_cancellable_with_model(
+    prompt: &str,
+    model_override: Option<&str>,
+    cancel_token: Option<&CancelToken>,
+) -> Result<String, String> {
     let resolution = resolve_codex_binary();
     let codex_bin = resolution
         .resolved_path
         .clone()
         .ok_or_else(|| "Codex CLI not found".to_string())?;
-    let args = base_exec_args(None, prompt, None, false, None);
+    let args = base_exec_args(None, prompt, model_override, false, None);
     let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let mut command = Command::new(&codex_bin);
