@@ -82,10 +82,10 @@ fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
 
 fn native_fast_mode_override_for_turn(
     provider: &ProviderKind,
-    channel_fast_mode_enabled: bool,
+    channel_fast_mode_setting: Option<bool>,
 ) -> Option<bool> {
-    if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) && channel_fast_mode_enabled {
-        Some(true)
+    if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+        channel_fast_mode_setting
     } else {
         None
     }
@@ -768,7 +768,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let native_fast_mode_override = native_fast_mode_override_for_turn(
         &provider,
-        shared.fast_mode_channels.contains(&channel_id),
+        super::super::commands::channel_fast_mode_setting(shared, channel_id).await,
     );
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
     let compact_percent = ctx_thresholds.compact_pct_for(&provider);
@@ -2440,7 +2440,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let native_fast_mode_override = native_fast_mode_override_for_turn(
         &provider,
-        shared.fast_mode_channels.contains(&channel_id),
+        super::super::commands::channel_fast_mode_setting(shared, channel_id).await,
     );
 
     // Fetch context compact percent from ADK settings (provider-specific)
@@ -4260,15 +4260,19 @@ mod tests {
     #[test]
     fn native_fast_mode_override_only_applies_when_explicitly_enabled() {
         assert_eq!(
-            native_fast_mode_override_for_turn(&ProviderKind::Claude, true),
+            native_fast_mode_override_for_turn(&ProviderKind::Claude, Some(true)),
             Some(true)
         );
         assert_eq!(
-            native_fast_mode_override_for_turn(&ProviderKind::Claude, false),
+            native_fast_mode_override_for_turn(&ProviderKind::Claude, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Claude, None),
             None
         );
         assert_eq!(
-            native_fast_mode_override_for_turn(&ProviderKind::Gemini, true),
+            native_fast_mode_override_for_turn(&ProviderKind::Gemini, Some(true)),
             None
         );
     }

@@ -474,6 +474,12 @@ pub(super) struct SharedData {
     /// Per-channel native fast mode enablement for providers that support it.
     pub(super) fast_mode_channels: dashmap::DashSet<ChannelId>,
     /// Channels that must start a fresh provider session on the next turn
+    /// because the persisted fast-mode runtime override changed.
+    pub(super) fast_mode_session_reset_pending: dashmap::DashSet<ChannelId>,
+    /// Channels that must start a fresh provider session on the next turn
+    /// because the effective model override changed.
+    pub(super) model_session_reset_pending: dashmap::DashSet<ChannelId>,
+    /// Channels that must start a fresh provider session on the next turn
     /// because a persisted runtime execution setting changed.
     pub(super) session_reset_pending: dashmap::DashSet<ChannelId>,
     /// Per-message staged model picker selection.
@@ -554,6 +560,8 @@ pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
         last_turn_at: std::sync::Mutex::new(None),
         model_overrides: dashmap::DashMap::new(),
         fast_mode_channels: dashmap::DashSet::new(),
+        fast_mode_session_reset_pending: dashmap::DashSet::new(),
+        model_session_reset_pending: dashmap::DashSet::new(),
         session_reset_pending: dashmap::DashSet::new(),
         model_picker_pending: dashmap::DashMap::new(),
         dispatch_role_overrides: dashmap::DashMap::new(),
