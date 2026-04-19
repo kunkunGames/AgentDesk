@@ -565,6 +565,31 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_memory_settings_keeps_query_recall_when_auto_remember_defaults_false() {
+        crate::services::memory::reset_backend_health_for_tests();
+        with_temp_home(|temp_home: &TempDir| {
+            write_memory_backend_config(
+                temp_home,
+                serde_json::json!({
+                    "version": 2,
+                    "backend": "memento",
+                    "query_recall_after_bootstrap": true
+                }),
+            );
+
+            let resolved = resolve_memory_settings(None, None);
+            assert!(
+                resolved.query_recall_after_bootstrap,
+                "auto-remember defaulting to false must not change recall bootstrap semantics"
+            );
+            assert!(
+                !resolved.auto_remember_enabled,
+                "auto-remember stays opt-in even when other runtime memory defaults are enabled"
+            );
+        });
+    }
+
+    #[test]
     fn test_resolve_memory_settings_applies_override_and_clamps_values() {
         crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {

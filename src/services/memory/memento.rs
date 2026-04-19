@@ -78,6 +78,14 @@ pub(crate) struct MementoToolFeedbackRequest {
     pub trigger_type: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MementoFragmentSummary {
+    pub id: String,
+    pub content: Option<String>,
+    pub assertion_status: Option<String>,
+    pub keywords: Vec<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct MementoBackend {
     client: reqwest::Client,
@@ -465,6 +473,19 @@ impl MementoBackend {
         topic: &str,
         keywords: &[String],
     ) -> Result<(Vec<String>, TokenUsage), String> {
+        let (fragments, usage) = self.lookup_fragments(workspace, topic, keywords).await?;
+        Ok((
+            fragments.into_iter().map(|fragment| fragment.id).collect(),
+            usage,
+        ))
+    }
+
+    pub(crate) async fn lookup_fragments(
+        &self,
+        workspace: &str,
+        topic: &str,
+        keywords: &[String],
+    ) -> Result<(Vec<MementoFragmentSummary>, TokenUsage), String> {
         let config = self.runtime_config()?;
         let mut args = Map::new();
         args.insert("agentId".to_string(), json!("default"));
@@ -486,7 +507,35 @@ impl MementoBackend {
         let result = self
             .call_tool(&config, "recall", Value::Object(args))
             .await?;
-        Ok((recall_fragment_ids(&result.payload), result.token_usage))
+        Ok((
+            recall_fragment_summaries(&result.payload),
+            result.token_usage,
+        ))
+    }
+
+    pub(crate) async fn amend_assertion_status(
+        &self,
+        fragment_id: &str,
+        assertion_status: &str,
+    ) -> Result<TokenUsage, String> {
+        let fragment_id = normalize_whitespace(fragment_id);
+        if fragment_id.is_empty() {
+            return Err("memento amend requires non-empty fragment id".to_string());
+        }
+
+        let assertion_status = normalize_whitespace(assertion_status);
+        if assertion_status.is_empty() {
+            return Err("memento amend requires non-empty assertion status".to_string());
+        }
+
+        let config = self.runtime_config()?;
+        let mut args = Map::new();
+        args.insert("id".to_string(), json!(fragment_id));
+        args.insert("assertionStatus".to_string(), json!(assertion_status));
+
+        self.call_tool(&config, "amend", Value::Object(args))
+            .await
+            .map(|result| result.token_usage)
     }
 
     pub(crate) async fn tool_feedback(
@@ -671,15 +720,51 @@ fn normalize_whitespace(value: &str) -> String {
 }
 
 fn recall_fragment_ids(payload: &Value) -> Vec<String> {
+    recall_fragment_summaries(payload)
+        .into_iter()
+        .map(|fragment| fragment.id)
+        .collect()
+}
+
+fn recall_fragment_summaries(payload: &Value) -> Vec<MementoFragmentSummary> {
     payload
         .get("fragments")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|fragment| fragment.get("id").and_then(Value::as_str))
+        .filter_map(|fragment| {
+            let id = fragment
+                .get("id")
+                .and_then(Value::as_str)
+                .map(normalize_whitespace)
+                .filter(|value| !value.is_empty())?;
+            let content = optional_fragment_string(fragment, &["content"]);
+            let assertion_status =
+                optional_fragment_string(fragment, &["assertionStatus", "assertion_status"]);
+            let keywords = fragment
+                .get("keywords")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(normalize_whitespace)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            Some(MementoFragmentSummary {
+                id,
+                content,
+                assertion_status,
+                keywords,
+            })
+        })
+        .collect()
+}
+
+fn optional_fragment_string(fragment: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| fragment.get(*key).and_then(Value::as_str))
         .map(normalize_whitespace)
         .filter(|value| !value.is_empty())
-        .collect()
 }
 
 fn insert_optional_arg(args: &mut Map<String, Value>, key: &str, value: Option<String>) {

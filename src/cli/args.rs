@@ -303,6 +303,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Auto-remember audit and operator utilities
+    AutoRemember {
+        #[command(subcommand)]
+        action: AutoRememberAction,
+    },
     /// Call any API endpoint (curl replacement)
     Api {
         /// HTTP method (GET, POST, PATCH, PUT, DELETE)
@@ -340,6 +345,43 @@ pub(crate) enum Commands {
     Migrate {
         #[command(subcommand)]
         action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AutoRememberAction {
+    /// List recent auto-remember audit rows
+    Audit {
+        /// Optional workspace filter
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Optional status filter
+        #[arg(long, value_enum)]
+        status: Option<AutoRememberStatusArg>,
+        /// Max rows to print
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show aggregate status and validation skip counts
+    Summary {
+        /// Optional workspace filter
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manually resubmit a failed or abandoned candidate immediately
+    Resubmit {
+        /// Workspace recorded in the audit sidecar
+        #[arg(long)]
+        workspace: String,
+        /// Candidate hash recorded in the audit sidecar
+        #[arg(long = "candidate-hash")]
+        candidate_hash: String,
     },
 }
 
@@ -511,6 +553,16 @@ pub(crate) enum ReportProvider {
     Codex,
     Gemini,
     Qwen,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum AutoRememberStatusArg {
+    Remembered,
+    VerifiedPromoted,
+    DuplicateSkip,
+    ValidationSkipped,
+    RememberFailed,
+    AbandonedAfterRetries,
 }
 
 #[derive(Clone, ValueEnum)]

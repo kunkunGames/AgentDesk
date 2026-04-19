@@ -1,9 +1,10 @@
 use anyhow::Result;
 
 use super::args::{
-    AutoQueueAction, CardAction, Commands, ConfigAction, DispatchAction, MigrateAction,
-    ReportProvider,
+    AutoQueueAction, AutoRememberAction, AutoRememberStatusArg, CardAction, Commands, ConfigAction,
+    DispatchAction, MigrateAction, ReportProvider,
 };
+use crate::services::memory::AutoRememberMemoryStatus;
 
 fn exit_for_cli(result: std::result::Result<(), String>) -> Result<()> {
     match result {
@@ -328,6 +329,29 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             ConfigAction::Set { json } => super::client::cmd_config_set(&json),
             ConfigAction::Audit { dry_run } => super::client::cmd_config_audit(dry_run),
         }),
+        Commands::AutoRemember { action } => exit_for_cli(match action {
+            AutoRememberAction::Audit {
+                workspace,
+                status,
+                limit,
+                json,
+            } => super::auto_remember::cmd_auto_remember_audit(
+                workspace.as_deref(),
+                status.map(auto_remember_status_from_arg),
+                limit,
+                json,
+            ),
+            AutoRememberAction::Summary { workspace, json } => {
+                super::auto_remember::cmd_auto_remember_summary(workspace.as_deref(), json)
+            }
+            AutoRememberAction::Resubmit {
+                workspace,
+                candidate_hash,
+            } => super::direct::run_async(super::auto_remember::cmd_auto_remember_resubmit(
+                &workspace,
+                &candidate_hash,
+            )),
+        }),
         Commands::Api { method, path, body } => {
             exit_for_cli(super::client::cmd_api(&method, &path, body.as_deref()))
         }
@@ -352,6 +376,19 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
         Commands::Migrate { action } => exit_for_cli(match action {
             MigrateAction::Openclaw(args) => super::migrate::cmd_migrate_openclaw(args),
         }),
+    }
+}
+
+fn auto_remember_status_from_arg(value: AutoRememberStatusArg) -> AutoRememberMemoryStatus {
+    match value {
+        AutoRememberStatusArg::Remembered => AutoRememberMemoryStatus::Remembered,
+        AutoRememberStatusArg::VerifiedPromoted => AutoRememberMemoryStatus::VerifiedPromoted,
+        AutoRememberStatusArg::DuplicateSkip => AutoRememberMemoryStatus::DuplicateSkip,
+        AutoRememberStatusArg::ValidationSkipped => AutoRememberMemoryStatus::ValidationSkipped,
+        AutoRememberStatusArg::RememberFailed => AutoRememberMemoryStatus::RememberFailed,
+        AutoRememberStatusArg::AbandonedAfterRetries => {
+            AutoRememberMemoryStatus::AbandonedAfterRetries
+        }
     }
 }
 

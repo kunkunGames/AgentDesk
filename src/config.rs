@@ -701,10 +701,53 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+fn default_auto_remember_improver_mode() -> String {
+    "local_llm".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AutoRememberConfig {
+    /// Keeps auto-remember opt-in. Audit/dedupe state lives in a runtime-root-local
+    /// SQLite sidecar at `data/memory-auto-remember.sqlite`; moving or reinitializing
+    /// the runtime root resets that local state and can allow equivalent facts to be
+    /// written again.
     pub enabled: bool,
+    pub improver: AutoRememberImproverConfig,
+}
+
+impl Default for AutoRememberConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            improver: AutoRememberImproverConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoRememberImproverConfig {
+    #[serde(default = "default_auto_remember_improver_mode")]
+    pub mode: String,
+    pub agent: AutoRememberAgentConfig,
+}
+
+impl Default for AutoRememberImproverConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_auto_remember_improver_mode(),
+            agent: AutoRememberAgentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AutoRememberAgentConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1420,7 +1463,10 @@ mod tests {
                 endpoint: "http://127.0.0.1:8765".to_string(),
                 access_key_env: "MEMENTO_API_KEY".to_string(),
             },
-            auto_remember: AutoRememberConfig { enabled: true },
+            auto_remember: AutoRememberConfig {
+                enabled: true,
+                ..AutoRememberConfig::default()
+            },
         });
 
         save_to_path(&path, &config).unwrap();

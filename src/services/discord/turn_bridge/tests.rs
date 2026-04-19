@@ -744,6 +744,37 @@ fn build_background_memory_jobs_keeps_capture_without_auto_remember() {
     }
 }
 
+#[tokio::test]
+async fn await_background_memory_postprocess_timeout_does_not_cancel_inflight_task() {
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = completed_tx.send(());
+        super::memory_postprocess::MemoryPostprocessResult {
+            token_usage: TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+            },
+        }
+    });
+
+    let result = super::await_background_memory_postprocess(
+        ChannelId::new(42),
+        task,
+        Duration::from_millis(5),
+    )
+    .await;
+
+    assert!(
+        result.is_none(),
+        "outer timeout should skip token accounting instead of surfacing a completed result"
+    );
+    tokio::time::timeout(Duration::from_secs(1), completed_rx)
+        .await
+        .expect("in-flight postprocess should keep running after outer timeout")
+        .expect("background postprocess should complete successfully");
+}
+
 #[test]
 fn retry_context_history_keeps_last_ten_visible_messages() {
     let history = (0..12)

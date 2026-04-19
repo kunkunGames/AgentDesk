@@ -175,6 +175,34 @@ fn build_background_memory_jobs(
     jobs
 }
 
+async fn await_background_memory_postprocess(
+    channel_id: ChannelId,
+    memory_task: tokio::task::JoinHandle<memory_postprocess::MemoryPostprocessResult>,
+    wait_budget: std::time::Duration,
+) -> Option<memory_postprocess::MemoryPostprocessResult> {
+    match tokio::time::timeout(wait_budget, memory_task).await {
+        Ok(Ok(result)) => Some(result),
+        Ok(Err(err)) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] [memory] background task join failed for channel {}: {}",
+                channel_id.get(),
+                err
+            );
+            None
+        }
+        Err(_) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] [memory] background task timed out after {}s for channel {} — skipping token accounting",
+                wait_budget.as_secs(),
+                channel_id.get(),
+            );
+            None
+        }
+    }
+}
+
 fn total_model_input_tokens(
     input_tokens: u64,
     cache_create_tokens: u64,
@@ -1923,28 +1951,17 @@ pub(super) fn spawn_turn_bridge(
                 capture_memory_settings,
                 background_memory_jobs,
             );
-            match tokio::time::timeout(std::time::Duration::from_secs(30), memory_task).await {
-                Ok(Ok(result)) => {
-                    accumulated_memory_input_tokens = accumulated_memory_input_tokens
-                        .saturating_add(result.token_usage.input_tokens);
-                    accumulated_memory_output_tokens = accumulated_memory_output_tokens
-                        .saturating_add(result.token_usage.output_tokens);
-                }
-                Ok(Err(err)) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
-                        "  [{ts}] [memory] background task join failed for channel {}: {}",
-                        channel_id.get(),
-                        err
-                    );
-                }
-                Err(_) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
-                        "  [{ts}] [memory] background task timed out after 30s for channel {} — skipping token accounting",
-                        channel_id.get(),
-                    );
-                }
+            if let Some(result) = await_background_memory_postprocess(
+                channel_id,
+                memory_task,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                accumulated_memory_input_tokens =
+                    accumulated_memory_input_tokens.saturating_add(result.token_usage.input_tokens);
+                accumulated_memory_output_tokens = accumulated_memory_output_tokens
+                    .saturating_add(result.token_usage.output_tokens);
             }
         }
 

@@ -1,31 +1,25 @@
 use std::collections::HashSet;
-use std::time::Duration;
 
 use regex::Regex;
-use reqwest::Url;
-use serde::Deserialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
 use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
 
+use super::auto_remember_quality::{
+    AutoRememberQualityInput, improve_candidate, rewrite_supported,
+};
 use super::auto_remember_store::{
-    AutoRememberAuditEntry, AutoRememberMemoryStatus, AutoRememberStage, AutoRememberStore,
+    AutoRememberAuditEntry, AutoRememberMemoryStatus, AutoRememberRetryRecord, AutoRememberStage,
+    AutoRememberStore,
 };
 use super::{
-    MementoBackend, MementoRememberRequest, TokenUsage, backend_is_active,
+    MementoBackend, MementoFragmentSummary, MementoRememberRequest, TokenUsage, backend_is_active,
     resolve_memento_workspace,
 };
 
 const AUTO_REMEMBER_SOURCE: &str = "agentdesk:auto-remember";
 const AUTO_REMEMBER_AGENT_ID: &str = "default";
-const AUTO_REMEMBER_LOCAL_REWRITE_SCHEMA_VERSION: &str = "1";
-const AUTO_REMEMBER_LOCAL_REWRITE_TIMEOUT_MS: u64 = 8_000;
-const AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV: &str = "AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL";
-const AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV: &str = "AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL";
-const DEFAULT_AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL: &str =
-    "http://127.0.0.1:1234/v1/chat/completions";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AutoRememberSignalKind {
@@ -40,6 +34,15 @@ impl AutoRememberSignalKind {
             Self::ConfirmedErrorRootCause => "confirmed_error_root_cause",
             Self::TechnicalDecision => "technical_decision",
             Self::ConfigChange => "config_change",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "confirmed_error_root_cause" => Some(Self::ConfirmedErrorRootCause),
+            "technical_decision" => Some(Self::TechnicalDecision),
+            "config_change" => Some(Self::ConfigChange),
+            _ => None,
         }
     }
 
@@ -110,8 +113,6 @@ enum AutoRememberDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutoRememberSkipReason {
     Uncertain,
-    AmbiguousSignal,
-    LowPrecision,
     MissingEntityKey,
     MissingWorkspace,
     ValidatorRejected,
@@ -119,39 +120,28 @@ enum AutoRememberSkipReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AutoRememberRewriteOutput {
-    content: String,
-    keyword_suggestions: Vec<String>,
+enum AutoRememberCandidateSource {
+    Fresh,
+    RetryQueue { retry_count: u32 },
+}
+
+impl AutoRememberCandidateSource {
+    fn retry_count(&self) -> u32 {
+        match self {
+            Self::Fresh => 0,
+            Self::RetryQueue { retry_count } => *retry_count,
+        }
+    }
+
+    fn is_retry_queue(&self) -> bool {
+        matches!(self, Self::RetryQueue { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalRewriteRuntimeConfig {
-    base_url: String,
-    model: String,
-    timeout: Duration,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalRewriteChatResponse {
-    choices: Vec<LocalRewriteChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalRewriteChoice {
-    message: LocalRewriteMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalRewriteMessage {
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LocalRewritePayload {
-    schema_version: String,
-    content: String,
-    #[serde(default)]
-    keywords: Vec<String>,
+struct AutoRememberQueuedCandidate {
+    raw: AutoRememberRawCandidate,
+    source: AutoRememberCandidateSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,27 +176,199 @@ pub(crate) async fn run_auto_remember(
         };
     }
 
-    let candidates = extract_candidates(&request);
-    if candidates.is_empty() {
-        return AutoRememberExecutionResult::default();
-    }
-
-    let store = match AutoRememberStore::open() {
+    let mut result = AutoRememberExecutionResult::default();
+    let existing_store = match AutoRememberStore::open_existing() {
         Ok(store) => store,
         Err(error) => {
-            return AutoRememberExecutionResult {
-                warnings: vec![error],
-                ..AutoRememberExecutionResult::default()
-            };
+            result.warnings.push(error);
+            None
         }
+    };
+
+    let retry_candidates = load_retry_candidates(existing_store.as_ref(), &mut result);
+    let fresh_candidates = extract_candidates(&request)
+        .into_iter()
+        .map(|raw| AutoRememberQueuedCandidate {
+            raw,
+            source: AutoRememberCandidateSource::Fresh,
+        })
+        .collect::<Vec<_>>();
+
+    if retry_candidates.is_empty() && fresh_candidates.is_empty() {
+        return result;
+    }
+
+    let store = match existing_store {
+        Some(store) => store,
+        None => match AutoRememberStore::open() {
+            Ok(store) => store,
+            Err(error) => {
+                result.warnings.push(error);
+                return result;
+            }
+        },
     };
     let backend = MementoBackend::new(settings.clone());
 
     let mut seen_hashes = HashSet::new();
-    let mut result = AutoRememberExecutionResult::default();
+    let mut candidates = retry_candidates;
+    candidates.extend(fresh_candidates);
 
-    for raw_candidate in candidates {
-        if !seen_hashes.insert(raw_candidate.candidate_hash.clone()) {
+    for queued in candidates {
+        process_candidate(
+            &request,
+            &store,
+            &backend,
+            queued,
+            &mut seen_hashes,
+            &mut result,
+        )
+        .await;
+    }
+
+    result
+}
+
+pub(crate) async fn resubmit_auto_remember_candidate(
+    workspace: &str,
+    candidate_hash: &str,
+) -> Result<AutoRememberExecutionResult, String> {
+    let workspace = normalize_whitespace(workspace);
+    let candidate_hash = normalize_whitespace(candidate_hash);
+    if workspace.is_empty() {
+        return Err("auto-remember resubmit requires non-empty workspace".to_string());
+    }
+    if candidate_hash.is_empty() {
+        return Err("auto-remember resubmit requires non-empty candidate hash".to_string());
+    }
+
+    if !backend_is_active(MemoryBackendKind::Memento) {
+        return Err(
+            "memento backend inactive; cannot resubmit auto-remember candidate".to_string(),
+        );
+    }
+
+    let store = AutoRememberStore::open_existing()?
+        .ok_or_else(|| "auto-remember sidecar does not exist for this runtime root".to_string())?;
+    let record = store
+        .load_resubmittable_candidate(&workspace, &candidate_hash)?
+        .ok_or_else(|| {
+            format!(
+                "no resubmittable auto-remember candidate found for workspace='{workspace}' hash='{candidate_hash}'"
+            )
+        })?;
+    let raw_candidate = candidate_from_retry_record(&record).ok_or_else(|| {
+        format!(
+            "auto-remember candidate '{}' has unsupported signal_kind '{}'",
+            record.candidate_hash, record.signal_kind
+        )
+    })?;
+
+    store.reset_retry_state(&workspace, &candidate_hash)?;
+
+    let backend = MementoBackend::new(ResolvedMemorySettings {
+        backend: MemoryBackendKind::Memento,
+        ..ResolvedMemorySettings::default()
+    });
+    let request = AutoRememberTurnRequest {
+        turn_id: format!(
+            "manual-resubmit-{}",
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        ),
+        role_id: String::new(),
+        channel_id: 0,
+        user_text: String::new(),
+        assistant_text: String::new(),
+        transcript_events: Vec::new(),
+    };
+
+    let mut seen_hashes = HashSet::new();
+    let mut result = AutoRememberExecutionResult::default();
+    process_candidate(
+        &request,
+        &store,
+        &backend,
+        AutoRememberQueuedCandidate {
+            raw: raw_candidate,
+            source: AutoRememberCandidateSource::Fresh,
+        },
+        &mut seen_hashes,
+        &mut result,
+    )
+    .await;
+    Ok(result)
+}
+
+fn load_retry_candidates(
+    store: Option<&AutoRememberStore>,
+    result: &mut AutoRememberExecutionResult,
+) -> Vec<AutoRememberQueuedCandidate> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    let records = match store.load_retry_batch() {
+        Ok(records) => records,
+        Err(error) => {
+            result.warnings.push(error);
+            return Vec::new();
+        }
+    };
+
+    let mut queued = Vec::new();
+    for record in records {
+        match candidate_from_retry_record(&record) {
+            Some(raw) => queued.push(AutoRememberQueuedCandidate {
+                raw,
+                source: AutoRememberCandidateSource::RetryQueue {
+                    retry_count: record.retry_count,
+                },
+            }),
+            None => {
+                result.warnings.push(format!(
+                    "auto-remember retry queue contains invalid signal_kind '{}'",
+                    record.signal_kind
+                ));
+                if let Err(error) = store.delete_retry(&record.workspace, &record.candidate_hash) {
+                    result.warnings.push(error);
+                }
+            }
+        }
+    }
+
+    queued
+}
+
+async fn process_candidate(
+    request: &AutoRememberTurnRequest,
+    store: &AutoRememberStore,
+    backend: &MementoBackend,
+    queued: AutoRememberQueuedCandidate,
+    seen_hashes: &mut HashSet<String>,
+    result: &mut AutoRememberExecutionResult,
+) {
+    let raw_candidate = queued.raw;
+    let retry_count = queued.source.retry_count();
+
+    if !seen_hashes.insert(raw_candidate.candidate_hash.clone()) {
+        result.duplicate_count += 1;
+        let _ = store.upsert_audit(AutoRememberAuditEntry {
+            turn_id: &request.turn_id,
+            candidate_hash: &raw_candidate.candidate_hash,
+            signal_kind: raw_candidate.signal_kind.as_str(),
+            workspace: &raw_candidate.workspace,
+            stage: AutoRememberStage::Dedupe,
+            status: AutoRememberMemoryStatus::DuplicateSkip,
+            retry_count,
+            error: Some("duplicate candidate in retry-drain + current turn"),
+            raw_content: Some(&raw_candidate.raw_content),
+            entity_key: raw_candidate.entity_key.as_deref(),
+            supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
+        });
+        return;
+    }
+
+    match store.lookup_record(&raw_candidate.workspace, &raw_candidate.candidate_hash) {
+        Ok(Some(record)) if record.status.suppresses_repeat() => {
             result.duplicate_count += 1;
             let _ = store.upsert_audit(AutoRememberAuditEntry {
                 turn_id: &request.turn_id,
@@ -215,65 +377,32 @@ pub(crate) async fn run_auto_remember(
                 workspace: &raw_candidate.workspace,
                 stage: AutoRememberStage::Dedupe,
                 status: AutoRememberMemoryStatus::DuplicateSkip,
-                retry_count: 0,
-                error: Some("duplicate candidate in same turn"),
+                retry_count: record.retry_count,
+                error: Some("candidate already processed"),
+                raw_content: Some(&raw_candidate.raw_content),
+                entity_key: raw_candidate.entity_key.as_deref(),
+                supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
             });
-            continue;
-        }
-
-        match store.lookup_record(&raw_candidate.workspace, &raw_candidate.candidate_hash) {
-            Ok(Some(record)) if record.status.suppresses_repeat() => {
-                result.duplicate_count += 1;
-                let _ = store.upsert_audit(AutoRememberAuditEntry {
-                    turn_id: &request.turn_id,
-                    candidate_hash: &raw_candidate.candidate_hash,
-                    signal_kind: raw_candidate.signal_kind.as_str(),
-                    workspace: &raw_candidate.workspace,
-                    stage: AutoRememberStage::Dedupe,
-                    status: AutoRememberMemoryStatus::DuplicateSkip,
-                    retry_count: record.retry_count,
-                    error: Some("candidate already processed"),
-                });
-                continue;
-            }
-            Ok(_) => {}
-            Err(error) => {
-                result.warnings.push(error);
-                continue;
-            }
-        }
-
-        let decision = pre_validate_candidate(&raw_candidate);
-        let candidate = match decision {
-            AutoRememberDecision::StoreDirectly => validate_candidate(
-                raw_candidate.signal_kind,
-                &raw_candidate.raw_content,
-                raw_candidate.entity_key.as_deref(),
-            )
-            .map(|content| build_validated_candidate(&raw_candidate, content, &[])),
-            AutoRememberDecision::RewriteNeeded => match rewrite_candidate(&raw_candidate).await {
-                Ok(Some(rewritten)) => validate_candidate(
-                    raw_candidate.signal_kind,
-                    &rewritten.content,
-                    raw_candidate.entity_key.as_deref(),
-                )
-                .map(|content| {
-                    build_validated_candidate(
-                        &raw_candidate,
-                        content,
-                        &rewritten.keyword_suggestions,
-                    )
-                }),
-                Ok(None) => None,
-                Err(error) => {
+            if queued.source.is_retry_queue() {
+                if let Err(error) =
+                    store.delete_retry(&raw_candidate.workspace, &raw_candidate.candidate_hash)
+                {
                     result.warnings.push(error);
-                    None
                 }
-            },
-            AutoRememberDecision::Skip(_) => None,
-        };
+            }
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            result.warnings.push(error);
+            return;
+        }
+    }
 
-        let Some(candidate) = candidate else {
+    let decision = pre_validate_candidate(&raw_candidate);
+    let candidate = match materialize_candidate(&raw_candidate, decision).await {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
             let _ = store.upsert_audit(AutoRememberAuditEntry {
                 turn_id: &request.turn_id,
                 candidate_hash: &raw_candidate.candidate_hash,
@@ -281,82 +410,149 @@ pub(crate) async fn run_auto_remember(
                 workspace: &raw_candidate.workspace,
                 stage: AutoRememberStage::Validate,
                 status: AutoRememberMemoryStatus::ValidationSkipped,
-                retry_count: 0,
+                retry_count,
                 error: Some(skip_reason_text(decision)),
+                raw_content: Some(&raw_candidate.raw_content),
+                entity_key: raw_candidate.entity_key.as_deref(),
+                supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
             });
-            continue;
-        };
-
-        let supersedes = if candidate.signal_kind == AutoRememberSignalKind::ConfigChange {
-            if let Some(entity_key) = candidate.entity_key.as_deref() {
-                match backend
-                    .lookup_fragment_ids(
-                        &candidate.workspace,
-                        candidate.signal_kind.topic(),
-                        &[format!("config-key:{entity_key}")],
-                    )
-                    .await
+            if queued.source.is_retry_queue() {
+                if let Err(error) =
+                    store.delete_retry(&raw_candidate.workspace, &raw_candidate.candidate_hash)
                 {
-                    Ok((fragment_ids, usage)) => {
-                        result.token_usage.saturating_add_assign(usage);
-                        fragment_ids
-                    }
-                    Err(error) => {
-                        result.warnings.push(error);
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        match backend
-            .remember(memento_request_from_candidate(&candidate, supersedes))
-            .await
-        {
-            Ok(token_usage) => {
-                result.token_usage.saturating_add_assign(token_usage);
-                result.remembered_count += 1;
-                if let Err(error) = store.upsert_audit(AutoRememberAuditEntry {
-                    turn_id: &request.turn_id,
-                    candidate_hash: &candidate.candidate_hash,
-                    signal_kind: candidate.signal_kind.as_str(),
-                    workspace: &candidate.workspace,
-                    stage: AutoRememberStage::Remember,
-                    status: AutoRememberMemoryStatus::Remembered,
-                    retry_count: 0,
-                    error: None,
-                }) {
                     result.warnings.push(error);
                 }
             }
-            Err(error) => {
-                result.warnings.push(error.clone());
-                match store.next_failure_status(&candidate.workspace, &candidate.candidate_hash) {
-                    Ok((status, retry_count)) => {
-                        if let Err(store_error) = store.upsert_audit(AutoRememberAuditEntry {
-                            turn_id: &request.turn_id,
-                            candidate_hash: &candidate.candidate_hash,
-                            signal_kind: candidate.signal_kind.as_str(),
-                            workspace: &candidate.workspace,
-                            stage: AutoRememberStage::Remember,
-                            status,
-                            retry_count,
-                            error: Some(&error),
-                        }) {
-                            result.warnings.push(store_error);
-                        }
-                    }
-                    Err(store_error) => result.warnings.push(store_error),
+            return;
+        }
+        Err(error) => {
+            queue_retry_failure(request, store, &raw_candidate, retry_count, error, result);
+            return;
+        }
+    };
+
+    let existing_fragments = {
+        let lookup_keywords = candidate_lookup_keywords(&candidate);
+        if lookup_keywords.is_empty() {
+            Vec::new()
+        } else {
+            match backend
+                .lookup_fragments(
+                    &candidate.workspace,
+                    candidate.signal_kind.topic(),
+                    &lookup_keywords,
+                )
+                .await
+            {
+                Ok((fragments, usage)) => {
+                    result.token_usage.saturating_add_assign(usage);
+                    fragments
+                }
+                Err(error) => {
+                    result.warnings.push(error);
+                    Vec::new()
                 }
             }
         }
+    };
+    let active_fragments = existing_fragments
+        .into_iter()
+        .filter(|fragment| !fragment_is_rejected(fragment))
+        .collect::<Vec<_>>();
+
+    if let Some(equivalent_fragment) = active_fragments
+        .iter()
+        .find(|fragment| fragment_matches_candidate(fragment, &candidate))
+    {
+        let assertion_status = fragment_assertion_status(equivalent_fragment);
+        if assertion_status == Some("inferred") {
+            match backend
+                .amend_assertion_status(&equivalent_fragment.id, "verified")
+                .await
+            {
+                Ok(token_usage) => {
+                    result.token_usage.saturating_add_assign(token_usage);
+                    let _ = store.upsert_audit(AutoRememberAuditEntry {
+                        turn_id: &request.turn_id,
+                        candidate_hash: &candidate.candidate_hash,
+                        signal_kind: candidate.signal_kind.as_str(),
+                        workspace: &candidate.workspace,
+                        stage: AutoRememberStage::Verify,
+                        status: AutoRememberMemoryStatus::VerifiedPromoted,
+                        retry_count,
+                        error: Some("promoted equivalent inferred fragment to verified"),
+                        raw_content: Some(&raw_candidate.raw_content),
+                        entity_key: raw_candidate.entity_key.as_deref(),
+                        supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
+                    });
+                    if let Err(error) =
+                        store.delete_retry(&candidate.workspace, &candidate.candidate_hash)
+                    {
+                        result.warnings.push(error);
+                    }
+                    return;
+                }
+                Err(error) => result.warnings.push(error),
+            }
+        } else {
+            result.duplicate_count += 1;
+            let _ = store.upsert_audit(AutoRememberAuditEntry {
+                turn_id: &request.turn_id,
+                candidate_hash: &candidate.candidate_hash,
+                signal_kind: candidate.signal_kind.as_str(),
+                workspace: &candidate.workspace,
+                stage: AutoRememberStage::Dedupe,
+                status: AutoRememberMemoryStatus::DuplicateSkip,
+                retry_count,
+                error: Some("equivalent fragment already exists"),
+                raw_content: Some(&raw_candidate.raw_content),
+                entity_key: raw_candidate.entity_key.as_deref(),
+                supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
+            });
+            if let Err(error) = store.delete_retry(&candidate.workspace, &candidate.candidate_hash)
+            {
+                result.warnings.push(error);
+            }
+            return;
+        }
     }
 
-    result
+    let supersedes = active_fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<Vec<_>>();
+
+    match backend
+        .remember(memento_request_from_candidate(&candidate, supersedes))
+        .await
+    {
+        Ok(token_usage) => {
+            result.token_usage.saturating_add_assign(token_usage);
+            result.remembered_count += 1;
+            if let Err(error) = store.upsert_audit(AutoRememberAuditEntry {
+                turn_id: &request.turn_id,
+                candidate_hash: &candidate.candidate_hash,
+                signal_kind: candidate.signal_kind.as_str(),
+                workspace: &candidate.workspace,
+                stage: AutoRememberStage::Remember,
+                status: AutoRememberMemoryStatus::Remembered,
+                retry_count,
+                error: None,
+                raw_content: Some(&raw_candidate.raw_content),
+                entity_key: raw_candidate.entity_key.as_deref(),
+                supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
+            }) {
+                result.warnings.push(error);
+            }
+            if let Err(error) = store.delete_retry(&candidate.workspace, &candidate.candidate_hash)
+            {
+                result.warnings.push(error);
+            }
+        }
+        Err(error) => {
+            queue_retry_failure(request, store, &raw_candidate, retry_count, error, result)
+        }
+    }
 }
 
 fn extract_candidates(request: &AutoRememberTurnRequest) -> Vec<AutoRememberRawCandidate> {
@@ -493,6 +689,7 @@ fn pre_validate_candidate(candidate: &AutoRememberRawCandidate) -> AutoRememberD
     if contains_uncertainty(&candidate.raw_content) {
         return AutoRememberDecision::Skip(AutoRememberSkipReason::Uncertain);
     }
+    let rewrite_supported = rewrite_supported();
 
     match candidate.signal_kind {
         AutoRememberSignalKind::ConfigChange => {
@@ -504,7 +701,7 @@ fn pre_validate_candidate(candidate: &AutoRememberRawCandidate) -> AutoRememberD
                 candidate.entity_key.as_deref(),
             ) {
                 AutoRememberDecision::StoreDirectly
-            } else if can_rewrite_config_change(candidate) {
+            } else if rewrite_supported && can_rewrite_config_change(candidate) {
                 AutoRememberDecision::RewriteNeeded
             } else {
                 AutoRememberDecision::Skip(AutoRememberSkipReason::RewriteUnavailable)
@@ -515,10 +712,14 @@ fn pre_validate_candidate(candidate: &AutoRememberRawCandidate) -> AutoRememberD
                 && is_atomic_sentence(&candidate.raw_content)
             {
                 AutoRememberDecision::StoreDirectly
-            } else if can_rewrite_root_cause(candidate) {
+            } else if rewrite_supported && can_rewrite_root_cause(candidate) {
                 AutoRememberDecision::RewriteNeeded
             } else {
-                AutoRememberDecision::Skip(AutoRememberSkipReason::ValidatorRejected)
+                AutoRememberDecision::Skip(if rewrite_supported {
+                    AutoRememberSkipReason::ValidatorRejected
+                } else {
+                    AutoRememberSkipReason::RewriteUnavailable
+                })
             }
         }
         AutoRememberSignalKind::TechnicalDecision => {
@@ -526,10 +727,14 @@ fn pre_validate_candidate(candidate: &AutoRememberRawCandidate) -> AutoRememberD
                 && is_atomic_sentence(&candidate.raw_content)
             {
                 AutoRememberDecision::StoreDirectly
-            } else if can_rewrite_decision(candidate) {
+            } else if rewrite_supported && can_rewrite_decision(candidate) {
                 AutoRememberDecision::RewriteNeeded
             } else {
-                AutoRememberDecision::Skip(AutoRememberSkipReason::ValidatorRejected)
+                AutoRememberDecision::Skip(if rewrite_supported {
+                    AutoRememberSkipReason::ValidatorRejected
+                } else {
+                    AutoRememberSkipReason::RewriteUnavailable
+                })
             }
         }
     }
@@ -555,184 +760,108 @@ fn build_validated_candidate(
     }
 }
 
-fn local_rewrite_runtime_config() -> Result<LocalRewriteRuntimeConfig, String> {
-    let base_url = std::env::var(AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL.to_string());
-    let parsed_url = Url::parse(&base_url)
-        .map_err(|error| format!("auto-remember local rewrite base URL is invalid: {error}"))?;
-    if !is_loopback_url(&parsed_url) {
-        return Err("auto-remember local rewrite base URL must stay on loopback".to_string());
-    }
+async fn materialize_candidate(
+    raw_candidate: &AutoRememberRawCandidate,
+    decision: AutoRememberDecision,
+) -> Result<Option<AutoRememberValidatedCandidate>, String> {
+    match decision {
+        AutoRememberDecision::StoreDirectly => Ok(validate_candidate(
+            raw_candidate.signal_kind,
+            &raw_candidate.raw_content,
+            raw_candidate.entity_key.as_deref(),
+        )
+        .map(|content| build_validated_candidate(raw_candidate, content, &[]))),
+        AutoRememberDecision::RewriteNeeded => {
+            let rewritten = improve_candidate(&AutoRememberQualityInput {
+                signal_kind: raw_candidate.signal_kind.as_str().to_string(),
+                raw_content: raw_candidate.raw_content.clone(),
+                supporting_evidence: raw_candidate.supporting_evidence.clone(),
+                entity_key: raw_candidate.entity_key.clone(),
+            })
+            .await?;
 
-    let model = std::env::var(AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("LOCAL_LLM_MODEL").ok())
-        .or_else(|| std::env::var("LMSTUDIO_MODEL").ok())
-        .map(|value| normalize_whitespace(&value))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "auto-remember local rewrite model is not configured; set {}",
-                AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV
+            let content = validate_candidate(
+                raw_candidate.signal_kind,
+                &rewritten.content,
+                raw_candidate.entity_key.as_deref(),
             )
-        })?;
+            .ok_or_else(|| "auto-remember rewritten candidate failed validator".to_string())?;
 
-    Ok(LocalRewriteRuntimeConfig {
-        base_url,
-        model,
-        timeout: Duration::from_millis(AUTO_REMEMBER_LOCAL_REWRITE_TIMEOUT_MS),
+            Ok(Some(build_validated_candidate(
+                raw_candidate,
+                content,
+                &rewritten.keyword_suggestions,
+            )))
+        }
+        AutoRememberDecision::Skip(_) => Ok(None),
+    }
+}
+
+fn candidate_from_retry_record(
+    record: &AutoRememberRetryRecord,
+) -> Option<AutoRememberRawCandidate> {
+    Some(AutoRememberRawCandidate {
+        signal_kind: AutoRememberSignalKind::from_str(&record.signal_kind)?,
+        raw_content: record.raw_content.clone(),
+        supporting_evidence: record.supporting_evidence.clone(),
+        entity_key: record.entity_key.clone(),
+        workspace: record.workspace.clone(),
+        candidate_hash: record.candidate_hash.clone(),
     })
 }
 
-fn is_loopback_url(url: &Url) -> bool {
-    matches!(
-        url.host_str(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1")
-    )
-}
+fn queue_retry_failure(
+    request: &AutoRememberTurnRequest,
+    store: &AutoRememberStore,
+    raw_candidate: &AutoRememberRawCandidate,
+    current_retry_count: u32,
+    error: String,
+    result: &mut AutoRememberExecutionResult,
+) {
+    result.warnings.push(error.clone());
+    match store.next_failure_status(&raw_candidate.workspace, &raw_candidate.candidate_hash) {
+        Ok((status, retry_count)) => {
+            if let Err(store_error) = store.upsert_audit(AutoRememberAuditEntry {
+                turn_id: &request.turn_id,
+                candidate_hash: &raw_candidate.candidate_hash,
+                signal_kind: raw_candidate.signal_kind.as_str(),
+                workspace: &raw_candidate.workspace,
+                stage: AutoRememberStage::Remember,
+                status,
+                retry_count,
+                error: Some(&error),
+                raw_content: Some(&raw_candidate.raw_content),
+                entity_key: raw_candidate.entity_key.as_deref(),
+                supporting_evidence: Some(raw_candidate.supporting_evidence.as_slice()),
+            }) {
+                result.warnings.push(store_error);
+            }
 
-fn build_local_rewrite_prompt(candidate: &AutoRememberRawCandidate) -> String {
-    let mut rules = vec![
-        "- Use only the provided evidence.".to_string(),
-        "- Return exactly one self-contained sentence in English.".to_string(),
-        "- Do not use pronouns or deictic phrases like this, that, it, they, 해당, 이번."
-            .to_string(),
-        "- Do not add uncertainty or speculate beyond the evidence.".to_string(),
-        "- Keep the sentence atomic and concrete.".to_string(),
-        format!(
-            "- Return JSON only with keys schema_version, content, keywords. schema_version must be {}.",
-            AUTO_REMEMBER_LOCAL_REWRITE_SCHEMA_VERSION
-        ),
-    ];
-    if let Some(entity_key) = candidate.entity_key.as_deref() {
-        rules.push(format!(
-            "- The sentence must include the exact config key `{entity_key}`."
-        ));
-    }
-
-    let evidence = candidate
-        .supporting_evidence
-        .iter()
-        .map(|line| format!("- {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "Signal kind: {}\nRaw candidate: {}\nRules:\n{}\nEvidence:\n{}\nJSON:",
-        candidate.signal_kind.as_str(),
-        candidate.raw_content,
-        rules.join("\n"),
-        evidence,
-    )
-}
-
-fn parse_local_rewrite_output(raw: &str) -> Result<AutoRememberRewriteOutput, String> {
-    let payload = parse_local_rewrite_payload(raw)?;
-    if payload.schema_version != AUTO_REMEMBER_LOCAL_REWRITE_SCHEMA_VERSION {
-        return Err(format!(
-            "auto-remember local rewrite schema mismatch: expected {}, got {}",
-            AUTO_REMEMBER_LOCAL_REWRITE_SCHEMA_VERSION, payload.schema_version
-        ));
-    }
-
-    let content = normalize_whitespace(&payload.content);
-    if content.is_empty() {
-        return Err("auto-remember local rewrite returned empty content".to_string());
-    }
-
-    Ok(AutoRememberRewriteOutput {
-        content,
-        keyword_suggestions: payload
-            .keywords
-            .into_iter()
-            .map(|keyword| normalize_keyword_suggestion(&keyword))
-            .filter(|keyword| !keyword.is_empty())
-            .collect(),
-    })
-}
-
-fn parse_local_rewrite_payload(raw: &str) -> Result<LocalRewritePayload, String> {
-    let trimmed = raw.trim();
-    if let Ok(payload) = serde_json::from_str::<LocalRewritePayload>(trimmed) {
-        return Ok(payload);
-    }
-
-    let stripped = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(str::trim)
-        .and_then(|value| value.strip_suffix("```"))
-        .map(str::trim)
-        .unwrap_or(trimmed);
-    if let Ok(payload) = serde_json::from_str::<LocalRewritePayload>(stripped) {
-        return Ok(payload);
-    }
-
-    let start = stripped
-        .find('{')
-        .ok_or_else(|| "auto-remember local rewrite did not return JSON".to_string())?;
-    let end = stripped
-        .rfind('}')
-        .ok_or_else(|| "auto-remember local rewrite did not return JSON".to_string())?;
-    serde_json::from_str::<LocalRewritePayload>(&stripped[start..=end]).map_err(|error| {
-        format!("auto-remember local rewrite JSON parse failed: {error}; body={stripped}")
-    })
-}
-
-async fn rewrite_candidate(
-    candidate: &AutoRememberRawCandidate,
-) -> Result<Option<AutoRememberRewriteOutput>, String> {
-    let config = local_rewrite_runtime_config()?;
-    let prompt = build_local_rewrite_prompt(candidate);
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(|error| format!("auto-remember local rewrite client build failed: {error}"))?;
-
-    let response = client
-        .post(&config.base_url)
-        .json(&json!({
-            "model": config.model,
-            "temperature": 0,
-            "response_format": { "type": "json_object" },
-            "messages": [
+            if status.suppresses_repeat() {
+                if let Err(store_error) =
+                    store.delete_retry(&raw_candidate.workspace, &raw_candidate.candidate_hash)
                 {
-                    "role": "system",
-                    "content": "You only rewrite a candidate memory sentence into one self-contained sentence. Use only the provided evidence. Return JSON only."
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
+                    result.warnings.push(store_error);
                 }
-            ]
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("auto-remember local rewrite request failed: {error}"))?;
+                return;
+            }
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "auto-remember local rewrite failed with {status}: {body}"
-        ));
+            if let Err(store_error) = store.upsert_retry(&AutoRememberRetryRecord {
+                turn_id: request.turn_id.clone(),
+                workspace: raw_candidate.workspace.clone(),
+                candidate_hash: raw_candidate.candidate_hash.clone(),
+                signal_kind: raw_candidate.signal_kind.as_str().to_string(),
+                raw_content: raw_candidate.raw_content.clone(),
+                entity_key: raw_candidate.entity_key.clone(),
+                supporting_evidence: raw_candidate.supporting_evidence.clone(),
+                retry_count: retry_count.max(current_retry_count.saturating_add(1)),
+                error: Some(error),
+            }) {
+                result.warnings.push(store_error);
+            }
+        }
+        Err(store_error) => result.warnings.push(store_error),
     }
-
-    let payload: LocalRewriteChatResponse = response
-        .json()
-        .await
-        .map_err(|error| format!("auto-remember local rewrite response decode failed: {error}"))?;
-    let raw_content = payload
-        .choices
-        .into_iter()
-        .next()
-        .map(|choice| choice.message.content)
-        .ok_or_else(|| "auto-remember local rewrite returned no choices".to_string())?;
-    let rewrite = parse_local_rewrite_output(&raw_content)?;
-    Ok(Some(rewrite))
 }
 
 fn normalize_keyword_suggestion(value: &str) -> String {
@@ -783,6 +912,13 @@ fn build_keywords(
         push_keyword(&mut keywords, &mut seen, format!("config-key:{entity_key}"));
         push_keyword(&mut keywords, &mut seen, entity_key.to_string());
     }
+    if let Some(canonical_key) = canonical_identity_key(signal_kind, entity_key, content) {
+        push_keyword(
+            &mut keywords,
+            &mut seen,
+            format!("canonical-key:{canonical_key}"),
+        );
+    }
 
     let token_re = Regex::new(r"[A-Za-z0-9_.:/-]{4,}").unwrap();
     for matched in token_re.find_iter(content) {
@@ -820,6 +956,134 @@ fn push_keyword(keywords: &mut Vec<String>, seen: &mut HashSet<String>, value: S
     }
 }
 
+fn candidate_lookup_keywords(candidate: &AutoRememberValidatedCandidate) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut seen = HashSet::new();
+
+    match candidate.signal_kind {
+        AutoRememberSignalKind::ConfigChange => {
+            if let Some(entity_key) = candidate.entity_key.as_deref() {
+                push_keyword(&mut keywords, &mut seen, format!("config-key:{entity_key}"));
+            }
+        }
+        AutoRememberSignalKind::ConfirmedErrorRootCause
+        | AutoRememberSignalKind::TechnicalDecision => {
+            if let Some(canonical_key) = canonical_identity_key(
+                candidate.signal_kind,
+                candidate.entity_key.as_deref(),
+                &candidate.content,
+            ) {
+                push_keyword(
+                    &mut keywords,
+                    &mut seen,
+                    format!("canonical-key:{canonical_key}"),
+                );
+            }
+        }
+    }
+
+    keywords
+}
+
+fn canonical_identity_key(
+    signal_kind: AutoRememberSignalKind,
+    entity_key: Option<&str>,
+    content: &str,
+) -> Option<String> {
+    match signal_kind {
+        AutoRememberSignalKind::ConfigChange => entity_key.map(|value| value.to_ascii_lowercase()),
+        AutoRememberSignalKind::ConfirmedErrorRootCause => {
+            canonical_identity_key_from_tokens("root-cause", content)
+        }
+        AutoRememberSignalKind::TechnicalDecision => {
+            canonical_identity_key_from_tokens("decision", content)
+        }
+    }
+}
+
+fn canonical_identity_key_from_tokens(prefix: &str, content: &str) -> Option<String> {
+    let token_re = Regex::new(r"[A-Za-z0-9_.:/-]{3,}|[가-힣]{2,}").unwrap();
+    let mut tokens = token_re
+        .find_iter(&content.to_ascii_lowercase())
+        .map(|matched| normalize_whitespace(matched.as_str()))
+        .filter(|token| !token.is_empty())
+        .filter(|token| !is_generic_identity_token(token))
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    if tokens.len() < 2 {
+        return None;
+    }
+    tokens.truncate(5);
+    Some(format!("{prefix}:{}", tokens.join("|")))
+}
+
+fn is_generic_identity_token(token: &str) -> bool {
+    matches!(
+        token,
+        "because"
+            | "caused"
+            | "cause"
+            | "config"
+            | "decision"
+            | "decided"
+            | "due"
+            | "error"
+            | "failure"
+            | "from"
+            | "root"
+            | "standardize"
+            | "technical"
+            | "the"
+            | "this"
+            | "that"
+            | "updated"
+            | "using"
+            | "with"
+            | "결정"
+            | "구조"
+            | "기술"
+            | "변경"
+            | "설정"
+            | "원인"
+            | "오류"
+            | "이유"
+            | "표준"
+            | "표준화"
+            | "하다"
+            | "했다"
+    )
+}
+
+fn fragment_is_rejected(fragment: &MementoFragmentSummary) -> bool {
+    fragment_assertion_status(fragment) == Some("rejected")
+}
+
+fn fragment_assertion_status(fragment: &MementoFragmentSummary) -> Option<&str> {
+    fragment
+        .assertion_status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn fragment_matches_candidate(
+    fragment: &MementoFragmentSummary,
+    candidate: &AutoRememberValidatedCandidate,
+) -> bool {
+    fragment
+        .content
+        .as_deref()
+        .map(|content| equivalent_memory_content(content, &candidate.content))
+        .unwrap_or(false)
+}
+
+fn equivalent_memory_content(lhs: &str, rhs: &str) -> bool {
+    normalize_whitespace(lhs)
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(normalize_whitespace(rhs).trim_end_matches('.'))
+}
+
 fn memento_request_from_candidate(
     candidate: &AutoRememberValidatedCandidate,
     supersedes: Vec<String>,
@@ -845,8 +1109,6 @@ fn skip_reason_text(decision: AutoRememberDecision) -> &'static str {
         AutoRememberDecision::RewriteNeeded => "rewrite_needed_but_invalid",
         AutoRememberDecision::Skip(reason) => match reason {
             AutoRememberSkipReason::Uncertain => "uncertain_candidate",
-            AutoRememberSkipReason::AmbiguousSignal => "ambiguous_signal",
-            AutoRememberSkipReason::LowPrecision => "low_precision_candidate",
             AutoRememberSkipReason::MissingEntityKey => "missing_entity_key",
             AutoRememberSkipReason::MissingWorkspace => "missing_workspace",
             AutoRememberSkipReason::ValidatorRejected => "validator_rejected",
@@ -1108,13 +1370,6 @@ fn looks_like_tool_evidence(unit: &str) -> bool {
             || unit.contains(" updated "))
 }
 
-fn clean_value(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | '(' | '"' | '\''))
-        .to_string()
-}
-
 fn hash_candidate(workspace: &str, signal_kind: AutoRememberSignalKind, content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(workspace.as_bytes());
@@ -1142,12 +1397,16 @@ fn normalize_whitespace(value: &str) -> String {
 mod tests {
     use std::time::Duration;
 
+    use serde_json::json;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::services::discord::runtime_store::lock_test_env;
     use crate::services::discord::settings::ResolvedMemorySettings;
+    use crate::services::memory::{
+        auto_remember_quality, refresh_backend_health, reset_backend_health_for_tests,
+    };
 
     fn remember_request_from_candidate(
         signal_kind: AutoRememberSignalKind,
@@ -1198,6 +1457,95 @@ mod tests {
             requests_rx,
             handle,
         )
+    }
+
+    fn restore_env(name: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    fn install_memento_runtime(
+        base_url: &str,
+        workspace: Option<&str>,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    ) {
+        let guard = crate::services::discord::runtime_store::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_key = std::env::var_os("MEMENTO_TEST_KEY");
+        let previous_workspace = std::env::var_os("MEMENTO_WORKSPACE");
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("agentdesk.yaml"),
+            format!(
+                "server:\n  port: 8791\nmemory:\n  backend: memento\n  auto_remember:\n    enabled: true\n  mcp:\n    endpoint: {base_url}\n    access_key_env: MEMENTO_TEST_KEY\n"
+            ),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("AGENTDESK_ROOT_DIR", temp.path());
+            std::env::set_var("MEMENTO_TEST_KEY", "memento-key");
+        }
+        match workspace {
+            Some(workspace) => unsafe { std::env::set_var("MEMENTO_WORKSPACE", workspace) },
+            None => unsafe { std::env::remove_var("MEMENTO_WORKSPACE") },
+        }
+        (guard, temp, previous_root, previous_key, previous_workspace)
+    }
+
+    struct MockHttpResponse {
+        status_line: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+        body: String,
+    }
+
+    async fn spawn_response_sequence_server(
+        responses: Vec<MockHttpResponse>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<Vec<String>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 32768];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+
+                let mut raw_response = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                    response.status_line,
+                    response.body.len()
+                );
+                for (header, value) in response.headers {
+                    raw_response.push_str(&format!("{header}: {value}\r\n"));
+                }
+                raw_response.push_str("\r\n");
+                raw_response.push_str(&response.body);
+
+                let _ = stream.write_all(raw_response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+            let _ = requests_tx.send(requests);
+        });
+        (format!("http://{}", addr), requests_rx, handle)
     }
 
     #[test]
@@ -1264,14 +1612,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewrite_config_change_uses_local_llm_json_contract() {
+    async fn quality_improver_local_llm_uses_json_contract() {
         let _guard = lock_test_env();
-        let response = serde_json::json!({
+        let response = json!({
             "choices": [
                 {
                     "message": {
-                        "content": serde_json::json!({
-                            "schema_version": AUTO_REMEMBER_LOCAL_REWRITE_SCHEMA_VERSION,
+                        "content": json!({
+                            "schema_version": "1",
                             "content": "Config key memory.backend changed from file to memento.",
                             "keywords": ["memory.backend", "memento"]
                         }).to_string()
@@ -1281,35 +1629,31 @@ mod tests {
         })
         .to_string();
         let (base_url, requests_rx, handle) = spawn_local_rewrite_server(&response).await;
+        let previous_base_url = std::env::var_os("AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL");
+        let previous_model = std::env::var_os("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL");
+        let previous_backend = std::env::var_os("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND");
         unsafe {
-            std::env::set_var(AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV, &base_url);
-            std::env::set_var(AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV, "qwen3-local");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL", &base_url);
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL", "qwen3-local");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", "local_llm");
         }
 
-        let candidate = AutoRememberRawCandidate {
-            signal_kind: AutoRememberSignalKind::ConfigChange,
-            raw_content: "memory.backend를 file에서 memento로 변경했다".to_string(),
-            supporting_evidence: vec!["memory.backend를 file에서 memento로 변경했다".to_string()],
-            entity_key: Some("memory.backend".to_string()),
-            workspace: "agentdesk-default".to_string(),
-            candidate_hash: "hash".to_string(),
-        };
+        let rewritten = auto_remember_quality::improve_candidate(
+            &auto_remember_quality::AutoRememberQualityInput {
+                signal_kind: "config_change".to_string(),
+                raw_content: "memory.backend를 file에서 memento로 변경했다".to_string(),
+                supporting_evidence: vec![
+                    "memory.backend를 file에서 memento로 변경했다".to_string(),
+                ],
+                entity_key: Some("memory.backend".to_string()),
+            },
+        )
+        .await
+        .expect("rewrite should succeed");
 
-        let rewritten = rewrite_candidate(&candidate)
-            .await
-            .expect("rewrite should succeed")
-            .expect("rewrite output should exist");
         assert_eq!(
             rewritten.content,
             "Config key memory.backend changed from file to memento."
-        );
-        assert!(
-            validate_candidate(
-                AutoRememberSignalKind::ConfigChange,
-                &rewritten.content,
-                Some("memory.backend")
-            )
-            .is_some()
         );
         assert!(
             rewritten
@@ -1328,28 +1672,614 @@ mod tests {
         assert!(requests[0].contains("memory.backend"));
 
         handle.await.unwrap();
-        unsafe {
-            std::env::remove_var(AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV);
-            std::env::remove_var(AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV);
-        }
+        restore_env("AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL", previous_base_url);
+        restore_env("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL", previous_model);
+        restore_env("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", previous_backend);
     }
 
     #[test]
-    fn local_rewrite_requires_loopback_base_url() {
+    fn quality_improver_agent_backend_accepts_provider_override() {
         let _guard = lock_test_env();
+        let previous_backend = std::env::var_os("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND");
+        let previous_provider = std::env::var_os("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER");
+        let previous_model = std::env::var_os("AGENTDESK_AUTO_REMEMBER_AGENT_MODEL");
+        let previous_label = std::env::var_os("AGENTDESK_AUTO_REMEMBER_AGENT_LABEL");
+        unsafe {
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", "agent");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER", "gemini");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_AGENT_MODEL", "gemini-2.5-flash");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_AGENT_LABEL", "memory-critic");
+        }
+
+        let config = auto_remember_quality::agent_rewrite_runtime_config_for_tests().unwrap();
+        assert_eq!(config.0, crate::services::provider::ProviderKind::Gemini);
+        assert_eq!(config.1.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(config.2, "memory-critic");
+        assert_eq!(config.3, Duration::from_secs(45));
+
+        auto_remember_quality::set_test_agent_improver(Some(Box::new(
+            |provider, model, prompt, _timeout, label| {
+                assert_eq!(provider, crate::services::provider::ProviderKind::Gemini);
+                assert_eq!(model.as_deref(), Some("gemini-2.5-flash"));
+                assert!(prompt.contains("memory.backend"));
+                assert!(label.contains("memory-critic"));
+                Ok(json!({
+                    "schema_version": "1",
+                    "content": "Config key memory.backend changed from file to memento.",
+                    "keywords": ["memory.backend", "memento"]
+                })
+                .to_string())
+            },
+        )));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let rewritten = runtime
+            .block_on(auto_remember_quality::improve_candidate(
+                &auto_remember_quality::AutoRememberQualityInput {
+                    signal_kind: "config_change".to_string(),
+                    raw_content: "memory.backend를 file에서 memento로 변경했다".to_string(),
+                    supporting_evidence: vec![
+                        "memory.backend를 file에서 memento로 변경했다".to_string(),
+                    ],
+                    entity_key: Some("memory.backend".to_string()),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            rewritten.content,
+            "Config key memory.backend changed from file to memento."
+        );
+
+        auto_remember_quality::set_test_agent_improver(None);
+        restore_env("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", previous_backend);
+        restore_env("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER", previous_provider);
+        restore_env("AGENTDESK_AUTO_REMEMBER_AGENT_MODEL", previous_model);
+        restore_env("AGENTDESK_AUTO_REMEMBER_AGENT_LABEL", previous_label);
+    }
+
+    #[test]
+    fn quality_improver_none_mode_disables_rewrite() {
+        let _guard = lock_test_env();
+        let previous_backend = std::env::var_os("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND");
+        unsafe {
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", "none");
+        }
+
+        assert_eq!(
+            auto_remember_quality::configured_backend_for_tests(),
+            auto_remember_quality::AutoRememberImproverBackend::None
+        );
+        assert!(!auto_remember_quality::rewrite_supported());
+
+        restore_env("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", previous_backend);
+    }
+
+    #[tokio::test]
+    async fn quality_improver_both_mode_falls_back_to_agent() {
+        let _guard = lock_test_env();
+        let previous_base_url = std::env::var_os("AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL");
+        let previous_local_model = std::env::var_os("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL");
+        let previous_backend = std::env::var_os("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND");
+        let previous_provider = std::env::var_os("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER");
         unsafe {
             std::env::set_var(
-                AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV,
-                "https://example.com/v1/chat/completions",
+                "AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL",
+                "http://192.168.0.10:1234/v1/chat/completions",
             );
-            std::env::set_var(AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV, "qwen3-local");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL", "qwen3-local");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", "both");
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER", "codex");
         }
-        let error = local_rewrite_runtime_config().unwrap_err();
-        assert!(error.contains("loopback"));
+
+        auto_remember_quality::set_test_agent_improver(Some(Box::new(
+            |provider, model, prompt, _timeout, label| {
+                assert_eq!(provider, crate::services::provider::ProviderKind::Codex);
+                assert!(model.is_none());
+                assert!(prompt.contains("memory.backend"));
+                assert!(label.contains("codex"));
+                Ok(json!({
+                    "schema_version": "1",
+                    "content": "Config key memory.backend changed from file to memento.",
+                    "keywords": ["memory.backend", "memento"]
+                })
+                .to_string())
+            },
+        )));
+
+        let rewritten = auto_remember_quality::improve_candidate(
+            &auto_remember_quality::AutoRememberQualityInput {
+                signal_kind: "config_change".to_string(),
+                raw_content: "memory.backend를 file에서 memento로 변경했다".to_string(),
+                supporting_evidence: vec![
+                    "memory.backend를 file에서 memento로 변경했다".to_string(),
+                ],
+                entity_key: Some("memory.backend".to_string()),
+            },
+        )
+        .await
+        .expect("both-mode fallback should succeed");
+
+        assert_eq!(
+            rewritten.content,
+            "Config key memory.backend changed from file to memento."
+        );
+
+        auto_remember_quality::set_test_agent_improver(None);
+        restore_env("AGENTDESK_AUTO_REMEMBER_LOCAL_BASE_URL", previous_base_url);
+        restore_env("AGENTDESK_AUTO_REMEMBER_LOCAL_MODEL", previous_local_model);
+        restore_env("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", previous_backend);
+        restore_env("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER", previous_provider);
+    }
+
+    #[tokio::test]
+    async fn retry_queue_retries_without_candidate_reappearing() {
+        let response_health = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: "{}".to_string(),
+        };
+        let response_initialize_1 = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-1")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall_1 = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"fragments\":[]}"
+                    }],
+                    "usage": { "input_tokens": 3, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_remember_1 = MockHttpResponse {
+            status_line: "500 Internal Server Error",
+            headers: vec![],
+            body: "{\"error\":\"temporary failure\"}".to_string(),
+        };
+        let response_initialize_2 = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-2")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall_2 = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"fragments\":[]}"
+                    }],
+                    "usage": { "input_tokens": 3, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_remember_2 = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"success\":true}" }],
+                    "usage": { "input_tokens": 10, "output_tokens": 5 }
+                }
+            })
+            .to_string(),
+        };
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            response_health,
+            response_initialize_1,
+            response_recall_1,
+            response_remember_1,
+            response_initialize_2,
+            response_recall_2,
+            response_remember_2,
+        ])
+        .await;
+        let (_guard, _temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, Some("agentdesk-default"));
+        let previous_backend = std::env::var_os("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND");
+        reset_backend_health_for_tests();
+        let snapshot = refresh_backend_health("auto-remember-retry-test").await;
+        assert!(snapshot.memento.active);
         unsafe {
-            std::env::remove_var(AUTO_REMEMBER_LOCAL_REWRITE_BASE_URL_ENV);
-            std::env::remove_var(AUTO_REMEMBER_LOCAL_REWRITE_MODEL_ENV);
+            std::env::set_var("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", "local_llm");
         }
+
+        let settings = ResolvedMemorySettings {
+            backend: MemoryBackendKind::Memento,
+            auto_remember_enabled: true,
+            ..ResolvedMemorySettings::default()
+        };
+        let first_request = AutoRememberTurnRequest {
+            turn_id: "turn-1".to_string(),
+            role_id: "project-agentdesk".to_string(),
+            channel_id: 42,
+            user_text: String::new(),
+            assistant_text:
+                "AgentDesk decided to standardize on SQLite sidecar as the audit store.".to_string(),
+            transcript_events: Vec::new(),
+        };
+
+        let first_result = run_auto_remember(&settings, first_request).await;
+        assert_eq!(first_result.remembered_count, 0);
+        assert!(!first_result.warnings.is_empty());
+
+        let store = AutoRememberStore::open_existing()
+            .unwrap()
+            .expect("retry sidecar should exist after failed remember");
+        let retry_batch = store.load_retry_batch().unwrap();
+        assert_eq!(retry_batch.len(), 1);
+
+        let second_request = AutoRememberTurnRequest {
+            turn_id: "turn-2".to_string(),
+            role_id: "project-agentdesk".to_string(),
+            channel_id: 42,
+            user_text: String::new(),
+            assistant_text: String::new(),
+            transcript_events: Vec::new(),
+        };
+        let second_result = run_auto_remember(&settings, second_request).await;
+        assert_eq!(second_result.remembered_count, 1);
+        assert_eq!(store.load_retry_batch().unwrap().len(), 0);
+
+        let requests = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 7);
+
+        handle.await.unwrap();
+        restore_env("AGENTDESK_AUTO_REMEMBER_IMPROVER_BACKEND", previous_backend);
+        restore_env("AGENTDESK_ROOT_DIR", previous_root);
+        restore_env("MEMENTO_TEST_KEY", previous_key);
+        restore_env("MEMENTO_WORKSPACE", previous_workspace);
+        reset_backend_health_for_tests();
+    }
+
+    #[tokio::test]
+    async fn technical_decision_recall_result_is_superseded_on_new_write() {
+        let response_health = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: "{}".to_string(),
+        };
+        let response_initialize = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-supersede")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&json!({
+                            "fragments": [{
+                                "id": "frag-old",
+                                "content": "AgentDesk decided to standardize on JSONL sidecar as the audit store.",
+                                "assertionStatus": "verified"
+                            }]
+                        })).unwrap()
+                    }],
+                    "usage": { "input_tokens": 4, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_remember = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"success\":true}" }],
+                    "usage": { "input_tokens": 8, "output_tokens": 3 }
+                }
+            })
+            .to_string(),
+        };
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            response_health,
+            response_initialize,
+            response_recall,
+            response_remember,
+        ])
+        .await;
+        let (_guard, _temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, Some("agentdesk-default"));
+        reset_backend_health_for_tests();
+        let snapshot = refresh_backend_health("auto-remember-supersede-test").await;
+        assert!(snapshot.memento.active);
+
+        let settings = ResolvedMemorySettings {
+            backend: MemoryBackendKind::Memento,
+            auto_remember_enabled: true,
+            ..ResolvedMemorySettings::default()
+        };
+        let request = AutoRememberTurnRequest {
+            turn_id: "turn-supersede".to_string(),
+            role_id: "project-agentdesk".to_string(),
+            channel_id: 42,
+            user_text: String::new(),
+            assistant_text:
+                "AgentDesk decided to standardize on SQLite sidecar as the audit store.".to_string(),
+            transcript_events: Vec::new(),
+        };
+
+        let result = run_auto_remember(&settings, request).await;
+        assert_eq!(result.remembered_count, 1);
+        assert!(result.warnings.is_empty());
+
+        let requests = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("\"name\":\"recall\""));
+        assert!(requests[3].contains("\"name\":\"remember\""));
+        assert!(requests[3].contains("\"supersedes\":[\"frag-old\"]"));
+
+        handle.await.unwrap();
+        restore_env("AGENTDESK_ROOT_DIR", previous_root);
+        restore_env("MEMENTO_TEST_KEY", previous_key);
+        restore_env("MEMENTO_WORKSPACE", previous_workspace);
+        reset_backend_health_for_tests();
+    }
+
+    #[tokio::test]
+    async fn inferred_fragment_is_promoted_to_verified_without_duplicate_write() {
+        let response_health = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: "{}".to_string(),
+        };
+        let response_initialize = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-verify")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&json!({
+                            "fragments": [{
+                                "id": "frag-inferred",
+                                "content": "AgentDesk decided to standardize on SQLite sidecar as the audit store.",
+                                "assertionStatus": "inferred"
+                            }]
+                        })).unwrap()
+                    }],
+                    "usage": { "input_tokens": 4, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_amend = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"success\":true}" }],
+                    "usage": { "input_tokens": 6, "output_tokens": 2 }
+                }
+            })
+            .to_string(),
+        };
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            response_health,
+            response_initialize,
+            response_recall,
+            response_amend,
+        ])
+        .await;
+        let (_guard, _temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, Some("agentdesk-default"));
+        reset_backend_health_for_tests();
+        let snapshot = refresh_backend_health("auto-remember-verify-test").await;
+        assert!(snapshot.memento.active);
+
+        let settings = ResolvedMemorySettings {
+            backend: MemoryBackendKind::Memento,
+            auto_remember_enabled: true,
+            ..ResolvedMemorySettings::default()
+        };
+        let request = AutoRememberTurnRequest {
+            turn_id: "turn-verify".to_string(),
+            role_id: "project-agentdesk".to_string(),
+            channel_id: 42,
+            user_text: String::new(),
+            assistant_text:
+                "AgentDesk decided to standardize on SQLite sidecar as the audit store.".to_string(),
+            transcript_events: Vec::new(),
+        };
+
+        let result = run_auto_remember(&settings, request).await;
+        assert_eq!(result.remembered_count, 0);
+        assert_eq!(result.duplicate_count, 0);
+        assert!(result.warnings.is_empty());
+
+        let store = AutoRememberStore::open_existing()
+            .unwrap()
+            .expect("verify promotion should create sidecar");
+        let counts = store.count_by_status(Some("agentdesk-default")).unwrap();
+        assert!(
+            counts
+                .iter()
+                .any(|(status, count)| status == "verified_promoted" && *count == 1)
+        );
+
+        let requests = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("\"name\":\"recall\""));
+        assert!(requests[3].contains("\"name\":\"amend\""));
+        assert!(requests[3].contains("\"id\":\"frag-inferred\""));
+        assert!(requests[3].contains("\"assertionStatus\":\"verified\""));
+
+        handle.await.unwrap();
+        restore_env("AGENTDESK_ROOT_DIR", previous_root);
+        restore_env("MEMENTO_TEST_KEY", previous_key);
+        restore_env("MEMENTO_WORKSPACE", previous_workspace);
+        reset_backend_health_for_tests();
+    }
+
+    #[tokio::test]
+    async fn manual_resubmit_replays_abandoned_candidate() {
+        let response_health = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: "{}".to_string(),
+        };
+        let response_initialize = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-resubmit")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"fragments\":[]}"
+                    }],
+                    "usage": { "input_tokens": 3, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_remember = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"success\":true}" }],
+                    "usage": { "input_tokens": 7, "output_tokens": 2 }
+                }
+            })
+            .to_string(),
+        };
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            response_health,
+            response_initialize,
+            response_recall,
+            response_remember,
+        ])
+        .await;
+        let (_guard, _temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, Some("agentdesk-default"));
+        reset_backend_health_for_tests();
+        let snapshot = refresh_backend_health("auto-remember-resubmit-test").await;
+        assert!(snapshot.memento.active);
+
+        let workspace = "agentdesk-default";
+        let raw_content = "AgentDesk decided to standardize on SQLite sidecar as the audit store.";
+        let candidate_hash = hash_candidate(
+            workspace,
+            AutoRememberSignalKind::TechnicalDecision,
+            raw_content,
+        );
+        let store = AutoRememberStore::open().unwrap();
+        let evidence = vec![raw_content.to_string()];
+        store
+            .upsert_audit(AutoRememberAuditEntry {
+                turn_id: "turn-abandoned",
+                candidate_hash: &candidate_hash,
+                signal_kind: AutoRememberSignalKind::TechnicalDecision.as_str(),
+                workspace,
+                stage: AutoRememberStage::Remember,
+                status: AutoRememberMemoryStatus::AbandonedAfterRetries,
+                retry_count: 3,
+                error: Some("temporary failure"),
+                raw_content: Some(raw_content),
+                entity_key: None,
+                supporting_evidence: Some(evidence.as_slice()),
+            })
+            .unwrap();
+
+        let result = resubmit_auto_remember_candidate(workspace, &candidate_hash)
+            .await
+            .unwrap();
+        assert_eq!(result.remembered_count, 1);
+        assert!(result.warnings.is_empty());
+        assert!(
+            store
+                .load_resubmittable_candidate(workspace, &candidate_hash)
+                .unwrap()
+                .is_none()
+        );
+
+        let requests = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("\"name\":\"recall\""));
+        assert!(requests[3].contains("\"name\":\"remember\""));
+
+        handle.await.unwrap();
+        restore_env("AGENTDESK_ROOT_DIR", previous_root);
+        restore_env("MEMENTO_TEST_KEY", previous_key);
+        restore_env("MEMENTO_WORKSPACE", previous_workspace);
+        reset_backend_health_for_tests();
     }
 
     #[test]

@@ -208,10 +208,53 @@ pub struct McpMemoryBackendConfig {
     pub access_key_env: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+fn default_auto_remember_improver_mode() -> String {
+    "local_llm".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoRememberConfig {
+    /// Keeps auto-remember opt-in. Audit/dedupe state lives in a runtime-root-local
+    /// SQLite sidecar at `data/memory-auto-remember.sqlite`; moving or reinitializing
+    /// the runtime root resets that local state and can allow equivalent facts to be
+    /// written again.
     pub enabled: bool,
+    pub improver: AutoRememberImproverConfig,
+}
+
+impl Default for AutoRememberConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            improver: AutoRememberImproverConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoRememberImproverConfig {
+    #[serde(default = "default_auto_remember_improver_mode")]
+    pub mode: String,
+    pub agent: AutoRememberAgentConfig,
+}
+
+impl Default for AutoRememberImproverConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_auto_remember_improver_mode(),
+            agent: AutoRememberAgentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoRememberAgentConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -442,6 +485,14 @@ fn memory_backend_from_config(config: crate::config::MemoryConfig) -> MemoryBack
         },
         auto_remember: AutoRememberConfig {
             enabled: config.auto_remember.enabled,
+            improver: AutoRememberImproverConfig {
+                mode: config.auto_remember.improver.mode,
+                agent: AutoRememberAgentConfig {
+                    provider: config.auto_remember.improver.agent.provider,
+                    model: config.auto_remember.improver.agent.model,
+                    label: config.auto_remember.improver.agent.label,
+                },
+            },
         },
         legacy_sak_path: None,
         legacy_sam_path: None,
