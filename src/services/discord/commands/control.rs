@@ -217,6 +217,8 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
     if shared.session_reset_pending.remove(&channel_id).is_none() {
         return;
     }
+    shared.fast_mode_session_reset_pending.remove(&channel_id);
+    shared.model_session_reset_pending.remove(&channel_id);
 
     let _ = reset_channel_provider_state(
         http,
@@ -266,6 +268,8 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
 
     shared.dispatch_role_overrides.remove(&channel_id);
 
+    shared.fast_mode_session_reset_pending.remove(&channel_id);
+    shared.model_session_reset_pending.remove(&channel_id);
     shared.session_reset_pending.remove(&channel_id);
 
     if let Some(token) = cleared.removed_token {

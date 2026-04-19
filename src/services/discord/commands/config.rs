@@ -115,6 +115,49 @@ fn resolve_dispatch_role_model(
     resolve_role_binding(override_channel, None).and_then(|binding| binding.model)
 }
 
+pub(in crate::services::discord) fn effective_provider_for_channel(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+) -> ProviderKind {
+    if let Some(override_channel) = shared
+        .dispatch_role_overrides
+        .get(&channel_id)
+        .map(|value| *value)
+    {
+        resolve_role_binding(override_channel, None)
+            .and_then(|binding| binding.provider)
+            .unwrap_or_else(|| provider.clone())
+    } else {
+        provider.clone()
+    }
+}
+
+pub(in crate::services::discord) fn native_fast_mode_supported(provider: &ProviderKind) -> bool {
+    matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+}
+
+pub(in crate::services::discord) async fn channel_fast_mode_setting(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> Option<bool> {
+    let settings = shared.settings.read().await;
+    settings
+        .channel_fast_modes
+        .get(&channel_id.get().to_string())
+        .copied()
+}
+
+fn sync_session_reset_pending(shared: &Arc<SharedData>, channel_id: serenity::ChannelId) {
+    if shared.fast_mode_session_reset_pending.contains(&channel_id)
+        || shared.model_session_reset_pending.contains(&channel_id)
+    {
+        shared.session_reset_pending.insert(channel_id);
+    } else {
+        shared.session_reset_pending.remove(&channel_id);
+    }
+}
+
 pub(in crate::services::discord) async fn effective_model_snapshot(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -223,8 +266,11 @@ pub(in crate::services::discord) async fn update_channel_model_override(
     }
 
     if reset_required {
-        shared.session_reset_pending.insert(channel_id);
+        shared.model_session_reset_pending.insert(channel_id);
+    } else {
+        shared.model_session_reset_pending.remove(&channel_id);
     }
+    sync_session_reset_pending(shared, channel_id);
 
     true
 }
@@ -261,11 +307,12 @@ pub(in crate::services::discord) async fn update_channel_fast_mode(
     } else {
         settings
             .channel_fast_modes
-            .remove(&channel_id.get().to_string());
+            .insert(channel_id.get().to_string(), false);
     }
     save_bot_settings(token, &settings);
 
-    shared.session_reset_pending.insert(channel_id);
+    shared.fast_mode_session_reset_pending.insert(channel_id);
+    sync_session_reset_pending(shared, channel_id);
     true
 }
 
@@ -751,15 +798,50 @@ pub(in crate::services::discord) async fn cmd_allowall(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+
     use crate::services::discord::make_shared_data_for_tests;
     use crate::services::discord::model_catalog::{
         DEFAULT_PICKER_VALUE, known_models, validate_model_input,
     };
+    use tempfile::TempDir;
 
     use super::super::model_ui::{
         build_model_picker_option_specs, build_model_picker_summary_lines,
     };
     use super::*;
+
+    struct TempAgentdeskRootGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_root: Option<OsString>,
+        _temp_home: TempDir,
+    }
+
+    impl TempAgentdeskRootGuard {
+        fn new() -> Self {
+            let lock = crate::services::discord::runtime_store::lock_test_env();
+            let temp_home = TempDir::new().unwrap();
+            let root = temp_home.path().join(".adk");
+            fs::create_dir_all(&root).unwrap();
+            let prev_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
+            Self {
+                _lock: lock,
+                prev_root,
+                _temp_home: temp_home,
+            }
+        }
+    }
+
+    impl Drop for TempAgentdeskRootGuard {
+        fn drop(&mut self) {
+            match self.prev_root.as_ref() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
 
     #[test]
     fn model_picker_custom_id_round_trip() {
@@ -925,8 +1007,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn clearing_model_override_preserves_pending_fast_mode_reset() {
+        let _env = TempAgentdeskRootGuard::new();
         let shared = make_shared_data_for_tests();
         let channel_id = serenity::ChannelId::new(42);
         shared
@@ -934,6 +1017,7 @@ mod tests {
             .insert(channel_id, "gpt-5.4-mini".to_string());
 
         assert!(update_channel_fast_mode(&shared, "test-token", channel_id, true).await);
+        assert!(shared.fast_mode_session_reset_pending.contains(&channel_id));
         assert!(shared.session_reset_pending.contains(&channel_id));
 
         assert!(
@@ -950,6 +1034,60 @@ mod tests {
             shared.session_reset_pending.contains(&channel_id),
             "clearing a model override must not discard a pending reset requested by /fast"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clearing_model_override_clears_stale_model_reset_when_no_other_reset_is_pending() {
+        let _env = TempAgentdeskRootGuard::new();
+        let shared = make_shared_data_for_tests();
+        let channel_id = serenity::ChannelId::new(77);
+        shared
+            .model_overrides
+            .insert(channel_id, "opus".to_string());
+        shared.model_session_reset_pending.insert(channel_id);
+        shared.session_reset_pending.insert(channel_id);
+
+        assert!(
+            update_channel_model_override(
+                &shared,
+                "test-token",
+                channel_id,
+                &ProviderKind::Claude,
+                None,
+            )
+            .await
+        );
+        assert!(
+            !shared.model_session_reset_pending.contains(&channel_id),
+            "model-specific reset marker should clear when the new effective model no longer needs a reset"
+        );
+        assert!(
+            !shared.session_reset_pending.contains(&channel_id),
+            "union reset marker should clear when no reset reason remains"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabling_fast_mode_persists_explicit_false_and_marks_reset_pending() {
+        let _env = TempAgentdeskRootGuard::new();
+        let shared = make_shared_data_for_tests();
+        let channel_id = serenity::ChannelId::new(88);
+
+        assert!(update_channel_fast_mode(&shared, "test-token", channel_id, true).await);
+        shared.fast_mode_session_reset_pending.remove(&channel_id);
+        shared.session_reset_pending.remove(&channel_id);
+
+        assert!(update_channel_fast_mode(&shared, "test-token", channel_id, false).await);
+        let settings = shared.settings.read().await;
+        assert_eq!(
+            settings
+                .channel_fast_modes
+                .get(&channel_id.get().to_string()),
+            Some(&false)
+        );
+        drop(settings);
+        assert!(shared.fast_mode_session_reset_pending.contains(&channel_id));
+        assert!(shared.session_reset_pending.contains(&channel_id));
     }
 
     #[test]

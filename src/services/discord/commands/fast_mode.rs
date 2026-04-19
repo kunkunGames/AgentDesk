@@ -1,11 +1,10 @@
 use crate::services::provider::ProviderKind;
 
 use super::super::{Context, Error, check_auth};
-use super::config::{channel_fast_mode_enabled, update_channel_fast_mode};
-
-fn fast_mode_supported(provider: &ProviderKind) -> bool {
-    matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
-}
+use super::config::{
+    channel_fast_mode_enabled, effective_provider_for_channel, native_fast_mode_supported,
+    update_channel_fast_mode,
+};
 
 fn fast_mode_reset_line(reset_pending: bool) -> &'static str {
     if reset_pending {
@@ -43,13 +42,16 @@ pub(in crate::services::discord) async fn cmd_fast(ctx: Context<'_>) -> Result<(
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!("  [{ts}] ◀ [{user_name}] /fast");
 
-    if !fast_mode_supported(&ctx.data().provider) {
+    let channel_id = ctx.channel_id();
+    let effective_provider =
+        effective_provider_for_channel(&ctx.data().shared, channel_id, &ctx.data().provider);
+
+    if !native_fast_mode_supported(&effective_provider) {
         ctx.say("/fast is only available in Claude and Codex channels.")
             .await?;
         return Ok(());
     }
 
-    let channel_id = ctx.channel_id();
     let currently_enabled = channel_fast_mode_enabled(&ctx.data().shared, channel_id);
     let next_enabled = !currently_enabled;
     update_channel_fast_mode(
@@ -66,9 +68,9 @@ pub(in crate::services::discord) async fn cmd_fast(ctx: Context<'_>) -> Result<(
         .session_reset_pending
         .contains(&channel_id);
     let notice = if next_enabled {
-        build_fast_enabled_notice(&ctx.data().provider, reset_pending)
+        build_fast_enabled_notice(&effective_provider, reset_pending)
     } else {
-        build_fast_disabled_notice(&ctx.data().provider, reset_pending)
+        build_fast_disabled_notice(&effective_provider, reset_pending)
     };
     ctx.say(notice).await?;
     Ok(())
@@ -76,18 +78,16 @@ pub(in crate::services::discord) async fn cmd_fast(ctx: Context<'_>) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_fast_disabled_notice, build_fast_enabled_notice, fast_mode_reset_line,
-        fast_mode_supported,
-    };
+    use super::{build_fast_disabled_notice, build_fast_enabled_notice, fast_mode_reset_line};
+    use crate::services::discord::commands::config::native_fast_mode_supported;
     use crate::services::provider::ProviderKind;
 
     #[test]
     fn fast_mode_supported_only_for_claude_and_codex() {
-        assert!(fast_mode_supported(&ProviderKind::Claude));
-        assert!(fast_mode_supported(&ProviderKind::Codex));
-        assert!(!fast_mode_supported(&ProviderKind::Gemini));
-        assert!(!fast_mode_supported(&ProviderKind::Qwen));
+        assert!(native_fast_mode_supported(&ProviderKind::Claude));
+        assert!(native_fast_mode_supported(&ProviderKind::Codex));
+        assert!(!native_fast_mode_supported(&ProviderKind::Gemini));
+        assert!(!native_fast_mode_supported(&ProviderKind::Qwen));
     }
 
     #[test]

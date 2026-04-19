@@ -15,6 +15,26 @@ pub(crate) struct RunBotContext {
 const DISCORD_GATEWAY_LEASE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DISCORD_GATEWAY_LOCK_PREFIX: u64 = 0x0443_0000_0000_0000;
 
+fn restored_fast_mode_channels_for_provider(
+    bot_settings: &DiscordBotSettings,
+    provider: &ProviderKind,
+) -> Vec<ChannelId> {
+    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+        return Vec::new();
+    }
+
+    bot_settings
+        .channel_fast_modes
+        .iter()
+        .filter_map(|(channel_id, enabled)| {
+            if !*enabled {
+                return None;
+            }
+            channel_id.parse::<u64>().ok().map(ChannelId::new)
+        })
+        .collect()
+}
+
 fn discord_gateway_lock_id(token_hash: &str) -> i64 {
     // `discord_token_hash()` returns "discord_<16hex>". Strip the literal prefix
     // so the first 16 chars we sample are actual hex; otherwise the `is_ascii_hexdigit`
@@ -620,16 +640,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 .map(|id| (ChannelId::new(id), model.clone()))
         })
         .collect();
-    let restored_fast_mode_channels: Vec<ChannelId> = bot_settings
-        .channel_fast_modes
-        .iter()
-        .filter_map(|(channel_id, enabled)| {
-            if !*enabled {
-                return None;
-            }
-            channel_id.parse::<u64>().ok().map(ChannelId::new)
-        })
-        .collect();
+    let restored_fast_mode_channels =
+        restored_fast_mode_channels_for_provider(&bot_settings, &provider);
 
     let shared = Arc::new(SharedData {
         core: Mutex::new(CoreState {
@@ -668,6 +680,20 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         fast_mode_channels: {
             let set = dashmap::DashSet::new();
             for channel_id in &restored_fast_mode_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
+        fast_mode_session_reset_pending: {
+            let set = dashmap::DashSet::new();
+            for channel_id in &restored_fast_mode_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
+        model_session_reset_pending: {
+            let set = dashmap::DashSet::new();
+            for (channel_id, _) in &restored_model_overrides {
                 set.insert(*channel_id);
             }
             set
@@ -1492,6 +1518,21 @@ mod tests {
     use poise::serenity_prelude::{MessageId, UserId};
     use std::collections::HashSet;
     use std::time::Instant;
+
+    #[test]
+    fn restored_fast_mode_channels_only_load_for_supported_providers() {
+        let mut settings = DiscordBotSettings::default();
+        settings.channel_fast_modes.insert("123".to_string(), true);
+        settings.channel_fast_modes.insert("456".to_string(), false);
+
+        let claude_channels =
+            restored_fast_mode_channels_for_provider(&settings, &ProviderKind::Claude);
+        assert_eq!(claude_channels, vec![ChannelId::new(123)]);
+
+        let gemini_channels =
+            restored_fast_mode_channels_for_provider(&settings, &ProviderKind::Gemini);
+        assert!(gemini_channels.is_empty());
+    }
 
     struct PgTestDatabase {
         admin_url: String,
