@@ -1845,10 +1845,15 @@ mod tests {
     #[test]
     fn test_append_claude_mcp_config_arg_skips_when_no_runtime_config() {
         let _guard = crate::services::discord::runtime_store::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
         let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_config = std::env::var_os("AGENTDESK_CONFIG");
         let previous_memento_access_key = std::env::var_os("MEMENTO_ACCESS_KEY");
+        let previous_test_runtime_root = crate::config::current_test_runtime_root_override();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+        unsafe { std::env::remove_var("AGENTDESK_CONFIG") };
         unsafe { std::env::remove_var("MEMENTO_ACCESS_KEY") };
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
 
         let mut args = vec!["-p".to_string()];
         append_claude_mcp_config_arg(&mut args);
@@ -1859,10 +1864,15 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
             None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
         }
+        match previous_config {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_CONFIG", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_CONFIG") },
+        }
         match previous_memento_access_key {
             Some(value) => unsafe { std::env::set_var("MEMENTO_ACCESS_KEY", value) },
             None => unsafe { std::env::remove_var("MEMENTO_ACCESS_KEY") },
         }
+        crate::config::set_test_runtime_root_override(previous_test_runtime_root);
     }
 
     #[test]

@@ -44,6 +44,7 @@ mod turn_bridge;
 
 pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
+pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
 
 use std::collections::HashMap;
@@ -58,7 +59,7 @@ use tokio::sync::Mutex;
 
 use libsql_rusqlite::OptionalExtension;
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, EditMessage, MessageId, UserId};
+use serenity::{ChannelId, MessageId, UserId};
 
 use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
 use crate::services::claude;

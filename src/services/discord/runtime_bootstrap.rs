@@ -16,7 +16,12 @@ const DISCORD_GATEWAY_LEASE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1
 const DISCORD_GATEWAY_LOCK_PREFIX: u64 = 0x0443_0000_0000_0000;
 
 fn discord_gateway_lock_id(token_hash: &str) -> i64 {
-    let hex = token_hash
+    // `discord_token_hash()` returns "discord_<16hex>". Strip the literal prefix
+    // so the first 16 chars we sample are actual hex; otherwise the `is_ascii_hexdigit`
+    // check fails on non-hex letters in the prefix and every bot collapses onto the
+    // same fallback lock id, causing only one bot to acquire the singleton lease.
+    let raw = token_hash.strip_prefix("discord_").unwrap_or(token_hash);
+    let hex = raw
         .get(..16)
         .filter(|prefix| prefix.chars().all(|ch| ch.is_ascii_hexdigit()))
         .unwrap_or("0");
@@ -1300,7 +1305,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 
     // Graceful shutdown: on SIGTERM, cancel all tmux watchers before dying
     let shared_for_signal = shared.clone();
-    let token_for_signal = token.to_string();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -1361,91 +1365,17 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                     }
                 }
 
-                // ── Inflight state, restart reports & placeholder updates ──
+                // ── Inflight state preservation for silent re-attach ──
                 let inflight_states = inflight::load_inflight_states(&provider_for_shutdown);
-
-                // Save restart reports FIRST (disk-only, guaranteed to complete)
-                // before any HTTP calls that might hang/timeout.
-                for state in &inflight_states {
-                    let existing = restart_report::load_restart_report(
-                        &provider_for_shutdown,
-                        state.channel_id,
-                    );
-                    if existing.as_ref().map(|r| r.status.as_str()) == Some("pending") {
-                        continue;
-                    }
-                    let mut report = restart_report::RestartCompletionReport::new(
-                        provider_for_shutdown.clone(),
-                        state.channel_id,
-                        "sigterm",
-                        "dcserver가 SIGTERM으로 종료되었습니다. 재시작 후 작업을 이어받습니다.",
-                    );
-                    report.current_msg_id = Some(state.current_msg_id);
-                    report.channel_name = state.channel_name.clone();
-                    report.user_msg_id = Some(state.user_msg_id);
-                    if let Err(e) = restart_report::save_restart_report(&report) {
-                        tracing::warn!(
-                            "  ⚠ failed to save restart report for channel {}: {e}",
-                            state.channel_id
-                        );
-                    }
-                }
                 if !inflight_states.is_empty() {
+                    let marked_for_restart =
+                        inflight::mark_all_inflight_states_planned_restart(&provider_for_shutdown);
                     let ts2 = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!(
-                        "  [{ts2}] 📝 saved {} restart report(s) for inflight channels",
-                        inflight_states.len()
+                        "  [{ts2}] 👁 preserving {} inflight turn(s) for restart recovery (marked {} as planned_restart)",
+                        inflight_states.len(),
+                        marked_for_restart
                     );
-                }
-
-                // Best-effort: update placeholder messages with restart notice.
-                // Each edit gets a 3-second timeout to avoid blocking shutdown.
-                if !inflight_states.is_empty() {
-                    let http = serenity::Http::new(&token_for_signal);
-                    for state in &inflight_states {
-                        let channel = ChannelId::new(state.channel_id);
-                        let msg_id = MessageId::new(state.current_msg_id);
-                        let restart_notice = if state.full_response.trim().is_empty() {
-                            "⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다".to_string()
-                        } else {
-                            let partial = formatting::format_for_discord_with_provider(
-                                state.full_response.trim(),
-                                &provider_for_shutdown,
-                            );
-                            format!("{partial}\n\n⚠️ dcserver 재시작으로 중단됨 — 곧 복원됩니다")
-                        };
-                        let edit_fut = channel.edit_message(
-                            &http,
-                            msg_id,
-                            EditMessage::new().content(&restart_notice),
-                        );
-                        match tokio::time::timeout(tokio::time::Duration::from_secs(3), edit_fut)
-                            .await
-                        {
-                            Ok(Ok(_)) => {
-                                let ts_ok = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!(
-                                    "  [{ts_ok}] ✓ Updated placeholder msg {} in channel {}",
-                                    state.current_msg_id,
-                                    state.channel_id
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    "  ⚠ Failed to update placeholder msg {} in channel {}: {e}",
-                                    state.current_msg_id,
-                                    state.channel_id
-                                );
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    "  ⚠ Timeout updating placeholder msg {} in channel {}",
-                                    state.current_msg_id,
-                                    state.channel_id
-                                );
-                            }
-                        }
-                    }
                 }
 
                 // ── Final state snapshot (belt-and-suspenders) ──
@@ -1742,6 +1672,24 @@ mod tests {
         let left = discord_gateway_lock_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let right = discord_gateway_lock_id("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn discord_gateway_lock_id_strips_discord_prefix_so_each_bot_gets_unique_id() {
+        // `discord_token_hash` produces "discord_<8 bytes hex>" — without stripping
+        // the prefix every bot collapses onto the fallback "0" lock id and only the
+        // first bot to start can acquire the singleton lease.
+        let claude_hash = super::super::settings::discord_token_hash("claude-bot-token-aaa");
+        let codex_hash = super::super::settings::discord_token_hash("codex-bot-token-bbb");
+        assert!(claude_hash.starts_with("discord_"));
+        assert!(codex_hash.starts_with("discord_"));
+        let claude_lock = discord_gateway_lock_id(&claude_hash);
+        let codex_lock = discord_gateway_lock_id(&codex_hash);
+        assert_ne!(claude_lock, codex_lock);
+        // Neither should collapse onto the prefix-only fallback (= 0x0443_0000_0000_0000)
+        let fallback_lock_id = (DISCORD_GATEWAY_LOCK_PREFIX) as i64;
+        assert_ne!(claude_lock, fallback_lock_id);
+        assert_ne!(codex_lock, fallback_lock_id);
     }
 
     #[tokio::test]

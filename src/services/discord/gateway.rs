@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
@@ -92,6 +93,8 @@ pub(super) struct DiscordGateway {
     live_turn: Option<LiveDiscordTurnContext>,
 }
 
+pub(super) struct HeadlessGateway;
+
 impl DiscordGateway {
     pub(super) fn new(
         http: Arc<serenity::Http>,
@@ -111,6 +114,11 @@ impl DiscordGateway {
 fn live_bot_owner_provider(live_turn: Option<&LiveDiscordTurnContext>) -> Option<ProviderKind> {
     let live_turn = live_turn?;
     Some(resolve_discord_bot_provider(&live_turn.token))
+}
+
+fn next_headless_message_id() -> MessageId {
+    static HEADLESS_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(9_000_000_000_000_000_000);
+    MessageId::new(HEADLESS_MESSAGE_ID_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 impl TurnGateway for DiscordGateway {
@@ -283,6 +291,99 @@ impl TurnGateway for DiscordGateway {
 
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
         live_bot_owner_provider(self.live_turn.as_ref())
+    }
+}
+
+impl TurnGateway for HeadlessGateway {
+    fn send_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _content: &'a str,
+    ) -> GatewayFuture<'a, Result<MessageId, String>> {
+        Box::pin(async move { Ok(next_headless_message_id()) })
+    }
+
+    fn edit_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _content: &'a str,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn replace_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _content: &'a str,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {})
+    }
+
+    fn schedule_retry_with_history<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        _user_message_id: MessageId,
+        user_text: &'a str,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 📦 Headless retry suppressed for channel {}: {}",
+                channel_id,
+                user_text
+            );
+        })
+    }
+
+    fn dispatch_queued_turn<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _intervention: &'a Intervention,
+        _request_owner_name: &'a str,
+        _has_more_queued_turns: bool,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(
+            async move { Err("headless turns do not dispatch queued turns locally".to_string()) },
+        )
+    }
+
+    fn validate_live_routing<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn requester_mention(&self) -> Option<String> {
+        None
+    }
+
+    fn can_chain_locally(&self) -> bool {
+        false
+    }
+
+    fn bot_owner_provider(&self) -> Option<ProviderKind> {
+        None
     }
 }
 

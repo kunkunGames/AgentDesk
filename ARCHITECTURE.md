@@ -40,6 +40,7 @@ src/
 │   │   ├── source.rs
 │   │   └── tests.rs
 │   ├── args.rs
+│   ├── auto_remember.rs
 │   ├── client.rs
 │   ├── dcserver.rs
 │   ├── direct.rs
@@ -54,7 +55,6 @@ src/
 │   ├── agents.rs
 │   ├── auto_queue.rs
 │   ├── builtin_pipeline.rs
-│   ├── cron_history.rs
 │   ├── kanban.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
@@ -97,7 +97,8 @@ src/
 │   ├── mod.rs
 │   ├── ops.rs
 │   ├── sql_guard.rs
-│   └── transition.rs
+│   ├── transition.rs
+│   └── transition_executor_pg.rs
 ├── github/
 │   ├── dod.rs
 │   ├── mod.rs
@@ -182,6 +183,7 @@ src/
 │   └── ws.rs
 ├── services/
 │   ├── auto_queue/
+│   │   ├── cancel_run.rs
 │   │   └── runtime.rs
 │   ├── discord/
 │   │   ├── commands/
@@ -264,6 +266,7 @@ src/
 │   │   └── tmux_restart_handoff.rs
 │   ├── memory/
 │   │   ├── auto_remember.rs
+│   │   ├── auto_remember_quality.rs
 │   │   ├── auto_remember_store.rs
 │   │   ├── local.rs
 │   │   ├── mem0.rs

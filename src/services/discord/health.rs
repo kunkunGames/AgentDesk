@@ -1258,6 +1258,135 @@ async fn resolve_direct_meeting_runtime(
     .to_string())
 }
 
+async fn resolve_direct_meeting_shared(
+    registry: &HealthRegistry,
+    channel_id: ChannelId,
+    owner_provider: &ProviderKind,
+) -> Result<Arc<SharedData>, String> {
+    let provider_name = owner_provider.as_str();
+    let shared_candidates = {
+        let providers = registry.providers.lock().await;
+        providers
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.name.eq_ignore_ascii_case(provider_name))
+            .map(|(index, entry)| (index, entry.shared.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    if shared_candidates.is_empty() {
+        return Err(serde_json::json!({
+            "ok": false,
+            "error": format!("provider runtime not registered: {}", provider_name),
+        })
+        .to_string());
+    }
+
+    let mut candidate_matches = Vec::with_capacity(shared_candidates.len());
+    for (index, shared) in &shared_candidates {
+        let settings = shared.settings.read().await.clone();
+        let explicit_channel_match = settings.allowed_channel_ids.contains(&channel_id.get());
+        let live_channel_match = match shared.cached_serenity_ctx.get() {
+            Some(ctx) => {
+                super::provider_handles_channel(ctx, owner_provider, &settings, channel_id).await
+            }
+            None => false,
+        };
+        candidate_matches.push(DirectMeetingRuntimeCandidate {
+            index: *index,
+            explicit_channel_match,
+            live_channel_match,
+        });
+    }
+
+    if let Some(selected_index) =
+        select_direct_meeting_runtime_candidate(provider_name, channel_id, &candidate_matches)?
+    {
+        let (_, shared) = shared_candidates
+            .iter()
+            .find(|(index, _)| *index == selected_index)
+            .cloned()
+            .ok_or_else(|| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "selected runtime index vanished for provider {} on channel {}",
+                        provider_name,
+                        channel_id.get()
+                    ),
+                })
+                .to_string()
+            })?;
+        return Ok(shared);
+    }
+
+    if shared_candidates.len() == 1 {
+        return Ok(shared_candidates[0].1.clone());
+    }
+
+    Err(serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "could not resolve a unique runtime for provider {} on channel {}",
+            provider_name,
+            channel_id.get()
+        ),
+    })
+    .to_string())
+}
+
+pub async fn start_headless_agent_turn(
+    registry: &HealthRegistry,
+    channel_id: ChannelId,
+    owner_provider: ProviderKind,
+    prompt: String,
+    source: Option<String>,
+    metadata: Option<serde_json::Value>,
+    channel_name_hint: Option<String>,
+) -> Result<super::router::HeadlessTurnStartOutcome, super::router::HeadlessTurnStartError> {
+    let shared = resolve_direct_meeting_shared(registry, channel_id, &owner_provider)
+        .await
+        .map_err(super::router::HeadlessTurnStartError::Internal)?;
+
+    if shared.mailbox(channel_id).has_active_turn().await {
+        return Err(super::router::HeadlessTurnStartError::Conflict(format!(
+            "agent mailbox is busy for channel {}",
+            channel_id.get()
+        )));
+    }
+
+    let ctx = shared.cached_serenity_ctx.get().cloned().ok_or_else(|| {
+        super::router::HeadlessTurnStartError::Internal(format!(
+            "provider runtime is not ready for channel {}",
+            channel_id.get()
+        ))
+    })?;
+    let token = shared
+        .cached_bot_token
+        .get()
+        .cloned()
+        .or_else(|| super::resolve_discord_token_by_hash(&shared.token_hash))
+        .ok_or_else(|| {
+            super::router::HeadlessTurnStartError::Internal(format!(
+                "provider token unavailable for channel {}",
+                channel_id.get()
+            ))
+        })?;
+
+    super::router::start_headless_turn(
+        &ctx,
+        channel_id,
+        &prompt,
+        source.as_deref().unwrap_or("system"),
+        &shared,
+        &token,
+        source.as_deref(),
+        metadata,
+        channel_name_hint,
+    )
+    .await
+}
+
 pub async fn start_direct_meeting(
     registry: &HealthRegistry,
     channel_id: ChannelId,
@@ -1739,10 +1868,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Db {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        crate::db::schema::migrate(&conn).unwrap();
-        crate::db::wrap_conn(conn)
+        crate::db::test_db()
     }
 
     #[test]

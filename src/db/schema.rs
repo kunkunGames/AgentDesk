@@ -1,5 +1,5 @@
 use anyhow::Result;
-use libsql_rusqlite::{Connection, OptionalExtension, params_from_iter};
+use libsql_rusqlite::{Connection, OptionalExtension, params_from_iter}; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 use std::collections::HashSet;
 
 use crate::db::builtin_pipeline::{AGENTDESK_PIPELINE_STAGES, AGENTDESK_REPO_ID};
@@ -943,6 +943,7 @@ fn ensure_pipeline_stage(
             SELECT 1 FROM pipeline_stages WHERE repo_id = ?1 AND stage_name = ?2
          )",
         libsql_rusqlite::params![
+            // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
             repo_id,
             stage_name,
             stage_order,
@@ -1211,7 +1212,7 @@ fn ensure_auto_queue_column(conn: &Connection, table: &str, column: &str, ddl: &
 fn auto_queue_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
-        libsql_rusqlite::params![table, column],
+        libsql_rusqlite::params![table, column], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         |row| row.get(0),
     )
     .unwrap_or(false)
@@ -1343,7 +1344,7 @@ fn rebuild_auto_queue_phase_gates_table(conn: &Connection) -> Result<()> {
                 updated_at: row.get(12)?,
             })
         })?
-        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 
     let valid_run_ids = load_existing_ids(
         conn,
@@ -1476,6 +1477,7 @@ fn rebuild_auto_queue_phase_gates_table(conn: &Connection) -> Result<()> {
                 COALESCE(?12, COALESCE(?11, CURRENT_TIMESTAMP))
             )",
             libsql_rusqlite::params![
+                // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                 row.run_id,
                 row.phase,
                 row.status,
@@ -1639,7 +1641,7 @@ fn backfill_auto_queue_dispatch_history(conn: &Connection) -> Result<()> {
             "INSERT OR IGNORE INTO auto_queue_entry_dispatch_history (
                 entry_id, dispatch_id, trigger_source, created_at
             ) VALUES (?1, ?2, 'schema_backfill_context', COALESCE(?3, CURRENT_TIMESTAMP))",
-            libsql_rusqlite::params![entry_id, dispatch_id, created_at],
+            libsql_rusqlite::params![entry_id, dispatch_id, created_at], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         )?;
     }
 
@@ -1656,7 +1658,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 
     struct LegacyKvPhaseGateState {
         run_id: String,
@@ -1795,7 +1797,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     created_at,
                     updated_at
                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), datetime('now'))",
-                libsql_rusqlite::params![
+                libsql_rusqlite::params![ // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                     row.run_id,
                     row.phase,
                     row.status,
@@ -1838,7 +1840,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     anchor_card_id = excluded.anchor_card_id,
                     failure_reason = excluded.failure_reason,
                     updated_at = datetime('now')",
-                libsql_rusqlite::params![
+                libsql_rusqlite::params![ // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                     row.run_id,
                     row.phase,
                     row.status,
@@ -1880,12 +1882,7 @@ fn ensure_session_transcripts_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_session_transcripts_agent_id
             ON session_transcripts (agent_id);
         CREATE INDEX IF NOT EXISTS idx_session_transcripts_created_at
-            ON session_transcripts (created_at DESC);
-        CREATE VIRTUAL TABLE IF NOT EXISTS session_transcripts_fts USING fts5(
-            session_transcript_id UNINDEXED,
-            content,
-            tokenize = 'unicode61'
-        );",
+            ON session_transcripts (created_at DESC);",
     )?;
     let _ = conn.execute_batch(
         "ALTER TABLE session_transcripts ADD COLUMN events_json TEXT NOT NULL DEFAULT '[]';",
@@ -1970,7 +1967,7 @@ fn backfill_session_agent_ids(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 
     for (session_key, thread_channel_id, dispatch_id) in sessions {
         let Some(agent_id) = crate::db::session_agent_resolution::resolve_agent_id_for_session(
@@ -1989,7 +1986,7 @@ fn backfill_session_agent_ids(conn: &Connection) -> Result<()> {
              SET agent_id = ?2
              WHERE session_key = ?1
                AND NULLIF(TRIM(agent_id), '') IS NULL",
-            libsql_rusqlite::params![session_key, agent_id],
+            libsql_rusqlite::params![session_key, agent_id], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         )?;
     }
 
@@ -2010,7 +2007,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 
     if legacy_cards.is_empty() {
         return Ok(());
@@ -2026,7 +2023,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                     "SELECT from_status FROM kanban_audit_logs
                      WHERE card_id = ?1 AND to_status = ?2
                      ORDER BY created_at DESC, id DESC LIMIT 1",
-                    libsql_rusqlite::params![card_id, legacy_status],
+                    libsql_rusqlite::params![card_id, legacy_status], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -2102,7 +2099,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                          blocked_reason = ?2,
                          updated_at = datetime('now')
                      WHERE id = ?3",
-                    libsql_rusqlite::params![target_status, blocked_reason, card_id],
+                    libsql_rusqlite::params![target_status, blocked_reason, card_id], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                 )?;
                 conn.execute(
                     "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at)
@@ -2150,7 +2147,7 @@ fn backfill_session_transcript_agent_ids(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 
     for (id, session_key, dispatch_id) in transcripts {
         let Some(agent_id) = crate::db::session_agent_resolution::resolve_agent_id_for_session(
@@ -2169,7 +2166,7 @@ fn backfill_session_transcript_agent_ids(conn: &Connection) -> Result<()> {
              SET agent_id = ?2
              WHERE id = ?1
                AND NULLIF(TRIM(agent_id), '') IS NULL",
-            libsql_rusqlite::params![id, agent_id],
+            libsql_rusqlite::params![id, agent_id], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         )?;
     }
 
@@ -2243,8 +2240,7 @@ fn migrate_legacy_session_transcripts_agent_fk(conn: &Connection) -> Result<()> 
     }
 
     conn.execute_batch(
-        "DROP TABLE IF EXISTS session_transcripts_fts;
-         ALTER TABLE session_transcripts RENAME TO session_transcripts_legacy;
+        "ALTER TABLE session_transcripts RENAME TO session_transcripts_legacy;
          CREATE TABLE session_transcripts (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             turn_id           TEXT NOT NULL UNIQUE,
@@ -2291,28 +2287,9 @@ fn migrate_legacy_session_transcripts_agent_fk(conn: &Connection) -> Result<()> 
          CREATE INDEX IF NOT EXISTS idx_session_transcripts_session_key
             ON session_transcripts (session_key);
          CREATE INDEX IF NOT EXISTS idx_session_transcripts_agent_id
-            ON session_transcripts (agent_id);
+         ON session_transcripts (agent_id);
          CREATE INDEX IF NOT EXISTS idx_session_transcripts_created_at
-            ON session_transcripts (created_at DESC);
-         CREATE VIRTUAL TABLE session_transcripts_fts USING fts5(
-            session_transcript_id UNINDEXED,
-            content,
-            tokenize = 'unicode61'
-         );
-         INSERT INTO session_transcripts_fts (session_transcript_id, content)
-         SELECT
-            id,
-            CASE
-                WHEN TRIM(user_message) <> '' AND TRIM(assistant_message) <> ''
-                    THEN 'user:' || char(10) || user_message || char(10) || char(10)
-                        || 'assistant:' || char(10) || assistant_message
-                WHEN TRIM(user_message) <> ''
-                    THEN 'user:' || char(10) || user_message
-                WHEN TRIM(assistant_message) <> ''
-                    THEN 'assistant:' || char(10) || assistant_message
-                ELSE ''
-            END
-         FROM session_transcripts;",
+            ON session_transcripts (created_at DESC);",
     )?;
 
     Ok(())
@@ -2521,13 +2498,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events_json, "[]");
-
-        let fts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session_transcripts_fts", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(fts_count, 1);
     }
 
     #[test]
@@ -2818,7 +2788,7 @@ mod tests {
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
-            .collect::<libsql_rusqlite::Result<Vec<_>>>()
+            .collect::<libsql_rusqlite::Result<Vec<_>>>() // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
             .unwrap();
 
         assert_eq!(
@@ -2852,13 +2822,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
                  VALUES (?1, ?2, 'done', datetime('now'), datetime('now'))",
-                libsql_rusqlite::params![card_id, format!("Phase Gate Card {index}")],
+                libsql_rusqlite::params![card_id, format!("Phase Gate Card {index}")], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
                  VALUES (?1, 'test/repo', 'agent-1', 'paused')",
-                libsql_rusqlite::params![run_id],
+                libsql_rusqlite::params![run_id], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
             )
             .unwrap();
             conn.execute(
@@ -2867,12 +2837,13 @@ mod tests {
                  ) VALUES (
                     ?1, ?2, 'agent-1', 'phase-gate', 'pending', ?3, datetime('now'), datetime('now'), '{}'
                  )",
-                libsql_rusqlite::params![dispatch_id, card_id, format!("Phase Gate Dispatch {index}")],
+                libsql_rusqlite::params![dispatch_id, card_id, format!("Phase Gate Dispatch {index}")], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
             )
             .unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
                 libsql_rusqlite::params![
+                    // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
                     phase_key,
                     serde_json::json!({
                         "run_id": run_id,

@@ -1,4 +1,4 @@
-use super::super::gateway::{DiscordGateway, LiveDiscordTurnContext};
+use super::super::gateway::{DiscordGateway, HeadlessGateway, LiveDiscordTurnContext};
 use super::super::*;
 use crate::services::memory::{
     RecallMode, RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
@@ -7,6 +7,7 @@ use crate::services::memory::{
 use crate::services::provider::{CancelToken, cancel_requested};
 use poise::serenity_prelude::CreateMessage;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, PartialEq, Eq)]
 struct MemoryInjectionPlan<'a> {
@@ -125,6 +126,801 @@ fn take_session_retry_context(channel_id: ChannelId) -> Option<String> {
         .flatten()
         .and_then(|raw| format_session_retry_context(&raw))
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadlessTurnStartOutcome {
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeadlessTurnStartError {
+    Conflict(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for HeadlessTurnStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(message) | Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for HeadlessTurnStartError {}
+
+fn next_headless_turn_message_id() -> MessageId {
+    static HEADLESS_TURN_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(9_100_000_000_000_000_000);
+    MessageId::new(HEADLESS_TURN_MESSAGE_ID_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+fn build_headless_trigger_context(
+    source: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    let source = source.map(str::trim).filter(|value| !value.is_empty());
+    let metadata = metadata.filter(|value| !value.is_null());
+    if source.is_none() && metadata.is_none() {
+        return None;
+    }
+
+    let mut lines = vec!["[Headless trigger context]".to_string()];
+    if let Some(source) = source {
+        lines.push(format!("source: {source}"));
+    }
+    if let Some(metadata) = metadata {
+        lines.push(format!("metadata: {}", metadata));
+    }
+    Some(lines.join("\n"))
+}
+
+pub(in crate::services::discord) async fn start_headless_turn(
+    ctx: &serenity::Context,
+    channel_id: ChannelId,
+    prompt: &str,
+    request_owner_name: &str,
+    shared: &Arc<SharedData>,
+    token: &str,
+    source: Option<&str>,
+    metadata: Option<serde_json::Value>,
+    channel_name_hint: Option<String>,
+) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err(HeadlessTurnStartError::Internal(
+            "prompt is required".to_string(),
+        ));
+    }
+
+    let request_owner = UserId::new(1);
+    let user_msg_id = next_headless_turn_message_id();
+    let placeholder_msg_id = next_headless_turn_message_id();
+    let mut session_reset_reason = None;
+    let mut reset_session_id_to_clear = None;
+
+    {
+        let mut data = shared.core.lock().await;
+        if let Some(session) = data.sessions.get_mut(&channel_id)
+            && let Some(reason) =
+                session_reset_reason_for_turn(session, tokio::time::Instant::now())
+        {
+            if let Some(retry_context) =
+                session.recent_history_context(super::super::SESSION_RECOVERY_CONTEXT_MESSAGES)
+            {
+                let _ = super::super::internal_api::set_kv_value(
+                    &super::super::session_retry_context_key(channel_id),
+                    &retry_context,
+                );
+            }
+            session_reset_reason = Some(reason);
+            reset_session_id_to_clear = session.session_id.clone();
+            session.clear_provider_session();
+            session.history.clear();
+        }
+    }
+
+    let (mut session_id, mut memento_context_loaded, current_path) = {
+        let mut data = shared.core.lock().await;
+        if let Some(info) = load_session_runtime_state(&mut data.sessions, channel_id) {
+            if let Some(channel_name_hint) = channel_name_hint.as_ref()
+                && let Some(session) = data.sessions.get_mut(&channel_id)
+                && session.channel_name.is_none()
+            {
+                session.channel_name = Some(channel_name_hint.clone());
+            }
+            info
+        } else {
+            let workspace = settings::resolve_workspace(channel_id, channel_name_hint.as_deref())
+                .ok_or_else(|| {
+                HeadlessTurnStartError::Internal(format!(
+                    "no workspace resolved for headless turn channel {}",
+                    channel_id.get()
+                ))
+            })?;
+            let workspace_path = std::path::Path::new(&workspace);
+            if !workspace_path.is_dir() {
+                return Err(HeadlessTurnStartError::Internal(format!(
+                    "resolved workspace does not exist for headless turn: {workspace}"
+                )));
+            }
+            let canonical = workspace_path
+                .canonicalize()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| workspace.clone());
+            let session = data
+                .sessions
+                .entry(channel_id)
+                .or_insert_with(|| DiscordSession {
+                    session_id: None,
+                    memento_context_loaded: false,
+                    memento_reflected: false,
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    channel_name: channel_name_hint.clone(),
+                    category_name: None,
+                    remote_profile_name: None,
+                    channel_id: Some(channel_id.get()),
+                    last_active: tokio::time::Instant::now(),
+                    worktree: None,
+                    born_generation: super::super::runtime_store::load_generation(),
+                    assistant_turns: 0,
+                });
+            session.current_path = Some(canonical.clone());
+            if session.channel_name.is_none() {
+                session.channel_name = channel_name_hint.clone();
+            }
+            session.channel_id = Some(channel_id.get());
+            session.last_active = tokio::time::Instant::now();
+            (
+                session.session_id.clone(),
+                session.memento_context_loaded,
+                canonical,
+            )
+        }
+    };
+
+    let pending_uploads = {
+        let mut data = shared.core.lock().await;
+        data.sessions
+            .get_mut(&channel_id)
+            .map(|session| {
+                session.cleared = false;
+                std::mem::take(&mut session.pending_uploads)
+            })
+            .unwrap_or_default()
+    };
+
+    let (settings_provider, allowed_tools) = {
+        let settings = shared.settings.read().await;
+        (settings.provider.clone(), settings.allowed_tools.clone())
+    };
+
+    let reply_context = take_session_retry_context(channel_id);
+    let role_binding = {
+        let data = shared.core.lock().await;
+        let channel_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|session| session.channel_name.as_deref());
+        resolve_role_binding(channel_id, channel_name)
+    };
+    let provider = role_binding
+        .as_ref()
+        .and_then(|binding| binding.provider.clone())
+        .unwrap_or(settings_provider);
+    let dispatch_profile = DispatchProfile::Full;
+
+    super::super::commands::reset_provider_session_if_pending(
+        &ctx.http, shared, &provider, channel_id,
+    )
+    .await;
+
+    let prompt_prep_started = std::time::Instant::now();
+    let (channel_name, tmux_session_name, category_name) = {
+        let data = shared.core.lock().await;
+        let channel_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|session| session.channel_name.clone())
+            .or_else(|| channel_name_hint.clone());
+        let tmux_session_name = channel_name
+            .as_ref()
+            .map(|name| provider.build_tmux_session_name(name));
+        let category_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|session| session.category_name.clone());
+        (channel_name, tmux_session_name, category_name)
+    };
+    let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
+    if session_reset_reason.is_some() {
+        if let Some(ref key) = adk_session_key {
+            super::super::adk_session::clear_provider_session_id(key, shared.api_port).await;
+        }
+        if let Some(ref session_id_to_clear) = reset_session_id_to_clear {
+            let _ = super::super::internal_api::clear_stale_session_id(session_id_to_clear).await;
+        }
+    }
+    if session_id.is_none() {
+        if let Some(reason) = session_reset_reason {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let reason = match reason {
+                SessionResetReason::IdleExpired => "idle timeout",
+                SessionResetReason::AssistantTurnCap => "assistant turn cap",
+            };
+            tracing::info!(
+                "  [{ts}] ↻ Skipping DB provider session restore for headless channel {} due to {}",
+                channel_id.get(),
+                reason
+            );
+        } else if let Some(ref key) = adk_session_key {
+            let restored = super::super::adk_session::fetch_provider_session_id(
+                key,
+                &provider,
+                shared.api_port,
+            )
+            .await;
+            if restored.is_some() {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] ↻ Restored provider session_id from DB for headless {}",
+                    key
+                );
+                let mut data = shared.core.lock().await;
+                if let Some(session) = data.sessions.get_mut(&channel_id) {
+                    session.restore_provider_session(restored.clone());
+                }
+                memento_context_loaded = true;
+            }
+            session_id = restored;
+        }
+    }
+
+    let cancel_token = Arc::new(CancelToken::new());
+    let started = super::super::mailbox_try_start_turn(
+        shared,
+        channel_id,
+        cancel_token.clone(),
+        request_owner,
+        user_msg_id,
+    )
+    .await;
+    if !started {
+        return Err(HeadlessTurnStartError::Conflict(format!(
+            "agent mailbox is busy for channel {}",
+            channel_id.get()
+        )));
+    }
+    shared
+        .global_active
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .turn_start_times
+        .insert(channel_id, std::time::Instant::now());
+
+    let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
+    let recall_mode = recall_mode_for_turn(&memory_settings, memento_context_loaded);
+    let memory_recall = memory_backend
+        .recall(RecallRequest {
+            mode: recall_mode,
+            provider: provider.clone(),
+            role_id: resolve_memory_role_id(role_binding.as_ref()),
+            channel_id: channel_id.get(),
+            session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
+            dispatch_profile,
+            user_text: prompt.to_string(),
+            context_text: Some(prompt.to_string()),
+            case_id: None,
+            phase: None,
+            resolution_status: None,
+        })
+        .await;
+    if memory_settings.backend == settings::MemoryBackendKind::Memento
+        && recall_mode == RecallMode::Bootstrap
+    {
+        let mut data = shared.core.lock().await;
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            session.note_memento_context_loaded();
+        }
+    }
+    for warning in &memory_recall.warnings {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] [memory] recall warning for headless channel {}: {}",
+            channel_id.get(),
+            warning
+        );
+    }
+
+    let mut context_chunks = Vec::new();
+    let memory_injection_plan = build_memory_injection_plan(
+        &provider,
+        session_id.is_some(),
+        dispatch_profile,
+        &memory_recall,
+    );
+    if !pending_uploads.is_empty() {
+        context_chunks.push(pending_uploads.join("\n"));
+    }
+    if let Some(headless_context) = build_headless_trigger_context(source, metadata.as_ref()) {
+        context_chunks.push(headless_context);
+    }
+    if let Some(reply_context) = reply_context {
+        context_chunks.push(reply_context);
+    }
+    if let Some(knowledge) = memory_injection_plan.shared_knowledge_for_context {
+        context_chunks.push(knowledge.to_string());
+    }
+    if let Some(external_recall) = memory_injection_plan.external_recall_for_context {
+        context_chunks.push(external_recall.to_string());
+    }
+    context_chunks.push(ai_screen::sanitize_user_input(prompt));
+    let context_prompt = context_chunks.join("\n\n");
+
+    let discord_context = match channel_name.as_deref() {
+        Some(name) => {
+            let cat_part = category_name
+                .as_deref()
+                .map(|value| format!(" (category: {})", value))
+                .unwrap_or_default();
+            format!(
+                "Discord context: channel #{} (ID: {}){}, user: {} (ID: {})",
+                name,
+                channel_id.get(),
+                cat_part,
+                request_owner_name,
+                request_owner.get()
+            )
+        }
+        None => format!(
+            "Discord context: headless channel {} (no bound channel name), user: {} (ID: {})",
+            channel_id.get(),
+            request_owner_name,
+            request_owner.get()
+        ),
+    };
+
+    let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
+    let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
+    let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
+    let system_prompt_owned = build_system_prompt(
+        &discord_context,
+        &current_path,
+        channel_id,
+        token,
+        role_binding.as_ref(),
+        false,
+        dispatch_profile,
+        None,
+        None,
+        sak_for_system,
+        longterm_catalog_for_prompt,
+        Some(&memory_settings),
+        memento_mcp_available,
+    );
+    let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
+    let memory_backend_label = memory_settings.backend.as_str();
+    let provider_label = match &provider {
+        ProviderKind::Claude => "claude",
+        ProviderKind::Codex => "codex",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::Qwen => "qwen",
+        ProviderKind::Unsupported(_) => "unsupported",
+    };
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] [prompt-prep] headless channel={} provider={} dispatch=full memory_backend={} memory_profile={} reused_session={} duration_ms={}",
+        channel_id.get(),
+        provider_label,
+        memory_backend_label,
+        memory_settings.mem0.profile,
+        session_id.is_some(),
+        prompt_prep_duration_ms
+    );
+
+    {
+        let watchdog_token = cancel_token.clone();
+        let watchdog_shared = shared.clone();
+        let timeout = super::super::turn_watchdog_timeout();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let deadline_ms = now_ms + timeout.as_millis() as i64;
+        let max_deadline_ms = now_ms + 3 * 3600 * 1000;
+        watchdog_token
+            .watchdog_deadline_ms
+            .store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
+        watchdog_token
+            .watchdog_max_deadline_ms
+            .store(max_deadline_ms, std::sync::atomic::Ordering::Relaxed);
+
+        let watchdog_channel_id_num = channel_id.get();
+        let watchdog_provider = provider.clone();
+        tokio::spawn(async move {
+            const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                if watchdog_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num).await;
+                    return;
+                }
+                if let Some(new_deadline) =
+                    super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
+                {
+                    let max_dl = watchdog_token
+                        .watchdog_max_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let clamped = std::cmp::min(new_deadline, max_dl);
+                    watchdog_token
+                        .watchdog_deadline_ms
+                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                }
+                {
+                    let current_dl = watchdog_token
+                        .watchdog_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let now_ms_check = chrono::Utc::now().timestamp_millis();
+                    if now_ms_check > current_dl - 120_000 {
+                        if let Some(inflight) = super::super::inflight::load_inflight_state(
+                            &watchdog_provider,
+                            watchdog_channel_id_num,
+                        ) {
+                            if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(
+                                &inflight.updated_at,
+                                "%Y-%m-%d %H:%M:%S",
+                            ) {
+                                let updated_ms = updated.and_utc().timestamp_millis();
+                                let age_ms = now_ms_check - updated_ms;
+                                if age_ms < 300_000 {
+                                    let max_dl = watchdog_token
+                                        .watchdog_max_deadline_ms
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let new_dl = std::cmp::min(
+                                        now_ms_check + timeout.as_millis() as i64,
+                                        max_dl,
+                                    );
+                                    if new_dl > current_dl {
+                                        watchdog_token
+                                            .watchdog_deadline_ms
+                                            .store(new_dl, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let current_deadline = watchdog_token
+                    .watchdog_deadline_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let now = chrono::Utc::now().timestamp_millis();
+                if now < current_deadline {
+                    continue;
+                }
+
+                let is_current_token =
+                    super::super::mailbox_cancel_token(&watchdog_shared, channel_id)
+                        .await
+                        .is_some_and(|current| std::sync::Arc::ptr_eq(&watchdog_token, &current));
+                if !is_current_token {
+                    super::super::clear_watchdog_deadline_override(watchdog_channel_id_num).await;
+                    return;
+                }
+
+                super::super::turn_bridge::cancel_active_token(
+                    &watchdog_token,
+                    super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
+                    "watchdog timeout",
+                );
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⏰ Headless watchdog timeout fired for channel {}",
+                    channel_id
+                );
+                return;
+            }
+        });
+    }
+
+    let remote_profile = {
+        let data = shared.core.lock().await;
+        data.sessions
+            .get(&channel_id)
+            .and_then(|session| session.remote_profile_name.as_ref())
+            .and_then(|name| {
+                let settings = crate::config::Settings::load();
+                settings
+                    .remote_profiles
+                    .iter()
+                    .find(|profile| profile.name == *name)
+                    .cloned()
+            })
+    };
+
+    let adk_session_name = channel_name.clone();
+    let adk_session_info =
+        derive_adk_session_info(Some(prompt), channel_name.as_deref(), Some(&current_path));
+    let adk_thread_channel_id = adk_session_name
+        .as_deref()
+        .and_then(super::super::adk_session::parse_thread_channel_id_from_name);
+    post_adk_session_status(
+        adk_session_key.as_deref(),
+        adk_session_name.as_deref(),
+        Some(provider.as_str()),
+        "working",
+        &provider,
+        Some(&adk_session_info),
+        None,
+        Some(&current_path),
+        None,
+        adk_thread_channel_id,
+        role_binding
+            .as_ref()
+            .map(|binding| binding.role_id.as_str()),
+        shared.api_port,
+    )
+    .await;
+
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) = {
+        #[cfg(unix)]
+        {
+            if remote_profile.is_none()
+                && provider.uses_managed_tmux_backend()
+                && claude::is_tmux_available()
+            {
+                if let Some(ref tmux_name) = tmux_session_name {
+                    let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
+                    let session_exists =
+                        crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
+                    let last_offset = std::fs::metadata(&output_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    (
+                        Some(tmux_name.clone()),
+                        Some(output_path),
+                        Some(input_fifo_path),
+                        if session_exists { last_offset } else { 0 },
+                    )
+                } else {
+                    (None, None, None, 0)
+                }
+            } else {
+                (None, None, None, 0)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            (None, None, None, 0u64)
+        }
+    };
+
+    let mut inflight_state = InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        channel_name.clone(),
+        request_owner.get(),
+        user_msg_id.get(),
+        placeholder_msg_id.get(),
+        prompt.to_string(),
+        session_id.clone(),
+        inflight_tmux_name,
+        inflight_output_path,
+        inflight_input_fifo.clone(),
+        inflight_offset,
+    );
+    inflight_state.logical_channel_id = Some(channel_id.get());
+    inflight_state.session_key = adk_session_key.clone();
+    if let Err(error) = save_inflight_state(&inflight_state) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!("  [{ts}]   ⚠ inflight state save failed: {error}");
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let session_id_clone = session_id.clone();
+    let current_path_clone = current_path.clone();
+    let cancel_token_clone = cancel_token.clone();
+
+    if let Some(watcher) = shared.tmux_watchers.get(&channel_id) {
+        watcher
+            .pause_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        watcher
+            .paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    {
+        let script = super::super::runtime_store::agentdesk_root()
+            .unwrap_or_default()
+            .join("scripts/worktree-autosync.sh");
+        if script.exists() {
+            let ws = current_path.clone();
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            match std::process::Command::new(&script)
+                .arg(&ws)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+            {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let msg = stdout.trim();
+                    match out.status.code() {
+                        Some(0) => tracing::info!("  [{ts}] 🔄 worktree-autosync [{ws}]: {msg}"),
+                        Some(1) => {
+                            tracing::info!("  [{ts}] ⏭ worktree-autosync [{ws}]: skipped — {msg}")
+                        }
+                        _ => tracing::warn!("  [{ts}] ⚠ worktree-autosync [{ws}]: error — {msg}"),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "  [{ts}] ⚠ worktree-autosync: failed to run for headless turn — {error}"
+                ),
+            }
+        }
+    }
+
+    let model_for_turn =
+        super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
+    let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
+    let compact_percent = ctx_thresholds.compact_pct_for(&provider);
+    let model_context_window = provider.resolve_context_window(model_for_turn.as_deref());
+    let compact_percent_for_claude = Some(ctx_thresholds.compact_pct_for(&provider));
+    let compact_token_limit_for_codex = {
+        let cli_config = provider.compact_cli_config(compact_percent, model_context_window);
+        cli_config
+            .first()
+            .map(|(_, value)| value.parse::<u64>().unwrap_or(0))
+    };
+
+    let prompt_owned = prompt.to_string();
+    let provider_for_blocking = provider.clone();
+    tokio::task::spawn_blocking(move || {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || match &provider_for_blocking {
+                    ProviderKind::Claude => claude::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
+                        compact_percent_for_claude,
+                    ),
+                    ProviderKind::Codex => codex::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
+                        compact_token_limit_for_codex,
+                    ),
+                    ProviderKind::Gemini => gemini::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
+                    ),
+                    ProviderKind::Qwen => qwen::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
+                    ),
+                    ProviderKind::Unsupported(name) => {
+                        let _ = tx.send(StreamMessage::Error {
+                            message: format!("Provider '{}' is not installed", name),
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: None,
+                        });
+                        Ok(())
+                    }
+                },
+            ));
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("  [headless streaming] Error: {}", error);
+                let _ = tx.send(StreamMessage::Error {
+                    message: error,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+            }
+            Err(panic_info) => {
+                let msg = if let Some(value) = panic_info.downcast_ref::<String>() {
+                    value.clone()
+                } else if let Some(value) = panic_info.downcast_ref::<&str>() {
+                    value.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::warn!("  [headless streaming] PANIC: {}", msg);
+                let _ = tx.send(StreamMessage::Error {
+                    message: format!("Internal error (panic): {}", msg),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
+            }
+        }
+    });
+
+    spawn_turn_bridge(
+        shared.clone(),
+        cancel_token,
+        rx,
+        TurnBridgeContext {
+            provider,
+            gateway: Arc::new(HeadlessGateway),
+            channel_id,
+            user_msg_id,
+            user_text_owned: prompt_owned,
+            request_owner_name: request_owner_name.to_string(),
+            role_binding,
+            adk_session_key,
+            adk_session_name,
+            adk_session_info: Some(adk_session_info),
+            adk_cwd: Some(current_path),
+            dispatch_id: None,
+            dispatch_profile,
+            memory_recall_usage: memory_recall.token_usage,
+            current_msg_id: placeholder_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(inflight_offset),
+            new_session_id: session_id,
+            defer_watcher_resume: false,
+            completion_tx: None,
+            inflight_state,
+        },
+    );
+
+    Ok(HeadlessTurnStartOutcome {
+        turn_id: format!("discord:{}:{}", channel_id.get(), user_msg_id.get()),
+    })
+}
+
 async fn send_restore_notification(
     shared: &Arc<SharedData>,
     fallback_http: &Arc<serenity::Http>,

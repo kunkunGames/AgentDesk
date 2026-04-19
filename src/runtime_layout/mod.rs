@@ -83,6 +83,9 @@ impl Default for MemoryBackendConfig {
 impl MemoryBackendConfig {
     fn normalized(mut self) -> Self {
         self.backend = normalize_memory_backend_name(Some(&self.backend));
+        if self.version < MEMORY_LAYOUT_VERSION {
+            self.query_recall_after_bootstrap = true;
+        }
         self.file = self.file.normalized(
             self.legacy_sak_path.take(),
             self.legacy_sam_path.take(),
@@ -879,7 +882,7 @@ mod tests {
         let backend = load_memory_backend(root);
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "auto");
-        assert!(!backend.query_recall_after_bootstrap);
+        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, default_sak_path());
         assert_eq!(backend.file.sam_path, default_sam_path());
         assert_eq!(backend.file.ltm_root, default_ltm_root());
@@ -1198,7 +1201,7 @@ memory:
 
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "memento");
-        assert!(!backend.query_recall_after_bootstrap);
+        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/yaml/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/yaml/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/yaml/ltm");
