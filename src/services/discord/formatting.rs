@@ -328,6 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn test_split_message_short_passthrough() {
+        use super::split_message;
+
+        let short = "Hello, world!";
+        let chunks = split_message(short);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], short);
+    }
+
+    #[test]
+    fn test_split_message_long_produces_multiple_chunks() {
+        use super::{DISCORD_MSG_LIMIT, split_message};
+
+        // Create a message longer than the Discord limit
+        let long_msg: String = "A".repeat(DISCORD_MSG_LIMIT + 500);
+        let chunks = split_message(&long_msg);
+        assert!(chunks.len() >= 2);
+        // Each chunk should be within the limit (with some overhead tolerance)
+        for chunk in &chunks {
+            assert!(chunk.len() <= DISCORD_MSG_LIMIT + 50);
+        }
+    }
+
+    #[test]
     fn test_build_long_message_attachment_preview_fits_limit() {
         use super::{ATTACHMENT_PREVIEW_BYTES, DISCORD_MSG_LIMIT, build_long_message_attachment};
 
@@ -1156,28 +1180,27 @@ pub(super) fn format_for_discord(s: &str) -> String {
     result
 }
 
-/// Send a message using poise Context. If it overflows Discord's single-message
-/// limit, send the message as an inline preview plus a `.txt` attachment with
-/// the full content.
+/// Send a message using poise Context, splitting if necessary
 pub(super) async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Result<(), Error> {
     if text.len() <= DISCORD_MSG_LIMIT {
         ctx.say(text).await?;
         return Ok(());
     }
 
-    let (preview, attachment) = build_long_message_attachment(text);
-    ctx.send(
-        poise::CreateReply::default()
-            .content(preview)
-            .attachment(attachment),
-    )
-    .await?;
+    let chunks = split_message(text);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            ctx.say(chunk).await?;
+        } else {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            ctx.channel_id().say(ctx.serenity_context(), chunk).await?;
+        }
+    }
+
     Ok(())
 }
 
-/// Send a long message using raw HTTP. Overflow falls back to an inline preview
-/// plus a `.txt` attachment so recipient bots still see opening context while
-/// humans can download the full text.
+/// Send a long message using raw HTTP, splitting if necessary
 pub(super) async fn send_long_message_raw(
     http: &serenity::Http,
     channel_id: ChannelId,
@@ -1192,19 +1215,19 @@ pub(super) async fn send_long_message_raw(
         return Ok(());
     }
 
-    let (preview, attachment) = build_long_message_attachment(text);
-    rate_limit_wait(shared, channel_id).await;
-    channel_id
-        .send_message(
-            http,
-            CreateMessage::new().content(preview).add_file(attachment),
-        )
-        .await?;
+    let chunks = split_message(text);
+    for chunk in &chunks {
+        rate_limit_wait(shared, channel_id).await;
+        channel_id
+            .send_message(http, CreateMessage::new().content(chunk))
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
     Ok(())
 }
 
-/// Replace an existing Discord message with long content. For overflow, the
-/// placeholder is edited to carry the preview and a `.txt` attachment.
+/// Replace an existing Discord message with the first chunk, then send the remaining chunks.
 pub(super) async fn replace_long_message_raw(
     http: &serenity::Http,
     channel_id: ChannelId,
@@ -1212,37 +1235,14 @@ pub(super) async fn replace_long_message_raw(
     text: &str,
     shared: &Arc<SharedData>,
 ) -> Result<(), Error> {
-    if text.is_empty() {
+    let chunks = split_message(text);
+    let Some(first_chunk) = chunks.first() else {
         return Ok(());
-    }
+    };
 
-    if text.len() <= DISCORD_MSG_LIMIT {
-        rate_limit_wait(shared, channel_id).await;
-        let edit_result = channel_id
-            .edit_message(http, message_id, EditMessage::new().content(text))
-            .await;
-        if let Err(e) = edit_result {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ⚠ replace_long_message_raw edit failed for channel {} msg {}: {e}",
-                channel_id.get(),
-                message_id.get()
-            );
-            return send_long_message_raw(http, channel_id, text, shared).await;
-        }
-        return Ok(());
-    }
-
-    let (preview, attachment) = build_long_message_attachment(text);
     rate_limit_wait(shared, channel_id).await;
     let edit_result = channel_id
-        .edit_message(
-            http,
-            message_id,
-            EditMessage::new()
-                .content(&preview)
-                .new_attachment(attachment),
-        )
+        .edit_message(http, message_id, EditMessage::new().content(first_chunk))
         .await;
 
     if let Err(e) = edit_result {
@@ -1255,7 +1255,90 @@ pub(super) async fn replace_long_message_raw(
         return send_long_message_raw(http, channel_id, text, shared).await;
     }
 
+    for chunk in chunks.iter().skip(1) {
+        rate_limit_wait(shared, channel_id).await;
+        channel_id
+            .send_message(http, CreateMessage::new().content(chunk))
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
     Ok(())
+}
+
+/// Split a message into chunks that fit within Discord's 2000 char limit.
+/// Handles code block boundaries correctly. Used by stream/slash-command/recovery
+/// paths where overflow is delivered as additional inline messages. The
+/// agent-to-agent `/api/send` path uses [`build_long_message_attachment`]
+/// instead so recipient bots receive a single self-contained message + `.txt`.
+pub(super) fn split_message(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    let mut in_code_block = false;
+    let mut code_block_lang = String::new();
+
+    while !remaining.is_empty() {
+        // Reserve space for code block tags we may need to add
+        let tag_overhead = if in_code_block {
+            // closing ``` + opening ```lang\n
+            3 + 3 + code_block_lang.len() + 1
+        } else {
+            0
+        };
+        let effective_limit = DISCORD_MSG_LIMIT
+            .saturating_sub(tag_overhead)
+            .saturating_sub(10);
+
+        if remaining.len() <= effective_limit {
+            let mut chunk = String::new();
+            if in_code_block {
+                chunk.push_str("```");
+                chunk.push_str(&code_block_lang);
+                chunk.push('\n');
+            }
+            chunk.push_str(remaining);
+            chunks.push(chunk);
+            break;
+        }
+
+        // Find a safe split point
+        let safe_end = floor_char_boundary(remaining, effective_limit);
+        let split_at = remaining[..safe_end].rfind('\n').unwrap_or(safe_end);
+
+        let (raw_chunk, rest) = remaining.split_at(split_at);
+
+        let mut chunk = String::new();
+        if in_code_block {
+            chunk.push_str("```");
+            chunk.push_str(&code_block_lang);
+            chunk.push('\n');
+        }
+        chunk.push_str(raw_chunk);
+
+        // Track code blocks across chunk boundaries
+        for line in raw_chunk.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                if in_code_block {
+                    in_code_block = false;
+                    code_block_lang.clear();
+                } else {
+                    in_code_block = true;
+                    code_block_lang = trimmed.strip_prefix("```").unwrap_or("").to_string();
+                }
+            }
+        }
+
+        // Close unclosed code block at end of chunk
+        if in_code_block {
+            chunk.push_str("\n```");
+        }
+
+        chunks.push(chunk);
+        remaining = rest.strip_prefix('\n').unwrap_or(rest);
+    }
+
+    chunks
 }
 
 /// Build an `(inline_preview, attachment)` pair for content that exceeds
