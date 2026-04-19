@@ -9,11 +9,9 @@ import {
   Home,
   LayoutDashboard,
   Menu,
-  Moon,
   Search,
   Settings,
   Sparkles,
-  SunMedium,
   Trophy,
   Users,
   Wifi,
@@ -48,6 +46,7 @@ import {
   type Notification,
 } from "../components/NotificationCenter";
 import OfficeSelectorBar from "../components/OfficeSelectorBar";
+import { MOBILE_LAYOUT_MEDIA_QUERY } from "./breakpoints";
 import {
   APP_ROUTE_SECTIONS,
   DEFAULT_ROUTE_PATH,
@@ -59,6 +58,19 @@ import {
   type AppRouteId,
 } from "./routes";
 import type { DashboardTab } from "./dashboardTabs";
+import {
+  DEFAULT_ACCENT_PRESET,
+  THEME_STORAGE_KEY,
+  applyThemeAccentDataset,
+  persistAccentPreset,
+  persistThemePreference,
+  readStoredAccentPreset,
+  readStoredThemePreference,
+  readThemePreferenceFromPatch,
+  resolveThemePreference,
+  type AccentPreset,
+  type ThemePreference,
+} from "./themePreferences";
 
 const OfficeView = lazy(() => import("../components/OfficeView"));
 const DashboardPageView = lazy(() => import("../components/DashboardPageView"));
@@ -86,6 +98,43 @@ type AgentsPageTab = "agents" | "departments" | "dispatch";
 type KanbanSignalFocus = "review" | "blocked" | "requested" | "stalled";
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "agentdesk.sidebar.collapsed";
+const MOBILE_TABBAR_SAFE_AREA_HEIGHT = "calc(3.5rem + env(safe-area-inset-bottom))";
+const MOBILE_PRIMARY_ROUTE_IDS: AppRouteId[] = [
+  "home",
+  "office",
+  "kanban",
+  "stats",
+];
+const MOBILE_MORE_ROUTE_IDS: AppRouteId[] = [
+  "agents",
+  "ops",
+  "meetings",
+  "achievements",
+  "settings",
+];
+
+const THEME_OPTIONS: Array<{
+  id: ThemePreference;
+  labelKo: string;
+  labelEn: string;
+}> = [
+  { id: "auto", labelKo: "자동", labelEn: "Auto" },
+  { id: "dark", labelKo: "다크", labelEn: "Dark" },
+  { id: "light", labelKo: "라이트", labelEn: "Light" },
+];
+
+const ACCENT_OPTIONS: Array<{
+  id: AccentPreset;
+  label: string;
+  token: string;
+}> = [
+  { id: "indigo", label: "Indigo", token: "--accent-indigo" },
+  { id: "violet", label: "Violet", token: "--accent-violet" },
+  { id: "amber", label: "Amber", token: "--accent-amber" },
+  { id: "rose", label: "Rose", token: "--accent-rose" },
+  { id: "cyan", label: "Cyan", token: "--accent-cyan" },
+  { id: "lime", label: "Lime", token: "--accent-lime" },
+];
 
 export default function AppShell({
   wsConnected,
@@ -131,7 +180,7 @@ export default function AppShell({
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [showMobileMoreMenu, setShowMobileMoreMenu] = useState(false);
   const [agentsPageTab, setAgentsPageTab] = useState<AgentsPageTab>("agents");
   const [kanbanSignalFocus, setKanbanSignalFocus] =
     useState<KanbanSignalFocus | null>(null);
@@ -140,6 +189,19 @@ export default function AppShell({
     return (
       window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true"
     );
+  });
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() =>
+    readStoredThemePreference(window.localStorage, settings.theme),
+  );
+  const [accentPreset, setAccentPreset] = useState<AccentPreset>(() =>
+    readStoredAccentPreset(window.localStorage, DEFAULT_ACCENT_PRESET),
+  );
+  const [prefersDarkScheme, setPrefersDarkScheme] = useState(() =>
+    window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+  const [isMobileViewport, setIsMobileViewport] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY).matches;
   });
 
   const spriteMap = useSpriteMap(agents);
@@ -150,7 +212,10 @@ export default function AppShell({
     (notification) => Date.now() - notification.ts < 60_000,
   ).length;
   const notificationBadgeCount = unresolvedMeetingsCount + unreadCount;
-  const resolvedTheme = getResolvedTheme(settings.theme);
+  const resolvedTheme = useMemo(
+    () => resolveThemePreference(themePreference, prefersDarkScheme),
+    [prefersDarkScheme, themePreference],
+  );
   const recentNotifications = notifications.slice(0, 6);
 
   useEffect(() => {
@@ -161,9 +226,55 @@ export default function AppShell({
   }, [sidebarCollapsed]);
 
   useEffect(() => {
-    setMobileSidebarOpen(false);
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const sync = (matches: boolean) => setPrefersDarkScheme(matches);
+
+    sync(query.matches);
+
+    const listener = (event: MediaQueryListEvent) => sync(event.matches);
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", listener);
+      return () => query.removeEventListener("change", listener);
+    }
+
+    query.addListener(listener);
+    return () => query.removeListener(listener);
+  }, []);
+
+  useEffect(() => {
+    if (window.localStorage.getItem(THEME_STORAGE_KEY) == null) {
+      setThemePreference(settings.theme);
+    }
+  }, [settings.theme]);
+
+  useEffect(() => {
+    persistThemePreference(window.localStorage, themePreference);
+    persistAccentPreset(window.localStorage, accentPreset);
+    applyThemeAccentDataset(
+      document.documentElement,
+      resolvedTheme,
+      accentPreset,
+    );
+  }, [accentPreset, resolvedTheme, themePreference]);
+
+  useEffect(() => {
+    const media = window.matchMedia(MOBILE_LAYOUT_MEDIA_QUERY);
+    const sync = () => setIsMobileViewport(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
     setShowNotificationPanel(false);
+    setShowMobileMoreMenu(false);
   }, [location.pathname]);
+
+  useEffect(() => {
+    if (!isMobileViewport) {
+      setShowMobileMoreMenu(false);
+    }
+  }, [isMobileViewport]);
 
   useEffect(() => {
     if (currentRoute?.id === "home" || currentRoute?.id === "stats") {
@@ -187,6 +298,7 @@ export default function AppShell({
       path: string,
       options?: { agentsTab?: AgentsPageTab; kanbanFocus?: KanbanSignalFocus },
     ) => {
+      setShowMobileMoreMenu(false);
       if (options?.agentsTab) {
         setAgentsPageTab(options.agentsTab);
       }
@@ -198,21 +310,16 @@ export default function AppShell({
     [navigate],
   );
 
-  const toggleTheme = useCallback(async () => {
-    const nextTheme = resolvedTheme === "dark" ? "light" : "dark";
-    try {
-      await persistSettingsPatch({ theme: nextTheme });
-      pushNotification(
-        tr("테마가 변경되었습니다.", "Theme updated."),
-        "success",
-      );
-    } catch {
-      pushNotification(
-        tr("테마를 저장하지 못했습니다.", "Failed to save theme."),
-        "error",
-      );
-    }
-  }, [persistSettingsPatch, pushNotification, resolvedTheme, tr]);
+  const handleSettingsSave = useCallback(
+    async (patch: Record<string, unknown>) => {
+      const requestedThemePreference = readThemePreferenceFromPatch(patch);
+      await persistSettingsPatch(patch);
+      if (requestedThemePreference) {
+        setThemePreference(requestedThemePreference);
+      }
+    },
+    [persistSettingsPatch],
+  );
 
   const handleOfficeChanged = useCallback(() => {
     refreshOffices();
@@ -276,182 +383,181 @@ export default function AppShell({
   const breadcrumbSection = getSectionById(
     currentRoute?.section ?? APP_ROUTE_SECTIONS[0].id,
   );
+  const mobilePrimaryRoutes = useMemo(
+    () =>
+      PRIMARY_ROUTES.filter((route) =>
+        MOBILE_PRIMARY_ROUTE_IDS.includes(route.id),
+      ),
+    [],
+  );
+  const mobileMoreRoutes = useMemo(
+    () =>
+      PRIMARY_ROUTES.filter((route) =>
+        MOBILE_MORE_ROUTE_IDS.includes(route.id),
+      ),
+    [],
+  );
+  const activeMobileRouteId =
+    showMobileMoreMenu ||
+    (currentRoute && MOBILE_MORE_ROUTE_IDS.includes(currentRoute.id))
+      ? "more"
+      : currentRoute && MOBILE_PRIMARY_ROUTE_IDS.includes(currentRoute.id)
+        ? currentRoute.id
+        : "home";
 
   return (
     <div
       className="fixed inset-0 flex overflow-hidden"
       style={{ background: "var(--th-bg-primary)" }}
     >
-      <div
-        className={`fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm transition-opacity md:hidden ${
-          mobileSidebarOpen
-            ? "pointer-events-auto opacity-100"
-            : "pointer-events-none opacity-0"
-        }`}
-        onClick={() => setMobileSidebarOpen(false)}
-      />
-
-      <aside
-        data-testid="app-sidebar"
-        className={`fixed inset-y-0 left-0 z-[80] flex flex-col border-r transition-transform duration-200 md:static md:translate-x-0 ${
-          mobileSidebarOpen ? "translate-x-0" : "-translate-x-full"
-        }`}
-        style={{
-          width: sidebarCollapsed ? "5.5rem" : "15rem",
-          borderColor: "var(--th-border-subtle)",
-          background:
-            "linear-gradient(180deg, color-mix(in srgb, var(--th-nav-bg) 96%, black 4%) 0%, color-mix(in srgb, var(--th-bg-surface) 94%, transparent) 100%)",
-        }}
-      >
-        <div
-          className={`flex items-center gap-3 border-b px-4 py-4 ${
-            sidebarCollapsed ? "justify-center" : ""
-          }`}
-          style={{ borderColor: "var(--th-border-subtle)" }}
-        >
-          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/15 text-xl text-emerald-300">
-            🐾
-          </div>
-          {!sidebarCollapsed && (
-            <div className="min-w-0">
-              <div
-                className="truncate text-sm font-semibold"
-                style={{ color: "var(--th-text-heading)" }}
-              >
-                AgentDesk
-              </div>
-              <div
-                className="truncate text-xs"
-                style={{ color: "var(--th-text-muted)" }}
-              >
-                {isKo ? "앱 셸 v2" : "App shell v2"}
-              </div>
-            </div>
-          )}
-          <button
-            type="button"
-            onClick={() =>
-              window.innerWidth >= 768
-                ? setSidebarCollapsed((prev) => !prev)
-                : setMobileSidebarOpen(false)
-            }
-            className="ml-auto hidden h-9 w-9 items-center justify-center rounded-xl border text-[var(--th-text-secondary)] transition-colors hover:bg-white/5 md:flex"
-            style={{ borderColor: "var(--th-border-subtle)" }}
-            aria-label={
-              sidebarCollapsed
-                ? tr("사이드바 펼치기", "Expand sidebar")
-                : tr("사이드바 접기", "Collapse sidebar")
-            }
-            title={
-              sidebarCollapsed
-                ? tr("사이드바 펼치기", "Expand sidebar")
-                : tr("사이드바 접기", "Collapse sidebar")
-            }
-          >
-            {sidebarCollapsed ? (
-              <ChevronRight size={16} />
-            ) : (
-              <ChevronLeft size={16} />
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => setMobileSidebarOpen(false)}
-            className="ml-auto flex h-9 w-9 items-center justify-center rounded-xl border text-[var(--th-text-secondary)] md:hidden"
-            style={{ borderColor: "var(--th-border-subtle)" }}
-            aria-label={tr("사이드바 닫기", "Close sidebar")}
-          >
-            <X size={16} />
-          </button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto px-3 py-4">
-          {APP_ROUTE_SECTIONS.map((section) => {
-            const routes = PRIMARY_ROUTES.filter(
-              (route) => route.section === section.id,
-            );
-            return (
-              <div key={section.id} className="mb-5">
-                {!sidebarCollapsed && (
-                  <div
-                    className="px-3 pb-2 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {isKo ? section.labelKo : section.labelEn}
-                  </div>
-                )}
-                <div className="space-y-1">
-                  {routes.map((route) => (
-                    <SidebarRouteButton
-                      key={route.id}
-                      route={route}
-                      currentRouteId={currentRoute?.id ?? null}
-                      collapsed={sidebarCollapsed}
-                      isKo={isKo}
-                      badge={
-                        route.id === "meetings"
-                          ? unresolvedMeetingsCount || undefined
-                          : route.id === "settings"
-                            ? unreadCount || undefined
-                            : undefined
-                      }
-                      onNavigate={() => {
-                        if (route.id === "agents") {
-                          setAgentsPageTab("agents");
-                        }
-                        navigateToRoute(route.path);
-                      }}
-                    />
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div
-          className="border-t px-3 py-3"
-          style={{ borderColor: "var(--th-border-subtle)" }}
+      {!isMobileViewport && (
+        <aside
+          data-testid="app-sidebar-nav"
+          className="flex flex-col border-r"
+          style={{
+            width: sidebarCollapsed ? "5.5rem" : "15rem",
+            borderColor: "var(--th-border-subtle)",
+            background:
+              "linear-gradient(180deg, color-mix(in srgb, var(--th-nav-bg) 96%, black 4%) 0%, color-mix(in srgb, var(--th-bg-surface) 94%, transparent) 100%)",
+          }}
         >
           <div
-            className={`flex items-center gap-3 rounded-2xl border px-3 py-3 ${
+            className={`flex items-center gap-3 border-b px-4 py-4 ${
               sidebarCollapsed ? "justify-center" : ""
             }`}
-            style={{
-              borderColor: wsConnected ? "#1f9d66" : "#9f3f3f",
-              background: wsConnected
-                ? "rgba(16, 185, 129, 0.08)"
-                : "rgba(239, 68, 68, 0.08)",
-            }}
+            style={{ borderColor: "var(--th-border-subtle)" }}
           >
-            {wsConnected ? (
-              <Wifi size={16} className="text-emerald-400" />
-            ) : (
-              <WifiOff size={16} className="text-red-400" />
-            )}
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-500/15 text-xl text-emerald-300">
+              🐾
+            </div>
             {!sidebarCollapsed && (
               <div className="min-w-0">
                 <div
-                  className="text-xs font-semibold"
-                  style={{ color: "var(--th-text-primary)" }}
+                  className="truncate text-sm font-semibold"
+                  style={{ color: "var(--th-text-heading)" }}
                 >
-                  {wsConnected
-                    ? tr("서버 연결됨", "Server connected")
-                    : tr("재연결 중", "Reconnecting")}
+                  AgentDesk
                 </div>
                 <div
-                  className="truncate text-[11px]"
+                  className="truncate text-xs"
                   style={{ color: "var(--th-text-muted)" }}
                 >
-                  {wsConnected
-                    ? tr("실시간 업데이트 수신 중", "Realtime updates active")
-                    : tr("웹소켓 상태를 확인하세요", "Check websocket status")}
+                  {isKo ? "앱 셸 v2" : "App shell v2"}
                 </div>
               </div>
             )}
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed((prev) => !prev)}
+              className="ml-auto hidden h-9 w-9 items-center justify-center rounded-xl border text-[var(--th-text-secondary)] transition-colors hover:bg-white/5 md:flex"
+              style={{ borderColor: "var(--th-border-subtle)" }}
+              aria-label={
+                sidebarCollapsed
+                  ? tr("사이드바 펼치기", "Expand sidebar")
+                  : tr("사이드바 접기", "Collapse sidebar")
+              }
+              title={
+                sidebarCollapsed
+                  ? tr("사이드바 펼치기", "Expand sidebar")
+                  : tr("사이드바 접기", "Collapse sidebar")
+              }
+            >
+              {sidebarCollapsed ? (
+                <ChevronRight size={16} />
+              ) : (
+                <ChevronLeft size={16} />
+              )}
+            </button>
           </div>
-        </div>
-      </aside>
+
+          <div className="flex-1 overflow-y-auto px-3 py-4">
+            {APP_ROUTE_SECTIONS.map((section) => {
+              const routes = PRIMARY_ROUTES.filter(
+                (route) => route.section === section.id,
+              );
+              return (
+                <div key={section.id} className="mb-5">
+                  {!sidebarCollapsed && (
+                    <div
+                      className="px-3 pb-2 text-[11px] font-semibold uppercase tracking-[0.18em]"
+                      style={{ color: "var(--th-text-muted)" }}
+                    >
+                      {isKo ? section.labelKo : section.labelEn}
+                    </div>
+                  )}
+                  <div className="space-y-1">
+                    {routes.map((route) => (
+                      <SidebarRouteButton
+                        key={route.id}
+                        route={route}
+                        currentRouteId={currentRoute?.id ?? null}
+                        collapsed={sidebarCollapsed}
+                        isKo={isKo}
+                        badge={
+                          route.id === "meetings"
+                            ? unresolvedMeetingsCount || undefined
+                            : route.id === "settings"
+                              ? unreadCount || undefined
+                              : undefined
+                        }
+                        onNavigate={() => {
+                          if (route.id === "agents") {
+                            setAgentsPageTab("agents");
+                          }
+                          navigateToRoute(route.path);
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div
+            className="border-t px-3 py-3"
+            style={{ borderColor: "var(--th-border-subtle)" }}
+          >
+            <div
+              className={`flex items-center gap-3 rounded-2xl border px-3 py-3 ${
+                sidebarCollapsed ? "justify-center" : ""
+              }`}
+              style={{
+                borderColor: wsConnected ? "#1f9d66" : "#9f3f3f",
+                background: wsConnected
+                  ? "rgba(16, 185, 129, 0.08)"
+                  : "rgba(239, 68, 68, 0.08)",
+              }}
+            >
+              {wsConnected ? (
+                <Wifi size={16} className="text-emerald-400" />
+              ) : (
+                <WifiOff size={16} className="text-red-400" />
+              )}
+              {!sidebarCollapsed && (
+                <div className="min-w-0">
+                  <div
+                    className="text-xs font-semibold"
+                    style={{ color: "var(--th-text-primary)" }}
+                  >
+                    {wsConnected
+                      ? tr("서버 연결됨", "Server connected")
+                      : tr("재연결 중", "Reconnecting")}
+                  </div>
+                  <div
+                    className="truncate text-[11px]"
+                    style={{ color: "var(--th-text-muted)" }}
+                  >
+                    {wsConnected
+                      ? tr("실시간 업데이트 수신 중", "Realtime updates active")
+                      : tr("웹소켓 상태를 확인하세요", "Check websocket status")}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </aside>
+      )}
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header
@@ -464,16 +570,6 @@ export default function AppShell({
           }}
         >
           <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setMobileSidebarOpen(true)}
-              className="flex h-10 w-10 items-center justify-center rounded-xl border md:hidden"
-              style={{ borderColor: "var(--th-border-subtle)" }}
-              aria-label={tr("사이드바 열기", "Open sidebar")}
-            >
-              <Menu size={18} />
-            </button>
-
             <div className="min-w-0 flex-1">
               <div
                 className="flex items-center gap-2 text-xs font-medium"
@@ -530,21 +626,6 @@ export default function AppShell({
             </label>
 
             <div className="ml-auto flex items-center gap-2 sm:ml-0">
-              <button
-                type="button"
-                onClick={() => void toggleTheme()}
-                className="flex h-10 w-10 items-center justify-center rounded-xl border transition-colors hover:bg-white/5"
-                style={{ borderColor: "var(--th-border-subtle)" }}
-                aria-label={tr("테마 전환", "Toggle theme")}
-                title={tr("테마 전환", "Toggle theme")}
-              >
-                {resolvedTheme === "dark" ? (
-                  <SunMedium size={18} />
-                ) : (
-                  <Moon size={18} />
-                )}
-              </button>
-
               <div className="relative">
                 <button
                   type="button"
@@ -701,6 +782,101 @@ export default function AppShell({
               </button>
             </div>
           </div>
+
+          <div
+            className="mt-3 flex flex-col gap-3 rounded-2xl border px-3 py-3 xl:flex-row xl:items-center xl:justify-between"
+            style={{
+              borderColor: "var(--th-border-subtle)",
+              background:
+                "linear-gradient(180deg, color-mix(in oklch, var(--bg-1) 94%, transparent) 0%, color-mix(in oklch, var(--bg-2) 98%, transparent) 100%)",
+            }}
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span
+                className="font-display text-[11px] font-semibold uppercase tracking-[0.18em]"
+                style={{ color: "var(--fg-faint)" }}
+              >
+                Theme
+              </span>
+              <div
+                className="flex items-center gap-1 rounded-full p-1"
+                style={{
+                  background:
+                    "color-mix(in oklch, var(--bg-3) 72%, transparent)",
+                }}
+              >
+                {THEME_OPTIONS.map((option) => {
+                  const active = themePreference === option.id;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => setThemePreference(option.id)}
+                      aria-pressed={active}
+                      className="rounded-full px-3 py-1 text-xs font-medium transition-colors"
+                      style={
+                        active
+                          ? {
+                              background: "var(--accent-soft)",
+                              color: "var(--accent)",
+                            }
+                          : { color: "var(--fg-muted)" }
+                      }
+                    >
+                      {isKo ? option.labelKo : option.labelEn}
+                    </button>
+                  );
+                })}
+              </div>
+              <span
+                className="rounded-full px-2 py-1 text-[11px]"
+                style={{
+                  background: "var(--th-overlay-medium)",
+                  color: "var(--fg-muted)",
+                }}
+              >
+                {isKo ? `현재 ${resolvedTheme}` : `Live ${resolvedTheme}`}
+              </span>
+            </div>
+
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span
+                className="font-display text-[11px] font-semibold uppercase tracking-[0.18em]"
+                style={{ color: "var(--fg-faint)" }}
+              >
+                Accent
+              </span>
+              <div className="flex items-center gap-1.5">
+                {ACCENT_OPTIONS.map((option) => {
+                  const active = accentPreset === option.id;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      title={option.label}
+                      aria-label={option.label}
+                      aria-pressed={active}
+                      onClick={() => setAccentPreset(option.id)}
+                      className="flex h-8 w-8 items-center justify-center rounded-full transition-transform"
+                      style={{
+                        border: active
+                          ? "2px solid var(--fg)"
+                          : "1px solid color-mix(in oklch, var(--line) 74%, transparent)",
+                        background:
+                          "color-mix(in oklch, var(--bg-2) 92%, transparent)",
+                        transform: active ? "translateY(-1px)" : undefined,
+                      }}
+                    >
+                      <span
+                        className="h-4 w-4 rounded-full"
+                        style={{ background: `var(${option.token})` }}
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </header>
 
         {currentRoute?.showOfficeSelector && offices.length > 0 && (
@@ -713,7 +889,15 @@ export default function AppShell({
           />
         )}
 
-        <main className="min-h-0 flex-1 overflow-hidden">
+        <main
+          data-testid="app-main-scroll"
+          className="min-h-0 flex-1 overflow-hidden"
+          style={{
+            marginBottom: isMobileViewport
+              ? MOBILE_TABBAR_SAFE_AREA_HEIGHT
+              : undefined,
+          }}
+        >
           <Suspense
             fallback={
               <ViewSkeleton
@@ -940,7 +1124,7 @@ export default function AppShell({
                 element={
                   <SettingsView
                     settings={settings}
-                    onSave={persistSettingsPatch}
+                    onSave={handleSettingsSave}
                     isKo={isKo}
                   />
                 }
@@ -962,6 +1146,180 @@ export default function AppShell({
           </Suspense>
         </main>
       </div>
+
+      {isMobileViewport && (
+        <>
+          <nav
+            data-testid="app-mobile-tabbar"
+            className="fixed bottom-0 left-0 right-0 z-[70] flex items-start justify-around border-t"
+            style={{
+              height: MOBILE_TABBAR_SAFE_AREA_HEIGHT,
+              borderColor: "var(--th-border-subtle)",
+              background:
+                "linear-gradient(180deg, color-mix(in srgb, var(--th-nav-bg) 98%, black 2%) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
+              paddingBottom: "env(safe-area-inset-bottom)",
+              paddingLeft: "env(safe-area-inset-left)",
+              paddingRight: "env(safe-area-inset-right)",
+            }}
+          >
+            {mobilePrimaryRoutes.map((route) => {
+              const Icon = iconForRoute(route.id);
+              const isActive = activeMobileRouteId === route.id;
+              return (
+                <button
+                  key={route.id}
+                  type="button"
+                  data-testid={`app-mobile-tab-${route.id}`}
+                  onClick={() => navigateToRoute(route.path)}
+                  className="relative flex h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[10px] font-medium"
+                  style={{
+                    color: isActive
+                      ? "var(--th-accent-primary)"
+                      : "var(--th-text-muted)",
+                  }}
+                >
+                  <Icon size={18} />
+                  <span>{isKo ? route.labelKo : route.labelEn}</span>
+                </button>
+              );
+            })}
+            <button
+              type="button"
+              data-testid="app-mobile-more-button"
+              onClick={() => setShowMobileMoreMenu((prev) => !prev)}
+              className="relative flex h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[10px] font-medium"
+              style={{
+                color:
+                  activeMobileRouteId === "more"
+                    ? "var(--th-accent-primary)"
+                    : "var(--th-text-muted)",
+              }}
+            >
+              <Menu size={18} />
+              <span>{tr("더보기", "More")}</span>
+              {(unresolvedMeetingsCount > 0 || unreadCount > 0) && (
+                <span className="absolute right-[28%] top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500 px-1 text-[8px] font-semibold text-white">
+                  {unresolvedMeetingsCount + unreadCount > 9
+                    ? "9+"
+                    : unresolvedMeetingsCount + unreadCount}
+                </span>
+              )}
+            </button>
+          </nav>
+
+          {showMobileMoreMenu && (
+            <div
+              className="fixed inset-0 z-[90] flex items-end justify-center"
+              onClick={() => setShowMobileMoreMenu(false)}
+            >
+              <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" />
+              <div
+                data-testid="app-mobile-more-menu"
+                role="dialog"
+                aria-modal="true"
+                aria-label={tr("더보기 메뉴", "More menu")}
+                className="relative w-full rounded-t-[32px] border px-4 pb-4 pt-3 shadow-2xl animate-in fade-in slide-in-from-bottom-4 duration-200"
+                style={{
+                  borderColor: "var(--th-border-subtle)",
+                  background:
+                    "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
+                  paddingBottom:
+                    "max(1rem, calc(1rem + env(safe-area-inset-bottom)))",
+                }}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="mx-auto mb-3 h-1.5 w-14 rounded-full bg-white/10" />
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div
+                      className="text-[11px] font-semibold uppercase tracking-[0.2em]"
+                      style={{ color: "var(--th-text-muted)" }}
+                    >
+                      {tr("더보기", "More")}
+                    </div>
+                    <div
+                      className="mt-1 text-base font-semibold"
+                      style={{ color: "var(--th-text-heading)" }}
+                    >
+                      {tr("숨겨진 페이지 바로가기", "Jump to secondary pages")}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowMobileMoreMenu(false)}
+                    className="flex h-10 w-10 items-center justify-center rounded-xl border text-[var(--th-text-muted)]"
+                    style={{
+                      borderColor:
+                        "color-mix(in srgb, var(--th-border) 64%, transparent)",
+                      background:
+                        "color-mix(in srgb, var(--th-card-bg) 88%, transparent)",
+                    }}
+                    aria-label={tr("더보기 닫기", "Close more menu")}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="grid gap-2">
+                  {mobileMoreRoutes.map((route) => {
+                    const Icon = iconForRoute(route.id);
+                    const badge =
+                      route.id === "meetings"
+                        ? unresolvedMeetingsCount || undefined
+                        : route.id === "settings"
+                          ? unreadCount || undefined
+                          : undefined;
+                    return (
+                      <button
+                        key={route.id}
+                        type="button"
+                        onClick={() =>
+                          navigateToRoute(
+                            route.path,
+                            route.id === "agents"
+                              ? { agentsTab: "agents" }
+                              : undefined,
+                          )
+                        }
+                        className="flex items-start gap-3 rounded-2xl border px-3 py-3 text-left"
+                        style={{
+                          borderColor:
+                            "color-mix(in srgb, var(--th-border) 70%, transparent)",
+                          background:
+                            "color-mix(in srgb, var(--th-card-bg) 90%, transparent)",
+                        }}
+                      >
+                        <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--th-overlay-subtle)]">
+                          <Icon size={18} />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span
+                            className="flex items-center gap-2 text-sm font-semibold"
+                            style={{ color: "var(--th-text-heading)" }}
+                          >
+                            {isKo ? route.labelKo : route.labelEn}
+                            {badge !== undefined && badge > 0 && (
+                              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1.5 text-[10px] text-white">
+                                {badge > 9 ? "9+" : badge}
+                              </span>
+                            )}
+                          </span>
+                          <span
+                            className="mt-1 block text-xs leading-relaxed"
+                            style={{ color: "var(--th-text-muted)" }}
+                          >
+                            {isKo ? route.descriptionKo : route.descriptionEn}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
 
       <Suspense fallback={null}>
         {officeInfoAgent && (
@@ -1489,14 +1847,6 @@ function hasUnresolvedMeetingIssues(meeting: RoundTableMeeting): boolean {
   const pending = Math.max(totalIssues - created - failed - discarded, 0);
 
   return pending > 0 || failed > 0;
-}
-
-function getResolvedTheme(theme: CompanySettings["theme"]): "dark" | "light" {
-  if (theme !== "auto") return theme;
-  if (typeof window === "undefined") return "dark";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
 }
 
 function notificationColor(type: Notification["type"]): string {

@@ -805,6 +805,15 @@ fn reseed_pr_tracking_raw(db: &Db, pg_pool: Option<&PgPool>, card_id: &str) -> S
 }
 
 async fn reseed_pr_tracking_pg(pool: &PgPool, card_id: &str) -> Result<serde_json::Value, String> {
+    // Run cancel/reset + pr_tracking generation/head/review_round update in a
+    // single transaction so a crash mid-flight cannot leave the dispatch
+    // cancelled while pr_tracking still points at the previous generation.
+    // This matches the SQLite `reseed_pr_tracking_tx` semantics (see below).
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("begin postgres pr_tracking reseed transaction: {e}"))?;
+
     let active_id = sqlx::query_scalar::<_, String>(
         "SELECT id
          FROM task_dispatches
@@ -815,23 +824,18 @@ async fn reseed_pr_tracking_pg(pool: &PgPool, card_id: &str) -> Result<serde_jso
          LIMIT 1",
     )
     .bind(card_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| format!("load active postgres create-pr dispatch for {card_id}: {e}"))?;
     if let Some(dispatch_id) = active_id {
-        let _ = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(
-            pool,
+        let _ = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg_tx(
+            &mut tx,
             &dispatch_id,
             Some("superseded_by_reseed"),
         )
         .await
         .map_err(|e| format!("cancel active postgres create-pr dispatch {dispatch_id}: {e}"))?;
     }
-
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| format!("begin postgres pr_tracking reseed transaction: {e}"))?;
 
     let latest_head = sqlx::query_scalar::<_, String>(
         "SELECT COALESCE(
@@ -1429,6 +1433,241 @@ mod tests {
         .await
         .expect("count status reaction outbox");
         assert_eq!(status_reaction_count, 1);
+
+        pool.close().await;
+        test_db.drop().await;
+    }
+
+    // Helper used by the atomicity-focused tests below. Seeds a card + active
+    // create-pr dispatch + pr_tracking row + a dispatched auto_queue entry tied
+    // to that dispatch so `reseed_pr_tracking_pg` has state to cancel/reset and
+    // rewrite. Returns the dispatch id, the original pr_tracking generation,
+    // and the seeded auto_queue entry id (so the rollback test can verify the
+    // queue half also rolls back atomically).
+    async fn seed_reseed_fixture(pool: &sqlx::PgPool, card_id: &str) -> (String, String, String) {
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, repo_id)
+             VALUES ($1, $2, 'review', 'repo-1')",
+        )
+        .bind(card_id)
+        .bind("Atomicity fixture")
+        .execute(pool)
+        .await
+        .expect("insert kanban card");
+
+        sqlx::query(
+            "INSERT INTO card_review_state (card_id, review_round, state)
+             VALUES ($1, 1, 'in_review')",
+        )
+        .bind(card_id)
+        .execute(pool)
+        .await
+        .expect("insert card review state");
+
+        let dispatch_id = format!("dispatch-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, dispatch_type, status, created_at, updated_at
+             ) VALUES ($1, $2, 'create-pr', 'pending', NOW(), NOW())",
+        )
+        .bind(&dispatch_id)
+        .bind(card_id)
+        .execute(pool)
+        .await
+        .expect("insert pending create-pr dispatch");
+
+        let original_generation = "gen-original".to_string();
+        sqlx::query(
+            "INSERT INTO pr_tracking (
+                card_id, state, dispatch_generation, review_round, retry_count,
+                created_at, updated_at
+             ) VALUES ($1, 'create-pr', $2, 0, 0, NOW(), NOW())",
+        )
+        .bind(card_id)
+        .bind(&original_generation)
+        .execute(pool)
+        .await
+        .expect("insert initial pr_tracking row");
+
+        // Seed an auto_queue run + entry tied to the dispatch so the cancel
+        // helper exercises its queue-reset half (it resets status and clears
+        // dispatch_id / slot_index, and inserts an auto_queue_entry_transitions
+        // row). The atomicity tests assert these mutations also roll back when
+        // the caller-owned tx is aborted.
+        let run_id = format!("run-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (
+                id, agent_id, status, total_entries, batch_phase_max,
+                created_at, updated_at
+             ) VALUES ($1, 'project-agentdesk', 'running', 1, 1, NOW(), NOW())",
+        )
+        .bind(&run_id)
+        .execute(pool)
+        .await
+        .expect("insert auto_queue run");
+
+        let entry_id = format!("entry-{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, status, dispatch_id, slot_index,
+                batch_phase, thread_group, dispatched_at, created_at, updated_at
+             ) VALUES ($1, $2, $3, 'dispatched', $4, 0, 1, 1, NOW(), NOW(), NOW())",
+        )
+        .bind(&entry_id)
+        .bind(&run_id)
+        .bind(card_id)
+        .bind(&dispatch_id)
+        .execute(pool)
+        .await
+        .expect("insert dispatched auto_queue entry");
+
+        (dispatch_id, original_generation, entry_id)
+    }
+
+    // Regression guard for #766: a successful reseed leaves dispatch cancelled
+    // AND pr_tracking rewritten with the new generation inside the same
+    // observable state. Before the fix the two mutations lived in separate
+    // transactions, creating a crash window where only one half applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reseed_pr_tracking_pg_is_atomic_on_success() {
+        let test_db = TestDatabase::create().await;
+        let pool = test_db.migrate().await;
+
+        let card_id = "card-reseed-atomic-ok";
+        let (dispatch_id, original_generation, entry_id) =
+            seed_reseed_fixture(&pool, card_id).await;
+        let _ = entry_id; // success path doesn't assert per-entry — see rollback test
+
+        let reseed = reseed_pr_tracking_pg(&pool, card_id)
+            .await
+            .expect("reseed pr tracking");
+        assert_eq!(reseed["ok"], true);
+        let new_generation = reseed["generation"]
+            .as_str()
+            .expect("new generation")
+            .to_string();
+        assert_ne!(new_generation, original_generation);
+
+        let dispatch_status: String =
+            sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+                .bind(&dispatch_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load dispatch status");
+        assert_eq!(dispatch_status, "cancelled");
+
+        let tracking_generation: String =
+            sqlx::query_scalar("SELECT dispatch_generation FROM pr_tracking WHERE card_id = $1")
+                .bind(card_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load pr_tracking generation");
+        assert_eq!(tracking_generation, new_generation);
+
+        pool.close().await;
+        test_db.drop().await;
+    }
+
+    // Atomicity guard: when the cancel/reset helper runs inside a caller-owned
+    // transaction that subsequently rolls back, NEITHER the dispatch cancel
+    // NOR the auto-queue reset must persist. This is the exact contract
+    // `reseed_pr_tracking_pg` relies on to stay atomic across both mutations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx_rolls_back_with_caller() {
+        let test_db = TestDatabase::create().await;
+        let pool = test_db.migrate().await;
+
+        let card_id = "card-reseed-atomic-rollback";
+        let (dispatch_id, original_generation, entry_id) =
+            seed_reseed_fixture(&pool, card_id).await;
+
+        let mut tx = pool.begin().await.expect("begin outer tx");
+        let changed = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg_tx(
+            &mut tx,
+            &dispatch_id,
+            Some("superseded_by_reseed"),
+        )
+        .await
+        .expect("cancel dispatch inside caller tx");
+        assert_eq!(changed, 1, "cancel should mark exactly one dispatch");
+
+        // Caller decides to abort the wider unit of work. The dispatch cancel
+        // must be rolled back atomically.
+        tx.rollback().await.expect("rollback outer tx");
+
+        let dispatch_status: String =
+            sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+                .bind(&dispatch_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load dispatch status after rollback");
+        assert_eq!(
+            dispatch_status, "pending",
+            "rollback must revert the dispatch cancel"
+        );
+
+        let tracking_generation: String =
+            sqlx::query_scalar("SELECT dispatch_generation FROM pr_tracking WHERE card_id = $1")
+                .bind(card_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load pr_tracking generation after rollback");
+        assert_eq!(
+            tracking_generation, original_generation,
+            "pr_tracking must remain at the original generation when the outer tx rolls back"
+        );
+
+        let cancel_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dispatch_events
+             WHERE dispatch_id = $1 AND to_status = 'cancelled'",
+        )
+        .bind(&dispatch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count cancel events after rollback");
+        assert_eq!(
+            cancel_event_count, 0,
+            "rollback must also discard the dispatch_events audit row"
+        );
+
+        // Auto-queue half of the helper must roll back too: the entry stays
+        // 'dispatched' with its dispatch_id intact, and no
+        // auto_queue_entry_transitions row was persisted for the cancel.
+        let entry_status: String =
+            sqlx::query_scalar("SELECT status FROM auto_queue_entries WHERE id = $1")
+                .bind(&entry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load auto_queue entry status after rollback");
+        assert_eq!(
+            entry_status, "dispatched",
+            "rollback must revert the auto_queue entry status reset"
+        );
+
+        let entry_dispatch_id: Option<String> =
+            sqlx::query_scalar("SELECT dispatch_id FROM auto_queue_entries WHERE id = $1")
+                .bind(&entry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load auto_queue entry dispatch_id after rollback");
+        assert_eq!(
+            entry_dispatch_id.as_deref(),
+            Some(dispatch_id.as_str()),
+            "rollback must revert the auto_queue entry dispatch_id clear"
+        );
+
+        let queue_transition_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auto_queue_entry_transitions
+             WHERE entry_id = $1 AND trigger_source = 'dispatch_cancel'",
+        )
+        .bind(&entry_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count auto_queue_entry_transitions after rollback");
+        assert_eq!(
+            queue_transition_count, 0,
+            "rollback must also discard the auto_queue_entry_transitions row"
+        );
 
         pool.close().await;
         test_db.drop().await;

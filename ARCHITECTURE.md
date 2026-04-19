@@ -176,6 +176,7 @@ src/
 │   │   │   ├── diagnostics.rs
 │   │   │   ├── fast_mode.rs
 │   │   │   ├── help.rs
+│   │   │   ├── mcp_reload.rs
 │   │   │   ├── meeting_cmd.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── model_picker.rs
@@ -221,6 +222,7 @@ src/
 │   │   ├── health.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
+│   │   ├── mcp_credential_watcher.rs
 │   │   ├── meeting_orchestrator.rs
 │   │   ├── metrics.rs
 │   │   ├── mod.rs

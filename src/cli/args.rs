@@ -627,6 +627,35 @@ mod tests {
                 assert!(args.dry_run);
                 assert_eq!(args.archive_dir.as_deref(), Some("/tmp/agentdesk-cutover"));
                 assert!(!args.skip_pg_import);
+                assert!(!args.allow_runtime_active);
+            }
+            other => panic!(
+                "unexpected parse result: {:?}",
+                other.map(|_| "other command")
+            ),
+        }
+    }
+
+    #[test]
+    fn migrate_postgres_cutover_parses_allow_runtime_active() {
+        let cli = Cli::try_parse_from([
+            "agentdesk",
+            "migrate",
+            "postgres-cutover",
+            "--skip-pg-import",
+            "--archive-dir",
+            "/tmp/agentdesk-cutover",
+            "--allow-runtime-active",
+        ])
+        .expect("cli args should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                action: MigrateAction::PostgresCutover(args),
+            }) => {
+                assert!(args.skip_pg_import);
+                assert!(args.allow_runtime_active);
+                assert_eq!(args.archive_dir.as_deref(), Some("/tmp/agentdesk-cutover"));
             }
             other => panic!(
                 "unexpected parse result: {:?}",
@@ -653,6 +682,34 @@ mod tests {
                 assert!(args.dry_run);
                 assert_eq!(args.archive_dir.as_deref(), Some("/tmp/agentdesk-cutover"));
                 assert!(!args.skip_pg_import);
+                assert!(!args.allow_unsent_messages);
+                assert!(!args.allow_runtime_active);
+            }
+            other => panic!(
+                "unexpected parse result: {:?}",
+                other.map(|_| "other command")
+            ),
+        }
+    }
+
+    #[test]
+    fn migrate_postgres_cutover_parses_allow_unsent_messages_flag() {
+        let cli = Cli::try_parse_from([
+            "agentdesk",
+            "migrate",
+            "postgres-cutover",
+            "--dry-run",
+            "--allow-unsent-messages",
+        ])
+        .expect("cli args should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                action: MigrateAction::PostgresCutover(args),
+            }) => {
+                assert!(args.dry_run);
+                assert!(args.allow_unsent_messages);
+                assert!(!args.allow_runtime_active);
             }
             other => panic!(
                 "unexpected parse result: {:?}",
