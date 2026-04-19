@@ -7,6 +7,7 @@ use crate::services::provider::ProviderKind;
 
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::settings::cleanup_channel_uploads;
+use super::super::settings::save_bot_settings;
 use super::super::turn_bridge::cancel_active_token;
 use super::super::{
     Context, Error, SharedData, check_auth, mailbox_cancel_active_turn, mailbox_clear_channel,
@@ -277,6 +278,10 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
         plan.recreate_tmux,
     )
     .await;
+
+    if fast_mode_reset_pending {
+        persist_fast_mode_reset_marker(shared, channel_id, false).await;
+    }
 }
 
 pub(in crate::services::discord) async fn clear_channel_session_state(
@@ -317,6 +322,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     shared.fast_mode_session_reset_pending.remove(&channel_id);
     shared.model_session_reset_pending.remove(&channel_id);
     shared.session_reset_pending.remove(&channel_id);
+    persist_fast_mode_reset_marker(shared, channel_id, false).await;
 
     if let Some(token) = cleared.removed_token {
         cancel_active_token(
@@ -723,4 +729,25 @@ pub(in crate::services::discord) async fn cmd_shell(
     send_long_message_ctx(ctx, &response).await?;
     tracing::info!("  [{ts}] ▶ [{user_name}] Shell done");
     Ok(())
+}
+
+async fn persist_fast_mode_reset_marker(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    pending: bool,
+) {
+    let Some(token) = shared.cached_bot_token.get() else {
+        return;
+    };
+
+    let channel_key = channel_id.get().to_string();
+    let mut settings = shared.settings.write().await;
+    if pending {
+        settings.channel_fast_mode_reset_pending.insert(channel_key);
+    } else {
+        settings
+            .channel_fast_mode_reset_pending
+            .remove(&channel_key);
+    }
+    save_bot_settings(token, &settings);
 }
