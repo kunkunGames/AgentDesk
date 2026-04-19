@@ -14,6 +14,7 @@ import os
 import plistlib
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,22 @@ def current_user_name() -> str:
         return "agentdesk"
 
 
+def home_for_user(user_name: str) -> Optional[Path]:
+    try:
+        return Path(pwd.getpwnam(user_name).pw_dir)
+    except Exception:
+        return None
+
+
+def invoking_home() -> Path:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        home = home_for_user(sudo_user)
+        if home is not None:
+            return home
+    return Path.home()
+
+
 def split_env_roots(raw: str | None) -> list[Path]:
     if not raw:
         return []
@@ -130,10 +147,57 @@ def default_skills_roots() -> list[Path]:
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
         roots.append(Path(codex_home).expanduser() / "skills")
-    roots.append(Path.home() / ".codex/skills")
-    roots.append(Path.home() / ".adk/release/skills")
+    home = invoking_home()
+    roots.append(home / ".codex/skills")
+    roots.append(home / ".adk/release/skills")
     roots.append(REPO_ROOT / "skills")
     return unique_paths(roots)
+
+
+def trusted_root_python_bin() -> Path:
+    return preferred_python_bin().expanduser().resolve()
+
+
+def path_is_root_owned_and_locked(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    return st.st_uid == 0 and not (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def privileged_root_requested(args: argparse.Namespace) -> bool:
+    return action_needs_privileged_reexec(args.action) and (args.as_root or os.geteuid() == 0)
+
+
+def effective_manager_python(args: argparse.Namespace) -> Path:
+    if privileged_root_requested(args):
+        return trusted_root_python_bin()
+    return Path(args.python_bin).expanduser()
+
+
+def validate_privileged_entrypoint(python_bin: Path) -> None:
+    for label, path in (
+        ("manager_python", python_bin),
+        ("script_path", SCRIPT_PATH),
+    ):
+        if not path_is_root_owned_and_locked(path):
+            raise PermissionError(
+                f"{label} must be root-owned and not group/other-writable for privileged actions: {path}"
+            )
+
+
+def validate_privileged_job_artifacts(job: ResolvedDawnJob, python_bin: Path) -> None:
+    validate_privileged_entrypoint(python_bin)
+    for label, path in (
+        ("skill_root", job.skill_root),
+        ("manager_script", job.manager_script),
+        ("daemon_plist", job.daemon_plist),
+    ):
+        if not path_is_root_owned_and_locked(path):
+            raise PermissionError(
+                f"{job.name} {label} must be root-owned and not group/other-writable for privileged actions: {path}"
+            )
 
 
 def candidate_skills_roots(args: argparse.Namespace) -> list[Path]:
@@ -326,6 +390,7 @@ def summarize_resolution_error(job_name: str, exc: Exception) -> list[str]:
 def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
     all_ok = True
     skills_roots = candidate_skills_roots(args)
+    manager_python = effective_manager_python(args)
     summary_lines = [
         "# Dawn LaunchDaemons",
         "",
@@ -334,7 +399,7 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
         f"- execution_user: `{current_user_name()}`",
         f"- execution_uid: `{os.geteuid()}`",
         f"- python: `{sys.executable}`",
-        f"- manager_python: `{Path(args.python_bin)}`",
+        f"- manager_python: `{manager_python}`",
         f"- schedule: `{args.hour:02d}:{args.minute:02d}`" if args.hour is not None else "- schedule: `default`",
         f"- skills_roots: `{', '.join(str(path) for path in skills_roots) or '(none)'}`",
         "",
@@ -347,10 +412,19 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
             all_ok = False
             summary_lines.extend(summarize_resolution_error(job_name, exc))
         else:
+            if privileged_root_requested(args):
+                try:
+                    validate_privileged_job_artifacts(resolved, manager_python)
+                except PermissionError as exc:
+                    all_ok = False
+                    summary_lines.extend(summarize_resolution_error(job_name, exc))
+                    if index != len(jobs) - 1:
+                        summary_lines.append("")
+                    continue
             result = run_manager(
                 resolved,
                 args.action,
-                python_bin=Path(args.python_bin),
+                python_bin=manager_python,
                 hour=args.hour,
                 minute=args.minute,
             )
@@ -380,6 +454,7 @@ def build_self_command(
     if args.hour is not None:
         command.extend(["--hour", str(args.hour), "--minute", str(args.minute)])
     command.extend(["--python-bin", str(Path(args.python_bin))])
+    command.extend(["--sudoers-user", args.sudoers_user])
     for skills_root in args.skills_root or []:
         command.extend(["--skills-root", skills_root])
     return command
@@ -396,7 +471,18 @@ def print_subprocess_output(result: subprocess.CompletedProcess) -> None:
 
 def run_via_sudo(args: argparse.Namespace) -> int:
     # Keep the public operator entrypoint stable; privilege escalation only re-enters this script.
-    command = ["sudo", "-n"] + build_self_command(args, as_root=True)
+    forwarded = build_self_command(args, as_root=True)
+    forwarded[0] = str(trusted_root_python_bin())
+    for index, token in enumerate(forwarded[:-1]):
+        if token == "--python-bin":
+            forwarded[index + 1] = str(trusted_root_python_bin())
+    if not args.skills_root:
+        forwarded.extend(
+            token
+            for path in candidate_skills_roots(args)
+            for token in ("--skills-root", str(path))
+        )
+    command = ["sudo", "-n"] + forwarded
     result = run_command(command)
     print_subprocess_output(result)
     return result.returncode
@@ -472,8 +558,9 @@ def access_denied(stderr: str) -> bool:
 
 
 def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
-    python_bin = Path(args.python_bin)
+    python_bin = Path(args.python_bin).expanduser()
     skills_roots = candidate_skills_roots(args)
+    manager_python = effective_manager_python(args)
     if python_bin.exists():
         version_result = run_command([str(python_bin), "--version"])
         invocation_python_version = version_result.stdout.strip() or version_result.stderr.strip() or "unknown"
@@ -484,6 +571,7 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         "",
         f"- script_path: `{SCRIPT_PATH}`",
         f"- invocation_python: `{python_bin}`",
+        f"- manager_python: `{manager_python}`",
         f"- runtime_python: `{sys.executable}`",
         f"- invocation_python_exists: `{python_bin.exists()}`",
         f"- invocation_python_version: `{invocation_python_version}`",
@@ -513,6 +601,12 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         source_exists = resolved.daemon_plist.exists()
         source_valid = plist_valid(resolved.daemon_plist) if source_exists else False
         target_exists = resolved.installed_target.exists()
+        trusted_for_privileged_actions = True
+        if action_needs_privileged_reexec("install"):
+            try:
+                validate_privileged_job_artifacts(resolved, manager_python)
+            except PermissionError:
+                trusted_for_privileged_actions = False
         lines.extend(
             [
                 f"## {job_name}",
@@ -524,15 +618,30 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
                 f"- source_path: `{resolved.daemon_plist}`",
                 f"- installed_target_exists: `{target_exists}`",
                 f"- installed_target_path: `{resolved.installed_target}`",
+                f"- privileged_trusted: `{trusted_for_privileged_actions}`",
                 "",
             ]
         )
-        all_ok = all_ok and manager_exists and source_exists and source_valid
+        all_ok = all_ok and manager_exists and source_exists and source_valid and trusted_for_privileged_actions
 
     probe_job_name = jobs[0][0]
-    probe_command = ["sudo", "-n"] + build_self_command(args, action="status", as_root=False, job_names=[probe_job_name])
+    probe_command = [
+        "sudo",
+        "-n",
+        str(trusted_root_python_bin()),
+        str(SCRIPT_PATH),
+        "status",
+        "--python-bin",
+        str(trusted_root_python_bin()),
+        "--sudoers-user",
+        args.sudoers_user,
+        "--job",
+        probe_job_name,
+    ]
+    for path in candidate_skills_roots(args):
+        probe_command.extend(["--skills-root", str(path)])
     probe_result = run_command(probe_command)
-    probe_access = not access_denied(probe_result.stderr or "")
+    probe_access = probe_result.returncode == 0 and not access_denied(probe_result.stderr or "")
     lines.extend(
         [
             "## sudo_probe",
@@ -575,8 +684,25 @@ def namespace_for_action(args: argparse.Namespace, action: str) -> argparse.Name
 
 
 def run_bootstrap(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
-    python_bin = Path(args.python_bin)
+    python_bin = effective_manager_python(args)
     # Bootstrap is the one-time setup path: install sudoers, then install the selected plists.
+    try:
+        validate_privileged_entrypoint(python_bin)
+    except PermissionError as exc:
+        print(
+            "\n".join(
+                [
+                    "# Dawn LaunchDaemon Bootstrap",
+                    "",
+                    f"- sudoers_target: `{SUDOERS_TARGET}`",
+                    f"- sudoers_user: `{args.sudoers_user}`",
+                    f"- invocation_python: `{python_bin}`",
+                    "- sudoers_installed: `False`",
+                    f"- detail: `{str(exc)}`",
+                ]
+            )
+        )
+        return 1
     sudoers_ok, sudoers_message = install_sudoers_dropin(
         user_name=args.sudoers_user,
         python_bin=python_bin,
@@ -608,7 +734,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             sudoers_text(
                 user_name=args.sudoers_user,
-                python_bin=Path(args.python_bin),
+                python_bin=effective_manager_python(args),
                 script_path=SCRIPT_PATH,
             )
         )

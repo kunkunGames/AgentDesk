@@ -4,9 +4,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
-SCRIPT_PATH = Path("/Users/kunkun/kunkunGames/agentdesk/scripts/manage_dawn_launchdaemons.py")
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts/manage_dawn_launchdaemons.py"
 SPEC = importlib.util.spec_from_file_location("manage_dawn_launchdaemons", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -33,6 +34,7 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
             hour=5,
             minute=30,
             python_bin="/opt/homebrew/bin/python3",
+            sudoers_user="agentdesk-runtime",
             skills_root=["/tmp/skills-a", "/tmp/skills-b"],
         )
 
@@ -42,8 +44,10 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
         self.assertIn("--job", command)
         self.assertIn("memory-dream", command)
         self.assertIn("service-monitoring", command)
+        self.assertIn("--sudoers-user", command)
+        self.assertIn("agentdesk-runtime", command)
         self.assertEqual(
-            command[-10:],
+            command[-12:],
             [
                 "--hour",
                 "5",
@@ -51,6 +55,8 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
                 "30",
                 "--python-bin",
                 "/opt/homebrew/bin/python3",
+                "--sudoers-user",
+                "agentdesk-runtime",
                 "--skills-root",
                 "/tmp/skills-a",
                 "--skills-root",
@@ -86,6 +92,14 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
             self.assertEqual(resolved.skill_root, skill_root)
             self.assertEqual(resolved.manager_script, skill_root / spec.manager_relpath)
             self.assertEqual(resolved.daemon_plist, skill_root / spec.daemon_plist_relpath)
+
+    def test_default_skills_roots_prefers_sudo_user_home(self) -> None:
+        with mock.patch.dict(MODULE.os.environ, {"SUDO_USER": "agentdesk"}, clear=False):
+            with mock.patch.object(MODULE, "home_for_user", return_value=Path("/Users/agentdesk")):
+                roots = MODULE.default_skills_roots()
+
+        self.assertIn(Path("/Users/agentdesk/.codex/skills"), roots)
+        self.assertIn(Path("/Users/agentdesk/.adk/release/skills"), roots)
 
 
 if __name__ == "__main__":
