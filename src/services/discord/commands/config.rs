@@ -115,22 +115,30 @@ fn resolve_dispatch_role_model(
     resolve_role_binding(override_channel, None).and_then(|binding| binding.model)
 }
 
-pub(in crate::services::discord) fn effective_provider_for_channel(
+pub(in crate::services::discord) async fn effective_provider_for_channel(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
 ) -> ProviderKind {
-    if let Some(override_channel) = shared
+    let override_channel = shared
         .dispatch_role_overrides
         .get(&channel_id)
-        .map(|value| *value)
-    {
-        resolve_role_binding(override_channel, None)
-            .and_then(|binding| binding.provider)
-            .unwrap_or_else(|| provider.clone())
+        .map(|value| *value);
+    let channel_name = if override_channel.is_none() {
+        let data = shared.core.lock().await;
+        data.sessions
+            .get(&channel_id)
+            .and_then(|session| session.channel_name.clone())
     } else {
-        provider.clone()
-    }
+        None
+    };
+
+    resolve_role_binding(
+        override_channel.unwrap_or(channel_id),
+        channel_name.as_deref(),
+    )
+    .and_then(|binding| binding.provider)
+    .unwrap_or_else(|| provider.clone())
 }
 
 pub(in crate::services::discord) fn native_fast_mode_supported(provider: &ProviderKind) -> bool {
@@ -834,6 +842,12 @@ mod tests {
         }
     }
 
+    fn write_agentdesk_yaml(dir: &std::path::Path, content: &str) {
+        let settings_dir = dir.join(".adk").join("config");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(settings_dir.join("agentdesk.yaml"), content).unwrap();
+    }
+
     impl Drop for TempAgentdeskRootGuard {
         fn drop(&mut self) {
             match self.prev_root.as_ref() {
@@ -1088,6 +1102,57 @@ mod tests {
         drop(settings);
         assert!(shared.fast_mode_session_reset_pending.contains(&channel_id));
         assert!(shared.session_reset_pending.contains(&channel_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_provider_for_channel_uses_role_binding_when_no_dispatch_override() {
+        let env = TempAgentdeskRootGuard::new();
+        write_agentdesk_yaml(
+            env._temp_home.path(),
+            r#"
+server:
+  port: 8791
+agents:
+  - id: project-agentdesk
+    name: "AgentDesk"
+    provider: codex
+    channels:
+      codex:
+        id: "1479671301387059200"
+        name: "adk-cdx"
+        aliases: ["adk-cdx-alt"]
+"#,
+        );
+
+        let shared = make_shared_data_for_tests();
+        let channel_id = serenity::ChannelId::new(1479671301387059200);
+        {
+            let mut data = shared.core.lock().await;
+            data.sessions.insert(
+                channel_id,
+                crate::services::discord::DiscordSession {
+                    session_id: None,
+                    memento_context_loaded: false,
+                    memento_reflected: false,
+                    current_path: None,
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    cleared: false,
+                    remote_profile_name: None,
+                    channel_id: Some(channel_id.get()),
+                    channel_name: Some("adk-cdx".to_string()),
+                    category_name: Some("AgentDesk".to_string()),
+                    last_active: tokio::time::Instant::now(),
+                    worktree: None,
+                    born_generation: 0,
+                    assistant_turns: 0,
+                },
+            );
+        }
+
+        let effective =
+            effective_provider_for_channel(&shared, channel_id, &ProviderKind::Gemini).await;
+        assert_eq!(effective, ProviderKind::Codex);
     }
 
     #[test]

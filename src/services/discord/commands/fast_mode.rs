@@ -44,7 +44,7 @@ pub(in crate::services::discord) async fn cmd_fast(ctx: Context<'_>) -> Result<(
 
     let channel_id = ctx.channel_id();
     let effective_provider =
-        effective_provider_for_channel(&ctx.data().shared, channel_id, &ctx.data().provider);
+        effective_provider_for_channel(&ctx.data().shared, channel_id, &ctx.data().provider).await;
 
     if !native_fast_mode_supported(&effective_provider) {
         ctx.say("/fast is only available in Claude and Codex channels.")

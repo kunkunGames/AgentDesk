@@ -43,7 +43,7 @@ fn managed_session_clear_behavior(provider: &ProviderKind) -> ManagedSessionClea
 
 fn managed_session_reset_behavior(provider: &ProviderKind) -> ManagedSessionResetBehavior {
     match provider {
-        ProviderKind::Claude => ManagedSessionResetBehavior::Noop,
+        ProviderKind::Claude => ManagedSessionResetBehavior::ResetManagedProcess,
         ProviderKind::Codex | ProviderKind::Qwen => {
             ManagedSessionResetBehavior::ResetManagedProcess
         }
@@ -548,7 +548,7 @@ mod tests {
     fn managed_session_reset_behavior_matches_provider_transport() {
         assert_eq!(
             managed_session_reset_behavior(&ProviderKind::Claude),
-            ManagedSessionResetBehavior::Noop
+            ManagedSessionResetBehavior::ResetManagedProcess
         );
         assert_eq!(
             managed_session_reset_behavior(&ProviderKind::Codex),
