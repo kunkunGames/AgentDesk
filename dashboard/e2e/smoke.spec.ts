@@ -1,44 +1,71 @@
-import { test, expect } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+const ROUTES = [
+  { path: "/home", label: /홈|Home/ },
+  { path: "/office", label: /오피스|Office/ },
+  { path: "/agents", label: /에이전트|Agents/ },
+  { path: "/kanban", label: /칸반|Kanban/ },
+  { path: "/stats", label: /통계|Stats/ },
+  { path: "/ops", label: /운영|Ops/ },
+  { path: "/meetings", label: /회의|Meetings/ },
+  { path: "/achievements", label: /업적|Achievements/ },
+  { path: "/settings", label: /설정|Settings/ },
+];
+
+async function expectNoHorizontalOverflow(page: Page) {
+  const metrics = await page.evaluate(() => ({
+    viewportWidth: window.innerWidth,
+    bodyScrollWidth: document.body.scrollWidth,
+    rootScrollWidth: document.documentElement.scrollWidth,
+  }));
+
+  expect(
+    Math.max(metrics.bodyScrollWidth, metrics.rootScrollWidth),
+  ).toBeLessThanOrEqual(metrics.viewportWidth + 1);
+}
 
 test.describe("Dashboard smoke tests", () => {
   test("page loads and renders root element", async ({ page }) => {
     await page.goto("/");
     await expect(page.locator("#root")).toBeAttached();
+    await expect(page.getByTestId("topbar")).toBeVisible();
   });
 
   test("theme: dark/light toggle changes CSS variables", async ({ page }) => {
     await page.goto("/");
-    // Set dark, verify CSS variable responds
-    await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = "dark";
+    });
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
     const darkBg = await page.evaluate(() =>
-      getComputedStyle(document.documentElement).getPropertyValue("--th-bg-primary").trim(),
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--th-bg-primary")
+        .trim(),
     );
     expect(darkBg).toBeTruthy();
 
-    // Switch to light, verify CSS variable changes
-    await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = "light";
+    });
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
     const lightBg = await page.evaluate(() =>
-      getComputedStyle(document.documentElement).getPropertyValue("--th-bg-primary").trim(),
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--th-bg-primary")
+        .trim(),
     );
     expect(lightBg).toBeTruthy();
     expect(lightBg).not.toBe(darkBg);
   });
 
   test("theme: auto mode responds to prefers-color-scheme", async ({ page }) => {
-    // Emulate dark system preference
     await page.emulateMedia({ colorScheme: "dark" });
     await page.goto("/");
-    // The SettingsContext auto path uses matchMedia to set data-theme.
-    // Without backend, simulate the auto logic that the app would run:
     await page.evaluate(() => {
       const mq = window.matchMedia("(prefers-color-scheme: dark)");
       document.documentElement.dataset.theme = mq.matches ? "dark" : "light";
     });
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
-    // Switch to light system preference
     await page.emulateMedia({ colorScheme: "light" });
     await page.evaluate(() => {
       const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -47,28 +74,117 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 
-  test("responsive: desktop viewport shows sidebar nav", async ({ page }, testInfo) => {
+  test("desktop: sidebar renders at the full shell width", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "mobile", "Desktop-only test");
-    await page.goto("/");
-    const sidebar = page.locator("nav").first();
-    await expect(sidebar).toBeVisible({ timeout: 5000 });
+    await page.goto("/home");
+
+    const sidebar = page.getByTestId("app-sidebar-nav");
+    await expect(sidebar).toBeVisible();
+    const box = await sidebar.boundingBox();
+    expect(box?.width).toBeGreaterThan(230);
+    expect(box?.width).toBeLessThan(250);
   });
 
-  test("responsive: mobile viewport shows bottom tab bar", async ({ page }, testInfo) => {
+  test("responsive: 900px switches from mobile tab bar to desktop sidebar", async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name === "mobile", "Desktop-only test");
+
+    await page.setViewportSize({ width: 899, height: 900 });
+    await page.goto("/home");
+
+    await expect(page.getByTestId("app-mobile-tabbar")).toBeVisible();
+    await expect(page.getByTestId("app-sidebar-nav")).toHaveCount(0);
+    await expect(page.getByTestId("app-mobile-tabbar").locator("button")).toHaveCount(5);
+
+    await page.setViewportSize({ width: 900, height: 900 });
+
+    await expect(page.getByTestId("app-sidebar-nav")).toBeVisible();
+    await expect(page.getByTestId("app-mobile-tabbar")).toHaveCount(0);
+  });
+
+  test("responsive: mobile viewport shows 5-tab bar and opens the More menu", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "desktop", "Mobile-only test");
-    await page.goto("/");
-    const bottomNav = page.locator("nav").last();
-    await expect(bottomNav).toBeVisible({ timeout: 5000 });
+    await page.goto("/home");
+
+    const bottomNav = page.getByTestId("app-mobile-tabbar");
+    await expect(bottomNav).toBeVisible();
+    await expect(bottomNav.locator("button")).toHaveCount(5);
+    await expect(page.getByTestId("app-mobile-tab-home")).toBeVisible();
+    await expect(page.getByTestId("app-mobile-tab-office")).toBeVisible();
+    await expect(page.getByTestId("app-mobile-tab-kanban")).toBeVisible();
+    await expect(page.getByTestId("app-mobile-tab-stats")).toBeVisible();
+
+    await page.getByTestId("app-mobile-more-button").click();
+
+    const moreMenu = page.getByTestId("app-mobile-more-menu");
+    await expect(moreMenu).toBeVisible();
+    await expect(moreMenu.getByRole("button", { name: /에이전트|Agents/ })).toBeVisible();
+    await expect(moreMenu.getByRole("button", { name: /운영|Ops/ })).toBeVisible();
+    await expect(moreMenu.getByRole("button", { name: /회의|Meetings/ })).toBeVisible();
+    await expect(moreMenu.getByRole("button", { name: /업적|Achievements/ })).toBeVisible();
+    await expect(moreMenu.getByRole("button", { name: /설정|Settings/ })).toBeVisible();
+
+    const shellStyles = await page.getByTestId("app-main-scroll").evaluate((element) => ({
+      marginBottom: (element as HTMLElement).style.marginBottom,
+    }));
+    expect(shellStyles.marginBottom).toContain("env(safe-area-inset-bottom)");
+
+    const tabbarStyles = await bottomNav.evaluate((element) => ({
+      height: (element as HTMLElement).style.height,
+      paddingBottom: (element as HTMLElement).style.paddingBottom,
+      paddingLeft: (element as HTMLElement).style.paddingLeft,
+      paddingRight: (element as HTMLElement).style.paddingRight,
+    }));
+    expect(tabbarStyles.height).toContain("env(safe-area-inset-bottom)");
+    expect(tabbarStyles.paddingBottom).toContain("env(safe-area-inset-bottom)");
+    expect(tabbarStyles.paddingLeft).toContain("env(safe-area-inset-left)");
+    expect(tabbarStyles.paddingRight).toContain("env(safe-area-inset-right)");
   });
 
-  test("settings: clicking settings button renders SettingsView", async ({ page }, testInfo) => {
+  test("responsive: mobile routes avoid horizontal overflow", async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name === "desktop", "Mobile-only test");
+    await page.goto("/home");
+
+    await expectNoHorizontalOverflow(page);
+
+    await page.getByTestId("app-mobile-tab-office").click();
+    await expect(page).toHaveURL(/\/office$/);
+    await expectNoHorizontalOverflow(page);
+
+    await page.getByTestId("app-mobile-tab-kanban").click();
+    await expect(page).toHaveURL(/\/kanban$/);
+    await expectNoHorizontalOverflow(page);
+
+    await page.getByTestId("app-mobile-tab-stats").click();
+    await expect(page).toHaveURL(/\/stats$/);
+    await expectNoHorizontalOverflow(page);
+
+    await page.getByTestId("app-mobile-more-button").click();
+    await page.getByTestId("app-mobile-more-menu").getByRole("button", { name: /에이전트|Agents/ }).click();
+    await expect(page).toHaveURL(/\/agents$/);
+    await expectNoHorizontalOverflow(page);
+
+    await page.getByTestId("app-mobile-more-button").click();
+    await page.getByTestId("app-mobile-more-menu").getByRole("button", { name: /설정|Settings/ }).click();
+    await expect(page).toHaveURL(/\/settings$/);
+    await expectNoHorizontalOverflow(page);
+  });
+
+  test("settings button routes to settings page", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "mobile", "Desktop-only test");
-    await page.goto("/");
-    const settingsBtn = page.locator('button[title*="Settings"], button[title*="설정"]').first();
-    await expect(settingsBtn).toBeVisible({ timeout: 5000 });
-    await settingsBtn.click();
-    // SettingsView renders a heading with "Settings" or "설정" text
-    const heading = page.locator('h2:has-text("Settings"), h2:has-text("설정")').first();
-    await expect(heading).toBeVisible({ timeout: 5000 });
+    await page.goto("/home");
+
+    await page.getByRole("button", { name: /설정으로 이동|Open settings/ }).click();
+    await expect(page).toHaveURL(/\/settings(\?.*)?$/);
+    await expect(page.getByTestId("topbar")).toContainText(/설정|Settings/);
+  });
+
+  test("all app shell routes are directly reachable", async ({ page }) => {
+    for (const route of ROUTES) {
+      await page.goto(route.path);
+      await expect(page).toHaveURL(
+        new RegExp(`${route.path.replace("/", "\\/")}$`),
+      );
+      await expect(page.getByTestId("topbar")).toContainText(route.label);
+    }
   });
 });

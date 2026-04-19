@@ -46,7 +46,7 @@ pub(super) fn resolve_restart_handoff_scope(
 }
 
 pub(super) fn resolve_dispatched_thread_dispatch_from_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     thread_channel_id: u64,
 ) -> Option<String> {
     let thread_channel_id = thread_channel_id.to_string();
@@ -149,6 +149,10 @@ pub(super) async fn start_restart_handoff_from_state(
             None,
             false,
             None,
+            // Watcher death handoff: synthetic system-initiated turn that
+            // owns its own placeholder; race-handler delete behavior
+            // matches the legacy foreground path.
+            super::router::TurnKind::Foreground,
         )
         .await
         {
@@ -308,7 +312,7 @@ mod tests {
 
     #[test]
     fn watcher_dispatch_db_fallback_prefers_dispatched_thread_row() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
             CREATE TABLE task_dispatches (
@@ -342,7 +346,7 @@ mod tests {
 
     #[test]
     fn watcher_dispatch_db_fallback_uses_session_when_thread_row_missing() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
             CREATE TABLE task_dispatches (

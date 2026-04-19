@@ -36,6 +36,7 @@ src/
 │   ├── migrate/
 │   │   ├── apply.rs
 │   │   ├── plan.rs
+│   │   ├── postgres_cutover.rs
 │   │   ├── source.rs
 │   │   └── tests.rs
 │   ├── args.rs
@@ -52,10 +53,12 @@ src/
 ├── db/
 │   ├── agents.rs
 │   ├── auto_queue.rs
+│   ├── builtin_pipeline.rs
 │   ├── cron_history.rs
 │   ├── kanban.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
+│   ├── postgres.rs
 │   ├── schema.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_transcripts.rs
@@ -187,6 +190,7 @@ src/
 │   │   │   ├── diagnostics.rs
 │   │   │   ├── fast_mode.rs
 │   │   │   ├── help.rs
+│   │   │   ├── mcp_reload.rs
 │   │   │   ├── meeting_cmd.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── model_picker.rs
@@ -232,6 +236,7 @@ src/
 │   │   ├── health.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
+│   │   ├── mcp_credential_watcher.rs
 │   │   ├── meeting_orchestrator.rs
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
@@ -281,6 +286,7 @@ src/
 │   ├── gemini.rs
 │   ├── kanban.rs
 │   ├── mcp_config.rs
+│   ├── message_outbox.rs
 │   ├── mod.rs
 │   ├── process.rs
 │   ├── provider.rs
@@ -306,6 +312,7 @@ src/
 │   ├── ai_screen.rs
 │   └── mod.rs
 ├── utils/
+│   ├── async_bridge.rs
 │   ├── format.rs
 │   └── mod.rs
 ├── bootstrap.rs

@@ -3,6 +3,7 @@ mod control;
 mod diagnostics;
 mod fast_mode;
 mod help;
+mod mcp_reload;
 mod meeting_cmd;
 mod model_picker;
 mod model_ui;
@@ -22,7 +23,8 @@ pub(in crate::services::discord) use config::{
 };
 pub(super) use config::{cmd_adduser, cmd_allowall, cmd_allowed, cmd_allowedtools, cmd_removeuser};
 pub(in crate::services::discord) use control::{
-    clear_channel_session_state, reset_provider_session_if_pending,
+    clear_channel_session_state, notify_turn_stop, reset_channel_provider_state,
+    reset_managed_process_session, reset_provider_session_if_pending,
 };
 pub(super) use control::{cmd_clear, cmd_down, cmd_shell, cmd_stop};
 pub(in crate::services::discord) use diagnostics::{
@@ -34,6 +36,7 @@ pub(super) use diagnostics::{
 };
 pub(super) use fast_mode::cmd_fast;
 pub(super) use help::cmd_help;
+pub(super) use mcp_reload::cmd_mcp_reload;
 pub(super) use meeting_cmd::cmd_meeting;
 pub(super) use model_picker::cmd_model;
 pub(super) use receipt::cmd_receipt;

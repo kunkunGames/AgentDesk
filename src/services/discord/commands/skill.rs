@@ -2,7 +2,7 @@ use poise::serenity_prelude as serenity;
 use serenity::CreateMessage;
 
 use super::super::formatting::{send_long_message_ctx, truncate_str};
-use super::super::router::handle_text_message;
+use super::super::router::{TurnKind, handle_text_message};
 use super::super::turn_bridge::cancel_active_token;
 use super::super::{
     Context, Error, auto_restore_session, check_auth, mailbox_cancel_active_turn,
@@ -151,7 +151,19 @@ pub(in crate::services::discord) async fn cmd_cc(
                         return Ok(());
                     }
                     ctx.say("Stopping...").await?;
-                    cancel_active_token(&token, true, "/cc stop");
+                    cancel_active_token(
+                        &token,
+                        super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
+                        "/cc stop",
+                    );
+                    super::control::notify_turn_stop(
+                        &ctx.serenity_context().http,
+                        &ctx.data().shared,
+                        &ctx.data().provider,
+                        channel_id,
+                        "/cc stop",
+                    )
+                    .await;
                     tracing::info!("  [{ts}] ■ Cancel signal sent");
                 }
                 None => {
@@ -266,6 +278,7 @@ pub(in crate::services::discord) async fn cmd_cc(
             None,
             false,
             None,
+            TurnKind::Foreground,
         )
         .await?;
         return Ok(());
@@ -329,6 +342,7 @@ pub(in crate::services::discord) async fn cmd_cc(
         None,
         false,
         None,
+        TurnKind::Foreground,
     )
     .await?;
 

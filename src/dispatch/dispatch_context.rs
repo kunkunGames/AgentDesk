@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::OptionalExtension;
+use libsql_rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::db::Db;
@@ -50,25 +50,114 @@ pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> 
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn dispatch_type_force_new_session_default(dispatch_type: Option<&str>) -> Option<bool> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DispatchSessionStrategy {
+    pub reset_provider_state: bool,
+    pub recreate_tmux: bool,
+}
+
+/// #762: Provenance of the `target_repo` field in a review dispatch context.
+///
+/// `build_review_context` needs to know whether the caller *actually* pinned
+/// a `target_repo` on this invocation, or whether the field was auto-injected
+/// by the dispatch create path from the card's canonical scope. When the
+/// external `target_repo` becomes unrecoverable, card-scoped fallbacks
+/// silently redirect the reviewer to unrelated code UNLESS we can distinguish
+/// "caller said so" (safe to fallback) from "we made it up" (must fail closed).
+///
+/// Prior behavior inferred this from the (possibly mutated) context passed in,
+/// which broke the moment any upstream injected `target_repo` before calling
+/// `build_review_context` (see `dispatch_create.rs`). Make the signal explicit
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetRepoSource {
+    /// Caller (e.g. REST API client) pinned `target_repo` explicitly on this
+    /// dispatch request. Card-scoped fallbacks may honor it.
+    CallerSupplied,
+    /// `target_repo` was either absent from the caller context OR was
+    /// auto-injected by the dispatch create path from `card.repo_id`.
+    /// Treat as card-scoped default — fail closed on unrecoverable externals.
+    CardScopeDefault,
+}
+
+pub(crate) fn dispatch_type_session_strategy_default(
+    dispatch_type: Option<&str>,
+) -> Option<DispatchSessionStrategy> {
     match dispatch_type {
-        Some("implementation") | Some("review") | Some("rework") => Some(true),
-        Some("review-decision") => Some(false),
+        Some("implementation") | Some("review") | Some("rework") => Some(DispatchSessionStrategy {
+            reset_provider_state: true,
+            recreate_tmux: false,
+        }),
+        Some("review-decision") => Some(DispatchSessionStrategy::default()),
         _ => None,
     }
+}
+
+pub(crate) fn dispatch_type_force_new_session_default(dispatch_type: Option<&str>) -> Option<bool> {
+    dispatch_type_session_strategy_default(dispatch_type)
+        .map(|strategy| strategy.reset_provider_state)
 }
 
 pub(crate) fn dispatch_type_uses_thread_routing(dispatch_type: Option<&str>) -> bool {
     !matches!(dispatch_type, Some("phase-gate"))
 }
 
+/// Resolve the per-dispatch session strategy from the incoming context.
+///
+/// ## `force_new_session` semantics — read this first (#800)
+///
+/// Despite its suggestive name, the `force_new_session` flag (and its alias
+/// `reset_provider_state`) only controls **provider-side session state** — i.e.
+/// whether the underlying agent CLI (Claude / Codex) should start a fresh
+/// conversation versus reusing the previous transcript. It is purely an input
+/// to [`DispatchSessionStrategy::reset_provider_state`].
+///
+/// **What `force_new_session` does NOT do:**
+/// - It does not delete or recreate the worktree directory.
+/// - It does not clear `worktree_path` / `worktree_branch` from the new
+///   dispatch context.
+/// - It does not interact with the worktree-reuse path. That logic lives in
+///   [`latest_completed_work_dispatch_target`], which now (per #800) validates
+///   that any recorded `worktree_path` still exists on disk before re-injecting
+///   it. Stale/missing paths are dropped automatically and the downstream
+///   fallback chain (`resolve_card_worktree`, `resolve_card_issue_commit_target`,
+///   repo-HEAD recovery) resolves a fresh execution target.
+///
+/// If you want a "blow away the worktree state" reset, that lives in the
+/// `reset_full=true` branch of `POST /api/kanban-cards/:id/reopen`, which
+/// invokes `cleanup_force_transition_revert_fields_on_conn` to scrub the
+/// recorded worktree metadata from `task_dispatches` JSON columns. See
+/// `src/kanban.rs:strip_stale_worktree_metadata_from_dispatches_on_conn`.
+pub(crate) fn dispatch_session_strategy_from_context(
+    context: Option<&serde_json::Value>,
+    dispatch_type: Option<&str>,
+) -> DispatchSessionStrategy {
+    let default = dispatch_type_session_strategy_default(dispatch_type).unwrap_or_default();
+    let reset_provider_state = context
+        .and_then(|value| value.get("reset_provider_state"))
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            context
+                .and_then(|value| value.get("force_new_session"))
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(default.reset_provider_state);
+    let recreate_tmux = context
+        .and_then(|value| value.get("recreate_tmux"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(default.recreate_tmux);
+
+    DispatchSessionStrategy {
+        reset_provider_state,
+        recreate_tmux,
+    }
+}
+
 pub(super) fn dispatch_context_with_session_strategy(
     dispatch_type: &str,
     context: &serde_json::Value,
 ) -> serde_json::Value {
-    let Some(default_force_new_session) =
-        dispatch_type_force_new_session_default(Some(dispatch_type))
-    else {
+    let Some(_) = dispatch_type_session_strategy_default(Some(dispatch_type)) else {
         return context.clone();
     };
 
@@ -78,9 +167,17 @@ pub(super) fn dispatch_context_with_session_strategy(
         json!({})
     };
 
+    let strategy = dispatch_session_strategy_from_context(Some(&context), Some(dispatch_type));
     if let Some(obj) = context.as_object_mut() {
-        obj.entry("force_new_session".to_string())
-            .or_insert(json!(default_force_new_session));
+        obj.insert(
+            "reset_provider_state".to_string(),
+            json!(strategy.reset_provider_state),
+        );
+        obj.insert("recreate_tmux".to_string(), json!(strategy.recreate_tmux));
+        obj.insert(
+            "force_new_session".to_string(),
+            json!(strategy.reset_provider_state),
+        );
     }
 
     context
@@ -109,7 +206,7 @@ pub(super) fn dispatch_context_worktree_target(
 }
 
 pub(super) fn resolve_parent_dispatch_context(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     context: &serde_json::Value,
 ) -> Result<(Option<String>, i64)> {
@@ -342,6 +439,31 @@ fn git_commit_exists(dir: &str, commit_sha: &str) -> bool {
         .is_some_and(|output| output.status.success())
 }
 
+/// #682: Exact-HEAD check — returns true only when the worktree's current
+/// HEAD resolves to `commit_sha`. Git's object store is shared across
+/// worktrees of the same repo, so `git cat-file -e` (git_commit_exists)
+/// is satisfied by any commit anywhere in the repo; `merge-base --is-ancestor`
+/// additionally accepts any descendant HEAD, which means a path that was
+/// recycled for follow-up work still passes — but the filesystem state the
+/// reviewer sees is the descendant, not the reviewed commit. Exact HEAD
+/// match is the only way to guarantee the on-disk state matches the
+/// reviewed commit.
+fn worktree_head_matches_commit(dir: &str, commit_sha: &str) -> bool {
+    let Some(output) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    head == commit_sha
+}
+
 fn resolve_review_target_branch(
     db: &Db,
     card_id: &str,
@@ -367,26 +489,58 @@ fn refresh_review_target_worktree(
     context: &serde_json::Value,
     target: &DispatchExecutionTarget,
 ) -> Result<Option<DispatchExecutionTarget>> {
-    if target
-        .worktree_path
-        .as_deref()
-        .is_some_and(|path| std::path::Path::new(path).is_dir())
-    {
-        return Ok(Some(target.clone()));
+    // #682 (Codex review, [medium]): the recorded worktree_path may still
+    // exist as a directory but point at a *different* checkout now (e.g. a
+    // later session recycled the path for another issue). Accept the
+    // recorded path only when the reviewed_commit is reachable from the
+    // worktree's current HEAD; otherwise fall through to recovery.
+    //
+    // git_commit_exists is insufficient here — git's object store is
+    // shared across worktrees of the same repo, so any commit anywhere
+    // in the repo satisfies it. worktree_head_reaches_commit confirms
+    // the reviewed state is actually what is checked out.
+    if let Some(recorded) = target.worktree_path.as_deref() {
+        if std::path::Path::new(recorded).is_dir()
+            && worktree_head_matches_commit(recorded, &target.reviewed_commit)
+        {
+            return Ok(Some(target.clone()));
+        }
     }
 
     if let Some(stale_path) = target.worktree_path.as_deref() {
         tracing::warn!(
-            "[dispatch] Review dispatch for card {}: latest work target path '{}' no longer exists — attempting fallback",
+            "[dispatch] Review dispatch for card {}: latest work target path '{}' no longer holds commit {} — attempting fallback",
             card_id,
-            stale_path
+            stale_path,
+            &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
         );
     }
 
+    // #682 (Codex round 2, [high]): resolve_card_worktree picks the repo
+    // from the current card/context, not the historical completion's
+    // target_repo. For an external-repo completion whose card's canonical
+    // repo differs, this would miss the right worktree. Inject target_repo
+    // into a local context copy so resolve_card_worktree's repo lookup
+    // honors the completion's recorded repo before falling back to the
+    // card's default.
+    let resolve_context = if let Some(tr) = target.target_repo.as_deref() {
+        let mut merged = context.clone();
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("target_repo".to_string(), json!(tr));
+        }
+        std::borrow::Cow::Owned(merged)
+    } else {
+        std::borrow::Cow::Borrowed(context)
+    };
+
     if let Some((wt_path, wt_branch, _wt_commit)) =
-        resolve_card_worktree(db, card_id, Some(context))?
+        resolve_card_worktree(db, card_id, Some(resolve_context.as_ref()))?
     {
-        if git_commit_exists(&wt_path, &target.reviewed_commit) {
+        // Use the exact-HEAD check here too — a worktree whose HEAD has
+        // advanced past reviewed_commit still satisfies git_commit_exists
+        // via the shared object store, but the files on disk are the
+        // descendant state, not what was reviewed.
+        if worktree_head_matches_commit(&wt_path, &target.reviewed_commit) {
             let branch = resolve_review_target_branch(
                 db,
                 card_id,
@@ -410,19 +564,44 @@ fn refresh_review_target_worktree(
         }
 
         tracing::warn!(
-            "[dispatch] Review dispatch for card {}: active issue worktree does not contain commit {} — skipping path refresh",
+            "[dispatch] Review dispatch for card {}: active issue worktree HEAD does not match reviewed commit {} — skipping path refresh",
             card_id,
             &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
         );
     }
 
-    if let Some(repo_dir) = resolve_card_repo_dir_with_context(
-        db,
-        card_id,
-        Some(context),
-        "recover review target repo",
-    )? {
-        if git_commit_exists(&repo_dir, &target.reviewed_commit) {
+    // #682 (Codex review, [high]): prefer the explicit target_repo recorded
+    // on the completion before falling back to card-scoped repo resolution.
+    // Issue-less cards that ran against an external repo (recorded as
+    // target_repo on the work dispatch) would otherwise lose the original
+    // repo when their worktree was cleaned up.
+    let fallback_repo_dir = target
+        .target_repo
+        .as_deref()
+        .and_then(|value| {
+            crate::services::platform::shell::resolve_repo_dir_for_target(Some(value))
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            resolve_card_repo_dir_with_context(
+                db,
+                card_id,
+                Some(context),
+                "recover review target repo",
+            )
+            .ok()
+            .flatten()
+        });
+
+    if let Some(repo_dir) = fallback_repo_dir {
+        // #682 (Codex round 3, [high]): require the repo_dir's HEAD to be
+        // exactly reviewed_commit before emitting it as worktree_path. The
+        // shared git object store makes git_commit_exists trivially pass
+        // for any commit anywhere in the repo — but if HEAD is checked out
+        // at something else, the reviewer sees unrelated filesystem state.
+        // Exact HEAD match guarantees the on-disk state is what was reviewed.
+        if worktree_head_matches_commit(&repo_dir, &target.reviewed_commit) {
             let branch = resolve_review_target_branch(
                 db,
                 card_id,
@@ -440,6 +619,31 @@ fn refresh_review_target_worktree(
                 reviewed_commit: target.reviewed_commit.clone(),
                 branch,
                 worktree_path: Some(repo_dir),
+                target_repo: target.target_repo.clone(),
+            }));
+        }
+
+        tracing::warn!(
+            "[dispatch] Review dispatch for card {}: repo_dir '{}' HEAD does not match reviewed commit {} — emitting reviewed_commit without worktree_path",
+            card_id,
+            repo_dir,
+            &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
+        );
+        // We know the commit exists in this repo (cat-file via the earlier
+        // branch); hand back reviewed_commit and let the reviewer inspect
+        // it via git commands, without misleading worktree_path.
+        if git_commit_exists(&repo_dir, &target.reviewed_commit) {
+            let branch = resolve_review_target_branch(
+                db,
+                card_id,
+                &repo_dir,
+                &target.reviewed_commit,
+                target.branch.as_deref(),
+            );
+            return Ok(Some(DispatchExecutionTarget {
+                reviewed_commit: target.reviewed_commit.clone(),
+                branch,
+                worktree_path: None,
                 target_repo: target.target_repo.clone(),
             }));
         }
@@ -479,7 +683,7 @@ fn latest_completed_work_dispatch_target(
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
 
-    let path = result_json
+    let raw_path = result_json
         .as_ref()
         .and_then(|v| json_string_field(v, "completed_worktree_path"))
         .or_else(|| {
@@ -492,7 +696,7 @@ fn latest_completed_work_dispatch_target(
                 .as_ref()
                 .and_then(|v| json_string_field(v, "worktree_path"))
         });
-    let branch = result_json
+    let raw_branch = result_json
         .as_ref()
         .and_then(|v| json_string_field(v, "completed_branch"))
         .or_else(|| {
@@ -516,6 +720,34 @@ fn latest_completed_work_dispatch_target(
                 .and_then(|v| json_string_field(v, "branch"))
         })
         .map(str::to_string);
+
+    // #800: Validate that the recorded worktree path still exists on disk
+    // before propagating it into the new dispatch context. A done card that
+    // gets reopened may reference a worktree that has since been removed
+    // (`git worktree remove`, manual cleanup, branch deletion). Without this
+    // check the new dispatch is silently re-pointed at the orphaned path,
+    // which manifests as the agent restarting work in the same broken
+    // location and reproducing the original conflict.
+    //
+    // When the path is stale we drop BOTH `worktree_path` and the associated
+    // branch; downstream fallbacks (`resolve_card_worktree`,
+    // `resolve_card_issue_commit_target`, repo-HEAD recovery) will then
+    // resolve a fresh execution target from the card's current scope.
+    let (path, branch) = match raw_path {
+        Some(candidate) if std::path::Path::new(candidate).is_dir() => {
+            (Some(candidate), raw_branch)
+        }
+        Some(stale) => {
+            tracing::warn!(
+                "[dispatch] Card {}: dropping stale completed-work worktree metadata — recorded path '{}' no longer exists; clearing branch '{}' and falling back to fresh worktree resolution",
+                kanban_card_id,
+                stale,
+                raw_branch.as_deref().unwrap_or("<none>")
+            );
+            (None, None)
+        }
+        None => (None, raw_branch),
+    };
     let reviewed_commit = result_json
         .as_ref()
         .and_then(|v| json_string_field(v, "completed_commit"))
@@ -601,20 +833,10 @@ fn result_has_work_completion_evidence(result: &serde_json::Value) -> bool {
         || json_string_field(result, "work_outcome").is_some()
 }
 
-fn dispatch_has_assistant_response(conn: &rusqlite::Connection, dispatch_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT COUNT(*) > 0
-         FROM session_transcripts
-         WHERE dispatch_id = ?1
-           AND TRIM(assistant_message) <> ''",
-        [dispatch_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| anyhow::anyhow!("session transcript lookup failed: {e}"))
-}
-
 pub(super) fn validate_dispatch_completion_evidence_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
+    db: &Db,
+    pg_pool: Option<&sqlx::PgPool>,
     dispatch_id: &str,
     result: &serde_json::Value,
 ) -> Result<()> {
@@ -633,7 +855,11 @@ pub(super) fn validate_dispatch_completion_evidence_on_conn(
     }
 
     if result_has_work_completion_evidence(result)
-        || dispatch_has_assistant_response(conn, dispatch_id)?
+        || crate::db::session_transcripts::dispatch_has_assistant_response_db(
+            db,
+            pg_pool,
+            dispatch_id,
+        )?
     {
         return Ok(());
     }
@@ -659,7 +885,7 @@ pub(crate) fn validate_dispatch_completion_evidence(
     let conn = db
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
-    validate_dispatch_completion_evidence_on_conn(&conn, dispatch_id, result)
+    validate_dispatch_completion_evidence_on_conn(&conn, db, None, dispatch_id, result)
 }
 
 fn apply_review_target_context(
@@ -688,6 +914,74 @@ fn apply_review_target_warning(
 ) {
     obj.insert("review_target_reject_reason".to_string(), json!(reason));
     obj.insert("review_target_warning".to_string(), json!(warning));
+}
+
+/// #762: Normalize a `target_repo` value for comparison.
+///
+/// Two repo references describe the same local repo iff their
+/// `resolve_repo_dir_for_target` results canonicalize to the same path. This
+/// handles mixed "org/name" / "/abs/path" / "~/path" forms without tripping on
+/// trivial string differences.
+fn normalized_target_repo_path(target_repo: Option<&str>) -> Option<std::path::PathBuf> {
+    let target_repo = target_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let resolved = crate::services::platform::shell::resolve_repo_dir_for_target(Some(target_repo))
+        .ok()
+        .flatten()?;
+    Some(std::fs::canonicalize(&resolved).unwrap_or_else(|_| std::path::PathBuf::from(&resolved)))
+}
+
+/// #762: Decide whether the historical work dispatch's `target_repo` risks
+/// silently redirecting a review to unrelated code when card-scoped
+/// fallbacks run.
+///
+/// A recorded `work_target_repo` is safe iff it demonstrably resolves to the
+/// same local repo as the card's canonical scope. Any other outcome —
+/// different resolved path, unresolvable work_target_repo, or no card-side
+/// anchor — is treated as "external and unrecoverable" to fail closed.
+fn historical_target_repo_differs_from_card(
+    work_target_repo: Option<&str>,
+    card_scope_repo: Option<&str>,
+) -> bool {
+    let Some(work) = work_target_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let card = card_scope_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    // Cheap string compare first — avoids touching the filesystem on the
+    // common case where the two references were copied from the same source.
+    if let Some(card_str) = card.as_deref() {
+        if work == card_str {
+            return false;
+        }
+    }
+
+    let work_path = normalized_target_repo_path(Some(work));
+    let card_path = card.and_then(|value| normalized_target_repo_path(Some(value)));
+    match (work_path, card_path) {
+        (Some(w), Some(c)) => w != c,
+        // If only one side resolves, we cannot prove the two references
+        // describe the same repo — treat as external-divergent so the
+        // card-scoped fallback path does not silently redirect.
+        (Some(_), None) => true,
+        (None, Some(_)) => true,
+        // #762 (C): when NEITHER side resolves we still have a concrete
+        // `work_target_repo` string recorded against the historical work
+        // dispatch. We cannot prove it matches the card scope — in fact the
+        // card scope is unresolvable too. Previously this returned `false`
+        // and let the card-scoped fallback chain run, which made
+        // `resolve_repo_dir_for_target(None)` redirect the reviewer into the
+        // default repo. Treat this as divergent so the caller fails closed
+        // on an unrecoverable external target_repo instead of silently
+        // reviewing unrelated code in the default repo.
+        (None, None) => true,
+    }
 }
 
 pub(crate) const REVIEW_QUALITY_SCOPE_REMINDER: &str =
@@ -880,17 +1174,104 @@ fn resolve_repo_head_fallback_target(
     }))
 }
 
+/// Review-target fields that steer the agent's execution state (which commit
+/// to check out, which worktree to inspect, which branch to compare against).
+///
+/// #761: These fields must be treated as untrusted when they arrive via the
+/// public dispatch-create API. A caller could craft a context that pins the
+/// review to any commit/path. `build_review_context` with
+/// `ReviewTargetTrust::Untrusted` strips them before running the
+/// validation/refresh chain. The trust signal is passed **out-of-band** as a
+/// function parameter — never read from the JSON context — so no
+/// client-controlled field can opt out of stripping.
+pub(super) const UNTRUSTED_REVIEW_TARGET_FIELDS: &[&str] =
+    &["reviewed_commit", "worktree_path", "branch", "target_repo"];
+
+/// Trust boundary for review-target fields on the incoming context.
+///
+/// #761 (Codex round-2): The round-1 design used a `_trusted_review_target`
+/// sentinel inside the context JSON. That made trust client-controlled — a
+/// crafted POST /api/dispatches body could set it and bypass stripping. This
+/// enum is the replacement: it is an out-of-band Rust-type parameter, not a
+/// JSON field. API-sourced code paths (`POST /api/dispatches` → dispatch
+/// service → `create_dispatch_core_internal` → `build_review_context`) always
+/// pass `Untrusted`. Only internal callers that legitimately pre-populate
+/// review-target fields (e.g. tests simulating a specific target_repo
+/// recovery path) may opt in via `Trusted`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReviewTargetTrust {
+    /// Review-target fields in the incoming context are UNTRUSTED and will be
+    /// stripped. The validation/refresh chain then resolves them fresh from
+    /// the card's history (latest completed work dispatch → worktree lookup →
+    /// issue commit recovery → repo HEAD fallback). This is the default for
+    /// anything reachable via the public HTTP API.
+    Untrusted,
+    /// Review-target fields in the incoming context are TRUSTED and will be
+    /// passed through to the downstream validation/refresh chain. Only use
+    /// this from internal call sites where the fields came from a
+    /// first-party source (not user-controlled JSON).
+    Trusted,
+}
+
 /// Build the context JSON string for a review dispatch.
 ///
 /// Injects `reviewed_commit`, `branch`, `worktree_path`, and provider info.
 /// Prefers worktree branch (if found for this card's issue) over main HEAD.
+///
+/// #761 (Codex round-2): `trust` is an out-of-band parameter. `Untrusted`
+/// unconditionally strips `reviewed_commit` / `worktree_path` / `branch` /
+/// `target_repo` from the incoming context before the validation/refresh
+/// chain runs. No JSON field on `context` can toggle this behavior — the
+/// previous `_trusted_review_target` sentinel has been removed. API-sourced
+/// callers (anyone reaching `POST /api/dispatches`) MUST pass `Untrusted`;
+/// internal callers that already have first-party review-target values may
+/// opt into `Trusted`.
 pub(super) fn build_review_context(
     db: &Db,
     kanban_card_id: &str,
     to_agent_id: &str,
     context: &serde_json::Value,
+    trust: ReviewTargetTrust,
+    target_repo_source: TargetRepoSource,
 ) -> Result<String> {
+    // #762 (A): the caller tells us explicitly whether `target_repo` in
+    // `context` originated from their request or from our own fallback
+    // injection. Inferring this from `context["target_repo"].is_some()` is
+    // unreliable because upstream (`dispatch_create.rs`) pre-injects
+    // `target_repo` into the context from the card's scope BEFORE calling
+    // this function — which would make every dispatch look caller-supplied
+    // and silently disable the `external_target_repo_unrecoverable` filter.
+    let caller_supplied_target_repo =
+        matches!(target_repo_source, TargetRepoSource::CallerSupplied)
+            && json_string_field(context, "target_repo").is_some();
     let mut ctx_val = dispatch_context_with_session_strategy("review", context);
+
+    // #761: Strip untrusted review-target fields before any downstream code
+    // consumes them. The trust decision is out-of-band (the `trust` parameter
+    // on this function's signature, not a JSON field), so a malicious or buggy
+    // POST /api/dispatches body cannot opt out of stripping. Any legacy
+    // `_trusted_review_target` key in the payload is also removed so it
+    // cannot leak into the persisted dispatch context and mislead future
+    // readers into thinking it carries meaning.
+    if let Some(obj) = ctx_val.as_object_mut() {
+        obj.remove("_trusted_review_target");
+        if matches!(trust, ReviewTargetTrust::Untrusted) {
+            let mut stripped: Vec<&str> = Vec::new();
+            for field in UNTRUSTED_REVIEW_TARGET_FIELDS {
+                if obj.remove(*field).is_some() {
+                    stripped.push(field);
+                }
+            }
+            if !stripped.is_empty() {
+                tracing::warn!(
+                    "[dispatch] Review dispatch for card {}: stripped untrusted review-target fields from input context ({}) — validation/refresh chain will resolve them from card history",
+                    kanban_card_id,
+                    stripped.join(", ")
+                );
+            }
+        }
+    }
+
     let target_repo = resolve_card_target_repo_ref(db, kanban_card_id, Some(&ctx_val));
     if let Some(obj) = ctx_val.as_object_mut() {
         if let Some(target_repo) = target_repo.as_deref() {
@@ -925,11 +1306,15 @@ pub(super) fn build_review_context(
                     );
                 }
                 if valid {
-                    if card_issue_number.is_none() {
-                        Some(target.clone())
-                    } else {
-                        refresh_review_target_worktree(db, kanban_card_id, &ctx_snapshot, target)?
-                    }
+                    // #682: Always refresh to catch stale worktree_path even for
+                    // issue-less cards. refresh_review_target_worktree tries
+                    // resolve_card_worktree first (needs issue_number — returns
+                    // None here) and falls back to the card's repo_dir when the
+                    // reviewed_commit still lives there. Prior code returned the
+                    // recorded target unchanged when issue_number was None, which
+                    // meant a stale worktree_path propagated into the dispatch
+                    // context and failed `Path::exists()` at review execution.
+                    refresh_review_target_worktree(db, kanban_card_id, &ctx_snapshot, target)?
                 } else {
                     None
                 }
@@ -953,7 +1338,55 @@ pub(super) fn build_review_context(
                         &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
                     );
                 }
-                if let Some((ref wt_path, ref wt_branch, ref wt_commit)) =
+
+                // #762 (A): if the historical work target was recorded against
+                // an EXTERNAL `target_repo` that differs from the card's
+                // canonical repo, and refresh failed, the card-scoped
+                // fallbacks below (`resolve_card_worktree`,
+                // `resolve_card_issue_commit_target`, repo-HEAD fallback) will
+                // silently redirect the reviewer to unrelated code in the
+                // card's default repo. Fail closed instead.
+                //
+                // Exception: when the caller explicitly pinned `target_repo`
+                // on the invocation context, `ctx_snapshot` already carries
+                // the correct repo scope — `resolve_card_worktree` et al. will
+                // honor it and no silent redirect can happen. We only fail
+                // closed when the caller provided no override.
+                let card_repo_id =
+                    load_card_issue_repo(db, kanban_card_id).and_then(|(_, repo_id)| repo_id);
+                let historical_external_repo_unrecoverable = latest_work_target
+                    .as_ref()
+                    .filter(|_| validated_work_target.is_none())
+                    .filter(|_| !caller_supplied_target_repo)
+                    .and_then(|target| target.target_repo.as_deref())
+                    .filter(|work_repo| {
+                        historical_target_repo_differs_from_card(
+                            Some(work_repo),
+                            card_repo_id.as_deref(),
+                        )
+                    })
+                    .map(|value| value.to_string());
+
+                if let Some(external_repo) = historical_external_repo_unrecoverable {
+                    apply_review_target_warning(
+                        obj,
+                        "external_target_repo_unrecoverable",
+                        "리뷰 대상 커밋을 원래 외부 target_repo에서 복구할 수 없습니다. 카드 기본 레포로 폴백하면 무관한 코드가 리뷰되므로 중단합니다.",
+                    );
+                    // Preserve the historical target_repo so downstream
+                    // consumers (prompt builder, bootstrap) at least know
+                    // which repo the reviewer should have been pointed at.
+                    // Overwrite any card-scoped target_repo that may have
+                    // been pre-injected by resolve_card_target_repo_ref —
+                    // the failed external reference is the meaningful signal
+                    // here, not the card's default repo.
+                    obj.insert("target_repo".to_string(), json!(external_repo.clone()));
+                    tracing::warn!(
+                        "[dispatch] Review dispatch for card {}: historical external target_repo '{}' is unrecoverable — suppressing card-scoped fallback",
+                        kanban_card_id,
+                        external_repo
+                    );
+                } else if let Some((ref wt_path, ref wt_branch, ref wt_commit)) =
                     resolve_card_worktree(db, kanban_card_id, Some(&ctx_snapshot))?
                 {
                     apply_review_target_context(
@@ -1150,7 +1583,7 @@ mod tests {
              ) VALUES (
                 ?1, 'Test Card', ?2, ?3, datetime('now'), datetime('now')
              )",
-            rusqlite::params![card_id, status, issue_number],
+            libsql_rusqlite::params![card_id, status, issue_number],
         )
         .unwrap();
     }
@@ -1159,7 +1592,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET repo_id = ?1 WHERE id = ?2",
-            rusqlite::params![repo_id, card_id],
+            libsql_rusqlite::params![repo_id, card_id],
         )
         .unwrap();
     }
@@ -1345,7 +1778,7 @@ mod tests {
                 'card-review-identifiers', ?1, ?2, 'wt/692-review', 901, ?3, 'review',
                 datetime('now'), datetime('now')
              )",
-            rusqlite::params![repo_dir, repo_dir, reviewed_commit],
+            libsql_rusqlite::params![repo_dir, repo_dir, reviewed_commit],
         )
         .unwrap();
         drop(conn);
@@ -1359,6 +1792,8 @@ mod tests {
                 "branch": "wt/692-review",
                 "reviewed_commit": reviewed_commit,
             }),
+            ReviewTargetTrust::Untrusted,
+            TargetRepoSource::CardScopeDefault,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
@@ -1371,5 +1806,121 @@ mod tests {
         assert_eq!(parsed["pr_number"], 901);
         assert_eq!(parsed["reviewed_commit"], reviewed_commit);
         assert_eq!(parsed["verdict_endpoint"], "POST /api/review-verdict");
+    }
+
+    /// #800: Verify that a recorded `worktree_path` pointing at a now-missing
+    /// directory does NOT survive into the resolved
+    /// `latest_completed_work_dispatch_target`. Without this guard a reopened
+    /// done card silently re-points the new dispatch at the orphaned worktree
+    /// and the agent restarts work in a broken location.
+    #[test]
+    fn latest_completed_work_dispatch_target_drops_stale_worktree_path() {
+        let db = test_db();
+        seed_card(&db, "card-stale-completed-wt", 800, "ready");
+
+        // Materialize a real directory, capture its path, then remove the
+        // directory so the recorded path becomes stale on disk while the
+        // dispatch row keeps pointing at it.
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_path = stale_dir.path().to_path_buf();
+        let stale_path_str = stale_path.to_str().unwrap().to_string();
+        let stale_branch = "wt/800-stale".to_string();
+        drop(stale_dir);
+        assert!(
+            !stale_path.exists(),
+            "tempdir must be removed before the test runs to simulate a stale wt"
+        );
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-800-stale', 'card-stale-completed-wt', 'agent-1', 'implementation', 'completed',
+                'Stale wt completion', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            libsql_rusqlite::params![
+                serde_json::json!({
+                    "worktree_path": stale_path_str,
+                    "worktree_branch": stale_branch,
+                })
+                .to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": stale_path_str,
+                    "completed_branch": stale_branch,
+                    // Intentionally no `completed_commit` so the function
+                    // exits via the "trusted_path" branch (lines after the
+                    // path-validation guard) and we can observe that the
+                    // stale path was filtered out instead of returned.
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let target = latest_completed_work_dispatch_target(&db, "card-stale-completed-wt");
+        assert!(
+            target.is_none(),
+            "stale worktree path with no recoverable commit must yield no dispatch target, got {:?}",
+            target
+        );
+    }
+
+    /// #800 companion: when a `completed_commit` IS recorded alongside a stale
+    /// `worktree_path`, the function falls back through `fallback_repo_dir`.
+    /// We assert that `worktree_path` on the returned target is NOT the stale
+    /// recorded value — proving the path-validation guard fired.
+    #[test]
+    fn latest_completed_work_dispatch_target_does_not_reuse_stale_path_with_commit() {
+        let db = test_db();
+        seed_card(&db, "card-stale-completed-with-commit", 800, "ready");
+
+        let stale_dir = tempfile::tempdir().unwrap();
+        let stale_path_str = stale_dir.path().to_str().unwrap().to_string();
+        drop(stale_dir);
+
+        // Use a real repo for the fallback so resolve_card_target_repo_ref/
+        // fallback_repo_dir yields *something*, otherwise the function returns
+        // a target with worktree_path: None which still satisfies "no stale
+        // reuse" but for the wrong reason.
+        let (repo, _repo_override) = setup_test_repo();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let completed_commit = crate::services::platform::git_head_commit(&repo_dir).unwrap();
+        set_card_repo_id(&db, "card-stale-completed-with-commit", &repo_dir);
+
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result, created_at, updated_at
+             ) VALUES (
+                'dispatch-800-stale-commit', 'card-stale-completed-with-commit', 'agent-1', 'implementation', 'completed',
+                'Stale wt completion (with commit)', ?1, ?2, datetime('now'), datetime('now')
+             )",
+            libsql_rusqlite::params![
+                serde_json::json!({}).to_string(),
+                serde_json::json!({
+                    "completed_worktree_path": stale_path_str,
+                    "completed_branch": "wt/800-stale-commit",
+                    "completed_commit": completed_commit,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let target = latest_completed_work_dispatch_target(
+            &db,
+            "card-stale-completed-with-commit",
+        )
+        .expect("target must exist when completed_commit is present and a fallback repo dir is resolvable");
+
+        assert_eq!(target.reviewed_commit, completed_commit);
+        assert_ne!(
+            target.worktree_path.as_deref(),
+            Some(stale_path_str.as_str()),
+            "stale worktree_path must not be reused even when commit recovery succeeds"
+        );
     }
 }

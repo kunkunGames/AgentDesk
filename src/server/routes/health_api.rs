@@ -1,10 +1,11 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use std::net::SocketAddr;
 
 use crate::services::discord::health;
 
@@ -19,7 +20,10 @@ struct DispatchOutboxStats {
     oldest_pending_age: i64,
 }
 
-fn discord_control_endpoints_allowed(config: &crate::config::Config) -> bool {
+fn discord_control_endpoints_allowed(
+    config: &crate::config::Config,
+    peer_addr: Option<SocketAddr>,
+) -> bool {
     if config
         .server
         .auth_token
@@ -27,6 +31,10 @@ fn discord_control_endpoints_allowed(config: &crate::config::Config) -> bool {
         .map(str::trim)
         .is_some_and(|token| !token.is_empty())
     {
+        return true;
+    }
+
+    if peer_addr.is_some_and(|addr| addr.ip().is_loopback()) {
         return true;
     }
 
@@ -138,8 +146,19 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
 }
 
 /// POST /api/send — agent-to-agent native routing.
-pub async fn send_handler(State(state): State<AppState>, body: Bytes) -> Response {
-    if !discord_control_endpoints_allowed(&state.config) {
+///
+/// Requires `ConnectInfo<SocketAddr>` injected by the server bootstrap
+/// (see `boot.rs::run_with_state` and `mod.rs::launch_*` which both call
+/// `into_make_service_with_connect_info::<SocketAddr>`). The
+/// `discord_control_endpoints_allowed` helper supports `peer_addr: None`
+/// for internal callers / unit tests where the connection info isn't
+/// available; in production HTTP traffic the extractor is always present.
+pub async fn send_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if !discord_control_endpoints_allowed(&state.config, Some(peer_addr)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
@@ -164,8 +183,15 @@ pub async fn send_handler(State(state): State<AppState>, body: Bytes) -> Respons
 }
 
 /// POST /api/senddm — send a DM to a Discord user.
-pub async fn senddm_handler(State(state): State<AppState>, body: Bytes) -> Response {
-    if !discord_control_endpoints_allowed(&state.config) {
+///
+/// See `send_handler` for the rationale on the mandatory
+/// `ConnectInfo<SocketAddr>` extractor.
+pub async fn senddm_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if !discord_control_endpoints_allowed(&state.config, Some(peer_addr)) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
@@ -187,6 +213,40 @@ pub async fn senddm_handler(State(state): State<AppState>, body: Bytes) -> Respo
     let json: serde_json::Value =
         serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
     (status, Json(json)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discord_control_endpoints_allowed;
+
+    #[test]
+    fn discord_control_endpoints_allow_loopback_peer_without_auth_token() {
+        let mut config = crate::config::Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.auth_token = Some(String::new());
+
+        assert!(discord_control_endpoints_allowed(
+            &config,
+            Some("127.0.0.1:8791".parse().unwrap())
+        ));
+        assert!(discord_control_endpoints_allowed(
+            &config,
+            Some("[::1]:8791".parse().unwrap())
+        ));
+    }
+
+    #[test]
+    fn discord_control_endpoints_reject_non_loopback_without_auth_token() {
+        let mut config = crate::config::Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.auth_token = Some(String::new());
+
+        assert!(!discord_control_endpoints_allowed(
+            &config,
+            Some("10.0.0.5:8791".parse().unwrap())
+        ));
+        assert!(!discord_control_endpoints_allowed(&config, None));
+    }
 }
 
 fn parse_status_code(s: &str) -> StatusCode {

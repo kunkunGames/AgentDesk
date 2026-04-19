@@ -1,6 +1,12 @@
 import { useEffect, useState, useMemo } from "react";
 import type { Agent } from "../../types";
 import * as api from "../../api/client";
+import { STORAGE_KEYS } from "../../lib/storageKeys";
+import {
+  readLocalStorageValue,
+  writeLocalStorageValue,
+} from "../../lib/useLocalStorage";
+import { getFontFamilyForText } from "../../lib/fonts";
 import type { TFunction } from "./model";
 import AgentAvatar from "../AgentAvatar";
 import { cx, dashboardBadge, dashboardCard } from "./ui";
@@ -15,7 +21,7 @@ import {
 } from "./dashboardInsights";
 
 const DEFAULT_CRON_TIMELINE_WINDOW_MS = 60 * 60_000;
-const BOTTLE_NECK_THRESHOLDS_STORAGE_KEY = "agentdesk:dashboard:bottleneck-thresholds";
+const BOTTLE_NECK_THRESHOLDS_STORAGE_KEY = STORAGE_KEYS.dashboardBottleneckThresholds;
 const AUTO_QUEUE_HISTORY_LIMIT = 24;
 const AUTO_QUEUE_HISTORY_PREVIEW_COUNT = 8;
 
@@ -135,28 +141,22 @@ function sanitizeThreshold(value: number, fallback: number, min = 1, max = 30): 
 }
 
 function readStoredBottleneckThresholds(): BottleneckThresholds {
-  if (typeof window === "undefined") return DEFAULT_BOTTLENECK_THRESHOLDS;
-  try {
-    const raw = window.localStorage.getItem(BOTTLE_NECK_THRESHOLDS_STORAGE_KEY);
-    if (!raw) return DEFAULT_BOTTLENECK_THRESHOLDS;
-    const parsed = JSON.parse(raw) as Partial<BottleneckThresholds>;
-    return {
-      review_delay_days: sanitizeThreshold(parsed.review_delay_days ?? NaN, REVIEW_DELAY_DAYS),
-      long_blocked_days: sanitizeThreshold(parsed.long_blocked_days ?? NaN, LONG_BLOCKED_DAYS),
-      rework_alert_threshold: sanitizeThreshold(parsed.rework_alert_threshold ?? NaN, REWORK_ALERT_THRESHOLD, 1, 20),
-    };
-  } catch {
+  const parsed = readLocalStorageValue<Partial<BottleneckThresholds> | null>(
+    BOTTLE_NECK_THRESHOLDS_STORAGE_KEY,
+    null,
+  );
+  if (!parsed || typeof parsed !== "object") {
     return DEFAULT_BOTTLENECK_THRESHOLDS;
   }
+  return {
+    review_delay_days: sanitizeThreshold(parsed.review_delay_days ?? NaN, REVIEW_DELAY_DAYS),
+    long_blocked_days: sanitizeThreshold(parsed.long_blocked_days ?? NaN, LONG_BLOCKED_DAYS),
+    rework_alert_threshold: sanitizeThreshold(parsed.rework_alert_threshold ?? NaN, REWORK_ALERT_THRESHOLD, 1, 20),
+  };
 }
 
 function persistBottleneckThresholds(thresholds: BottleneckThresholds) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(BOTTLE_NECK_THRESHOLDS_STORAGE_KEY, JSON.stringify(thresholds));
-  } catch {
-    // Ignore localStorage failures and keep the current in-memory values.
-  }
+  writeLocalStorageValue(BOTTLE_NECK_THRESHOLDS_STORAGE_KEY, thresholds);
 }
 
 function buildWeightedSuccessRate(runs: api.AutoQueueHistoryRun[]): number {
@@ -942,12 +942,22 @@ export function AchievementWidget({ t, agents }: AchievementWidgetProps) {
       className={dashboardCard.accentStandard}
       style={{ borderColor: "var(--th-border)", background: "linear-gradient(145deg, color-mix(in srgb, var(--th-surface) 90%, #eab308 10%), var(--th-surface))" }}
     >
-      <h3 className="text-sm font-semibold mb-3" style={{ color: "var(--th-text)" }}>
+      <h3
+        className="font-pixel mb-3 text-sm font-semibold"
+        style={{
+          color: "var(--th-text)",
+          fontFamily: getFontFamilyForText(
+            t({ ko: "업적", en: "Achievements", ja: "実績", zh: "成就" }),
+            "pixel",
+          ),
+        }}
+      >
         🏆 {t({ ko: "업적", en: "Achievements", ja: "実績", zh: "成就" })}
       </h3>
       <div className="space-y-1.5 max-h-48 overflow-y-auto">
         {achievements.slice(0, 15).map((ach) => {
           const agent = agentMap.get(ach.agent_id) ?? fallbackAgentFromAchievement(ach);
+          const agentLabel = ach.agent_name_ko || ach.agent_name;
           return (
             <div
               key={ach.id}
@@ -964,10 +974,22 @@ export function AchievementWidget({ t, agents }: AchievementWidgetProps) {
                 </span>
               </div>
               <div className="flex-1 min-w-0">
-                <div className="text-xs font-medium truncate" style={{ color: "var(--th-text)" }}>
-                  {ach.agent_name_ko || ach.agent_name}
+                <div
+                  className="font-pixel truncate text-xs font-medium"
+                  style={{
+                    color: "var(--th-text)",
+                    fontFamily: getFontFamilyForText(agentLabel, "pixel"),
+                  }}
+                >
+                  {agentLabel}
                 </div>
-                <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>
+                <div
+                  className="font-pixel text-xs"
+                  style={{
+                    color: "var(--th-text-muted)",
+                    fontFamily: getFontFamilyForText(ach.name, "pixel"),
+                  }}
+                >
                   {ach.name} — {ach.description}
                 </div>
               </div>

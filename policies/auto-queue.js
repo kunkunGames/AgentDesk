@@ -93,6 +93,23 @@ function autoQueueLog(level, message, context) {
 var PHASE_GATE_HUMAN_ESCALATION_THRESHOLD = 3;
 var PHASE_GATE_FAILURE_TTL_SEC = 7 * 24 * 60 * 60;
 
+function configuredAutoQueueMaxEntryRetries() {
+  var configured = parseInt(agentdesk.config.get("maxEntryRetries"), 10);
+  if (!configured || configured < 1) return 3;
+  return configured;
+}
+
+function notifyAutoQueueEntryFailure(stuck, failure) {
+  if (!stuck || !failure || failure.to !== "failed" || failure.changed !== true) return;
+  notifyHumanAlert(
+    "⚠️ [Auto Queue] " + loadPhaseGateCardLabel(stuck.kanban_card_id) + "\n" +
+      "entry " + stuck.id + "가 dispatch failure " + failure.retryCount + "/" + failure.retryLimit + "회 누적으로 failed 상태가 되었습니다.\n" +
+      "dispatch " + (stuck.dispatch_id || "NULL") + " is orphan/cancelled/failed/phantom\n" +
+      "수동 확인이 필요합니다.",
+    "auto-queue"
+  );
+}
+
 // #699 (round 2): mirror of src/dispatch/dispatch_status.rs
 // maybe_inject_phase_gate_verdict. Infers `pass_verdict` for a phase-gate
 // result only when (a) no explicit verdict/decision is present, (b) every
@@ -555,16 +572,17 @@ var autoQueue = {
 
     for (var j = 0; j < stuckDispatched.length; j++) {
       var stuck = stuckDispatched[j];
-      autoQueueLog("info", "onTick1min: resetting stuck dispatched entry " + stuck.id + " (dispatch " + (stuck.dispatch_id || "NULL") + " is orphan/cancelled/failed/phantom)", {
+      var failure = agentdesk.autoQueue.recordDispatchFailure(
+        stuck.id,
+        configuredAutoQueueMaxEntryRetries(),
+        "tick_recovery"
+      );
+      autoQueueLog("info", "onTick1min: recovered stuck dispatched entry " + stuck.id + " (dispatch " + (stuck.dispatch_id || "NULL") + " is orphan/cancelled/failed/phantom) retry " + failure.retryCount + "/" + failure.retryLimit + " -> " + failure.to, {
         entry_id: stuck.id,
         card_id: stuck.kanban_card_id,
         dispatch_id: stuck.dispatch_id
       });
-      agentdesk.autoQueue.updateEntryStatus(
-        stuck.id,
-        "pending",
-        "tick_recovery"
-      );
+      notifyAutoQueueEntryFailure(stuck, failure);
     }
   }
 };
@@ -728,11 +746,68 @@ function runHasBlockingPhaseGate(runId) {
   return rows.length > 0 && rows[0].cnt > 0;
 }
 
+// #747 round-2: Phase-gate race protection.
+// Tick hooks now run on a separate `PolicyEngine` from `onCardTerminal`, so
+// `onTick1min.finalizeRunWithoutPhaseGate` can see a run with no
+// pending/dispatched entries AFTER Rust marks the last entry `done` but
+// BEFORE the main engine's `onCardTerminal` has finished creating phase-gate
+// dispatches. Mark a short grace window in the DB at the start of
+// `continueRunAfterEntry` and respect it in finalization.
+var PHASE_GATE_GRACE_WINDOW_MS = 30 * 1000; // 30s
+
+function beginPhaseGateGraceWindow(runId) {
+  if (!runId) return;
+  var until = new Date(Date.now() + PHASE_GATE_GRACE_WINDOW_MS).toISOString();
+  try {
+    agentdesk.db.execute(
+      "UPDATE auto_queue_runs SET phase_gate_grace_until = ? WHERE id = ?",
+      [until, runId]
+    );
+  } catch (e) {
+    autoQueueLog("warn", "Failed to begin phase-gate grace window for run " + runId + ": " + e, {
+      run_id: runId
+    });
+  }
+}
+
+function clearPhaseGateGraceWindow(runId) {
+  if (!runId) return;
+  try {
+    agentdesk.db.execute(
+      "UPDATE auto_queue_runs SET phase_gate_grace_until = NULL WHERE id = ?",
+      [runId]
+    );
+  } catch (e) {
+    // Non-fatal: grace window will naturally expire.
+  }
+}
+
+function runWithinPhaseGateGrace(runId) {
+  if (!runId) return false;
+  var rows = agentdesk.db.query(
+    "SELECT phase_gate_grace_until FROM auto_queue_runs WHERE id = ?",
+    [runId]
+  );
+  if (rows.length === 0 || !rows[0].phase_gate_grace_until) return false;
+  var until = Date.parse(rows[0].phase_gate_grace_until);
+  if (!isFinite(until)) return false;
+  return Date.now() < until;
+}
+
 function finalizeRunWithoutPhaseGate(runId) {
   if (!runId) return false;
 
   if (runHasBlockingPhaseGate(runId)) return false;
   if (remainingRunnableEntryCount(runId) > 0) return false;
+  // Phase-gate race guard: the main engine's `onCardTerminal` may still be
+  // in the middle of creating gate dispatches. Respect the grace window so
+  // we never mark a run completed before phase gates get registered.
+  if (runWithinPhaseGateGrace(runId)) {
+    autoQueueLog("info", "Deferring finalize for run " + runId + " — phase-gate grace window active", {
+      run_id: runId
+    });
+    return false;
+  }
 
   var completed = false;
   try {
@@ -830,6 +905,14 @@ function _deployGateTitle(phase) {
 function continueRunAfterEntry(runId, agentId, doneGroup, donePhase, anchorCardId) {
   if (!runId || !agentId) return;
 
+  // #747 round-2: Open the phase-gate grace window BEFORE we do any work so
+  // an overlapping `onTick1min.finalizeRunWithoutPhaseGate` on the tick
+  // engine cannot steal-complete the run. Cleared on all non-phase-gate
+  // exits below; `_createPhaseGateDispatches` leaves the gate in place (the
+  // pending phase-gate row itself now guards the run via
+  // `runHasBlockingPhaseGate`).
+  beginPhaseGateGraceWindow(runId);
+
   var remainingCount = remainingRunnableEntryCount(runId, null);
 
   var effectiveDonePhase = (donePhase !== null && donePhase !== undefined) ? donePhase : -1;
@@ -845,6 +928,8 @@ function continueRunAfterEntry(runId, agentId, doneGroup, donePhase, anchorCardI
       if (_phaseGateRequired(runId, donePhase)) {
         var finalPhase = remainingCount === 0;
         _createPhaseGateDispatches(runId, donePhase, nextPhase, finalPhase, anchorCardId);
+        // Intentionally leave grace window in place: the phase-gate row
+        // created above now guards the run; grace naturally expires.
         return;
       }
       if (nextPhase !== null && nextPhase !== undefined) {
@@ -855,6 +940,7 @@ function continueRunAfterEntry(runId, agentId, doneGroup, donePhase, anchorCardI
         );
         var nextPhaseCount = (nextPhaseCountRows.length > 0) ? nextPhaseCountRows[0].cnt : 0;
         agentdesk.log.info("[auto-queue] Phase " + donePhase + " 완료, Phase " + nextPhase + " 시작 (" + nextPhaseCount + " entries)");
+        clearPhaseGateGraceWindow(runId);
         activateRun(runId, null);
         return;
       }
@@ -862,6 +948,9 @@ function continueRunAfterEntry(runId, agentId, doneGroup, donePhase, anchorCardI
   }
 
   if (remainingCount === 0) {
+    // No more work AND no phase gate required → grace window no longer
+    // needed. Clear it so finalization can proceed immediately.
+    clearPhaseGateGraceWindow(runId);
     if (!finalizeRunWithoutPhaseGate(runId)) {
       completeRunAndNotify(runId);
     }
@@ -888,6 +977,12 @@ function continueRunAfterEntry(runId, agentId, doneGroup, donePhase, anchorCardI
     );
     agentBusy = active.length > 0 && active[0].cnt > 0;
   }
+
+  // Grace window no longer needed past this point — either we keep
+  // dispatching in the same group (no phase transition happened) or we
+  // move to the next group. Either way, there is no phase-gate dispatch
+  // window to protect.
+  clearPhaseGateGraceWindow(runId);
 
   if (!groupDone) {
     if (!agentBusy) {

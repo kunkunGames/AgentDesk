@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
+use libsql_rusqlite::{
+    Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue,
+};
 
 pub(crate) const AUTO_REMEMBER_MAX_RETRIES: u32 = 3;
 pub(crate) const AUTO_REMEMBER_RETRY_BACKOFF_MS: [i64; 2] = [30_000, 300_000];
@@ -715,7 +717,7 @@ impl AutoRememberStore {
                 ],
             )?;
             if updated == 0 {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
+                return Err(libsql_rusqlite::Error::QueryReturnedNoRows);
             }
             conn.execute(
                 "DELETE FROM auto_remember_retry_queue
@@ -880,7 +882,7 @@ impl AutoRememberStore {
 
     fn with_conn<T>(
         &self,
-        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+        f: impl FnOnce(&Connection) -> libsql_rusqlite::Result<T>,
     ) -> Result<T, String> {
         let conn = Connection::open(&self.path)
             .map_err(|err| format!("failed to open auto-remember sidecar: {err}"))?;
@@ -966,7 +968,9 @@ fn retry_backoff_ms(retry_count: u32) -> i64 {
     AUTO_REMEMBER_RETRY_BACKOFF_MS[index]
 }
 
-fn decode_audit_detail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutoRememberAuditDetail> {
+fn decode_audit_detail_row(
+    row: &libsql_rusqlite::Row<'_>,
+) -> libsql_rusqlite::Result<AutoRememberAuditDetail> {
     let stage_raw = row.get::<_, String>(4)?;
     let status_raw = row.get::<_, String>(5)?;
     let supporting_evidence_json = row
@@ -996,7 +1000,7 @@ fn ensure_column(
     table: &str,
     column: &str,
     definition: &str,
-) -> rusqlite::Result<()> {
+) -> libsql_rusqlite::Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))?

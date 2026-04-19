@@ -10,6 +10,7 @@ mod handoff;
 pub(crate) mod health;
 mod inflight;
 pub(crate) mod internal_api;
+mod mcp_credential_watcher;
 pub(crate) mod meeting_orchestrator;
 mod metrics;
 mod model_catalog;
@@ -43,6 +44,7 @@ mod turn_bridge;
 
 pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
+pub(crate) use turn_bridge::TmuxCleanupPolicy;
 
 use std::collections::HashMap;
 use std::fs;
@@ -54,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use libsql_rusqlite::OptionalExtension;
 use poise::serenity_prelude as serenity;
-use rusqlite::OptionalExtension;
 use serenity::{ChannelId, EditMessage, MessageId, UserId};
 
 use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
@@ -139,12 +141,34 @@ pub(super) fn should_process_allowed_bot_turn_text(text: &str) -> bool {
     text.trim_start().starts_with("DISPATCH:")
 }
 
+pub(in crate::services::discord) async fn resolve_announce_bot_user_id(
+    shared: &SharedData,
+) -> Option<u64> {
+    let registry = shared.health_registry()?;
+    registry.utility_bot_user_id("announce").await
+}
+
+/// Cached lookup for the notify bot's Discord user id. Used by the message
+/// router to classify incoming messages as `BackgroundTrigger` turns —
+/// see `TurnKind` in `router/message_handler.rs` and the race-handler
+/// preservation rule from #796.
+pub(in crate::services::discord) async fn resolve_notify_bot_user_id(
+    shared: &SharedData,
+) -> Option<u64> {
+    let registry = shared.health_registry()?;
+    registry.utility_bot_user_id("notify").await
+}
+
 pub(in crate::services::discord) fn is_allowed_turn_sender(
     allowed_bot_ids: &[u64],
+    announce_bot_id: Option<u64>,
     author_id: u64,
     author_is_bot: bool,
     text: &str,
 ) -> bool {
+    if announce_bot_id.is_some_and(|id| id == author_id) {
+        return true;
+    }
     if allowed_bot_ids.contains(&author_id) {
         return should_process_allowed_bot_turn_text(text);
     }
@@ -475,6 +499,8 @@ pub(super) struct SharedData {
     pub(super) api_port: u16,
     /// Shared DB handle for direct dispatch finalization (avoids HTTP round-trip).
     pub(super) db: Option<crate::db::Db>,
+    /// Shared PostgreSQL pool for PG-backed route and runtime helpers.
+    pub(super) pg_pool: Option<sqlx::PgPool>,
     /// Shared policy engine for direct dispatch finalization.
     pub(super) engine: Option<crate::engine::PolicyEngine>,
     /// Weak reference to the process-wide health registry so turn handlers can
@@ -537,6 +563,7 @@ pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
         token_hash: "test-token-hash".to_string(),
         api_port: 9,
         db: None,
+        pg_pool: None,
         engine: None,
         health_registry: std::sync::Weak::new(),
         known_slash_commands: tokio::sync::OnceCell::new(),
@@ -1009,6 +1036,7 @@ async fn catch_up_missed_messages(
             let settings = shared.settings.read().await;
             settings.allowed_bot_ids.clone()
         };
+        let announce_bot_id = resolve_announce_bot_user_id(shared).await;
 
         let mut channel_recovered = 0usize;
         let mut max_recovered_id: Option<u64> = None;
@@ -1036,8 +1064,13 @@ async fn catch_up_missed_messages(
             if text.is_empty() {
                 continue;
             }
-            if !is_allowed_turn_sender(&allowed_bot_ids, msg.author.id.get(), msg.author.bot, text)
-            {
+            if !is_allowed_turn_sender(
+                &allowed_bot_ids,
+                announce_bot_id,
+                msg.author.id.get(),
+                msg.author.bot,
+                text,
+            ) {
                 continue;
             }
 
@@ -1106,6 +1139,7 @@ async fn catch_up_missed_messages(
         let settings = shared.settings.read().await;
         settings.allowed_bot_ids.clone()
     };
+    let announce_bot_id_phase2 = resolve_announce_bot_user_id(shared).await;
 
     for entry in entries2.flatten() {
         let path = entry.path();
@@ -1186,14 +1220,16 @@ async fn catch_up_missed_messages(
             let mid = msg.id.get();
             if !is_allowed_turn_sender(
                 &allowed_bot_ids_phase2,
+                announce_bot_id_phase2,
                 msg.author.id.get(),
                 msg.author.bot,
                 text,
             ) {
                 continue;
             }
-            let is_allowed_bot =
-                msg.author.bot && allowed_bot_ids_phase2.contains(&msg.author.id.get());
+            let is_allowed_bot = msg.author.bot
+                && (allowed_bot_ids_phase2.contains(&msg.author.id.get())
+                    || announce_bot_id_phase2.is_some_and(|id| id == msg.author.id.get()));
             if !is_allowed_bot {
                 let settings = shared.settings.read().await;
                 if !discord_io::user_is_authorized(&settings, msg.author.id.get()) {
@@ -1344,6 +1380,10 @@ pub(super) async fn kickoff_idle_queues(
             intervention.reply_context.clone(),
             intervention.has_reply_boundary,
             None,
+            // Queued interventions kicked off after a previous turn already
+            // own their own placeholder; they're never racing for it.
+            // Foreground keeps legacy behavior.
+            router::TurnKind::Foreground,
         )
         .await
         {
@@ -1718,8 +1758,9 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             }
 
             if let Some(db) = shared.db.as_ref() {
-                crate::services::termination_audit::record_termination_with_db(
+                crate::services::termination_audit::record_termination_with_handles(
                     db,
+                    shared.pg_pool.as_ref(),
                     session_key,
                     None,
                     "cleanup",
@@ -1929,6 +1970,7 @@ mod tests {
     #[test]
     fn allowed_bot_turns_require_dispatch_prefix() {
         let allowed_bot_ids = vec![123];
+        let announce_bot_id = Some(456);
         let dispatch = "DISPATCH: abc123\n작업 시작";
         let agent_msg = "completion_guard 수정해줘";
 
@@ -1939,20 +1981,30 @@ mod tests {
         assert!(!should_process_allowed_bot_turn_text(agent_msg));
         assert!(!is_allowed_turn_sender(
             &allowed_bot_ids,
+            announce_bot_id,
             123,
             false,
             "⚠️ 검토 전용 — 작업 착수 금지"
         ));
         assert!(is_allowed_turn_sender(
             &allowed_bot_ids,
+            announce_bot_id,
             123,
             false,
             dispatch
         ));
         assert!(!is_allowed_turn_sender(
             &allowed_bot_ids,
+            announce_bot_id,
             123,
             false,
+            agent_msg
+        ));
+        assert!(is_allowed_turn_sender(
+            &allowed_bot_ids,
+            announce_bot_id,
+            456,
+            true,
             agent_msg
         ));
     }

@@ -2,7 +2,7 @@ use poise::serenity_prelude as serenity;
 use poise::serenity_prelude::{CreateAttachment, CreateMessage};
 use std::sync::Arc;
 
-use super::super::router::handle_text_message;
+use super::super::router::{TurnKind, handle_text_message};
 use super::super::*;
 use super::build_provider_skill_prompt;
 use crate::services::provider::CancelToken;
@@ -303,7 +303,19 @@ pub(in crate::services::discord) async fn handle_text_command(
             let stop_lookup = cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
             match stop_lookup {
                 TextStopLookup::Stop(token) => {
-                    super::super::turn_bridge::cancel_active_token(&token, true, "!stop");
+                    super::super::turn_bridge::cancel_active_token(
+                        &token,
+                        super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
+                        "!stop",
+                    );
+                    super::super::commands::notify_turn_stop(
+                        &ctx.http,
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        "!stop",
+                    )
+                    .await;
                 }
                 TextStopLookup::AlreadyStopping => {
                     let _ = msg.reply(&ctx.http, "Already stopping...").await;
@@ -1035,8 +1047,18 @@ Any other message is sent to {p}.
                     match stop_lookup {
                         TextStopLookup::Stop(token) => {
                             super::super::turn_bridge::cancel_active_token(
-                                &token, true, "!cc stop",
+                                &token,
+                                super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
+                                "!cc stop",
                             );
+                            super::super::commands::notify_turn_stop(
+                                &ctx.http,
+                                &data.shared,
+                                &data.provider,
+                                channel_id,
+                                "!cc stop",
+                            )
+                            .await;
                             let _ = msg.reply(&ctx.http, "Stopping...").await;
                         }
                         TextStopLookup::AlreadyStopping => {
@@ -1144,6 +1166,7 @@ Any other message is sent to {p}.
                 None,
                 false,
                 None,
+                TurnKind::Foreground,
             )
             .await?;
             return Ok(true);

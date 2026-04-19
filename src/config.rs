@@ -23,6 +23,8 @@ pub struct Config {
     pub policies: PoliciesConfig,
     #[serde(default)]
     pub data: DataConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     #[serde(default, skip_serializing_if = "KanbanConfig::is_empty")]
     pub kanban: KanbanConfig,
     #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
@@ -35,6 +37,43 @@ pub struct Config {
     pub escalation: EscalationConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
+    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
+    pub mcp: McpConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpConfig {
+    /// When true, AgentDesk watches the Claude MCP credential / config files
+    /// (`~/.claude.json`, `~/.claude/.mcp.json`, `~/.claude/.credentials.json`,
+    /// honoring `$CLAUDE_CONFIG_DIR` if set) and posts a notification to all
+    /// active Claude sessions when they change so the operator can run
+    /// `/mcp-reload` to pick up newly-authenticated MCP servers.
+    #[serde(default = "default_true")]
+    pub watch_credentials: bool,
+    /// Per-channel cooldown between credential-change notifications, in seconds.
+    /// Defaults to 300s (5 minutes).
+    #[serde(default = "default_credential_notify_dedupe_secs")]
+    pub credential_notify_dedupe_secs: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            watch_credentials: true,
+            credential_notify_dedupe_secs: default_credential_notify_dedupe_secs(),
+        }
+    }
+}
+
+impl McpConfig {
+    pub fn is_default(&self) -> bool {
+        *self == McpConfig::default()
+    }
+}
+
+fn default_credential_notify_dedupe_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -495,6 +534,25 @@ pub struct DataConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct DatabaseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_database_host")]
+    pub host: String,
+    #[serde(default = "default_database_port")]
+    pub port: u16,
+    #[serde(default = "default_database_name")]
+    pub dbname: String,
+    #[serde(default = "default_database_user")]
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default = "default_database_pool_max")]
+    pub pool_max: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct KanbanConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_channel_id: Option<String>,
@@ -560,6 +618,8 @@ pub struct RuntimeSettingsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entry_retries: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_reminder_min: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_warning_pct: Option<u64>,
@@ -588,6 +648,7 @@ impl RuntimeSettingsConfig {
             && self.issue_triage_poll_sec.is_none()
             && self.ceo_warn_depth.is_none()
             && self.max_retries.is_none()
+            && self.max_entry_retries.is_none()
             && self.review_reminder_min.is_none()
             && self.rate_limit_warning_pct.is_none()
             && self.rate_limit_danger_pct.is_none()
@@ -843,6 +904,21 @@ fn default_data_dir() -> PathBuf {
 fn default_db_name() -> String {
     "agentdesk.sqlite".into()
 }
+fn default_database_host() -> String {
+    "127.0.0.1".into()
+}
+fn default_database_port() -> u16 {
+    5432
+}
+fn default_database_name() -> String {
+    "agentdesk".into()
+}
+fn default_database_user() -> String {
+    "agentdesk".into()
+}
+fn default_database_pool_max() -> u32 {
+    12
+}
 fn default_memory_backend() -> String {
     "auto".into()
 }
@@ -973,12 +1049,14 @@ impl Default for Config {
             github: GitHubConfig::default(),
             policies: PoliciesConfig::default(),
             data: DataConfig::default(),
+            database: DatabaseConfig::default(),
             kanban: KanbanConfig::default(),
             review: ReviewConfig::default(),
             runtime: RuntimeSettingsConfig::default(),
             automation: AutomationConfig::default(),
             escalation: EscalationConfig::default(),
             memory: None,
+            mcp: McpConfig::default(),
         }
         .apply_runtime_defaults()
     }
@@ -1420,6 +1498,7 @@ mod tests {
             issue_triage_poll_sec: Some(360),
             ceo_warn_depth: Some(4),
             max_retries: Some(5),
+            max_entry_retries: Some(6),
             review_reminder_min: Some(25),
             rate_limit_warning_pct: Some(78),
             rate_limit_danger_pct: Some(93),
@@ -1577,6 +1656,7 @@ mod tests {
         assert_eq!(loaded.runtime.issue_triage_poll_sec, Some(360));
         assert_eq!(loaded.runtime.ceo_warn_depth, Some(4));
         assert_eq!(loaded.runtime.max_retries, Some(5));
+        assert_eq!(loaded.runtime.max_entry_retries, Some(6));
         assert_eq!(loaded.runtime.review_reminder_min, Some(25));
         assert_eq!(loaded.runtime.rate_limit_warning_pct, Some(78));
         assert_eq!(loaded.runtime.rate_limit_danger_pct, Some(93));

@@ -1,6 +1,11 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import type { CompanySettings } from "../types";
 import * as api from "../api";
+import { STORAGE_KEYS } from "../lib/storageKeys";
+import {
+  readLocalStorageValue,
+  writeLocalStorageValue,
+} from "../lib/useLocalStorage";
 import {
   SettingsCallout,
   SettingsCard,
@@ -61,9 +66,7 @@ interface AuditNote {
   status: AuditNoteStatus;
 }
 
-const SETTINGS_PANEL_STORAGE_KEY = "agentdesk.settings.active-panel";
 const SETTINGS_PANEL_QUERY_KEY = "settingsPanel";
-const SETTINGS_RUNTIME_CATEGORY_STORAGE_KEY = "agentdesk.settings.runtime-category";
 const GENERAL_FIELD_KEYS = ["companyName", "ceoName", "language", "theme"] as const;
 
 const CATEGORIES: Array<{
@@ -173,6 +176,26 @@ const CATEGORIES: Array<{
         labelEn: "Max retries",
         descriptionKo: "자동 재시도가 허용되는 최대 횟수입니다.",
         descriptionEn: "Maximum number of automatic retries allowed.",
+        unit: "",
+        min: 1,
+        max: 10,
+        step: 1,
+      },
+    ],
+  },
+  {
+    id: "autoQueue",
+    titleKo: "자동 큐",
+    titleEn: "Auto Queue",
+    descriptionKo: "auto-queue entry 실패 재시도 상한과 복구 동작을 조절합니다.",
+    descriptionEn: "Controls retry ceilings and recovery behavior for auto-queue entries.",
+    fields: [
+      {
+        key: "maxEntryRetries",
+        labelKo: "Entry 최대 재시도 횟수",
+        labelEn: "Entry max retries",
+        descriptionKo: "dispatch 생성 실패가 이 횟수에 도달하면 entry를 failed로 전환합니다.",
+        descriptionEn: "Turns an entry into failed after this many dispatch creation failures.",
         unit: "",
         min: 1,
         max: 10,
@@ -507,15 +530,21 @@ function readSettingsPanelFromUrl(): SettingsPanel | null {
 }
 
 function readStoredSettingsPanel(): SettingsPanel {
-  if (typeof window === "undefined") return "general";
-  const stored = window.localStorage.getItem(SETTINGS_PANEL_STORAGE_KEY);
-  return readSettingsPanelFromUrl() ?? (isSettingsPanel(stored) ? stored : "general");
+  const panelFromUrl = readSettingsPanelFromUrl();
+  if (panelFromUrl) {
+    return panelFromUrl;
+  }
+  return readLocalStorageValue<SettingsPanel>(STORAGE_KEYS.settingsPanel, "general", {
+    validate: (value): value is SettingsPanel => typeof value === "string" && isSettingsPanel(value),
+    legacy: (raw) => (isSettingsPanel(raw) ? raw : null),
+  });
 }
 
 function readStoredRuntimeCategory(): string {
-  if (typeof window === "undefined") return CATEGORIES[0]?.id ?? "polling";
-  const value = window.localStorage.getItem(SETTINGS_RUNTIME_CATEGORY_STORAGE_KEY);
-  return isRuntimeCategoryId(value) ? value : (CATEGORIES[0]?.id ?? "polling");
+  return readLocalStorageValue<string>(STORAGE_KEYS.settingsRuntimeCategory, CATEGORIES[0]?.id ?? "polling", {
+    validate: (value): value is string => typeof value === "string" && isRuntimeCategoryId(value),
+    legacy: (raw) => (isRuntimeCategoryId(raw) ? raw : null),
+  });
 }
 
 function isBooleanConfigKey(key: string): boolean {
@@ -859,13 +888,11 @@ export default function SettingsView({
   }, [settings.companyName, settings.ceoName, settings.language, settings.theme]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(SETTINGS_PANEL_STORAGE_KEY, activePanel);
+    writeLocalStorageValue(STORAGE_KEYS.settingsPanel, activePanel);
   }, [activePanel]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(SETTINGS_RUNTIME_CATEGORY_STORAGE_KEY, activeRuntimeCategoryId);
+    writeLocalStorageValue(STORAGE_KEYS.settingsRuntimeCategory, activeRuntimeCategoryId);
   }, [activeRuntimeCategoryId]);
 
   useEffect(() => {

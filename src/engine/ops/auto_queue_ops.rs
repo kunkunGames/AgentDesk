@@ -2,22 +2,32 @@ use crate::db::Db;
 use crate::supervisor::BridgeHandle;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use serde::Deserialize;
+use sqlx::PgPool;
 
 pub(super) fn register_auto_queue_ops<'js>(
     ctx: &Ctx<'js>,
     db: Db,
+    pg_pool: Option<PgPool>,
     bridge: BridgeHandle,
 ) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let auto_queue_obj = Object::new(ctx.clone())?;
 
     let db_update = db.clone();
+    let pg_update = pg_pool.clone();
     auto_queue_obj.set(
         "__updateEntryStatusRaw",
         Function::new(
             ctx.clone(),
             move |entry_id: String, status: String, source: String, opts_json: String| -> String {
-                update_entry_status_raw(&db_update, &entry_id, &status, &source, &opts_json)
+                update_entry_status_raw(
+                    &db_update,
+                    pg_update.as_ref(),
+                    &entry_id,
+                    &status,
+                    &source,
+                    &opts_json,
+                )
             },
         )?,
     )?;
@@ -95,6 +105,21 @@ pub(super) fn register_auto_queue_ops<'js>(
                     &dispatch_id,
                     &source,
                     &metadata_json,
+                )
+            },
+        )?,
+    )?;
+    let db_record_dispatch_failure = db.clone();
+    auto_queue_obj.set(
+        "__recordEntryDispatchFailureRaw",
+        Function::new(
+            ctx.clone(),
+            move |entry_id: String, max_retries: i64, source: String| -> String {
+                record_entry_dispatch_failure_raw(
+                    &db_record_dispatch_failure,
+                    &entry_id,
+                    max_retries,
+                    &source,
                 )
             },
         )?,
@@ -207,6 +232,17 @@ pub(super) fn register_auto_queue_ops<'js>(
                         dispatchId,
                         source || "",
                         JSON.stringify(metadata || {})
+                    )
+                );
+                if (result.error) throw new Error(result.error);
+                return result;
+            };
+            agentdesk.autoQueue.recordDispatchFailure = function(entryId, maxRetries, source) {
+                var result = JSON.parse(
+                    agentdesk.autoQueue.__recordEntryDispatchFailureRaw(
+                        entryId,
+                        maxRetries,
+                        source || ""
                     )
                 );
                 if (result.error) throw new Error(result.error);
@@ -452,9 +488,52 @@ fn record_consultation_dispatch_raw(
     }
 }
 
+fn record_entry_dispatch_failure_raw(
+    db: &Db,
+    entry_id: &str,
+    max_retries: i64,
+    source: &str,
+) -> String {
+    if source.trim().is_empty() {
+        return r#"{"error":"source is required"}"#.to_string();
+    }
+
+    let conn = match db.separate_conn() {
+        Ok(conn) => conn,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("DB: {error}")
+            })
+            .to_string();
+        }
+    };
+
+    match crate::db::auto_queue::record_entry_dispatch_failure_on_conn(
+        &conn,
+        entry_id,
+        max_retries,
+        source,
+    ) {
+        Ok(result) => serde_json::json!({
+            "ok": true,
+            "changed": result.changed,
+            "from": result.from_status,
+            "to": result.to_status,
+            "run_id": result.run_id,
+            "retryCount": result.retry_count,
+            "retryLimit": result.retry_limit,
+        })
+        .to_string(),
+        Err(error) => serde_json::json!({
+            "error": error.to_string()
+        })
+        .to_string(),
+    }
+}
+
 fn update_run_status_raw<F>(db: &Db, source: &str, update: F) -> String
 where
-    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<bool>,
+    F: FnOnce(&libsql_rusqlite::Connection) -> libsql_rusqlite::Result<bool>,
 {
     if source.trim().is_empty() {
         return r#"{"error":"source is required"}"#.to_string();
@@ -485,6 +564,7 @@ where
 
 fn update_entry_status_raw(
     db: &Db,
+    pg_pool: Option<&PgPool>,
     entry_id: &str,
     status: &str,
     source: &str,
@@ -512,19 +592,33 @@ fn update_entry_status_raw(
         slot_index: opts_value.get("slotIndex").and_then(|value| value.as_i64()),
     };
 
-    let conn = match db.separate_conn() {
-        Ok(conn) => conn,
-        Err(error) => {
-            return serde_json::json!({
-                "error": format!("DB: {error}")
-            })
-            .to_string();
-        }
+    let result = if let Some(pool) = pg_pool {
+        let entry_id = entry_id.to_string();
+        let status = status.to_string();
+        let source = source.to_string();
+        run_async_bridge_pg(pool, move |pool| async move {
+            crate::db::auto_queue::update_entry_status_on_pg(
+                &pool, &entry_id, &status, &source, &options,
+            )
+            .await
+        })
+    } else {
+        let conn = match db.separate_conn() {
+            Ok(conn) => conn,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("DB: {error}")
+                })
+                .to_string();
+            }
+        };
+        crate::db::auto_queue::update_entry_status_on_conn(
+            &conn, entry_id, status, source, &options,
+        )
+        .map_err(|error| error.to_string())
     };
 
-    match crate::db::auto_queue::update_entry_status_on_conn(
-        &conn, entry_id, status, source, &options,
-    ) {
+    match result {
         Ok(result) => serde_json::json!({
             "ok": true,
             "changed": result.changed,
@@ -538,4 +632,15 @@ fn update_entry_status_raw(
         })
         .to_string(),
     }
+}
+
+fn run_async_bridge_pg<F, T>(
+    pool: &PgPool,
+    future_factory: impl FnOnce(PgPool) -> F + Send + 'static,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    crate::utils::async_bridge::block_on_pg_result(pool, future_factory, |error| error)
 }

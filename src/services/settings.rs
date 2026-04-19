@@ -14,6 +14,7 @@ const RUNTIME_CONFIG_KEYS: &[&str] = &[
     "issueTriagePollSec",
     "ceoWarnDepth",
     "maxRetries",
+    "maxEntryRetries",
     "reviewReminderMin",
     "rateLimitWarningPct",
     "rateLimitDangerPct",
@@ -136,6 +137,11 @@ fn runtime_config_yaml_overrides(config: &crate::config::Config) -> Map<String, 
     insert_runtime_number(&mut overrides, "maxRetries", config.runtime.max_retries);
     insert_runtime_number(
         &mut overrides,
+        "maxEntryRetries",
+        config.runtime.max_entry_retries,
+    );
+    insert_runtime_number(
+        &mut overrides,
         "reviewReminderMin",
         config.runtime.review_reminder_min,
     );
@@ -172,6 +178,7 @@ fn runtime_config_defaults_map(config: &crate::config::Config) -> Map<String, Va
         "issueTriagePollSec": 300,
         "ceoWarnDepth": 3,
         "maxRetries": 3,
+        "maxEntryRetries": 3,
         "reviewReminderMin": 30,
         "rateLimitWarningPct": 80,
         "rateLimitDangerPct": 95,
@@ -191,6 +198,32 @@ pub fn runtime_config_defaults(config: &crate::config::Config) -> Value {
     Value::Object(runtime_config_defaults_map(config))
 }
 
+pub fn runtime_config_u64(
+    conn: &libsql_rusqlite::Connection,
+    config: &crate::config::Config,
+    key: &str,
+) -> Option<u64> {
+    let saved = conn
+        .query_row(
+            "SELECT value FROM kv_meta WHERE key = 'runtime-config'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    if let Some(value) = saved
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_u64)
+    {
+        return Some(value);
+    }
+
+    runtime_config_defaults_map(config)
+        .get(key)
+        .and_then(Value::as_u64)
+}
+
 fn runtime_scalar_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
@@ -201,7 +234,7 @@ fn runtime_scalar_to_string(value: &Value) -> Option<String> {
 }
 
 fn write_runtime_config(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     values: &Map<String, Value>,
 ) -> ServiceResult<()> {
     let value_str =
@@ -229,7 +262,7 @@ fn write_runtime_config(
         if let Some(text) = runtime_scalar_to_string(value) {
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![key, text],
+                libsql_rusqlite::params![key, text],
             )
             .map_err(|error| {
                 ServiceError::internal(format!("{error}"))
@@ -243,7 +276,10 @@ fn write_runtime_config(
     Ok(())
 }
 
-pub fn seed_runtime_config_defaults(conn: &rusqlite::Connection, config: &crate::config::Config) {
+pub fn seed_runtime_config_defaults(
+    conn: &libsql_rusqlite::Connection,
+    config: &crate::config::Config,
+) {
     let defaults = runtime_config_defaults_map(config);
     let yaml_overrides = runtime_config_yaml_overrides(config);
     let saved_obj = conn

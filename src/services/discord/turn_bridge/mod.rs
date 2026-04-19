@@ -35,6 +35,7 @@ pub(super) use recovery_text::{
     auto_retry_with_history, build_session_retry_context_from_history, store_session_retry_context,
 };
 pub(super) use stale_resume::result_event_has_stale_resume_error;
+pub(crate) use tmux_runtime::TmuxCleanupPolicy;
 pub(super) use tmux_runtime::cancel_active_token;
 pub(super) use tmux_runtime::stale_inflight_message;
 
@@ -1784,8 +1785,9 @@ pub(super) fn spawn_turn_bridge(
         let mut transcript_persisted = false;
         if should_persist_transcript && let Some(db) = shared_owned.db.as_ref() {
             let channel_id_text = channel_id.get().to_string();
-            match crate::db::session_transcripts::persist_turn(
+            match crate::db::session_transcripts::persist_turn_db(
                 db,
+                shared_owned.pg_pool.as_ref(),
                 crate::db::session_transcripts::PersistSessionTranscript {
                     turn_id: turn_id.as_str(),
                     session_key: adk_session_key.as_deref(),
@@ -1800,7 +1802,9 @@ pub(super) fn spawn_turn_bridge(
                     events: &transcript_events,
                     duration_ms: Some(turn_duration_ms(turn_start)),
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(persisted) => {
                     transcript_persisted = persisted;
                 }

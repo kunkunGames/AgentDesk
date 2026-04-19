@@ -1,8 +1,8 @@
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use libsql_rusqlite::{Connection, OptionalExtension, params_from_iter};
 use std::collections::HashSet;
 
-const AGENTDESK_REPO_ID: &str = "itismyfield/AgentDesk";
+use crate::db::builtin_pipeline::{AGENTDESK_PIPELINE_STAGES, AGENTDESK_REPO_ID};
 const SESSION_AGENT_ID_BACKFILL_META_KEY: &str = "session_agent_id_backfill:v1";
 const SESSION_TRANSCRIPT_AGENT_ID_BACKFILL_META_KEY: &str =
     "session_transcript_agent_id_backfill:v1";
@@ -601,11 +601,64 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             content    TEXT NOT NULL,
             bot        TEXT NOT NULL DEFAULT 'announce',
             source     TEXT NOT NULL DEFAULT 'system',
+            reason_code TEXT,
+            session_key TEXT,
             status     TEXT NOT NULL DEFAULT 'pending',
             created_at DATETIME DEFAULT (datetime('now')),
             sent_at    DATETIME,
-            error      TEXT
+            error      TEXT,
+            claimed_at DATETIME,
+            claim_owner TEXT
         );",
+    )?;
+    {
+        let has_reason_code: bool = conn
+            .prepare("SELECT reason_code FROM message_outbox LIMIT 0")
+            .is_ok();
+        if !has_reason_code {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN reason_code TEXT;")?;
+        }
+    }
+    {
+        let has_session_key: bool = conn
+            .prepare("SELECT session_key FROM message_outbox LIMIT 0")
+            .is_ok();
+        if !has_session_key {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN session_key TEXT;")?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_message_outbox_lifecycle_dedupe
+         ON message_outbox(target, reason_code, session_key, created_at);",
+    )?;
+
+    {
+        let has_claimed_at: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('message_outbox') WHERE name = 'claimed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_claimed_at {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN claimed_at DATETIME;")?;
+        }
+    }
+    {
+        let has_claim_owner: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('message_outbox') WHERE name = 'claim_owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_claim_owner {
+            conn.execute_batch("ALTER TABLE message_outbox ADD COLUMN claim_owner TEXT;")?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_message_outbox_status_claimed_at
+            ON message_outbox(status, claimed_at, id);",
     )?;
 
     // #144: Dispatch notification outbox — durable queue for Discord side-effects.
@@ -857,24 +910,17 @@ pub fn seed_builtin_pipeline_stages(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    ensure_pipeline_stage(
-        conn,
-        AGENTDESK_REPO_ID,
-        "dev-deploy",
-        100,
-        Some("review_pass"),
-        Some("self"),
-        Some("no_rs_changes"),
-    )?;
-    ensure_pipeline_stage(
-        conn,
-        AGENTDESK_REPO_ID,
-        "e2e-test",
-        200,
-        None,
-        Some("counter"),
-        Some("no_rs_changes"),
-    )?;
+    for stage in AGENTDESK_PIPELINE_STAGES {
+        ensure_pipeline_stage(
+            conn,
+            AGENTDESK_REPO_ID,
+            stage.stage_name,
+            stage.stage_order,
+            stage.trigger_after,
+            stage.provider,
+            stage.skip_condition,
+        )?;
+    }
 
     Ok(())
 }
@@ -896,7 +942,7 @@ fn ensure_pipeline_stage(
          WHERE NOT EXISTS (
             SELECT 1 FROM pipeline_stages WHERE repo_id = ?1 AND stage_name = ?2
          )",
-        rusqlite::params![
+        libsql_rusqlite::params![
             repo_id,
             stage_name,
             stage_order,
@@ -935,6 +981,7 @@ pub(crate) fn ensure_auto_queue_schema(conn: &Connection) -> Result<()> {
             reason          TEXT,
             status          TEXT DEFAULT 'pending',
             dispatch_id     TEXT,
+            retry_count     INTEGER NOT NULL DEFAULT 0,
             slot_index      INTEGER,
             thread_group    INTEGER DEFAULT 0,
             batch_phase     INTEGER DEFAULT 0,
@@ -1045,11 +1092,30 @@ pub(crate) fn ensure_auto_queue_schema(conn: &Connection) -> Result<()> {
         "deploy_phases",
         "ALTER TABLE auto_queue_runs ADD COLUMN deploy_phases TEXT;",
     )?;
+    // #747 round-2: phase-gate grace window. Set by OnCardTerminal at the
+    // start of its continuation work; read by the tick-fired
+    // `finalizeRunWithoutPhaseGate` path so a tiered tick on the dedicated
+    // tick engine cannot race ahead and complete a run while the main engine
+    // is still preparing phase-gate dispatches. Value is an ISO-8601 UTC
+    // timestamp (string) representing the moment *after* which finalization
+    // is allowed to proceed again. NULL means no grace window is active.
+    ensure_auto_queue_column(
+        conn,
+        "auto_queue_runs",
+        "phase_gate_grace_until",
+        "ALTER TABLE auto_queue_runs ADD COLUMN phase_gate_grace_until TEXT;",
+    )?;
     ensure_auto_queue_column(
         conn,
         "auto_queue_entries",
         "dispatch_id",
         "ALTER TABLE auto_queue_entries ADD COLUMN dispatch_id TEXT;",
+    )?;
+    ensure_auto_queue_column(
+        conn,
+        "auto_queue_entries",
+        "retry_count",
+        "ALTER TABLE auto_queue_entries ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;",
     )?;
     ensure_auto_queue_column(
         conn,
@@ -1145,7 +1211,7 @@ fn ensure_auto_queue_column(conn: &Connection, table: &str, column: &str, ddl: &
 fn auto_queue_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
-        rusqlite::params![table, column],
+        libsql_rusqlite::params![table, column],
         |row| row.get(0),
     )
     .unwrap_or(false)
@@ -1277,7 +1343,7 @@ fn rebuild_auto_queue_phase_gates_table(conn: &Connection) -> Result<()> {
                 updated_at: row.get(12)?,
             })
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
 
     let valid_run_ids = load_existing_ids(
         conn,
@@ -1409,7 +1475,7 @@ fn rebuild_auto_queue_phase_gates_table(conn: &Connection) -> Result<()> {
                 COALESCE(?11, CURRENT_TIMESTAMP),
                 COALESCE(?12, COALESCE(?11, CURRENT_TIMESTAMP))
             )",
-            rusqlite::params![
+            libsql_rusqlite::params![
                 row.run_id,
                 row.phase,
                 row.status,
@@ -1573,7 +1639,7 @@ fn backfill_auto_queue_dispatch_history(conn: &Connection) -> Result<()> {
             "INSERT OR IGNORE INTO auto_queue_entry_dispatch_history (
                 entry_id, dispatch_id, trigger_source, created_at
             ) VALUES (?1, ?2, 'schema_backfill_context', COALESCE(?3, CURRENT_TIMESTAMP))",
-            rusqlite::params![entry_id, dispatch_id, created_at],
+            libsql_rusqlite::params![entry_id, dispatch_id, created_at],
         )?;
     }
 
@@ -1590,7 +1656,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
 
     struct LegacyKvPhaseGateState {
         run_id: String,
@@ -1729,7 +1795,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     created_at,
                     updated_at
                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), datetime('now'))",
-                rusqlite::params![
+                libsql_rusqlite::params![
                     row.run_id,
                     row.phase,
                     row.status,
@@ -1772,7 +1838,7 @@ fn backfill_auto_queue_phase_gates(conn: &Connection) -> Result<()> {
                     anchor_card_id = excluded.anchor_card_id,
                     failure_reason = excluded.failure_reason,
                     updated_at = datetime('now')",
-                rusqlite::params![
+                libsql_rusqlite::params![
                     row.run_id,
                     row.phase,
                     row.status,
@@ -1904,7 +1970,7 @@ fn backfill_session_agent_ids(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
 
     for (session_key, thread_channel_id, dispatch_id) in sessions {
         let Some(agent_id) = crate::db::session_agent_resolution::resolve_agent_id_for_session(
@@ -1923,7 +1989,7 @@ fn backfill_session_agent_ids(conn: &Connection) -> Result<()> {
              SET agent_id = ?2
              WHERE session_key = ?1
                AND NULLIF(TRIM(agent_id), '') IS NULL",
-            rusqlite::params![session_key, agent_id],
+            libsql_rusqlite::params![session_key, agent_id],
         )?;
     }
 
@@ -1944,7 +2010,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
 
     if legacy_cards.is_empty() {
         return Ok(());
@@ -1960,7 +2026,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                     "SELECT from_status FROM kanban_audit_logs
                      WHERE card_id = ?1 AND to_status = ?2
                      ORDER BY created_at DESC, id DESC LIMIT 1",
-                    rusqlite::params![card_id, legacy_status],
+                    libsql_rusqlite::params![card_id, legacy_status],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -2036,7 +2102,7 @@ fn backfill_pending_blocked_statuses(conn: &Connection) -> Result<()> {
                          blocked_reason = ?2,
                          updated_at = datetime('now')
                      WHERE id = ?3",
-                    rusqlite::params![target_status, blocked_reason, card_id],
+                    libsql_rusqlite::params![target_status, blocked_reason, card_id],
                 )?;
                 conn.execute(
                     "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at)
@@ -2084,7 +2150,7 @@ fn backfill_session_transcript_agent_ids(conn: &Connection) -> Result<()> {
                 row.get::<_, Option<String>>(2)?,
             ))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<libsql_rusqlite::Result<Vec<_>>>()?;
 
     for (id, session_key, dispatch_id) in transcripts {
         let Some(agent_id) = crate::db::session_agent_resolution::resolve_agent_id_for_session(
@@ -2103,7 +2169,7 @@ fn backfill_session_transcript_agent_ids(conn: &Connection) -> Result<()> {
              SET agent_id = ?2
              WHERE id = ?1
                AND NULLIF(TRIM(agent_id), '') IS NULL",
-            rusqlite::params![id, agent_id],
+            libsql_rusqlite::params![id, agent_id],
         )?;
     }
 
@@ -2752,7 +2818,7 @@ mod tests {
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+            .collect::<libsql_rusqlite::Result<Vec<_>>>()
             .unwrap();
 
         assert_eq!(
@@ -2786,13 +2852,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
                  VALUES (?1, ?2, 'done', datetime('now'), datetime('now'))",
-                rusqlite::params![card_id, format!("Phase Gate Card {index}")],
+                libsql_rusqlite::params![card_id, format!("Phase Gate Card {index}")],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
                  VALUES (?1, 'test/repo', 'agent-1', 'paused')",
-                rusqlite::params![run_id],
+                libsql_rusqlite::params![run_id],
             )
             .unwrap();
             conn.execute(
@@ -2801,12 +2867,12 @@ mod tests {
                  ) VALUES (
                     ?1, ?2, 'agent-1', 'phase-gate', 'pending', ?3, datetime('now'), datetime('now'), '{}'
                  )",
-                rusqlite::params![dispatch_id, card_id, format!("Phase Gate Dispatch {index}")],
+                libsql_rusqlite::params![dispatch_id, card_id, format!("Phase Gate Dispatch {index}")],
             )
             .unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params![
+                libsql_rusqlite::params![
                     phase_key,
                     serde_json::json!({
                         "run_id": run_id,

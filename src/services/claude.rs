@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
-use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage, is_valid_session_id};
+use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
@@ -152,17 +152,14 @@ pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,
     working_dir: &str,
-    allowed_tools: Option<&[String]>,
+    _allowed_tools: Option<&[String]>,
 ) -> ClaudeResponse {
-    let tools_str = match allowed_tools {
-        Some(tools) => tools.join(","),
-        None => DEFAULT_ALLOWED_TOOLS.join(","),
-    };
+    // Tool whitelist policy deprecated (#794): Claude CLI is invoked without
+    // `--allowed-tools` so all currently-available tools are exposed. The
+    // `_allowed_tools` parameter is kept for ABI stability with existing call sites.
     let mut args = vec![
         "-p".to_string(),
         "--dangerously-skip-permissions".to_string(),
-        "--tools".to_string(),
-        tools_str,
         "--output-format".to_string(),
         "json".to_string(),
         "--append-system-prompt".to_string(),
@@ -493,15 +490,13 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use headers (## Title) to organize longer responses
 - Keep formatting minimal and terminal-friendly"#;
 
-    let tools_str = match allowed_tools {
-        Some(tools) => tools.join(","),
-        None => DEFAULT_ALLOWED_TOOLS.join(","),
-    };
+    // Tool whitelist policy deprecated (#794): Claude CLI is invoked without
+    // `--allowed-tools` so all currently-available tools (e.g. `Monitor`) are exposed.
+    // The `allowed_tools` parameter still flows through for logging/context only.
+    let _ = allowed_tools;
     let mut args = vec![
         "-p".to_string(),
         "--dangerously-skip-permissions".to_string(),
-        "--tools".to_string(),
-        tools_str,
         "--verbose".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -1851,7 +1846,7 @@ mod tests {
     fn test_append_claude_mcp_config_arg_skips_when_no_runtime_config() {
         let _guard = crate::services::discord::runtime_store::lock_test_env();
         let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let previous_memento = std::env::var_os("MEMENTO_ACCESS_KEY");
+        let previous_memento_access_key = std::env::var_os("MEMENTO_ACCESS_KEY");
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
         unsafe { std::env::remove_var("MEMENTO_ACCESS_KEY") };
 
@@ -1864,7 +1859,7 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
             None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
         }
-        match previous_memento {
+        match previous_memento_access_key {
             Some(value) => unsafe { std::env::set_var("MEMENTO_ACCESS_KEY", value) },
             None => unsafe { std::env::remove_var("MEMENTO_ACCESS_KEY") },
         }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::db::Db;
@@ -31,6 +31,10 @@ pub(super) async fn serve_http(
     let batch_buffer = worker_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
 
     seed_server_runtime_config(&db, &config);
+    let pg_pool = crate::db::postgres::connect(&config)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    crate::services::termination_audit::init_audit_db(db.clone(), pg_pool.clone());
 
     let app = build_app(
         &dashboard_dir,
@@ -40,12 +44,14 @@ pub(super) async fn serve_http(
         broadcast_tx,
         batch_buffer,
         health_registry,
+        pg_pool,
     );
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("HTTP server listening on {addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .await?;
     Ok(())
 }
 
@@ -106,21 +112,27 @@ fn build_app(
     broadcast_tx: ws::BroadcastTx,
     batch_buffer: ws::BatchBuffer,
     health_registry: Option<Arc<HealthRegistry>>,
+    pg_pool: Option<sqlx::PgPool>,
 ) -> Router {
+    let dashboard_service = ServeDir::new(dashboard_dir)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(dashboard_dir.join("index.html")));
+
     Router::new()
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
         .nest(
             "/api",
-            routes::api_router(
+            routes::api_router_with_pg(
                 db,
                 engine,
                 config,
                 broadcast_tx,
                 batch_buffer,
                 health_registry,
+                pg_pool,
             ),
         )
-        .fallback_service(ServeDir::new(dashboard_dir).append_index_html_on_directories(true))
+        .fallback_service(dashboard_service)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<usize> {

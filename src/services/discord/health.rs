@@ -4,11 +4,12 @@ use std::time::Instant;
 
 use poise::serenity_prelude as serenity;
 use serde::Serialize;
-use serenity::ChannelId;
+use serenity::{ChannelId, CreateMessage};
 
+use super::formatting::build_long_message_attachment;
 use super::{
-    SharedData, clear_inflight_state, mailbox_cancel_active_turn, mailbox_clear_channel,
-    mailbox_clear_recovery_marker, mailbox_finish_turn,
+    DISCORD_MSG_LIMIT, SharedData, clear_inflight_state, mailbox_cancel_active_turn,
+    mailbox_clear_channel, mailbox_clear_recovery_marker, mailbox_finish_turn,
 };
 use crate::db::Db;
 use crate::services::provider::ProviderKind;
@@ -91,9 +92,13 @@ pub struct HealthRegistry {
     /// Dedicated HTTP client for the announce bot (agent-to-agent routing).
     /// This bot's messages are accepted by all agents' allowed_bot_ids.
     announce_http: tokio::sync::Mutex<Option<Arc<serenity::Http>>>,
+    /// Cached Discord user id for the announce bot.
+    announce_user_id: tokio::sync::Mutex<Option<u64>>,
     /// Dedicated HTTP client for the notify bot (info-only notifications).
     /// Agents do NOT process notify bot messages — use for non-actionable alerts.
     notify_http: tokio::sync::Mutex<Option<Arc<serenity::Http>>>,
+    /// Cached Discord user id for the notify bot.
+    notify_user_id: tokio::sync::Mutex<Option<u64>>,
 }
 
 impl HealthRegistry {
@@ -103,7 +108,9 @@ impl HealthRegistry {
             started_at: Instant::now(),
             discord_http: tokio::sync::Mutex::new(Vec::new()),
             announce_http: tokio::sync::Mutex::new(None),
+            announce_user_id: tokio::sync::Mutex::new(None),
             notify_http: tokio::sync::Mutex::new(None),
+            notify_user_id: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -138,6 +145,32 @@ impl HealthRegistry {
                     tracing::info!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
                 }
             }
+        }
+    }
+
+    pub async fn utility_bot_user_id(&self, bot_name: &str) -> Option<u64> {
+        match bot_name {
+            "announce" => {
+                if let Some(id) = *self.announce_user_id.lock().await {
+                    return Some(id);
+                }
+                let http = { self.announce_http.lock().await.clone()? };
+                let user = http.get_current_user().await.ok()?;
+                let id = user.id.get();
+                *self.announce_user_id.lock().await = Some(id);
+                Some(id)
+            }
+            "notify" => {
+                if let Some(id) = *self.notify_user_id.lock().await {
+                    return Some(id);
+                }
+                let http = { self.notify_http.lock().await.clone()? };
+                let user = http.get_current_user().await.ok()?;
+                let id = user.id.get();
+                *self.notify_user_id.lock().await = Some(id);
+                Some(id)
+            }
+            _ => None,
         }
     }
 }
@@ -192,33 +225,42 @@ fn runtime_stop_wait_timeout() -> std::time::Duration {
     }
 }
 
-pub async fn stop_provider_channel_runtime(
+async fn stop_provider_channel_runtime_with_policy(
     registry: &HealthRegistry,
     provider_name: &str,
     channel_id: ChannelId,
     reason: &str,
+    cleanup_policy: super::TmuxCleanupPolicy,
 ) -> Option<RuntimeTurnStopResult> {
     let provider = ProviderKind::from_str(provider_name)?;
     let shared = shared_for_provider(registry, &provider).await?;
     let result = mailbox_cancel_active_turn(&shared, channel_id).await;
+    let cleanup_requested = matches!(
+        cleanup_policy,
+        super::TmuxCleanupPolicy::CleanupSession { .. }
+    );
 
     if let Some(token) = result.token.as_ref() {
-        if !result.already_stopping {
-            super::turn_bridge::cancel_active_token(token, true, reason);
-        }
+        let termination_recorded = if !result.already_stopping || cleanup_requested {
+            super::turn_bridge::cancel_active_token(token, cleanup_policy, reason)
+        } else {
+            false
+        };
         if wait_for_turn_end(&shared, channel_id, runtime_stop_wait_timeout()).await {
             let snapshot = shared.mailbox(channel_id).snapshot().await;
             return Some(RuntimeTurnStopResult {
                 lifecycle_path: "canonical",
                 queue_depth: snapshot.intervention_queue.len(),
-                termination_recorded: result.token.is_some(),
+                termination_recorded,
             });
         }
     }
 
     let finish = mailbox_finish_turn(&shared, &provider, channel_id).await;
+    let mut termination_recorded = false;
     if let Some(token) = finish.removed_token.as_ref() {
-        super::turn_bridge::cancel_active_token(token, true, reason);
+        termination_recorded =
+            super::turn_bridge::cancel_active_token(token, cleanup_policy, reason);
     }
     apply_runtime_hard_stop_cleanup(
         &shared,
@@ -240,8 +282,43 @@ pub async fn stop_provider_channel_runtime(
     Some(RuntimeTurnStopResult {
         lifecycle_path: "runtime-fallback",
         queue_depth,
-        termination_recorded: finish.removed_token.is_some(),
+        termination_recorded,
     })
+}
+
+pub async fn stop_provider_channel_runtime(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+    reason: &str,
+) -> Option<RuntimeTurnStopResult> {
+    stop_provider_channel_runtime_with_policy(
+        registry,
+        provider_name,
+        channel_id,
+        reason,
+        super::TmuxCleanupPolicy::PreserveSession,
+    )
+    .await
+}
+
+pub async fn force_kill_provider_channel_runtime(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+    reason: &str,
+    termination_reason_code: &'static str,
+) -> Option<RuntimeTurnStopResult> {
+    stop_provider_channel_runtime_with_policy(
+        registry,
+        provider_name,
+        channel_id,
+        reason,
+        super::TmuxCleanupPolicy::CleanupSession {
+            termination_reason_code: Some(termination_reason_code),
+        },
+    )
+    .await
 }
 
 pub async fn active_request_owner_for_channel(
@@ -518,7 +595,11 @@ pub async fn clear_provider_channel_runtime(
 
     let cleared = mailbox_clear_channel(&shared, &provider, channel_id).await;
     if let Some(token) = cleared.removed_token {
-        super::turn_bridge::cancel_active_token(&token, true, "auto-queue slot clear");
+        super::turn_bridge::cancel_active_token(
+            &token,
+            super::TmuxCleanupPolicy::PreserveSession,
+            "auto-queue slot clear",
+        );
         decrement_counter(shared.global_active.as_ref());
     }
 
@@ -534,12 +615,14 @@ pub async fn clear_provider_channel_runtime(
     }
 
     #[cfg(unix)]
-    if provider == ProviderKind::Claude {
-        if let Some(name) = tmux_name {
+    if let Some(name) = tmux_name {
+        if provider == ProviderKind::Claude {
             let _ = tokio::task::spawn_blocking(move || {
                 crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
             })
             .await;
+        } else if provider.uses_managed_tmux_backend() {
+            super::commands::reset_managed_process_session(&name);
         }
     }
 
@@ -763,6 +846,7 @@ impl TestHealthHarness {
             token_hash: super::settings::discord_token_hash("test-token"),
             api_port: 8791,
             db: None,
+            pg_pool: None,
             engine: None,
             health_registry: Arc::downgrade(&registry),
             known_slash_commands: tokio::sync::OnceCell::new(),
@@ -1356,17 +1440,44 @@ pub async fn send_message(
         Err(resp) => return resp,
     };
 
-    match channel_id.say(&*http, content).await {
+    // Overflow path: any content beyond DISCORD_MSG_LIMIT is delivered as an
+    // inline preview + `.txt` attachment so recipient agents still see
+    // opening context without the 2000-char split turning into two messages.
+    let send_result = if content.len() <= DISCORD_MSG_LIMIT {
+        channel_id
+            .send_message(&*http, CreateMessage::new().content(content))
+            .await
+    } else {
+        let (preview, attachment) = build_long_message_attachment(content);
+        channel_id
+            .send_message(
+                &*http,
+                CreateMessage::new().content(preview).add_file(attachment),
+            )
+            .await
+    };
+
+    match send_result {
         Ok(_) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             let emoji = if bot == "notify" { "🔔" } else { "📨" };
-            tracing::info!("  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot})");
+            let attached = if content.len() > DISCORD_MSG_LIMIT {
+                " +attach"
+            } else {
+                ""
+            };
+            tracing::info!(
+                "  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot}{attached})"
+            );
             let mut response = serde_json::json!({
                 "ok": true,
                 "target": format!("channel:{channel_id}"),
                 "source": source,
                 "bot": bot,
             });
+            if content.len() > DISCORD_MSG_LIMIT {
+                response["delivery"] = serde_json::Value::String("inline_preview+txt".to_string());
+            }
             if target != format!("channel:{channel_id}") {
                 response["requested_target"] = serde_json::Value::String(target.to_string());
             }
@@ -1628,7 +1739,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
