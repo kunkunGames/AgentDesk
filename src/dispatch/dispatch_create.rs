@@ -7,9 +7,10 @@ use crate::engine::PolicyEngine;
 
 use super::dispatch_channel::{dispatch_uses_alt_channel, resolve_dispatch_channel_id};
 use super::dispatch_context::{
-    build_review_context, dispatch_context_with_session_strategy, dispatch_context_worktree_target,
-    inject_review_dispatch_identifiers, resolve_card_target_repo_ref, resolve_card_worktree,
-    resolve_parent_dispatch_context,
+    ReviewTargetTrust, TargetRepoSource, build_review_context,
+    dispatch_context_with_session_strategy, dispatch_context_worktree_target,
+    inject_review_dispatch_identifiers, json_string_field, resolve_card_target_repo_ref,
+    resolve_card_worktree, resolve_parent_dispatch_context,
 };
 use super::dispatch_status::{
     ensure_dispatch_notify_outbox_on_conn, record_dispatch_status_event_on_conn,
@@ -30,7 +31,7 @@ fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
 }
 
 fn load_existing_thread_for_channel(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     channel_id: u64,
 ) -> Result<Option<String>> {
@@ -78,7 +79,7 @@ fn load_existing_thread_for_channel(
 }
 
 fn lookup_active_dispatch_id(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     dispatch_type: &str,
 ) -> Option<String> {
@@ -87,23 +88,23 @@ fn lookup_active_dispatch_id(
          WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
          AND status IN ('pending', 'dispatched') \
          ORDER BY rowid DESC LIMIT 1",
-        rusqlite::params![card_id, dispatch_type],
+        libsql_rusqlite::params![card_id, dispatch_type],
         |row| row.get(0),
     )
     .ok()
 }
 
-fn is_single_active_dispatch_violation(error: &rusqlite::Error) -> bool {
+fn is_single_active_dispatch_violation(error: &libsql_rusqlite::Error) -> bool {
     matches!(
         error,
-        rusqlite::Error::SqliteFailure(_, Some(message))
+        libsql_rusqlite::Error::SqliteFailure(_, Some(message))
             if message.contains("UNIQUE constraint failed")
                 && message.contains("task_dispatches.kanban_card_id")
     )
 }
 
 fn validate_dispatch_target_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_type: &str,
@@ -226,6 +227,17 @@ fn create_dispatch_core_internal(
     let (parent_dispatch_id, chain_depth) =
         resolve_parent_dispatch_context(&conn, kanban_card_id, context)?;
 
+    // #762 (A): Capture whether the caller explicitly supplied target_repo
+    // BEFORE we inject our card-scoped fallback below. Downstream
+    // `build_review_context` needs this provenance signal to decide whether
+    // an unrecoverable external target_repo can safely fall back to
+    // card-scoped recovery. Inferring from the post-injection context would
+    // make every dispatch look caller-supplied.
+    let caller_target_repo_source = if json_string_field(context, "target_repo").is_some() {
+        TargetRepoSource::CallerSupplied
+    } else {
+        TargetRepoSource::CardScopeDefault
+    };
     let mut context_with_session_strategy =
         dispatch_context_with_session_strategy(dispatch_type, context);
     let target_repo =
@@ -237,11 +249,23 @@ fn create_dispatch_core_internal(
         }
     }
     let context_str = if dispatch_type == "review" {
+        // #761 (Codex round-2): `create_dispatch_core_internal` is the single
+        // funnel for every review dispatch that originates from the public
+        // HTTP API (POST /api/dispatches → dispatch_service::create_dispatch
+        // → here) as well as from JS policies
+        // (`agentdesk.dispatch.create(..., "review", ...)`). Neither of those
+        // call sites is entitled to pre-seed review-target fields, so this
+        // path is ALWAYS untrusted. Internal tests or future Rust callers that
+        // need to pre-populate review-target fields must NOT go through
+        // `create_dispatch*` — they must call `build_review_context` directly
+        // with `ReviewTargetTrust::Trusted`.
         build_review_context(
             db,
             kanban_card_id,
             to_agent_id,
             &context_with_session_strategy,
+            ReviewTargetTrust::Untrusted,
+            caller_target_repo_source,
         )?
     } else {
         let mut base = serde_json::to_string(&context_with_session_strategy)?;
@@ -537,7 +561,7 @@ pub fn create_dispatch_with_options(
 /// `handoffCreatePr` in #743) should call
 /// [`apply_dispatch_attached_intents_on_conn`] directly instead.
 fn apply_dispatch_attached_intents(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_id: &str,
@@ -585,7 +609,7 @@ fn apply_dispatch_attached_intents(
 /// dispatch creation with surrounding pr_tracking/kanban_cards updates in a
 /// single atomic transaction.
 pub(crate) fn apply_dispatch_attached_intents_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_id: &str,
@@ -651,7 +675,7 @@ pub(crate) fn apply_dispatch_attached_intents_on_conn(
             parent_dispatch_id, chain_depth, created_at, updated_at
         )
          VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
-        rusqlite::params![
+        libsql_rusqlite::params![
             dispatch_id,
             card_id,
             to_agent_id,

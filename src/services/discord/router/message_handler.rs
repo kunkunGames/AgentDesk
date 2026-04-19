@@ -74,8 +74,15 @@ fn recall_mode_for_turn(
     }
 }
 
-fn should_add_turn_pending_reaction(dispatch_id: Option<&str>) -> bool {
-    dispatch_id.is_none()
+fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
+    // #750: announce bot no longer writes lifecycle emojis, so the command bot
+    // is now the single source of ⏳ for both regular and dispatch turns.
+    // Users stop an active dispatch turn by removing this ⏳, which
+    // intake_gate's classify_removed_control_reaction catches.
+    // (#559 originally skipped this for dispatches to avoid duplicating the
+    // announce bot's ⏳. With the announce-bot path gone, we must re-add it
+    // here so the stop-via-reaction-removal path keeps working.)
+    true
 }
 
 fn session_reset_reason_for_turn(
@@ -178,6 +185,10 @@ async fn send_restore_notification(
 struct DispatchContextHints {
     worktree_path: Option<String>,
     stale_worktree_path: Option<String>,
+    /// #762: when the dispatch context explicitly pins a `target_repo` (e.g. an
+    /// external-repo review), propagate it so bootstrap fallbacks can resolve
+    /// to the correct repo instead of the default AgentDesk workspace.
+    target_repo: Option<String>,
     reset_provider_state: bool,
     recreate_tmux: bool,
 }
@@ -193,6 +204,13 @@ fn parse_dispatch_context_hints(
         .and_then(|v| v.get("worktree_path"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let target_repo = parsed
+        .as_ref()
+        .and_then(|v| v.get("target_repo"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from);
     let strategy =
         crate::dispatch::dispatch_session_strategy_from_context(parsed.as_ref(), dispatch_type);
     DispatchContextHints {
@@ -201,8 +219,36 @@ fn parse_dispatch_context_hints(
             .filter(|p| std::path::Path::new(p).exists())
             .map(str::to_string),
         stale_worktree_path: requested_worktree_path.filter(|p| !std::path::Path::new(p).exists()),
+        target_repo,
         reset_provider_state: strategy.reset_provider_state,
         recreate_tmux: strategy.recreate_tmux,
+    }
+}
+
+/// #762: Resolve a bootstrap fallback path for a dispatch without a usable
+/// `worktree_path`. When the context pins an external `target_repo`, the
+/// dispatch must land in that repo's configured directory rather than the
+/// default AgentDesk workspace — otherwise external-repo reviews silently
+/// review this repo's default HEAD.
+///
+/// Returns `None` when `target_repo` is unset or cannot be resolved; callers
+/// fall back to `resolve_repo_dir()` / session CWD as before.
+fn resolve_dispatch_target_repo_dir(target_repo: Option<&str>) -> Option<String> {
+    let target_repo = target_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    match crate::services::platform::shell::resolve_repo_dir_for_target(Some(target_repo)) {
+        Ok(Some(path)) => std::path::Path::new(&path).is_dir().then_some(path),
+        Ok(None) => None,
+        Err(err) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ Dispatch target_repo '{}' could not be resolved: {}",
+                target_repo,
+                err
+            );
+            None
+        }
     }
 }
 
@@ -231,6 +277,35 @@ fn session_runtime_state_after_redirect(
     }
 
     load_session_runtime_state(sessions, effective_channel_id).unwrap_or(original_state)
+}
+
+/// #762 (B): Decide whether a dispatch's `dispatch_effective_path` should
+/// overwrite the active session's current_path.
+///
+/// Triggers when any of the following holds:
+/// - The dispatch emitted a concrete `worktree_path` (classic #259 path —
+///   review/rework sessions must execute inside the checked-out worktree).
+/// - The dispatch pinned a `target_repo` whose resolved directory differs
+///   from the session's current path. This covers reused threads where
+///   `bootstrap_thread_session` returned early because the thread already
+///   had a session: without this branch the session keeps its stale
+///   `current_path` and an external-repo review quietly executes inside
+///   the previous repo.
+///
+/// Returns `true` when the effective path should overwrite the session path.
+fn dispatch_session_path_should_update(
+    has_dispatch: bool,
+    has_worktree_path: bool,
+    current_path: &str,
+    dispatch_effective_path: &str,
+) -> bool {
+    if !has_dispatch {
+        return false;
+    }
+    if has_worktree_path {
+        return true;
+    }
+    dispatch_effective_path != current_path
 }
 
 fn build_race_requeued_intervention(
@@ -524,14 +599,26 @@ pub(in crate::services::discord) async fn handle_text_message(
     );
     let dispatch_worktree_path = dispatch_context_hints.worktree_path.clone();
     let dispatch_stale_worktree_path = dispatch_context_hints.stale_worktree_path.clone();
+    let dispatch_target_repo = dispatch_context_hints.target_repo.clone();
     let dispatch_reset_provider_state = dispatch_context_hints.reset_provider_state;
     let dispatch_recreate_tmux = dispatch_context_hints.recreate_tmux;
     if let (Some(wt), Some(did)) = (&dispatch_worktree_path, &dispatch_id_for_thread) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!("  [{ts}] 🌿 Dispatch {did}: resolved worktree CWD: {wt}");
     }
-    let dispatch_default_path = crate::services::platform::resolve_repo_dir()
-        .filter(|p| std::path::Path::new(p).is_dir())
+    // #762: when the dispatch pins an external target_repo but emits no
+    // worktree_path (e.g. refresh fell back without a usable path), resolve
+    // the repo's configured directory first instead of dropping straight into
+    // the default AgentDesk repo. Otherwise external-repo reviews silently
+    // execute in the wrong repo.
+    let dispatch_target_repo_path =
+        resolve_dispatch_target_repo_dir(dispatch_target_repo.as_deref());
+    let dispatch_default_path = dispatch_target_repo_path
+        .clone()
+        .or_else(|| {
+            crate::services::platform::resolve_repo_dir()
+                .filter(|p| std::path::Path::new(p).is_dir())
+        })
         .unwrap_or_else(|| current_path.clone());
     let dispatch_effective_path = dispatch_worktree_path
         .clone()
@@ -546,6 +633,16 @@ pub(in crate::services::discord) async fn handle_text_message(
                 "  [{ts}] ⚠ Dispatch {did}: context worktree_path no longer exists: {} — falling back to {}",
                 stale_path,
                 dispatch_effective_path
+            );
+        } else if let (Some(did), Some(tr), Some(tr_path)) = (
+            dispatch_id_for_thread.as_deref(),
+            dispatch_target_repo.as_deref(),
+            dispatch_target_repo_path.as_deref(),
+        ) {
+            tracing::info!(
+                "  [{ts}] 🌱 Dispatch {did}: no worktree_path; honoring target_repo '{}' at {}",
+                tr,
+                tr_path
             );
         } else {
             tracing::info!(
@@ -748,10 +845,34 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     // #259: Override current_path with the pre-computed dispatch worktree path.
     // Also update the in-memory session so the worktree sticks for subsequent turns.
-    let current_path = if dispatch_worktree_path.is_some() {
+    //
+    // #762 (B): Reused threads (where `bootstrap_thread_session` returned
+    // early because the thread already had a session) carry their existing
+    // `session.current_path`. Without this branch, a review dispatch that
+    // pins only `target_repo` (no `worktree_path`, e.g. because the
+    // external-repo worktree was cleaned up but `target_repo` still
+    // resolves to the external repo root) would re-execute inside the
+    // previous repo — the prompt and `adk_cwd` would both be built from
+    // the stale path. Propagate `dispatch_effective_path` into the
+    // session whenever it differs from the current path, regardless of
+    // whether `worktree_path` was supplied.
+    let current_path = if dispatch_session_path_should_update(
+        dispatch_id_for_thread.is_some(),
+        dispatch_worktree_path.is_some(),
+        &current_path,
+        &dispatch_effective_path,
+    ) {
         let mut data = shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
-            session.current_path = Some(dispatch_effective_path.clone());
+            if session.current_path.as_deref() != Some(dispatch_effective_path.as_str()) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🔄 Dispatch session CWD update: {:?} → {}",
+                    session.current_path,
+                    dispatch_effective_path
+                );
+                session.current_path = Some(dispatch_effective_path.clone());
+            }
         }
         dispatch_effective_path.clone()
     } else {
@@ -1023,29 +1144,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     context_chunks.push(sanitized_input);
     let context_prompt = context_chunks.join("\n\n");
 
-    // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> =
-        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> =
-        allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools
-        .iter()
-        .filter(|t| !allowed_set.contains(**t))
-        .collect();
-    let disabled_notice = if disabled.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        format!(
-            "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
-             You MUST NOT attempt to use these tools. \
-             If a user's request requires a disabled tool, do NOT proceed with the task. \
-             Instead, clearly inform the user which tool is needed and that it is currently disabled. \
-             Suggest they re-enable it with: /allowed +ToolName",
-            names.join(", ")
-        )
-    };
-
     // Build Discord context info
     let discord_context = {
         let data = shared.core.lock().await;
@@ -1095,7 +1193,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         &current_path,
         channel_id,
         token,
-        &disabled_notice,
         role_binding.as_ref(),
         reply_to_user_message,
         dispatch_profile,
@@ -3287,12 +3384,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_turns_skip_generic_pending_reaction() {
+    fn dispatch_turns_add_pending_reaction_as_single_source() {
+        // #750: announce bot no longer writes ⏳. Command bot must add it on
+        // dispatch turn start so the stop-via-reaction-removal path still
+        // works.
         let dispatch_id = crate::services::discord::adk_session::parse_dispatch_id(
             "DISPATCH:550e8400-e29b-41d4-a716-446655440000 - Fix login bug",
         );
 
-        assert!(!should_add_turn_pending_reaction(dispatch_id.as_deref()));
+        assert!(should_add_turn_pending_reaction(dispatch_id.as_deref()));
     }
 
     #[test]
@@ -3438,6 +3538,107 @@ mod tests {
     }
 
     #[test]
+    fn parse_dispatch_context_hints_extracts_target_repo() {
+        let hints = parse_dispatch_context_hints(
+            Some(r#"{"target_repo":"/tmp/external-762","worktree_path":null}"#),
+            Some("review"),
+        );
+        assert_eq!(hints.target_repo.as_deref(), Some("/tmp/external-762"));
+        assert!(hints.worktree_path.is_none());
+    }
+
+    #[test]
+    fn parse_dispatch_context_hints_target_repo_rejects_blank_values() {
+        let hints = parse_dispatch_context_hints(
+            Some(r#"{"target_repo":"   ","worktree_path":null}"#),
+            Some("review"),
+        );
+        assert!(hints.target_repo.is_none());
+    }
+
+    /// #762 (B): when the dispatch context pins an external `target_repo` but
+    /// emits `worktree_path: null` (e.g. the completion lives in repo HEAD
+    /// but HEAD has drifted, so refresh suppressed worktree_path per #682
+    /// round 3), bootstrap must land in the external repo instead of the
+    /// default AgentDesk workspace. Prior behavior always fell back to
+    /// `resolve_repo_dir()` because `DispatchContextHints` dropped
+    /// `target_repo` on the floor.
+    #[test]
+    fn resolve_dispatch_target_repo_dir_honors_external_target_repo_when_worktree_path_is_null() {
+        // Build a real git worktree at a path that is explicitly NOT the
+        // default AgentDesk workspace. `resolve_repo_dir_for_target` treats
+        // absolute paths as explicit and only accepts them if the directory
+        // is a valid git worktree.
+        let external = tempfile::tempdir().unwrap();
+        let external_dir = external.path().to_str().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(external_dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(external_dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(external_dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(external_dir)
+            .output()
+            .unwrap();
+
+        let raw = serde_json::json!({
+            "target_repo": external_dir,
+            "worktree_path": serde_json::Value::Null,
+            "reviewed_commit": "0123456789abcdef0123456789abcdef01234567",
+        })
+        .to_string();
+        let hints = parse_dispatch_context_hints(Some(&raw), Some("review"));
+
+        assert_eq!(hints.target_repo.as_deref(), Some(external_dir));
+        assert!(
+            hints.worktree_path.is_none(),
+            "null worktree_path must not be synthesized from target_repo by the hints parser"
+        );
+
+        // This is the specific regression: bootstrap must resolve to the
+        // external repo, NOT the default AgentDesk workspace. Prior code
+        // called `resolve_repo_dir()` unconditionally when `worktree_path`
+        // was absent.
+        let resolved = resolve_dispatch_target_repo_dir(hints.target_repo.as_deref())
+            .expect("external target_repo with null worktree_path must resolve to the repo dir");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(external_dir).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_dispatch_target_repo_dir_returns_none_for_missing_target_repo() {
+        assert!(resolve_dispatch_target_repo_dir(None).is_none());
+        assert!(resolve_dispatch_target_repo_dir(Some("")).is_none());
+        assert!(resolve_dispatch_target_repo_dir(Some("   ")).is_none());
+    }
+
+    #[test]
+    fn resolve_dispatch_target_repo_dir_rejects_nonexistent_path() {
+        // A target_repo that references a path outside any configured
+        // mapping cannot be resolved — bootstrap falls back to the default
+        // workspace, not to the (nonexistent) requested path.
+        assert!(
+            resolve_dispatch_target_repo_dir(Some(
+                "/tmp/agentdesk-issue-762-definitely-not-a-repo"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn session_runtime_state_after_redirect_prefers_reused_thread_state() {
         let parent_dir = tempfile::tempdir().unwrap();
         let thread_dir = tempfile::tempdir().unwrap();
@@ -3466,6 +3667,59 @@ mod tests {
         assert_eq!(resolved.0, None);
         assert!(!resolved.1);
         assert_eq!(resolved.2, thread_dir.path().to_str().unwrap());
+    }
+
+    /// #762 round-2 (B): reused threads that bypass `bootstrap_thread_session`
+    /// still need their session CWD refreshed whenever the new dispatch
+    /// points at a different effective path — even when no `worktree_path`
+    /// is supplied. Prior behavior only updated session.current_path when
+    /// `dispatch_worktree_path.is_some()`, so external-repo reviews that
+    /// emitted only `target_repo` quietly executed inside the previous
+    /// implementation's repo.
+    #[test]
+    fn dispatch_session_path_should_update_when_target_repo_diverges_without_worktree() {
+        // Reused thread: dispatch present, no worktree_path, but
+        // target_repo resolved to a different directory than the
+        // session's stale current_path. Must update.
+        assert!(
+            dispatch_session_path_should_update(
+                true,  // has_dispatch
+                false, // has_worktree_path
+                "/tmp/stale-impl-repo",
+                "/tmp/external-target-repo",
+            ),
+            "reused thread with divergent target_repo must update session CWD"
+        );
+    }
+
+    #[test]
+    fn dispatch_session_path_should_update_still_triggers_for_worktree_path_dispatch() {
+        // Classic #259 path: dispatch has worktree_path. Always update,
+        // even when stale current_path already happens to match.
+        assert!(
+            dispatch_session_path_should_update(true, true, "/tmp/impl-wt", "/tmp/impl-wt",),
+            "worktree_path dispatches must always update session CWD"
+        );
+        assert!(
+            dispatch_session_path_should_update(true, true, "/tmp/stale", "/tmp/fresh-wt",),
+            "worktree_path dispatches with divergent path must update"
+        );
+    }
+
+    #[test]
+    fn dispatch_session_path_should_update_skips_when_paths_match() {
+        // No dispatch → leave alone.
+        assert!(!dispatch_session_path_should_update(
+            false, false, "/tmp/a", "/tmp/b",
+        ));
+        // Dispatch present but worktree_path absent AND effective path
+        // matches current path → nothing to update.
+        assert!(!dispatch_session_path_should_update(
+            true,
+            false,
+            "/tmp/same",
+            "/tmp/same",
+        ));
     }
 
     #[test]

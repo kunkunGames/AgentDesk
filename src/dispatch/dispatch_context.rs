@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::OptionalExtension;
+use libsql_rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::db::Db;
@@ -54,6 +54,30 @@ pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> 
 pub(crate) struct DispatchSessionStrategy {
     pub reset_provider_state: bool,
     pub recreate_tmux: bool,
+}
+
+/// #762: Provenance of the `target_repo` field in a review dispatch context.
+///
+/// `build_review_context` needs to know whether the caller *actually* pinned
+/// a `target_repo` on this invocation, or whether the field was auto-injected
+/// by the dispatch create path from the card's canonical scope. When the
+/// external `target_repo` becomes unrecoverable, card-scoped fallbacks
+/// silently redirect the reviewer to unrelated code UNLESS we can distinguish
+/// "caller said so" (safe to fallback) from "we made it up" (must fail closed).
+///
+/// Prior behavior inferred this from the (possibly mutated) context passed in,
+/// which broke the moment any upstream injected `target_repo` before calling
+/// `build_review_context` (see `dispatch_create.rs`). Make the signal explicit
+/// instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetRepoSource {
+    /// Caller (e.g. REST API client) pinned `target_repo` explicitly on this
+    /// dispatch request. Card-scoped fallbacks may honor it.
+    CallerSupplied,
+    /// `target_repo` was either absent from the caller context OR was
+    /// auto-injected by the dispatch create path from `card.repo_id`.
+    /// Treat as card-scoped default — fail closed on unrecoverable externals.
+    CardScopeDefault,
 }
 
 pub(crate) fn dispatch_type_session_strategy_default(
@@ -156,7 +180,7 @@ pub(super) fn dispatch_context_worktree_target(
 }
 
 pub(super) fn resolve_parent_dispatch_context(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
     card_id: &str,
     context: &serde_json::Value,
 ) -> Result<(Option<String>, i64)> {
@@ -755,20 +779,10 @@ fn result_has_work_completion_evidence(result: &serde_json::Value) -> bool {
         || json_string_field(result, "work_outcome").is_some()
 }
 
-fn dispatch_has_assistant_response(conn: &rusqlite::Connection, dispatch_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT COUNT(*) > 0
-         FROM session_transcripts
-         WHERE dispatch_id = ?1
-           AND TRIM(assistant_message) <> ''",
-        [dispatch_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| anyhow::anyhow!("session transcript lookup failed: {e}"))
-}
-
 pub(super) fn validate_dispatch_completion_evidence_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &libsql_rusqlite::Connection,
+    db: &Db,
+    pg_pool: Option<&sqlx::PgPool>,
     dispatch_id: &str,
     result: &serde_json::Value,
 ) -> Result<()> {
@@ -787,7 +801,11 @@ pub(super) fn validate_dispatch_completion_evidence_on_conn(
     }
 
     if result_has_work_completion_evidence(result)
-        || dispatch_has_assistant_response(conn, dispatch_id)?
+        || crate::db::session_transcripts::dispatch_has_assistant_response_db(
+            db,
+            pg_pool,
+            dispatch_id,
+        )?
     {
         return Ok(());
     }
@@ -813,7 +831,7 @@ pub(crate) fn validate_dispatch_completion_evidence(
     let conn = db
         .separate_conn()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
-    validate_dispatch_completion_evidence_on_conn(&conn, dispatch_id, result)
+    validate_dispatch_completion_evidence_on_conn(&conn, db, None, dispatch_id, result)
 }
 
 fn apply_review_target_context(
@@ -842,6 +860,74 @@ fn apply_review_target_warning(
 ) {
     obj.insert("review_target_reject_reason".to_string(), json!(reason));
     obj.insert("review_target_warning".to_string(), json!(warning));
+}
+
+/// #762: Normalize a `target_repo` value for comparison.
+///
+/// Two repo references describe the same local repo iff their
+/// `resolve_repo_dir_for_target` results canonicalize to the same path. This
+/// handles mixed "org/name" / "/abs/path" / "~/path" forms without tripping on
+/// trivial string differences.
+fn normalized_target_repo_path(target_repo: Option<&str>) -> Option<std::path::PathBuf> {
+    let target_repo = target_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let resolved = crate::services::platform::shell::resolve_repo_dir_for_target(Some(target_repo))
+        .ok()
+        .flatten()?;
+    Some(std::fs::canonicalize(&resolved).unwrap_or_else(|_| std::path::PathBuf::from(&resolved)))
+}
+
+/// #762: Decide whether the historical work dispatch's `target_repo` risks
+/// silently redirecting a review to unrelated code when card-scoped
+/// fallbacks run.
+///
+/// A recorded `work_target_repo` is safe iff it demonstrably resolves to the
+/// same local repo as the card's canonical scope. Any other outcome —
+/// different resolved path, unresolvable work_target_repo, or no card-side
+/// anchor — is treated as "external and unrecoverable" to fail closed.
+fn historical_target_repo_differs_from_card(
+    work_target_repo: Option<&str>,
+    card_scope_repo: Option<&str>,
+) -> bool {
+    let Some(work) = work_target_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let card = card_scope_repo
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    // Cheap string compare first — avoids touching the filesystem on the
+    // common case where the two references were copied from the same source.
+    if let Some(card_str) = card.as_deref() {
+        if work == card_str {
+            return false;
+        }
+    }
+
+    let work_path = normalized_target_repo_path(Some(work));
+    let card_path = card.and_then(|value| normalized_target_repo_path(Some(value)));
+    match (work_path, card_path) {
+        (Some(w), Some(c)) => w != c,
+        // If only one side resolves, we cannot prove the two references
+        // describe the same repo — treat as external-divergent so the
+        // card-scoped fallback path does not silently redirect.
+        (Some(_), None) => true,
+        (None, Some(_)) => true,
+        // #762 (C): when NEITHER side resolves we still have a concrete
+        // `work_target_repo` string recorded against the historical work
+        // dispatch. We cannot prove it matches the card scope — in fact the
+        // card scope is unresolvable too. Previously this returned `false`
+        // and let the card-scoped fallback chain run, which made
+        // `resolve_repo_dir_for_target(None)` redirect the reviewer into the
+        // default repo. Treat this as divergent so the caller fails closed
+        // on an unrecoverable external target_repo instead of silently
+        // reviewing unrelated code in the default repo.
+        (None, None) => true,
+    }
 }
 
 pub(crate) const REVIEW_QUALITY_SCOPE_REMINDER: &str =
@@ -1034,17 +1120,104 @@ fn resolve_repo_head_fallback_target(
     }))
 }
 
+/// Review-target fields that steer the agent's execution state (which commit
+/// to check out, which worktree to inspect, which branch to compare against).
+///
+/// #761: These fields must be treated as untrusted when they arrive via the
+/// public dispatch-create API. A caller could craft a context that pins the
+/// review to any commit/path. `build_review_context` with
+/// `ReviewTargetTrust::Untrusted` strips them before running the
+/// validation/refresh chain. The trust signal is passed **out-of-band** as a
+/// function parameter — never read from the JSON context — so no
+/// client-controlled field can opt out of stripping.
+pub(super) const UNTRUSTED_REVIEW_TARGET_FIELDS: &[&str] =
+    &["reviewed_commit", "worktree_path", "branch", "target_repo"];
+
+/// Trust boundary for review-target fields on the incoming context.
+///
+/// #761 (Codex round-2): The round-1 design used a `_trusted_review_target`
+/// sentinel inside the context JSON. That made trust client-controlled — a
+/// crafted POST /api/dispatches body could set it and bypass stripping. This
+/// enum is the replacement: it is an out-of-band Rust-type parameter, not a
+/// JSON field. API-sourced code paths (`POST /api/dispatches` → dispatch
+/// service → `create_dispatch_core_internal` → `build_review_context`) always
+/// pass `Untrusted`. Only internal callers that legitimately pre-populate
+/// review-target fields (e.g. tests simulating a specific target_repo
+/// recovery path) may opt in via `Trusted`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReviewTargetTrust {
+    /// Review-target fields in the incoming context are UNTRUSTED and will be
+    /// stripped. The validation/refresh chain then resolves them fresh from
+    /// the card's history (latest completed work dispatch → worktree lookup →
+    /// issue commit recovery → repo HEAD fallback). This is the default for
+    /// anything reachable via the public HTTP API.
+    Untrusted,
+    /// Review-target fields in the incoming context are TRUSTED and will be
+    /// passed through to the downstream validation/refresh chain. Only use
+    /// this from internal call sites where the fields came from a
+    /// first-party source (not user-controlled JSON).
+    Trusted,
+}
+
 /// Build the context JSON string for a review dispatch.
 ///
 /// Injects `reviewed_commit`, `branch`, `worktree_path`, and provider info.
 /// Prefers worktree branch (if found for this card's issue) over main HEAD.
+///
+/// #761 (Codex round-2): `trust` is an out-of-band parameter. `Untrusted`
+/// unconditionally strips `reviewed_commit` / `worktree_path` / `branch` /
+/// `target_repo` from the incoming context before the validation/refresh
+/// chain runs. No JSON field on `context` can toggle this behavior — the
+/// previous `_trusted_review_target` sentinel has been removed. API-sourced
+/// callers (anyone reaching `POST /api/dispatches`) MUST pass `Untrusted`;
+/// internal callers that already have first-party review-target values may
+/// opt into `Trusted`.
 pub(super) fn build_review_context(
     db: &Db,
     kanban_card_id: &str,
     to_agent_id: &str,
     context: &serde_json::Value,
+    trust: ReviewTargetTrust,
+    target_repo_source: TargetRepoSource,
 ) -> Result<String> {
+    // #762 (A): the caller tells us explicitly whether `target_repo` in
+    // `context` originated from their request or from our own fallback
+    // injection. Inferring this from `context["target_repo"].is_some()` is
+    // unreliable because upstream (`dispatch_create.rs`) pre-injects
+    // `target_repo` into the context from the card's scope BEFORE calling
+    // this function — which would make every dispatch look caller-supplied
+    // and silently disable the `external_target_repo_unrecoverable` filter.
+    let caller_supplied_target_repo =
+        matches!(target_repo_source, TargetRepoSource::CallerSupplied)
+            && json_string_field(context, "target_repo").is_some();
     let mut ctx_val = dispatch_context_with_session_strategy("review", context);
+
+    // #761: Strip untrusted review-target fields before any downstream code
+    // consumes them. The trust decision is out-of-band (the `trust` parameter
+    // on this function's signature, not a JSON field), so a malicious or buggy
+    // POST /api/dispatches body cannot opt out of stripping. Any legacy
+    // `_trusted_review_target` key in the payload is also removed so it
+    // cannot leak into the persisted dispatch context and mislead future
+    // readers into thinking it carries meaning.
+    if let Some(obj) = ctx_val.as_object_mut() {
+        obj.remove("_trusted_review_target");
+        if matches!(trust, ReviewTargetTrust::Untrusted) {
+            let mut stripped: Vec<&str> = Vec::new();
+            for field in UNTRUSTED_REVIEW_TARGET_FIELDS {
+                if obj.remove(*field).is_some() {
+                    stripped.push(field);
+                }
+            }
+            if !stripped.is_empty() {
+                tracing::warn!(
+                    "[dispatch] Review dispatch for card {}: stripped untrusted review-target fields from input context ({}) — validation/refresh chain will resolve them from card history",
+                    kanban_card_id,
+                    stripped.join(", ")
+                );
+            }
+        }
+    }
+
     let target_repo = resolve_card_target_repo_ref(db, kanban_card_id, Some(&ctx_val));
     if let Some(obj) = ctx_val.as_object_mut() {
         if let Some(target_repo) = target_repo.as_deref() {
@@ -1111,7 +1284,55 @@ pub(super) fn build_review_context(
                         &target.reviewed_commit[..8.min(target.reviewed_commit.len())]
                     );
                 }
-                if let Some((ref wt_path, ref wt_branch, ref wt_commit)) =
+
+                // #762 (A): if the historical work target was recorded against
+                // an EXTERNAL `target_repo` that differs from the card's
+                // canonical repo, and refresh failed, the card-scoped
+                // fallbacks below (`resolve_card_worktree`,
+                // `resolve_card_issue_commit_target`, repo-HEAD fallback) will
+                // silently redirect the reviewer to unrelated code in the
+                // card's default repo. Fail closed instead.
+                //
+                // Exception: when the caller explicitly pinned `target_repo`
+                // on the invocation context, `ctx_snapshot` already carries
+                // the correct repo scope — `resolve_card_worktree` et al. will
+                // honor it and no silent redirect can happen. We only fail
+                // closed when the caller provided no override.
+                let card_repo_id =
+                    load_card_issue_repo(db, kanban_card_id).and_then(|(_, repo_id)| repo_id);
+                let historical_external_repo_unrecoverable = latest_work_target
+                    .as_ref()
+                    .filter(|_| validated_work_target.is_none())
+                    .filter(|_| !caller_supplied_target_repo)
+                    .and_then(|target| target.target_repo.as_deref())
+                    .filter(|work_repo| {
+                        historical_target_repo_differs_from_card(
+                            Some(work_repo),
+                            card_repo_id.as_deref(),
+                        )
+                    })
+                    .map(|value| value.to_string());
+
+                if let Some(external_repo) = historical_external_repo_unrecoverable {
+                    apply_review_target_warning(
+                        obj,
+                        "external_target_repo_unrecoverable",
+                        "리뷰 대상 커밋을 원래 외부 target_repo에서 복구할 수 없습니다. 카드 기본 레포로 폴백하면 무관한 코드가 리뷰되므로 중단합니다.",
+                    );
+                    // Preserve the historical target_repo so downstream
+                    // consumers (prompt builder, bootstrap) at least know
+                    // which repo the reviewer should have been pointed at.
+                    // Overwrite any card-scoped target_repo that may have
+                    // been pre-injected by resolve_card_target_repo_ref —
+                    // the failed external reference is the meaningful signal
+                    // here, not the card's default repo.
+                    obj.insert("target_repo".to_string(), json!(external_repo.clone()));
+                    tracing::warn!(
+                        "[dispatch] Review dispatch for card {}: historical external target_repo '{}' is unrecoverable — suppressing card-scoped fallback",
+                        kanban_card_id,
+                        external_repo
+                    );
+                } else if let Some((ref wt_path, ref wt_branch, ref wt_commit)) =
                     resolve_card_worktree(db, kanban_card_id, Some(&ctx_snapshot))?
                 {
                     apply_review_target_context(
@@ -1308,7 +1529,7 @@ mod tests {
              ) VALUES (
                 ?1, 'Test Card', ?2, ?3, datetime('now'), datetime('now')
              )",
-            rusqlite::params![card_id, status, issue_number],
+            libsql_rusqlite::params![card_id, status, issue_number],
         )
         .unwrap();
     }
@@ -1317,7 +1538,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET repo_id = ?1 WHERE id = ?2",
-            rusqlite::params![repo_id, card_id],
+            libsql_rusqlite::params![repo_id, card_id],
         )
         .unwrap();
     }
@@ -1503,7 +1724,7 @@ mod tests {
                 'card-review-identifiers', ?1, ?2, 'wt/692-review', 901, ?3, 'review',
                 datetime('now'), datetime('now')
              )",
-            rusqlite::params![repo_dir, repo_dir, reviewed_commit],
+            libsql_rusqlite::params![repo_dir, repo_dir, reviewed_commit],
         )
         .unwrap();
         drop(conn);
@@ -1517,6 +1738,8 @@ mod tests {
                 "branch": "wt/692-review",
                 "reviewed_commit": reviewed_commit,
             }),
+            ReviewTargetTrust::Untrusted,
+            TargetRepoSource::CardScopeDefault,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context).unwrap();
