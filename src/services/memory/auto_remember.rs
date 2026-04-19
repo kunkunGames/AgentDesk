@@ -4,7 +4,9 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
-use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
+use crate::services::discord::settings::{
+    MemoryBackendKind, ResolvedMemorySettings, resolve_memory_settings,
+};
 
 use super::auto_remember_quality::{
     AutoRememberQualityInput, improve_candidate_with_config, rewrite_supported_with_config,
@@ -267,11 +269,10 @@ pub(crate) async fn resubmit_auto_remember_candidate(
 
     store.reset_retry_state(&workspace, &candidate_hash)?;
 
-    let resubmit_settings = ResolvedMemorySettings {
-        backend: MemoryBackendKind::Memento,
-        auto_remember_enabled: true,
-        ..ResolvedMemorySettings::default()
-    };
+    let mut resubmit_settings = resolve_memory_settings(None, None);
+    resubmit_settings.backend = MemoryBackendKind::Memento;
+    resubmit_settings.auto_remember_enabled = true;
+    resubmit_settings.auto_remember.enabled = true;
     let backend = MementoBackend::new(resubmit_settings.clone());
     let request = AutoRememberTurnRequest {
         turn_id: format!(
@@ -2363,6 +2364,138 @@ mod tests {
         assert!(requests[2].contains("\"name\":\"recall\""));
         assert!(requests[3].contains("\"name\":\"remember\""));
 
+        handle.await.unwrap();
+        restore_env("AGENTDESK_ROOT_DIR", previous_root);
+        restore_env("MEMENTO_TEST_KEY", previous_key);
+        restore_env("MEMENTO_WORKSPACE", previous_workspace);
+        reset_backend_health_for_tests();
+    }
+
+    #[tokio::test]
+    async fn manual_resubmit_cli_uses_runtime_improver_configuration() {
+        let response_health = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: "{}".to_string(),
+        };
+        let response_initialize = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![("MCP-Session-Id", "session-resubmit-runtime")],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            })
+            .to_string(),
+        };
+        let response_recall = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "{\"fragments\":[]}"
+                    }],
+                    "usage": { "input_tokens": 3, "output_tokens": 1 }
+                }
+            })
+            .to_string(),
+        };
+        let response_remember = MockHttpResponse {
+            status_line: "200 OK",
+            headers: vec![],
+            body: json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"success\":true}" }],
+                    "usage": { "input_tokens": 7, "output_tokens": 2 }
+                }
+            })
+            .to_string(),
+        };
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            response_health,
+            response_initialize,
+            response_recall,
+            response_remember,
+        ])
+        .await;
+        let (_guard, temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, Some("agentdesk-default"));
+        std::fs::write(
+            temp.path().join("config").join("agentdesk.yaml"),
+            format!(
+                "server:\n  port: 8791\nmemory:\n  backend: memento\n  auto_remember:\n    enabled: true\n    improver:\n      mode: agent\n      agent:\n        provider: gemini\n        model: gemini-2.5-pro\n        label: runtime-memory-critic\n  mcp:\n    endpoint: {base_url}\n    access_key_env: MEMENTO_TEST_KEY\n"
+            ),
+        )
+        .unwrap();
+        reset_backend_health_for_tests();
+        let snapshot = refresh_backend_health("auto-remember-resubmit-runtime-test").await;
+        assert!(snapshot.memento.active);
+
+        auto_remember_quality::set_test_agent_improver(Some(Box::new(
+            |provider, model, prompt, _timeout, label| {
+                assert_eq!(provider, crate::services::provider::ProviderKind::Gemini);
+                assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
+                assert_eq!(label, "runtime-memory-critic");
+                assert!(prompt.contains("SQLite sidecar"));
+                Ok(json!({
+                    "schema_version": "1",
+                    "content": "AgentDesk decided to standardize on SQLite sidecar as the audit store.",
+                    "keywords": ["sqlite", "sidecar", "audit-store"]
+                })
+                .to_string())
+            },
+        )));
+
+        let workspace = "agentdesk-default";
+        let raw_content = "AgentDesk decided to standardize on SQLite sidecar as the audit store.";
+        let candidate_hash = hash_candidate(
+            workspace,
+            AutoRememberSignalKind::TechnicalDecision,
+            raw_content,
+        );
+        let store = AutoRememberStore::open().unwrap();
+        let evidence = vec![raw_content.to_string()];
+        store
+            .upsert_audit(AutoRememberAuditEntry {
+                turn_id: "turn-abandoned-runtime",
+                candidate_hash: &candidate_hash,
+                signal_kind: AutoRememberSignalKind::TechnicalDecision.as_str(),
+                workspace,
+                stage: AutoRememberStage::Remember,
+                status: AutoRememberMemoryStatus::AbandonedAfterRetries,
+                retry_count: 3,
+                error: Some("temporary failure"),
+                raw_content: Some(raw_content),
+                entity_key: None,
+                supporting_evidence: Some(evidence.as_slice()),
+            })
+            .unwrap();
+
+        crate::cli::auto_remember::cmd_auto_remember_resubmit(workspace, &candidate_hash)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_resubmittable_candidate(workspace, &candidate_hash)
+                .unwrap()
+                .is_none()
+        );
+
+        let requests = tokio::time::timeout(Duration::from_secs(1), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("\"name\":\"recall\""));
+        assert!(requests[3].contains("\"name\":\"remember\""));
+
+        auto_remember_quality::set_test_agent_improver(None);
         handle.await.unwrap();
         restore_env("AGENTDESK_ROOT_DIR", previous_root);
         restore_env("MEMENTO_TEST_KEY", previous_key);

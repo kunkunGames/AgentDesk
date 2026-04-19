@@ -827,6 +827,12 @@ impl AutoRememberStore {
                     PRIMARY KEY (workspace, candidate_hash)
                 );",
             )?;
+            ensure_column(
+                conn,
+                "auto_remember_audit",
+                "retry_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
             ensure_column(conn, "auto_remember_audit", "raw_content", "TEXT")?;
             ensure_column(conn, "auto_remember_audit", "entity_key", "TEXT")?;
             ensure_column(
@@ -840,6 +846,12 @@ impl AutoRememberStore {
                 "auto_remember_retry_queue",
                 "supporting_evidence_json",
                 "TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                conn,
+                "auto_remember_retry_queue",
+                "retry_count",
+                "INTEGER NOT NULL DEFAULT 0",
             )?;
             ensure_column(
                 conn,
@@ -1318,6 +1330,117 @@ mod tests {
                 Some("operator confirmed replay result")
             );
             assert!(store.load_retry_batch().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn open_existing_migrates_legacy_retry_count_columns() {
+        with_temp_root(|temp| {
+            let sidecar_path = temp.path().join("data").join("memory-auto-remember.sqlite");
+            std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+
+            let conn = Connection::open(&sidecar_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE auto_remember_audit (
+                    workspace TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    signal_kind TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    memory_status TEXT NOT NULL,
+                    error TEXT,
+                    raw_content TEXT,
+                    entity_key TEXT,
+                    supporting_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (workspace, candidate_hash)
+                );
+                CREATE TABLE auto_remember_retry_queue (
+                    workspace TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    signal_kind TEXT NOT NULL,
+                    raw_content TEXT NOT NULL,
+                    entity_key TEXT,
+                    supporting_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT,
+                    available_at_ms INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (workspace, candidate_hash)
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_remember_audit (
+                    workspace,
+                    candidate_hash,
+                    turn_id,
+                    signal_kind,
+                    stage,
+                    memory_status,
+                    error,
+                    raw_content,
+                    entity_key,
+                    supporting_evidence_json,
+                    created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    "agentdesk-default",
+                    "legacy-hash",
+                    "turn-legacy",
+                    "technical_decision",
+                    "remember",
+                    "remember_failed",
+                    "temporary failure",
+                    "SQLite sidecar is the audit store.",
+                    Option::<String>::None,
+                    "[]",
+                    "2026-04-19T00:00:00Z",
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO auto_remember_retry_queue (
+                    workspace,
+                    candidate_hash,
+                    turn_id,
+                    signal_kind,
+                    raw_content,
+                    entity_key,
+                    supporting_evidence_json,
+                    error,
+                    available_at_ms,
+                    updated_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    "agentdesk-default",
+                    "legacy-hash",
+                    "turn-legacy",
+                    "technical_decision",
+                    "SQLite sidecar is the audit store.",
+                    Option::<String>::None,
+                    "[]",
+                    "temporary failure",
+                    0_i64,
+                    0_i64,
+                ],
+            )
+            .unwrap();
+            drop(conn);
+
+            let store = AutoRememberStore::open_existing()
+                .unwrap()
+                .expect("legacy sidecar should be opened");
+            let record = store
+                .lookup_record("agentdesk-default", "legacy-hash")
+                .unwrap()
+                .expect("legacy audit row should survive migration");
+            assert_eq!(record.retry_count, 0);
+
+            let retry_batch = store.load_retry_batch().unwrap();
+            assert_eq!(retry_batch.len(), 1);
+            assert_eq!(retry_batch[0].candidate_hash, "legacy-hash");
+            assert_eq!(retry_batch[0].retry_count, 0);
         });
     }
 }
