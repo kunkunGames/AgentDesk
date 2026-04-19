@@ -13,6 +13,7 @@ import argparse
 import os
 import plistlib
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -99,6 +100,18 @@ def current_user_name() -> str:
         return pwd.getpwuid(os.getuid()).pw_name
     except Exception:
         return "agentdesk"
+
+
+SAFE_SUDOERS_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def validate_sudoers_user_name(user_name: str) -> str:
+    if not SAFE_SUDOERS_USER_RE.fullmatch(user_name):
+        raise SystemExit(
+            "--sudoers-user must be a single POSIX-style account name "
+            "containing only letters, digits, underscores, dots, or hyphens"
+        )
+    return user_name
 
 
 def home_for_user(user_name: str) -> Optional[Path]:
@@ -288,6 +301,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def validate_schedule_args(args: argparse.Namespace) -> None:
+    args.sudoers_user = validate_sudoers_user_name(args.sudoers_user)
     if (args.hour is None) != (args.minute is None):
         raise SystemExit("--hour and --minute must be provided together")
     if args.hour is None:
@@ -533,12 +547,13 @@ def plist_valid(path: Path) -> bool:
 
 
 def sudoers_text(*, user_name: str, python_bin: Path, script_path: Path) -> str:
+    safe_user_name = validate_sudoers_user_name(user_name)
     return "\n".join(
         [
             "# /etc/sudoers.d/agentdesk-dawn-manager",
             "# Install with: sudo visudo -f /etc/sudoers.d/agentdesk-dawn-manager",
             "",
-            f"User_Alias AGENTDESK_RUNTIME = {user_name}",
+            f"User_Alias AGENTDESK_RUNTIME = {safe_user_name}",
             "",
             "Cmnd_Alias AGENTDESK_DAWN_MANAGER = \\",
             f"    {python_bin} {script_path} *",
@@ -598,7 +613,7 @@ def access_denied(stderr: str) -> bool:
 def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
     python_bin = Path(args.python_bin).expanduser()
     skills_roots = candidate_skills_roots(args)
-    manager_python = effective_manager_python(args)
+    manager_python = trusted_root_python_bin()
     if python_bin.exists():
         version_result = run_command([str(python_bin), "--version"])
         invocation_python_version = version_result.stdout.strip() or version_result.stderr.strip() or "unknown"
