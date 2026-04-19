@@ -17,12 +17,8 @@ const DISCORD_GATEWAY_LOCK_PREFIX: u64 = 0x0443_0000_0000_0000;
 
 fn restored_fast_mode_enabled_channels_for_provider(
     bot_settings: &DiscordBotSettings,
-    provider: &ProviderKind,
+    _provider: &ProviderKind,
 ) -> Vec<ChannelId> {
-    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
-        return Vec::new();
-    }
-
     let mut channels: Vec<ChannelId> = bot_settings
         .channel_fast_modes
         .iter()
@@ -39,12 +35,8 @@ fn restored_fast_mode_enabled_channels_for_provider(
 
 fn restored_fast_mode_reset_channels_for_provider(
     bot_settings: &DiscordBotSettings,
-    provider: &ProviderKind,
+    _provider: &ProviderKind,
 ) -> Vec<ChannelId> {
-    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
-        return Vec::new();
-    }
-
     let mut channels: Vec<ChannelId> = bot_settings
         .channel_fast_modes
         .keys()
@@ -1539,7 +1531,7 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn restored_fast_mode_channels_only_load_for_supported_providers() {
+    fn restored_fast_mode_channels_restore_for_mixed_provider_runtimes() {
         let mut settings = DiscordBotSettings::default();
         settings.channel_fast_modes.insert("123".to_string(), true);
         settings.channel_fast_modes.insert("456".to_string(), false);
@@ -1550,7 +1542,7 @@ mod tests {
 
         let gemini_channels =
             restored_fast_mode_enabled_channels_for_provider(&settings, &ProviderKind::Gemini);
-        assert!(gemini_channels.is_empty());
+        assert_eq!(gemini_channels, vec![ChannelId::new(123)]);
     }
 
     #[test]
@@ -1568,7 +1560,10 @@ mod tests {
 
         let gemini_channels =
             restored_fast_mode_reset_channels_for_provider(&settings, &ProviderKind::Gemini);
-        assert!(gemini_channels.is_empty());
+        assert_eq!(
+            gemini_channels,
+            vec![ChannelId::new(123), ChannelId::new(456)]
+        );
     }
 
     struct PgTestDatabase {
