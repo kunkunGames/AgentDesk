@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,14 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
         self.assertIn("User_Alias AGENTDESK_RUNTIME = agentdesk", text)
         self.assertIn("/opt/homebrew/bin/python3 " + str(SCRIPT_PATH) + " *", text)
         self.assertIn("NOPASSWD: AGENTDESK_DAWN_MANAGER", text)
+
+    def test_sudoers_text_rejects_unsafe_user_name(self) -> None:
+        with self.assertRaises(SystemExit):
+            MODULE.sudoers_text(
+                user_name="agentdesk\nALL ALL=(ALL) NOPASSWD: ALL",
+                python_bin=Path("/usr/bin/python3"),
+                script_path=SCRIPT_PATH,
+            )
 
     def test_build_self_command_keeps_jobs_and_schedule(self) -> None:
         args = argparse.Namespace(
@@ -166,6 +175,57 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
 
         self.assertIn(Path("/Users/agentdesk/.codex/skills"), roots)
         self.assertIn(Path("/Users/agentdesk/.adk/release/skills"), roots)
+
+    def test_parse_args_rejects_unsafe_sudoers_user(self) -> None:
+        with self.assertRaises(SystemExit):
+            MODULE.parse_args(["sudoers", "--sudoers-user", "agentdesk\nroot ALL=(ALL) NOPASSWD: ALL"])
+
+    def test_preflight_validates_artifacts_with_trusted_root_python(self) -> None:
+        args = argparse.Namespace(
+            action="preflight",
+            job=None,
+            hour=None,
+            minute=None,
+            python_bin="/opt/homebrew/bin/python3",
+            sudoers_user="agentdesk",
+            skills_root=None,
+            as_root=False,
+        )
+        resolved = MODULE.ResolvedDawnJob(
+            name="memory-dream",
+            skill_root=Path("/tmp/skills/memory-dream"),
+            manager_script=Path("/tmp/skills/memory-dream/scripts/manage_memory_dream_launchd.py"),
+            daemon_plist=Path("/tmp/skills/memory-dream/launchd/com.agentdesk.memory-dream-dawn.plist"),
+        )
+        seen: dict[str, Path] = {}
+
+        def fake_validate(job: MODULE.ResolvedDawnJob, python_bin: Path) -> None:
+            self.assertEqual(job, resolved)
+            seen["python_bin"] = python_bin
+
+        def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+            if command == ["/opt/homebrew/bin/python3", "--version"]:
+                return subprocess.CompletedProcess(command, 0, stdout="Python 3.12.0\n", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with mock.patch.object(MODULE, "candidate_skills_roots", return_value=[Path("/tmp/skills")]):
+            with mock.patch.object(MODULE, "trusted_root_python_bin", return_value=Path("/usr/bin/python3")):
+                with mock.patch.object(MODULE, "resolve_job_artifacts", return_value=resolved):
+                    with mock.patch.object(MODULE, "plist_valid", return_value=True):
+                        with mock.patch.object(MODULE, "validate_privileged_job_artifacts", side_effect=fake_validate):
+                            with mock.patch.object(
+                                MODULE,
+                                "build_preflight_probe_command",
+                                return_value=["sudo", "-n", "/usr/bin/python3", str(SCRIPT_PATH), "status"],
+                            ):
+                                with mock.patch.object(MODULE, "run_command", side_effect=fake_run):
+                                    with mock.patch("builtins.print"):
+                                        MODULE.render_preflight(
+                                            args,
+                                            [("memory-dream", MODULE.JOB_SPECS["memory-dream"])],
+                                        )
+
+        self.assertEqual(seen["python_bin"], Path("/usr/bin/python3"))
 
 
 if __name__ == "__main__":
