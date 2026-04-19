@@ -292,6 +292,53 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
+            "/api/agents/{id}/turn/start",
+            "agents",
+            "Start a headless agent turn from the agent primary mailbox/session. Returns conflict when another turn is already active for that agent mailbox.",
+        )
+        .with_params([
+            ("id", path_param("Agent id")),
+            (
+                "prompt",
+                body_param("string", true, "Instruction to execute in the headless turn"),
+            ),
+            (
+                "metadata",
+                body_param(
+                    "object",
+                    false,
+                    "Optional trigger metadata injected into the turn context",
+                ),
+            ),
+            (
+                "source",
+                body_param(
+                    "string",
+                    false,
+                    "Optional trigger source label (for example system or pipeline)",
+                ),
+            ),
+        ])
+        .with_example(
+            json!({
+                "path": {"id": "family-counsel"},
+                "body": {
+                    "prompt": "오부장 probe slot 도달. memento recall 후 gap 탐지하고 DM 전송",
+                    "metadata": {
+                        "trigger_source": "launchd:family-profile-probe",
+                        "target_key": "obujang"
+                    },
+                    "source": "system"
+                }
+            }),
+            json!({
+                "ok": true,
+                "turn_id": "discord:1473922824350601297:9100000000000000000",
+                "status": "started"
+            }),
+        ),
+        ep(
+            "POST",
             "/api/agents/{id}/turn/stop",
             "agents",
             "Stop the active turn for agent",

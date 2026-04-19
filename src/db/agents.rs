@@ -23,7 +23,7 @@ impl AgentChannelBindings {
             .or_else(ProviderKind::default_channel_provider)
     }
 
-    fn resolved_primary_provider_kind(&self) -> Option<ProviderKind> {
+    pub(crate) fn resolved_primary_provider_kind(&self) -> Option<ProviderKind> {
         let configured_provider = self.primary_provider_kind()?;
         if self
             .provider_specific_channel(&configured_provider)

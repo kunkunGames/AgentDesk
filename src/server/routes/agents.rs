@@ -26,6 +26,15 @@ pub struct TranscriptQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StartAgentTurnBody {
+    pub prompt: String,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 const TURN_CAPTURE_SCROLLBACK_LINES: i32 = -80;
 const TURN_CAPTURE_TAIL_LINES: usize = 60;
 const TURN_OUTPUT_MAX_CHARS: usize = 4000;
@@ -866,6 +875,126 @@ pub async fn agent_turn(
             "tool_count": tool_count,
         })),
     )
+}
+
+/// POST /api/agents/:id/turn/start
+pub async fn start_agent_turn(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<StartAgentTurnBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let prompt = body.prompt.trim();
+    if prompt.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "prompt is required"})),
+        );
+    }
+
+    let (provider, primary_channel) = {
+        let conn = match state.db.lock() {
+            Ok(conn) => conn,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"ok": false, "error": format!("{error}")})),
+                );
+            }
+        };
+
+        if !agent_exists(&conn, &id) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "agent not found"})),
+            );
+        }
+
+        let Some(bindings) = crate::db::agents::load_agent_channel_bindings(&conn, &id)
+            .map_err(|error| error.to_string())
+            .ok()
+            .flatten()
+        else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"ok": false, "error": "agent channel binding not found"})),
+            );
+        };
+
+        let Some(provider) = bindings.resolved_primary_provider_kind() else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "agent primary provider is not configured"})),
+            );
+        };
+        let Some(primary_channel) = bindings.primary_channel() else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"ok": false, "error": "agent primary channel is not configured"})),
+            );
+        };
+        (provider, primary_channel)
+    };
+
+    let Some(channel_id_num) = super::dispatches::resolve_channel_alias_pub(&primary_channel)
+        .or_else(|| primary_channel.parse::<u64>().ok())
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": format!("agent primary channel is invalid: {}", primary_channel),
+            })),
+        );
+    };
+
+    let Some(registry) = state.health_registry.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "discord runtime health registry unavailable"})),
+        );
+    };
+
+    let channel_name_hint = primary_channel
+        .chars()
+        .all(|ch| ch.is_ascii_digit())
+        .then_some(None)
+        .unwrap_or_else(|| Some(primary_channel.clone()));
+
+    match crate::services::discord::health::start_headless_agent_turn(
+        registry,
+        poise::serenity_prelude::ChannelId::new(channel_id_num),
+        provider,
+        prompt.to_string(),
+        body.source,
+        body.metadata,
+        channel_name_hint,
+    )
+    .await
+    {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "turn_id": outcome.turn_id,
+                "status": "started",
+            })),
+        ),
+        Err(crate::services::discord::HeadlessTurnStartError::Conflict(error)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": error,
+                "status": "conflict",
+            })),
+        ),
+        Err(crate::services::discord::HeadlessTurnStartError::Internal(error)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": error,
+            })),
+        ),
+    }
 }
 
 /// POST /api/agents/:id/turn/stop

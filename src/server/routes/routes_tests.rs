@@ -1284,6 +1284,60 @@ async fn stop_agent_turn_preserves_pending_queue_via_mailbox_fallback_cleanup() 
 }
 
 #[tokio::test]
+async fn start_agent_turn_returns_conflict_when_mailbox_is_busy() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let harness = crate::services::discord::health::TestHealthHarness::new_with_provider(
+        crate::services::provider::ProviderKind::Codex,
+    )
+    .await;
+    let channel_id = "1485506232256168123";
+    let channel_num = channel_id.parse::<u64>().unwrap();
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents
+             (id, name, provider, discord_channel_id, discord_channel_alt, created_at, updated_at)
+             VALUES ('agent-turn-start-busy', 'Agent Turn Start Busy', 'codex', 'legacy-busy', ?1, datetime('now'), datetime('now'))",
+            [channel_id],
+        )
+        .unwrap();
+    }
+
+    harness.seed_active_turn(channel_num, 7, 77).await;
+
+    let app = test_api_router(db, engine, Some(harness.registry()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agents/agent-turn-start-busy/turn/start")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"prompt":"run headless probe","source":"system","metadata":{"trigger_source":"test"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["status"], "conflict");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|value| value.contains("mailbox is busy")),
+        "unexpected error body: {json}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires tmux"]
 async fn cancel_turn_preserves_tmux_and_cancels_active_dispatch() {
     let _env_lock = env_lock();
@@ -3874,6 +3928,46 @@ async fn api_docs_category_exposes_kanban_params_and_examples() {
     assert_eq!(
         resume["example"]["response"]["action"]["type"],
         "new_implementation_dispatch"
+    );
+}
+
+#[tokio::test]
+async fn api_docs_category_exposes_agents_turn_start_contract() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["category"], "agents");
+
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("category detail must include endpoint array");
+    let turn_start = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/agents/{id}/turn/start")
+        .expect("agents turn/start endpoint must be present");
+    assert_eq!(turn_start["params"]["id"]["location"], "path");
+    assert_eq!(turn_start["params"]["prompt"]["required"], true);
+    assert_eq!(turn_start["params"]["metadata"]["type"], "object");
+    assert_eq!(turn_start["params"]["source"]["type"], "string");
+    assert_eq!(
+        turn_start["example"]["response"]["status"],
+        serde_json::json!("started")
     );
 }
 

@@ -44,6 +44,7 @@ mod turn_bridge;
 
 pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
+pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
 
 use std::collections::HashMap;
