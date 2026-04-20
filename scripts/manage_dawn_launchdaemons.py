@@ -477,14 +477,27 @@ def resolve_job_artifacts(
     )
 
 
+class ScheduleOverrideError(RuntimeError):
+    """Raised when a temporary launchd plist override cannot be built safely."""
+
+
 def build_schedule_override(source_plist: Path, *, hour: int, minute: int) -> Path:
-    with source_plist.open("rb") as handle:
-        plist = plistlib.load(handle)
+    try:
+        with source_plist.open("rb") as handle:
+            plist = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise ScheduleOverrideError(
+            f"failed to build schedule override from `{source_plist}`: {exc}"
+        ) from exc
     plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
     tmp = tempfile.NamedTemporaryFile(prefix="dawn-launchd-", suffix=".plist", delete=False)
     try:
         with open(tmp.name, "wb") as handle:
             plistlib.dump(plist, handle)
+    except OSError as exc:
+        raise ScheduleOverrideError(
+            f"failed to write schedule override for `{source_plist}`: {exc}"
+        ) from exc
     finally:
         tmp.close()
     return Path(tmp.name)
@@ -590,13 +603,20 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
                     if index != len(jobs) - 1:
                         summary_lines.append("")
                     continue
-            result = run_manager(
-                resolved,
-                args.action,
-                python_bin=manager_python,
-                hour=args.hour,
-                minute=args.minute,
-            )
+            try:
+                result = run_manager(
+                    resolved,
+                    args.action,
+                    python_bin=manager_python,
+                    hour=args.hour,
+                    minute=args.minute,
+                )
+            except ScheduleOverrideError as exc:
+                all_ok = False
+                summary_lines.extend(summarize_resolution_error(job_name, exc))
+                if index != len(jobs) - 1:
+                    summary_lines.append("")
+                continue
             if result.returncode != 0:
                 all_ok = False
             summary_lines.extend(summarize_result(job_name, result))

@@ -638,6 +638,63 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
         run_manager.assert_called_once()
         self.assertEqual(run_manager.call_args.args[0], managed_job)
 
+    def test_render_batch_summary_reports_schedule_override_error_per_job(self) -> None:
+        args = argparse.Namespace(
+            action="install",
+            job=["memory-dream", "service-monitoring"],
+            hour=5,
+            minute=30,
+            python_bin="/usr/bin/python3",
+            sudoers_user="agentdesk-runtime",
+            skills_root=None,
+            as_root=False,
+        )
+        first_job = MODULE.ResolvedDawnJob(
+            name="memory-dream",
+            skill_root=Path("/Users/agentdesk/.codex/skills/memory-dream"),
+            manager_script=Path("/Users/agentdesk/.codex/skills/memory-dream/scripts/manage_memory_dream_launchd.py"),
+            daemon_plist=Path("/Users/agentdesk/.codex/skills/memory-dream/launchd/com.agentdesk.memory-dream-dawn.plist"),
+        )
+        second_job = MODULE.ResolvedDawnJob(
+            name="service-monitoring",
+            skill_root=Path("/Users/agentdesk/.codex/skills/service-monitoring"),
+            manager_script=Path("/Users/agentdesk/.codex/skills/service-monitoring/scripts/manage_service_monitoring_launchd.py"),
+            daemon_plist=Path("/Users/agentdesk/.codex/skills/service-monitoring/launchd/com.agentdesk.service-monitoring-dawn.plist"),
+        )
+        run_result = subprocess.CompletedProcess(["python3"], 0, stdout="ok", stderr="")
+
+        with mock.patch.object(MODULE, "candidate_skills_roots", return_value=[Path("/Users/agentdesk/.codex/skills")]):
+            with mock.patch.object(MODULE, "effective_manager_python", return_value=Path("/usr/bin/python3")):
+                with mock.patch.object(
+                    MODULE,
+                    "resolve_job_artifacts",
+                    side_effect=[first_job, second_job],
+                ):
+                    with mock.patch.object(
+                        MODULE,
+                        "run_manager",
+                        side_effect=[
+                            MODULE.ScheduleOverrideError("failed to build schedule override from `/tmp/bad.plist`: malformed"),
+                            run_result,
+                        ],
+                    ) as run_manager:
+                        with mock.patch("builtins.print") as print_mock:
+                            rc = MODULE.render_batch_summary(
+                                args,
+                                [
+                                    ("memory-dream", MODULE.JOB_SPECS["memory-dream"]),
+                                    ("service-monitoring", MODULE.JOB_SPECS["service-monitoring"]),
+                                ],
+                            )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(run_manager.call_count, 2)
+        rendered = print_mock.call_args.args[0]
+        self.assertIn("## memory-dream", rendered)
+        self.assertIn("failed to build schedule override", rendered)
+        self.assertIn("## service-monitoring", rendered)
+        self.assertIn("- output: `ok`", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
