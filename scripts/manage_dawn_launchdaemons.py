@@ -611,7 +611,7 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
                     hour=args.hour,
                     minute=args.minute,
                 )
-            except ScheduleOverrideError as exc:
+            except (OSError, ScheduleOverrideError) as exc:
                 all_ok = False
                 summary_lines.extend(summarize_resolution_error(job_name, exc))
                 if index != len(jobs) - 1:
