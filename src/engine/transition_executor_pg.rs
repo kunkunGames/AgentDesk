@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pg_transition_intent_variants_mutate_expected_rows() {
+    async fn transition_intent_variants_mutate_expected_rows_pg_coverage() {
         let test_db = TestDatabase::create().await;
         let pool = test_db.migrate().await;
 
