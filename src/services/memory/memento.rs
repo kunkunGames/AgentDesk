@@ -1303,6 +1303,29 @@ fn format_context_payload_for_external_recall(payload: &Value) -> Option<String>
         ));
     }
 
+    let procedure_memory_lines = payload
+        .get("auxiliary")
+        .and_then(Value::as_object)
+        .and_then(|auxiliary| auxiliary.get("procedureMemory"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines_with_seen(
+                &mut global_seen,
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+    if !procedure_memory_lines.is_empty() {
+        sections.push(format!(
+            "[PROCEDURE MEMORY]\n- {}",
+            procedure_memory_lines.join("\n- ")
+        ));
+    }
+
     let decision_memory_lines = payload
         .get("auxiliary")
         .and_then(Value::as_object)
@@ -1824,6 +1847,13 @@ mod tests {
                         "score": 0.92
                     }
                 ],
+                "procedureMemory": [
+                    {
+                        "content": "Run schema migration before restarting workers",
+                        "type": "procedure",
+                        "score": 0.915
+                    }
+                ],
                 "decisionMemory": [
                     {
                         "content": "Use canonical skill names in routing memory",
@@ -1852,9 +1882,11 @@ mod tests {
 
         assert!(formatted.contains("[LEARNING MEMORY]"));
         assert!(formatted.contains("[ERROR PLAYBOOK]"));
+        assert!(formatted.contains("[PROCEDURE MEMORY]"));
         assert!(formatted.contains("[DECISION MEMORY]"));
         assert!(formatted.contains("[OPEN QUESTIONS MEMORY]"));
         assert!(formatted.contains("[CASE MEMORY]"));
+        assert!(formatted.contains("Run schema migration before restarting workers"));
         assert!(formatted.contains(
             "issue-418 [resolved] | goal: Ship bootstrap hardening | outcome: ContextText threaded into context()"
         ));
@@ -1919,6 +1951,14 @@ mod tests {
                         "content": "Finish #344",
                         "type": "procedure",
                         "score": 0.93
+                    }
+                ]
+            },
+            "auxiliary": {
+                "procedureMemory": [
+                    {
+                        "content": "Run schema migration before restarting workers.",
+                        "type": "procedure"
                     }
                 ]
             },
@@ -2012,6 +2052,8 @@ mod tests {
         assert!(external_recall.contains("Finish #344"));
         assert!(external_recall.contains("Replace placeholder Memento backend"));
         assert!(external_recall.contains("Use /health for Memento health checks."));
+        assert!(external_recall.contains("[PROCEDURE MEMORY]"));
+        assert!(external_recall.contains("Run schema migration before restarting workers."));
         assert!(external_recall.contains("Remember to clear resolved errors."));
         assert!(recall.shared_knowledge.is_none());
         assert!(recall.longterm_catalog.is_none());
