@@ -215,6 +215,20 @@ def path_is_root_owned_and_locked(path: Path) -> bool:
         current = parent
 
 
+def ensure_locked_directory_chain(path: Path, *, anchor: Path, mode: int = 0o755) -> None:
+    path = path.expanduser()
+    anchor = anchor.expanduser()
+    if anchor != path and anchor not in path.parents:
+        raise ValueError(f"{path} must stay under managed anchor {anchor}")
+    path.mkdir(parents=True, exist_ok=True)
+    current = path
+    while True:
+        os.chmod(current, mode)
+        if current == anchor:
+            break
+        current = current.parent
+
+
 def path_is_executable(path: Path) -> bool:
     return path.exists() and os.access(path, os.X_OK)
 
@@ -267,8 +281,7 @@ def resolve_managed_job_artifacts(job_name: str, spec: DawnJobSpec) -> ResolvedD
 
 
 def copy_locked_file(source: Path, target: Path, *, mode: int) -> Path:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(target.parent, 0o755)
+    ensure_locked_directory_chain(target.parent, anchor=MANAGED_ENTRYPOINT_DIR)
     tmp = tempfile.NamedTemporaryFile(prefix=f"{target.name}-", dir=target.parent, delete=False)
     tmp_path = Path(tmp.name)
     tmp.close()
@@ -305,8 +318,7 @@ def install_managed_job_artifacts(source_job: ResolvedDawnJob, spec: DawnJobSpec
 
 def install_managed_entrypoint(source_path: Path = SCRIPT_PATH) -> Path:
     target = managed_entrypoint_target()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(target.parent, 0o755)
+    ensure_locked_directory_chain(target.parent, anchor=MANAGED_ENTRYPOINT_DIR)
     tmp = tempfile.NamedTemporaryFile(prefix="agentdesk-dawn-manager-", dir=target.parent, delete=False)
     tmp_path = Path(tmp.name)
     tmp.close()
@@ -759,6 +771,7 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
     manager_python = trusted_root_python_bin()
     managed_script = managed_entrypoint_target()
     managed_script_exists = managed_script.exists()
+    prefer_managed_artifacts = privileged_root_requested(args) or managed_script_exists
     if path_is_executable(python_bin):
         try:
             version_result = run_command([str(python_bin), "--version"])
@@ -795,7 +808,7 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         try:
             resolved = (
                 resolve_managed_job_artifacts(job_name, spec)
-                if privileged_root_requested(args)
+                if prefer_managed_artifacts
                 else resolve_job_artifacts(job_name, spec, skills_roots=skills_roots)
             )
         except FileNotFoundError as exc:

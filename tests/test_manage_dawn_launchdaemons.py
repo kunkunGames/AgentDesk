@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -175,10 +176,27 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
             target = Path(tmpdir) / "libexec/agentdesk/manage_dawn_launchdaemons.py"
 
             with mock.patch.object(MODULE, "managed_entrypoint_target", return_value=target):
-                installed = MODULE.install_managed_entrypoint(SCRIPT_PATH)
-                self.assertEqual(installed, target)
-                self.assertTrue(target.exists())
-                self.assertEqual(target.read_text(encoding="utf-8"), SCRIPT_PATH.read_text(encoding="utf-8"))
+                with mock.patch.object(MODULE, "MANAGED_ENTRYPOINT_DIR", target.parent):
+                    installed = MODULE.install_managed_entrypoint(SCRIPT_PATH)
+                    self.assertEqual(installed, target)
+                    self.assertTrue(target.exists())
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        SCRIPT_PATH.read_text(encoding="utf-8"),
+                    )
+
+    def test_ensure_locked_directory_chain_normalizes_existing_managed_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            anchor = Path(tmpdir) / "agentdesk"
+            nested = anchor / "skills/memory-dream/scripts"
+            nested.mkdir(parents=True, exist_ok=True)
+            for path in [anchor, anchor / "skills", anchor / "skills/memory-dream", nested]:
+                os.chmod(path, 0o775)
+
+            MODULE.ensure_locked_directory_chain(nested, anchor=anchor)
+
+            for path in [anchor, anchor / "skills", anchor / "skills/memory-dream", nested]:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o755)
 
     def test_status_as_root_is_treated_as_privileged_probe(self) -> None:
         args = argparse.Namespace(action="status", as_root=False)
@@ -338,6 +356,80 @@ class ManageDawnLaunchdaemonsTests(unittest.TestCase):
 
         self.assertEqual(seen["python_bin"], Path("/usr/bin/python3"))
         self.assertIsNone(seen["script_path"])
+
+    def test_preflight_prefers_managed_artifacts_when_managed_entrypoint_exists(self) -> None:
+        args = argparse.Namespace(
+            action="preflight",
+            job=None,
+            hour=None,
+            minute=None,
+            python_bin="/opt/homebrew/bin/python3",
+            sudoers_user="agentdesk",
+            skills_root=None,
+            as_root=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            managed_script = tmpdir_path / "manage_dawn_launchdaemons.py"
+            managed_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            managed_job = MODULE.ResolvedDawnJob(
+                name="memory-dream",
+                skill_root=tmpdir_path / "skills/memory-dream",
+                manager_script=tmpdir_path / "skills/memory-dream/scripts/manage_memory_dream_launchd.py",
+                daemon_plist=tmpdir_path / "skills/memory-dream/launchd/com.agentdesk.memory-dream-dawn.plist",
+            )
+            managed_job.manager_script.parent.mkdir(parents=True, exist_ok=True)
+            managed_job.manager_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            managed_job.daemon_plist.parent.mkdir(parents=True, exist_ok=True)
+            managed_job.daemon_plist.write_text(
+                "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"></plist>\n",
+                encoding="utf-8",
+            )
+            seen: dict[str, Path] = {}
+
+            def fake_validate(
+                job: MODULE.ResolvedDawnJob,
+                python_bin: Path,
+                script_path: Path | None = None,
+            ) -> None:
+                self.assertEqual(job, managed_job)
+                seen["python_bin"] = python_bin
+                seen["script_path"] = script_path
+
+            def fake_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+                if command == ["/opt/homebrew/bin/python3", "--version"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="Python 3.12.0\n", stderr="")
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with mock.patch.object(MODULE, "candidate_skills_roots", return_value=[Path("/tmp/skills")]):
+                with mock.patch.object(MODULE, "managed_entrypoint_target", return_value=managed_script):
+                    with mock.patch.object(MODULE, "trusted_root_python_bin", return_value=Path("/usr/bin/python3")):
+                        with mock.patch.object(MODULE, "resolve_managed_job_artifacts", return_value=managed_job):
+                            with mock.patch.object(
+                                MODULE,
+                                "resolve_job_artifacts",
+                                side_effect=AssertionError("preflight should use managed artifacts once bootstrap installed them"),
+                            ):
+                                with mock.patch.object(MODULE, "plist_valid", return_value=True):
+                                    with mock.patch.object(
+                                        MODULE,
+                                        "validate_privileged_job_artifacts",
+                                        side_effect=fake_validate,
+                                    ):
+                                        with mock.patch.object(
+                                            MODULE,
+                                            "build_preflight_probe_command",
+                                            return_value=["sudo", "-n", "/usr/bin/python3", str(managed_script), "status"],
+                                        ):
+                                            with mock.patch.object(MODULE, "run_command", side_effect=fake_run):
+                                                with mock.patch("builtins.print"):
+                                                    MODULE.render_preflight(
+                                                        args,
+                                                        [("memory-dream", MODULE.JOB_SPECS["memory-dream"])],
+                                                    )
+
+            self.assertEqual(seen["python_bin"], Path("/usr/bin/python3"))
+            self.assertEqual(seen["script_path"], managed_script)
 
     def test_root_preflight_uses_trusted_python_for_version_probe(self) -> None:
         args = argparse.Namespace(
