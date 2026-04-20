@@ -193,6 +193,16 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn write_test_skill(runtime_root: &std::path::Path, skill_name: &str, description: &str) {
+    let skill_dir = runtime_root.join("skills").join(skill_name);
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("# {skill_name}\n\n{description}\n"),
+    )
+    .unwrap();
+}
+
 struct MockGhOverride {
     _dir: tempfile::TempDir,
     _env: EnvVarGuard,
@@ -4154,6 +4164,296 @@ async fn api_docs_unknown_category_returns_not_found() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_docs_category_exposes_skill_prune_and_filter_params() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/skills")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["category"], "skills");
+
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("skills detail must include endpoint array");
+    let catalog = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "GET" && ep["path"] == "/api/skills/catalog")
+        .expect("skills catalog endpoint must be documented");
+    assert_eq!(catalog["params"]["include_stale"]["location"], "query");
+    assert_eq!(catalog["params"]["include_stale"]["type"], "boolean");
+
+    let prune = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/skills/prune")
+        .expect("skills prune endpoint must be documented");
+    assert_eq!(prune["params"]["dry_run"]["location"], "query");
+    assert_eq!(prune["params"]["dry_run"]["type"], "boolean");
+}
+
+#[tokio::test]
+async fn skills_catalog_filters_stale_entries_and_exposes_disk_presence() {
+    let _env_lock = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let runtime_root = home.path().join(".adk").join("release");
+    write_test_skill(&runtime_root, "live-skill", "Live skill description");
+    let _home_env = EnvVarGuard::set_path("HOME", home.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", &runtime_root);
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skills (id, name, description, source_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            libsql_rusqlite::params![
+                "stale-skill",
+                "stale-skill",
+                "Stale skill description",
+                home.path()
+                    .join("missing")
+                    .join("stale-skill")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["live-skill", "agent-live", "session-live"],
+        )
+        .unwrap();
+    }
+
+    let app = axum::Router::new().nest("/api", test_api_router(db, engine, None));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog?include_stale=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let catalog = json["catalog"]
+        .as_array()
+        .expect("catalog response must include a catalog array");
+    let live = catalog
+        .iter()
+        .find(|entry| entry["name"] == "live-skill")
+        .expect("live skill must be present when include_stale=true");
+    assert_eq!(live["disk_present"], true);
+    let stale = catalog
+        .iter()
+        .find(|entry| entry["name"] == "stale-skill")
+        .expect("stale skill must be present when include_stale=true");
+    assert_eq!(stale["disk_present"], false);
+
+    let filtered = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_body = axum::body::to_bytes(filtered.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let filtered_json: serde_json::Value = serde_json::from_slice(&filtered_body).unwrap();
+    let filtered_catalog = filtered_json["catalog"]
+        .as_array()
+        .expect("filtered catalog response must include a catalog array");
+    assert!(
+        filtered_catalog
+            .iter()
+            .any(|entry| entry["name"] == "live-skill"),
+        "default catalog response must keep live skills"
+    );
+    assert!(
+        filtered_catalog
+            .iter()
+            .all(|entry| entry["name"] != "stale-skill"),
+        "default catalog response must filter stale skills"
+    );
+}
+
+#[tokio::test]
+async fn skills_prune_dry_run_previews_and_delete_preserves_usage() {
+    let _env_lock = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let runtime_root = home.path().join(".adk").join("release");
+    write_test_skill(&runtime_root, "live-skill", "Live skill description");
+    let _home_env = EnvVarGuard::set_path("HOME", home.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", &runtime_root);
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skills (id, name, description, source_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            libsql_rusqlite::params![
+                "stale-skill",
+                "stale-skill",
+                "Stale skill description",
+                home.path()
+                    .join("missing")
+                    .join("stale-skill")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+        )
+        .unwrap();
+    }
+
+    let app = axum::Router::new().nest("/api", test_api_router(db.clone(), engine, None));
+    let dry_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/skills/prune?dry_run=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(dry_run.status(), StatusCode::OK);
+    let dry_run_body = axum::body::to_bytes(dry_run.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let dry_run_json: serde_json::Value = serde_json::from_slice(&dry_run_body).unwrap();
+    assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(dry_run_json["deleted_from_skills"], 0);
+    assert!(
+        dry_run_json["stale_skill_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "stale-skill"),
+        "dry-run must preview stale skill ids"
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skills WHERE id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 1, "dry-run must not delete skills rows");
+    }
+
+    let prune = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/skills/prune")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(prune.status(), StatusCode::OK);
+    let prune_body = axum::body::to_bytes(prune.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let prune_json: serde_json::Value = serde_json::from_slice(&prune_body).unwrap();
+    assert_eq!(prune_json["deleted_from_skills"], 1);
+    assert_eq!(prune_json["skill_usage_policy"], "preserved");
+
+    {
+        let conn = db.lock().unwrap();
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skills WHERE id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 0, "prune must delete stale skill metadata");
+
+        let usage_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skill_usage WHERE skill_id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage_count, 1, "prune must preserve historical skill usage");
+    }
+
+    let filtered = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_body = axum::body::to_bytes(filtered.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let filtered_json: serde_json::Value = serde_json::from_slice(&filtered_body).unwrap();
+    let filtered_catalog = filtered_json["catalog"]
+        .as_array()
+        .expect("catalog response must include a catalog array");
+    assert!(
+        filtered_catalog
+            .iter()
+            .all(|entry| entry["name"] != "stale-skill"),
+        "default catalog response must hide pruned stale skills"
+    );
 }
 
 #[tokio::test]

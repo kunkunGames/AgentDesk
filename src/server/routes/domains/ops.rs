@@ -106,6 +106,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route("/skills/catalog", get(skills_api::catalog))
             .route("/skills/ranking", get(skills_api::ranking))
+            .route("/skills/prune", post(skills_api::prune))
             .route("/cron-jobs", get(cron_api::list_cron_jobs))
             .route("/auto-queue/generate", post(auto_queue::generate))
             .route("/auto-queue/dispatch", post(auto_queue::dispatch))
