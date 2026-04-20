@@ -112,7 +112,7 @@ impl DispatchService {
         })
     }
 
-    pub fn create_dispatch(
+    pub async fn create_dispatch(
         &self,
         input: CreateDispatchInput,
     ) -> ServiceResult<CreateDispatchResult> {
@@ -120,21 +120,115 @@ impl DispatchService {
             .dispatch_type
             .unwrap_or_else(|| "implementation".to_string());
         let context = input.context.unwrap_or_else(|| json!({}));
-        let options = dispatch::DispatchCreateOptions {
+        let base_options = dispatch::DispatchCreateOptions {
             skip_outbox: input.skip_outbox.unwrap_or(false),
             ..Default::default()
         };
+        let options = dispatch::DispatchCreateOptions {
+            sidecar_dispatch: base_options.sidecar_dispatch
+                || context
+                    .get("sidecar_dispatch")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                || context
+                    .get("phase_gate")
+                    .and_then(|value| value.as_object())
+                    .is_some(),
+            ..base_options
+        };
 
-        match dispatch::create_dispatch_with_options(
-            &self.db,
-            &self.engine,
-            &input.kanban_card_id,
-            &input.to_agent_id,
-            &dispatch_type,
-            &input.title,
-            &context,
-            options,
-        ) {
+        let Some(pg_pool) = self.engine.pg_pool() else {
+            return match dispatch::create_dispatch_with_options(
+                &self.db,
+                None,
+                &self.engine,
+                &input.kanban_card_id,
+                &input.to_agent_id,
+                &dispatch_type,
+                &input.title,
+                &context,
+                options,
+            ) {
+                Ok(dispatch) => {
+                    let was_reused = dispatch
+                        .get("__reused")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    Ok(CreateDispatchResult {
+                        dispatch,
+                        status: if was_reused {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::CREATED
+                        },
+                    })
+                }
+                Err(error) => {
+                    let message = format!("{error}");
+                    if message.contains("not found") {
+                        Err(ServiceError::not_found(message).with_code(ErrorCode::Dispatch))
+                    } else if message.starts_with("Cannot create ")
+                        || message.contains("already exists")
+                    {
+                        Err(ServiceError::conflict(message).with_code(ErrorCode::Dispatch))
+                    } else {
+                        Err(ServiceError::internal(message).with_code(ErrorCode::Dispatch))
+                    }
+                }
+            };
+        };
+
+        let result: anyhow::Result<serde_json::Value> = async {
+            let (dispatch_id, old_status, reused) = dispatch::create_dispatch_core_with_options(
+                pg_pool,
+                &input.kanban_card_id,
+                &input.to_agent_id,
+                &dispatch_type,
+                &input.title,
+                &context,
+                options,
+            )
+            .await?;
+            let mut dispatch = dispatch::query_dispatch_row_pg(pg_pool, &dispatch_id).await?;
+            if reused {
+                dispatch["__reused"] = json!(true);
+                return Ok(dispatch);
+            }
+            if !options.sidecar_dispatch {
+                crate::pipeline::ensure_loaded();
+                let (card_repo_id, card_agent_id) =
+                    sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                        "SELECT repo_id, assigned_agent_id
+                         FROM kanban_cards
+                         WHERE id = $1",
+                    )
+                    .bind(&input.kanban_card_id)
+                    .fetch_optional(pg_pool)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Card not found: {}", input.kanban_card_id))?;
+                let effective = crate::pipeline::resolve_for_card_pg(
+                    pg_pool,
+                    card_repo_id.as_deref(),
+                    card_agent_id.as_deref(),
+                )
+                .await;
+                let kickoff_owned = effective.kickoff_for(&old_status).unwrap_or_else(|| {
+                    tracing::error!("Pipeline has no kickoff state for hook firing");
+                    effective.initial_state().to_string()
+                });
+                crate::kanban::fire_state_hooks(
+                    &self.db,
+                    &self.engine,
+                    &input.kanban_card_id,
+                    &old_status,
+                    &kickoff_owned,
+                );
+            }
+            Ok(dispatch)
+        }
+        .await;
+
+        match result {
             Ok(dispatch) => {
                 let was_reused = dispatch
                     .get("__reused")
@@ -188,17 +282,17 @@ impl DispatchService {
             return Ok(dispatch);
         }
 
-        if let Some(status) = input.status.as_deref() {
-            if !VALID_DISPATCH_STATUSES.contains(&status) {
-                return Err(ServiceError::bad_request(format!(
-                    "invalid dispatch status '{}' — allowed values: {}",
-                    status,
-                    VALID_DISPATCH_STATUSES.join(", ")
-                ))
-                .with_code(ErrorCode::Validation)
-                .with_context("dispatch_id", id)
-                .with_context("status", status));
-            }
+        if let Some(status) = input.status.as_deref()
+            && !VALID_DISPATCH_STATUSES.contains(&status)
+        {
+            return Err(ServiceError::bad_request(format!(
+                "invalid dispatch status '{}' — allowed values: {}",
+                status,
+                VALID_DISPATCH_STATUSES.join(", ")
+            ))
+            .with_code(ErrorCode::Validation)
+            .with_context("dispatch_id", id)
+            .with_context("status", status));
         }
 
         let conn = self.db.lock().map_err(|e| {

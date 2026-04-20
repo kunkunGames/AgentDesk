@@ -208,12 +208,27 @@ mod tests {
 
     #[test]
     fn test_tmux_exit_reason_round_trip() {
+        let _lock = crate::services::discord::runtime_store::lock_test_env();
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_host = std::env::var_os("HOSTNAME");
+        unsafe {
+            std::env::set_var("AGENTDESK_ROOT_DIR", "/tmp/agentdesk-test-runtime");
+            std::env::set_var("HOSTNAME", "agentdesk-test-host");
+        }
         let session = format!("AgentDesk-test-{}", std::process::id());
         clear_tmux_exit_reason(&session);
         record_tmux_exit_reason(&session, "explicit cleanup: /stop");
         let diag = build_tmux_death_diagnostic(&session, None).unwrap();
         assert!(diag.contains("explicit cleanup: /stop"));
         clear_tmux_exit_reason(&session);
+        match previous_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+        match previous_host {
+            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
+            None => unsafe { std::env::remove_var("HOSTNAME") },
+        }
     }
 
     #[test]

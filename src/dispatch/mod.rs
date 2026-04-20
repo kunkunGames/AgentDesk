@@ -14,6 +14,8 @@ mod dispatch_status;
 
 #[cfg(test)]
 use dispatch_channel::provider_from_channel_suffix;
+#[cfg(test)]
+pub(crate) use dispatch_context::resolve_card_worktree_sqlite_test;
 #[allow(unused_imports)]
 pub(crate) use dispatch_context::{
     DispatchSessionStrategy, REVIEW_QUALITY_CHECKLIST, REVIEW_QUALITY_SCOPE_REMINDER,
@@ -25,15 +27,22 @@ pub(crate) use dispatch_context::{
 };
 #[cfg(test)]
 use dispatch_context::{
-    ReviewTargetTrust, TargetRepoSource, build_review_context, inject_review_merge_base_context,
+    ReviewTargetTrust, TargetRepoSource, build_review_context_sqlite_test,
+    inject_review_merge_base_context,
 };
 #[allow(unused_imports)]
 pub(crate) use dispatch_create::apply_dispatch_attached_intents_on_conn;
+pub(crate) use dispatch_create::query_dispatch_row_pg;
 #[allow(unused_imports)]
 pub use dispatch_create::{
     create_dispatch, create_dispatch_core, create_dispatch_core_with_id,
     create_dispatch_core_with_id_and_options, create_dispatch_core_with_options,
     create_dispatch_with_options,
+};
+#[cfg(test)]
+pub(crate) use dispatch_create::{
+    create_dispatch_core_sqlite_test, create_dispatch_core_with_id_and_options_sqlite_test,
+    create_dispatch_core_with_id_sqlite_test,
 };
 #[allow(unused_imports)]
 pub use dispatch_status::{complete_dispatch, finalize_dispatch, mark_dispatch_completed};
@@ -47,6 +56,35 @@ pub(crate) use dispatch_status::{
 pub struct DispatchCreateOptions {
     pub skip_outbox: bool,
     pub sidecar_dispatch: bool,
+}
+
+/// Cancel reasons that represent an explicit operator stop, not a system
+/// retry or supersession (#815). When we see one of these reasons we
+/// preserve the user's intent by moving the linked auto-queue entry to a
+/// non-dispatchable terminal status instead of resetting it back to
+/// `pending`, which would let the next tick re-dispatch the same work.
+const USER_CANCEL_REASONS: &[&str] = &["turn_bridge_cancelled"];
+
+/// Returns true when the supplied cancel reason represents a user /
+/// external explicit stop. Matches either an exact reason in
+/// [`USER_CANCEL_REASONS`] or any reason with the `user_` prefix so
+/// future operator-initiated stops can opt in without editing the
+/// whitelist.
+pub(crate) fn is_user_cancel_reason(reason: Option<&str>) -> bool {
+    let Some(reason) = reason else {
+        return false;
+    };
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if USER_CANCEL_REASONS
+        .iter()
+        .any(|candidate| *candidate == trimmed)
+    {
+        return true;
+    }
+    trimmed.starts_with("user_")
 }
 
 /// Cancel a live dispatch and reset any linked auto-queue entry back to pending.
@@ -112,12 +150,30 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
 
+        // #815: user / external explicit stops must move the entry to a
+        // non-dispatchable terminal status so the next auto-queue tick does
+        // not immediately re-dispatch the same entry. System cancels (retry
+        // exhausted, supersession, etc.) keep the existing pending reset so
+        // re-dispatch proceeds.
+        let user_cancel = is_user_cancel_reason(reason);
+        let (target_status, trigger_source) = if user_cancel {
+            (
+                crate::db::auto_queue::ENTRY_STATUS_USER_CANCELLED,
+                "dispatch_cancel_user",
+            )
+        } else {
+            (
+                crate::db::auto_queue::ENTRY_STATUS_PENDING,
+                "dispatch_cancel",
+            )
+        };
+
         for entry_id in entry_ids {
             crate::db::auto_queue::update_entry_status_on_conn(
                 conn,
                 &entry_id,
-                crate::db::auto_queue::ENTRY_STATUS_PENDING,
-                "dispatch_cancel",
+                target_status,
+                trigger_source,
                 &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
             )
             .map_err(|error| match error {
@@ -282,43 +338,43 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
     .await
     .map_err(|error| format!("load postgres queue entries for dispatch {dispatch_id}: {error}"))?;
 
+    // #815: user / external explicit stops must move the entry to a
+    // non-dispatchable terminal status so the next auto-queue tick does
+    // not immediately re-dispatch the same entry. System cancels keep
+    // the existing pending reset so re-dispatch proceeds.
+    //
+    // #815 P2: route both branches through the shared
+    // `update_entry_status_on_pg_tx` helper so the PG path mirrors the SQLite
+    // path (`update_entry_status_on_conn`). Going via the helper validates
+    // the transition, records `auto_queue_entry_transitions` consistently,
+    // and (for system-terminal target statuses) invokes
+    // `maybe_finalize_run_after_terminal_entry_pg`. `user_cancelled` is
+    // intentionally non-finalizing per P1 — see the helper's comment.
+    let user_cancel = is_user_cancel_reason(reason);
+    let (target_status, trigger_source) = if user_cancel {
+        (
+            crate::db::auto_queue::ENTRY_STATUS_USER_CANCELLED,
+            "dispatch_cancel_user",
+        )
+    } else {
+        (
+            crate::db::auto_queue::ENTRY_STATUS_PENDING,
+            "dispatch_cancel",
+        )
+    };
+
     for row in entry_rows {
         let entry_id: String = row.try_get("id").map_err(|error| {
             format!("decode postgres queue entry id for {dispatch_id}: {error}")
         })?;
-        let from_status: String = row.try_get("status").map_err(|error| {
-            format!("decode postgres queue entry status for {entry_id}: {error}")
-        })?;
-        let entry_changed = sqlx::query(
-            "UPDATE auto_queue_entries
-             SET status = 'pending',
-                 dispatch_id = NULL,
-                 slot_index = NULL,
-                 dispatched_at = NULL,
-                 completed_at = NULL
-             WHERE id = $1
-               AND status = $2",
+        crate::db::auto_queue::update_entry_status_on_pg_tx(
+            tx,
+            &entry_id,
+            target_status,
+            trigger_source,
+            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
         )
-        .bind(&entry_id)
-        .bind(&from_status)
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| format!("reset postgres queue entry {entry_id}: {error}"))?
-        .rows_affected() as usize;
-        if entry_changed > 0 {
-            let _ = sqlx::query(
-                "INSERT INTO auto_queue_entry_transitions (
-                    entry_id,
-                    from_status,
-                    to_status,
-                    trigger_source
-                ) VALUES ($1, $2, 'pending', 'dispatch_cancel')",
-            )
-            .bind(&entry_id)
-            .bind(&from_status)
-            .execute(&mut **tx)
-            .await;
-        }
+        .await?;
     }
 
     Ok(changed)
@@ -697,6 +753,11 @@ pub fn drain_unified_thread_kill_signals() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::build_review_context_sqlite_test as build_review_context;
+    use super::create_dispatch_core_sqlite_test as create_dispatch_core_test;
+    use super::create_dispatch_core_with_id_and_options_sqlite_test as create_dispatch_core_with_id_and_options;
+    use super::create_dispatch_core_with_id_sqlite_test as create_dispatch_core_with_id;
+    use super::resolve_card_worktree_sqlite_test as resolve_card_worktree;
     use super::*;
     use std::process::Command;
     use std::sync::MutexGuard;
@@ -1242,6 +1303,293 @@ mod tests {
         );
     }
 
+    // ── #815 regression: user reaction-stop must not re-dispatch ──────
+    //
+    // Exercises the full user-cancel flow against the canonical sqlite
+    // schema (the real `migrate()` tables are created by `test_db()`):
+    //
+    //   (a) auto-queue activates a dispatch for an entry;
+    //   (b) the user cancels the dispatch with
+    //       `turn_cancel_reason = turn_bridge_cancelled`, which must move
+    //       the linked entry to `user_cancelled` (non-dispatchable) rather
+    //       than resetting to `pending`, and must NOT mark the card `done`;
+    //   (c) a subsequent auto-queue tick-style lookup for `pending` entries
+    //       must not find this entry — i.e. it is NOT re-dispatchable;
+    //   (d) the system-cancel path (reason = `superseded_by_reseed`)
+    //       keeps the old behaviour: entry resets to `pending` and the
+    //       next tick can re-pick it up.
+    fn seed_user_cancel_fixture(db: &Db, card_id: &str, dispatch_id: &str, entry_id: &str) {
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES (?1, 'User Cancel Card', 'in_progress', 'agent-1', datetime('now'), datetime('now'))",
+            [card_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+             VALUES (?1, ?2, 'agent-1', 'implementation', 'dispatched', 'User Cancel', datetime('now'), datetime('now'))",
+            libsql_rusqlite::params![dispatch_id, card_id],
+        )
+        .unwrap();
+        // Use a per-card run id so fixtures from sibling tests do not collide
+        // when multiple regression assertions seed rows against the same DB.
+        let run_id = format!("run-{entry_id}");
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
+             VALUES (?1, 'repo', 'agent-1', 'active')",
+            [&run_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries \
+                 (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
+             VALUES (?1, ?2, ?3, 'agent-1', 'dispatched', ?4, datetime('now'))",
+            libsql_rusqlite::params![entry_id, run_id, card_id, dispatch_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn user_cancel_reason_whitelist_matches_turn_bridge_and_user_prefix() {
+        assert!(
+            is_user_cancel_reason(Some("turn_bridge_cancelled")),
+            "reaction-stop reason must be classified as a user cancel"
+        );
+        assert!(
+            is_user_cancel_reason(Some("user_reaction_stop")),
+            "any user_-prefixed reason must classify as user cancel"
+        );
+        assert!(
+            !is_user_cancel_reason(Some("superseded_by_reseed")),
+            "supersession is a system cancel"
+        );
+        assert!(
+            !is_user_cancel_reason(Some("auto_cancelled_on_terminal_card")),
+            "terminal-card cleanup is a system cancel"
+        );
+        assert!(!is_user_cancel_reason(None));
+        assert!(!is_user_cancel_reason(Some("")));
+        assert!(!is_user_cancel_reason(Some("   ")));
+    }
+
+    #[test]
+    fn cancel_dispatch_with_user_reason_moves_entry_to_user_cancelled() {
+        let db = test_db();
+        seed_user_cancel_fixture(&db, "card-815-user", "dispatch-815-user", "entry-815-user");
+
+        let conn = db.separate_conn().unwrap();
+        let cancelled = cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            "dispatch-815-user",
+            Some("turn_bridge_cancelled"),
+        )
+        .unwrap();
+        assert_eq!(cancelled, 1);
+
+        let dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'dispatch-815-user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_status, "cancelled");
+
+        let (entry_status, entry_dispatch_id, completed_at): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_id, completed_at FROM auto_queue_entries WHERE id = 'entry-815-user'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "user_cancelled",
+            "user cancel must transition entry to non-dispatchable user_cancelled"
+        );
+        assert!(
+            entry_dispatch_id.is_none(),
+            "user_cancelled entry must detach from its dispatch"
+        );
+        assert!(
+            completed_at.is_some(),
+            "user_cancelled entry must stamp completed_at so run-finalization treats it as terminal"
+        );
+
+        // (c) simulate the auto-queue tick query — a `pending` entry in an
+        // active run would be re-dispatched. `user_cancelled` must NOT be.
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE r.status = 'active' AND e.status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_count, 0,
+            "next auto-queue tick must not find the user-cancelled entry"
+        );
+        assert!(
+            crate::db::auto_queue::is_dispatchable_entry_status("pending"),
+            "pending entries must remain dispatchable"
+        );
+        assert!(
+            !crate::db::auto_queue::is_dispatchable_entry_status("user_cancelled"),
+            "user_cancelled must be non-dispatchable"
+        );
+
+        // Card must NOT have been force-transitioned to done by the cancel
+        // path. It stays in its prior status (in_progress) so the user can
+        // restart work deliberately.
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-815-user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            card_status, "in_progress",
+            "user cancel must not mark the card done"
+        );
+
+        // #815 P1: the run must NOT be auto-finalized when the last live
+        // entry transitions to `user_cancelled`. If it were `completed`,
+        // there is no API path that could re-open it (`restore` only takes
+        // `cancelled`/`restoring`, `resume` only reopens `paused`,
+        // `activate()` only promotes `generated`/`pending`), so flipping the
+        // entry back to `pending` would strand it inside a completed run.
+        let run_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_runs WHERE id = 'run-entry-815-user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            run_status, "active",
+            "user cancel must leave the run resumable, not auto-complete it"
+        );
+    }
+
+    // #815 P1: after a user cancel, the operator must be able to restart the
+    // entry by flipping it back to `pending`. The next auto-queue tick must
+    // then see it as re-dispatchable.
+    #[test]
+    fn user_cancelled_entry_can_be_restarted_via_pending_flip() {
+        let db = test_db();
+        seed_user_cancel_fixture(
+            &db,
+            "card-815-restart",
+            "dispatch-815-restart",
+            "entry-815-restart",
+        );
+
+        let conn = db.separate_conn().unwrap();
+        cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            "dispatch-815-restart",
+            Some("turn_bridge_cancelled"),
+        )
+        .unwrap();
+
+        // Confirm the precondition: entry is `user_cancelled`, run is still active.
+        let (entry_status, run_status): (String, String) = conn
+            .query_row(
+                "SELECT e.status, r.status \
+                 FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE e.id = 'entry-815-restart'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(entry_status, "user_cancelled");
+        assert_eq!(run_status, "active");
+
+        // Operator restart: flip the entry back to `pending` via the same
+        // shared helper the API/policy paths use. The transition table
+        // includes (user_cancelled -> pending) for exactly this case.
+        let restart_result = crate::db::auto_queue::update_entry_status_on_conn(
+            &conn,
+            "entry-815-restart",
+            crate::db::auto_queue::ENTRY_STATUS_PENDING,
+            "user_restart",
+            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            restart_result.changed,
+            "restart must transition user_cancelled -> pending"
+        );
+        assert_eq!(restart_result.from_status, "user_cancelled");
+        assert_eq!(restart_result.to_status, "pending");
+
+        // The next auto-queue tick (modeled here as the same JOIN the tick
+        // uses to find dispatchable work) must now see the entry again.
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE r.status = 'active' AND e.status = 'pending' AND e.id = 'entry-815-restart'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_count, 1,
+            "after restart, the entry must be re-dispatchable by the next tick"
+        );
+    }
+
+    #[test]
+    fn cancel_dispatch_with_system_reason_preserves_pending_reset() {
+        let db = test_db();
+        seed_user_cancel_fixture(&db, "card-815-sys", "dispatch-815-sys", "entry-815-sys");
+
+        let conn = db.separate_conn().unwrap();
+        let cancelled = cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            "dispatch-815-sys",
+            Some("superseded_by_reseed"),
+        )
+        .unwrap();
+        assert_eq!(cancelled, 1);
+
+        let (entry_status, entry_dispatch_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_id FROM auto_queue_entries WHERE id = 'entry-815-sys'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "pending",
+            "system cancels must still reset the entry to pending"
+        );
+        assert!(
+            entry_dispatch_id.is_none(),
+            "system cancel must still clear the stale dispatch pointer"
+        );
+
+        // The entry must remain re-dispatchable by the tick.
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE r.status = 'active' AND e.status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_count, 1,
+            "system cancels must leave the entry visible to the next tick"
+        );
+    }
+
     #[test]
     fn provider_from_channel_suffix_supports_gemini() {
         assert_eq!(provider_from_channel_suffix("agent-cc"), Some("claude"));
@@ -1390,8 +1738,8 @@ mod tests {
         let engine = test_engine(&db);
         seed_card(&db, "card-core", "ready");
 
-        // create_dispatch_core returns (dispatch_id, old_status, reused)
-        let (dispatch_id, old_status, _reused) = create_dispatch_core(
+        // sqlite dispatch-core helper returns (dispatch_id, old_status, reused)
+        let (dispatch_id, old_status, _reused) = create_dispatch_core_test(
             &db,
             "card-core",
             "agent-1",
@@ -1520,7 +1868,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-session-default", "ready");
 
-        let (dispatch_id, _, _) = create_dispatch_core(
+        let (dispatch_id, _, _) = create_dispatch_core_test(
             &db,
             "card-session-default",
             "agent-1",
@@ -1550,7 +1898,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-session-override", "ready");
 
-        let (dispatch_id, _, _) = create_dispatch_core(
+        let (dispatch_id, _, _) = create_dispatch_core_test(
             &db,
             "card-session-override",
             "agent-1",
@@ -1579,7 +1927,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-session-review-decision", "review");
 
-        let (dispatch_id, _, _) = create_dispatch_core(
+        let (dispatch_id, _, _) = create_dispatch_core_test(
             &db,
             "card-session-review-decision",
             "agent-1",
@@ -1704,7 +2052,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-done-core", "done");
 
-        let result = create_dispatch_core(
+        let result = create_dispatch_core_test(
             &db,
             "card-done-core",
             "agent-1",
@@ -1720,7 +2068,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-missing-agent", "ready");
 
-        let result = create_dispatch_core(
+        let result = create_dispatch_core_test(
             &db,
             "card-missing-agent",
             "agent-missing",
@@ -1759,7 +2107,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result = create_dispatch_core(
+        let result = create_dispatch_core_test(
             &db,
             "card-no-channel",
             "agent-1",
@@ -1831,7 +2179,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result = create_dispatch_core(
+        let result = create_dispatch_core_test(
             &db,
             "card-bad-thread",
             "agent-1",
@@ -2625,7 +2973,7 @@ mod tests {
         let db = test_db();
         seed_card(&db, "card-flag", "ready");
 
-        let (id1, _, reused1) = create_dispatch_core(
+        let (id1, _, reused1) = create_dispatch_core_test(
             &db,
             "card-flag",
             "agent-1",
@@ -2636,7 +2984,7 @@ mod tests {
         .unwrap();
         assert!(!reused1, "first creation must not be reused");
 
-        let (id2, _, reused2) = create_dispatch_core(
+        let (id2, _, reused2) = create_dispatch_core_test(
             &db,
             "card-flag",
             "agent-1",
@@ -2782,7 +3130,7 @@ mod tests {
         set_card_issue_number(&db, "card-missing-mapping", 515);
         set_card_repo_id(&db, "card-missing-mapping", "owner/missing");
 
-        let err = create_dispatch_core(
+        let err = create_dispatch_core_test(
             &db,
             "card-missing-mapping",
             "agent-1",
@@ -4116,7 +4464,7 @@ mod tests {
         assert_eq!(parsed["target_repo"], external_repo_dir);
     }
 
-    /// #762 round-2 (A): when `create_dispatch_core` pre-injects the card's
+    /// #762 round-2 (A): when the dispatch-core path pre-injects the card's
     /// `target_repo` into the context before calling `build_review_context`,
     /// the fail-closed filter for unrecoverable external target_repos must
     /// STILL engage. Previous behavior snapshotted `context["target_repo"]`
@@ -4194,7 +4542,7 @@ mod tests {
         // Invoke the real production path. The caller passes NO target_repo
         // override — `dispatch_create` will inject `card.repo_id`
         // (`card_repo_dir`) before calling `build_review_context`.
-        let (dispatch_id, _, _) = create_dispatch_core(
+        let (dispatch_id, _, _) = create_dispatch_core_test(
             &db,
             "card-review-762-a-core",
             "agent-1",
@@ -4240,11 +4588,11 @@ mod tests {
     /// filter.
     ///
     /// #761 merge note: under the merged design, the production
-    /// `create_dispatch_core` → `build_review_context` path always passes
+    /// the dispatch-core → `build_review_context` path always passes
     /// `ReviewTargetTrust::Untrusted`, which strips caller-supplied
     /// `target_repo` regardless of provenance. Trusted internal callers that
     /// legitimately pre-seed `target_repo` must therefore bypass
-    /// `create_dispatch_core` and invoke `build_review_context` directly with
+    /// the dispatch-core helper and invoke `build_review_context` directly with
     /// `ReviewTargetTrust::Trusted` + `TargetRepoSource::CallerSupplied`, which
     /// is exactly what this test now exercises.
     #[test]
@@ -4638,5 +4986,165 @@ mod tests {
             Some("Accepted review feedback: Ship it")
         );
         assert_eq!(dispatch["result"]["decision"], "accept");
+    }
+
+    // ── #821 invariants: cancel / terminal / done / reactivate ───────────
+    //
+    // These tests lock the runtime invariants protected by #815 (user cancel
+    // intent preservation) and related prior work. They are intentionally
+    // narrow regression guards that can be audited quickly rather than full
+    // integration tests. See `docs/FEATURES.md` for the broader state flow.
+
+    /// #821 (1): A user stop (reason `turn_bridge_cancelled`) must move the
+    /// linked auto-queue entry to `user_cancelled`, NOT reset it to `pending`.
+    /// The next auto-queue tick query (active run + pending entry) must not
+    /// find this entry, so no re-dispatch can fire.
+    #[test]
+    fn user_stop_does_not_redispatch() {
+        let db = test_db();
+        seed_user_cancel_fixture(&db, "card-821-nore", "dispatch-821-nore", "entry-821-nore");
+
+        let conn = db.separate_conn().unwrap();
+        cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            "dispatch-821-nore",
+            Some("turn_bridge_cancelled"),
+        )
+        .unwrap();
+
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-821-nore'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "user_cancelled",
+            "user stop must mark the entry non-dispatchable"
+        );
+
+        // Model the auto-queue tick's pick query: `active` run + `pending`
+        // entry. A re-dispatch would require the entry to surface here.
+        let pending_visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE r.status = 'active' AND e.status = 'pending' \
+                   AND e.id = 'entry-821-nore'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_visible, 0,
+            "user-cancelled entries must not be seen by the next auto-queue tick"
+        );
+        assert!(
+            !crate::db::auto_queue::is_dispatchable_entry_status("user_cancelled"),
+            "user_cancelled must be a non-dispatchable terminal status"
+        );
+    }
+
+    /// #821 (2): A user stop must leave the card's kanban status as-is
+    /// (`in_progress`). The cancel path must NOT force-transition the card
+    /// into `done` — that would bypass review and strand the user's explicit
+    /// stop as a silent auto-completion.
+    #[test]
+    fn user_stop_does_not_mark_done() {
+        let db = test_db();
+        seed_user_cancel_fixture(&db, "card-821-nd", "dispatch-821-nd", "entry-821-nd");
+
+        let conn = db.separate_conn().unwrap();
+        cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            "dispatch-821-nd",
+            Some("turn_bridge_cancelled"),
+        )
+        .unwrap();
+
+        let card_status: String = conn
+            .query_row(
+                "SELECT status FROM kanban_cards WHERE id = 'card-821-nd'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            card_status, "in_progress",
+            "user cancel must NOT force the card into a terminal status"
+        );
+        assert_ne!(card_status, "done");
+        assert_ne!(card_status, "review");
+    }
+
+    /// #821 (3): When a PMD/admin force-transitions a card back to a
+    /// non-terminal state (or terminal, via a different path), live dispatches
+    /// for that card must be cancelled WITHOUT resetting the linked auto-queue
+    /// entry to `pending`. `cancel_active_dispatches_for_card_on_conn` is the
+    /// helper that enforces this: it cancels dispatches in bulk but never
+    /// touches `auto_queue_entries`. A re-queue on terminal transition would
+    /// cause the run to redispatch work the operator just abandoned.
+    #[test]
+    fn terminal_card_cancels_live_dispatch_without_requeue() {
+        let db = test_db();
+        seed_user_cancel_fixture(&db, "card-821-tc", "dispatch-821-tc", "entry-821-tc");
+
+        let conn = db.separate_conn().unwrap();
+        let cancelled = cancel_active_dispatches_for_card_on_conn(
+            &conn,
+            "card-821-tc",
+            Some("auto_cancelled_on_terminal_card"),
+        )
+        .unwrap();
+        assert_eq!(cancelled, 1, "live dispatch must be cancelled");
+
+        // Live dispatch moves to cancelled.
+        let dispatch_status: String = conn
+            .query_row(
+                "SELECT status FROM task_dispatches WHERE id = 'dispatch-821-tc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dispatch_status, "cancelled");
+
+        // The auto-queue entry must NOT have been reset to `pending` by the
+        // terminal-cancel helper. It remains in its prior state (`dispatched`)
+        // with its dispatch_id pointer intact. Re-queueing here would let the
+        // next auto-queue tick re-pick the abandoned work.
+        let (entry_status, entry_dispatch_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, dispatch_id FROM auto_queue_entries WHERE id = 'entry-821-tc'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "dispatched",
+            "terminal cancel must NOT reset the auto-queue entry to pending"
+        );
+        assert_eq!(
+            entry_dispatch_id.as_deref(),
+            Some("dispatch-821-tc"),
+            "terminal cancel must leave the entry's dispatch pointer intact"
+        );
+
+        // Modeled tick query: the run is still active but no pending entry
+        // surfaces, so nothing re-dispatches.
+        let pending_visible: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM auto_queue_entries e \
+                 JOIN auto_queue_runs r ON e.run_id = r.id \
+                 WHERE r.status = 'active' AND e.status = 'pending' \
+                   AND e.kanban_card_id = 'card-821-tc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_visible, 0,
+            "terminal cancel must not make the entry pick-able by the tick"
+        );
     }
 }

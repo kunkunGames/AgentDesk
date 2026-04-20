@@ -246,6 +246,10 @@ impl std::error::Error for DispatchMessagePostError {}
 /// Discord delivery side-effects boundary.
 /// Keep business rules local and swap transport behavior in tests.
 pub(crate) trait DispatchTransport: Send + Sync {
+    fn pg_pool(&self) -> Option<&PgPool> {
+        None
+    }
+
     fn send_dispatch(
         &self,
         db: crate::db::Db,
@@ -302,6 +306,10 @@ impl HttpDispatchTransport {
 }
 
 impl DispatchTransport for HttpDispatchTransport {
+    fn pg_pool(&self) -> Option<&PgPool> {
+        self.pg_pool.as_ref()
+    }
+
     fn send_dispatch(
         &self,
         db: crate::db::Db,
@@ -3093,43 +3101,95 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
             );
         }
 
-        return match crate::dispatch::create_dispatch_core(
-            db,
-            card_id,
-            &agent_id,
-            "review-decision",
-            &format!("[리뷰 검토] {title}"),
-            &serde_json::Value::Object(decision_context),
-        ) {
-            Ok((id, _old_status, _reused)) => {
-                if let Ok(conn) = db.lock() {
-                    crate::engine::ops::review_state_sync_on_conn(
-                        &conn,
-                        &serde_json::json!({
-                            "card_id": card_id,
-                            "state": "suggestion_pending",
-                            "pending_dispatch_id": id,
-                            "last_verdict": verdict,
-                        })
-                        .to_string(),
+        if let Some(pool) = transport.pg_pool() {
+            return match crate::dispatch::create_dispatch_core(
+                pool,
+                card_id,
+                &agent_id,
+                "review-decision",
+                &format!("[리뷰 검토] {title}"),
+                &serde_json::Value::Object(decision_context),
+            )
+            .await
+            {
+                Ok((id, _old_status, _reused)) => {
+                    if let Ok(conn) = db.lock() {
+                        crate::engine::ops::review_state_sync_on_conn(
+                            &conn,
+                            &serde_json::json!({
+                                "card_id": card_id,
+                                "state": "suggestion_pending",
+                                "pending_dispatch_id": id,
+                                "last_verdict": verdict,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    tracing::info!(
+                        "[review-followup] enqueued review-decision dispatch {} for card {}",
+                        id,
+                        card_id
                     );
+                    Ok(())
                 }
-                tracing::info!(
-                    "[review-followup] enqueued review-decision dispatch {} for card {}",
-                    id,
-                    card_id
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[review-followup] skipping review-decision dispatch for card {card_id}: {e}"
-                );
-                Err(format!(
-                    "create_dispatch_core failed for review-decision: {e}"
-                ))
-            }
-        };
+                Err(e) => {
+                    tracing::warn!(
+                        "[review-followup] skipping review-decision dispatch for card {card_id}: {e}"
+                    );
+                    Err(format!(
+                        "dispatch-core create failed for review-decision: {e}"
+                    ))
+                }
+            };
+        }
+
+        #[cfg(test)]
+        {
+            return match crate::dispatch::create_dispatch_core_sqlite_test(
+                db,
+                card_id,
+                &agent_id,
+                "review-decision",
+                &format!("[리뷰 검토] {title}"),
+                &serde_json::Value::Object(decision_context),
+            ) {
+                Ok((id, _old_status, _reused)) => {
+                    if let Ok(conn) = db.lock() {
+                        crate::engine::ops::review_state_sync_on_conn(
+                            &conn,
+                            &serde_json::json!({
+                                "card_id": card_id,
+                                "state": "suggestion_pending",
+                                "pending_dispatch_id": id,
+                                "last_verdict": verdict,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    tracing::info!(
+                        "[review-followup] enqueued review-decision dispatch {} for card {}",
+                        id,
+                        card_id
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[review-followup] skipping review-decision dispatch for card {card_id}: {e}"
+                    );
+                    Err(format!(
+                        "create_dispatch_core failed for review-decision: {e}"
+                    ))
+                }
+            };
+        }
+
+        #[cfg(not(test))]
+        {
+            return Err(
+                "Postgres pool required for review-decision follow-up dispatch".to_string(),
+            );
+        }
     }
 
     let channel_id = {

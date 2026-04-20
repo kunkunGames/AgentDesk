@@ -10,11 +10,12 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, super::Data, Error>;
 const STREAMING_PLACEHOLDER_MARGIN: usize = 10;
 const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
+const THINKING_STATUS_MAX_BYTES: usize = 600;
+const TOOL_STATUS_MAX_BYTES: usize = 300;
 
-/// Byte budget for the inline preview kept alongside a .txt attachment when a
-/// message would otherwise have to be split. Leaves ~300 bytes of DISCORD_MSG_LIMIT
-/// for a truncation footer and any code-fence closure.
-const ATTACHMENT_PREVIEW_BYTES: usize = 1700;
+/// Inline footer appended to a summary when a long message is delivered as a
+/// `.txt` attachment via `/api/send`.
+const ATTACHMENT_FOOTER_PREFIX: &str = "📎 전문은 첨부 파일 참고";
 
 /// All available tools with (name, description, is_destructive)
 pub(super) const ALL_TOOLS: &[(&str, &str, bool)] = &[
@@ -352,54 +353,69 @@ mod tests {
     }
 
     #[test]
-    fn test_build_long_message_attachment_preview_fits_limit() {
-        use super::{ATTACHMENT_PREVIEW_BYTES, DISCORD_MSG_LIMIT, build_long_message_attachment};
+    fn test_build_long_message_attachment_without_summary_uses_generic_notice() {
+        use super::{DISCORD_MSG_LIMIT, build_long_message_attachment};
 
         let long: String = "A".repeat(DISCORD_MSG_LIMIT + 5000);
-        let (preview, _attachment) = build_long_message_attachment(&long);
+        let (inline, _attachment) = build_long_message_attachment(&long, None);
 
-        assert!(preview.len() <= DISCORD_MSG_LIMIT);
-        assert!(preview.contains("📎 전문 첨부"));
-        // The preview is anchored near the preview budget, not the full length.
-        assert!(preview.len() >= ATTACHMENT_PREVIEW_BYTES / 2);
+        assert!(inline.len() <= DISCORD_MSG_LIMIT);
+        assert!(inline.contains("전문을 파일로 첨부"));
+        // Must not embed a raw prefix of the source content.
+        assert!(
+            !inline.contains("AAAAAAAAAA"),
+            "inline should not leak body bytes: {inline}"
+        );
     }
 
     #[test]
-    fn test_build_long_message_attachment_closes_open_code_fence() {
-        use super::{DISCORD_MSG_LIMIT, build_attachment_preview};
+    fn test_build_long_message_attachment_with_summary_uses_summary() {
+        use super::{DISCORD_MSG_LIMIT, build_long_message_attachment};
 
-        // Open a fenced block near the top so the preview cut falls inside it.
-        let head = "```rust\n";
-        let body = "let x = 1;\n".repeat(500);
-        let tail = "```\nepilogue\n";
-        let text = format!("{head}{body}{tail}");
-        assert!(text.len() > DISCORD_MSG_LIMIT);
+        let body: String = "A".repeat(DISCORD_MSG_LIMIT + 5000);
+        let summary = "# AI 통합 브리핑\n- OpenAI: codex CLI 0.122.0-alpha 릴리스\n- Anthropic: Claude 4.7 1M context";
+        let (inline, _attachment) = build_long_message_attachment(&body, Some(summary));
 
-        let preview = build_attachment_preview(&text);
-        // Even-number of fences means the preview does not leave an open block.
-        let fence_count = preview
-            .lines()
-            .filter(|l| l.trim_start().starts_with("```"))
-            .count();
-        assert!(
-            fence_count % 2 == 0,
-            "preview has an unclosed code fence: {fence_count}"
-        );
-        assert!(preview.ends_with("생략)"));
+        assert!(inline.len() <= DISCORD_MSG_LIMIT);
+        assert!(inline.starts_with("# AI 통합 브리핑"));
+        assert!(inline.contains("전문은 첨부 파일 참고"));
+    }
+
+    #[test]
+    fn test_build_long_message_attachment_empty_summary_treated_as_none() {
+        use super::build_long_message_attachment;
+
+        let body: String = "A".repeat(5000);
+        let (inline, _attachment) = build_long_message_attachment(&body, Some("   \n  "));
+
+        assert!(inline.contains("전문을 파일로 첨부"));
+    }
+
+    #[test]
+    fn test_build_long_message_attachment_oversized_summary_falls_back() {
+        use super::{DISCORD_MSG_LIMIT, build_long_message_attachment};
+
+        let body: String = "A".repeat(DISCORD_MSG_LIMIT + 1000);
+        let huge_summary: String = "S".repeat(DISCORD_MSG_LIMIT + 100);
+        let (inline, _attachment) = build_long_message_attachment(&body, Some(&huge_summary));
+
+        assert!(inline.len() <= DISCORD_MSG_LIMIT);
+        assert!(inline.contains("전문을 파일로 첨부"));
+        assert!(!inline.contains("SSSSSSSSSS"));
     }
 
     #[test]
     fn test_build_long_message_attachment_utf8_safe_boundary() {
         use super::{DISCORD_MSG_LIMIT, build_long_message_attachment};
 
-        // Multi-byte characters that could straddle the preview budget.
+        // Multi-byte summary that sits near the limit.
         let text: String = "한글🙂".repeat(1500);
+        let summary: String = "요약 ".repeat(400);
         assert!(text.len() > DISCORD_MSG_LIMIT);
 
-        let (preview, _attachment) = build_long_message_attachment(&text);
-        // Preview must remain valid UTF-8 and fit the limit.
-        assert!(preview.is_char_boundary(preview.len()));
-        assert!(preview.len() <= DISCORD_MSG_LIMIT);
+        let (inline, _attachment) = build_long_message_attachment(&text, Some(&summary));
+        assert!(inline.is_char_boundary(inline.len()));
+        assert!(inline.len() <= DISCORD_MSG_LIMIT);
     }
 
     #[test]
@@ -465,6 +481,17 @@ mod tests {
         assert!(placeholder.len() <= DISCORD_MSG_LIMIT);
         assert!(placeholder.ends_with(&format!("\n\n{status_block}")));
         assert!(placeholder.starts_with('…'));
+    }
+
+    #[test]
+    fn test_build_streaming_placeholder_text_respects_utf8_limit_for_status_only() {
+        use super::{DISCORD_MSG_LIMIT, build_streaming_placeholder_text};
+
+        let status_block = &format!("⏳ {}", "🙂".repeat(1200));
+        let placeholder = build_streaming_placeholder_text("", status_block);
+
+        assert!(placeholder.len() <= DISCORD_MSG_LIMIT);
+        assert!(placeholder.ends_with('…'));
     }
 
     // ── filter_codex_tool_logs tests ─────────────────────────────────────
@@ -598,6 +625,18 @@ mod tests {
         );
         assert_eq!(placeholder, "⠋ ⚙ Bash: cargo build");
     }
+
+    #[test]
+    fn test_build_placeholder_status_block_keeps_utf8_text_within_byte_budget() {
+        let placeholder = build_placeholder_status_block(
+            "⠋",
+            None,
+            Some(&format!("💭 {}", "🙂".repeat(1200))),
+            "",
+        );
+        assert!(placeholder.len() <= super::THINKING_STATUS_MAX_BYTES + 16);
+        assert!(placeholder.ends_with('…'));
+    }
 }
 
 pub(super) fn floor_char_boundary(s: &str, index: usize) -> usize {
@@ -652,6 +691,7 @@ pub(super) struct StreamingRolloverPlan {
 }
 
 fn build_streaming_placeholder_snapshot(current_portion: &str, status_block: &str) -> String {
+    let status_block = clamp_placeholder_status_block(status_block);
     let footer = format!("\n\n{status_block}");
     let body_budget = DISCORD_MSG_LIMIT
         .saturating_sub(footer.len() + STREAMING_PLACEHOLDER_MARGIN)
@@ -670,6 +710,7 @@ pub(super) fn plan_streaming_rollover(
         return None;
     }
 
+    let status_block = clamp_placeholder_status_block(status_block);
     let footer = format!("\n\n{status_block}");
     let body_budget = DISCORD_MSG_LIMIT
         .saturating_sub(footer.len() + STREAMING_PLACEHOLDER_MARGIN)
@@ -677,7 +718,7 @@ pub(super) fn plan_streaming_rollover(
     let split_at = streaming_split_boundary(current_portion, body_budget)?;
 
     Some(StreamingRolloverPlan {
-        display_snapshot: build_streaming_placeholder_snapshot(current_portion, status_block),
+        display_snapshot: build_streaming_placeholder_snapshot(current_portion, &status_block),
         frozen_chunk: current_portion[..split_at].to_string(),
         split_at,
     })
@@ -688,7 +729,7 @@ pub(super) fn build_streaming_placeholder_text(
     status_block: &str,
 ) -> String {
     if current_portion.is_empty() {
-        status_block.to_string()
+        clamp_placeholder_status_block(status_block)
     } else {
         build_streaming_placeholder_snapshot(current_portion, status_block)
     }
@@ -1341,61 +1382,41 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Build an `(inline_preview, attachment)` pair for content that exceeds
-/// `DISCORD_MSG_LIMIT`. The preview contains the first safe-boundary-aligned
-/// prefix of `text` plus a footer indicating the omitted byte count; the
-/// attachment carries the full unmodified `text` as a `.txt` file.
-pub(super) fn build_long_message_attachment(text: &str) -> (String, CreateAttachment) {
+/// Build an `(inline_message, attachment)` pair for content that exceeds
+/// `DISCORD_MSG_LIMIT`. The attachment carries the full unmodified `text` as a
+/// `.txt` file. The inline message uses `summary` when provided (so the sender
+/// controls what humans see); otherwise it falls back to a short generic notice
+/// pointing at the attachment instead of dumping a blind byte-prefix of `text`.
+pub(super) fn build_long_message_attachment(
+    text: &str,
+    summary: Option<&str>,
+) -> (String, CreateAttachment) {
     let filename = format!(
         "response-{}.txt",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let attachment = CreateAttachment::bytes(text.as_bytes().to_vec(), filename);
-    let preview = build_attachment_preview(text);
-    (preview, attachment)
+    let inline = build_attachment_inline(text, summary);
+    (inline, attachment)
 }
 
-fn build_attachment_preview(text: &str) -> String {
-    let preview_budget = ATTACHMENT_PREVIEW_BYTES.min(text.len());
-    let safe_end = floor_char_boundary(text, preview_budget);
-    // Prefer to cut at a line boundary within the budget; fall back to the raw
-    // char-boundary offset if there is no newline in range.
-    let split_at = text[..safe_end].rfind('\n').map_or(safe_end, |idx| idx + 1);
-    let (head, _) = text.split_at(split_at);
-    let mut preview = head.to_string();
+fn build_attachment_inline(text: &str, summary: Option<&str>) -> String {
+    let footer = format!("\n\n{ATTACHMENT_FOOTER_PREFIX} ({} bytes)", text.len());
+    let trimmed_summary = summary.and_then(|s| {
+        let t = s.trim();
+        (!t.is_empty()).then_some(t)
+    });
 
-    // Close any unterminated fenced code block so Discord does not swallow the
-    // footer into a code block.
-    if count_code_fences(&preview) % 2 == 1 {
-        if !preview.ends_with('\n') {
-            preview.push('\n');
+    if let Some(summary) = trimmed_summary {
+        if summary.len() + footer.len() <= DISCORD_MSG_LIMIT {
+            return format!("{summary}{footer}");
         }
-        preview.push_str("```");
     }
 
-    let omitted_bytes = text.len() - split_at;
-    let footer = format!(
-        "\n\n📎 전문 첨부 ({} bytes 중 {} bytes 생략)",
-        text.len(),
-        omitted_bytes
-    );
-
-    // Defensive: ensure preview + footer fits below DISCORD_MSG_LIMIT even in
-    // pathological inputs (long codepoints, many code fences).
-    let total_len = preview.len() + footer.len();
-    if total_len > DISCORD_MSG_LIMIT {
-        let trim_target = DISCORD_MSG_LIMIT.saturating_sub(footer.len());
-        let trimmed = floor_char_boundary(&preview, trim_target);
-        preview.truncate(trimmed);
-    }
-    preview.push_str(&footer);
-    preview
-}
-
-fn count_code_fences(text: &str) -> usize {
-    text.lines()
-        .filter(|line| line.trim_start().starts_with("```"))
-        .count()
+    format!(
+        "📎 내용이 길어 전문을 파일로 첨부했습니다. ({} bytes)",
+        text.len()
+    )
 }
 
 /// Add reaction using raw HTTP reference
@@ -1498,12 +1519,13 @@ pub(super) fn preserve_previous_tool_status(
 
 /// Convert a technical tool status line into a human-friendly label with emoji.
 pub(super) fn humanize_tool_status(tool_line: &str) -> String {
-    // Thinking: show full text, cap at 600 chars (must leave room for body+footer within Discord 2000 char limit)
+    // Thinking: show more detail than tool invocations, but keep the final
+    // placeholder edit safely below Discord's byte limit even for UTF-8-heavy text.
     if tool_line.starts_with("💭") {
-        return truncate_for_status(tool_line, 600);
+        return truncate_for_status_bytes(tool_line, THINKING_STATUS_MAX_BYTES);
     }
-    // Everything else: show the raw tool line, truncated at 300 chars
-    truncate_for_status(tool_line, 300)
+    // Everything else: show the raw tool line, truncated more aggressively.
+    truncate_for_status_bytes(tool_line, TOOL_STATUS_MAX_BYTES)
 }
 
 /// Build the spinner/status block shown in Discord placeholders.
@@ -1520,11 +1542,21 @@ pub(super) fn build_placeholder_status_block(
     format!("{indicator} {tool_status}")
 }
 
-fn truncate_for_status(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{truncated}…")
+fn truncate_for_status_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
     }
+
+    let ellipsis = "…";
+    let body_budget = max_bytes.saturating_sub(ellipsis.len());
+    if body_budget == 0 {
+        return ellipsis.to_string();
+    }
+
+    let safe_end = floor_char_boundary(s, body_budget);
+    format!("{}{}", &s[..safe_end], ellipsis)
+}
+
+fn clamp_placeholder_status_block(status_block: &str) -> String {
+    truncate_for_status_bytes(status_block, DISCORD_MSG_LIMIT)
 }

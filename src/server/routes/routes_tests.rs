@@ -193,6 +193,16 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn write_test_skill(runtime_root: &std::path::Path, skill_name: &str, description: &str) {
+    let skill_dir = runtime_root.join("skills").join(skill_name);
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("# {skill_name}\n\n{description}\n"),
+    )
+    .unwrap();
+}
+
 struct MockGhOverride {
     _dir: tempfile::TempDir,
     _env: EnvVarGuard,
@@ -424,6 +434,10 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
                 axum::routing::post(|| async { StatusCode::CREATED }),
             )
             .route("/send", axum::routing::post(|| async { StatusCode::OK }))
+            .route(
+                "/send_to_agent",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
             .route("/senddm", axum::routing::post(|| async { StatusCode::OK }))
             .route("/settings", axum::routing::get(|| async { StatusCode::OK })),
         state.clone(),
@@ -480,6 +494,19 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
         .unwrap();
     assert_eq!(send_response.status(), StatusCode::UNAUTHORIZED);
 
+    let send_to_agent_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/send_to_agent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(send_to_agent_response.status(), StatusCode::UNAUTHORIZED);
+
     let senddm_response = app
         .oneshot(
             Request::builder()
@@ -510,9 +537,24 @@ async fn discord_control_endpoints_require_auth_token_on_non_loopback_host() {
         "10.0.0.5:8791".parse::<std::net::SocketAddr>().unwrap(),
     ));
 
-    let response = app.oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut send_to_agent_request = Request::builder()
+        .method("POST")
+        .uri("/send_to_agent")
+        .body(Body::from(r#"{"role_id":"ch-pd","message":"hello"}"#))
+        .unwrap();
+    send_to_agent_request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(
+            "10.0.0.5:8791".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+    let send_to_agent_response = app.oneshot(send_to_agent_request).await.unwrap();
+
+    assert_eq!(send_to_agent_response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -535,6 +577,33 @@ async fn discord_control_endpoints_allow_loopback_without_auth_token() {
     let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn send_to_agent_returns_not_found_for_unknown_role_id() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let health_registry = Arc::new(crate::services::discord::health::HealthRegistry::new());
+    let app = test_api_router(db, engine, Some(health_registry));
+
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/send_to_agent")
+        .body(Body::from(r#"{"role_id":"missing","message":"hello"}"#))
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:8791".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["error"], "unknown agent target: missing");
 }
 
 #[tokio::test]
@@ -4154,6 +4223,331 @@ async fn api_docs_unknown_category_returns_not_found() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_docs_category_exposes_send_to_agent_endpoint() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/discord")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["category"], "discord");
+
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("discord detail must include endpoint array");
+    let send_to_agent = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/send_to_agent")
+        .expect("send_to_agent endpoint must be documented");
+    assert_eq!(send_to_agent["params"]["role_id"]["location"], "body");
+    assert_eq!(send_to_agent["params"]["message"]["type"], "string");
+    assert_eq!(send_to_agent["params"]["mode"]["type"], "string");
+}
+
+#[tokio::test]
+async fn api_docs_category_exposes_skill_prune_and_filter_params() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/skills")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["category"], "skills");
+
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("skills detail must include endpoint array");
+    let catalog = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "GET" && ep["path"] == "/api/skills/catalog")
+        .expect("skills catalog endpoint must be documented");
+    assert_eq!(catalog["params"]["include_stale"]["location"], "query");
+    assert_eq!(catalog["params"]["include_stale"]["type"], "boolean");
+
+    let prune = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/skills/prune")
+        .expect("skills prune endpoint must be documented");
+    assert_eq!(prune["params"]["dry_run"]["location"], "query");
+    assert_eq!(prune["params"]["dry_run"]["type"], "boolean");
+}
+
+#[tokio::test]
+async fn skills_catalog_filters_stale_entries_and_exposes_disk_presence() {
+    let _env_lock = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let runtime_root = home.path().join(".adk").join("release");
+    write_test_skill(&runtime_root, "live-skill", "Live skill description");
+    let _home_env = EnvVarGuard::set_path("HOME", home.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", &runtime_root);
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skills (id, name, description, source_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            libsql_rusqlite::params![
+                "stale-skill",
+                "stale-skill",
+                "Stale skill description",
+                home.path()
+                    .join("missing")
+                    .join("stale-skill")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["live-skill", "agent-live", "session-live"],
+        )
+        .unwrap();
+    }
+
+    let app = axum::Router::new().nest("/api", test_api_router(db, engine, None));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog?include_stale=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let catalog = json["catalog"]
+        .as_array()
+        .expect("catalog response must include a catalog array");
+    let live = catalog
+        .iter()
+        .find(|entry| entry["name"] == "live-skill")
+        .expect("live skill must be present when include_stale=true");
+    assert_eq!(live["disk_present"], true);
+    let stale = catalog
+        .iter()
+        .find(|entry| entry["name"] == "stale-skill")
+        .expect("stale skill must be present when include_stale=true");
+    assert_eq!(stale["disk_present"], false);
+
+    let filtered = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_body = axum::body::to_bytes(filtered.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let filtered_json: serde_json::Value = serde_json::from_slice(&filtered_body).unwrap();
+    let filtered_catalog = filtered_json["catalog"]
+        .as_array()
+        .expect("filtered catalog response must include a catalog array");
+    assert!(
+        filtered_catalog
+            .iter()
+            .any(|entry| entry["name"] == "live-skill"),
+        "default catalog response must keep live skills"
+    );
+    assert!(
+        filtered_catalog
+            .iter()
+            .all(|entry| entry["name"] != "stale-skill"),
+        "default catalog response must filter stale skills"
+    );
+}
+
+#[tokio::test]
+async fn skills_prune_dry_run_previews_and_delete_preserves_usage() {
+    let _env_lock = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    let runtime_root = home.path().join(".adk").join("release");
+    write_test_skill(&runtime_root, "live-skill", "Live skill description");
+    let _home_env = EnvVarGuard::set_path("HOME", home.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", &runtime_root);
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skills (id, name, description, source_path, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            libsql_rusqlite::params![
+                "stale-skill",
+                "stale-skill",
+                "Stale skill description",
+                home.path()
+                    .join("missing")
+                    .join("stale-skill")
+                    .join("SKILL.md")
+                    .display()
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+        )
+        .unwrap();
+    }
+
+    let app = axum::Router::new().nest("/api", test_api_router(db.clone(), engine, None));
+    let dry_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/skills/prune?dry_run=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(dry_run.status(), StatusCode::OK);
+    let dry_run_body = axum::body::to_bytes(dry_run.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let dry_run_json: serde_json::Value = serde_json::from_slice(&dry_run_body).unwrap();
+    assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(dry_run_json["deleted_from_skills"], 0);
+    assert!(
+        dry_run_json["stale_skill_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "stale-skill"),
+        "dry-run must preview stale skill ids"
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skills WHERE id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 1, "dry-run must not delete skills rows");
+    }
+
+    let prune = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/skills/prune")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(prune.status(), StatusCode::OK);
+    let prune_body = axum::body::to_bytes(prune.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let prune_json: serde_json::Value = serde_json::from_slice(&prune_body).unwrap();
+    assert_eq!(prune_json["deleted_from_skills"], 1);
+    assert_eq!(prune_json["skill_usage_policy"], "preserved");
+
+    {
+        let conn = db.lock().unwrap();
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skills WHERE id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 0, "prune must delete stale skill metadata");
+
+        let usage_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skill_usage WHERE skill_id = 'stale-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage_count, 1, "prune must preserve historical skill usage");
+    }
+
+    let filtered = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/skills/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.status(), StatusCode::OK);
+    let filtered_body = axum::body::to_bytes(filtered.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let filtered_json: serde_json::Value = serde_json::from_slice(&filtered_body).unwrap();
+    let filtered_catalog = filtered_json["catalog"]
+        .as_array()
+        .expect("catalog response must include a catalog array");
+    assert!(
+        filtered_catalog
+            .iter()
+            .all(|entry| entry["name"] != "stale-skill"),
+        "default catalog response must hide pruned stale skills"
+    );
 }
 
 #[tokio::test]
@@ -10172,6 +10566,117 @@ async fn auto_queue_restore_run_restores_skipped_entries_by_card_state() {
         )
         .unwrap();
     assert_eq!(rebound_slots, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_cancel_restore_reloads_user_cancelled_entries() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+    seed_agent(&db, "agent-restore-user-cancelled");
+    seed_auto_queue_card(
+        &db,
+        "card-restore-user-cancelled",
+        1810,
+        "in_progress",
+        "agent-restore-user-cancelled",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-restore-user-cancelled', 'test-repo', 'agent-restore-user-cancelled', 'paused', 1, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, completed_at
+            ) VALUES (
+                'entry-restore-user-cancelled', 'run-restore-user-cancelled',
+                'card-restore-user-cancelled', 'agent-restore-user-cancelled',
+                'user_cancelled', 0, 0, datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let cancel_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/cancel?run_id=run-restore-user-cancelled")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(cancel_response.status(), StatusCode::OK);
+    let cancel_body = axum::body::to_bytes(cancel_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let cancel_json: serde_json::Value = serde_json::from_slice(&cancel_body).unwrap();
+    assert_eq!(cancel_json["cancelled_runs"], 1);
+    assert_eq!(cancel_json["cancelled_entries"], 1);
+
+    {
+        let conn = db.lock().unwrap();
+        let entry_status: String = conn
+            .query_row(
+                "SELECT status FROM auto_queue_entries WHERE id = 'entry-restore-user-cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entry_status, "skipped",
+            "run cancel must sweep user_cancelled entries into the restorable skipped bucket"
+        );
+    }
+
+    let restore_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/runs/run-restore-user-cancelled/restore")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(restore_response.status(), StatusCode::OK);
+    let restore_body = axum::body::to_bytes(restore_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let restore_json: serde_json::Value = serde_json::from_slice(&restore_body).unwrap();
+    assert_eq!(restore_json["ok"], true);
+    assert_eq!(restore_json["run_status"], "active");
+    assert_eq!(restore_json["restored_pending"], 1);
+    assert_eq!(restore_json["restored_done"], 0);
+    assert_eq!(restore_json["restored_dispatched"], 0);
+
+    let conn = db.lock().unwrap();
+    let entry_status: String = conn
+        .query_row(
+            "SELECT status FROM auto_queue_entries WHERE id = 'entry-restore-user-cancelled'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        entry_status, "pending",
+        "restore must reload swept user_cancelled entries instead of leaving them stranded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16596,6 +17101,130 @@ async fn auto_queue_cancel_pg_includes_restoring_runs() {
 }
 
 #[tokio::test]
+async fn auto_queue_cancel_pg_sweeps_user_cancelled_entries() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("test-repo")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (id, name, provider)
+         VALUES ($1, $2, $3)",
+    )
+    .bind("agent-cancel-user-cancelled-pg")
+    .bind("Agent Cancel User Cancelled PG")
+    .bind("claude")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id, github_issue_number
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind("card-cancel-user-cancelled-pg")
+    .bind("test-repo")
+    .bind("Cancel user_cancelled PG")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-cancel-user-cancelled-pg")
+    .bind(6600_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (
+            id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+         ) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind("run-cancel-user-cancelled-pg")
+    .bind("test-repo")
+    .bind("agent-cancel-user-cancelled-pg")
+    .bind("paused")
+    .bind(1_i64)
+    .bind(1_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, completed_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())",
+    )
+    .bind("entry-cancel-user-cancelled-pg")
+    .bind("run-cancel-user-cancelled-pg")
+    .bind("card-cancel-user-cancelled-pg")
+    .bind("agent-cancel-user-cancelled-pg")
+    .bind("user_cancelled")
+    .bind(0_i64)
+    .bind(0_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/cancel?run_id=run-cancel-user-cancelled-pg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "auto_queue_cancel_pg_sweeps_user_cancelled_entries status={} body={}",
+        status,
+        body_text
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["cancelled_runs"], 1);
+    assert_eq!(json["cancelled_entries"], 1);
+
+    let run_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM auto_queue_runs WHERE id = $1")
+            .bind("run-cancel-user-cancelled-pg")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(run_status, "cancelled");
+
+    let entry_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM auto_queue_entries WHERE id = $1")
+            .bind("entry-cancel-user-cancelled-pg")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        entry_status, "skipped",
+        "PG run cancel must sweep user_cancelled entries into skipped so restore semantics stay consistent"
+    );
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
 async fn auto_queue_cancel_surfaces_warning_when_slot_release_fails() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -18021,6 +18650,64 @@ fn auto_queue_recovery_completes_finished_non_phase_gate_runs_and_releases_slots
             "completed run must release slot {slot_index}"
         );
     }
+}
+
+#[test]
+fn auto_queue_recovery_keeps_user_cancelled_runs_active() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    ensure_auto_queue_tables(&db);
+
+    seed_agent(&db, "agent-user-cancelled-recovery");
+    seed_auto_queue_card(
+        &db,
+        "card-user-cancelled-recovery",
+        9017,
+        "in_progress",
+        "agent-user-cancelled-recovery",
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-user-cancelled-recovery', 'test-repo', 'agent-user-cancelled-recovery', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group, completed_at
+            ) VALUES (
+                'entry-user-cancelled-recovery', 'run-user-cancelled-recovery',
+                'card-user-cancelled-recovery', 'agent-user-cancelled-recovery',
+                'user_cancelled', 0, 0, datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    engine
+        .fire_hook(
+            crate::engine::hooks::Hook::OnTick1min,
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+    let conn = db.lock().unwrap();
+    let run_status: String = conn
+        .query_row(
+            "SELECT status FROM auto_queue_runs WHERE id = 'run-user-cancelled-recovery'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        run_status, "active",
+        "user_cancelled entries must block onTick1min from auto-completing the run"
+    );
 }
 
 #[test]

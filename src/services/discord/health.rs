@@ -6,7 +6,7 @@ use poise::serenity_prelude as serenity;
 use serde::Serialize;
 use serenity::{ChannelId, CreateMessage};
 
-use super::formatting::build_long_message_attachment;
+use super::formatting::{build_long_message_attachment, split_message};
 use super::{
     DISCORD_MSG_LIMIT, SharedData, clear_inflight_state, mailbox_cancel_active_turn,
     mailbox_clear_channel, mailbox_clear_recovery_marker, mailbox_finish_turn,
@@ -225,7 +225,7 @@ fn runtime_stop_wait_timeout() -> std::time::Duration {
     }
 }
 
-async fn stop_provider_channel_runtime_with_policy(
+pub(crate) async fn stop_provider_channel_runtime_with_policy(
     registry: &HealthRegistry,
     provider_name: &str,
     channel_id: ChannelId,
@@ -235,10 +235,7 @@ async fn stop_provider_channel_runtime_with_policy(
     let provider = ProviderKind::from_str(provider_name)?;
     let shared = shared_for_provider(registry, &provider).await?;
     let result = mailbox_cancel_active_turn(&shared, channel_id).await;
-    let cleanup_requested = matches!(
-        cleanup_policy,
-        super::TmuxCleanupPolicy::CleanupSession { .. }
-    );
+    let cleanup_requested = cleanup_policy.should_cleanup_tmux();
 
     if let Some(token) = result.token.as_ref() {
         let termination_recorded = if !result.already_stopping || cleanup_requested {
@@ -277,7 +274,9 @@ async fn stop_provider_channel_runtime_with_policy(
         .intervention_queue
         .len();
     mailbox_clear_recovery_marker(&shared, channel_id).await;
-    clear_inflight_state(&provider, channel_id.get());
+    if cleanup_policy.should_clear_inflight() {
+        clear_inflight_state(&provider, channel_id.get());
+    }
 
     Some(RuntimeTurnStopResult {
         lifecycle_path: "runtime-fallback",
@@ -1470,7 +1469,14 @@ fn resolve_send_target_channel_id(db: &Db, target: &str) -> Result<u64, SendTarg
 }
 
 /// Handle POST /api/send — agent-to-agent native routing.
-/// Accepts JSON: {"target":"channel:<id>|channel:<name>|agent:<roleId>", "content":"...", "source":"role-id", "bot":"announce|notify"}
+/// Accepts JSON: {"target":"channel:<id>|channel:<name>|agent:<roleId>", "content":"...", "source":"role-id", "bot":"announce|notify", "summary":"..."}
+///
+/// `summary` is optional. When `content` exceeds the Discord 2000-char limit,
+/// the full `content` is delivered as a `.txt` attachment; the inline message
+/// then uses `summary` (if provided) so the sender controls what humans see
+/// at a glance, or falls back to a short generic notice pointing at the
+/// attachment. Keeping attachment-based delivery (instead of chunk splitting)
+/// avoids firing one recipient turn per chunk.
 pub async fn send_message(
     registry: &HealthRegistry,
     db: &Db,
@@ -1478,6 +1484,7 @@ pub async fn send_message(
     content: &str,
     source: &str,
     bot: &str,
+    summary: Option<&str>,
 ) -> (&'static str, String) {
     if content.is_empty() {
         return (
@@ -1572,43 +1579,71 @@ pub async fn send_message(
         Err(resp) => return resp,
     };
 
-    // Overflow path: any content beyond DISCORD_MSG_LIMIT is delivered as an
-    // inline preview + `.txt` attachment so recipient agents still see
-    // opening context without the 2000-char split turning into two messages.
-    let send_result = if content.len() <= DISCORD_MSG_LIMIT {
+    // Overflow strategy depends on the bot:
+    //   - `announce` (agent-to-agent): deliver as a single inline message +
+    //     `.txt` attachment so chunk splits do not trigger one recipient turn
+    //     per chunk. Inline uses caller-supplied `summary` when present, else
+    //     a generic notice — never a raw byte-prefix of `content`.
+    //   - everything else (notify, etc.): human-facing alert channel with no
+    //     turn-trigger concern, so preserve the classic chunk-split behavior
+    //     for readability.
+    let overflowed = content.len() > DISCORD_MSG_LIMIT;
+    let use_attachment = overflowed && bot == "announce";
+    let chunked = overflowed && !use_attachment;
+    let send_result = if !overflowed {
         channel_id
             .send_message(&*http, CreateMessage::new().content(content))
             .await
-    } else {
-        let (preview, attachment) = build_long_message_attachment(content);
+    } else if use_attachment {
+        let (inline, attachment) = build_long_message_attachment(content, summary);
         channel_id
             .send_message(
                 &*http,
-                CreateMessage::new().content(preview).add_file(attachment),
+                CreateMessage::new().content(inline).add_file(attachment),
             )
             .await
+    } else {
+        let chunks = split_message(content);
+        let mut last: Result<_, serenity::Error> =
+            Err(serenity::Error::Other("split_message returned no chunks"));
+        for chunk in chunks {
+            last = channel_id
+                .send_message(&*http, CreateMessage::new().content(chunk))
+                .await;
+            if last.is_err() {
+                break;
+            }
+        }
+        last
     };
 
     match send_result {
-        Ok(_) => {
+        Ok(message) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             let emoji = if bot == "notify" { "🔔" } else { "📨" };
-            let attached = if content.len() > DISCORD_MSG_LIMIT {
+            let delivery_tag = if use_attachment {
                 " +attach"
+            } else if chunked {
+                " +split"
             } else {
                 ""
             };
             tracing::info!(
-                "  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot}{attached})"
+                "  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot}{delivery_tag})"
             );
             let mut response = serde_json::json!({
                 "ok": true,
                 "target": format!("channel:{channel_id}"),
+                "channel_id": channel_id.get().to_string(),
+                "message_id": message.id.get().to_string(),
                 "source": source,
                 "bot": bot,
+                "sent_at": message.timestamp.to_string(),
             });
-            if content.len() > DISCORD_MSG_LIMIT {
-                response["delivery"] = serde_json::Value::String("inline_preview+txt".to_string());
+            if use_attachment {
+                response["delivery"] = serde_json::Value::String("summary+txt".to_string());
+            } else if chunked {
+                response["delivery"] = serde_json::Value::String("chunked".to_string());
             }
             if target != format!("channel:{channel_id}") {
                 response["requested_target"] = serde_json::Value::String(target.to_string());
@@ -1644,8 +1679,83 @@ pub async fn handle_send<'a>(registry: &HealthRegistry, db: &Db, body: &str) -> 
         .get("bot")
         .and_then(|v| v.as_str())
         .unwrap_or("announce");
+    let summary = json.get("summary").and_then(|v| v.as_str());
 
-    send_message(registry, db, target, content, source, bot).await
+    send_message(registry, db, target, content, source, bot, summary).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedSendToAgentRequest {
+    role_id: String,
+    message: String,
+    mode: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_send_to_agent_body(body: &str) -> Result<ParsedSendToAgentRequest, &'static str> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|_| "invalid JSON")?;
+    let role_id = json
+        .get("role_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    if role_id.is_empty() {
+        return Err("role_id is required");
+    }
+
+    let message = json
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if message.is_empty() {
+        return Err("message is required");
+    }
+
+    let mode = json
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("announce");
+    if !matches!(mode, "announce" | "notify") {
+        return Err("mode must be announce or notify");
+    }
+
+    Ok(ParsedSendToAgentRequest {
+        role_id,
+        message,
+        mode: mode.to_string(),
+    })
+}
+
+pub async fn handle_send_to_agent(
+    registry: &HealthRegistry,
+    db: &Db,
+    body: &str,
+) -> (&'static str, String) {
+    let request = match parse_send_to_agent_body(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"ok": false, "error": error}).to_string(),
+            );
+        }
+    };
+
+    let target = format!("agent:{}", request.role_id);
+    send_message(
+        registry,
+        db,
+        &target,
+        &request.message,
+        "system",
+        &request.mode,
+        None,
+    )
+    .await
 }
 
 /// Handle POST /api/senddm — send a DM to a Discord user.
@@ -1930,6 +2040,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_send_to_agent_body_defaults_mode_to_announce() {
+        let body = r#"{"role_id":"ch-pd","message":"hello"}"#;
+        let parsed = parse_send_to_agent_body(body).expect("send_to_agent body should parse");
+        assert_eq!(
+            parsed,
+            ParsedSendToAgentRequest {
+                role_id: "ch-pd".to_string(),
+                message: "hello".to_string(),
+                mode: "announce".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_send_to_agent_body_accepts_notify_mode() {
+        let body = r#"{"role_id":"ch-pd","message":"hello","mode":"notify"}"#;
+        let parsed = parse_send_to_agent_body(body).expect("send_to_agent body should parse");
+        assert_eq!(parsed.mode, "notify");
+    }
+
+    #[test]
+    fn test_parse_send_to_agent_body_rejects_invalid_mode() {
+        let body = r#"{"role_id":"ch-pd","message":"hello","mode":"codex"}"#;
+        let error = parse_send_to_agent_body(body).unwrap_err();
+        assert_eq!(error, "mode must be announce or notify");
+    }
+
+    #[test]
     fn test_parse_senddm_body_without_reply_tracking() {
         let body = r#"{"user_id":"123","content":"hello","bot":"claude"}"#;
         let parsed = parse_senddm_body(body).expect("senddm body should parse");
@@ -2009,6 +2147,17 @@ mod tests {
             err,
             SendTargetResolutionError::NotFound("unknown agent target: missing".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn handle_send_to_agent_returns_not_found_for_unknown_role() {
+        let registry = HealthRegistry::new();
+        let db = test_db();
+        let (status, body) =
+            handle_send_to_agent(&registry, &db, r#"{"role_id":"missing","message":"hello"}"#)
+                .await;
+        assert_eq!(status, "404 Not Found");
+        assert!(body.contains("unknown agent target: missing"));
     }
 
     #[tokio::test]

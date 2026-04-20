@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, type DragEvent } from "react";
-import type { Agent, Department, DispatchedSession } from "../types";
+import type { Agent, Department, DispatchedSession, KanbanCard } from "../types";
 import type { UiLanguage } from "../i18n";
 import { localeName } from "../i18n";
 import * as api from "../api";
@@ -8,10 +8,16 @@ import { pickRandomSpritePair } from "./agent-manager/utils";
 import { BLANK, ICON_SPRITE_POOL } from "./agent-manager/constants";
 import type { FormData } from "./agent-manager/types";
 import AgentsTab from "./agent-manager/AgentsTab";
+import BacklogTab from "./agent-manager/BacklogTab";
 import DepartmentsTab from "./agent-manager/DepartmentsTab";
 import AgentFormModal from "./agent-manager/AgentFormModal";
 import DepartmentFormModal from "./agent-manager/DepartmentFormModal";
 import { SessionPanel } from "./session-panel/SessionPanel";
+import {
+  SurfaceActionButton,
+  SurfaceSection,
+  SurfaceSegmentButton,
+} from "./common/SurfacePrimitives";
 
 interface AgentManagerViewProps {
   agents: Agent[];
@@ -24,6 +30,8 @@ interface AgentManagerViewProps {
   onAssign?: (id: string, patch: Partial<DispatchedSession>) => Promise<void>;
   activeTab?: Tab;
   onTabChange?: (tab: Tab) => void;
+  kanbanCards?: KanbanCard[];
+  onSelectAgent?: (agent: Agent) => void;
   showHeader?: boolean;
   showTabBar?: boolean;
   title?: string;
@@ -31,7 +39,7 @@ interface AgentManagerViewProps {
   scrollable?: boolean;
 }
 
-type Tab = "agents" | "departments" | "dispatch";
+type Tab = "agents" | "departments" | "backlog" | "dispatch";
 
 export default function AgentManagerView({
   agents,
@@ -44,6 +52,8 @@ export default function AgentManagerView({
   onAssign,
   activeTab,
   onTabChange,
+  kanbanCards = [],
+  onSelectAgent,
   showHeader = true,
   showTabBar = true,
   title,
@@ -60,6 +70,8 @@ export default function AgentManagerView({
   // ── Tab state ──
   const [internalTab, setInternalTab] = useState<Tab>("agents");
   const tab = activeTab ?? internalTab;
+  const canShowDispatch = Boolean(sessions && onAssign);
+  const resolvedTab = tab === "dispatch" && !canShowDispatch ? "agents" : tab;
   const handleTabChange = useCallback((nextTab: Tab) => {
     if (activeTab === undefined) {
       setInternalTab(nextTab);
@@ -274,21 +286,101 @@ export default function AgentManagerView({
   }, []);
 
   const defaultTitle =
-    tab === "departments"
+    resolvedTab === "departments"
       ? tr("부서 관리", "Departments")
-      : tab === "dispatch"
+      : resolvedTab === "dispatch"
         ? tr("파견 세션", "Dispatch Sessions")
+        : resolvedTab === "backlog"
+        ? tr("백로그", "Backlog")
         : tr("직원 관리", "Agent Manager");
   const resolvedTitle = title ?? defaultTitle;
   const resolvedSubtitle = subtitle
-    ?? (tab === "departments"
+    ?? (resolvedTab === "departments"
       ? tr("부서 순서, 역할, 테마를 관리합니다.", "Manage department order, roles, and themes.")
-      : tab === "dispatch"
-        ? tr("감지된 AgentDesk 세션을 오피스에 배치합니다.", "Assign detected AgentDesk sessions into the office.")
+      : resolvedTab === "dispatch"
+        ? tr("감지된 AgentDesk 세션을 부서와 에이전트에 연결해 오피스 시각화에 투입합니다.", "Assign detected AgentDesk sessions into teams and agents for office visualization.")
+      : resolvedTab === "backlog"
+        ? tr("핵심 backlog를 테이블과 모바일 카드 스택으로 관리합니다.", "Review the current backlog in a table or mobile card stack.")
         : tr("에이전트 프로필, 스킬, 소속을 관리합니다.", "Manage agent profiles, skills, and office membership."));
+  const tabItems: Array<{
+    key: Tab;
+    id: string;
+    panelId: string;
+    testId: string;
+    label: string;
+  }> = [
+    {
+      key: "agents",
+      id: "agents-tab-button-agents",
+      panelId: "agents-tab-panel",
+      testId: "agents-tab-button-agents",
+      label: `${tr("직원", "Agents")} (${agents.length})`,
+    },
+    {
+      key: "departments",
+      id: "agents-tab-button-departments",
+      panelId: "agents-departments-tab-panel",
+      testId: "agents-tab-button-departments",
+      label: `${tr("부서", "Departments")} (${departments.length})`,
+    },
+    ...(canShowDispatch
+      ? [{
+          key: "dispatch" as const,
+          id: "agents-tab-button-dispatch",
+          panelId: "agents-dispatch-tab-panel",
+          testId: "agents-tab-button-dispatch",
+          label: `${tr("파견", "Dispatch")} (${sessions?.length ?? 0})`,
+        }]
+      : []),
+    {
+      key: "backlog",
+      id: "agents-tab-button-backlog",
+      panelId: "agents-backlog-tab-panel",
+      testId: "agents-tab-button-backlog",
+      label: `${tr("백로그", "Backlog")} (${kanbanCards.length})`,
+    },
+  ];
+  const headerActions = (
+    <div className="flex flex-wrap items-center gap-2">
+      {(showTabBar || resolvedTab === "departments") && resolvedTab !== "backlog" && resolvedTab !== "dispatch" && (
+        <SurfaceActionButton tone="neutral" onClick={openCreateDept}>
+          + {tr("부서 추가", "Add Dept")}
+        </SurfaceActionButton>
+      )}
+      {(showTabBar || resolvedTab === "agents") && resolvedTab !== "departments" && resolvedTab !== "backlog" && resolvedTab !== "dispatch" && (
+        <SurfaceActionButton onClick={openCreateAgent}>
+          + {tr("직원 채용", "Hire Agent")}
+        </SurfaceActionButton>
+      )}
+    </div>
+  );
+  const tabBar = showTabBar ? (
+    <div
+      data-testid="agents-tab-bar"
+      role="tablist"
+      aria-label={tr("직원 관리 섹션", "Agent manager sections")}
+      className="mt-4 flex flex-wrap gap-2"
+    >
+      {tabItems.map((item) => (
+        <SurfaceSegmentButton
+          key={item.key}
+          id={item.id}
+          data-testid={item.testId}
+          role="tab"
+          aria-selected={resolvedTab === item.key}
+          aria-controls={item.panelId}
+          active={resolvedTab === item.key}
+          onClick={() => handleTabChange(item.key)}
+        >
+          {item.label}
+        </SurfaceSegmentButton>
+      ))}
+    </div>
+  ) : null;
 
   return (
     <div
+      data-testid="agents-page"
       className={`mx-auto w-full max-w-5xl min-w-0 space-y-4 overflow-x-hidden p-4 pb-40 sm:p-6 ${
         scrollable ? "sm:h-full sm:overflow-y-auto" : ""
       }`}
@@ -299,87 +391,26 @@ export default function AgentManagerView({
       }}
     >
       {showHeader && (
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h1 className="text-xl font-bold" style={{ color: "var(--th-text-heading)" }}>
-              {resolvedTitle}
-            </h1>
-            {resolvedSubtitle && (
-              <p className="mt-1 text-sm" style={{ color: "var(--th-text-muted)" }}>
-                {resolvedSubtitle}
-              </p>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            {(showTabBar || tab === "departments") && tab !== "dispatch" && (
-              <button
-                onClick={openCreateDept}
-                className="rounded-lg border px-3 py-1.5 text-xs font-medium transition-opacity hover:opacity-100"
-                style={{
-                  borderColor: "color-mix(in srgb, var(--th-border) 64%, transparent)",
-                  background: "color-mix(in srgb, var(--th-card-bg) 88%, transparent)",
-                  color: "var(--th-text-secondary)",
-                }}
-              >
-                + {tr("부서 추가", "Add Dept")}
-              </button>
-            )}
-            {(showTabBar || tab === "agents") && tab !== "departments" && tab !== "dispatch" && (
-              <button
-                onClick={openCreateAgent}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-all"
-              >
-                + {tr("직원 채용", "Hire Agent")}
-              </button>
-            )}
-          </div>
-        </div>
+        <SurfaceSection
+          title={resolvedTitle}
+          description={resolvedSubtitle}
+          actions={headerActions}
+          className="rounded-[30px] p-4 sm:p-5"
+        >
+          {tabBar}
+        </SurfaceSection>
       )}
 
-      {showTabBar && (
-        <div className="flex gap-1" style={{ borderBottom: "1px solid var(--th-card-border)" }}>
-          <button
-            onClick={() => handleTabChange("agents")}
-            className={`px-4 py-2 text-sm font-medium transition-colors ${
-              tab === "agents" ? "text-blue-400 border-b-2 border-blue-400" : ""
-            }`}
-            style={tab !== "agents" ? { color: "var(--th-text-muted)" } : undefined}
-          >
-            {tr("직원", "Agents")} ({agents.length})
-          </button>
-          <button
-            onClick={() => handleTabChange("departments")}
-            className={`px-4 py-2 text-sm font-medium transition-colors ${
-              tab === "departments" ? "text-blue-400 border-b-2 border-blue-400" : ""
-            }`}
-            style={tab !== "departments" ? { color: "var(--th-text-muted)" } : undefined}
-          >
-            {tr("부서", "Departments")} ({departments.length})
-          </button>
-          {sessions && onAssign && (
-            <button
-              onClick={() => handleTabChange("dispatch")}
-              className={`px-4 py-2 text-sm font-medium transition-colors ${
-                tab === "dispatch" ? "text-blue-400 border-b-2 border-blue-400" : ""
-              }`}
-              style={tab !== "dispatch" ? { color: "var(--th-text-muted)" } : undefined}
-            >
-              {tr("파견", "Dispatch")} ({sessions.length})
-            </button>
-          )}
-        </div>
-      )}
+      {!showHeader && tabBar}
 
       {/* Tab content */}
-      {tab === "dispatch" && sessions && onAssign ? (
-        <SessionPanel
-          sessions={sessions}
-          departments={departments}
-          agents={agents}
-          onAssign={onAssign}
-        />
-      ) : tab === "agents" ? (
-        <div className="space-y-4">
+      {resolvedTab === "agents" ? (
+        <div
+          id="agents-tab-panel"
+          role="tabpanel"
+          aria-labelledby="agents-tab-button-agents"
+          className="space-y-4"
+        >
           <AgentsTab
             tr={tr}
             locale={locale}
@@ -396,6 +427,9 @@ export default function AgentManagerView({
             spriteMap={spriteMap}
             confirmDeleteId={confirmDeleteId}
             setConfirmDeleteId={setConfirmDeleteId}
+            onOpenAgent={(agent) =>
+              onSelectAgent ? onSelectAgent(agent) : openEditAgent(agent)
+            }
             onEditAgent={openEditAgent}
             onEditDepartment={openEditDept}
             onDeleteAgent={handleDeleteAgent}
@@ -403,27 +437,59 @@ export default function AgentManagerView({
             randomIconSprites={randomIconSprites}
           />
         </div>
+      ) : resolvedTab === "backlog" ? (
+        <div
+          id="agents-backlog-tab-panel"
+          role="tabpanel"
+          aria-labelledby="agents-tab-button-backlog"
+        >
+          <BacklogTab
+            tr={tr}
+            locale={locale}
+            cards={kanbanCards}
+            agents={agents}
+          />
+        </div>
+      ) : resolvedTab === "dispatch" && sessions && onAssign ? (
+        <div
+          id="agents-dispatch-tab-panel"
+          role="tabpanel"
+          aria-labelledby="agents-tab-button-dispatch"
+        >
+          <SessionPanel
+            sessions={sessions}
+            departments={departments}
+            agents={agents}
+            onAssign={onAssign}
+          />
+        </div>
       ) : (
-        <DepartmentsTab
-          tr={tr}
-          locale={locale}
-          agents={agents}
-          departments={departments}
-          deptOrder={deptOrder}
-          deptOrderDirty={deptOrderDirty}
-          reorderSaving={reorderSaving}
-          draggingDeptId={draggingDeptId}
-          dragOverDeptId={dragOverDeptId}
-          dragOverPosition={dragOverPosition}
-          onSaveOrder={handleSaveOrder}
-          onCancelOrder={handleCancelOrder}
-          onMoveDept={handleMoveDept}
-          onEditDept={openEditDept}
-          onDragStart={handleDragStart}
-          onDragOver={handleDragOver}
-          onDrop={handleDrop}
-          onDragEnd={handleDragEnd}
-        />
+        <div
+          id="agents-departments-tab-panel"
+          role="tabpanel"
+          aria-labelledby="agents-tab-button-departments"
+        >
+          <DepartmentsTab
+            tr={tr}
+            locale={locale}
+            agents={agents}
+            departments={departments}
+            deptOrder={deptOrder}
+            deptOrderDirty={deptOrderDirty}
+            reorderSaving={reorderSaving}
+            draggingDeptId={draggingDeptId}
+            dragOverDeptId={dragOverDeptId}
+            dragOverPosition={dragOverPosition}
+            onSaveOrder={handleSaveOrder}
+            onCancelOrder={handleCancelOrder}
+            onMoveDept={handleMoveDept}
+            onEditDept={openEditDept}
+            onDragStart={handleDragStart}
+            onDragOver={handleDragOver}
+            onDrop={handleDrop}
+            onDragEnd={handleDragEnd}
+          />
+        </div>
       )}
 
       {/* Agent create/edit modal */}

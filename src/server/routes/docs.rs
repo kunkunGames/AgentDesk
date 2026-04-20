@@ -188,6 +188,25 @@ fn all_endpoints() -> Vec<EndpointDoc> {
     vec![
         ep("GET", "/api/health", "health", "Health check"),
         ep("POST", "/api/send", "discord", "Send a Discord channel message"),
+        ep(
+            "POST",
+            "/api/send_to_agent",
+            "discord",
+            "Send a Discord message by agent role_id",
+        )
+        .with_params([
+            ("role_id", body_param("string", true, "Target agent role_id")),
+            ("message", body_param("string", true, "Discord message content")),
+            (
+                "mode",
+                body_param(
+                    "string",
+                    false,
+                    "Delivery bot: announce (default) or notify",
+                )
+                .with_enum(&["announce", "notify"]),
+            ),
+        ]),
         ep("POST", "/api/senddm", "discord", "Send a Discord direct message"),
         ep("GET", "/api/agents", "agents", "List all agents"),
         ep("POST", "/api/agents", "agents", "Create an agent"),
@@ -1463,13 +1482,47 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "meetings",
             "Discard all meeting issues",
         ),
-        ep("GET", "/api/skills/catalog", "skills", "List skill catalog"),
+        ep("GET", "/api/skills/catalog", "skills", "List skill catalog").with_params([(
+            "include_stale",
+            query_param(
+                "boolean",
+                false,
+                "Include stale skill entries that no longer exist on disk",
+            ),
+        )]),
         ep(
             "GET",
             "/api/skills/ranking",
             "skills",
             "Skill usage ranking",
-        ),
+        )
+        .with_params([
+            (
+                "window",
+                query_param("string", false, "Ranking window: 7d, 30d, 90d, all"),
+            ),
+            (
+                "limit",
+                query_param("integer", false, "Maximum number of ranking entries"),
+            ),
+            (
+                "include_stale",
+                query_param(
+                    "boolean",
+                    false,
+                    "Include stale skill entries that no longer exist on disk",
+                ),
+            ),
+        ]),
+        ep("POST", "/api/skills/prune", "skills", "Preview or prune stale skill metadata")
+            .with_params([(
+                "dry_run",
+                query_param(
+                    "boolean",
+                    false,
+                    "When true, report stale skill ids without deleting skills rows",
+                ),
+            )]),
         ep("GET", "/api/cron-jobs", "cron", "List cron jobs"),
         ep(
             "POST",

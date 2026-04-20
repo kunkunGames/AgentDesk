@@ -136,6 +136,7 @@ pub fn execute_intents(
                 let _guard = intent_span.enter();
                 match execute_create_dispatch(
                     db,
+                    engine,
                     &dispatch_id,
                     &card_id,
                     &agent_id,
@@ -319,6 +320,7 @@ fn execute_transition(
 
 fn execute_create_dispatch(
     db: &crate::db::Db,
+    engine: Option<&crate::engine::PolicyEngine>,
     pre_id: &str,
     card_id: &str,
     agent_id: &str,
@@ -332,19 +334,48 @@ fn execute_create_dispatch(
         Some(agent_id),
     );
     let _guard = dispatch_span.enter();
-    // Delegate to the authoritative dispatch creation path.
-    // create_dispatch_core generates its own UUID — we override by using a
-    // variant that accepts a pre-assigned ID.
     let context = serde_json::json!({});
-    let (dispatch_id, _old_status, _reused) = crate::dispatch::create_dispatch_core_with_id(
-        db,
-        pre_id,
-        card_id,
-        agent_id,
-        dispatch_type,
-        title,
-        &context,
-    )?;
+    let (dispatch_id, _old_status, _reused) =
+        if let Some(pg_pool) = engine.and_then(|value| value.pg_pool()) {
+            let dispatch_id_input = pre_id.to_string();
+            let card_id_input = card_id.to_string();
+            let agent_id_input = agent_id.to_string();
+            let dispatch_type_input = dispatch_type.to_string();
+            let title_input = title.to_string();
+            crate::utils::async_bridge::block_on_pg_result(
+                pg_pool,
+                move |bridge_pool| async move {
+                    crate::dispatch::create_dispatch_core_with_id(
+                        &bridge_pool,
+                        &dispatch_id_input,
+                        &card_id_input,
+                        &agent_id_input,
+                        &dispatch_type_input,
+                        &title_input,
+                        &context,
+                    )
+                    .await
+                },
+                |error| anyhow::anyhow!(error),
+            )?
+        } else {
+            #[cfg(test)]
+            {
+                crate::dispatch::create_dispatch_core_with_id_sqlite_test(
+                    db,
+                    pre_id,
+                    card_id,
+                    agent_id,
+                    dispatch_type,
+                    title,
+                    &context,
+                )?
+            }
+            #[cfg(not(test))]
+            {
+                anyhow::bail!("postgres pool required for create_dispatch intent");
+            }
+        };
 
     // #117/#158: Update card_review_state via unified entrypoint
     if dispatch_type == "review-decision" {

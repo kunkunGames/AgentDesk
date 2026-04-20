@@ -5,6 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use sqlx::PgPool;
 use std::net::SocketAddr;
 
 use crate::services::discord::health;
@@ -59,7 +60,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         dashboard_dir.join("index.html").exists()
     };
 
-    let outbox_stats = load_dispatch_outbox_stats(&state.db);
+    let outbox_stats = load_dispatch_outbox_stats(&state.db, state.pg_pool.as_ref()).await;
     let outbox_json = outbox_stats.as_ref().map(|stats| {
         serde_json::json!({
             "pending": stats.pending,
@@ -182,6 +183,40 @@ pub async fn send_handler(
     (status, Json(json)).into_response()
 }
 
+/// POST /api/send_to_agent — role_id-based agent routing.
+///
+/// See `send_handler` for the rationale on the mandatory
+/// `ConnectInfo<SocketAddr>` extractor.
+pub async fn send_to_agent_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if !discord_control_endpoints_allowed(&state.config, Some(peer_addr)) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
+        )
+            .into_response();
+    }
+
+    let Some(ref registry) = state.health_registry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
+        )
+            .into_response();
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+    let (status_str, response_body) =
+        health::handle_send_to_agent(registry, &state.db, &body_str).await;
+    let status = parse_status_code(status_str);
+    let json: serde_json::Value =
+        serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
+    (status, Json(json)).into_response()
+}
+
 /// POST /api/senddm — send a DM to a Discord user.
 ///
 /// See `send_handler` for the rationale on the mandatory
@@ -261,7 +296,59 @@ fn parse_status_code(s: &str) -> StatusCode {
     }
 }
 
-fn load_dispatch_outbox_stats(db: &crate::db::Db) -> Option<DispatchOutboxStats> {
+async fn load_dispatch_outbox_stats(
+    db: &crate::db::Db,
+    pg_pool: Option<&PgPool>,
+) -> Option<DispatchOutboxStats> {
+    if let Some(pool) = pg_pool {
+        if let Some(stats) = load_dispatch_outbox_stats_pg(pool).await {
+            return Some(stats);
+        }
+        tracing::warn!(
+            "[health] failed to load dispatch_outbox stats from PostgreSQL; falling back to SQLite"
+        );
+    }
+
+    load_dispatch_outbox_stats_sqlite(db)
+}
+
+async fn load_dispatch_outbox_stats_pg(pool: &PgPool) -> Option<DispatchOutboxStats> {
+    let pending = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT FROM dispatch_outbox WHERE status = 'pending'",
+    )
+    .fetch_one(pool)
+    .await
+    .ok()?;
+    let retrying = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT FROM dispatch_outbox WHERE status = 'pending' AND retry_count > 0",
+    )
+    .fetch_one(pool)
+    .await
+    .ok()?;
+    let failed = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT FROM dispatch_outbox WHERE status = 'failed'",
+    )
+    .fetch_one(pool)
+    .await
+    .ok()?;
+    let oldest_pending_age = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(CAST(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) AS BIGINT), 0)
+         FROM dispatch_outbox
+         WHERE status = 'pending'",
+    )
+    .fetch_one(pool)
+    .await
+    .ok()?;
+
+    Some(DispatchOutboxStats {
+        pending,
+        retrying,
+        permanent_failures: failed,
+        oldest_pending_age,
+    })
+}
+
+fn load_dispatch_outbox_stats_sqlite(db: &crate::db::Db) -> Option<DispatchOutboxStats> {
     db.lock().ok().map(|conn| {
         let pending: i64 = conn
             .query_row(

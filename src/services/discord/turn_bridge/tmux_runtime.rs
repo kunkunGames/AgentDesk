@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::services::discord::InflightRestartMode;
 use crate::services::provider::CancelToken;
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::record_tmux_exit_reason;
@@ -6,9 +7,29 @@ use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TmuxCleanupPolicy {
     PreserveSession,
+    PreserveSessionAndInflight {
+        restart_mode: InflightRestartMode,
+    },
     CleanupSession {
         termination_reason_code: Option<&'static str>,
     },
+}
+
+impl TmuxCleanupPolicy {
+    pub(crate) const fn preserves_inflight(self) -> Option<InflightRestartMode> {
+        match self {
+            Self::PreserveSessionAndInflight { restart_mode } => Some(restart_mode),
+            Self::PreserveSession | Self::CleanupSession { .. } => None,
+        }
+    }
+
+    pub(crate) const fn should_cleanup_tmux(self) -> bool {
+        matches!(self, Self::CleanupSession { .. })
+    }
+
+    pub(crate) const fn should_clear_inflight(self) -> bool {
+        !matches!(self, Self::PreserveSessionAndInflight { .. })
+    }
 }
 
 pub(in crate::services::discord) fn cancel_active_token(
@@ -17,6 +38,7 @@ pub(in crate::services::discord) fn cancel_active_token(
     reason: &str,
 ) -> bool {
     token.cancelled.store(true, Ordering::Relaxed);
+    token.set_restart_mode(cleanup_policy.preserves_inflight());
     let mut termination_recorded = false;
 
     let child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
@@ -57,7 +79,10 @@ pub(in crate::services::discord) fn cancel_active_token(
                             termination_recorded = true;
                         }
                         record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
-                        crate::services::platform::tmux::kill_session(&name);
+                        crate::services::platform::tmux::kill_session_with_reason(
+                            &name,
+                            &format!("explicit cleanup via {reason}"),
+                        );
                     }
                 }
                 #[cfg(not(unix))]
@@ -105,30 +130,36 @@ pub(crate) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
 }
 
 pub(in crate::services::discord) fn stale_inflight_message(saved_response: &str) -> String {
-    inflight_recovery_message(saved_response, false)
-}
-
-pub(in crate::services::discord) fn planned_restart_inflight_message(
-    saved_response: &str,
-) -> String {
-    inflight_recovery_message(saved_response, true)
-}
-
-fn inflight_recovery_message(saved_response: &str, planned_restart: bool) -> String {
     let trimmed = saved_response.trim();
     if trimmed.is_empty() {
-        if planned_restart {
-            "♻️ AgentDesk가 재시작되었습니다. 진행 중이던 응답은 후속 턴에서 이어서 복구합니다."
-                .to_string()
-        } else {
-            "⚠️ AgentDesk가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
-        }
+        "⚠️ AgentDesk가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
     } else {
         let formatted = format_for_discord(trimmed);
-        if planned_restart {
-            format!("{}\n\n[재시작 후 복구 진행 중]", formatted)
-        } else {
-            format!("{}\n\n[Interrupted by restart]", formatted)
+        format!("{formatted}\n\n[Interrupted by restart]")
+    }
+}
+
+pub(in crate::services::discord) fn handoff_interrupted_message(
+    restart_mode: InflightRestartMode,
+    saved_response: &str,
+) -> String {
+    let trimmed = saved_response.trim();
+    match restart_mode {
+        InflightRestartMode::DrainRestart => {
+            if trimmed.is_empty() {
+                "⚠️ dcserver 재시작 중이던 turn을 다시 붙이지 못했습니다. 다음 메시지부터 새 turn으로 이어갑니다.".to_string()
+            } else {
+                let formatted = format_for_discord(trimmed);
+                format!("{formatted}\n\n[Restart handoff incomplete]")
+            }
+        }
+        InflightRestartMode::HotSwapHandoff => {
+            if trimmed.is_empty() {
+                "⚠️ 런타임 handoff 중 세션 재연결이 완료되지 않았습니다. 다음 메시지부터 새 turn으로 이어갑니다.".to_string()
+            } else {
+                let formatted = format_for_discord(trimmed);
+                format!("{formatted}\n\n[Runtime handoff incomplete]")
+            }
         }
     }
 }
@@ -159,20 +190,10 @@ pub(super) fn should_resume_watcher_after_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{planned_restart_inflight_message, stale_inflight_message};
-
-    #[test]
-    fn planned_restart_message_uses_restart_recovery_wording() {
-        let empty = planned_restart_inflight_message("");
-        assert!(empty.contains("재시작"));
-        assert!(empty.contains("복구"));
-        assert!(!empty.contains("이어붙이지 못했습니다"));
-
-        let partial = planned_restart_inflight_message("partial response");
-        assert!(partial.contains("partial response"));
-        assert!(partial.contains("[재시작 후 복구 진행 중]"));
-        assert!(!partial.contains("[Interrupted by restart]"));
-    }
+    use super::{TmuxCleanupPolicy, handoff_interrupted_message, stale_inflight_message};
+    use crate::services::discord::InflightRestartMode;
+    use crate::services::provider::CancelToken;
+    use std::sync::Arc;
 
     #[test]
     fn stale_message_keeps_generic_interrupted_wording() {
@@ -183,5 +204,28 @@ mod tests {
         assert!(partial.contains("partial response"));
         assert!(partial.contains("[Interrupted by restart]"));
         assert!(!partial.contains("[재시작 후 복구 진행 중]"));
+    }
+
+    #[test]
+    fn preserve_session_and_inflight_sets_restart_mode_on_token() {
+        let token = Arc::new(CancelToken::new());
+        super::cancel_active_token(
+            &token,
+            TmuxCleanupPolicy::PreserveSessionAndInflight {
+                restart_mode: InflightRestartMode::HotSwapHandoff,
+            },
+            "test preserve-session stop",
+        );
+        assert_eq!(
+            token.restart_mode(),
+            Some(InflightRestartMode::HotSwapHandoff)
+        );
+    }
+
+    #[test]
+    fn drain_restart_message_uses_restart_specific_wording() {
+        let text = handoff_interrupted_message(InflightRestartMode::DrainRestart, "");
+        assert!(text.contains("dcserver 재시작"));
+        assert!(!text.contains("이어붙이지 못했습니다"));
     }
 }

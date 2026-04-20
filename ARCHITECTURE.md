@@ -250,6 +250,7 @@ src/
 │   │   ├── queue_io.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── restart_ctrl.rs
+│   │   ├── restart_mode.rs
 │   │   ├── restart_report.rs
 │   │   ├── role_map.rs
 │   │   ├── runtime_bootstrap.rs

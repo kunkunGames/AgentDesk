@@ -3,6 +3,7 @@
 //! All tmux binary invocations MUST go through this module.
 //! Callers in async contexts should use `tokio::task::spawn_blocking`.
 
+use super::binary_resolver;
 use std::process::{Command, Output, Stdio};
 
 /// Format session name as exact-match target (prefix with `=`).
@@ -10,9 +11,15 @@ fn exact_target(session_name: &str) -> String {
     format!("={session_name}")
 }
 
+fn tmux_command() -> Command {
+    let mut cmd = Command::new("tmux");
+    binary_resolver::apply_runtime_path(&mut cmd);
+    cmd
+}
+
 /// Check if tmux is available on the system.
 pub fn is_available() -> bool {
-    Command::new("tmux")
+    tmux_command()
         .arg("-V")
         .output()
         .map(|o| o.status.success())
@@ -21,7 +28,7 @@ pub fn is_available() -> bool {
 
 /// Get tmux version string (e.g. "tmux 3.4").
 pub fn version() -> Result<String, String> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .arg("-V")
         .output()
         .map_err(|e| format!("tmux not found: {e}"))?;
@@ -34,7 +41,7 @@ pub fn version() -> Result<String, String> {
 
 /// Check if a named tmux session exists.
 pub fn has_session(session_name: &str) -> bool {
-    Command::new("tmux")
+    tmux_command()
         .args(["has-session", "-t", &exact_target(session_name)])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -52,7 +59,7 @@ pub fn create_session(
     working_dir: Option<&str>,
     shell_command: &str,
 ) -> Result<Output, String> {
-    let mut cmd = Command::new("tmux");
+    let mut cmd = tmux_command();
     cmd.args(["new-session", "-d", "-s", session_name]);
     if let Some(dir) = working_dir {
         cmd.args(["-c", dir]);
@@ -63,38 +70,98 @@ pub fn create_session(
         .map_err(|e| format!("Failed to create tmux session: {e}"))
 }
 
+fn log_kill_request(session_name: &str, reason: &str) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ✂ tmux kill requested: session={session_name} reason={reason}");
+}
+
+fn log_kill_result(session_name: &str, reason: &str, output: &Output) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    if output.status.success() {
+        tracing::info!("  [{ts}] ✂ tmux kill succeeded: session={session_name} reason={reason}");
+        return;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        tracing::warn!(
+            "  [{ts}] ⚠ tmux kill failed: session={session_name} reason={reason} status={}",
+            output.status
+        );
+    } else {
+        tracing::warn!(
+            "  [{ts}] ⚠ tmux kill failed: session={session_name} reason={reason} status={} stderr={}",
+            output.status,
+            stderr
+        );
+    }
+}
+
+fn kill_session_output_internal(session_name: &str, reason: &str) -> std::io::Result<Output> {
+    log_kill_request(session_name, reason);
+    let output = tmux_command()
+        .args(["kill-session", "-t", &exact_target(session_name)])
+        .output();
+    match &output {
+        Ok(output) => log_kill_result(session_name, reason, output),
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ tmux kill spawn failed: session={session_name} reason={reason} error={error}"
+            );
+        }
+    }
+    output
+}
+
+/// Kill a tmux session. Returns true if the kill command succeeded.
+pub fn kill_session_with_reason(session_name: &str, reason: &str) -> bool {
+    kill_session_output_internal(session_name, reason)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 /// Kill a tmux session. Returns true if the kill command succeeded.
 pub fn kill_session(session_name: &str) -> bool {
-    Command::new("tmux")
-        .args(["kill-session", "-t", &exact_target(session_name)])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    kill_session_with_reason(session_name, "unspecified")
+}
+
+/// Kill a tmux session, returning full Output for error inspection.
+pub fn kill_session_output_with_reason(
+    session_name: &str,
+    reason: &str,
+) -> std::io::Result<Output> {
+    kill_session_output_internal(session_name, reason)
 }
 
 /// Kill a tmux session, returning full Output for error inspection.
 pub fn kill_session_output(session_name: &str) -> std::io::Result<Output> {
-    Command::new("tmux")
-        .args(["kill-session", "-t", &exact_target(session_name)])
-        .output()
+    kill_session_output_with_reason(session_name, "unspecified")
+}
+
+/// Kill a tmux session, returning an error on failure (for anyhow contexts).
+#[allow(dead_code)]
+pub fn kill_session_checked_with_reason(session_name: &str, reason: &str) -> Result<(), String> {
+    let output = kill_session_output_internal(session_name, reason)
+        .map_err(|e| format!("tmux kill-session spawn failed: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(format!("tmux kill-session failed for {session_name}"))
+        } else {
+            Err(format!(
+                "tmux kill-session failed for {session_name}: {stderr}"
+            ))
+        }
+    }
 }
 
 /// Kill a tmux session, returning an error on failure (for anyhow contexts).
 #[allow(dead_code)]
 pub fn kill_session_checked(session_name: &str) -> Result<(), String> {
-    let status = Command::new("tmux")
-        .args(["kill-session", "-t", &exact_target(session_name)])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("tmux kill-session spawn failed: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("tmux kill-session failed for {session_name}"))
-    }
+    kill_session_checked_with_reason(session_name, "unspecified")
 }
 
 /// Send keys to a tmux session.
@@ -104,7 +171,7 @@ pub fn send_keys(session_name: &str, keys: &[&str]) -> Result<Output, String> {
     let target = exact_target(session_name);
     let mut args = vec!["send-keys", "-t", &target];
     args.extend(keys);
-    Command::new("tmux")
+    tmux_command()
         .args(&args)
         .output()
         .map_err(|e| format!("tmux send-keys failed: {e}"))
@@ -115,7 +182,7 @@ pub fn send_keys(session_name: &str, keys: &[&str]) -> Result<Output, String> {
 /// `scroll_back` is the number of lines to capture (negative = from bottom).
 pub fn capture_pane(session_name: &str, scroll_back: i32) -> Option<String> {
     let scroll = scroll_back.to_string();
-    Command::new("tmux")
+    tmux_command()
         .args([
             "capture-pane",
             "-p",
@@ -132,7 +199,7 @@ pub fn capture_pane(session_name: &str, scroll_back: i32) -> Option<String> {
 
 /// List all tmux session names.
 pub fn list_session_names() -> Result<Vec<String>, String> {
-    let out = Command::new("tmux")
+    let out = tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| format!("tmux list-sessions failed: {e}"))?;
@@ -151,7 +218,7 @@ pub fn has_live_pane(session_name: &str) -> bool {
     if !has_session(session_name) {
         return false;
     }
-    Command::new("tmux")
+    tmux_command()
         .args([
             "list-panes",
             "-t",
@@ -172,7 +239,7 @@ pub fn has_live_pane(session_name: &str) -> bool {
 
 /// Set a tmux session option. Errors are silently ignored (fire-and-forget).
 pub fn set_option(session_name: &str, key: &str, value: &str) {
-    let _ = Command::new("tmux")
+    let _ = tmux_command()
         .args(["set-option", "-t", &exact_target(session_name), key, value])
         .output();
 }

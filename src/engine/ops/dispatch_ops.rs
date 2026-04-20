@@ -32,13 +32,17 @@ pub(super) fn register_dispatch_ops<'js>(
                       title: String,
                       context_json: String|
                       -> String {
-                    if pg_create.is_some() {
-                        // TODO(#839 phase C): `dispatch.create` still depends on sqlite-only
-                        // dispatch-layer helpers (`create_dispatch_core*`,
-                        // `build_review_context`, attached-intent transactions).
-                        // Porting it cleanly requires lifting those invariants to PG first.
+                    if let Some(pool) = pg_create.as_ref() {
+                        return dispatch_create_sync(
+                            pool,
+                            &card_id,
+                            &agent_id,
+                            &dispatch_type,
+                            &title,
+                            &context_json,
+                        );
                     }
-                    dispatch_create_sync(
+                    dispatch_create_sync_sqlite(
                         &db_d,
                         &card_id,
                         &agent_id,
@@ -180,7 +184,7 @@ pub(super) fn register_dispatch_ops<'js>(
                 };
                 match conn.execute(
                     "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
-                    libsql_rusqlite::params![count, dispatch_id], // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+                    libsql_rusqlite::params![count, dispatch_id],
                 ) {
                     Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
                     Err(e) => format!(r#"{{"error":"sql: {}"}}"#, e),
@@ -252,9 +256,9 @@ pub(super) fn register_dispatch_ops<'js>(
 
 /// #248/#249: Synchronous dispatch creation — validates and inserts into DB
 /// immediately. The notify outbox row is now inserted atomically inside
-/// `create_dispatch_core`, so no JS-side outbox buffering is needed.
+/// the dispatch-core path, so no JS-side outbox buffering is needed.
 fn dispatch_create_sync(
-    db: &Db,
+    pg_pool: &PgPool,
     card_id: &str,
     agent_id: &str,
     dispatch_type: &str,
@@ -281,20 +285,98 @@ fn dispatch_create_sync(
                 .and_then(|value| value.as_object())
                 .is_some(),
     };
-    match crate::dispatch::create_dispatch_core_with_options(
+    let card_id_owned = card_id.to_string();
+    let agent_id_owned = agent_id.to_string();
+    let dispatch_type_owned = dispatch_type.to_string();
+    let title_owned = title.to_string();
+    match crate::utils::async_bridge::block_on_pg_result(
+        pg_pool,
+        move |bridge_pool| async move {
+            crate::dispatch::create_dispatch_core_with_options(
+                &bridge_pool,
+                &card_id_owned,
+                &agent_id_owned,
+                &dispatch_type_owned,
+                &title_owned,
+                &context,
+                options,
+            )
+            .await
+        },
+        |error| anyhow::anyhow!(error),
+    ) {
+        Ok((dispatch_id, _old_status, reused)) => {
+            if reused {
+                return format!(r#"{{"dispatch_id":"{dispatch_id}","reused":true}}"#);
+            }
+            if dispatch_type == "review-decision" {
+                let card_id_state = card_id.to_string();
+                let dispatch_id_state = dispatch_id.clone();
+                if let Err(error) = crate::utils::async_bridge::block_on_pg_result(
+                    pg_pool,
+                    move |bridge_pool| async move {
+                        sqlx::query(
+                            "INSERT INTO card_review_state (
+                                card_id,
+                                state,
+                                pending_dispatch_id,
+                                updated_at
+                             ) VALUES ($1, 'suggestion_pending', $2, NOW())
+                             ON CONFLICT (card_id) DO UPDATE
+                             SET state = 'suggestion_pending',
+                                 pending_dispatch_id = EXCLUDED.pending_dispatch_id,
+                                 updated_at = NOW()",
+                        )
+                        .bind(&card_id_state)
+                        .bind(&dispatch_id_state)
+                        .execute(&bridge_pool)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                    },
+                    |error| anyhow::anyhow!(error),
+                ) {
+                    return format!(r#"{{"error":"{}"}}"#, error.to_string().replace('"', "'"));
+                }
+            }
+            format!(r#"{{"dispatch_id":"{dispatch_id}"}}"#)
+        }
+        Err(e) => {
+            format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'"))
+        }
+    }
+}
+
+#[cfg(test)]
+fn dispatch_create_sync_sqlite(
+    db: &Db,
+    card_id: &str,
+    agent_id: &str,
+    dispatch_type: &str,
+    title: &str,
+    context_json: &str,
+) -> String {
+    let context: serde_json::Value = match serde_json::from_str(context_json) {
+        Ok(value) => value,
+        Err(e) => {
+            return format!(
+                r#"{{"error":"invalid dispatch context JSON: {}"}}"#,
+                e.to_string().replace('"', "'")
+            );
+        }
+    };
+    match crate::dispatch::create_dispatch_core_sqlite_test(
         db,
         card_id,
         agent_id,
         dispatch_type,
         title,
         &context,
-        options,
     ) {
         Ok((dispatch_id, _old_status, reused)) => {
             if reused {
                 return format!(r#"{{"dispatch_id":"{dispatch_id}","reused":true}}"#);
             }
-            // #117/#158: Update card_review_state for review-decision dispatches
             if dispatch_type == "review-decision" {
                 crate::engine::ops::review_state_sync(
                     db,
@@ -312,6 +394,18 @@ fn dispatch_create_sync(
             format!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', "'"))
         }
     }
+}
+
+#[cfg(not(test))]
+fn dispatch_create_sync_sqlite(
+    _db: &Db,
+    _card_id: &str,
+    _agent_id: &str,
+    _dispatch_type: &str,
+    _title: &str,
+    _context_json: &str,
+) -> String {
+    r#"{"error":"postgres pool required for dispatch.create in JS hook"}"#.to_string()
 }
 
 fn dispatch_has_active_work_raw_pg(pool: &PgPool, card_id: &str) -> String {

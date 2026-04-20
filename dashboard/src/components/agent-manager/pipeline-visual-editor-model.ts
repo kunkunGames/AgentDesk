@@ -64,6 +64,12 @@ export interface PipelineGraphLayout {
 
 type RawOverride = PipelineOverride & Record<string, unknown>;
 
+function cloneStringListMap(input?: Record<string, string[]>) {
+  return Object.fromEntries(
+    Object.entries(input ?? {}).map(([key, values]) => [key, [...values]]),
+  );
+}
+
 const VISUAL_OVERRIDE_KEYS = new Set([
   "states",
   "transitions",
@@ -95,6 +101,7 @@ export function clonePipelineConfig(pipeline: PipelineConfigFull): PipelineConfi
         },
       ]),
     ),
+    events: cloneStringListMap(pipeline.events),
     clocks: Object.fromEntries(
       Object.entries(pipeline.clocks).map(([key, clock]) => [key, { ...clock }]),
     ),
