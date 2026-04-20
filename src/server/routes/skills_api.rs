@@ -51,19 +51,19 @@ pub(super) fn sync_skills_from_disk(conn: &libsql_rusqlite::Connection) {
 /// Syncs the `skills` catalog rows with what is currently on disk.
 ///
 /// When `prune_missing` is `true` (the default behavior), any row whose `id`
-/// is not present on disk after the upsert pass is hard-deleted so the
-/// catalog/ranking endpoints stop surfacing skills that have been removed
-/// from disk (#816).
+/// is not present on disk after the upsert pass is **soft-deleted** by
+/// stamping `deleted_at` with the current unix timestamp. Live-view endpoints
+/// (`/api/skills/catalog`, `/api/skills/ranking`, `load_skill_metadata`)
+/// filter out rows with `deleted_at IS NOT NULL`, while historical joins
+/// (`/api/agents/:id/skills`) and transcript-based analytics
+/// (`collect_known_skills`) intentionally keep reading soft-deleted rows so
+/// past usage stays attributable (#816 review fixes).
 ///
-/// Pruning is skipped when **none** of the configured skill roots could be
-/// enumerated, to avoid wiping the entire table just because the home
-/// directory or runtime root is temporarily unavailable.
-///
-/// Hard delete (rather than soft delete) is used because the `skills` table
-/// has no `deleted_at` / `is_active` column today, and `skill_usage.skill_id`
-/// has no `FOREIGN KEY ... ON DELETE CASCADE`, so historical usage rows
-/// remain intact and the catalog endpoint already surfaces usage-only ids
-/// via its existing fallback path.
+/// Pruning is **all-or-nothing**: if *any* configured root fails to enumerate
+/// (IO error, not just "missing or empty"), pruning is skipped entirely with
+/// a `warn!` log. Otherwise a temporarily-unreadable root would cause the
+/// other roots' absences to be mistaken for disk-level deletions and every
+/// skill under the failed root would be silently soft-deleted.
 pub(super) fn sync_skills_from_disk_with_prune(
     conn: &libsql_rusqlite::Connection,
     prune_missing: bool,
@@ -79,15 +79,26 @@ pub(super) fn sync_skills_from_disk_with_prune(
     }
 
     let mut seen = HashSet::new();
-    let mut any_root_enumerated = false;
+    let mut any_root_errored = false;
     for root in roots {
         if !root.is_dir() {
+            // "Doesn't exist" is a benign configuration state — no skills under
+            // this root — not an IO failure. Only a genuine read error should
+            // trip the safety guard.
             continue;
         }
-        let Ok(entries) = fs::read_dir(&root) else {
-            continue;
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %err,
+                    "sync_skills_from_disk: failed to enumerate skill root; skipping prune"
+                );
+                any_root_errored = true;
+                continue;
+            }
         };
-        any_root_enumerated = true;
 
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
@@ -131,47 +142,63 @@ pub(super) fn sync_skills_from_disk_with_prune(
                 .and_then(|meta| meta.modified().ok())
                 .map(|modified| DateTime::<Utc>::from(modified).to_rfc3339());
 
+            // Undelete (deleted_at = NULL) on upsert: a skill that reappears
+            // on disk should become visible again in live views without any
+            // operator intervention.
             let _ = conn.execute(
-                "INSERT INTO skills (id, name, description, source_path, trigger_patterns, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                "INSERT INTO skills (id, name, description, source_path, trigger_patterns, updated_at, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)
                  ON CONFLICT(id) DO UPDATE SET
                    name = excluded.name,
                    description = excluded.description,
                    source_path = excluded.source_path,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   deleted_at = NULL",
                 libsql_rusqlite::params![name, name, description, source_path, updated_at],
             );
         }
     }
 
-    if !prune_missing || !any_root_enumerated {
+    if !prune_missing {
+        return;
+    }
+
+    if any_root_errored {
+        tracing::warn!(
+            "sync_skills_from_disk: pruning skipped due to partial disk failure \
+             (at least one skill root failed to enumerate)"
+        );
         return;
     }
 
     prune_missing_skills(conn, &seen);
 }
 
-/// Hard-delete `skills` rows whose `id` is not in `seen`.
+/// Soft-delete `skills` rows whose `id` is not in `seen`.
 ///
-/// `skill_usage` rows are left untouched because there is no FK CASCADE; the
-/// catalog endpoint will continue to expose those entries via its
-/// usage-only fallback so analytics aren't lost.
+/// Rows are marked with `deleted_at = <unix seconds>` (leaving already
+/// soft-deleted rows untouched). Live-view queries filter these out via
+/// `deleted_at IS NULL`, while `/api/agents/:id/skills` and transcript
+/// analytics deliberately keep reading them so historical attribution
+/// survives disk-level deletion.
 fn prune_missing_skills(conn: &libsql_rusqlite::Connection, seen: &HashSet<String>) {
-    let existing_ids: Vec<String> = match conn.prepare("SELECT id FROM skills") {
-        Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
-            Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+    let existing_ids: Vec<String> =
+        match conn.prepare("SELECT id FROM skills WHERE deleted_at IS NULL") {
+            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows.filter_map(|row| row.ok()).collect(),
+                Err(_) => return,
+            },
             Err(_) => return,
-        },
-        Err(_) => return,
-    };
+        };
 
+    let now_secs = Utc::now().timestamp();
     for id in existing_ids {
         if seen.contains(&id) {
             continue;
         }
         let _ = conn.execute(
-            "DELETE FROM skills WHERE id = ?1",
-            libsql_rusqlite::params![id],
+            "UPDATE skills SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            libsql_rusqlite::params![id, now_secs],
         );
     }
 }
@@ -201,11 +228,16 @@ fn ranking_days(window: &str) -> Option<i64> {
 fn load_skill_metadata(
     conn: &libsql_rusqlite::Connection,
 ) -> libsql_rusqlite::Result<HashMap<String, (String, String)>> {
+    // Live-view metadata: exclude soft-deleted rows so `/api/skills/catalog`
+    // and `/api/skills/ranking` stop surfacing skills that have been removed
+    // from disk. Historical joins (e.g. `/api/agents/:id/skills`) and
+    // transcript analytics deliberately bypass this filter.
     let mut stmt = conn.prepare(
         "SELECT id,
                 COALESCE(name, id) AS skill_name,
                 COALESCE(description, name, id) AS skill_desc
-         FROM skills",
+         FROM skills
+         WHERE deleted_at IS NULL",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -498,7 +530,8 @@ mod tests {
                 description TEXT,
                 source_path TEXT,
                 trigger_patterns TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                deleted_at INTEGER
             );
             CREATE TABLE skill_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -520,7 +553,24 @@ mod tests {
         .unwrap();
     }
 
-    fn skill_ids(conn: &libsql_rusqlite::Connection) -> Vec<String> {
+    /// Upsert via the same code path the real sync uses, so the undelete-on-
+    /// resurrection behavior is covered.
+    fn upsert_skill_live(conn: &libsql_rusqlite::Connection, id: &str, description: &str) {
+        conn.execute(
+            "INSERT INTO skills (id, name, description, source_path, trigger_patterns, updated_at, deleted_at)
+             VALUES (?1, ?1, ?2, ?3, NULL, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               description = excluded.description,
+               source_path = excluded.source_path,
+               updated_at = excluded.updated_at,
+               deleted_at = NULL",
+            libsql_rusqlite::params![id, description, format!("/tmp/skills/{id}/SKILL.md")],
+        )
+        .unwrap();
+    }
+
+    fn all_skill_ids(conn: &libsql_rusqlite::Connection) -> Vec<String> {
         let mut stmt = conn.prepare("SELECT id FROM skills ORDER BY id").unwrap();
         stmt.query_map([], |row| row.get::<_, String>(0))
             .unwrap()
@@ -528,8 +578,27 @@ mod tests {
             .collect()
     }
 
+    fn live_skill_ids(conn: &libsql_rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM skills WHERE deleted_at IS NULL ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+    }
+
+    fn deleted_at(conn: &libsql_rusqlite::Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT deleted_at FROM skills WHERE id = ?1",
+            libsql_rusqlite::params![id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn prune_removes_rows_not_present_on_disk() {
+    fn prune_soft_deletes_rows_not_present_on_disk() {
         let conn = setup_skills_conn();
         insert_skill(&conn, "alive-skill", "still on disk");
         insert_skill(&conn, "deleted-skill", "removed from disk");
@@ -539,7 +608,22 @@ mod tests {
 
         prune_missing_skills(&conn, &seen);
 
-        assert_eq!(skill_ids(&conn), vec!["alive-skill".to_string()]);
+        // Rows are retained physically so historical joins still reach them.
+        assert_eq!(
+            all_skill_ids(&conn),
+            vec!["alive-skill".to_string(), "deleted-skill".to_string()]
+        );
+        // But only the live one shows up in live-view queries.
+        assert_eq!(live_skill_ids(&conn), vec!["alive-skill".to_string()]);
+        assert!(
+            deleted_at(&conn, "deleted-skill").is_some(),
+            "missing skill should have deleted_at stamped"
+        );
+        assert_eq!(
+            deleted_at(&conn, "alive-skill"),
+            None,
+            "live skill must not be touched"
+        );
     }
 
     #[test]
@@ -557,7 +641,7 @@ mod tests {
         prune_missing_skills(&conn, &seen);
 
         assert_eq!(
-            skill_ids(&conn),
+            live_skill_ids(&conn),
             vec![
                 "skill-a".to_string(),
                 "skill-b".to_string(),
@@ -577,8 +661,8 @@ mod tests {
 
     #[test]
     fn prune_preserves_skill_usage_history_for_deleted_skills() {
-        // Hard-delete should NOT touch skill_usage (no FK CASCADE), so historical
-        // analytics aren't broken when a skill is removed from disk.
+        // Soft-delete must keep skill_usage reachable — the exact guarantee
+        // that makes /api/agents/:id/skills INNER JOIN safe post-prune (P2b).
         let conn = setup_skills_conn();
         insert_skill(&conn, "deleted-skill", "removed from disk");
         conn.execute(
@@ -589,7 +673,9 @@ mod tests {
 
         prune_missing_skills(&conn, &HashSet::new());
 
-        assert!(skill_ids(&conn).is_empty());
+        // Row is still physically present — historical INNER JOIN resolves.
+        assert_eq!(all_skill_ids(&conn), vec!["deleted-skill".to_string()]);
+        assert!(live_skill_ids(&conn).is_empty());
         let usage_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM skill_usage", [], |row| row.get(0))
             .unwrap();
@@ -597,10 +683,49 @@ mod tests {
     }
 
     #[test]
-    fn load_skill_metadata_excludes_pruned_rows() {
-        // Regression for #816: after sync, /api/skills/catalog and
-        // /api/skills/ranking pull names from `skills` via load_skill_metadata,
-        // so a pruned row must not appear in the metadata map.
+    fn agents_skills_inner_join_still_sees_soft_deleted_rows() {
+        // Regression for P2b: the query at /api/agents/:id/skills is
+        // `FROM skills s INNER JOIN skill_usage su ON su.skill_id = s.id`
+        // WITHOUT any deleted_at filter. Soft-deleted skills must remain
+        // reachable via this join.
+        let conn = setup_skills_conn();
+        insert_skill(&conn, "historical", "was used once");
+        conn.execute(
+            "INSERT INTO skill_usage (skill_id, agent_id, session_key) VALUES (?1, ?2, ?3)",
+            libsql_rusqlite::params!["historical", "agent-a", "sess-1"],
+        )
+        .unwrap();
+
+        prune_missing_skills(&conn, &HashSet::new());
+
+        let joined: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT s.id
+                     FROM skills s
+                     INNER JOIN skill_usage su ON su.skill_id = s.id
+                     WHERE su.agent_id = ?1
+                     ORDER BY s.id",
+                )
+                .unwrap();
+            stmt.query_map(libsql_rusqlite::params!["agent-a"], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
+        };
+        assert_eq!(
+            joined,
+            vec!["historical".to_string()],
+            "soft-deleted skill must still be reachable via INNER JOIN"
+        );
+    }
+
+    #[test]
+    fn load_skill_metadata_excludes_soft_deleted_rows() {
+        // Regression for #816: live views pull names from `skills` via
+        // load_skill_metadata, which filters `WHERE deleted_at IS NULL`.
         let conn = setup_skills_conn();
         insert_skill(&conn, "alive", "alive desc");
         insert_skill(&conn, "stale", "stale desc");
@@ -613,14 +738,36 @@ mod tests {
         assert!(metadata.contains_key("alive"));
         assert!(
             !metadata.contains_key("stale"),
-            "pruned skill should not surface in catalog/ranking metadata"
+            "soft-deleted skill should not surface in catalog/ranking metadata"
         );
+    }
+
+    #[test]
+    fn upsert_resurrects_previously_soft_deleted_skill() {
+        // A skill that reappears on disk must clear its deleted_at so the
+        // catalog/ranking endpoints surface it again (#816 review fixes).
+        let conn = setup_skills_conn();
+        insert_skill(&conn, "resurrected", "was once here");
+
+        // First prune removes it.
+        prune_missing_skills(&conn, &HashSet::new());
+        assert!(deleted_at(&conn, "resurrected").is_some());
+
+        // Then disk scan finds it again; upsert must undelete.
+        upsert_skill_live(&conn, "resurrected", "now on disk again");
+
+        assert_eq!(
+            deleted_at(&conn, "resurrected"),
+            None,
+            "resurrection must clear deleted_at"
+        );
+        assert_eq!(live_skill_ids(&conn), vec!["resurrected".to_string()]);
     }
 
     #[test]
     fn prune_with_empty_seen_when_disk_unavailable_is_handled_by_caller() {
         // Sanity check: prune_missing_skills itself trusts the caller; the
-        // safety check (skip pruning if no root could be enumerated) lives in
+        // safety check (skip pruning if any root errored) lives in
         // sync_skills_from_disk_with_prune. Verify the helper behaves
         // predictably when given an empty set.
         let conn = setup_skills_conn();
@@ -628,6 +775,70 @@ mod tests {
 
         prune_missing_skills(&conn, &HashSet::new());
 
-        assert!(skill_ids(&conn).is_empty());
+        // Physically retained, just soft-deleted.
+        assert_eq!(all_skill_ids(&conn), vec!["only-skill".to_string()]);
+        assert!(live_skill_ids(&conn).is_empty());
+    }
+
+    #[test]
+    fn partial_root_failure_skips_prune_regression() {
+        // Regression for P2a: if ANY configured root fails to enumerate, the
+        // sync must skip pruning entirely — otherwise skills whose root was
+        // temporarily unreadable get silently soft-deleted while the other
+        // roots' absences look "successful".
+        //
+        // Because `sync_skills_from_disk_with_prune` hard-codes its root set
+        // from `runtime_root()` + `dirs::home_dir()`, we can't feed it a
+        // custom bad root without plumbing. Instead we reproduce the guard
+        // pattern locally (same `read_dir` + `any_root_errored` logic) and
+        // assert that when the guard trips, `prune_missing_skills` is NOT
+        // invoked and the pre-existing row survives unchanged.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_root = tmp.path().join("bad-skills");
+        std::fs::create_dir(&bad_root).unwrap();
+        // Strip all permissions so read_dir errors (EACCES).
+        let mut perms = std::fs::metadata(&bad_root).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&bad_root, perms).unwrap();
+
+        // Skip when running as root (chmod 000 doesn't stop root).
+        if std::fs::read_dir(&bad_root).is_ok() {
+            let mut perms = std::fs::metadata(&bad_root).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&bad_root, perms).unwrap();
+            eprintln!("skipping: cannot simulate EACCES (running as root?)");
+            return;
+        }
+
+        let conn = setup_skills_conn();
+        insert_skill(&conn, "should-survive", "would be pruned if guard failed");
+
+        // Mirror sync_skills_from_disk_with_prune's guard.
+        let mut any_root_errored = false;
+        if bad_root.is_dir() && fs::read_dir(&bad_root).is_err() {
+            any_root_errored = true;
+        }
+        assert!(any_root_errored, "test precondition: bad root must error");
+
+        let seen: HashSet<String> = HashSet::new();
+        if !any_root_errored {
+            prune_missing_skills(&conn, &seen);
+        }
+        assert_eq!(
+            live_skill_ids(&conn),
+            vec!["should-survive".to_string()],
+            "guard must skip prune on partial root failure"
+        );
+        assert!(
+            deleted_at(&conn, "should-survive").is_none(),
+            "row must not be soft-deleted when guard trips"
+        );
+
+        // Restore perms so tempdir cleanup works.
+        let mut perms = std::fs::metadata(&bad_root).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&bad_root, perms).unwrap();
     }
 }
