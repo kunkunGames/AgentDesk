@@ -131,6 +131,79 @@ fn response_portion_after_offset(full_response: &str, response_sent_offset: usiz
     full_response.get(response_sent_offset..).unwrap_or("")
 }
 
+async fn enqueue_headless_delivery(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    session_key: Option<&str>,
+    content: &str,
+) -> Result<(), String> {
+    let target = format!("channel:{}", channel_id.get());
+
+    if let Some(pool) = shared.pg_pool.as_ref() {
+        sqlx::query(
+            "INSERT INTO message_outbox (target, content, bot, source, session_key)
+             VALUES ($1, $2, 'notify', 'headless_turn', $3)",
+        )
+        .bind(&target)
+        .bind(content)
+        .bind(session_key)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("enqueue postgres headless delivery: {error}"))?;
+        return Ok(());
+    }
+
+    if let Some(db) = shared.db.as_ref() {
+        let conn = db
+            .separate_conn()
+            .map_err(|error| format!("open sqlite outbox connection: {error}"))?;
+        crate::services::message_outbox::enqueue(
+            &conn,
+            crate::services::message_outbox::OutboxMessage {
+                target: &target,
+                content,
+                bot: "notify",
+                source: "headless_turn",
+                reason_code: None,
+                session_key,
+            },
+        )
+        .map_err(|error| format!("enqueue sqlite headless delivery: {error}"))?;
+        return Ok(());
+    }
+
+    let notify_http = if let Some(registry) = shared.health_registry() {
+        match super::health::resolve_bot_http(registry.as_ref(), "notify").await {
+            Ok(http) => Some(http),
+            Err((status, body)) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ headless notify bot unavailable in channel {}: {} {} — falling back to provider bot",
+                    channel_id,
+                    status,
+                    body
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let http = notify_http
+        .or_else(|| shared.cached_serenity_ctx.get().map(|ctx| ctx.http.clone()))
+        .ok_or_else(|| {
+            format!(
+                "headless delivery unavailable for channel {}: no outbox storage or discord http",
+                channel_id.get()
+            )
+        })?;
+    send_long_message_raw(&http, channel_id, content, shared)
+        .await
+        .map_err(|error| format!("headless direct delivery failed: {error}"))?;
+    Ok(())
+}
+
 fn total_model_input_tokens(
     input_tokens: u64,
     cache_create_tokens: u64,
@@ -1460,9 +1533,25 @@ pub(super) fn spawn_turn_bridge(
                     &delivery_response,
                     &provider,
                 );
-                let _ = gateway
-                    .replace_message(channel_id, current_msg_id, &delivery_response)
-                    .await;
+                if can_chain_locally {
+                    let _ = gateway
+                        .replace_message(channel_id, current_msg_id, &delivery_response)
+                        .await;
+                } else if let Err(error) = enqueue_headless_delivery(
+                    &shared_owned,
+                    channel_id,
+                    adk_session_key.as_deref(),
+                    &delivery_response,
+                )
+                .await
+                {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ headless delivery enqueue failed for channel {}: {}",
+                        channel_id,
+                        error
+                    );
+                }
             }
 
             // Signal the watcher that this turn's response was already delivered.
@@ -1471,7 +1560,7 @@ pub(super) fn spawn_turn_bridge(
                 watcher.turn_delivered.store(true, Ordering::Relaxed);
             }
 
-            if !delivery_response.trim().is_empty() {
+            if can_chain_locally && !delivery_response.trim().is_empty() {
                 gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
 

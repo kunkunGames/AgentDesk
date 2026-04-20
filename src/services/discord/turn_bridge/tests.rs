@@ -25,6 +25,7 @@ use super::stale_resume::{
 };
 use super::tmux_runtime::should_resume_watcher_after_turn;
 use crate::db::turns::TurnTokenUsage;
+use crate::services::agent_protocol::StreamMessage;
 use crate::services::discord::ChannelId;
 use crate::services::discord::DiscordSession;
 use crate::services::discord::InflightTurnState;
@@ -693,6 +694,123 @@ fn storing_retry_context_enqueues_deduped_lifecycle_notification() {
         take_session_retry_context(Some(&db), 42),
         Some("User: hi\nAssistant: hello again".to_string())
     );
+}
+
+#[tokio::test]
+async fn headless_turn_completion_enqueues_notify_outbox_message() {
+    let db = crate::db::test_db();
+    let shared =
+        crate::services::discord::make_shared_data_for_tests_with_storage(Some(db.clone()), None);
+    let cancel_token = std::sync::Arc::new(crate::services::provider::CancelToken::new());
+    let channel_id = ChannelId::new(42);
+    let user_msg_id = MessageId::new(4201);
+    let current_msg_id = MessageId::new(4202);
+    let inflight_state = InflightTurnState::new(
+        ProviderKind::Codex,
+        channel_id.get(),
+        Some("agentdesk-cdx".to_string()),
+        1,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        "background follow-up".to_string(),
+        Some("session-headless".to_string()),
+        None,
+        None,
+        None,
+        0,
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+
+    super::spawn_turn_bridge(
+        shared,
+        cancel_token,
+        rx,
+        super::TurnBridgeContext {
+            provider: ProviderKind::Codex,
+            gateway: std::sync::Arc::new(super::super::gateway::HeadlessGateway),
+            channel_id,
+            user_msg_id,
+            user_text_owned: "background follow-up".to_string(),
+            request_owner_name: "system".to_string(),
+            role_binding: None,
+            adk_session_key: Some("headless-session-key".to_string()),
+            adk_session_name: None,
+            adk_session_info: None,
+            adk_cwd: None,
+            dispatch_id: None,
+            memory_recall_usage: TokenUsage::default(),
+            current_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: None,
+            new_session_id: Some("session-headless".to_string()),
+            defer_watcher_resume: false,
+            completion_tx: Some(completion_tx),
+            inflight_state,
+        },
+    );
+
+    tx.send(StreamMessage::TaskNotification {
+        task_id: "task-42".to_string(),
+        status: "completed".to_string(),
+        summary: "background task done".to_string(),
+    })
+    .unwrap();
+    tx.send(StreamMessage::Text {
+        content: "✅ PR #825 리뷰 4건 fix 완료".to_string(),
+    })
+    .unwrap();
+    tx.send(StreamMessage::Done {
+        result: String::new(),
+        session_id: Some("session-headless-next".to_string()),
+    })
+    .unwrap();
+    drop(tx);
+
+    tokio::time::timeout(Duration::from_secs(5), completion_rx)
+        .await
+        .expect("turn bridge completion")
+        .expect("completion signal");
+
+    let conn = db.read_conn().unwrap();
+    let (target, content, bot, source, session_key, count): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+    ) = conn
+        .query_row(
+            "SELECT
+                COALESCE(MAX(target), ''),
+                COALESCE(MAX(content), ''),
+                COALESCE(MAX(bot), ''),
+                COALESCE(MAX(source), ''),
+                MAX(session_key),
+                COUNT(*)
+             FROM message_outbox",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(target, "channel:42");
+    assert_eq!(bot, "notify");
+    assert_eq!(source, "headless_turn");
+    assert_eq!(session_key.as_deref(), Some("headless-session-key"));
+    assert!(content.contains("PR #825 리뷰 4건 fix 완료"));
 }
 
 #[allow(clippy::await_holding_lock)]
