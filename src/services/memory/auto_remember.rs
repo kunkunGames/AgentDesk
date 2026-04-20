@@ -1778,7 +1778,7 @@ mod tests {
         assert_eq!(config.3, Duration::from_secs(45));
 
         auto_remember_quality::set_test_agent_improver(Some(Box::new(
-            |provider, model, prompt, _timeout, label| {
+            move |provider, model, prompt, _timeout, label| {
                 assert_eq!(provider, crate::services::provider::ProviderKind::Gemini);
                 assert_eq!(model.as_deref(), Some("gemini-2.5-flash"));
                 assert!(prompt.contains("memory.backend"));
@@ -1851,10 +1851,14 @@ mod tests {
             std::env::set_var("AGENTDESK_AUTO_REMEMBER_AGENT_PROVIDER", "codex");
         }
 
+        let expected_model = auto_remember_quality::agent_rewrite_runtime_config_for_tests()
+            .expect("agent rewrite runtime config should resolve")
+            .1;
+
         auto_remember_quality::set_test_agent_improver(Some(Box::new(
-            |provider, model, prompt, _timeout, label| {
+            move |provider, model, prompt, _timeout, label| {
                 assert_eq!(provider, crate::services::provider::ProviderKind::Codex);
-                assert!(model.is_none());
+                assert_eq!(model, expected_model);
                 assert!(prompt.contains("memory.backend"));
                 assert!(label.contains("codex"));
                 Ok(json!({

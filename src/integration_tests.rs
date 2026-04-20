@@ -6625,10 +6625,10 @@ mod tests {
         );
     }
 
-    /// #743 regression: when markPrCreateFailed escalates after max retries,
-    /// the human-facing escalation helper must not overwrite the
-    /// pr:create_failed_escalated:* machine marker that merge automation uses
-    /// to keep the card in the create-pr failure lane.
+    /// #743 regression: escalateToManualIntervention can overwrite the
+    /// machine-readable create-pr escalation marker with a human-readable
+    /// message. markPrCreateFailed must restore the machine marker afterward so
+    /// merge automation keeps the card in the create-pr failure lane.
     #[cfg(unix)]
     #[test]
     fn scenario_743_mark_pr_create_failed_escalation_preserves_machine_marker() {
@@ -6878,9 +6878,9 @@ mod tests {
         );
     }
 
-    /// #743: if handoffCreatePr reuses an already-active create-pr dispatch,
-    /// it must refresh pr_tracking back to the active dispatch's stamped
-    /// generation so stale loser generations do not leak into retry logic.
+    /// #743: if handoffCreatePr reuses an already-active create-pr dispatch, it
+    /// must refresh pr_tracking back to the active dispatch's generation so
+    /// stale loser generations do not leak into retry logic.
     #[cfg(unix)]
     #[test]
     fn scenario_743_handoff_reuse_refreshes_tracking_generation_from_active_dispatch() {
@@ -6916,6 +6916,12 @@ mod tests {
             conn.execute(
                 "UPDATE pr_tracking SET dispatch_generation = '00000000-0000-0000-0000-stale0reuse01' \
                  WHERE card_id = 'card-743-handoff-reuse'",
+                [],
+            )
+            .unwrap();
+
+            conn.execute(
+                "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = 'card-743-handoff-reuse'",
                 [],
             )
             .unwrap();

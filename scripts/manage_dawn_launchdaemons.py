@@ -13,7 +13,10 @@ import argparse
 import os
 import plistlib
 import pwd
+
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +29,10 @@ from typing import Iterator, Optional, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[1]
 SUDOERS_TARGET = Path("/etc/sudoers.d/agentdesk-dawn-manager")
+
+MANAGED_ENTRYPOINT_DIR = Path("/usr/local/libexec/agentdesk")
+MANAGED_ENTRYPOINT = MANAGED_ENTRYPOINT_DIR / SCRIPT_PATH.name
+MANAGED_SKILLS_DIR = MANAGED_ENTRYPOINT_DIR / "skills"
 
 
 @dataclass(frozen=True)
@@ -100,13 +107,32 @@ def current_user_name() -> str:
         return "agentdesk"
 
 
-def invoking_user_home() -> Path:
+
+SAFE_SUDOERS_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def validate_sudoers_user_name(user_name: str) -> str:
+    if not SAFE_SUDOERS_USER_RE.fullmatch(user_name):
+        raise SystemExit(
+            "--sudoers-user must be a single POSIX-style account name "
+            "containing only letters, digits, underscores, dots, or hyphens"
+        )
+    return user_name
+
+
+def home_for_user(user_name: str) -> Optional[Path]:
+    try:
+        return Path(pwd.getpwnam(user_name).pw_dir)
+    except Exception:
+        return None
+
+
+def invoking_home() -> Path:
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
-        try:
-            return Path(pwd.getpwnam(sudo_user).pw_dir)
-        except KeyError:
-            pass
+        home = home_for_user(sudo_user)
+        if home is not None:
+            return home
     return Path.home()
 
 
@@ -134,17 +160,210 @@ def unique_paths(paths: Sequence[Path]) -> list[Path]:
 
 
 def default_skills_roots() -> list[Path]:
-    # Under sudo, prefer the invoking operator's home instead of /var/root.
-    caller_home = invoking_user_home()
+
+    # Search the most common local runtime layouts before falling back to repo-local skills.
     roots: list[Path] = []
     roots.extend(split_env_roots(os.environ.get("AGENTDESK_SKILLS_ROOT")))
     codex_home = os.environ.get("CODEX_HOME")
     if codex_home:
         roots.append(Path(codex_home).expanduser() / "skills")
-    roots.append(caller_home / ".codex/skills")
-    roots.append(caller_home / ".adk/release/skills")
+
+    home = invoking_home()
+    roots.append(home / ".codex/skills")
+    roots.append(home / ".adk/release/skills")
     roots.append(REPO_ROOT / "skills")
     return unique_paths(roots)
+
+
+
+def trusted_root_python_bin() -> Path:
+    candidates = unique_paths(
+        [
+            preferred_python_bin().expanduser().resolve(),
+            Path("/usr/bin/python3"),
+            Path("/usr/bin/python"),
+            Path(sys.executable).expanduser().resolve(),
+        ]
+        + [
+            Path(candidate).expanduser().resolve()
+            for candidate in (shutil.which("python3"), shutil.which("python"))
+            if candidate
+        ]
+    )
+    for candidate in candidates:
+        if path_is_root_owned_and_locked(candidate):
+            return candidate
+    return candidates[0]
+
+
+def path_is_root_owned_and_locked(path: Path) -> bool:
+    current = path.expanduser()
+    seen: set[Path] = set()
+
+    while True:
+        if current in seen:
+            return False
+        seen.add(current)
+
+        try:
+            if current.is_symlink():
+                return False
+            st = current.stat()
+        except OSError:
+            return False
+
+        if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            return False
+
+        parent = current.parent
+        if parent == current:
+            return True
+        current = parent
+
+
+def ensure_locked_directory_chain(path: Path, *, anchor: Path, mode: int = 0o755) -> None:
+    path = path.expanduser()
+    anchor = anchor.expanduser()
+    if anchor != path and anchor not in path.parents:
+        raise ValueError(f"{path} must stay under managed anchor {anchor}")
+    path.mkdir(parents=True, exist_ok=True)
+    current = path
+    while True:
+        os.chmod(current, mode)
+        if current == anchor:
+            break
+        current = current.parent
+
+
+def path_is_executable(path: Path) -> bool:
+    return path.exists() and os.access(path, os.X_OK)
+
+
+def privileged_root_requested(args: argparse.Namespace) -> bool:
+    if args.action == "status" and os.geteuid() == 0:
+        return True
+    return action_needs_privileged_reexec(args.action) and (args.as_root or os.geteuid() == 0)
+
+
+def effective_manager_python(args: argparse.Namespace) -> Path:
+    if privileged_root_requested(args):
+        return trusted_root_python_bin()
+    return Path(args.python_bin).expanduser()
+
+
+def managed_entrypoint_target() -> Path:
+    return MANAGED_ENTRYPOINT
+
+
+def privileged_reexec_script_path() -> Path:
+    target = managed_entrypoint_target()
+    return target if target.exists() else SCRIPT_PATH
+
+
+def managed_skill_root(spec: DawnJobSpec) -> Path:
+    return MANAGED_SKILLS_DIR / spec.skill_name
+
+
+def resolve_managed_job_artifacts(job_name: str, spec: DawnJobSpec) -> ResolvedDawnJob:
+    skill_root = managed_skill_root(spec)
+    manager_script = skill_root / spec.manager_relpath
+    daemon_plist = skill_root / spec.daemon_plist_relpath
+    missing: list[str] = []
+    if not manager_script.exists():
+        missing.append(str(manager_script))
+    if not daemon_plist.exists():
+        missing.append(str(daemon_plist))
+    if missing:
+        raise FileNotFoundError(
+            f"managed artifacts for `{job_name}` are missing: {', '.join(missing)}; "
+            "run `sudo ... manage_dawn_launchdaemons.py bootstrap` to install trusted copies"
+        )
+    return ResolvedDawnJob(
+        name=job_name,
+        skill_root=skill_root,
+        manager_script=manager_script,
+        daemon_plist=daemon_plist,
+    )
+
+
+def copy_locked_file(source: Path, target: Path, *, mode: int) -> Path:
+    ensure_locked_directory_chain(target.parent, anchor=MANAGED_ENTRYPOINT_DIR)
+    tmp = tempfile.NamedTemporaryFile(prefix=f"{target.name}-", dir=target.parent, delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        shutil.copyfile(source, tmp_path)
+        os.chmod(tmp_path, mode)
+        tmp_path.replace(target)
+        os.chmod(target, mode)
+        return target
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def install_managed_job_artifacts(source_job: ResolvedDawnJob, spec: DawnJobSpec) -> ResolvedDawnJob:
+    skill_root = managed_skill_root(spec)
+    manager_script = copy_locked_file(
+        source_job.manager_script,
+        skill_root / spec.manager_relpath,
+        mode=0o755,
+    )
+    daemon_plist = copy_locked_file(
+        source_job.daemon_plist,
+        skill_root / spec.daemon_plist_relpath,
+        mode=0o644,
+    )
+    return ResolvedDawnJob(
+        name=source_job.name,
+        skill_root=skill_root,
+        manager_script=manager_script,
+        daemon_plist=daemon_plist,
+    )
+
+
+def install_managed_entrypoint(source_path: Path = SCRIPT_PATH) -> Path:
+    target = managed_entrypoint_target()
+    ensure_locked_directory_chain(target.parent, anchor=MANAGED_ENTRYPOINT_DIR)
+    tmp = tempfile.NamedTemporaryFile(prefix="agentdesk-dawn-manager-", dir=target.parent, delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        shutil.copyfile(source_path, tmp_path)
+        os.chmod(tmp_path, 0o755)
+        tmp_path.replace(target)
+        os.chmod(target, 0o755)
+        return target
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def validate_privileged_entrypoint(python_bin: Path, script_path: Optional[Path] = None) -> None:
+    paths: list[tuple[str, Path]] = [("manager_python", python_bin)]
+    if script_path is not None:
+        paths.append(("script_path", script_path))
+    for label, path in paths:
+        if not path_is_root_owned_and_locked(path):
+            raise PermissionError(
+                f"{label} must be root-owned and not group/other-writable for privileged actions: {path}"
+            )
+
+
+def validate_privileged_job_artifacts(
+    job: ResolvedDawnJob,
+    python_bin: Path,
+    script_path: Optional[Path] = None,
+) -> None:
+    validate_privileged_entrypoint(python_bin, script_path)
+    for label, path in (
+        ("manager_script", job.manager_script),
+        ("daemon_plist", job.daemon_plist),
+    ):
+        if not path_is_root_owned_and_locked(path):
+            raise PermissionError(
+                f"{job.name} {label} must be root-owned and not group/other-writable for privileged actions: {path}"
+            )
 
 
 def candidate_skills_roots(args: argparse.Namespace) -> list[Path]:
@@ -170,7 +389,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "  status     inspect configured jobs without requiring root by default\n"
             "  uninstall  remove installed LaunchDaemon plists\n"
             "  preflight  verify python path, skill roots, plist validity, and sudo readiness\n"
-            "  sudoers    print the exact sudoers drop-in content for manual review"
+
+            "  sudoers    print the post-bootstrap managed-entrypoint sudoers drop-in for manual review"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -217,6 +437,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def validate_schedule_args(args: argparse.Namespace) -> None:
+
+    args.sudoers_user = validate_sudoers_user_name(args.sudoers_user)
     if (args.hour is None) != (args.minute is None):
         raise SystemExit("--hour and --minute must be provided together")
     if args.hour is None:
@@ -263,14 +485,34 @@ def resolve_job_artifacts(
     )
 
 
+
+class ScheduleOverrideError(RuntimeError):
+    """Raised when a temporary launchd plist override cannot be built safely."""
+
+
 def build_schedule_override(source_plist: Path, *, hour: int, minute: int) -> Path:
-    with source_plist.open("rb") as handle:
-        plist = plistlib.load(handle)
+    try:
+        with source_plist.open("rb") as handle:
+            plist = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise ScheduleOverrideError(
+            f"failed to build schedule override from `{source_plist}`: {exc}"
+        ) from exc
+    if not isinstance(plist, dict):
+        raise ScheduleOverrideError(
+            "failed to build schedule override from "
+            f"`{source_plist}`: expected plist dictionary root, got {type(plist).__name__}"
+        )
     plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
     tmp = tempfile.NamedTemporaryFile(prefix="dawn-launchd-", suffix=".plist", delete=False)
     try:
         with open(tmp.name, "wb") as handle:
             plistlib.dump(plist, handle)
+
+    except OSError as exc:
+        raise ScheduleOverrideError(
+            f"failed to write schedule override for `{source_plist}`: {exc}"
+        ) from exc
     finally:
         tmp.close()
     return Path(tmp.name)
@@ -337,6 +579,8 @@ def summarize_resolution_error(job_name: str, exc: Exception) -> list[str]:
 def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
     all_ok = True
     skills_roots = candidate_skills_roots(args)
+
+    manager_python = effective_manager_python(args)
     summary_lines = [
         "# Dawn LaunchDaemons",
         "",
@@ -345,7 +589,8 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
         f"- execution_user: `{current_user_name()}`",
         f"- execution_uid: `{os.geteuid()}`",
         f"- python: `{sys.executable}`",
-        f"- manager_python: `{Path(args.python_bin)}`",
+
+        f"- manager_python: `{manager_python}`",
         f"- schedule: `{args.hour:02d}:{args.minute:02d}`" if args.hour is not None else "- schedule: `default`",
         f"- skills_roots: `{', '.join(str(path) for path in skills_roots) or '(none)'}`",
         "",
@@ -353,18 +598,44 @@ def render_batch_summary(args: argparse.Namespace, jobs: Sequence[tuple[str, Daw
 
     for index, (job_name, spec) in enumerate(jobs):
         try:
-            resolved = resolve_job_artifacts(job_name, spec, skills_roots=skills_roots)
+
+            resolved = (
+                resolve_managed_job_artifacts(job_name, spec)
+                if privileged_root_requested(args)
+                else resolve_job_artifacts(job_name, spec, skills_roots=skills_roots)
+            )
         except FileNotFoundError as exc:
             all_ok = False
             summary_lines.extend(summarize_resolution_error(job_name, exc))
         else:
-            result = run_manager(
-                resolved,
-                args.action,
-                python_bin=Path(args.python_bin),
-                hour=args.hour,
-                minute=args.minute,
-            )
+
+            if privileged_root_requested(args):
+                try:
+                    validate_privileged_job_artifacts(
+                        resolved,
+                        manager_python,
+                        privileged_reexec_script_path(),
+                    )
+                except PermissionError as exc:
+                    all_ok = False
+                    summary_lines.extend(summarize_resolution_error(job_name, exc))
+                    if index != len(jobs) - 1:
+                        summary_lines.append("")
+                    continue
+            try:
+                result = run_manager(
+                    resolved,
+                    args.action,
+                    python_bin=manager_python,
+                    hour=args.hour,
+                    minute=args.minute,
+                )
+            except (OSError, ScheduleOverrideError) as exc:
+                all_ok = False
+                summary_lines.extend(summarize_resolution_error(job_name, exc))
+                if index != len(jobs) - 1:
+                    summary_lines.append("")
+                continue
             if result.returncode != 0:
                 all_ok = False
             summary_lines.extend(summarize_result(job_name, result))
@@ -391,6 +662,8 @@ def build_self_command(
     if args.hour is not None:
         command.extend(["--hour", str(args.hour), "--minute", str(args.minute)])
     command.extend(["--python-bin", str(Path(args.python_bin))])
+
+    command.extend(["--sudoers-user", args.sudoers_user])
     for skills_root in args.skills_root or []:
         command.extend(["--skills-root", skills_root])
     return command
@@ -407,10 +680,44 @@ def print_subprocess_output(result: subprocess.CompletedProcess) -> None:
 
 def run_via_sudo(args: argparse.Namespace) -> int:
     # Keep the public operator entrypoint stable; privilege escalation only re-enters this script.
-    command = ["sudo", "-n"] + build_self_command(args, as_root=True)
+
+    forwarded = build_self_command(args, as_root=True)
+    forwarded[0] = str(trusted_root_python_bin())
+    forwarded[1] = str(privileged_reexec_script_path())
+    for index, token in enumerate(forwarded[:-1]):
+        if token == "--python-bin":
+            forwarded[index + 1] = str(trusted_root_python_bin())
+    if not args.skills_root:
+        forwarded.extend(
+            token
+            for path in candidate_skills_roots(args)
+            for token in ("--skills-root", str(path))
+        )
+    command = ["sudo", "-n"] + forwarded
     result = run_command(command)
     print_subprocess_output(result)
     return result.returncode
+
+
+
+def build_preflight_probe_command(args: argparse.Namespace, probe_job_name: str) -> list[str]:
+    command = [
+        "sudo",
+        "-n",
+        str(trusted_root_python_bin()),
+        str(privileged_reexec_script_path()),
+        "--as-root",
+        "status",
+        "--python-bin",
+        str(trusted_root_python_bin()),
+        "--sudoers-user",
+        args.sudoers_user,
+        "--job",
+        probe_job_name,
+    ]
+    for path in candidate_skills_roots(args):
+        command.extend(["--skills-root", str(path)])
+    return command
 
 
 def plist_valid(path: Path) -> bool:
@@ -419,13 +726,30 @@ def plist_valid(path: Path) -> bool:
     return run_command(["plutil", "-lint", str(path)]).returncode == 0
 
 
-def sudoers_text(*, user_name: str, python_bin: Path, script_path: Path) -> str:
-    return "\n".join(
+
+def sudoers_text(
+    *,
+    user_name: str,
+    python_bin: Path,
+    script_path: Path,
+    bootstrap_required: bool = False,
+) -> str:
+    safe_user_name = validate_sudoers_user_name(user_name)
+    lines = [
+        "# /etc/sudoers.d/agentdesk-dawn-manager",
+        "# Install with: sudo visudo -f /etc/sudoers.d/agentdesk-dawn-manager",
+    ]
+    if bootstrap_required:
+        lines.append(
+            "# First-time setup still requires `sudo ... manage_dawn_launchdaemons.py bootstrap`"
+        )
+        lines.append(
+            "# This sudoers stanza targets the managed root-owned entrypoint installed by bootstrap."
+        )
+    lines.extend(
         [
-            "# /etc/sudoers.d/agentdesk-dawn-manager",
-            "# Install with: sudo visudo -f /etc/sudoers.d/agentdesk-dawn-manager",
             "",
-            f"User_Alias AGENTDESK_RUNTIME = {user_name}",
+            f"User_Alias AGENTDESK_RUNTIME = {safe_user_name}",
             "",
             "Cmnd_Alias AGENTDESK_DAWN_MANAGER = \\",
             f"    {python_bin} {script_path} *",
@@ -433,6 +757,8 @@ def sudoers_text(*, user_name: str, python_bin: Path, script_path: Path) -> str:
             "AGENTDESK_RUNTIME ALL = (root) NOPASSWD: AGENTDESK_DAWN_MANAGER",
         ]
     )
+
+    return "\n".join(lines)
 
 
 def visudo_bin() -> Path:
@@ -482,16 +808,26 @@ def access_denied(stderr: str) -> bool:
     return any(fragment in lowered for fragment in fragments)
 
 
-def sudo_probe_access_ready(result: subprocess.CompletedProcess) -> bool:
-    return result.returncode == 0 and not access_denied(result.stderr or "")
-
 
 def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
-    python_bin = Path(args.python_bin)
+    requested_python_bin = Path(args.python_bin).expanduser()
+    python_bin = trusted_root_python_bin() if os.geteuid() == 0 else requested_python_bin
     skills_roots = candidate_skills_roots(args)
-    if python_bin.exists():
-        version_result = run_command([str(python_bin), "--version"])
-        invocation_python_version = version_result.stdout.strip() or version_result.stderr.strip() or "unknown"
+    manager_python = trusted_root_python_bin()
+    managed_script = managed_entrypoint_target()
+    managed_script_exists = managed_script.exists()
+    prefer_managed_artifacts = privileged_root_requested(args) or managed_script_exists
+    if path_is_executable(python_bin):
+        try:
+            version_result = run_command([str(python_bin), "--version"])
+        except OSError as exc:
+            invocation_python_version = str(exc)
+        else:
+            invocation_python_version = (
+                version_result.stdout.strip() or version_result.stderr.strip() or "unknown"
+            )
+    elif python_bin.exists():
+        invocation_python_version = "not executable"
     else:
         invocation_python_version = "missing"
     lines = [
@@ -499,18 +835,29 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         "",
         f"- script_path: `{SCRIPT_PATH}`",
         f"- invocation_python: `{python_bin}`",
+
+        f"- requested_python: `{requested_python_bin}`",
+        f"- manager_python: `{manager_python}`",
+        f"- managed_entrypoint: `{managed_script}`",
+        f"- managed_entrypoint_exists: `{managed_script_exists}`",
         f"- runtime_python: `{sys.executable}`",
         f"- invocation_python_exists: `{python_bin.exists()}`",
+        f"- invocation_python_executable: `{path_is_executable(python_bin)}`",
         f"- invocation_python_version: `{invocation_python_version}`",
         f"- sudoers_user: `{args.sudoers_user}`",
         f"- skills_roots: `{', '.join(str(path) for path in skills_roots) or '(none)'}`",
         "",
     ]
 
-    all_ok = python_bin.exists()
+
+    all_ok = path_is_executable(python_bin)
     for job_name, spec in jobs:
         try:
-            resolved = resolve_job_artifacts(job_name, spec, skills_roots=skills_roots)
+            resolved = (
+                resolve_managed_job_artifacts(job_name, spec)
+                if prefer_managed_artifacts
+                else resolve_job_artifacts(job_name, spec, skills_roots=skills_roots)
+            )
         except FileNotFoundError as exc:
             lines.extend(
                 [
@@ -528,6 +875,17 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         source_exists = resolved.daemon_plist.exists()
         source_valid = plist_valid(resolved.daemon_plist) if source_exists else False
         target_exists = resolved.installed_target.exists()
+
+        trusted_for_privileged_actions = True
+        if action_needs_privileged_reexec("install"):
+            try:
+                validate_privileged_job_artifacts(
+                    resolved,
+                    manager_python,
+                    managed_script if managed_script_exists else None,
+                )
+            except PermissionError:
+                trusted_for_privileged_actions = False
         lines.extend(
             [
                 f"## {job_name}",
@@ -539,15 +897,17 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
                 f"- source_path: `{resolved.daemon_plist}`",
                 f"- installed_target_exists: `{target_exists}`",
                 f"- installed_target_path: `{resolved.installed_target}`",
+
+                f"- privileged_trusted: `{trusted_for_privileged_actions}`",
                 "",
             ]
         )
-        all_ok = all_ok and manager_exists and source_exists and source_valid
+        all_ok = all_ok and manager_exists and source_exists and source_valid and trusted_for_privileged_actions
 
     probe_job_name = jobs[0][0]
-    probe_command = ["sudo", "-n"] + build_self_command(args, action="status", as_root=False, job_names=[probe_job_name])
+    probe_command = build_preflight_probe_command(args, probe_job_name)
     probe_result = run_command(probe_command)
-    probe_access = sudo_probe_access_ready(probe_result)
+    probe_access = probe_result.returncode == 0 and not access_denied(probe_result.stderr or "")
     lines.extend(
         [
             "## sudo_probe",
@@ -567,8 +927,9 @@ def render_preflight(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJob
         [
             "",
             "## next_steps",
-            f"- install sudoers file with `python3 {SCRIPT_PATH} sudoers` output",
-            f"- or run `sudo {python_bin} {SCRIPT_PATH} bootstrap` once",
+
+            f"- first bootstrap with `sudo {manager_python} {SCRIPT_PATH} bootstrap`",
+            f"- after bootstrap, review or refresh the sudoers drop-in with `python3 {SCRIPT_PATH} sudoers`",
             f"- status can be checked with `python3 {SCRIPT_PATH} status`",
         ]
     )
@@ -590,18 +951,44 @@ def namespace_for_action(args: argparse.Namespace, action: str) -> argparse.Name
 
 
 def run_bootstrap(args: argparse.Namespace, jobs: Sequence[tuple[str, DawnJobSpec]]) -> int:
-    python_bin = Path(args.python_bin)
+
+    python_bin = effective_manager_python(args)
     # Bootstrap is the one-time setup path: install sudoers, then install the selected plists.
+    try:
+        managed_script_path = install_managed_entrypoint()
+        validate_privileged_entrypoint(python_bin, managed_script_path)
+        source_roots = candidate_skills_roots(args)
+        for job_name, spec in jobs:
+            source_job = resolve_job_artifacts(job_name, spec, skills_roots=source_roots)
+            install_managed_job_artifacts(source_job, spec)
+    except (OSError, PermissionError, FileNotFoundError) as exc:
+        print(
+            "\n".join(
+                [
+                    "# Dawn LaunchDaemon Bootstrap",
+                    "",
+                    f"- sudoers_target: `{SUDOERS_TARGET}`",
+                    f"- managed_entrypoint: `{managed_entrypoint_target()}`",
+                    f"- sudoers_user: `{args.sudoers_user}`",
+                    f"- invocation_python: `{python_bin}`",
+                    "- sudoers_installed: `False`",
+                    f"- detail: `{str(exc)}`",
+                ]
+            )
+        )
+        return 1
     sudoers_ok, sudoers_message = install_sudoers_dropin(
         user_name=args.sudoers_user,
         python_bin=python_bin,
-        script_path=SCRIPT_PATH,
+        script_path=managed_script_path,
     )
 
     lines = [
         "# Dawn LaunchDaemon Bootstrap",
         "",
         f"- sudoers_target: `{SUDOERS_TARGET}`",
+
+        f"- managed_entrypoint: `{managed_script_path}`",
         f"- sudoers_user: `{args.sudoers_user}`",
         f"- invocation_python: `{python_bin}`",
         f"- sudoers_installed: `{sudoers_ok}`",
@@ -623,8 +1010,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             sudoers_text(
                 user_name=args.sudoers_user,
-                python_bin=Path(args.python_bin),
-                script_path=SCRIPT_PATH,
+
+                python_bin=trusted_root_python_bin(),
+                script_path=managed_entrypoint_target(),
+                bootstrap_required=not managed_entrypoint_target().exists(),
             )
         )
         return 0

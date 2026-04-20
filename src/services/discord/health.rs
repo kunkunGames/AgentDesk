@@ -836,6 +836,9 @@ impl TestHealthHarness {
             last_turn_at: std::sync::Mutex::new(None),
             model_overrides: dashmap::DashMap::new(),
             fast_mode_channels: dashmap::DashSet::new(),
+
+            fast_mode_session_reset_pending: dashmap::DashSet::new(),
+            model_session_reset_pending: dashmap::DashSet::new(),
             session_reset_pending: dashmap::DashSet::new(),
             model_picker_pending: dashmap::DashMap::new(),
             dispatch_role_overrides: dashmap::DashMap::new(),

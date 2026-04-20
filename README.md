@@ -50,8 +50,9 @@ If you also install observability skills such as `memory-dream`, `service-monito
 The script automatically searches common skill install roots in this order:
 - `$AGENTDESK_SKILLS_ROOT`
 - `$CODEX_HOME/skills`
-- invoking user's `~/.codex/skills` even when run via `sudo`
-- invoking user's `~/.adk/release/skills` even when run via `sudo`
+
+- `~/.codex/skills`
+- `~/.adk/release/skills`
 - `<repo>/skills`
 
 First-time bootstrap:
