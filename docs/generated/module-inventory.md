@@ -65,7 +65,7 @@
 | `db::builtin_pipeline` | `src/db/builtin_pipeline.rs` | 27 |  |
 | `db::kanban` | `src/db/kanban.rs` | 165 |  |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 255 |  |
-| `db::postgres` | `src/db/postgres.rs` | 673 |  |
+| `db::postgres` | `src/db/postgres.rs` | 686 |  |
 | `db::schema` | `src/db/schema.rs` | 3063 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 262 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 1200 | giant-file |
