@@ -16,8 +16,9 @@ static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
 /// Session-scoped PostgreSQL advisory lock lease.
 ///
 /// The lock remains held for the lifetime of the dedicated connection.
-/// Dropping the lease releases the lock implicitly; callers may also call
-/// `unlock()` for an explicit release.
+/// Dropping the lease closes that connection so PostgreSQL releases the
+/// session lock when the backend exits; callers may also call `unlock()`
+/// for an explicit release without waiting for connection teardown.
 pub struct AdvisoryLockLease {
     conn: PoolConnection<Postgres>,
     lock_id: i64,
@@ -364,6 +365,7 @@ mod tests {
         database_enabled, database_summary, startup_reseed,
     };
     use sqlx::Row;
+    use std::time::Duration;
 
     struct TestDatabase {
         admin_url: String,
@@ -657,10 +659,21 @@ mod tests {
 
         drop(holder_a);
 
-        let holder_b = AdvisoryLockLease::try_acquire(&pool_b, 91_002, "test advisory lock")
-            .await
-            .expect("acquire advisory lock on pool B after drop")
-            .expect("pool B advisory lock holder after drop");
+        let holder_b = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(holder) =
+                    AdvisoryLockLease::try_acquire(&pool_b, 91_002, "test advisory lock")
+                        .await
+                        .expect("acquire advisory lock on pool B after drop")
+                {
+                    break holder;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("pool B advisory lock holder after drop");
         holder_b
             .unlock()
             .await
