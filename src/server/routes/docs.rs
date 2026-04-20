@@ -1463,13 +1463,47 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "meetings",
             "Discard all meeting issues",
         ),
-        ep("GET", "/api/skills/catalog", "skills", "List skill catalog"),
+        ep("GET", "/api/skills/catalog", "skills", "List skill catalog").with_params([(
+            "include_stale",
+            query_param(
+                "boolean",
+                false,
+                "Include stale skill entries that no longer exist on disk",
+            ),
+        )]),
         ep(
             "GET",
             "/api/skills/ranking",
             "skills",
             "Skill usage ranking",
-        ),
+        )
+        .with_params([
+            (
+                "window",
+                query_param("string", false, "Ranking window: 7d, 30d, 90d, all"),
+            ),
+            (
+                "limit",
+                query_param("integer", false, "Maximum number of ranking entries"),
+            ),
+            (
+                "include_stale",
+                query_param(
+                    "boolean",
+                    false,
+                    "Include stale skill entries that no longer exist on disk",
+                ),
+            ),
+        ]),
+        ep("POST", "/api/skills/prune", "skills", "Preview or prune stale skill metadata")
+            .with_params([(
+                "dry_run",
+                query_param(
+                    "boolean",
+                    false,
+                    "When true, report stale skill ids without deleting skills rows",
+                ),
+            )]),
         ep("GET", "/api/cron-jobs", "cron", "List cron jobs"),
         ep(
             "POST",
