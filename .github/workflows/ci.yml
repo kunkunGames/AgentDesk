@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -112,10 +116,12 @@ jobs:
             ${{ runner.os }}-cargo-postgres-
 
       - name: cargo test (postgres bootstrap)
-        run: cargo test postgres_ -- --nocapture
+        timeout-minutes: 15
+        run: cargo test postgres_ -- --nocapture --test-threads=1
 
       - name: cargo test (PG routes)
-        run: cargo test _pg_ -- --nocapture
+        timeout-minutes: 15
+        run: cargo test _pg_ -- --nocapture --test-threads=1
 
   high-risk-recovery:
     name: High-risk recovery

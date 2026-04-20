@@ -1965,14 +1965,13 @@ mod tests {
                 uuid::Uuid::new_v4().simple()
             );
             let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
-            let admin_pool = sqlx::PgPool::connect(&admin_url)
-                .await
-                .expect("connect postgres admin db");
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
-                .await
-                .expect("create postgres test db");
-            admin_pool.close().await;
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "dispatched sessions tests",
+            )
+            .await
+            .expect("create postgres test db");
 
             Self {
                 admin_url,
@@ -1982,37 +1981,22 @@ mod tests {
         }
 
         async fn connect_and_migrate(&self) -> sqlx::PgPool {
-            let pool = sqlx::PgPool::connect(&self.database_url)
-                .await
-                .expect("connect postgres test db");
-            crate::db::postgres::migrate(&pool)
-                .await
-                .expect("apply postgres migration");
-            pool
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "dispatched sessions tests",
+            )
+            .await
+            .expect("apply postgres migration")
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::PgPool::connect(&self.admin_url)
-                .await
-                .expect("reconnect postgres admin db");
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "dispatched sessions tests",
             )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
-            .await
-            .expect("terminate postgres test db sessions");
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
             .await
             .expect("drop postgres test db");
-            admin_pool.close().await;
         }
     }
 
