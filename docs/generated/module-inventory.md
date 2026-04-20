@@ -275,7 +275,7 @@
 | `services::memory::auto_remember_store` | `src/services/memory/auto_remember_store.rs` | 1450 | giant-file |
 | `services::memory::local` | `src/services/memory/local.rs` | 119 |  |
 | `services::memory::mem0` | `src/services/memory/mem0.rs` | 1047 | giant-file |
-| `services::memory::memento` | `src/services/memory/memento.rs` | 2599 | giant-file |
+| `services::memory::memento` | `src/services/memory/memento.rs` | 2641 | giant-file |
 | `services::memory::runtime_state` | `src/services/memory/runtime_state.rs` | 572 |  |
 | `services::message_outbox` | `src/services/message_outbox.rs` | 256 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
