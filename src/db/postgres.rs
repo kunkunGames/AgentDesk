@@ -359,10 +359,124 @@ fn database_url_override() -> Option<String> {
 }
 
 #[cfg(test)]
+const TEST_POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+async fn run_test_postgres_sqlx_op_with_timeout<T, F>(
+    timeout: Duration,
+    label: &str,
+    future: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| format!("{label} timed out after {}s", timeout.as_secs()))?
+        .map_err(|error| format!("{label}: {error}"))
+}
+
+#[cfg(test)]
+async fn run_test_postgres_sqlx_op<T, F>(label: &str, future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    run_test_postgres_sqlx_op_with_timeout(TEST_POSTGRES_OP_TIMEOUT, label, future).await
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_test_pool(database_url: &str, label: &str) -> Result<PgPool, String> {
+    let options = PgConnectOptions::from_str(database_url)
+        .map_err(|error| format!("{label} parse postgres url: {error}"))?;
+    run_test_postgres_sqlx_op(
+        &format!("{label} connect postgres"),
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(TEST_POSTGRES_OP_TIMEOUT)
+            .connect_with(options),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_test_database(
+    admin_url: &str,
+    database_name: &str,
+    label: &str,
+) -> Result<(), String> {
+    let admin_pool = connect_test_pool(admin_url, &format!("{label} admin")).await?;
+    run_test_postgres_sqlx_op(
+        &format!("{label} create postgres test db {database_name}"),
+        sqlx::query(&format!("CREATE DATABASE \"{database_name}\"")).execute(&admin_pool),
+    )
+    .await?;
+    close_test_pool(admin_pool, &format!("{label} admin")).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_test_pool_and_migrate(
+    database_url: &str,
+    label: &str,
+) -> Result<PgPool, String> {
+    let pool = connect_test_pool(database_url, label).await?;
+    tokio::time::timeout(TEST_POSTGRES_OP_TIMEOUT, migrate(&pool))
+        .await
+        .map_err(|_| {
+            format!(
+                "{label} migrate postgres timed out after {}s",
+                TEST_POSTGRES_OP_TIMEOUT.as_secs()
+            )
+        })??;
+    Ok(pool)
+}
+
+#[cfg(test)]
+pub(crate) async fn drop_test_database(
+    admin_url: &str,
+    database_name: &str,
+    label: &str,
+) -> Result<(), String> {
+    let admin_pool = connect_test_pool(admin_url, &format!("{label} admin")).await?;
+    run_test_postgres_sqlx_op(
+        &format!("{label} terminate postgres test db sessions {database_name}"),
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = $1
+               AND pid <> pg_backend_pid()",
+        )
+        .bind(database_name)
+        .execute(&admin_pool),
+    )
+    .await?;
+    run_test_postgres_sqlx_op(
+        &format!("{label} drop postgres test db {database_name}"),
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{database_name}\"")).execute(&admin_pool),
+    )
+    .await?;
+    close_test_pool(admin_pool, &format!("{label} admin")).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), String> {
+    tokio::time::timeout(TEST_POSTGRES_OP_TIMEOUT, pool.close())
+        .await
+        .map_err(|_| {
+            format!(
+                "{label} close postgres pool timed out after {}s",
+                TEST_POSTGRES_OP_TIMEOUT.as_secs()
+            )
+        })
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        AdvisoryLockLease, config_database_summary, connect_and_migrate, connect_options,
-        database_enabled, database_summary, startup_reseed,
+        AdvisoryLockLease, close_test_pool, config_database_summary, connect_and_migrate,
+        connect_options, create_test_database, database_enabled, database_summary,
+        run_test_postgres_sqlx_op_with_timeout, startup_reseed,
     };
     use sqlx::Row;
     use std::time::Duration;
@@ -378,14 +492,9 @@ mod tests {
             let admin_url = admin_database_url();
             let database_name = format!("agentdesk_pg_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!("{}/{}", base_database_url(), database_name);
-            let admin_pool = sqlx::PgPool::connect(&admin_url)
-                .await
-                .expect("connect postgres admin db");
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
+            create_test_database(&admin_url, &database_name, "db::postgres tests")
                 .await
                 .expect("create postgres test db");
-            admin_pool.close().await;
 
             Self {
                 admin_url,
@@ -395,27 +504,9 @@ mod tests {
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::PgPool::connect(&self.admin_url)
+            super::drop_test_database(&self.admin_url, &self.database_name, "db::postgres tests")
                 .await
-                .expect("reconnect postgres admin db");
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
-            )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
-            .await
-            .expect("terminate postgres test db sessions");
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
-            .await
-            .expect("drop postgres test db");
-            admin_pool.close().await;
+                .expect("drop postgres test db");
         }
     }
 
@@ -589,7 +680,9 @@ mod tests {
             Some("pg-agent-cdx".to_string())
         );
 
-        pool.close().await;
+        close_test_pool(pool, "db::postgres migration test pool")
+            .await
+            .expect("close postgres pool");
         assert!(test_db.database_url.contains("agentdesk_pg_"));
         test_db.drop().await;
     }
@@ -626,7 +719,9 @@ mod tests {
             .expect("third advisory lock holder after unlock");
         third.unlock().await.expect("unlock third advisory lock");
 
-        pool.close().await;
+        close_test_pool(pool, "db::postgres advisory lock test pool")
+            .await
+            .expect("close postgres pool");
         test_db.drop().await;
     }
 
@@ -679,8 +774,31 @@ mod tests {
             .await
             .expect("unlock advisory lock on pool B");
 
-        pool_b.close().await;
-        pool_a.close().await;
+        close_test_pool(pool_b, "db::postgres advisory lock pool B")
+            .await
+            .expect("close pool B");
+        close_test_pool(pool_a, "db::postgres advisory lock pool A")
+            .await
+            .expect("close pool A");
         test_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_test_sqlx_timeout_wrapper_fails_fast() {
+        let err = run_test_postgres_sqlx_op_with_timeout(
+            Duration::from_millis(20),
+            "synthetic postgres timeout",
+            async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok::<(), sqlx::Error>(())
+            },
+        )
+        .await
+        .expect_err("sleep should time out");
+
+        assert!(
+            err.contains("timed out"),
+            "expected timeout wording, got {err}"
+        );
     }
 }

@@ -1259,17 +1259,13 @@ mod tests {
             let admin_url = admin_database_url();
             let database_name = format!("agentdesk_review_auto_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!("{}/{}", base_database_url(), database_name);
-            let admin_pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&admin_url)
-                .await
-                .expect("connect postgres admin db");
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
-                .await
-                .expect("create postgres test db");
-            admin_pool.close().await;
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "review automation pg tests",
+            )
+            .await
+            .expect("create postgres test db");
 
             Self {
                 admin_url,
@@ -1279,43 +1275,22 @@ mod tests {
         }
 
         async fn migrate(&self) -> sqlx::PgPool {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&self.database_url)
-                .await
-                .expect("connect postgres test db");
-            crate::db::postgres::migrate(&pool)
-                .await
-                .expect("migrate postgres test db");
-            pool
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "review automation pg tests",
+            )
+            .await
+            .expect("migrate postgres test db")
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&self.admin_url)
-                .await
-                .expect("reconnect postgres admin db");
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "review automation pg tests",
             )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
-            .await
-            .expect("terminate postgres test db sessions");
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
             .await
             .expect("drop postgres test db");
-            admin_pool.close().await;
         }
     }
 
