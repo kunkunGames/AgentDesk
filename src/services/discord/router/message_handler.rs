@@ -1,7 +1,7 @@
 use super::super::gateway::{DiscordGateway, HeadlessGateway, LiveDiscordTurnContext};
 use super::super::*;
 use crate::services::memory::{
-    RecallMode, RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
+    RecallRequest, RecallResponse, build_memory_backend, resolve_memory_role_id,
     resolve_memory_session_id,
 };
 use crate::services::provider::{CancelToken, cancel_requested};
@@ -59,14 +59,6 @@ fn build_memory_injection_plan<'a>(
         shared_knowledge_for_system_prompt,
         external_recall_for_context,
         longterm_catalog_for_system_prompt,
-    }
-}
-
-fn recall_mode_for_turn(memory_settings: &settings::ResolvedMemorySettings) -> RecallMode {
-    if memory_settings.backend == settings::MemoryBackendKind::Memento {
-        RecallMode::Bootstrap
-    } else {
-        RecallMode::Query
     }
 }
 
@@ -418,17 +410,12 @@ pub(in crate::services::discord) async fn start_headless_turn(
     } else {
         memory_backend
             .recall(RecallRequest {
-                mode: recall_mode_for_turn(&memory_settings),
                 provider: provider.clone(),
                 role_id: resolve_memory_role_id(role_binding.as_ref()),
                 channel_id: channel_id.get(),
                 session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
                 dispatch_profile,
                 user_text: prompt.to_string(),
-                context_text: Some(prompt.to_string()),
-                case_id: None,
-                phase: None,
-                resolution_status: None,
             })
             .await
     };
@@ -524,10 +511,11 @@ pub(in crate::services::discord) async fn start_headless_turn(
     };
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
-        "  [{ts}] [prompt-prep] headless channel={} provider={} dispatch=full memory_backend={} reused_session={} duration_ms={}",
+        "  [{ts}] [prompt-prep] headless channel={} provider={} dispatch=full memory_backend={} memory_profile={} reused_session={} duration_ms={}",
         channel_id.get(),
         provider_label,
         memory_backend_label,
+        memory_settings.mem0.profile,
         session_id.is_some(),
         prompt_prep_duration_ms
     );
@@ -920,7 +908,6 @@ pub(in crate::services::discord) async fn start_headless_turn(
             adk_session_info: Some(adk_session_info),
             adk_cwd: Some(current_path),
             dispatch_id: None,
-            dispatch_profile,
             memory_recall_usage: memory_recall.token_usage,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
@@ -1006,13 +993,6 @@ struct DispatchContextHints {
     recreate_tmux: bool,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct DispatchMemoryHints {
-    case_id: Option<String>,
-    phase: Option<String>,
-    resolution_status: Option<String>,
-}
-
 fn parse_dispatch_context_hints(
     dispatch_context: Option<&str>,
     dispatch_type: Option<&str>,
@@ -1069,68 +1049,6 @@ fn resolve_dispatch_target_repo_dir(target_repo: Option<&str>) -> Option<String>
             );
             None
         }
-    }
-}
-
-fn normalize_memento_phase(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "planning" | "debugging" | "verification" | "completed" | "retrospective" | "runtime" => {
-            Some(normalized)
-        }
-        _ => None,
-    }
-}
-
-fn dispatch_type_to_memory_phase(dispatch_type: Option<&str>) -> Option<String> {
-    let normalized = dispatch_type?.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "review" | "review-decision" => Some("verification".to_string()),
-        _ if normalized.ends_with("-gate") => Some("verification".to_string()),
-        _ => None,
-    }
-}
-
-fn derive_dispatch_memory_hints(
-    dispatch_info: Option<&super::thread_binding::DispatchInfo>,
-) -> DispatchMemoryHints {
-    let Some(dispatch_info) = dispatch_info else {
-        return DispatchMemoryHints::default();
-    };
-
-    let case_id = dispatch_info
-        .github_issue_number
-        .filter(|value| *value > 0)
-        .map(|value| format!("issue-{value}"))
-        .or_else(|| {
-            dispatch_info
-                .card_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        });
-
-    let explicit_phase = dispatch_info
-        .context
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .as_ref()
-        .and_then(|value| value.get("phase"))
-        .and_then(|value| value.as_str())
-        .and_then(normalize_memento_phase);
-    let phase = explicit_phase
-        .or_else(|| dispatch_type_to_memory_phase(dispatch_info.dispatch_type.as_deref()));
-    let resolution_status = if case_id.is_some() || phase.is_some() {
-        Some("open".to_string())
-    } else {
-        None
-    };
-
-    DispatchMemoryHints {
-        case_id,
-        phase,
-        resolution_status,
     }
 }
 
@@ -1846,7 +1764,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     };
 
     // Derive dispatch prompt profile before memory recall so ReviewLite can
-    // skip heavy memory work consistently across supported backends.
+    // skip heavy memory work consistently across local/mem0 backends.
     let dispatch_profile = DispatchProfile::from_dispatch_type(
         active_dispatch_id_for_prompt
             .as_ref()
@@ -1888,7 +1806,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     let prompt_prep_started = std::time::Instant::now();
 
     // Resolve channel/tmux session name from current session state. We need the
-    // persisted provider session_id before recall so external memory can scope by run_id.
+    // persisted provider session_id before recall so Mem0 can scope search by run_id.
     let (channel_name, tmux_session_name) = {
         let data = shared.core.lock().await;
         let channel_name = data
@@ -2041,23 +1959,17 @@ pub(in crate::services::discord) async fn handle_text_message(
         .insert(channel_id, std::time::Instant::now());
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
-    let dispatch_memory_hints = derive_dispatch_memory_hints(active_dispatch_info.as_ref());
     let memory_recall = if should_skip_memento_recall(&memory_settings, memento_context_loaded) {
         RecallResponse::default()
     } else {
         memory_backend
             .recall(RecallRequest {
-                mode: recall_mode_for_turn(&memory_settings),
                 provider: provider.clone(),
                 role_id: resolve_memory_role_id(role_binding.as_ref()),
                 channel_id: channel_id.get(),
                 session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
                 dispatch_profile,
                 user_text: user_text.to_string(),
-                context_text: Some(user_text.to_string()),
-                case_id: dispatch_memory_hints.case_id,
-                phase: dispatch_memory_hints.phase,
-                resolution_status: dispatch_memory_hints.resolution_status,
             })
             .await
     };
@@ -2181,11 +2093,12 @@ pub(in crate::services::discord) async fn handle_text_message(
     };
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
-        "  [{ts}] [prompt-prep] channel={} provider={} dispatch={} memory_backend={} reused_session={} duration_ms={}",
+        "  [{ts}] [prompt-prep] channel={} provider={} dispatch={} memory_backend={} memory_profile={} reused_session={} duration_ms={}",
         channel_id.get(),
         provider_label,
         dispatch_profile_label,
         memory_backend_label,
+        memory_settings.mem0.profile,
         session_id.is_some(),
         prompt_prep_duration_ms
     );
@@ -2525,7 +2438,6 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     let model_for_turn =
         super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
-
     let native_fast_mode_override = native_fast_mode_override_for_turn(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, channel_id).await,
@@ -2683,7 +2595,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             adk_session_info: Some(adk_session_info),
             adk_cwd: Some(current_path.clone()),
             dispatch_id,
-            dispatch_profile,
             memory_recall_usage: memory_recall.token_usage,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
@@ -4317,15 +4228,13 @@ mod tests {
     }
 
     #[test]
-    fn recall_mode_defaults_to_bootstrap_for_memento_and_query_for_file() {
+    fn memento_recall_skip_only_triggers_for_loaded_memento_sessions() {
         let memento = settings::ResolvedMemorySettings {
             backend: settings::MemoryBackendKind::Memento,
             ..settings::ResolvedMemorySettings::default()
         };
         let file = settings::ResolvedMemorySettings::default();
 
-        assert_eq!(recall_mode_for_turn(&memento), RecallMode::Bootstrap);
-        assert_eq!(recall_mode_for_turn(&file), RecallMode::Query);
         assert!(should_skip_memento_recall(&memento, true));
         assert!(!should_skip_memento_recall(&memento, false));
         assert!(!should_skip_memento_recall(&file, true));
@@ -4349,7 +4258,6 @@ mod tests {
     }
 
     #[test]
-
     fn native_fast_mode_override_only_applies_when_explicitly_enabled() {
         assert_eq!(
             native_fast_mode_override_for_turn(&ProviderKind::Claude, Some(true)),
@@ -4739,53 +4647,5 @@ mod tests {
 
         assert!(!queued.has_reply_boundary);
         assert!(!queued.merge_consecutive);
-    }
-
-    #[test]
-    fn derive_dispatch_memory_hints_prefers_issue_case_and_review_phase() {
-        let dispatch_info = crate::services::discord::router::thread_binding::DispatchInfo {
-            card_id: Some("card-418".to_string()),
-            github_issue_number: Some(418),
-            dispatch_type: Some("review".to_string()),
-            ..Default::default()
-        };
-
-        let hints = derive_dispatch_memory_hints(Some(&dispatch_info));
-
-        assert_eq!(hints.case_id.as_deref(), Some("issue-418"));
-        assert_eq!(hints.phase.as_deref(), Some("verification"));
-        assert_eq!(hints.resolution_status.as_deref(), Some("open"));
-    }
-
-    #[test]
-    fn derive_dispatch_memory_hints_uses_explicit_context_phase_when_supported() {
-        let dispatch_info = crate::services::discord::router::thread_binding::DispatchInfo {
-            card_id: Some("card-runtime".to_string()),
-            dispatch_type: Some("implementation".to_string()),
-            context: Some(r#"{"phase":"debugging"}"#.to_string()),
-            ..Default::default()
-        };
-
-        let hints = derive_dispatch_memory_hints(Some(&dispatch_info));
-
-        assert_eq!(hints.case_id.as_deref(), Some("card-runtime"));
-        assert_eq!(hints.phase.as_deref(), Some("debugging"));
-        assert_eq!(hints.resolution_status.as_deref(), Some("open"));
-    }
-
-    #[test]
-    fn derive_dispatch_memory_hints_ignores_unknown_context_phase() {
-        let dispatch_info = crate::services::discord::router::thread_binding::DispatchInfo {
-            card_id: Some("card-raw".to_string()),
-            dispatch_type: Some("implementation".to_string()),
-            context: Some(r#"{"phase":"implementation"}"#.to_string()),
-            ..Default::default()
-        };
-
-        let hints = derive_dispatch_memory_hints(Some(&dispatch_info));
-
-        assert_eq!(hints.case_id.as_deref(), Some("card-raw"));
-        assert_eq!(hints.phase, None);
-        assert_eq!(hints.resolution_status.as_deref(), Some("open"));
     }
 }

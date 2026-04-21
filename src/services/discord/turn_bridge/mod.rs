@@ -90,7 +90,6 @@ pub(super) struct TurnBridgeContext {
     pub(super) adk_session_info: Option<String>,
     pub(super) adk_cwd: Option<String>,
     pub(super) dispatch_id: Option<String>,
-    pub(super) dispatch_profile: DispatchProfile,
     pub(super) memory_recall_usage: TokenUsage,
     pub(super) current_msg_id: MessageId,
     pub(super) response_sent_offset: usize,

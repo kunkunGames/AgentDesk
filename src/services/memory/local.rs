@@ -33,7 +33,6 @@ mod tests {
     use super::*;
     use crate::runtime_layout::{long_term_memory_root, shared_agent_knowledge_path};
     use crate::services::discord::DispatchProfile;
-    use crate::services::memory::RecallMode;
     use crate::services::provider::ProviderKind;
     use tempfile::TempDir;
 
@@ -73,17 +72,12 @@ mod tests {
         let backend = LocalMemoryBackend;
         let recall = backend
             .recall(RecallRequest {
-                mode: RecallMode::Query,
                 provider: ProviderKind::Codex,
                 role_id: "codex".to_string(),
                 channel_id: 1,
                 session_id: "session-1".to_string(),
                 dispatch_profile: DispatchProfile::Full,
                 user_text: "hello".to_string(),
-                context_text: None,
-                case_id: None,
-                phase: None,
-                resolution_status: None,
             })
             .await;
         restore_temp_root(prev);

@@ -245,6 +245,7 @@ fn normalize_memory_backend_name(raw: Option<&str>) -> String {
         Some(value) if value.eq_ignore_ascii_case("auto") => "auto".to_string(),
         Some(value) if value.eq_ignore_ascii_case("file") => "file".to_string(),
         Some(value) if value.eq_ignore_ascii_case("local") => "file".to_string(),
+        Some(value) if value.eq_ignore_ascii_case("mem0") => "mem0".to_string(),
         Some(value) if value.eq_ignore_ascii_case("memento") => "memento".to_string(),
         Some(_) => DEFAULT_MEMORY_BACKEND.to_string(),
     }

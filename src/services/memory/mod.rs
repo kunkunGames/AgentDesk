@@ -1,4 +1,5 @@
 mod local;
+mod mem0;
 mod memento;
 mod runtime_state;
 
@@ -12,6 +13,7 @@ use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettin
 use crate::services::provider::ProviderKind;
 
 pub(crate) use local::LocalMemoryBackend;
+pub(crate) use mem0::Mem0Backend;
 pub(crate) use memento::{
     MementoBackend, MementoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agent_id,
     resolve_memento_workspace, sanitize_memento_workspace_segment,
@@ -43,27 +45,15 @@ impl TokenUsage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum RecallMode {
-    Bootstrap,
-    #[default]
-    Query,
-}
-
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct RecallRequest {
-    pub mode: RecallMode,
     pub provider: ProviderKind,
     pub role_id: String,
     pub channel_id: u64,
     pub session_id: String,
     pub dispatch_profile: DispatchProfile,
     pub user_text: String,
-    pub context_text: Option<String>,
-    pub case_id: Option<String>,
-    pub phase: Option<String>,
-    pub resolution_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -148,6 +138,7 @@ pub(crate) fn build_resolved_memory_backend(
 ) -> Box<dyn MemoryBackend + Send + Sync> {
     match settings.backend {
         MemoryBackendKind::File => Box::new(LocalMemoryBackend),
+        MemoryBackendKind::Mem0 => Box::new(Mem0Backend::new(settings.clone())),
         MemoryBackendKind::Memento => Box::new(MementoBackend::new(settings.clone())),
     }
 }
@@ -254,9 +245,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_build_resolved_memory_backend_file_and_memento() {
+    fn test_build_resolved_memory_backend_file_mem0_and_memento() {
         let file = build_resolved_memory_backend(&ResolvedMemorySettings::default());
         let _ = file;
+
+        let mem0 = build_resolved_memory_backend(&ResolvedMemorySettings {
+            backend: MemoryBackendKind::Mem0,
+            ..ResolvedMemorySettings::default()
+        });
+        let _ = mem0;
 
         let memento = build_resolved_memory_backend(&ResolvedMemorySettings {
             backend: MemoryBackendKind::Memento,
