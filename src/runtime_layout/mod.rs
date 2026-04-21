@@ -37,10 +37,6 @@ pub use paths::{
 pub const MEMORY_LAYOUT_VERSION: u32 = 2;
 const DEFAULT_MEMORY_BACKEND: &str = "auto";
 
-const fn default_query_recall_after_bootstrap() -> bool {
-    false
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemoryBackendConfig {
@@ -48,8 +44,6 @@ pub struct MemoryBackendConfig {
     pub version: u32,
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    #[serde(default = "default_query_recall_after_bootstrap")]
-    pub query_recall_after_bootstrap: bool,
     #[serde(default)]
     pub file: FileMemoryBackendConfig,
     #[serde(default)]
@@ -67,7 +61,6 @@ impl Default for MemoryBackendConfig {
         Self {
             version: default_memory_layout_version(),
             backend: default_memory_backend(),
-            query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
             file: FileMemoryBackendConfig::default(),
             mcp: McpMemoryBackendConfig::default(),
             legacy_sak_path: None,
@@ -80,9 +73,6 @@ impl Default for MemoryBackendConfig {
 impl MemoryBackendConfig {
     fn normalized(mut self) -> Self {
         self.backend = normalize_memory_backend_name(Some(&self.backend));
-        if self.version < MEMORY_LAYOUT_VERSION {
-            self.query_recall_after_bootstrap = true;
-        }
         self.file = self.file.normalized(
             self.legacy_sak_path.take(),
             self.legacy_sam_path.take(),
@@ -422,7 +412,6 @@ fn memory_backend_from_config(config: crate::config::MemoryConfig) -> MemoryBack
     MemoryBackendConfig {
         version: MEMORY_LAYOUT_VERSION,
         backend: config.backend,
-        query_recall_after_bootstrap: config.query_recall_after_bootstrap,
         file: FileMemoryBackendConfig {
             sak_path: config.file.sak_path,
             sam_path: config.file.sam_path,
@@ -815,7 +804,6 @@ mod tests {
         let backend = load_memory_backend(root);
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "auto");
-        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, default_sak_path());
         assert_eq!(backend.file.sam_path, default_sam_path());
         assert_eq!(backend.file.ltm_root, default_ltm_root());
@@ -1105,7 +1093,6 @@ agents:
   port: 9001
 memory:
   backend: memento
-  query_recall_after_bootstrap: true
   file:
     sak_path: /tmp/yaml/shared.md
     sam_path: /tmp/yaml/sam
@@ -1134,7 +1121,6 @@ memory:
 
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "memento");
-        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/yaml/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/yaml/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/yaml/ltm");
@@ -1167,7 +1153,6 @@ memory:
             serde_json::json!({
                 "version": 2,
                 "backend": "memento",
-                "query_recall_after_bootstrap": true,
                 "file": {
                     "sak_path": "/tmp/custom/shared.md",
                     "sam_path": "/tmp/custom/sam",
@@ -1187,7 +1172,6 @@ memory:
         assert!(!report.migrated);
         assert_eq!(backend.version, 2);
         assert_eq!(backend.backend, "memento");
-        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/custom/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/custom/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/custom/ltm");
@@ -1218,7 +1202,6 @@ memory:
 
         assert_eq!(backend.version, 1);
         assert_eq!(backend.backend, "auto");
-        assert!(backend.query_recall_after_bootstrap);
         assert_eq!(backend.file.sak_path, "/tmp/legacy/shared.md");
         assert_eq!(backend.file.sam_path, "/tmp/legacy/sam");
         assert_eq!(backend.file.ltm_root, "/tmp/legacy/ltm");

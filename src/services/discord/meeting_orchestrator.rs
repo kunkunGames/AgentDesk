@@ -2035,13 +2035,8 @@ fn format_memory_recall_context(recall: &RecallResponse) -> String {
 }
 
 fn participant_recall_mode(memory: &ResolvedMemorySettings) -> RecallMode {
-    if memory.backend == super::settings::MemoryBackendKind::Memento
-        && !memory.query_recall_after_bootstrap
-    {
-        RecallMode::Bootstrap
-    } else {
-        RecallMode::Query
-    }
+    let _ = memory;
+    RecallMode::Query
 }
 
 fn build_participant_recall_request(
@@ -3254,7 +3249,6 @@ mod tests {
             peer_agents_enabled: true,
             memory: ResolvedMemorySettings {
                 backend: crate::services::discord::settings::MemoryBackendKind::Memento,
-                query_recall_after_bootstrap: true,
                 ..ResolvedMemorySettings::default()
             },
         };

@@ -24,12 +24,6 @@ fn configured_memory_backend_name() -> Option<String> {
     runtime_memory_backend_config().map(|config| config.backend)
 }
 
-fn configured_query_recall_after_bootstrap() -> bool {
-    runtime_memory_backend_config()
-        .map(|config| config.query_recall_after_bootstrap)
-        .unwrap_or(false)
-}
-
 fn memento_backend_available() -> bool {
     crate::services::memory::backend_is_active(MemoryBackendKind::Memento)
 }
@@ -86,9 +80,6 @@ fn merge_memory_config(
         backend: override_cfg
             .and_then(|cfg| cfg.backend.clone())
             .or_else(|| base.and_then(|cfg| cfg.backend.clone())),
-        query_recall_after_bootstrap: override_cfg
-            .and_then(|cfg| cfg.query_recall_after_bootstrap)
-            .or_else(|| base.and_then(|cfg| cfg.query_recall_after_bootstrap)),
         recall_timeout_ms: override_cfg
             .and_then(|cfg| cfg.recall_timeout_ms)
             .or_else(|| base.and_then(|cfg| cfg.recall_timeout_ms)),
@@ -105,9 +96,6 @@ pub(crate) fn resolve_memory_settings(
     let merged = merge_memory_config(base, override_cfg);
     ResolvedMemorySettings {
         backend: resolve_memory_backend(merged.backend.as_deref()),
-        query_recall_after_bootstrap: merged
-            .query_recall_after_bootstrap
-            .unwrap_or_else(configured_query_recall_after_bootstrap),
         recall_timeout_ms: clamp_timeout(
             "memory.recall_timeout_ms",
             merged

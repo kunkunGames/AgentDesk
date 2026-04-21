@@ -62,17 +62,19 @@ fn build_memory_injection_plan<'a>(
     }
 }
 
-fn recall_mode_for_turn(
-    memory_settings: &settings::ResolvedMemorySettings,
-    memento_context_loaded: bool,
-) -> RecallMode {
-    if memory_settings.backend != settings::MemoryBackendKind::Memento {
-        RecallMode::Query
-    } else if !memory_settings.query_recall_after_bootstrap || !memento_context_loaded {
+fn recall_mode_for_turn(memory_settings: &settings::ResolvedMemorySettings) -> RecallMode {
+    if memory_settings.backend == settings::MemoryBackendKind::Memento {
         RecallMode::Bootstrap
     } else {
         RecallMode::Query
     }
+}
+
+fn should_skip_memento_recall(
+    memory_settings: &settings::ResolvedMemorySettings,
+    memento_context_loaded: bool,
+) -> bool {
+    memory_settings.backend == settings::MemoryBackendKind::Memento && memento_context_loaded
 }
 
 fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
@@ -411,25 +413,26 @@ pub(in crate::services::discord) async fn start_headless_turn(
         .insert(channel_id, std::time::Instant::now());
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
-    let recall_mode = recall_mode_for_turn(&memory_settings, memento_context_loaded);
-    let memory_recall = memory_backend
-        .recall(RecallRequest {
-            mode: recall_mode,
-            provider: provider.clone(),
-            role_id: resolve_memory_role_id(role_binding.as_ref()),
-            channel_id: channel_id.get(),
-            session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
-            dispatch_profile,
-            user_text: prompt.to_string(),
-            context_text: Some(prompt.to_string()),
-            case_id: None,
-            phase: None,
-            resolution_status: None,
-        })
-        .await;
-    if memory_settings.backend == settings::MemoryBackendKind::Memento
-        && recall_mode == RecallMode::Bootstrap
-    {
+    let memory_recall = if should_skip_memento_recall(&memory_settings, memento_context_loaded) {
+        RecallResponse::default()
+    } else {
+        memory_backend
+            .recall(RecallRequest {
+                mode: recall_mode_for_turn(&memory_settings),
+                provider: provider.clone(),
+                role_id: resolve_memory_role_id(role_binding.as_ref()),
+                channel_id: channel_id.get(),
+                session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
+                dispatch_profile,
+                user_text: prompt.to_string(),
+                context_text: Some(prompt.to_string()),
+                case_id: None,
+                phase: None,
+                resolution_status: None,
+            })
+            .await
+    };
+    if memory_settings.backend == settings::MemoryBackendKind::Memento && !memento_context_loaded {
         let mut data = shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
             session.note_memento_context_loaded();
@@ -2038,26 +2041,27 @@ pub(in crate::services::discord) async fn handle_text_message(
         .insert(channel_id, std::time::Instant::now());
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
-    let recall_mode = recall_mode_for_turn(&memory_settings, memento_context_loaded);
     let dispatch_memory_hints = derive_dispatch_memory_hints(active_dispatch_info.as_ref());
-    let memory_recall = memory_backend
-        .recall(RecallRequest {
-            mode: recall_mode,
-            provider: provider.clone(),
-            role_id: resolve_memory_role_id(role_binding.as_ref()),
-            channel_id: channel_id.get(),
-            session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
-            dispatch_profile,
-            user_text: user_text.to_string(),
-            context_text: Some(user_text.to_string()),
-            case_id: dispatch_memory_hints.case_id,
-            phase: dispatch_memory_hints.phase,
-            resolution_status: dispatch_memory_hints.resolution_status,
-        })
-        .await;
-    if memory_settings.backend == settings::MemoryBackendKind::Memento
-        && recall_mode == RecallMode::Bootstrap
-    {
+    let memory_recall = if should_skip_memento_recall(&memory_settings, memento_context_loaded) {
+        RecallResponse::default()
+    } else {
+        memory_backend
+            .recall(RecallRequest {
+                mode: recall_mode_for_turn(&memory_settings),
+                provider: provider.clone(),
+                role_id: resolve_memory_role_id(role_binding.as_ref()),
+                channel_id: channel_id.get(),
+                session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
+                dispatch_profile,
+                user_text: user_text.to_string(),
+                context_text: Some(user_text.to_string()),
+                case_id: dispatch_memory_hints.case_id,
+                phase: dispatch_memory_hints.phase,
+                resolution_status: dispatch_memory_hints.resolution_status,
+            })
+            .await
+    };
+    if memory_settings.backend == settings::MemoryBackendKind::Memento && !memento_context_loaded {
         let mut data = shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
             session.note_memento_context_loaded();
@@ -4313,28 +4317,18 @@ mod tests {
     }
 
     #[test]
-    fn recall_mode_defaults_to_bootstrap_until_query_recall_is_enabled_for_memento() {
+    fn recall_mode_defaults_to_bootstrap_for_memento_and_query_for_file() {
         let memento = settings::ResolvedMemorySettings {
             backend: settings::MemoryBackendKind::Memento,
             ..settings::ResolvedMemorySettings::default()
         };
         let file = settings::ResolvedMemorySettings::default();
 
-        assert_eq!(recall_mode_for_turn(&memento, false), RecallMode::Bootstrap);
-        assert_eq!(recall_mode_for_turn(&memento, true), RecallMode::Bootstrap);
-        assert_eq!(recall_mode_for_turn(&file, true), RecallMode::Query);
-    }
-
-    #[test]
-    fn recall_mode_bootstraps_only_on_first_memento_turn_when_query_recall_enabled() {
-        let memento = settings::ResolvedMemorySettings {
-            backend: settings::MemoryBackendKind::Memento,
-            query_recall_after_bootstrap: true,
-            ..settings::ResolvedMemorySettings::default()
-        };
-
-        assert_eq!(recall_mode_for_turn(&memento, false), RecallMode::Bootstrap);
-        assert_eq!(recall_mode_for_turn(&memento, true), RecallMode::Query);
+        assert_eq!(recall_mode_for_turn(&memento), RecallMode::Bootstrap);
+        assert_eq!(recall_mode_for_turn(&file), RecallMode::Query);
+        assert!(should_skip_memento_recall(&memento, true));
+        assert!(!should_skip_memento_recall(&memento, false));
+        assert!(!should_skip_memento_recall(&file, true));
     }
 
     #[test]
@@ -4379,23 +4373,22 @@ mod tests {
     fn clear_resets_memento_skip_so_next_turn_can_reload_context() {
         let memento = settings::ResolvedMemorySettings {
             backend: settings::MemoryBackendKind::Memento,
-            query_recall_after_bootstrap: true,
             ..settings::ResolvedMemorySettings::default()
         };
         let mut session = make_session(Some("/tmp/project".to_string()), None);
 
         session.restore_provider_session(Some("session-1".to_string()));
         session.note_memento_context_loaded();
-        assert_eq!(
-            recall_mode_for_turn(&memento, session.memento_context_loaded),
-            RecallMode::Query
-        );
+        assert!(should_skip_memento_recall(
+            &memento,
+            session.memento_context_loaded
+        ));
 
         session.clear_provider_session();
-        assert_eq!(
-            recall_mode_for_turn(&memento, session.memento_context_loaded),
-            RecallMode::Bootstrap
-        );
+        assert!(!should_skip_memento_recall(
+            &memento,
+            session.memento_context_loaded
+        ));
     }
 
     #[test]

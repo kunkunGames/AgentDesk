@@ -145,7 +145,6 @@ const MAX_MEMORY_CAPTURE_TIMEOUT_MS: u64 = 30_000;
 #[serde(default)]
 pub(crate) struct MemoryConfigOverride {
     pub backend: Option<String>,
-    pub query_recall_after_bootstrap: Option<bool>,
     pub recall_timeout_ms: Option<u64>,
     pub capture_timeout_ms: Option<u64>,
 }
@@ -169,7 +168,6 @@ impl MemoryBackendKind {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResolvedMemorySettings {
     pub backend: MemoryBackendKind,
-    pub query_recall_after_bootstrap: bool,
     pub recall_timeout_ms: u64,
     pub capture_timeout_ms: u64,
 }
@@ -178,7 +176,6 @@ impl Default for ResolvedMemorySettings {
     fn default() -> Self {
         Self {
             backend: MemoryBackendKind::File,
-            query_recall_after_bootstrap: false,
             recall_timeout_ms: DEFAULT_MEMORY_RECALL_TIMEOUT_MS,
             capture_timeout_ms: DEFAULT_MEMORY_CAPTURE_TIMEOUT_MS,
         }
@@ -459,54 +456,7 @@ mod tests {
                 assert_eq!(resolved.backend, super::MemoryBackendKind::File);
                 assert_eq!(resolved.recall_timeout_ms, 500);
                 assert_eq!(resolved.capture_timeout_ms, 5_000);
-                assert!(!resolved.query_recall_after_bootstrap);
             });
-        });
-    }
-
-    #[test]
-    fn test_resolve_memory_settings_query_recall_uses_runtime_default_and_override() {
-        crate::services::memory::reset_backend_health_for_tests();
-        with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
-                temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "memento",
-                    "query_recall_after_bootstrap": true
-                }),
-            );
-
-            let runtime_default = resolve_memory_settings(None, None);
-            assert!(runtime_default.query_recall_after_bootstrap);
-
-            let channel_override = super::MemoryConfigOverride {
-                query_recall_after_bootstrap: Some(false),
-                ..Default::default()
-            };
-            let resolved = resolve_memory_settings(None, Some(&channel_override));
-            assert!(!resolved.query_recall_after_bootstrap);
-        });
-    }
-
-    #[test]
-    fn test_resolve_memory_settings_keeps_query_recall_defaults() {
-        crate::services::memory::reset_backend_health_for_tests();
-        with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
-                temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "memento",
-                    "query_recall_after_bootstrap": true
-                }),
-            );
-
-            let resolved = resolve_memory_settings(None, None);
-            assert!(
-                resolved.query_recall_after_bootstrap,
-                "query recall defaults must not change recall bootstrap semantics"
-            );
         });
     }
 

@@ -740,8 +740,6 @@ impl EscalationConfig {
 pub struct MemoryConfig {
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    #[serde(default = "default_query_recall_after_bootstrap")]
-    pub query_recall_after_bootstrap: bool,
     #[serde(default)]
     pub file: FileMemoryConfig,
     #[serde(default)]
@@ -752,7 +750,6 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: default_memory_backend(),
-            query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
             file: FileMemoryConfig::default(),
             mcp: McpMemoryConfig::default(),
         }
@@ -788,10 +785,6 @@ impl Default for FileMemoryConfig {
 pub struct McpMemoryConfig {
     pub endpoint: String,
     pub access_key_env: String,
-}
-
-const fn default_query_recall_after_bootstrap() -> bool {
-    false
 }
 
 /// Compile-time defaults loaded from the project-root `defaults.json`.
@@ -1479,7 +1472,6 @@ mod tests {
         };
         config.memory = Some(MemoryConfig {
             backend: "memento".to_string(),
-            query_recall_after_bootstrap: true,
             file: FileMemoryConfig {
                 sak_path: "/tmp/shared.md".to_string(),
                 sam_path: "/tmp/sam".to_string(),
@@ -1641,13 +1633,6 @@ mod tests {
         assert_eq!(
             loaded.memory.as_ref().map(|memory| memory.backend.as_str()),
             Some("memento")
-        );
-        assert_eq!(
-            loaded
-                .memory
-                .as_ref()
-                .map(|memory| memory.query_recall_after_bootstrap),
-            Some(true)
         );
         assert_eq!(
             loaded
