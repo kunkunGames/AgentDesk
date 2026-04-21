@@ -42,7 +42,7 @@ pub struct GenerateBody {
     pub max_concurrent_per_agent: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ActivateBody {
     pub run_id: Option<String>,
     pub repo: Option<String>,
@@ -78,7 +78,6 @@ pub struct ReorderBody {
 pub struct UpdateRunBody {
     pub status: Option<String>,
     pub unified_thread: Option<bool>,
-    pub deploy_phases: Option<Vec<i64>>,
     pub max_concurrent_threads: Option<i64>,
 }
 
@@ -99,7 +98,6 @@ pub struct DispatchBody {
     pub activate: Option<bool>,
     pub auto_assign_agent: Option<bool>,
     pub max_concurrent_threads: Option<i64>,
-    pub deploy_phases: Option<Vec<i64>>,
     pub force: Option<bool>,
 }
 
@@ -157,16 +155,6 @@ struct PlannedEntry {
 struct DependencyParseResult {
     numbers: Vec<i64>,
     signals: Vec<String>,
-}
-
-fn deploy_phase_api_enabled(state: &AppState) -> bool {
-    state
-        .config
-        .server
-        .auth_token
-        .as_deref()
-        .map(|token| !token.trim().is_empty())
-        .unwrap_or(false)
 }
 
 fn slot_thread_map_has_bindings(
@@ -402,7 +390,7 @@ async fn group_has_dispatched_entries_pg(
 }
 
 async fn create_activate_dispatch_pg(
-    deps: &AutoQueueActivateDeps,
+    _deps: &AutoQueueActivateDeps,
     pool: &sqlx::PgPool,
     card_id: &str,
     to_agent_id: &str,
@@ -1474,24 +1462,6 @@ async fn update_run_with_pg(
         changed += result.rows_affected() as usize;
     }
 
-    if let Some(ref deploy_phases) = body.deploy_phases {
-        let json_str = serde_json::to_string(deploy_phases)
-            .map_err(|error| format!("serialize deploy_phases for run {run_id}: {error}"))?;
-        let result = sqlx::query(
-            "UPDATE auto_queue_runs
-             SET deploy_phases = $1::jsonb
-             WHERE id = $2",
-        )
-        .bind(json_str)
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .map_err(|error| {
-            format!("update postgres auto_queue_runs deploy_phases for {run_id}: {error}")
-        })?;
-        changed += result.rows_affected() as usize;
-    }
-
     if let Some(max_concurrent_threads) = body.max_concurrent_threads {
         let result = sqlx::query(
             "UPDATE auto_queue_runs
@@ -2497,8 +2467,28 @@ impl AutoQueueActivateDeps {
         }
     }
 
+    pub(crate) fn for_bridge_pg(engine: crate::engine::PolicyEngine) -> Self {
+        let db = engine.legacy_db().cloned().unwrap_or_else(|| {
+            let conn =
+                libsql_rusqlite::Connection::open_in_memory().expect("open sqlite bridge db");
+            crate::db::schema::migrate(&conn).expect("migrate sqlite bridge db");
+            crate::db::wrap_conn(conn)
+        });
+        Self {
+            db,
+            pg_pool: engine.pg_pool().cloned(),
+            engine,
+            config: Arc::new(crate::config::Config::default()),
+            health_registry: None,
+            guild_id: None,
+        }
+    }
+
     fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
-        crate::services::auto_queue::AutoQueueService::new(self.db.clone(), self.engine.clone())
+        crate::services::auto_queue::AutoQueueService::new(
+            Some(self.db.clone()),
+            self.engine.clone(),
+        )
     }
 
     fn entry_json(&self, entry_id: &str) -> serde_json::Value {
@@ -4783,6 +4773,24 @@ pub async fn activate(
     }
 }
 
+pub(crate) async fn activate_with_bridge_pg(
+    engine: crate::engine::PolicyEngine,
+    body: ActivateBody,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let deps = AutoQueueActivateDeps::for_bridge_pg(engine);
+    let Some(pool) = deps.pg_pool.as_ref() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "postgres pool is not configured"})),
+        );
+    };
+    let body = match activate_preflight_with_pg(pool, body).await {
+        ActivatePgPreflight::Return(response) => return response,
+        ActivatePgPreflight::Continue(body) => body,
+    };
+    activate_with_deps_pg(&deps, body).await
+}
+
 enum ActivatePgPreflight {
     Return((StatusCode, Json<serde_json::Value>)),
     Continue(ActivateBody),
@@ -6716,7 +6724,7 @@ pub(crate) fn activate_with_deps(
                     &card_id,
                     step,
                     "auto-queue-walk",
-                    false,
+                    crate::engine::transition::ForceIntent::None,
                 ) {
                     crate::auto_queue_log!(
                         warn,
@@ -7192,20 +7200,6 @@ pub async fn dispatch(
     State(state): State<AppState>,
     Json(body): Json<DispatchBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if body
-        .deploy_phases
-        .as_ref()
-        .is_some_and(|phases| !phases.is_empty())
-        && !deploy_phase_api_enabled(&state)
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "deploy_phases requires server.auth_token to be configured"
-            })),
-        );
-    }
-
     let force = body.force.unwrap_or(false);
     let requested_entries = match normalize_dispatch_entries(&body) {
         Ok(entries) => entries,
@@ -7330,17 +7324,6 @@ pub async fn dispatch(
             );
         }
     };
-
-    if let Some(ref deploy_phases) = body.deploy_phases {
-        if !deploy_phases.is_empty() {
-            if let Ok(json_str) = serde_json::to_string(deploy_phases) {
-                let _ = conn.execute(
-                    "UPDATE auto_queue_runs SET deploy_phases = ?1 WHERE id = ?2",
-                    libsql_rusqlite::params![json_str, run_id],
-                );
-            }
-        }
-    }
 
     let mut rank_per_group = HashMap::<i64, i64>::new();
     for entry in &requested_entries {
@@ -8419,20 +8402,6 @@ pub async fn update_run(
     Path(id): Path<String>,
     Json(body): Json<UpdateRunBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if body
-        .deploy_phases
-        .as_ref()
-        .is_some_and(|phases| !phases.is_empty())
-        && !deploy_phase_api_enabled(&state)
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "deploy_phases requires server.auth_token to be configured"
-            })),
-        );
-    }
-
     if let Some(pool) = state.pg_pool.as_ref() {
         if let Some(max_concurrent_threads) = body.max_concurrent_threads {
             if max_concurrent_threads <= 0 {
@@ -8444,10 +8413,7 @@ pub async fn update_run(
         }
 
         let ignored_unified_thread = body.unified_thread.is_some();
-        if body.status.is_none()
-            && body.deploy_phases.is_none()
-            && body.max_concurrent_threads.is_none()
-            && !ignored_unified_thread
+        if body.status.is_none() && body.max_concurrent_threads.is_none() && !ignored_unified_thread
         {
             return (
                 StatusCode::BAD_REQUEST,
@@ -8497,17 +8463,6 @@ pub async fn update_run(
             .unwrap_or(0);
     }
 
-    if let Some(ref deploy_phases) = body.deploy_phases {
-        if let Ok(json_str) = serde_json::to_string(deploy_phases) {
-            changed += conn
-                .execute(
-                    "UPDATE auto_queue_runs SET deploy_phases = ?1 WHERE id = ?2",
-                    libsql_rusqlite::params![json_str, id],
-                )
-                .unwrap_or(0);
-        }
-    }
-
     if let Some(max_concurrent_threads) = body.max_concurrent_threads {
         if max_concurrent_threads <= 0 {
             return (
@@ -8528,7 +8483,6 @@ pub async fn update_run(
     let ignored_unified_thread = body.unified_thread.is_some();
     if changed == 0
         && body.status.is_none()
-        && body.deploy_phases.is_none()
         && body.max_concurrent_threads.is_none()
         && !ignored_unified_thread
     {

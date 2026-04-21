@@ -14,7 +14,7 @@ use std::future::Future;
 
 pub(super) fn register_dm_reply_ops<'js>(
     ctx: &Ctx<'js>,
-    db: Db,
+    db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
@@ -35,7 +35,7 @@ pub(super) fn register_dm_reply_ops<'js>(
                       ttl_seconds: i64|
                       -> String {
                     dm_reply_register_raw(
-                        &db_reg,
+                        db_reg.as_ref(),
                         pg_reg.clone(),
                         &source_agent,
                         &user_id,
@@ -56,7 +56,7 @@ pub(super) fn register_dm_reply_ops<'js>(
         Function::new(
             ctx.clone(),
             rquickjs::function::MutFn::from(move |user_id: String| -> String {
-                dm_reply_consume_raw(&db_con, pg_con.clone(), &user_id)
+                dm_reply_consume_raw(db_con.as_ref(), pg_con.clone(), &user_id)
             }),
         )?,
     )?;
@@ -69,7 +69,7 @@ pub(super) fn register_dm_reply_ops<'js>(
         Function::new(
             ctx.clone(),
             rquickjs::function::MutFn::from(move |user_id: String| -> String {
-                dm_reply_pending_raw(&db_pend, pg_pend.clone(), &user_id)
+                dm_reply_pending_raw(db_pend.as_ref(), pg_pend.clone(), &user_id)
             }),
         )?,
     )?;
@@ -82,7 +82,7 @@ pub(super) fn register_dm_reply_ops<'js>(
         Function::new(
             ctx.clone(),
             rquickjs::function::MutFn::from(move |user_id: String| -> String {
-                dm_reply_read_consumed_raw(&db_read, pg_read.clone(), &user_id)
+                dm_reply_read_consumed_raw(db_read.as_ref(), pg_read.clone(), &user_id)
             }),
         )?,
     )?;
@@ -117,7 +117,7 @@ pub(super) fn register_dm_reply_ops<'js>(
 }
 
 fn dm_reply_register_raw(
-    db: &Db,
+    db: Option<&Db>,
     pg_pool: Option<PgPool>,
     source_agent: &str,
     user_id: &str,
@@ -127,6 +127,9 @@ fn dm_reply_register_raw(
 ) -> String {
     let ch = (!channel_id.is_empty()).then_some(channel_id);
     let result = if let Some(pg_pool) = pg_pool {
+        let Some(db) = db.cloned() else {
+            return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+        };
         let db = db.clone();
         let source_agent = source_agent.trim().to_string();
         let user_id = user_id.trim().to_string();
@@ -144,8 +147,10 @@ fn dm_reply_register_raw(
             )
             .await
         })
-    } else {
+    } else if let Some(db) = db {
         register_pending_dm_reply(db, source_agent, user_id, ch, context, ttl_seconds)
+    } else {
+        Err("sqlite backend is unavailable".to_string())
     };
 
     match result {
@@ -163,8 +168,11 @@ fn dm_reply_register_raw(
     }
 }
 
-fn dm_reply_consume_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> String {
+fn dm_reply_consume_raw(db: Option<&Db>, pg_pool: Option<PgPool>, user_id: &str) -> String {
     if let Some(pg_pool) = pg_pool {
+        let Some(db) = db.cloned() else {
+            return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+        };
         let db = db.clone();
         let user_id = user_id.to_string();
         let log_user_id = user_id.clone();
@@ -191,6 +199,9 @@ fn dm_reply_consume_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> Stri
         };
     }
 
+    let Some(db) = db else {
+        return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+    };
     let conn = match db.separate_conn() {
         Ok(c) => c,
         Err(e) => return format!(r#"{{"error":"db connection: {e}"}}"#),
@@ -249,8 +260,11 @@ fn dm_reply_consume_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> Stri
     }
 }
 
-fn dm_reply_pending_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> String {
+fn dm_reply_pending_raw(db: Option<&Db>, pg_pool: Option<PgPool>, user_id: &str) -> String {
     if let Some(pg_pool) = pg_pool {
+        let Some(db) = db.cloned() else {
+            return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+        };
         let db = db.clone();
         let user_id = user_id.to_string();
         return match run_async_bridge_pg(&pg_pool, move |pool| async move {
@@ -262,6 +276,9 @@ fn dm_reply_pending_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> Stri
         };
     }
 
+    let Some(db) = db else {
+        return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+    };
     let conn = match db.separate_conn() {
         Ok(c) => c,
         Err(e) => return format!(r#"{{"error":"db connection: {e}"}}"#),
@@ -294,8 +311,11 @@ fn dm_reply_pending_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> Stri
     }
 }
 
-fn dm_reply_read_consumed_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -> String {
+fn dm_reply_read_consumed_raw(db: Option<&Db>, pg_pool: Option<PgPool>, user_id: &str) -> String {
     if let Some(pg_pool) = pg_pool {
+        let Some(db) = db.cloned() else {
+            return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+        };
         let db = db.clone();
         let user_id = user_id.to_string();
         return match run_async_bridge_pg(&pg_pool, move |pool| async move {
@@ -307,6 +327,9 @@ fn dm_reply_read_consumed_raw(db: &Db, pg_pool: Option<PgPool>, user_id: &str) -
         };
     }
 
+    let Some(db) = db else {
+        return r#"{"error":"sqlite backend is unavailable"}"#.to_string();
+    };
     let conn = match db.separate_conn() {
         Ok(c) => c,
         Err(e) => return format!(r#"{{"error":"db connection: {e}"}}"#),
@@ -411,14 +434,13 @@ mod tests {
             let admin_url = admin_database_url();
             let database_name = format!("agentdesk_pg_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!("{}/{}", base_database_url(), database_name);
-            let admin_pool = sqlx::PgPool::connect(&admin_url)
-                .await
-                .expect("connect postgres admin db");
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
-                .await
-                .expect("create postgres test db");
-            admin_pool.close().await;
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "dm reply pg tests",
+            )
+            .await
+            .expect("create postgres test db");
 
             Self {
                 admin_url,
@@ -428,37 +450,22 @@ mod tests {
         }
 
         async fn migrate(&self) -> sqlx::PgPool {
-            let pool = sqlx::PgPool::connect(&self.database_url)
-                .await
-                .expect("connect postgres test db");
-            crate::db::postgres::migrate(&pool)
-                .await
-                .expect("migrate postgres test db");
-            pool
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "dm reply pg tests",
+            )
+            .await
+            .expect("migrate postgres test db")
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::PgPool::connect(&self.admin_url)
-                .await
-                .expect("reconnect postgres admin db");
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "dm reply pg tests",
             )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
-            .await
-            .expect("terminate postgres test db sessions");
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
             .await
             .expect("drop postgres test db");
-            admin_pool.close().await;
         }
     }
 
@@ -517,7 +524,7 @@ mod tests {
             let globals = ctx.globals();
             let ad = Object::new(ctx.clone()).expect("agentdesk object");
             globals.set("agentdesk", ad).expect("install agentdesk");
-            register_dm_reply_ops(&ctx, sqlite_db.clone(), Some(pg_pool.clone()))
+            register_dm_reply_ops(&ctx, Some(sqlite_db.clone()), Some(pg_pool.clone()))
                 .expect("register dmReply ops");
 
             let raw: String = ctx

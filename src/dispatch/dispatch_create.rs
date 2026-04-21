@@ -3,6 +3,7 @@ use serde_json::json;
 use sqlx::{PgPool, Postgres, Row as SqlxRow};
 
 use crate::db::Db;
+#[cfg(test)]
 use crate::db::agents::resolve_agent_dispatch_channel_on_conn;
 use crate::db::agents::resolve_agent_dispatch_channel_pg;
 use crate::engine::PolicyEngine;
@@ -14,17 +15,20 @@ use super::dispatch_context::{
     inject_review_dispatch_identifiers, json_string_field, resolve_card_target_repo_ref,
     resolve_card_worktree, resolve_parent_dispatch_context,
 };
+#[cfg(test)]
 use super::dispatch_context::{
     build_review_context_sqlite_test, inject_review_dispatch_identifiers_sqlite_test,
     resolve_card_target_repo_ref_sqlite_test, resolve_card_worktree_sqlite_test,
     resolve_parent_dispatch_context_sqlite_test,
 };
+#[cfg(test)]
 use super::dispatch_status::{
     ensure_dispatch_notify_outbox_on_conn, record_dispatch_status_event_on_conn,
 };
 use super::{
     DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx, summarize_dispatch_result,
 };
+#[cfg(test)]
 use super::{cancel_dispatch_and_reset_auto_queue_on_conn, query_dispatch_row};
 
 fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
@@ -38,6 +42,7 @@ fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
             .is_some()
 }
 
+#[cfg(test)]
 fn load_existing_thread_for_channel(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
@@ -136,6 +141,7 @@ async fn load_existing_thread_for_channel_pg(
     Ok(active_thread_id)
 }
 
+#[cfg(test)]
 fn lookup_active_dispatch_id(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
@@ -174,6 +180,7 @@ async fn lookup_active_dispatch_id_pg(
     .flatten()
 }
 
+#[cfg(test)]
 fn is_single_active_dispatch_violation(error: &libsql_rusqlite::Error) -> bool {
     matches!(
         error,
@@ -200,6 +207,7 @@ fn is_single_active_dispatch_violation_pg(error: &sqlx::Error) -> bool {
     )
 }
 
+#[cfg(test)]
 fn validate_dispatch_target_on_conn(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
@@ -344,11 +352,11 @@ pub(crate) async fn query_dispatch_row_pg(
             context,
             result,
             parent_dispatch_id,
-            chain_depth,
+            COALESCE(chain_depth, 0)::bigint AS chain_depth,
             created_at::text AS created_at,
             updated_at::text AS updated_at,
             completed_at::text AS completed_at,
-            COALESCE(retry_count, 0) AS retry_count
+            COALESCE(retry_count, 0)::bigint AS retry_count
          FROM task_dispatches
          WHERE id = $1",
     )
@@ -697,6 +705,7 @@ pub async fn create_dispatch_core_with_id_and_options(
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_core_sqlite_test(
     db: &Db,
@@ -706,7 +715,7 @@ pub(crate) fn create_dispatch_core_sqlite_test(
     title: &str,
     context: &serde_json::Value,
 ) -> Result<(String, String, bool)> {
-    create_dispatch_core_with_options_sqlite_test(
+    create_dispatch_record_sqlite_test(
         db,
         kanban_card_id,
         to_agent_id,
@@ -717,8 +726,9 @@ pub(crate) fn create_dispatch_core_sqlite_test(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_dispatch_core_with_options_sqlite_test(
+pub(crate) fn create_dispatch_record_sqlite_test(
     db: &Db,
     kanban_card_id: &str,
     to_agent_id: &str,
@@ -728,7 +738,7 @@ pub(crate) fn create_dispatch_core_with_options_sqlite_test(
     options: DispatchCreateOptions,
 ) -> Result<(String, String, bool)> {
     let dispatch_id = uuid::Uuid::new_v4().to_string();
-    create_dispatch_core_with_id_and_options_sqlite_test(
+    create_dispatch_record_with_id_sqlite_test(
         db,
         &dispatch_id,
         kanban_card_id,
@@ -740,6 +750,7 @@ pub(crate) fn create_dispatch_core_with_options_sqlite_test(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_core_with_id_sqlite_test(
     db: &Db,
@@ -750,7 +761,7 @@ pub(crate) fn create_dispatch_core_with_id_sqlite_test(
     title: &str,
     context: &serde_json::Value,
 ) -> Result<(String, String, bool)> {
-    create_dispatch_core_with_id_and_options_sqlite_test(
+    create_dispatch_record_with_id_sqlite_test(
         db,
         dispatch_id,
         kanban_card_id,
@@ -762,8 +773,9 @@ pub(crate) fn create_dispatch_core_with_id_sqlite_test(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_dispatch_core_with_id_and_options_sqlite_test(
+pub(crate) fn create_dispatch_record_with_id_sqlite_test(
     db: &Db,
     dispatch_id: &str,
     kanban_card_id: &str,
@@ -1016,16 +1028,25 @@ pub fn create_dispatch_with_options(
         ..options
     };
     let Some(pool) = pg_pool else {
-        return create_dispatch_with_options_sqlite_test(
-            db,
-            engine,
-            kanban_card_id,
-            to_agent_id,
-            dispatch_type,
-            title,
-            context,
-            options,
-        );
+        #[cfg(test)]
+        {
+            return create_dispatch_with_options_sqlite_test(
+                db,
+                engine,
+                kanban_card_id,
+                to_agent_id,
+                dispatch_type,
+                title,
+                context,
+                options,
+            );
+        }
+        #[cfg(not(test))]
+        {
+            return Err(anyhow::anyhow!(
+                "Postgres pool required for create_dispatch_with_options"
+            ));
+        }
     };
 
     let card_id_owned = kanban_card_id.to_string();
@@ -1100,6 +1121,7 @@ pub fn create_dispatch_with_options(
     Ok(dispatch)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn create_dispatch_with_options_sqlite_test(
     db: &Db,
@@ -1111,7 +1133,7 @@ fn create_dispatch_with_options_sqlite_test(
     context: &serde_json::Value,
     options: DispatchCreateOptions,
 ) -> Result<serde_json::Value> {
-    let (dispatch_id, old_status, reused) = create_dispatch_core_with_options_sqlite_test(
+    let (dispatch_id, old_status, reused) = create_dispatch_record_sqlite_test(
         db,
         kanban_card_id,
         to_agent_id,
@@ -1156,12 +1178,12 @@ fn create_dispatch_with_options_sqlite_test(
     Ok(dispatch)
 }
 
-/// Transaction-owning wrapper. Opens BEGIN/COMMIT around the on-conn variant.
+/// Test-only sqlite wrapper. Opens BEGIN/COMMIT around the on-conn variant.
 ///
-/// Use this when the caller does not have an outer transaction. Callers that
-/// need to compose dispatch creation into their own transaction (e.g.
-/// `handoffCreatePr` in #743) should call
-/// [`apply_dispatch_attached_intents_on_conn`] directly instead.
+/// Production callers use the PG helpers (`apply_dispatch_attached_intents_pg`
+/// / `apply_dispatch_attached_intents_on_pg_tx`). This wrapper remains only
+/// for sqlite-backed test fixtures.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_dispatch_attached_intents(
     conn: &libsql_rusqlite::Connection,
@@ -1390,8 +1412,14 @@ pub(crate) async fn apply_dispatch_attached_intents_pg(
     }
 }
 
+/// Transaction-local PG variant: does NOT manage its own transaction.
+/// Caller must already have an open postgres transaction and commit/rollback
+/// after this returns.
+///
+/// This exists for callers like review-automation handoff paths that need to
+/// compose dispatch creation with surrounding PG updates in one atomic unit.
 #[allow(clippy::too_many_arguments)]
-async fn apply_dispatch_attached_intents_on_pg_tx(
+pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     card_id: &str,
     to_agent_id: &str,
@@ -1504,14 +1532,14 @@ async fn apply_dispatch_attached_intents_on_pg_tx(
     Ok(())
 }
 
-/// Connection-local variant: does NOT manage its own transaction. Caller must
-/// have an open transaction on `conn` and commit/rollback after this returns.
+/// Test-only sqlite connection-local variant.
 ///
-/// This variant exists so bridge ops like `handoffCreatePr` (#743) can compose
-/// dispatch creation with surrounding pr_tracking/kanban_cards updates in a
-/// single atomic transaction.
+/// Production transactional callers use `apply_dispatch_attached_intents_on_pg_tx`.
+/// This exists only for sqlite-backed test fixtures that still exercise the
+/// old connection-local transition plumbing.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_dispatch_attached_intents_on_conn(
+fn apply_dispatch_attached_intents_on_conn(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
     to_agent_id: &str,

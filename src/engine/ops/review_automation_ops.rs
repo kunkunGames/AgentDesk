@@ -16,8 +16,8 @@
 //!   resetting retry_count and last_error.
 
 use crate::db::Db;
-use crate::dispatch::{DispatchCreateOptions, apply_dispatch_attached_intents_on_conn};
-use libsql_rusqlite::{OptionalExtension, TransactionBehavior}; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+use crate::dispatch::{DispatchCreateOptions, apply_dispatch_attached_intents_on_pg_tx};
+use libsql_rusqlite::OptionalExtension; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 pub(super) fn register_review_automation_ops<'js>(
     ctx: &Ctx<'js>,
-    db: Db,
+    db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
@@ -37,7 +37,7 @@ pub(super) fn register_review_automation_ops<'js>(
     obj.set(
         "__handoffCreatePrRaw",
         Function::new(ctx.clone(), move |payload_json: String| -> String {
-            handoff_create_pr_raw(&db_handoff, pg_handoff.as_ref(), &payload_json)
+            handoff_create_pr_raw(db_handoff.as_ref(), pg_handoff.as_ref(), &payload_json)
         })?,
     )?;
 
@@ -49,7 +49,7 @@ pub(super) fn register_review_automation_ops<'js>(
             ctx.clone(),
             move |card_id: String, error: String, stamp_gen: String| -> String {
                 record_pr_create_failure_raw(
-                    &db_record,
+                    db_record.as_ref(),
                     pg_record.as_ref(),
                     &card_id,
                     &error,
@@ -64,7 +64,7 @@ pub(super) fn register_review_automation_ops<'js>(
     obj.set(
         "__reseedPrTrackingRaw",
         Function::new(ctx.clone(), move |card_id: String| -> String {
-            reseed_pr_tracking_raw(&db_reseed, pg_reseed.as_ref(), &card_id)
+            reseed_pr_tracking_raw(db_reseed.as_ref(), pg_reseed.as_ref(), &card_id)
         })?,
     )?;
 
@@ -119,7 +119,7 @@ struct HandoffPayload {
     title: String,
 }
 
-fn handoff_create_pr_raw(db: &Db, pg_pool: Option<&PgPool>, payload_json: &str) -> String {
+fn handoff_create_pr_raw(db: Option<&Db>, pg_pool: Option<&PgPool>, payload_json: &str) -> String {
     let payload: HandoffPayload = match serde_json::from_str(payload_json) {
         Ok(p) => p,
         Err(e) => return json!({"error": format!("invalid payload: {e}")}).to_string(),
@@ -143,7 +143,10 @@ fn handoff_create_pr_raw(db: &Db, pg_pool: Option<&PgPool>, payload_json: &str) 
             |error| error,
         )
     } else {
-        handoff_create_pr_tx(db, &payload).map_err(|e| format!("{e}"))
+        let Some(db) = db else {
+            return json!({"error": "sqlite backend is unavailable"}).to_string();
+        };
+        handoff_create_pr_sqlite_test(db, &payload).map_err(|error| error.to_string())
     };
     match result {
         Ok(v) => v.to_string(),
@@ -431,20 +434,30 @@ async fn handoff_create_pr_pg(
         }
     }
 
-    let card_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM kanban_cards
-            WHERE id = $1
-         )",
+    let (old_status, card_repo_id, card_agent_id) =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT status, repo_id, assigned_agent_id
+             FROM kanban_cards
+             WHERE id = $1",
+        )
+        .bind(&payload.card_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            format!(
+                "load postgres card {} for create-pr handoff: {e}",
+                payload.card_id
+            )
+        })?
+        .ok_or_else(|| format!("card {} not found", payload.card_id))?;
+
+    crate::pipeline::ensure_loaded();
+    let effective = crate::pipeline::resolve_for_card_pg(
+        pool,
+        card_repo_id.as_deref(),
+        card_agent_id.as_deref(),
     )
-    .bind(&payload.card_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| format!("check postgres card {} existence: {e}", payload.card_id))?;
-    if !card_exists {
-        return Err(format!("card {} not found", payload.card_id));
-    }
+    .await;
 
     let generation = Uuid::new_v4().to_string();
     let dispatch_id = Uuid::new_v4().to_string();
@@ -466,80 +479,42 @@ async fn handoff_create_pr_pg(
         )
     })?;
 
-    let insert_dispatch = sqlx::query(
-        "INSERT INTO task_dispatches (
-            id,
-            kanban_card_id,
-            to_agent_id,
-            dispatch_type,
-            status,
-            title,
-            context,
-            parent_dispatch_id,
-            chain_depth,
-            created_at,
-            updated_at
-        ) VALUES (
-            $1, $2, $3, 'create-pr', 'pending', $4, $5, NULL, 0, NOW(), NOW()
-        )",
+    match apply_dispatch_attached_intents_on_pg_tx(
+        &mut tx,
+        &payload.card_id,
+        &payload.agent_id,
+        &dispatch_id,
+        "create-pr",
+        false,
+        &old_status,
+        &effective,
+        &payload.title,
+        &context_str,
+        None,
+        0,
+        DispatchCreateOptions {
+            sidecar_dispatch: true,
+            ..Default::default()
+        },
     )
-    .bind(&dispatch_id)
-    .bind(&payload.card_id)
-    .bind(&payload.agent_id)
-    .bind(&payload.title)
-    .bind(&context_str)
-    .execute(&mut *tx)
-    .await;
-    if let Err(error) = insert_dispatch {
-        if matches!(&error, sqlx::Error::Database(db_error) if db_error.is_unique_violation()) {
+    .await
+    {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .to_string()
+                .contains("concurrent race prevented by DB constraint") =>
+        {
             tx.rollback().await.ok();
+            return Err(error.to_string());
+        }
+        Err(error) => {
             return Err(format!(
-                "create-pr already exists for card {} (concurrent race prevented by DB constraint)",
-                payload.card_id
+                "attach postgres create-pr dispatch {} for {}: {error}",
+                dispatch_id, payload.card_id
             ));
         }
-        return Err(format!(
-            "insert postgres create-pr dispatch {} for {}: {error}",
-            dispatch_id, payload.card_id
-        ));
     }
-
-    sqlx::query(
-        "INSERT INTO dispatch_events (
-            dispatch_id,
-            kanban_card_id,
-            dispatch_type,
-            from_status,
-            to_status,
-            transition_source,
-            payload_json
-        ) VALUES (
-            $1, $2, 'create-pr', NULL, 'pending', 'create_dispatch', NULL
-        )",
-    )
-    .bind(&dispatch_id)
-    .bind(&payload.card_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        format!(
-            "insert postgres create-pr dispatch event {}: {e}",
-            dispatch_id
-        )
-    })?;
-
-    sqlx::query(
-        "INSERT INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title)
-         VALUES ($1, 'notify', $2, $3, $4)
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(&dispatch_id)
-    .bind(&payload.agent_id)
-    .bind(&payload.card_id)
-    .bind(&payload.title)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| format!("insert postgres create-pr outbox {}: {e}", dispatch_id))?;
 
     sqlx::query(
         "UPDATE kanban_cards
@@ -567,6 +542,102 @@ async fn handoff_create_pr_pg(
     }))
 }
 
+#[cfg(test)]
+fn handoff_create_pr_sqlite_test(
+    db: &Db,
+    payload: &HandoffPayload,
+) -> anyhow::Result<serde_json::Value> {
+    let mut conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+    let tx = conn.transaction()?;
+
+    let current_round: i64 = tx
+        .query_row(
+            "SELECT review_round FROM card_review_state WHERE card_id = ?1",
+            [&payload.card_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if let Some((dispatch_id, generation)) =
+        lookup_active_create_pr_dispatch(&tx, &payload.card_id)?
+    {
+        refresh_pr_tracking_reuse_state(&tx, payload, &generation, current_round)?;
+        tx.execute(
+            "UPDATE kanban_cards
+             SET blocked_reason = 'pr:creating',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [&payload.card_id],
+        )?;
+        tx.commit()?;
+        return Ok(json!({
+            "ok": true,
+            "reused": true,
+            "dispatch_id": dispatch_id,
+            "generation": generation,
+        }));
+    }
+
+    tx.commit()?;
+
+    let generation = Uuid::new_v4().to_string();
+    let dispatch_id = Uuid::new_v4().to_string();
+    let context = json!({
+        "dispatch_generation": generation,
+        "review_round_at_dispatch": current_round,
+        "sidecar_dispatch": true,
+        "worktree_path": payload.worktree_path,
+        "worktree_branch": payload.branch,
+        "branch": payload.branch,
+    });
+
+    crate::dispatch::create_dispatch_record_with_id_sqlite_test(
+        db,
+        &dispatch_id,
+        &payload.card_id,
+        &payload.agent_id,
+        "create-pr",
+        &payload.title,
+        &context,
+        DispatchCreateOptions {
+            sidecar_dispatch: true,
+            ..Default::default()
+        },
+    )?;
+
+    let mut conn = db
+        .separate_conn()
+        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
+    let tx = conn.transaction()?;
+    seed_pr_tracking_handoff_state(&tx, payload, &generation, current_round)?;
+    tx.execute(
+        "UPDATE kanban_cards
+         SET blocked_reason = 'pr:creating',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1",
+        [&payload.card_id],
+    )?;
+    tx.commit()?;
+
+    Ok(json!({
+        "ok": true,
+        "reused": false,
+        "dispatch_id": dispatch_id,
+        "generation": generation,
+    }))
+}
+
+#[cfg(not(test))]
+fn handoff_create_pr_sqlite_test(
+    _db: &Db,
+    _payload: &HandoffPayload,
+) -> anyhow::Result<serde_json::Value> {
+    anyhow::bail!("postgres pool required for reviewAutomation.handoffCreatePr");
+}
+
+#[cfg(test)]
 fn lookup_active_create_pr_dispatch(
     conn: &libsql_rusqlite::Transaction<'_>,
     card_id: &str,
@@ -592,6 +663,7 @@ fn lookup_active_create_pr_dispatch(
     .map_err(|e| anyhow::anyhow!("lookup active create-pr dispatch for {card_id}: {e}"))
 }
 
+#[cfg(test)]
 fn seed_pr_tracking_handoff_state(
     tx: &libsql_rusqlite::Transaction<'_>,
     payload: &HandoffPayload,
@@ -624,9 +696,11 @@ fn seed_pr_tracking_handoff_state(
             current_round,
         ],
     )?;
+
     Ok(())
 }
 
+#[cfg(test)]
 fn refresh_pr_tracking_reuse_state(
     tx: &libsql_rusqlite::Transaction<'_>,
     payload: &HandoffPayload,
@@ -652,176 +726,10 @@ fn refresh_pr_tracking_reuse_state(
     Ok(())
 }
 
-fn load_dispatch_status(
-    tx: &libsql_rusqlite::Transaction<'_>,
-    dispatch_id: &str,
-) -> anyhow::Result<Option<String>> {
-    tx.query_row(
-        "SELECT status
-         FROM task_dispatches
-         WHERE id = ?1",
-        [dispatch_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|e| anyhow::anyhow!("load dispatch status for {dispatch_id}: {e}"))
-}
-
-fn handoff_create_pr_tx(db: &Db, payload: &HandoffPayload) -> anyhow::Result<serde_json::Value> {
-    let mut conn = db
-        .separate_conn()
-        .map_err(|e| anyhow::anyhow!("DB conn error: {e}"))?;
-    // Take the SQLite write lock up front so the reuse path does not fail with
-    // a deferred read->write upgrade when another WAL writer commits first.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-    // 1. Read current review_round early so reuse and fresh handoff paths keep
-    //    pr_tracking aligned with the currently active dispatch.
-    let current_round: i64 = tx
-        .query_row(
-            "SELECT review_round FROM card_review_state WHERE card_id = ?1",
-            [&payload.card_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    // 2. Idempotent reuse — refresh pr_tracking to the active dispatch stamp so
-    //    stale generations do not leak into retry logic.
-    if let Some((dispatch_id, generation)) =
-        lookup_active_create_pr_dispatch(&tx, &payload.card_id)?
-    {
-        match load_dispatch_status(&tx, &dispatch_id)?.as_deref() {
-            Some("pending") | Some("dispatched") => {
-                refresh_pr_tracking_reuse_state(&tx, payload, &generation, current_round)?;
-                tx.execute(
-                    "UPDATE kanban_cards SET blocked_reason = 'pr:creating', updated_at = datetime('now') \
-                     WHERE id = ?1",
-                    [&payload.card_id],
-                )?;
-                tx.commit()?;
-                return Ok(json!({
-                    "ok": true,
-                    "reused": true,
-                    "dispatch_id": dispatch_id,
-                    "generation": generation,
-                }));
-            }
-            Some("completed") => {
-                tx.commit()?;
-                return Ok(json!({
-                    "ok": true,
-                    "reused": true,
-                    "dispatch_id": dispatch_id,
-                    "generation": generation,
-                }));
-            }
-            _ => {
-                // The dispatch is no longer active; do not rewind card/tracking
-                // state back into create-pr reuse for a completed or failed lane.
-            }
-        }
-    }
-
-    // 3. Read card row for pipeline resolution + current status.
-    let (old_status, card_repo_id, card_agent_id): (String, Option<String>, Option<String>) = tx
-        .query_row(
-            "SELECT status, repo_id, assigned_agent_id FROM kanban_cards WHERE id = ?1",
-            [&payload.card_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| anyhow::anyhow!("card not found: {e}"))?;
-
-    // 4. Resolve pipeline for TransitionContext.
-    crate::pipeline::ensure_loaded();
-    let effective =
-        crate::pipeline::resolve_for_card(&tx, card_repo_id.as_deref(), card_agent_id.as_deref());
-
-    // 5. Mint fresh generation + dispatch id.
-    let generation = Uuid::new_v4().to_string();
-    let dispatch_id = Uuid::new_v4().to_string();
-
-    // 6. pr_tracking upsert with stamp.
-    seed_pr_tracking_handoff_state(&tx, payload, &generation, current_round)?;
-
-    // 7. Build dispatch context with stamps.
-    let context = json!({
-        "dispatch_generation": generation,
-        "review_round_at_dispatch": current_round,
-        "sidecar_dispatch": true,
-        "worktree_path": payload.worktree_path,
-        "worktree_branch": payload.branch,
-        "branch": payload.branch,
-    });
-    let context_str = serde_json::to_string(&context)?;
-
-    // 8. Insert the create-pr dispatch using the on-conn variant so the whole
-    //    handoff stays in one transaction.
-    let (result_dispatch_id, result_generation, reused) =
-        match apply_dispatch_attached_intents_on_conn(
-            &tx,
-            &payload.card_id,
-            &payload.agent_id,
-            &dispatch_id,
-            "create-pr",
-            false, // is_review_type
-            &old_status,
-            &effective,
-            &payload.title,
-            &context_str,
-            None, // parent_dispatch_id
-            0,    // chain_depth
-            DispatchCreateOptions {
-                sidecar_dispatch: true,
-                ..Default::default()
-            },
-        ) {
-            Ok(()) => (dispatch_id, generation, false),
-            Err(e) => {
-                if e.to_string()
-                    .contains("concurrent race prevented by DB constraint")
-                {
-                    if let Some((winner_dispatch_id, winner_generation)) =
-                        lookup_active_create_pr_dispatch(&tx, &payload.card_id)?
-                    {
-                        refresh_pr_tracking_reuse_state(
-                            &tx,
-                            payload,
-                            &winner_generation,
-                            current_round,
-                        )?;
-                        (winner_dispatch_id, winner_generation, true)
-                    } else {
-                        return Err(e);
-                    }
-                } else {
-                    return Err(e);
-                }
-            }
-        };
-
-    // 9. Stamp blocked_reason='pr:creating' so timeouts/escalation treat the
-    //    in-flight handoff as benign progress (manual_intervention.rs benign
-    //    list includes "pr:creating" as of #743 commit 1).
-    tx.execute(
-        "UPDATE kanban_cards SET blocked_reason = 'pr:creating', updated_at = datetime('now') \
-         WHERE id = ?1",
-        [&payload.card_id],
-    )?;
-
-    tx.commit()?;
-
-    Ok(json!({
-        "ok": true,
-        "reused": reused,
-        "dispatch_id": result_dispatch_id,
-        "generation": result_generation,
-    }))
-}
-
 // ── recordPrCreateFailure ──────────────────────────────────────────────
 
 fn record_pr_create_failure_raw(
-    db: &Db,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     card_id: &str,
     error: &str,
@@ -842,6 +750,9 @@ fn record_pr_create_failure_raw(
             |runtime_error| runtime_error,
         )
     } else {
+        let Some(db) = db else {
+            return json!({"error": "sqlite backend is unavailable"}).to_string();
+        };
         record_pr_create_failure_tx(db, card_id, error, stamp_gen).map_err(|e| format!("{e}"))
     };
     match result {
@@ -1037,7 +948,7 @@ fn record_pr_create_failure_tx(
 
 // ── reseedPrTracking ──────────────────────────────────────────────────
 
-fn reseed_pr_tracking_raw(db: &Db, pg_pool: Option<&PgPool>, card_id: &str) -> String {
+fn reseed_pr_tracking_raw(db: Option<&Db>, pg_pool: Option<&PgPool>, card_id: &str) -> String {
     if card_id.trim().is_empty() {
         return json!({"error": "card_id is required"}).to_string();
     }
@@ -1049,6 +960,9 @@ fn reseed_pr_tracking_raw(db: &Db, pg_pool: Option<&PgPool>, card_id: &str) -> S
             |runtime_error| runtime_error,
         )
     } else {
+        let Some(db) = db else {
+            return json!({"error": "sqlite backend is unavailable"}).to_string();
+        };
         reseed_pr_tracking_tx(db, card_id).map_err(|e| format!("{e}"))
     };
     match result {
@@ -1282,17 +1196,13 @@ mod tests {
             let admin_url = admin_database_url();
             let database_name = format!("agentdesk_review_auto_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!("{}/{}", base_database_url(), database_name);
-            let admin_pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&admin_url)
-                .await
-                .expect("connect postgres admin db");
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
-                .await
-                .expect("create postgres test db");
-            admin_pool.close().await;
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "review automation pg tests",
+            )
+            .await
+            .expect("create postgres test db");
 
             Self {
                 admin_url,
@@ -1302,43 +1212,22 @@ mod tests {
         }
 
         async fn migrate(&self) -> sqlx::PgPool {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&self.database_url)
-                .await
-                .expect("connect postgres test db");
-            crate::db::postgres::migrate(&pool)
-                .await
-                .expect("migrate postgres test db");
-            pool
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "review automation pg tests",
+            )
+            .await
+            .expect("migrate postgres test db")
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(std::time::Duration::from_secs(30))
-                .connect(&self.admin_url)
-                .await
-                .expect("reconnect postgres admin db");
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "review automation pg tests",
             )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
-            .await
-            .expect("terminate postgres test db sessions");
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
             .await
             .expect("drop postgres test db");
-            admin_pool.close().await;
         }
     }
 
@@ -2421,7 +2310,6 @@ mod tests {
         let run_id = format!("run-{}", uuid::Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO auto_queue_runs (
-
                 id, repo, agent_id, status, max_concurrent_threads, thread_group_count,
                 created_at
              ) VALUES ($1, 'itismyfield/AgentDesk', 'project-agentdesk', 'running', 1, 1, NOW())",

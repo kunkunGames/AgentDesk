@@ -256,13 +256,13 @@ pub async fn trigger_rework(
         };
 
         return match crate::kanban::transition_status_with_opts_pg(
-            &state.db,
+            Some(&state.db),
             pg_pool,
             &state.engine,
             &card_id,
             "in_progress",
             "trigger-rework",
-            true,
+            crate::engine::transition::ForceIntent::OperatorOverride,
         )
         .await
         {
@@ -322,7 +322,7 @@ pub async fn trigger_rework(
         &card_id,
         "in_progress",
         "trigger-rework",
-        true,
+        crate::engine::transition::ForceIntent::OperatorOverride,
     ) {
         Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))),
         Err(e) => (
@@ -348,7 +348,7 @@ mod tests {
 
     fn test_engine(db: &Db) -> PolicyEngine {
         let config = crate::config::Config::default();
-        PolicyEngine::new(&config, db.clone()).unwrap()
+        PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
     }
 
     fn test_state_with_pg(db: Db, engine: PolicyEngine, pg_pool: sqlx::PgPool) -> AppState {
@@ -376,12 +376,9 @@ mod tests {
             let admin_url = postgres_admin_database_url();
             let database_name = format!("agentdesk_reviews_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
-            let admin_pool = sqlx::PgPool::connect(&admin_url).await.unwrap();
-            sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-                .execute(&admin_pool)
+            crate::db::postgres::create_test_database(&admin_url, &database_name, "reviews tests")
                 .await
                 .unwrap();
-            admin_pool.close().await;
             Self {
                 admin_url,
                 database_name,
@@ -390,31 +387,19 @@ mod tests {
         }
 
         async fn migrate(&self) -> sqlx::PgPool {
-            let pool = sqlx::PgPool::connect(&self.database_url).await.unwrap();
-            crate::db::postgres::migrate(&pool).await.unwrap();
-            pool
+            crate::db::postgres::connect_test_pool_and_migrate(&self.database_url, "reviews tests")
+                .await
+                .unwrap()
         }
 
         async fn drop(self) {
-            let admin_pool = sqlx::PgPool::connect(&self.admin_url).await.unwrap();
-            sqlx::query(
-                "SELECT pg_terminate_backend(pid)
-                 FROM pg_stat_activity
-                 WHERE datname = $1
-                   AND pid <> pg_backend_pid()",
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "reviews tests",
             )
-            .bind(&self.database_name)
-            .execute(&admin_pool)
             .await
             .unwrap();
-            sqlx::query(&format!(
-                "DROP DATABASE IF EXISTS \"{}\"",
-                self.database_name
-            ))
-            .execute(&admin_pool)
-            .await
-            .unwrap();
-            admin_pool.close().await;
         }
     }
 

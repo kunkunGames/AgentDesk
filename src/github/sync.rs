@@ -185,7 +185,7 @@ pub fn sync_github_issues_for_repo(
             card_id,
             terminal,
             "github-sync",
-            true,
+            crate::engine::transition::ForceIntent::SystemRecovery,
         );
         result.closed_count += 1;
         tracing::info!(
@@ -419,7 +419,7 @@ async fn close_pg_card_for_issue(
         &ctx,
         &target_status,
         "github-sync",
-        true,
+        crate::engine::transition::ForceIntent::SystemRecovery,
     );
 
     match &decision.outcome {
@@ -730,7 +730,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.policies.dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
         config.policies.hot_reload = false;
-        crate::engine::PolicyEngine::new(&config, db.clone()).unwrap()
+        crate::engine::PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
     }
 
     #[test]

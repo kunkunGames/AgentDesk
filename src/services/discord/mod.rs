@@ -539,6 +539,14 @@ impl SharedData {
 
 #[cfg(test)]
 pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
+    make_shared_data_for_tests_with_storage(None, None)
+}
+
+#[cfg(test)]
+pub(super) fn make_shared_data_for_tests_with_storage(
+    db: Option<crate::db::Db>,
+    pg_pool: Option<sqlx::PgPool>,
+) -> Arc<SharedData> {
     Arc::new(SharedData {
         core: tokio::sync::Mutex::new(CoreState {
             sessions: std::collections::HashMap::new(),
@@ -580,8 +588,8 @@ pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
         cached_bot_token: tokio::sync::OnceCell::new(),
         token_hash: "test-token-hash".to_string(),
         api_port: 9,
-        db: None,
-        pg_pool: None,
+        db,
+        pg_pool,
         engine: None,
         health_registry: std::sync::Weak::new(),
         known_slash_commands: tokio::sync::OnceCell::new(),

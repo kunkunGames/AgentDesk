@@ -56,7 +56,7 @@ struct RetrospectiveDraft {
 }
 
 pub(crate) fn record_card_retrospective_json(
-    db: &Db,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     card_id: &str,
     terminal_status: &str,
@@ -72,12 +72,12 @@ pub(crate) fn record_card_retrospective_json(
 }
 
 fn record_card_retrospective(
-    db: &Db,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     card_id: &str,
     terminal_status: &str,
 ) -> Result<Value, String> {
-    let db = db.clone();
+    let db = db.cloned();
     let card_id = card_id.trim().to_string();
     let terminal_status = terminal_status.trim().to_string();
 
@@ -90,10 +90,13 @@ fn record_card_retrospective(
 
     if let Some(pg_pool) = pg_pool.cloned() {
         return run_async_bridge_pg(&pg_pool, move |pool| async move {
-            record_card_retrospective_pg(&db, &pool, &card_id, &terminal_status).await
+            record_card_retrospective_pg(&pool, &card_id, &terminal_status).await
         });
     }
 
+    let Some(db) = db else {
+        return Err("sqlite backend is unavailable".to_string());
+    };
     record_card_retrospective_sqlite(&db, &card_id, &terminal_status)
 }
 
@@ -191,7 +194,7 @@ fn record_card_retrospective_sqlite(
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 sync_retrospective_to_memento(
-                    db_clone,
+                    Some(db_clone),
                     None,
                     retrospective_id_clone,
                     sync_settings,
@@ -213,7 +216,6 @@ fn record_card_retrospective_sqlite(
 }
 
 async fn record_card_retrospective_pg(
-    db: &Db,
     pg_pool: &PgPool,
     card_id: &str,
     terminal_status: &str,
@@ -284,7 +286,6 @@ async fn record_card_retrospective_pg(
     }
 
     if sync_settings.backend == MemoryBackendKind::Memento && has_runtime {
-        let db_clone = db.clone();
         let pg_pool_clone = pg_pool.clone();
         let retrospective_id_clone = retrospective_id.clone();
         let remember_request = MementoRememberRequest {
@@ -309,7 +310,7 @@ async fn record_card_retrospective_pg(
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 sync_retrospective_to_memento(
-                    db_clone,
+                    None,
                     Some(pg_pool_clone),
                     retrospective_id_clone,
                     sync_settings,
@@ -331,7 +332,7 @@ async fn record_card_retrospective_pg(
 }
 
 async fn sync_retrospective_to_memento(
-    db: Db,
+    db: Option<Db>,
     pg_pool: Option<PgPool>,
     retrospective_id: String,
     settings: ResolvedMemorySettings,
@@ -362,6 +363,9 @@ async fn sync_retrospective_to_memento(
         return;
     }
 
+    let Some(db) = db else {
+        return;
+    };
     let Ok(conn) = db.lock() else {
         return;
     };
@@ -989,7 +993,7 @@ mod tests {
         drop(conn);
 
         let payload = serde_json::from_str::<Value>(&record_card_retrospective_json(
-            &db,
+            Some(&db),
             None,
             "card-retro",
             "done",
@@ -1048,7 +1052,7 @@ mod tests {
         drop(conn);
 
         let payload = serde_json::from_str::<Value>(&record_card_retrospective_json(
-            &db,
+            Some(&db),
             None,
             "card-retro-skip",
             "done",
@@ -1130,7 +1134,7 @@ mod tests {
         .unwrap();
 
         let payload = serde_json::from_str::<Value>(&record_card_retrospective_json(
-            &sqlite_db,
+            Some(&sqlite_db),
             Some(&pg_pool),
             "card-retro-pg",
             "done",

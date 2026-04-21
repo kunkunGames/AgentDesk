@@ -1,5 +1,5 @@
 use super::*;
-use axum::body::Body;
+use axum::body::{Body, HttpBody as _};
 use axum::http::{Request, StatusCode};
 use libsql_rusqlite::OptionalExtension;
 use serde_json::json;
@@ -8,15 +8,14 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use tower::ServiceExt;
 
 fn test_db() -> Db {
-    let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-    crate::db::wrap_conn(conn)
+    crate::db::test_db()
 }
 
 /// Seed test agents for dispatch-related tests (#245 agent-exists guard).
@@ -31,7 +30,12 @@ fn seed_test_agents(db: &Db) {
 
 fn test_engine(db: &Db) -> PolicyEngine {
     let config = crate::config::Config::default();
-    PolicyEngine::new(&config, db.clone()).unwrap()
+    PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
+}
+
+fn test_engine_with_pg(_db: &Db, pg_pool: sqlx::PgPool) -> PolicyEngine {
+    let config = crate::config::Config::default();
+    PolicyEngine::new_with_pg(&config, Some(pg_pool)).unwrap()
 }
 
 fn test_api_router(
@@ -70,6 +74,28 @@ fn test_api_router_with_pg(
     api_router_with_pg(db, engine, config, tx, buf, health_registry, Some(pg_pool))
 }
 
+async fn read_sse_body_until(body: &mut Body, needles: &[&str]) -> String {
+    let mut output = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+
+    while !needles.iter().all(|needle| output.contains(needle)) {
+        let frame = tokio::time::timeout_at(
+            deadline,
+            futures::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)),
+        )
+        .await
+        .expect("timed out waiting for SSE frame")
+        .expect("stream should still be open")
+        .expect("stream frame should be readable");
+
+        if let Ok(data) = frame.into_data() {
+            output.push_str(&String::from_utf8_lossy(&data));
+        }
+    }
+
+    output
+}
+
 struct TestPostgresDb {
     admin_url: String,
     database_name: String,
@@ -81,12 +107,9 @@ impl TestPostgresDb {
         let admin_url = postgres_admin_database_url();
         let database_name = format!("agentdesk_routes_{}", uuid::Uuid::new_v4().simple());
         let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
-        let admin_pool = sqlx::PgPool::connect(&admin_url).await.unwrap();
-        sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
-            .execute(&admin_pool)
+        crate::db::postgres::create_test_database(&admin_url, &database_name, "routes tests")
             .await
             .unwrap();
-        admin_pool.close().await;
 
         Self {
             admin_url,
@@ -96,31 +119,19 @@ impl TestPostgresDb {
     }
 
     async fn connect_and_migrate(&self) -> sqlx::PgPool {
-        let pool = sqlx::PgPool::connect(&self.database_url).await.unwrap();
-        crate::db::postgres::migrate(&pool).await.unwrap();
-        pool
+        crate::db::postgres::connect_test_pool_and_migrate(&self.database_url, "routes tests")
+            .await
+            .unwrap()
     }
 
     async fn drop(self) {
-        let admin_pool = sqlx::PgPool::connect(&self.admin_url).await.unwrap();
-        sqlx::query(
-            "SELECT pg_terminate_backend(pid)
-             FROM pg_stat_activity
-             WHERE datname = $1
-               AND pid <> pg_backend_pid()",
+        crate::db::postgres::drop_test_database(
+            &self.admin_url,
+            &self.database_name,
+            "routes tests",
         )
-        .bind(&self.database_name)
-        .execute(&admin_pool)
         .await
         .unwrap();
-        sqlx::query(&format!(
-            "DROP DATABASE IF EXISTS \"{}\"",
-            self.database_name
-        ))
-        .execute(&admin_pool)
-        .await
-        .unwrap();
-        admin_pool.close().await;
     }
 }
 
@@ -208,6 +219,12 @@ struct MockGhOverride {
     _env: EnvVarGuard,
 }
 
+impl MockGhOverride {
+    fn path(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
 #[cfg(unix)]
 fn install_mock_gh_pr_tracking(
     repo: &str,
@@ -271,6 +288,24 @@ fn install_mock_gh_issue_list(
     }
 }
 
+#[cfg(unix)]
+fn install_mock_gh_issue_create(repo: &str, issue_number: i64) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\ncapture_dir=\"$(dirname \"$0\")\"\nif [ \"${{1-}}\" = \"--version\" ]; then\n  echo 'gh mock 1.0'\n  exit 0\nfi\nif [ \"${{1-}}\" = \"issue\" ] && [ \"${{2-}}\" = \"create\" ]; then\n  printf '%s\\n' \"$@\" > \"$capture_dir/issue-create-args.txt\"\n  body_file=''\n  prev=''\n  for arg in \"$@\"; do\n    if [ \"$prev\" = '--body-file' ]; then\n      body_file=\"$arg\"\n      break\n    fi\n    prev=\"$arg\"\n  done\n  if [ -n \"$body_file\" ]; then\n    cp \"$body_file\" \"$capture_dir/issue-create-body.md\"\n  fi\n  echo 'https://github.com/{repo}/issues/{issue_number}'\n  exit 0\nfi\necho 'gh mock: unexpected args: $*' >&2\nexit 1\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
+    }
+}
+
 #[cfg(windows)]
 fn install_mock_gh_pr_tracking(
     repo: &str,
@@ -316,6 +351,21 @@ fn install_mock_gh_issue_list(
     let gh_path = dir.path().join("gh.ps1");
     let script = format!(
         "$joined = $args -join ' '\nif ($args.Count -gt 0 -and $args[0] -eq '--version') {{\n  Write-Output 'gh mock 1.0'\n  exit 0\n}}\nif ($args.Count -ge 2 -and $args[0] -eq 'issue' -and $args[1] -eq 'list' -and $joined.Contains('--repo {repo}')) {{\n  if ($joined.Contains('--state all')) {{\n@'\n{primary_json}\n'@ | Write-Output\n    exit 0\n  }}\n  if ($joined.Contains('--state closed')) {{\n@'\n{recent_closed_json}\n'@ | Write-Output\n    exit 0\n  }}\n}}\nWrite-Error \"gh mock: unexpected args: $joined\"\nexit 1\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
+    MockGhOverride {
+        _dir: dir,
+        _env: env,
+    }
+}
+
+#[cfg(windows)]
+fn install_mock_gh_issue_create(repo: &str, issue_number: i64) -> MockGhOverride {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh.ps1");
+    let script = format!(
+        "$captureDir = $PSScriptRoot\nif ($args.Count -gt 0 -and $args[0] -eq '--version') {{\n  Write-Output 'gh mock 1.0'\n  exit 0\n}}\nif ($args.Count -ge 2 -and $args[0] -eq 'issue' -and $args[1] -eq 'create') {{\n  $args | Set-Content -Path (Join-Path $captureDir 'issue-create-args.txt')\n  for ($i = 0; $i -lt $args.Count - 1; $i++) {{\n    if ($args[$i] -eq '--body-file') {{\n      Copy-Item -LiteralPath $args[$i + 1] -Destination (Join-Path $captureDir 'issue-create-body.md') -Force\n      break\n    }}\n  }}\n  'https://github.com/{repo}/issues/{issue_number}' | Write-Output\n  exit 0\n}}\nWrite-Error \"gh mock: unexpected args: $($args -join ' ')\"\nexit 1\n"
     );
     fs::write(&gh_path, script).unwrap();
     let env = EnvVarGuard::set_path("AGENTDESK_GH_PATH", &gh_path);
@@ -764,6 +814,77 @@ async fn health_api_includes_latest_config_audit_report() {
 }
 
 #[tokio::test]
+async fn health_api_includes_pipeline_override_report_and_degraded_reason() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let harness = crate::services::discord::health::TestHealthHarness::new().await;
+    let app = axum::Router::new().nest(
+        "/api",
+        test_api_router(db.clone(), engine, Some(harness.registry())),
+    );
+
+    {
+        let conn = db.lock().unwrap();
+        let report = crate::pipeline::PipelineOverrideHealthReport {
+            generated_at: "2026-04-20T00:00:00Z".to_string(),
+            status: "warn".to_string(),
+            warnings_count: 1,
+            warnings: vec![
+                "repo override alpha replaces transitions and drops 2 inherited entries"
+                    .to_string(),
+            ],
+            parse_failures: Vec::new(),
+            replace_warnings: vec![crate::pipeline::PipelineOverrideReplaceWarning {
+                layer: "repo".to_string(),
+                target_id: "alpha".to_string(),
+                section: "transitions".to_string(),
+                dropped_count: 2,
+                dropped_items: vec![
+                    "backlog->in_progress".to_string(),
+                    "in_progress->done".to_string(),
+                ],
+            }],
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('pipeline_override_health_report', ?1)",
+            [serde_json::to_string(&report).unwrap()],
+        )
+        .unwrap();
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let json: serde_json::Value = reqwest::get(format!("http://{addr}/api/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["pipeline_overrides"]["status"], "warn");
+    assert_eq!(json["pipeline_overrides"]["warnings_count"], 1);
+    assert_eq!(
+        json["pipeline_overrides"]["replace_warnings"][0]["target_id"],
+        "alpha"
+    );
+    assert!(
+        json["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|reason| reason == "pipeline_override_warnings:1"),
+        "expected pipeline_override_warnings degraded reason, got {:?}",
+        json["degraded_reasons"]
+    );
+}
+
+#[tokio::test]
 async fn offices_reorder_accepts_bare_array_and_updates_listing_order() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -844,6 +965,7 @@ async fn offices_reorder_rejects_wrapped_order_body() {
     let app = test_api_router(db, engine, None);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -867,6 +989,7 @@ async fn round_table_meeting_channels_endpoint_does_not_fall_through_to_meeting_
     let app = axum::Router::new().nest("/api", test_api_router(db, engine, None));
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/round-table-meetings/channels")
@@ -961,6 +1084,7 @@ async fn round_table_meeting_channels_endpoint_returns_configured_experts_and_fa
     let app = axum::Router::new().nest("/api", test_api_router(db, engine, Some(health_registry)));
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/round-table-meetings/channels")
@@ -1054,6 +1178,7 @@ async fn agent_turn_returns_recent_output_from_inflight_snapshot() {
 
     let app = test_api_router(db, engine, None);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/agents/agent-turn/turn")
@@ -1106,6 +1231,7 @@ async fn agent_turn_reports_idle_when_agent_has_no_active_session() {
 
     let app = test_api_router(db, engine, None);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/agents/agent-idle/turn")
@@ -1208,6 +1334,7 @@ async fn stop_agent_turn_preserves_matching_tmux_session() {
 
     let app = test_api_router(db.clone(), engine, None);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3368,6 +3495,7 @@ async fn dispatch_create_and_get() {
 
     let app = test_api_router(db.clone(), engine.clone(), None);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3381,11 +3509,12 @@ async fn dispatch_create_and_get() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::CREATED, "unexpected response: {json}");
     let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
     assert_eq!(json["dispatch"]["status"], "pending");
     assert_eq!(json["dispatch"]["kanban_card_id"], "c1");
@@ -3446,6 +3575,7 @@ async fn dispatch_create_for_terminal_card_returns_conflict_with_reason() {
 
     let app = test_api_router(db, engine, None);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3477,7 +3607,9 @@ async fn dispatch_create_for_terminal_card_returns_conflict_with_reason() {
 async fn dispatch_create_with_skip_outbox_omits_notify_row() {
     let db = test_db();
     seed_test_agents(&db);
-    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
 
     {
         let conn = db.lock().unwrap();
@@ -3487,8 +3619,38 @@ async fn dispatch_create_with_skip_outbox_omits_notify_row() {
             ).unwrap();
     }
 
-    let app = test_api_router(db.clone(), engine, None);
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("ch-td")
+    .bind("TD")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, priority)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("c1-skip")
+    .bind("Card1 Skip")
+    .bind("ready")
+    .bind("medium")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db.clone(),
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3502,25 +3664,33 @@ async fn dispatch_create_with_skip_outbox_omits_notify_row() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::CREATED, "unexpected response: {json}");
     let dispatch_id = json["dispatch"]["id"].as_str().unwrap().to_string();
 
-    let conn = db.lock().unwrap();
-    let notify_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'notify'",
-            [&dispatch_id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let verify_pool = sqlx::PgPool::connect(&pg_db.database_url).await.unwrap();
+    let notify_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint
+         FROM dispatch_outbox
+         WHERE dispatch_id = $1 AND action = 'notify'",
+    )
+    .bind(&dispatch_id)
+    .fetch_one(&verify_pool)
+    .await
+    .unwrap();
     assert_eq!(
         notify_count, 0,
         "skip_outbox=true must suppress notify outbox persistence"
     );
+
+    verify_pool.close().await;
+    drop(app);
+    pg_pool.close().await;
+    pg_db.drop().await;
 }
 
 /// #761: A crafted `POST /api/dispatches` call that preseeds review-target
@@ -3532,17 +3702,18 @@ async fn dispatch_create_with_skip_outbox_omits_notify_row() {
 async fn dispatch_create_review_strips_untrusted_review_target_fields_from_context() {
     let db = test_db();
     seed_test_agents(&db);
-    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
 
-    // Real repo with a commit that mentions issue #761 — this is the commit
-    // the validation/refresh chain must resolve to, NOT the injected one.
+    // Real repo exists on the card, but the caller injects a foreign
+    // external target_repo. The hardened path must fail closed instead of
+    // silently falling back to the card repo and reviewing unrelated code.
     let (repo, _repo_override) = setup_test_repo();
-    let real_commit = git_commit(repo.path(), "fix: real work for card (#761)");
     let real_worktree_path = repo.path().to_string_lossy().into_owned();
 
-    // Card in the review-ready state (pre-review), linked to the real repo
-    // via a repo_id that resolves (via AGENTDESK_REPO_DIR set by
-    // setup_test_repo) to `repo.path()`.
+    // Card in the review-ready state (pre-review), linked to a real repo
+    // path while the caller injects a conflicting foreign target_repo.
     {
         let conn = db.lock().unwrap();
         conn.execute(
@@ -3557,6 +3728,35 @@ async fn dispatch_create_review_strips_untrusted_review_target_fields_from_conte
         )
         .unwrap();
     }
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("ch-td")
+    .bind("TD")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, github_issue_number, repo_id
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7
+         )",
+    )
+    .bind("card-761")
+    .bind("Preseed review target")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("ch-td")
+    .bind(761_i64)
+    .bind(&real_worktree_path)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
 
     // Simulate a malicious / buggy caller preseeding review-target fields.
     // The injected commit SHA is syntactically valid but points at nothing
@@ -3584,8 +3784,15 @@ async fn dispatch_create_review_strips_untrusted_review_target_fields_from_conte
     })
     .to_string();
 
-    let app = test_api_router(db.clone(), engine, None);
+    let app = test_api_router_with_pg(
+        db.clone(),
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3597,64 +3804,53 @@ async fn dispatch_create_review_strips_untrusted_review_target_fields_from_conte
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    let context = &json["dispatch"]["context"];
-
-    // The injected values MUST NOT survive into the persisted dispatch
-    // context. Either the field is missing (validation chain found nothing)
-    // or it was overwritten with the real target from the card's history.
-    assert_ne!(
-        context["reviewed_commit"].as_str(),
-        Some(injected_commit),
-        "injected reviewed_commit must not propagate into review dispatch context"
-    );
-    assert_ne!(
-        context["worktree_path"].as_str(),
-        Some(injected_worktree),
-        "injected worktree_path must not propagate into review dispatch context"
-    );
-    assert_ne!(
-        context["branch"].as_str(),
-        Some("attacker/controlled-branch"),
-        "injected branch must not propagate into review dispatch context"
-    );
-    assert_ne!(
-        context["target_repo"].as_str(),
-        Some(injected_target_repo),
-        "injected target_repo must not propagate into review dispatch context"
-    );
-
-    // The real target (resolved via find_latest_commit_for_issue for #761)
-    // must have replaced the injected one.
     assert_eq!(
-        context["reviewed_commit"].as_str(),
-        Some(real_commit.as_str()),
-        "validation chain must overwrite reviewed_commit with the real commit for this card's issue"
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unexpected response: {json}"
     );
-    let canonical = |value: &str| {
-        std::fs::canonicalize(value)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    };
-    assert_eq!(
-        canonical(context["worktree_path"].as_str().unwrap()),
-        canonical(&real_worktree_path),
-        "worktree_path must resolve to the card's real repo dir"
-    );
-
-    // #761 (Codex round-2): The `_trusted_review_target` flag must be
-    // scrubbed from the persisted dispatch context — it has no meaning on
-    // the API-sourced path and must not become an audit artifact that
-    // implies the client steered the review target.
+    let error = json["error"].as_str().unwrap_or_default();
     assert!(
-        context.get("_trusted_review_target").is_none(),
-        "client-supplied _trusted_review_target flag must not persist into the dispatch context"
+        error.contains("external_target_repo_unrecoverable"),
+        "expected fail-closed external_target_repo guard, got {json}"
     );
+    assert!(
+        error.contains(injected_target_repo),
+        "error should point at the rejected injected target_repo, got {json}"
+    );
+    assert!(
+        !json.to_string().contains(injected_commit),
+        "error response must not echo the injected reviewed_commit: {json}"
+    );
+    assert!(
+        !json.to_string().contains(injected_worktree),
+        "error response must not echo the injected worktree_path: {json}"
+    );
+    assert!(
+        !json.to_string().contains("attacker/controlled-branch"),
+        "error response must not echo the injected branch: {json}"
+    );
+
+    let dispatch_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM task_dispatches WHERE kanban_card_id = $1",
+    )
+    .bind("card-761")
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        dispatch_count, 0,
+        "fail-closed review-target validation must not persist a dispatch row"
+    );
+
+    drop(app);
+    pg_pool.close().await;
+    pg_db.drop().await;
 }
 
 /// #761 (Codex round-2): Focused negative test for the trust-boundary
@@ -3672,7 +3868,9 @@ async fn dispatch_create_review_strips_untrusted_review_target_fields_from_conte
 async fn dispatch_create_review_ignores_client_trusted_review_target_flag() {
     let db = test_db();
     seed_test_agents(&db);
-    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
 
     // Deliberately do NOT seed any work dispatch or pr_tracking row for this
     // card — the validation/refresh chain has nothing to resolve. If the
@@ -3693,6 +3891,34 @@ async fn dispatch_create_review_ignores_client_trusted_review_target_flag() {
         .unwrap();
     }
 
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("ch-td")
+    .bind("TD")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, github_issue_number
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6
+         )",
+    )
+    .bind("card-761-flag")
+    .bind("Ignore trust flag")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("ch-td")
+    .bind(999999_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
     let injected_commit = "cafef00dcafef00dcafef00dcafef00dcafef00d";
     let injected_worktree = "/tmp/agentdesk-761-flag-attacker-worktree";
     let injected_target_repo = "/tmp/agentdesk-761-flag-attacker-repo";
@@ -3712,8 +3938,15 @@ async fn dispatch_create_review_ignores_client_trusted_review_target_flag() {
     })
     .to_string();
 
-    let app = test_api_router(db, engine, None);
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3772,6 +4005,10 @@ async fn dispatch_create_review_ignores_client_trusted_review_target_flag() {
             "error response must not echo the injected reviewed_commit: {json}"
         );
     }
+
+    drop(app);
+    pg_pool.close().await;
+    pg_db.drop().await;
 }
 
 #[tokio::test]
@@ -4041,6 +4278,152 @@ async fn api_docs_category_exposes_agents_turn_start_contract() {
 }
 
 #[tokio::test]
+async fn create_issue_route_builds_pmd_body_and_agent_label() {
+    let _env_lock = env_lock();
+    let gh = install_mock_gh_issue_create("itismyfield/AgentDesk", 819);
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/issues")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "repo": "ADK",
+                        "title": "create-issue 스킬을 ADK API로 승격",
+                        "background": "AgentDesk 내부에서 PMD 포맷 이슈를 서버 API로 직접 생성해야 한다.",
+                        "content": [
+                            "POST /api/issues 엔드포인트를 추가한다.",
+                            "서버에서 PMD 마크다운 포맷을 강제한다."
+                        ],
+                        "dod": [
+                            "성공 시 issue URL과 번호를 반환한다",
+                            "DoD 항목은 체크리스트로 렌더링된다"
+                        ],
+                        "agent_id": "adk-backend"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["issue"]["number"], 819);
+    assert_eq!(
+        json["issue"]["url"],
+        "https://github.com/itismyfield/AgentDesk/issues/819"
+    );
+    assert_eq!(json["issue"]["repo"], "itismyfield/AgentDesk");
+    assert_eq!(json["applied_labels"], json!(["agent:adk-backend"]));
+    assert_eq!(json["pmd_format_version"], 1);
+
+    let args = fs::read_to_string(gh.path().join("issue-create-args.txt")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--repo", "itismyfield/AgentDesk"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--label", "agent:adk-backend"])
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--title", "create-issue 스킬을 ADK API로 승격"])
+    );
+
+    let issue_body = fs::read_to_string(gh.path().join("issue-create-body.md")).unwrap();
+    assert!(
+        issue_body
+            .contains("## 배경\nAgentDesk 내부에서 PMD 포맷 이슈를 서버 API로 직접 생성해야 한다.")
+    );
+    assert!(issue_body.contains("## 내용\n- POST /api/issues 엔드포인트를 추가한다.\n- 서버에서 PMD 마크다운 포맷을 강제한다."));
+    assert!(issue_body.contains("## DoD\n- [ ] 성공 시 issue URL과 번호를 반환한다\n- [ ] DoD 항목은 체크리스트로 렌더링된다"));
+    assert!(!issue_body.contains("## 의존성"));
+    assert!(!issue_body.contains("## 리스크"));
+}
+
+#[tokio::test]
+async fn create_issue_route_rejects_more_than_ten_dod_items() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+    let dod: Vec<String> = (0..11).map(|index| format!("item-{index}")).collect();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/issues")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "repo": "ADK",
+                        "title": "invalid dod",
+                        "background": "background",
+                        "content": ["content"],
+                        "dod": dod,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "dod items must be 10 or fewer");
+}
+
+#[tokio::test]
+async fn github_docs_include_issue_creation_endpoint() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/github")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("docs/github must return endpoint array");
+    let create_issue = endpoints
+        .iter()
+        .find(|endpoint| endpoint["method"] == "POST" && endpoint["path"] == "/api/issues")
+        .expect("github docs must include POST /api/issues");
+    assert_eq!(json["category"], "github");
+    assert_eq!(create_issue["params"]["repo"]["required"], true);
+    assert_eq!(create_issue["params"]["dod"]["type"], "array[string]");
+    assert_eq!(create_issue["params"]["agent_id"]["required"], false);
+}
+
+#[tokio::test]
 async fn api_docs_flat_format_lists_routes_missing_from_legacy_docs() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -4073,6 +4456,7 @@ async fn api_docs_flat_format_lists_routes_missing_from_legacy_docs() {
         "/api/auto-queue/slots/{agent_id}/{slot_index}/reset-thread",
         "/api/help",
         "/api/docs/{category}",
+        "/api/issues",
     ] {
         assert!(
             endpoints.iter().any(|ep| ep["path"] == path),
@@ -4766,7 +5150,7 @@ async fn kanban_terminal_status_fires_hook() {
         },
         ..crate::config::Config::default()
     };
-    let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+    let engine = PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap();
 
     {
         let conn = db.lock().unwrap();
@@ -4777,8 +5161,14 @@ async fn kanban_terminal_status_fires_hook() {
     }
 
     // Use force transition: requested → done (no rule, force bypasses)
-    let result =
-        crate::kanban::transition_status_with_opts(&db, &engine, "c1", "done", "pmd", true);
+    let result = crate::kanban::transition_status_with_opts(
+        &db,
+        &engine,
+        "c1",
+        "done",
+        "pmd",
+        crate::engine::transition::ForceIntent::OperatorOverride,
+    );
     assert!(
         result.is_ok(),
         "force transition should succeed: {:?}",
@@ -5432,102 +5822,6 @@ fn seed_agent(db: &Db, agent_id: &str) {
         [agent_id],
     )
     .unwrap();
-}
-
-#[tokio::test]
-async fn create_repo_seeds_builtin_agentdesk_pipeline_stages_for_new_db() {
-    let db = test_db();
-    let engine = test_engine(&db);
-    let app = test_api_router(db.clone(), engine, None);
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/kanban-repos")
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"repo":"itismyfield/AgentDesk"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-
-    let conn = db.lock().unwrap();
-    let rows: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> = conn
-        .prepare(
-            "SELECT stage_name, stage_order, trigger_after, provider, skip_condition
-             FROM pipeline_stages
-             WHERE repo_id = 'itismyfield/AgentDesk'
-             ORDER BY stage_order ASC",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-
-    assert_eq!(
-        rows,
-        vec![
-            (
-                "dev-deploy".to_string(),
-                100,
-                Some("review_pass".to_string()),
-                Some("self".to_string()),
-                Some("no_rs_changes".to_string()),
-            ),
-            (
-                "e2e-test".to_string(),
-                200,
-                None,
-                Some("counter".to_string()),
-                Some("no_rs_changes".to_string()),
-            ),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn create_repo_does_not_duplicate_builtin_agentdesk_pipeline_stages() {
-    let db = test_db();
-    let engine = test_engine(&db);
-    let app = test_api_router(db.clone(), engine, None);
-
-    for _ in 0..2 {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/kanban-repos")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"repo":"itismyfield/AgentDesk"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
-
-    let conn = db.lock().unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pipeline_stages WHERE repo_id = 'itismyfield/AgentDesk'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-
-    assert_eq!(count, 2);
 }
 
 #[tokio::test]
@@ -6941,7 +7235,7 @@ async fn force_transition_to_done_tracks_pr_from_live_work_dispatch_and_cleans_i
     let db = test_db();
     let mut config = crate::config::Config::default();
     config.policies.dir = policy_dir.path().to_path_buf();
-    let engine = PolicyEngine::new(&config, db.clone()).unwrap();
+    let engine = PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap();
     seed_agent(&db, "agent-ft-terminal");
     seed_repo(&db, "test/repo");
     set_pmd_channel(&db, "pmd-chan-123");
@@ -8201,7 +8495,6 @@ async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
     let pg_pool = pg_db.connect_and_migrate().await;
     let engine = crate::engine::PolicyEngine::new_with_pg(
         &crate::config::Config::default(),
-        db.clone(),
         Some(pg_pool.clone()),
     )
     .unwrap();
@@ -8286,7 +8579,7 @@ async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
         "card-pg-tn",
         "done",
         "review",
-        true,
+        crate::engine::transition::ForceIntent::OperatorOverride,
     );
     assert!(result.is_ok(), "transition to done should succeed");
 
@@ -9184,54 +9477,6 @@ async fn auto_queue_dispatch_prepares_backlog_cards_and_auto_assigns_agent() {
 }
 
 #[tokio::test]
-async fn auto_queue_dispatch_rejects_deploy_phases_when_auth_token_is_not_configured() {
-    crate::pipeline::ensure_loaded();
-    let db = test_db();
-    let engine = test_engine(&db);
-    seed_agent(&db, "project-agentdesk");
-    ensure_auto_queue_tables(&db);
-    seed_auto_queue_card(
-        &db,
-        "card-dq-deploy-phase-reject",
-        7401,
-        "ready",
-        "project-agentdesk",
-    );
-
-    let app = test_api_router(db.clone(), engine, None);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auto-queue/dispatch")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_string(&serde_json::json!({
-                        "repo": "test-repo",
-                        "agent_id": "project-agentdesk",
-                        "groups": [{"issues": [7401]}],
-                        "deploy_phases": [1],
-                        "activate": false
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        json["error"],
-        "deploy_phases requires server.auth_token to be configured"
-    );
-}
-
-#[tokio::test]
 async fn auto_queue_dispatch_rejects_when_live_run_exists_without_force() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -9675,41 +9920,6 @@ async fn auto_queue_add_run_entry_rejects_non_active_runs() {
             .unwrap_or("")
             .contains("status=cancelled"),
         "inactive runs must be rejected with status details: {json}"
-    );
-}
-
-#[tokio::test]
-async fn auto_queue_update_run_rejects_deploy_phases_when_auth_token_is_not_configured() {
-    let db = test_db();
-    let engine = test_engine(&db);
-    ensure_auto_queue_tables(&db);
-
-    let app = test_api_router(db, engine, None);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PATCH")
-                .uri("/auto-queue/runs/run-does-not-matter")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_string(&json!({
-                        "deploy_phases": [2]
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        json["error"],
-        "deploy_phases requires server.auth_token to be configured"
     );
 }
 
@@ -19836,4 +20046,628 @@ async fn auto_queue_reset_without_agent_id_preserves_active_runs() {
     assert_eq!(pending_run_status, "completed");
     assert_eq!(active_entries, 1);
     assert_eq!(remaining_entries, 1);
+}
+
+#[tokio::test]
+async fn v1_routes_pg_surface_dashboard_contract() {
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("repo-v1")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, name_ko, provider, status, xp, avatar_emoji, discord_channel_id, discord_channel_alt
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9
+         )",
+    )
+    .bind("agent-v1")
+    .bind("V1 Agent")
+    .bind("브이원 에이전트")
+    .bind("claude")
+    .bind("working")
+    .bind(60_i64)
+    .bind("🤖")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO skills (id, name, description, source_path, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())",
+    )
+    .bind("live-skill")
+    .bind("Live Skill")
+    .bind("Live skill description")
+    .bind("/tmp/live-skill/SKILL.md")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
+         VALUES ($1, $2, $3, NOW())",
+    )
+    .bind("live-skill")
+    .bind("agent-v1")
+    .bind("session-v1")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id, github_issue_number, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
+         )",
+    )
+    .bind("card-v1-current")
+    .bind("repo-v1")
+    .bind("Current V1 Card")
+    .bind("in_progress")
+    .bind("high")
+    .bind("agent-v1")
+    .bind(791_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id, github_issue_number, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
+         )",
+    )
+    .bind("card-v1-review")
+    .bind("repo-v1")
+    .bind("Review Queue Card")
+    .bind("review")
+    .bind("medium")
+    .bind("agent-v1")
+    .bind(792_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-current")
+    .bind("card-v1-current")
+    .bind("agent-v1")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("Current dispatch")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kanban_cards SET latest_dispatch_id = $1 WHERE id = $2")
+        .bind("dispatch-current")
+        .bind("card-v1-current")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+
+    for index in 0..5_i64 {
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                NOW() - ($7::BIGINT || ' hours')::INTERVAL,
+                NOW() - ($7::BIGINT || ' hours')::INTERVAL
+             )",
+        )
+        .bind(format!("dispatch-completed-{index}"))
+        .bind("card-v1-review")
+        .bind("agent-v1")
+        .bind("implementation")
+        .bind("completed")
+        .bind(format!("Completed dispatch {index}"))
+        .bind(index + 1)
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO sessions (
+            session_key, agent_id, provider, status, active_dispatch_id, session_info, tokens,
+            last_heartbeat, thread_channel_id, created_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), $8, NOW()
+         )",
+    )
+    .bind("host:session-v1")
+    .bind("agent-v1")
+    .bind("claude")
+    .bind("working")
+    .bind("dispatch-current")
+    .bind("v1 session")
+    .bind(321_i64)
+    .bind("222000000000001")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO kanban_audit_logs (card_id, from_status, to_status, source, result, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())",
+    )
+    .bind("card-v1-current")
+    .bind("requested")
+    .bind("in_progress")
+    .bind("dispatch")
+    .bind("ok")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_logs (entity_type, entity_id, action, actor, timestamp)
+         VALUES ($1, $2, $3, $4, NOW())",
+    )
+    .bind("provider")
+    .bind("claude")
+    .bind("provider_restart_pending")
+    .bind("system")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("run-v1")
+    .bind("repo-v1")
+    .bind("agent-v1")
+    .bind("active")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, priority_rank
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6
+         )",
+    )
+    .bind("entry-v1")
+    .bind("run-v1")
+    .bind("card-v1-current")
+    .bind("agent-v1")
+    .bind("pending")
+    .bind(0_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = axum::Router::new().nest(
+        "/api",
+        test_api_router_with_pg(
+            db,
+            engine,
+            crate::config::Config::default(),
+            None,
+            pg_pool.clone(),
+        ),
+    );
+
+    let overview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/overview")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(overview.status(), StatusCode::OK);
+    assert_eq!(
+        overview.headers().get("cache-control").unwrap(),
+        "max-age=30"
+    );
+    let overview_body = axum::body::to_bytes(overview.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let overview_json: serde_json::Value = serde_json::from_slice(&overview_body).unwrap();
+    assert_eq!(overview_json["session_count"], json!(1));
+    assert_eq!(overview_json["metrics"]["agents"]["total"], json!(1));
+    assert_eq!(overview_json["metrics"]["kanban"]["review_queue"], json!(1));
+    assert!(overview_json["spark_14d"].as_array().is_some());
+
+    let agents = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(agents.status(), StatusCode::OK);
+    assert_eq!(agents.headers().get("cache-control").unwrap(), "max-age=10");
+    let agents_body = axum::body::to_bytes(agents.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let agents_json: serde_json::Value = serde_json::from_slice(&agents_body).unwrap();
+    assert_eq!(
+        agents_json["agents"][0]["current_task"]["dispatch_id"],
+        json!("dispatch-current")
+    );
+    assert_eq!(
+        agents_json["agents"][0]["skills_7d"][0]["id"],
+        json!("live-skill")
+    );
+
+    let tokens = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tokens?range=7d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tokens.status(), StatusCode::OK);
+    assert_eq!(tokens.headers().get("cache-control").unwrap(), "max-age=60");
+    let tokens_body = axum::body::to_bytes(tokens.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tokens_json: serde_json::Value = serde_json::from_slice(&tokens_body).unwrap();
+    assert!(tokens_json["summary"]["total_cost"].is_string());
+    assert!(tokens_json["daily"].is_array());
+
+    let kanban = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/kanban")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kanban.status(), StatusCode::OK);
+    assert_eq!(kanban.headers().get("cache-control").unwrap(), "max-age=5");
+    let kanban_body = axum::body::to_bytes(kanban.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let kanban_json: serde_json::Value = serde_json::from_slice(&kanban_body).unwrap();
+    assert_eq!(kanban_json["auto_queue"]["run"]["id"], json!("run-v1"));
+    assert!(kanban_json.get("wip_limit").is_some());
+
+    let ops = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ops/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ops.status(), StatusCode::OK);
+    assert_eq!(ops.headers().get("cache-control").unwrap(), "max-age=5");
+    let ops_body = axum::body::to_bytes(ops.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ops_json: serde_json::Value = serde_json::from_slice(&ops_body).unwrap();
+    assert!(ops_json["bottlenecks"].is_array());
+
+    let activity = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/activity?limit=8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activity.status(), StatusCode::OK);
+    let activity_body = axum::body::to_bytes(activity.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let activity_json: serde_json::Value = serde_json::from_slice(&activity_body).unwrap();
+    let kinds = activity_json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["kind"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(kinds.contains("dispatch"));
+    assert!(kinds.contains("kanban_transition"));
+    assert!(kinds.contains("provider_event"));
+    assert!(activity_json["next_cursor"].is_string() || activity_json["next_cursor"].is_null());
+
+    let achievements = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/achievements")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(achievements.status(), StatusCode::OK);
+    assert_eq!(
+        achievements.headers().get("cache-control").unwrap(),
+        "max-age=300"
+    );
+    let achievements_body = axum::body::to_bytes(achievements.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let achievements_json: serde_json::Value = serde_json::from_slice(&achievements_body).unwrap();
+    assert_eq!(
+        achievements_json["achievements"][0]["rarity"],
+        json!("common")
+    );
+    assert!(achievements_json["achievements"][0]["progress"].is_object());
+    assert_eq!(
+        achievements_json["daily_missions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let settings_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_get.status(), StatusCode::OK);
+    assert_eq!(
+        settings_get.headers().get("cache-control").unwrap(),
+        "no-store"
+    );
+    let settings_get_body = axum::body::to_bytes(settings_get.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let settings_get_json: serde_json::Value = serde_json::from_slice(&settings_get_body).unwrap();
+    assert!(settings_get_json["entries"].as_array().is_some());
+
+    let settings_patch = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/settings/merge_strategy")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"rebase"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settings_patch.status(), StatusCode::OK);
+    let settings_patch_body = axum::body::to_bytes(settings_patch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let settings_patch_json: serde_json::Value =
+        serde_json::from_slice(&settings_patch_body).unwrap();
+    assert_eq!(settings_patch_json["key"], json!("merge_strategy"));
+    assert_eq!(settings_patch_json["value"], json!("rebase"));
+    assert_eq!(settings_patch_json["live_override"]["active"], json!(true));
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn v1_stream_pg_emits_snapshot_and_replays_shared_bus_events() {
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("repo-v1-stream")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, status, xp, avatar_emoji, discord_channel_id, discord_channel_alt
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8
+         )",
+    )
+    .bind("agent-v1-stream")
+    .bind("V1 Stream Agent")
+    .bind("claude")
+    .bind("working")
+    .bind(60_i64)
+    .bind("🤖")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id, github_issue_number, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
+         )",
+    )
+    .bind("card-v1-stream")
+    .bind("repo-v1-stream")
+    .bind("Stream Card")
+    .bind("in_progress")
+    .bind("high")
+    .bind("agent-v1-stream")
+    .bind(792_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-v1-stream")
+    .bind("card-v1-stream")
+    .bind("agent-v1-stream")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("Stream dispatch")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kanban_cards SET latest_dispatch_id = $1 WHERE id = $2")
+        .bind("dispatch-v1-stream")
+        .bind("card-v1-stream")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (
+            session_key, agent_id, provider, status, active_dispatch_id, session_info, tokens,
+            last_heartbeat, thread_channel_id, created_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), $8, NOW()
+         )",
+    )
+    .bind("host:session-v1-stream")
+    .bind("agent-v1-stream")
+    .bind("claude")
+    .bind("working")
+    .bind("dispatch-v1-stream")
+    .bind("v1 stream session")
+    .bind(321_i64)
+    .bind("222000000000002")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_audit_logs (card_id, from_status, to_status, source, result, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())",
+    )
+    .bind("card-v1-stream")
+    .bind("requested")
+    .bind("in_progress")
+    .bind("dispatch")
+    .bind("ok")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let tx = crate::server::ws::new_broadcast();
+    let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
+    let app = axum::Router::new().nest(
+        "/api",
+        api_router_with_pg(
+            db,
+            engine,
+            crate::config::Config::default(),
+            tx.clone(),
+            buf,
+            None,
+            Some(pg_pool.clone()),
+        ),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    );
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+
+    let mut body = response.into_body();
+    let snapshot = read_sse_body_until(
+        &mut body,
+        &[
+            "event: agent.status",
+            "event: token.tick",
+            "event: achievement.unlocked",
+            "event: kanban.transition",
+            "event: ops.health",
+        ],
+    )
+    .await;
+
+    assert!(snapshot.contains("\"agent_id\":\"agent-v1-stream\""));
+    assert!(snapshot.contains("\"delta_tokens\":321"));
+    assert!(snapshot.contains("\"achievement_id\""));
+    assert!(snapshot.contains("\"from\":\"requested\""));
+    assert!(snapshot.contains("\"status\":\"ok\""));
+    drop(body);
+
+    crate::server::ws::emit_event(
+        &tx,
+        "agent.status",
+        json!({
+            "agent_id": "agent-v1-stream",
+            "status": "idle",
+            "task": null,
+        }),
+    );
+    crate::server::ws::emit_event(
+        &tx,
+        "token.tick",
+        json!({
+            "agent_id": "agent-v1-stream",
+            "delta_tokens": 7,
+            "delta_cost_usd": "0.12",
+        }),
+    );
+
+    let replay_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .header("Last-Event-ID", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_response.status(), StatusCode::OK);
+
+    let mut replay_body = replay_response.into_body();
+    let replay = read_sse_body_until(
+        &mut replay_body,
+        &["id: 2", "event: token.tick", "\"delta_tokens\":7"],
+    )
+    .await;
+    assert!(replay.contains("\"delta_cost_usd\":\"0.12\""));
+
+    pg_pool.close().await;
+    pg_db.drop().await;
 }

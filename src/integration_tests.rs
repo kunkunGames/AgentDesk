@@ -34,14 +34,14 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.policies.dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
         config.policies.hot_reload = false;
-        PolicyEngine::new(&config, db.clone()).unwrap()
+        PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
     }
 
     fn test_engine_with_dir(db: &db::Db, dir: &std::path::Path) -> PolicyEngine {
         let mut config = crate::config::Config::default();
         config.policies.dir = dir.to_path_buf();
         config.policies.hot_reload = false;
-        PolicyEngine::new(&config, db.clone()).unwrap()
+        PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
     }
 
     struct WorktreeCommitOverrideGuard;
@@ -1640,8 +1640,15 @@ mod tests {
 
         // review → done (force)
         assert!(
-            kanban::transition_status_with_opts(&db, &engine, "card-s4", "done", "test", true)
-                .is_ok()
+            kanban::transition_status_with_opts(
+                &db,
+                &engine,
+                "card-s4",
+                "done",
+                "test",
+                crate::engine::transition::ForceIntent::OperatorOverride,
+            )
+            .is_ok()
         );
         assert_eq!(get_card_status(&db, "card-s4"), "done");
 
@@ -1715,7 +1722,7 @@ mod tests {
                 "card-retro-e2e",
                 "done",
                 "test",
-                true,
+                crate::engine::transition::ForceIntent::OperatorOverride,
             )
             .is_ok()
         );
@@ -2046,7 +2053,7 @@ mod tests {
             "card-force-enter",
             "backlog",
             "test",
-            true,
+            crate::engine::transition::ForceIntent::OperatorOverride,
         )
         .unwrap();
 
@@ -2084,7 +2091,8 @@ mod tests {
             "card-force-leave",
             "backlog",
             "test",
-            true,
+            crate::engine::transition::ForceIntent::OperatorOverride,
+            crate::kanban::AllowedOnConnMutation::TestOnlyManualInterventionCleanup,
             |conn| {
                 conn.execute(
                     "UPDATE kanban_cards SET blocked_reason = NULL WHERE id = 'card-force-leave'",
@@ -3676,7 +3684,7 @@ mod tests {
             "card-qa",
             "in_progress",
             "qa-fail",
-            true,
+            crate::engine::transition::ForceIntent::OperatorOverride,
         );
         assert!(
             result.is_ok(),
@@ -4093,8 +4101,15 @@ mod tests {
 
         // Force card to done — review state must reset to idle
         assert!(
-            kanban::transition_status_with_opts(&db, &engine, "card-158d", "done", "test", true)
-                .is_ok()
+            kanban::transition_status_with_opts(
+                &db,
+                &engine,
+                "card-158d",
+                "done",
+                "test",
+                crate::engine::transition::ForceIntent::OperatorOverride,
+            )
+            .is_ok()
         );
         assert_eq!(get_card_status(&db, "card-158d"), "done");
 
@@ -10210,7 +10225,7 @@ mod tests {
                 "card-208-guard",
                 "done",
                 "test",
-                true,
+                crate::engine::transition::ForceIntent::OperatorOverride,
             )
             .is_ok()
         );
