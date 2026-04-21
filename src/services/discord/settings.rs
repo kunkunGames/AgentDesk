@@ -140,8 +140,6 @@ const MIN_MEMORY_RECALL_TIMEOUT_MS: u64 = 100;
 const MAX_MEMORY_RECALL_TIMEOUT_MS: u64 = 2_000;
 const MIN_MEMORY_CAPTURE_TIMEOUT_MS: u64 = 500;
 const MAX_MEMORY_CAPTURE_TIMEOUT_MS: u64 = 30_000;
-const DEFAULT_MEM0_PROFILE: &str = "default";
-const KNOWN_MEM0_PROFILES: &[&str] = &["default", "strict"];
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
@@ -152,7 +150,6 @@ pub(crate) struct MemoryConfigOverride {
     pub capture_timeout_ms: Option<u64>,
     pub auto_remember_enabled: Option<bool>,
     pub auto_remember: Option<AutoRememberConfigOverride>,
-    pub mem0: Option<Mem0ConfigOverride>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -177,26 +174,10 @@ pub(crate) struct AutoRememberAgentConfigOverride {
     pub label: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct Mem0ConfigOverride {
-    pub profile: Option<String>,
-    pub ingestion: Option<Mem0IngestionConfigOverride>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct Mem0IngestionConfigOverride {
-    pub infer: Option<bool>,
-    pub custom_instructions: Option<String>,
-    pub confidence_threshold: Option<f64>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MemoryBackendKind {
     #[default]
     File,
-    Mem0,
     Memento,
 }
 
@@ -204,30 +185,7 @@ impl MemoryBackendKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::File => "file",
-            Self::Mem0 => "mem0",
             Self::Memento => "memento",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Mem0IngestionSettings {
-    pub infer: Option<bool>,
-    pub custom_instructions: Option<String>,
-    pub confidence_threshold: Option<f64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Mem0ResolvedSettings {
-    pub profile: String,
-    pub ingestion: Mem0IngestionSettings,
-}
-
-impl Default for Mem0ResolvedSettings {
-    fn default() -> Self {
-        Self {
-            profile: DEFAULT_MEM0_PROFILE.to_string(),
-            ingestion: Mem0IngestionSettings::default(),
         }
     }
 }
@@ -277,7 +235,6 @@ pub(crate) struct ResolvedMemorySettings {
     pub capture_timeout_ms: u64,
     pub auto_remember_enabled: bool,
     pub auto_remember: ResolvedAutoRememberSettings,
-    pub mem0: Mem0ResolvedSettings,
 }
 
 impl Default for ResolvedMemorySettings {
@@ -289,7 +246,6 @@ impl Default for ResolvedMemorySettings {
             capture_timeout_ms: DEFAULT_MEMORY_CAPTURE_TIMEOUT_MS,
             auto_remember_enabled: false,
             auto_remember: ResolvedAutoRememberSettings::default(),
-            mem0: Mem0ResolvedSettings::default(),
         }
     }
 }
@@ -452,7 +408,6 @@ mod tests {
     use poise::serenity_prelude::ChannelId;
     use tempfile::TempDir;
 
-    use crate::services::agent_protocol::DEFAULT_ALLOWED_TOOLS;
     use crate::services::provider::ProviderKind;
 
     use super::{
@@ -564,17 +519,13 @@ mod tests {
                 "server:\n  port: 8791\nmemory:\n  backend: auto\n",
             );
 
-            with_env_vars(&[("MEM0_API_KEY", None), ("MEM0_BASE_URL", None)], || {
+            with_env_vars(&[("MEMENTO_TEST_KEY", None)], || {
                 let resolved = resolve_memory_settings(None, None);
                 assert_eq!(resolved.backend, super::MemoryBackendKind::File);
                 assert_eq!(resolved.recall_timeout_ms, 500);
                 assert_eq!(resolved.capture_timeout_ms, 5_000);
                 assert!(!resolved.auto_remember_enabled);
                 assert!(!resolved.query_recall_after_bootstrap);
-                assert_eq!(resolved.mem0.profile, "default");
-                assert!(resolved.mem0.ingestion.infer.is_none());
-                assert!(resolved.mem0.ingestion.custom_instructions.is_none());
-                assert!(resolved.mem0.ingestion.confidence_threshold.is_none());
             });
         });
     }
@@ -740,67 +691,38 @@ mod tests {
                 temp_home,
                 serde_json::json!({
                     "version": 2,
-                    "backend": "file"
+                    "backend": "memento",
+                    "mcp": {
+                        "endpoint": "http://127.0.0.1:8765",
+                        "access_key_env": "MEMENTO_TEST_KEY"
+                    }
                 }),
             );
 
             let agent = super::MemoryConfigOverride {
-                backend: Some("mem0".to_string()),
-                query_recall_after_bootstrap: None,
+                backend: Some("memento".to_string()),
                 recall_timeout_ms: Some(50),
                 capture_timeout_ms: Some(60_000),
-                auto_remember_enabled: None,
-                auto_remember: None,
-                mem0: Some(super::Mem0ConfigOverride {
-                    profile: Some("strict".to_string()),
-                    ingestion: Some(super::Mem0IngestionConfigOverride {
-                        infer: Some(true),
-                        custom_instructions: Some("Prefer durable facts".to_string()),
-                        confidence_threshold: Some(0.75),
-                    }),
-                }),
+                ..Default::default()
             };
             let channel = super::MemoryConfigOverride {
-                backend: Some("mem0".to_string()),
-                query_recall_after_bootstrap: None,
+                backend: Some("memento".to_string()),
                 recall_timeout_ms: Some(5_000),
                 capture_timeout_ms: Some(100),
-                auto_remember_enabled: None,
-                auto_remember: None,
-                mem0: Some(super::Mem0ConfigOverride {
-                    profile: Some("unknown-profile".to_string()),
-                    ingestion: Some(super::Mem0IngestionConfigOverride {
-                        infer: None,
-                        custom_instructions: Some("Channel override".to_string()),
-                        confidence_threshold: Some(2.0),
-                    }),
-                }),
+                ..Default::default()
             };
 
-            with_env_vars(
-                &[
-                    ("MEM0_API_KEY", Some("mem0-key")),
-                    ("MEM0_BASE_URL", Some("http://mem0.local")),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(Some(&agent), Some(&channel));
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::Mem0);
-                    assert_eq!(resolved.recall_timeout_ms, 2_000);
-                    assert_eq!(resolved.capture_timeout_ms, 500);
-                    assert_eq!(resolved.mem0.profile, "default");
-                    assert_eq!(
-                        resolved.mem0.ingestion.custom_instructions.as_deref(),
-                        Some("Channel override")
-                    );
-                    assert_eq!(resolved.mem0.ingestion.infer, Some(true));
-                    assert_eq!(resolved.mem0.ingestion.confidence_threshold, None);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", Some("memento-key"))], || {
+                let resolved = resolve_memory_settings(Some(&agent), Some(&channel));
+                assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
+                assert_eq!(resolved.recall_timeout_ms, 2_000);
+                assert_eq!(resolved.capture_timeout_ms, 500);
+            });
         });
     }
 
     #[test]
-    fn test_resolve_memory_settings_auto_detects_memento_then_mem0_then_file() {
+    fn test_resolve_memory_settings_auto_detects_memento_then_file() {
         crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
             write_agentdesk_yaml(
@@ -815,41 +737,15 @@ memory:
 "#,
             );
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", Some("memento-key")),
-                    ("MEM0_API_KEY", Some("mem0-key")),
-                    ("MEM0_BASE_URL", Some("http://mem0.local")),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(None, None);
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", Some("memento-key"))], || {
+                let resolved = resolve_memory_settings(None, None);
+                assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
+            });
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", None),
-                    ("MEM0_API_KEY", Some("mem0-key")),
-                    ("MEM0_BASE_URL", Some("http://mem0.local")),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(None, None);
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::Mem0);
-                },
-            );
-
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", None),
-                    ("MEM0_API_KEY", None),
-                    ("MEM0_BASE_URL", None),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(None, None);
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::File);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", None)], || {
+                let resolved = resolve_memory_settings(None, None);
+                assert_eq!(resolved.backend, super::MemoryBackendKind::File);
+            });
         });
     }
 
@@ -869,41 +765,25 @@ memory:
 "#,
             );
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", Some("memento-key")),
-                    ("MEM0_API_KEY", Some("mem0-key")),
-                    ("MEM0_BASE_URL", Some("http://mem0.local")),
-                ],
-                || {
-                    let file = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("file".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(file.backend, super::MemoryBackendKind::File);
+            with_env_vars(&[("MEMENTO_TEST_KEY", Some("memento-key"))], || {
+                let file = resolve_memory_settings(
+                    Some(&super::MemoryConfigOverride {
+                        backend: Some("file".to_string()),
+                        ..Default::default()
+                    }),
+                    None,
+                );
+                assert_eq!(file.backend, super::MemoryBackendKind::File);
 
-                    let mem0 = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("mem0".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(mem0.backend, super::MemoryBackendKind::Mem0);
-
-                    let memento = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("memento".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(memento.backend, super::MemoryBackendKind::Memento);
-                },
-            );
+                let memento = resolve_memory_settings(
+                    Some(&super::MemoryConfigOverride {
+                        backend: Some("memento".to_string()),
+                        ..Default::default()
+                    }),
+                    None,
+                );
+                assert_eq!(memento.backend, super::MemoryBackendKind::Memento);
+            });
         });
     }
 
@@ -923,23 +803,16 @@ memory:
 "#,
             );
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", Some("memento-key")),
-                    ("MEM0_API_KEY", Some("mem0-key")),
-                    ("MEM0_BASE_URL", Some("http://mem0.local")),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("local".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::File);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", Some("memento-key"))], || {
+                let resolved = resolve_memory_settings(
+                    Some(&super::MemoryConfigOverride {
+                        backend: Some("local".to_string()),
+                        ..Default::default()
+                    }),
+                    None,
+                );
+                assert_eq!(resolved.backend, super::MemoryBackendKind::File);
+            });
         });
     }
 
@@ -959,32 +832,16 @@ memory:
 "#,
             );
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", None),
-                    ("MEM0_API_KEY", None),
-                    ("MEM0_BASE_URL", None),
-                ],
-                || {
-                    let mem0 = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("mem0".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(mem0.backend, super::MemoryBackendKind::File);
-
-                    let memento = resolve_memory_settings(
-                        Some(&super::MemoryConfigOverride {
-                            backend: Some("memento".to_string()),
-                            ..Default::default()
-                        }),
-                        None,
-                    );
-                    assert_eq!(memento.backend, super::MemoryBackendKind::File);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", None)], || {
+                let memento = resolve_memory_settings(
+                    Some(&super::MemoryConfigOverride {
+                        backend: Some("memento".to_string()),
+                        ..Default::default()
+                    }),
+                    None,
+                );
+                assert_eq!(memento.backend, super::MemoryBackendKind::File);
+            });
         });
     }
 
@@ -993,12 +850,7 @@ memory:
         crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|_temp_home: &TempDir| {
             with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", None),
-                    ("MEMENTO_WORKSPACE", None),
-                    ("MEM0_API_KEY", None),
-                    ("MEM0_BASE_URL", None),
-                ],
+                &[("MEMENTO_TEST_KEY", None), ("MEMENTO_WORKSPACE", None)],
                 || {
                     let resolved = resolve_memory_settings(
                         Some(&super::MemoryConfigOverride {
@@ -1030,8 +882,6 @@ memory:
                     assert!(prompt.contains("`memory-write` skill"));
                     assert!(!prompt.contains("`recall` MCP tool"));
                     assert!(!prompt.contains("`remember` MCP tool"));
-                    assert!(!prompt.contains("`search_memory` MCP tool"));
-                    assert!(!prompt.contains("`add_memories` MCP tool"));
                 },
             );
         });
@@ -1053,17 +903,10 @@ memory:
                 }),
             );
 
-            with_env_vars(
-                &[
-                    ("MEMENTO_TEST_KEY", Some("memento-key")),
-                    ("MEM0_API_KEY", None),
-                    ("MEM0_BASE_URL", None),
-                ],
-                || {
-                    let resolved = resolve_memory_settings(None, None);
-                    assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
-                },
-            );
+            with_env_vars(&[("MEMENTO_TEST_KEY", Some("memento-key"))], || {
+                let resolved = resolve_memory_settings(None, None);
+                assert_eq!(resolved.backend, super::MemoryBackendKind::Memento);
+            });
         });
     }
 
