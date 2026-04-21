@@ -1288,7 +1288,6 @@ fn is_technical_decision(unit: &str) -> bool {
         "backend",
         "sqlite",
         "memento",
-        "mem0",
         "agentdesk",
         "구조",
         "아키텍처",
@@ -2600,7 +2599,7 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
 
         let settings = ResolvedMemorySettings {
-            backend: MemoryBackendKind::Mem0,
+            backend: MemoryBackendKind::File,
             auto_remember_enabled: true,
             ..ResolvedMemorySettings::default()
         };

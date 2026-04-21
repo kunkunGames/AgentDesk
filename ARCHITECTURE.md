@@ -13,7 +13,7 @@ High-signal navigation guide for contributors. The generated inventories under `
 
 ## Memory Flow
 
-- `src/services/memory/mod.rs` defines the shared recall contract across `file`, `mem0`, and `memento` backends.
+- `src/services/memory/mod.rs` defines the shared recall contract across `file` and `memento` backends.
 - `src/services/memory/memento.rs` intentionally splits Memento recall into two modes:
   - bootstrap mode calls `context(structured=true)` to load stable session context
   - query mode calls `recall(text=user_text, contextText=user_text, sessionId, excludeSeen=true)` for task-conditioned memory
@@ -270,7 +270,6 @@ src/
 │   │   ├── auto_remember_quality.rs
 │   │   ├── auto_remember_store.rs
 │   │   ├── local.rs
-│   │   ├── mem0.rs
 │   │   ├── memento.rs
 │   │   ├── mod.rs
 │   │   └── runtime_state.rs
