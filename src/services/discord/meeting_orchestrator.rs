@@ -8,7 +8,9 @@ use serenity::{
     builder::{CreateThread, EditMessage, EditThread},
 };
 
-use crate::services::memory::{RecallRequest, RecallResponse, build_resolved_memory_backend};
+use crate::services::memory::{
+    RecallMode, RecallRequest, RecallResponse, build_resolved_memory_backend,
+};
 use crate::services::provider::ProviderKind;
 use crate::services::provider_exec;
 
@@ -2044,6 +2046,7 @@ async fn participant_memory_recall(
     let backend = build_resolved_memory_backend(&participant.memory);
     let recall = backend
         .recall(RecallRequest {
+            mode: RecallMode::Query,
             provider,
             role_id: participant.role_id.clone(),
             channel_id,

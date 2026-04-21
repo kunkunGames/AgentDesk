@@ -6,8 +6,9 @@ use std::{
 use serde_json::{Map, Value, json};
 
 use super::{
-    CaptureRequest, CaptureResult, LocalMemoryBackend, MemoryBackend, MemoryFuture, RecallRequest,
-    RecallResponse, ReflectRequest, TokenUsage, UNBOUND_MEMORY_ROLE_ID, extract_token_usage,
+    CaptureRequest, CaptureResult, LocalMemoryBackend, MemoryBackend, MemoryFuture, RecallMode,
+    RecallRequest, RecallResponse, ReflectRequest, TokenUsage, UNBOUND_MEMORY_ROLE_ID,
+    extract_token_usage,
 };
 use crate::runtime_layout;
 use crate::services::discord::DispatchProfile;
@@ -18,6 +19,8 @@ const MEMENTO_PROTOCOL_VERSION: &str = "2025-11-25";
 const MAX_WORKING_MEMORY_LINES: usize = 6;
 const MAX_MEMORY_LINES: usize = 6;
 const MAX_SKIP_LINES: usize = 4;
+const QUERY_RECALL_PAGE_SIZE: usize = 8;
+const QUERY_RECALL_TOKEN_BUDGET: usize = 1200;
 
 #[derive(Clone, Debug)]
 struct CachedMcpSession {
@@ -335,6 +338,32 @@ impl MementoBackend {
             .await?;
         Ok(ContextFetchResult {
             external_recall: format_context_payload_for_external_recall(&result.payload),
+            token_usage: result.token_usage,
+        })
+    }
+
+    async fn fetch_query_recall(
+        &self,
+        request: &RecallRequest,
+        config: &MementoRuntimeConfig,
+        workspace: &str,
+    ) -> Result<ContextFetchResult, String> {
+        let agent_id = self.resolve_agent_id(&request.role_id, request.channel_id);
+        let mut args = Map::new();
+        args.insert("agentId".to_string(), json!(agent_id));
+        args.insert("workspace".to_string(), json!(workspace));
+        args.insert("text".to_string(), json!(request.user_text));
+        args.insert("contextText".to_string(), json!(request.user_text));
+        args.insert("sessionId".to_string(), json!(request.session_id));
+        args.insert("excludeSeen".to_string(), json!(true));
+        args.insert("pageSize".to_string(), json!(QUERY_RECALL_PAGE_SIZE));
+        args.insert("tokenBudget".to_string(), json!(QUERY_RECALL_TOKEN_BUDGET));
+
+        let result = self
+            .call_tool(config, "recall", Value::Object(args))
+            .await?;
+        Ok(ContextFetchResult {
+            external_recall: format_recall_payload_for_external_recall(&result.payload),
             token_usage: result.token_usage,
         })
     }
@@ -1036,6 +1065,47 @@ fn format_context_payload_for_external_recall(payload: &Value) -> Option<String>
     }
 }
 
+fn format_recall_payload_for_external_recall(payload: &Value) -> Option<String> {
+    let fragments = payload
+        .get("fragments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            dedup_lines(
+                items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(format_ranked_memory_line),
+                MAX_MEMORY_LINES,
+            )
+        })
+        .unwrap_or_default();
+
+    let suggestion = payload
+        .get("_memento_hint")
+        .and_then(Value::as_object)
+        .and_then(|hint| hint.get("suggestion"))
+        .and_then(Value::as_str)
+        .map(normalize_whitespace)
+        .filter(|value| !value.is_empty());
+
+    if fragments.is_empty() && suggestion.is_none() {
+        return None;
+    }
+
+    let mut sections = vec!["[External Recall]".to_string()];
+    if !fragments.is_empty() {
+        sections.push(format!(
+            "Relevant memories from Memento:\n- {}",
+            fragments.join("\n- ")
+        ));
+    }
+    if let Some(suggestion) = suggestion {
+        sections.push(format!("Memento hint:\n{suggestion}"));
+    }
+
+    Some(sections.join("\n"))
+}
+
 impl MemoryBackend for MementoBackend {
     fn recall<'a>(&'a self, request: RecallRequest) -> MemoryFuture<'a, RecallResponse> {
         Box::pin(async move {
@@ -1055,7 +1125,16 @@ impl MemoryBackend for MementoBackend {
 
             match tokio::time::timeout(
                 Duration::from_millis(self.settings.recall_timeout_ms),
-                self.fetch_context(&request, &config, &workspace),
+                async {
+                    match request.mode {
+                        RecallMode::Bootstrap => {
+                            self.fetch_context(&request, &config, &workspace).await
+                        }
+                        RecallMode::Query => {
+                            self.fetch_query_recall(&request, &config, &workspace).await
+                        }
+                    }
+                },
             )
             .await
             {
@@ -1371,6 +1450,7 @@ mod tests {
 
         let recall = backend
             .recall(RecallRequest {
+                mode: RecallMode::Bootstrap,
                 provider: ProviderKind::Codex,
                 role_id: "project-agentdesk".to_string(),
                 channel_id: 42,
@@ -1416,6 +1496,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memento_recall_calls_query_tool_over_mcp() {
+        let recall_content = serde_json::to_string(&json!({
+            "fragments": [
+                {
+                    "content": "Use deploy script before touching the live runtime tree",
+                    "type": "procedure",
+                    "score": 0.94
+                }
+            ],
+            "_memento_hint": {
+                "suggestion": "Scope query recall to the active session."
+            }
+        }))
+        .unwrap();
+        let initialize_response = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": MEMENTO_PROTOCOL_VERSION
+            }
+        }))
+        .unwrap();
+        let tool_response = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "usage": {
+                    "input_tokens": 41,
+                    "output_tokens": 7
+                },
+                "content": [
+                    {
+                        "type": "text",
+                        "text": recall_content
+                    }
+                ],
+                "isError": false
+            }
+        }))
+        .unwrap();
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("MCP-Session-Id", "session-123")],
+                body: initialize_response,
+            },
+            MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("MCP-Session-Id", "session-123")],
+                body: tool_response,
+            },
+        ])
+        .await;
+        let (_guard, _temp, previous_root, previous_key, previous_workspace) =
+            install_memento_runtime(&base_url, None);
+        let backend = MementoBackend::new(memento_settings());
+
+        let recall = backend
+            .recall(RecallRequest {
+                mode: RecallMode::Query,
+                provider: ProviderKind::Codex,
+                role_id: "project-agentdesk".to_string(),
+                channel_id: 42,
+                session_id: "session-1".to_string(),
+                dispatch_profile: DispatchProfile::Full,
+                user_text: "How should I deploy the service safely?".to_string(),
+            })
+            .await;
+
+        let requests = request_rx.await.unwrap();
+        handle.abort();
+        restore_memento_runtime(previous_root, previous_key, previous_workspace);
+
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("\"name\":\"recall\""));
+        assert!(requests[1].contains("\"workspace\":\"agentdesk-project-agentdesk\""));
+        assert!(requests[1].contains("\"agentId\":\"project-agentdesk\""));
+        assert!(requests[1].contains("\"sessionId\":\"session-1\""));
+        assert!(requests[1].contains("\"excludeSeen\":true"));
+        assert!(requests[1].contains("\"text\":\"How should I deploy the service safely?\""));
+        assert!(
+            requests[1].contains("\"contextText\":\"How should I deploy the service safely?\"")
+        );
+
+        let external_recall = recall.external_recall.unwrap_or_default();
+        assert!(
+            external_recall.contains("Use deploy script before touching the live runtime tree")
+        );
+        assert!(external_recall.contains("Scope query recall to the active session."));
+        assert!(recall.warnings.is_empty());
+        assert_eq!(
+            recall.token_usage,
+            crate::services::memory::TokenUsage {
+                input_tokens: 41,
+                output_tokens: 7,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn test_memento_recall_timeout_warns_and_falls_back_to_local() {
         let (base_url, handle) = spawn_hanging_http_server().await;
         let (_guard, _temp, previous_root, previous_key, previous_workspace) =
@@ -1428,6 +1608,7 @@ mod tests {
 
         let recall = backend
             .recall(RecallRequest {
+                mode: RecallMode::Bootstrap,
                 provider: ProviderKind::Codex,
                 role_id: "project-agentdesk".to_string(),
                 channel_id: 42,
@@ -1455,6 +1636,7 @@ mod tests {
 
         let recall = backend
             .recall(RecallRequest {
+                mode: RecallMode::Bootstrap,
                 provider: ProviderKind::Codex,
                 role_id: "project-agentdesk".to_string(),
                 channel_id: 42,

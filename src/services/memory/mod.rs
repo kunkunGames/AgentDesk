@@ -45,9 +45,17 @@ impl TokenUsage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RecallMode {
+    Bootstrap,
+    #[default]
+    Query,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct RecallRequest {
+    pub mode: RecallMode,
     pub provider: ProviderKind,
     pub role_id: String,
     pub channel_id: u64,

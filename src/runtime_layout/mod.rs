@@ -245,7 +245,7 @@ fn normalize_memory_backend_name(raw: Option<&str>) -> String {
         Some(value) if value.eq_ignore_ascii_case("auto") => "auto".to_string(),
         Some(value) if value.eq_ignore_ascii_case("file") => "file".to_string(),
         Some(value) if value.eq_ignore_ascii_case("local") => "file".to_string(),
-        Some(value) if value.eq_ignore_ascii_case("mem0") => "file".to_string(),
+        Some(value) if value.eq_ignore_ascii_case("mem0") => "mem0".to_string(),
         Some(value) if value.eq_ignore_ascii_case("memento") => "memento".to_string(),
         Some(_) => DEFAULT_MEMORY_BACKEND.to_string(),
     }
@@ -1132,7 +1132,7 @@ memory:
     }
 
     #[test]
-    fn load_memory_backend_treats_legacy_mem0_backend_as_file() {
+    fn load_memory_backend_preserves_explicit_mem0_backend() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let _home_guard = TestHomeGuard::install(&temp.path().join("home"), root);
@@ -1147,7 +1147,7 @@ memory:
 
         let backend = load_memory_backend(root);
 
-        assert_eq!(backend.backend, "file");
+        assert_eq!(backend.backend, "mem0");
     }
 
     #[test]
