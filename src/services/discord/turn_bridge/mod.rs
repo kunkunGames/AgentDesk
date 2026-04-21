@@ -17,10 +17,9 @@ use super::restart_report::{RestartCompletionReport, clear_restart_report, save_
 use super::*;
 use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
 use crate::db::turns::{PersistTurnOwned, TurnTokenUsage, upsert_turn_owned_on_separate_conn};
-use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
 use crate::services::memory::{
-    AutoRememberTurnRequest, CaptureRequest, ReflectRequest, SessionEndReason, TokenUsage,
-    resolve_memory_role_id, resolve_memory_session_id,
+    CaptureRequest, ReflectRequest, SessionEndReason, TokenUsage, resolve_memory_role_id,
+    resolve_memory_session_id,
 };
 use crate::services::provider::cancel_requested;
 
@@ -135,44 +134,18 @@ fn response_portion_after_offset(full_response: &str, response_sent_offset: usiz
     full_response.get(response_sent_offset..).unwrap_or("")
 }
 
-fn should_spawn_auto_remember(
-    transcript_persisted: bool,
-    memory_settings: &ResolvedMemorySettings,
-    dispatch_profile: DispatchProfile,
-    memento_backend_active: bool,
-) -> bool {
-    transcript_persisted
-        && memory_settings.auto_remember_enabled
-        && memory_settings.backend == MemoryBackendKind::Memento
-        && memento_backend_active
-        && dispatch_profile == DispatchProfile::Full
-}
-
 fn build_background_memory_jobs(
     provider: &ProviderKind,
     channel_id: ChannelId,
-    turn_id: &str,
     memory_role_id: &str,
     session_id_to_persist: Option<&str>,
     dispatch_id: Option<&str>,
     user_text: &str,
     assistant_text: &str,
-    transcript_events: &[SessionTranscriptEvent],
     should_spawn_memory_capture: bool,
-    should_spawn_auto_remember: bool,
     reflect_request: Option<ReflectRequest>,
 ) -> Vec<TurnEndMemoryJob> {
     let mut jobs = Vec::new();
-    if should_spawn_auto_remember {
-        jobs.push(TurnEndMemoryJob::AutoRemember(AutoRememberTurnRequest {
-            turn_id: turn_id.to_string(),
-            role_id: memory_role_id.to_string(),
-            channel_id: channel_id.get(),
-            user_text: user_text.to_string(),
-            assistant_text: assistant_text.to_string(),
-            transcript_events: transcript_events.to_vec(),
-        }));
-    }
     if should_spawn_memory_capture {
         jobs.push(TurnEndMemoryJob::Capture(CaptureRequest {
             provider: provider.clone(),
@@ -372,7 +345,6 @@ pub(super) fn spawn_turn_bridge(
         let adk_session_info = bridge.adk_session_info.clone();
         let adk_cwd = bridge.adk_cwd.clone();
         let dispatch_id = bridge.dispatch_id.clone();
-        let dispatch_profile = bridge.dispatch_profile;
         let bridge_span = tracing::info_span!(
             "discord_turn_bridge",
             channel_id = channel_id.get(),
@@ -1719,7 +1691,6 @@ pub(super) fn spawn_turn_bridge(
             output_tokens: accumulated_output_tokens,
         };
 
-        let mut transcript_persisted = false;
         if should_persist_transcript && let Some(db) = shared_owned.db.as_ref() {
             let channel_id_text = channel_id.get().to_string();
             match crate::db::session_transcripts::persist_turn_db(
@@ -1742,9 +1713,7 @@ pub(super) fn spawn_turn_bridge(
             )
             .await
             {
-                Ok(persisted) => {
-                    transcript_persisted = persisted;
-                }
+                Ok(_) => {}
                 Err(e) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!("  [{ts}] ⚠ failed to persist session transcript: {e}");
@@ -1864,25 +1833,15 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        let should_spawn_auto_remember = should_spawn_auto_remember(
-            transcript_persisted,
-            &capture_memory_settings,
-            dispatch_profile,
-            crate::services::memory::backend_is_active(MemoryBackendKind::Memento),
-        );
-
         let background_memory_jobs = build_background_memory_jobs(
             &provider,
             channel_id,
-            &turn_id,
             &memory_role_id,
             session_id_to_persist.as_deref(),
             dispatch_id.as_deref(),
             &user_text_owned,
             &full_response,
-            &transcript_events,
             should_spawn_memory_capture,
-            should_spawn_auto_remember,
             reflect_request,
         );
 

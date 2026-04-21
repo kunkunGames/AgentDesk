@@ -54,7 +54,7 @@ Targeted regression checks used for this phase:
 - `recall_mode_defaults_to_bootstrap_until_query_recall_is_enabled_for_memento`
 - `recall_mode_bootstraps_only_on_first_memento_turn_when_query_recall_enabled`
 - `test_resolve_memory_settings_query_recall_uses_runtime_default_and_override`
-- `test_resolve_memory_settings_keeps_query_recall_when_auto_remember_defaults_false`
+- `test_resolve_memory_settings_keeps_query_recall_defaults`
 
 Operational rollout evaluated for this phase used these enabled settings:
 

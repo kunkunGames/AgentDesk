@@ -1,6 +1,3 @@
-mod auto_remember;
-mod auto_remember_quality;
-mod auto_remember_store;
 mod local;
 mod memento;
 mod runtime_state;
@@ -14,21 +11,10 @@ use crate::services::discord::DispatchProfile;
 use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings, RoleBinding};
 use crate::services::provider::ProviderKind;
 
-pub(crate) use auto_remember::{
-    AutoRememberExecutionResult, AutoRememberTurnRequest, reject_auto_remember_candidate,
-    requeue_auto_remember_candidate, resubmit_auto_remember_candidate, run_auto_remember,
-    verify_auto_remember_candidate,
-};
-#[cfg(test)]
-pub(crate) use auto_remember_store::AutoRememberAuditEntry;
-pub(crate) use auto_remember_store::{
-    AutoRememberAuditDetail, AutoRememberAuditFilter, AutoRememberMemoryStatus, AutoRememberStage,
-    AutoRememberStore,
-};
 pub(crate) use local::LocalMemoryBackend;
 pub(crate) use memento::{
-    MementoBackend, MementoFragmentSummary, MementoRememberRequest, MementoToolFeedbackRequest,
-    resolve_memento_agent_id, resolve_memento_workspace, sanitize_memento_workspace_segment,
+    MementoBackend, MementoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agent_id,
+    resolve_memento_workspace, sanitize_memento_workspace_segment,
 };
 pub(crate) use runtime_state::{backend_is_active, backend_state, refresh_backend_health};
 #[cfg(test)]

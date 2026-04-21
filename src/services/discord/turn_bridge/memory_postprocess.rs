@@ -2,15 +2,13 @@ use poise::serenity_prelude::ChannelId;
 
 use crate::services::discord::settings;
 use crate::services::memory::{
-    AutoRememberExecutionResult, AutoRememberTurnRequest, CaptureRequest, ReflectRequest,
-    TokenUsage, build_resolved_memory_backend, run_auto_remember,
+    CaptureRequest, ReflectRequest, TokenUsage, build_resolved_memory_backend,
 };
 
 #[derive(Debug)]
 pub(super) enum TurnEndMemoryJob {
     Capture(CaptureRequest),
     Reflect(ReflectRequest),
-    AutoRemember(AutoRememberTurnRequest),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,21 +56,6 @@ pub(super) fn spawn_memory_postprocess_task(
                     result
                         .token_usage
                         .saturating_add_assign(reflect_result.token_usage);
-                }
-                TurnEndMemoryJob::AutoRemember(auto_request) => {
-                    let auto_result: AutoRememberExecutionResult =
-                        run_auto_remember(&memory_settings, auto_request).await;
-                    for warning in &auto_result.warnings {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
-                            "  [{ts}] [memory] auto-remember warning for channel {}: {}",
-                            channel_id.get(),
-                            warning
-                        );
-                    }
-                    result
-                        .token_usage
-                        .saturating_add_assign(auto_result.token_usage);
                 }
             }
         }

@@ -54,8 +54,6 @@ pub struct MemoryBackendConfig {
     pub file: FileMemoryBackendConfig,
     #[serde(default)]
     pub mcp: McpMemoryBackendConfig,
-    #[serde(default)]
-    pub auto_remember: AutoRememberConfig,
     #[serde(default, rename = "sak_path", skip_serializing)]
     legacy_sak_path: Option<String>,
     #[serde(default, rename = "sam_path", skip_serializing)]
@@ -72,7 +70,6 @@ impl Default for MemoryBackendConfig {
             query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
             file: FileMemoryBackendConfig::default(),
             mcp: McpMemoryBackendConfig::default(),
-            auto_remember: AutoRememberConfig::default(),
             legacy_sak_path: None,
             legacy_sam_path: None,
             legacy_ltm_root: None,
@@ -209,57 +206,6 @@ fn normalize_file_memory_path(
 pub struct McpMemoryBackendConfig {
     pub endpoint: String,
     pub access_key_env: String,
-}
-
-fn default_auto_remember_improver_mode() -> String {
-    "local_llm".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoRememberConfig {
-    /// Keeps auto-remember opt-in. Audit/dedupe state defaults to the runtime-root-local
-    /// SQLite sidecar at `data/memory-auto-remember.sqlite`. Set `sidecar_path` to
-    /// pin the store to a stable location across runtime-root moves; when set, AgentDesk
-    /// migrates the legacy runtime-local sidecar on first use.
-    pub enabled: bool,
-    pub sidecar_path: Option<String>,
-    pub improver: AutoRememberImproverConfig,
-}
-
-impl Default for AutoRememberConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sidecar_path: None,
-            improver: AutoRememberImproverConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoRememberImproverConfig {
-    #[serde(default = "default_auto_remember_improver_mode")]
-    pub mode: String,
-    pub agent: AutoRememberAgentConfig,
-}
-
-impl Default for AutoRememberImproverConfig {
-    fn default() -> Self {
-        Self {
-            mode: default_auto_remember_improver_mode(),
-            agent: AutoRememberAgentConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoRememberAgentConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -486,18 +432,6 @@ fn memory_backend_from_config(config: crate::config::MemoryConfig) -> MemoryBack
         mcp: McpMemoryBackendConfig {
             endpoint: config.mcp.endpoint,
             access_key_env: config.mcp.access_key_env,
-        },
-        auto_remember: AutoRememberConfig {
-            enabled: config.auto_remember.enabled,
-            sidecar_path: config.auto_remember.sidecar_path,
-            improver: AutoRememberImproverConfig {
-                mode: config.auto_remember.improver.mode,
-                agent: AutoRememberAgentConfig {
-                    provider: config.auto_remember.improver.agent.provider,
-                    model: config.auto_remember.improver.agent.model,
-                    label: config.auto_remember.improver.agent.label,
-                },
-            },
         },
         legacy_sak_path: None,
         legacy_sam_path: None,

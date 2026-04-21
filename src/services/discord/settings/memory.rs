@@ -24,31 +24,6 @@ fn configured_memory_backend_name() -> Option<String> {
     runtime_memory_backend_config().map(|config| config.backend)
 }
 
-fn configured_auto_remember_enabled() -> bool {
-    runtime_memory_backend_config()
-        .map(|config| config.auto_remember.enabled)
-        .unwrap_or(false)
-}
-
-fn configured_auto_remember_improver_mode() -> String {
-    runtime_memory_backend_config()
-        .map(|config| config.auto_remember.improver.mode)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "local_llm".to_string())
-}
-
-fn configured_auto_remember_agent_provider() -> Option<String> {
-    runtime_memory_backend_config().and_then(|config| config.auto_remember.improver.agent.provider)
-}
-
-fn configured_auto_remember_agent_model() -> Option<String> {
-    runtime_memory_backend_config().and_then(|config| config.auto_remember.improver.agent.model)
-}
-
-fn configured_auto_remember_agent_label() -> Option<String> {
-    runtime_memory_backend_config().and_then(|config| config.auto_remember.improver.agent.label)
-}
-
 fn configured_query_recall_after_bootstrap() -> bool {
     runtime_memory_backend_config()
         .map(|config| config.query_recall_after_bootstrap)
@@ -103,25 +78,6 @@ fn resolve_explicit_memory_backend(kind: MemoryBackendKind) -> MemoryBackendKind
     MemoryBackendKind::File
 }
 
-fn merge_auto_remember_config(
-    base: Option<&AutoRememberConfigOverride>,
-    override_cfg: Option<&AutoRememberConfigOverride>,
-    base_legacy_enabled: Option<bool>,
-    override_legacy_enabled: Option<bool>,
-) -> AutoRememberConfigOverride {
-    AutoRememberConfigOverride {
-        enabled: override_cfg
-            .and_then(|cfg| cfg.enabled)
-            .or(override_legacy_enabled)
-            .or_else(|| base.and_then(|cfg| cfg.enabled))
-            .or(base_legacy_enabled),
-        // P0 keeps the improver contract on runtime/env config only. Binding-level
-        // memory overrides may disable auto-remember, but they do not introduce a
-        // separate provider/model/mode surface.
-        improver: None,
-    }
-}
-
 fn merge_memory_config(
     base: Option<&MemoryConfigOverride>,
     override_cfg: Option<&MemoryConfigOverride>,
@@ -139,15 +95,6 @@ fn merge_memory_config(
         capture_timeout_ms: override_cfg
             .and_then(|cfg| cfg.capture_timeout_ms)
             .or_else(|| base.and_then(|cfg| cfg.capture_timeout_ms)),
-        auto_remember_enabled: override_cfg
-            .and_then(|cfg| cfg.auto_remember_enabled)
-            .or_else(|| base.and_then(|cfg| cfg.auto_remember_enabled)),
-        auto_remember: Some(merge_auto_remember_config(
-            base.and_then(|cfg| cfg.auto_remember.as_ref()),
-            override_cfg.and_then(|cfg| cfg.auto_remember.as_ref()),
-            base.and_then(|cfg| cfg.auto_remember_enabled),
-            override_cfg.and_then(|cfg| cfg.auto_remember_enabled),
-        )),
     }
 }
 
@@ -156,11 +103,6 @@ pub(crate) fn resolve_memory_settings(
     override_cfg: Option<&MemoryConfigOverride>,
 ) -> ResolvedMemorySettings {
     let merged = merge_memory_config(base, override_cfg);
-    let auto_remember_override = merged.auto_remember.as_ref();
-    let auto_remember_enabled = auto_remember_override
-        .and_then(|cfg| cfg.enabled)
-        .or(merged.auto_remember_enabled)
-        .unwrap_or_else(configured_auto_remember_enabled);
     ResolvedMemorySettings {
         backend: resolve_memory_backend(merged.backend.as_deref()),
         query_recall_after_bootstrap: merged
@@ -184,18 +126,6 @@ pub(crate) fn resolve_memory_settings(
             MAX_MEMORY_CAPTURE_TIMEOUT_MS,
             DEFAULT_MEMORY_CAPTURE_TIMEOUT_MS,
         ),
-        auto_remember_enabled,
-        auto_remember: ResolvedAutoRememberSettings {
-            enabled: auto_remember_enabled,
-            improver: ResolvedAutoRememberImproverSettings {
-                mode: configured_auto_remember_improver_mode(),
-                agent: ResolvedAutoRememberAgentSettings {
-                    provider: configured_auto_remember_agent_provider(),
-                    model: configured_auto_remember_agent_model(),
-                    label: configured_auto_remember_agent_label(),
-                },
-            },
-        },
     }
 }
 

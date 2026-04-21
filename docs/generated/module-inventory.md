@@ -44,7 +44,6 @@
 | `bootstrap` | `src/bootstrap.rs` | 57 |  |
 | `cli` | `src/cli/mod.rs` | 19 |  |
 | `cli::args` | `src/cli/args.rs` | 929 |  |
-| `cli::auto_remember` | `src/cli/auto_remember.rs` | 277 |  |
 | `cli::client` | `src/cli/client.rs` | 1498 | giant-file |
 | `cli::dcserver` | `src/cli/dcserver.rs` | 1480 | giant-file |
 | `cli::direct` | `src/cli/direct.rs` | 1465 | giant-file |
@@ -271,9 +270,6 @@
 | `services::kanban` | `src/services/kanban.rs` | 145 |  |
 | `services::mcp_config` | `src/services/mcp_config.rs` | 632 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 363 |  |
-| `services::memory::auto_remember` | `src/services/memory/auto_remember.rs` | 2638 | giant-file |
-| `services::memory::auto_remember_quality` | `src/services/memory/auto_remember_quality.rs` | 595 |  |
-| `services::memory::auto_remember_store` | `src/services/memory/auto_remember_store.rs` | 1450 | giant-file |
 | `services::memory::local` | `src/services/memory/local.rs` | 119 |  |
 | `services::memory::memento` | `src/services/memory/memento.rs` | 2641 | giant-file |
 | `services::memory::runtime_state` | `src/services/memory/runtime_state.rs` | 434 |  |

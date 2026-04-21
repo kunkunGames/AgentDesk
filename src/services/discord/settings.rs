@@ -148,30 +148,6 @@ pub(crate) struct MemoryConfigOverride {
     pub query_recall_after_bootstrap: Option<bool>,
     pub recall_timeout_ms: Option<u64>,
     pub capture_timeout_ms: Option<u64>,
-    pub auto_remember_enabled: Option<bool>,
-    pub auto_remember: Option<AutoRememberConfigOverride>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct AutoRememberConfigOverride {
-    pub enabled: Option<bool>,
-    pub improver: Option<AutoRememberImproverConfigOverride>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct AutoRememberImproverConfigOverride {
-    pub mode: Option<String>,
-    pub agent: Option<AutoRememberAgentConfigOverride>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct AutoRememberAgentConfigOverride {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -190,51 +166,12 @@ impl MemoryBackendKind {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResolvedAutoRememberAgentSettings {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub label: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedAutoRememberImproverSettings {
-    pub mode: String,
-    pub agent: ResolvedAutoRememberAgentSettings,
-}
-
-impl Default for ResolvedAutoRememberImproverSettings {
-    fn default() -> Self {
-        Self {
-            mode: "local_llm".to_string(),
-            agent: ResolvedAutoRememberAgentSettings::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedAutoRememberSettings {
-    pub enabled: bool,
-    pub improver: ResolvedAutoRememberImproverSettings,
-}
-
-impl Default for ResolvedAutoRememberSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            improver: ResolvedAutoRememberImproverSettings::default(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResolvedMemorySettings {
     pub backend: MemoryBackendKind,
     pub query_recall_after_bootstrap: bool,
     pub recall_timeout_ms: u64,
     pub capture_timeout_ms: u64,
-    pub auto_remember_enabled: bool,
-    pub auto_remember: ResolvedAutoRememberSettings,
 }
 
 impl Default for ResolvedMemorySettings {
@@ -244,8 +181,6 @@ impl Default for ResolvedMemorySettings {
             query_recall_after_bootstrap: false,
             recall_timeout_ms: DEFAULT_MEMORY_RECALL_TIMEOUT_MS,
             capture_timeout_ms: DEFAULT_MEMORY_CAPTURE_TIMEOUT_MS,
-            auto_remember_enabled: false,
-            auto_remember: ResolvedAutoRememberSettings::default(),
         }
     }
 }
@@ -524,112 +459,8 @@ mod tests {
                 assert_eq!(resolved.backend, super::MemoryBackendKind::File);
                 assert_eq!(resolved.recall_timeout_ms, 500);
                 assert_eq!(resolved.capture_timeout_ms, 5_000);
-                assert!(!resolved.auto_remember_enabled);
                 assert!(!resolved.query_recall_after_bootstrap);
             });
-        });
-    }
-
-    #[test]
-    fn test_resolve_memory_settings_auto_remember_uses_runtime_default_and_override() {
-        crate::services::memory::reset_backend_health_for_tests();
-        with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
-                temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "file",
-                    "auto_remember": {
-                        "enabled": true
-                    }
-                }),
-            );
-
-            let runtime_default = resolve_memory_settings(None, None);
-            assert!(runtime_default.auto_remember_enabled);
-            assert_eq!(
-                runtime_default.auto_remember.enabled,
-                runtime_default.auto_remember_enabled
-            );
-
-            let channel_override = super::MemoryConfigOverride {
-                auto_remember_enabled: Some(false),
-                ..Default::default()
-            };
-            let resolved = resolve_memory_settings(None, Some(&channel_override));
-            assert!(!resolved.auto_remember_enabled);
-            assert!(!resolved.auto_remember.enabled);
-        });
-    }
-
-    #[test]
-    fn test_resolve_memory_settings_keeps_runtime_auto_remember_improver_config() {
-        crate::services::memory::reset_backend_health_for_tests();
-        with_temp_home(|temp_home: &TempDir| {
-            write_memory_backend_config(
-                temp_home,
-                serde_json::json!({
-                    "version": 2,
-                    "backend": "memento",
-                    "auto_remember": {
-                        "enabled": true,
-                        "improver": {
-                            "mode": "local_llm",
-                            "agent": {
-                                "provider": "codex",
-                                "model": "gpt-5.4",
-                                "label": "codex-default"
-                            }
-                        }
-                    }
-                }),
-            );
-
-            let base_override = super::MemoryConfigOverride {
-                auto_remember: Some(super::AutoRememberConfigOverride {
-                    enabled: Some(true),
-                    improver: Some(super::AutoRememberImproverConfigOverride {
-                        mode: Some("agent".to_string()),
-                        agent: Some(super::AutoRememberAgentConfigOverride {
-                            provider: Some("gemini".to_string()),
-                            model: Some("gemini-2.5-pro".to_string()),
-                            label: Some("gemini-ops".to_string()),
-                        }),
-                    }),
-                }),
-                ..Default::default()
-            };
-            let channel_override = super::MemoryConfigOverride {
-                auto_remember: Some(super::AutoRememberConfigOverride {
-                    enabled: Some(false),
-                    improver: Some(super::AutoRememberImproverConfigOverride {
-                        mode: Some("both".to_string()),
-                        agent: Some(super::AutoRememberAgentConfigOverride {
-                            provider: None,
-                            model: Some("gpt-5.4-mini".to_string()),
-                            label: Some("channel-override".to_string()),
-                        }),
-                    }),
-                }),
-                ..Default::default()
-            };
-
-            let resolved = resolve_memory_settings(Some(&base_override), Some(&channel_override));
-            assert!(!resolved.auto_remember_enabled);
-            assert!(!resolved.auto_remember.enabled);
-            assert_eq!(resolved.auto_remember.improver.mode, "local_llm");
-            assert_eq!(
-                resolved.auto_remember.improver.agent.provider.as_deref(),
-                Some("codex")
-            );
-            assert_eq!(
-                resolved.auto_remember.improver.agent.model.as_deref(),
-                Some("gpt-5.4")
-            );
-            assert_eq!(
-                resolved.auto_remember.improver.agent.label.as_deref(),
-                Some("codex-default")
-            );
         });
     }
 
@@ -659,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_memory_settings_keeps_query_recall_when_auto_remember_defaults_false() {
+    fn test_resolve_memory_settings_keeps_query_recall_defaults() {
         crate::services::memory::reset_backend_health_for_tests();
         with_temp_home(|temp_home: &TempDir| {
             write_memory_backend_config(
@@ -674,11 +505,7 @@ mod tests {
             let resolved = resolve_memory_settings(None, None);
             assert!(
                 resolved.query_recall_after_bootstrap,
-                "auto-remember defaulting to false must not change recall bootstrap semantics"
-            );
-            assert!(
-                !resolved.auto_remember_enabled,
-                "auto-remember stays opt-in even when other runtime memory defaults are enabled"
+                "query recall defaults must not change recall bootstrap semantics"
             );
         });
     }

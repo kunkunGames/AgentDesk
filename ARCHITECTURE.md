@@ -21,9 +21,6 @@ High-signal navigation guide for contributors. The generated inventories under `
 - `src/services/discord/meeting_orchestrator.rs` uses the same gate so meetings query Memento with `agenda + transcript` by default, while explicit `memory.query_recall_after_bootstrap: false` preserves bootstrap-only behavior when compatibility is more important than targeted recall.
 - `src/services/memory/memento.rs` deduplicates `rankedInjection`, `core`, `working`, and `anchors` before serializing external recall text so the same memory line is not injected multiple times.
 - Compatibility rule: `memory.query_recall_after_bootstrap` now defaults to `true` in `src/config.rs`, `src/runtime_layout/mod.rs`, and `src/services/discord/settings.rs`; older deployments can pin `false` to keep the prior bootstrap-only behavior.
-- `src/services/discord/turn_bridge/` keeps turn-end memory ordering explicit: `auto_remember -> capture -> reflect`. Existing recall-feedback analysis still runs even when background auto-remember is enabled.
-- `src/services/memory/auto_remember.rs` is P0-only for Memento-backed full persisted turns. It extracts `technical_decision`, `confirmed_error_root_cause`, and `config_change`, then lets validator + remember mapping keep final write authority.
-- `src/services/memory/auto_remember_store.rs` owns the sidecar-backed audit, retry, and operator-review surface. Default storage is `data/memory-auto-remember.sqlite` under the runtime root; set `memory.auto_remember.sidecar_path` when dedupe/retry continuity must survive runtime-root moves or resets.
 
 ## Generated `src/` Tree
 
@@ -40,7 +37,6 @@ src/
 │   │   ├── source.rs
 │   │   └── tests.rs
 │   ├── args.rs
-│   ├── auto_remember.rs
 │   ├── client.rs
 │   ├── dcserver.rs
 │   ├── direct.rs
@@ -266,9 +262,6 @@ src/
 │   │   ├── tmux_reaper.rs
 │   │   └── tmux_restart_handoff.rs
 │   ├── memory/
-│   │   ├── auto_remember.rs
-│   │   ├── auto_remember_quality.rs
-│   │   ├── auto_remember_store.rs
 │   │   ├── local.rs
 │   │   ├── memento.rs
 │   │   ├── mod.rs
