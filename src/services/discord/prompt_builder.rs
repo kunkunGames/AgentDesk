@@ -456,7 +456,7 @@ fn proactive_memory_guidance(
     channel_id: ChannelId,
     role_binding: Option<&RoleBinding>,
     profile: DispatchProfile,
-    memento_mcp_available: bool,
+    memory_mcp_available: bool,
 ) -> Option<String> {
     if profile != DispatchProfile::Full {
         return None;
@@ -470,13 +470,14 @@ fn proactive_memory_guidance(
             "`memory-write` skill",
             String::new(),
         ),
+        MemoryBackendKind::Mem0 if !memory_mcp_available => return None,
         MemoryBackendKind::Mem0 => (
             "mem0",
             "`search_memory` MCP tool",
             "`add_memories` MCP tool",
             String::new(),
         ),
-        MemoryBackendKind::Memento if !memento_mcp_available => return None,
+        MemoryBackendKind::Memento if !memory_mcp_available => return None,
         MemoryBackendKind::Memento => {
             let role_id = role_binding
                 .map(|binding| binding.role_id.as_str())
@@ -562,7 +563,7 @@ pub(super) fn build_system_prompt(
     shared_knowledge: Option<&str>,
     longterm_catalog: Option<&str>,
     memory_settings: Option<&ResolvedMemorySettings>,
-    memento_mcp_available: bool,
+    memory_mcp_available: bool,
 ) -> String {
     let mut system_prompt_owned = format!(
         "You are chatting with a user through Discord.\n\
@@ -699,7 +700,7 @@ pub(super) fn build_system_prompt(
         channel_id,
         role_binding,
         profile,
-        memento_mcp_available,
+        memory_mcp_available,
     ) {
         system_prompt_owned.push_str(&memory_guidance);
     }
@@ -740,13 +741,13 @@ mod tests {
     use super::*;
 
     /// Helper: call build_system_prompt with minimal/default arguments (Full profile),
-    /// while requiring each test to choose its own memento availability.
+    /// while requiring each test to choose its own memory MCP availability.
     fn call_build(
         discord_context: &str,
         current_path: &str,
         channel_id: u64,
         token: &str,
-        memento_mcp_available: bool,
+        memory_mcp_available: bool,
     ) -> String {
         build_system_prompt(
             discord_context,
@@ -761,7 +762,7 @@ mod tests {
             None, // shared_knowledge
             None, // longterm_catalog
             None, // memory_settings
-            memento_mcp_available,
+            memory_mcp_available,
         )
     }
 
@@ -1074,12 +1075,38 @@ mod tests {
                 backend: MemoryBackendKind::Mem0,
                 ..ResolvedMemorySettings::default()
             }),
-            false,
+            true,
         );
 
         assert!(prompt.contains("[Proactive Memory Guidance]"));
         assert!(prompt.contains("`search_memory` MCP tool"));
         assert!(prompt.contains("`add_memories` MCP tool"));
+    }
+
+    #[test]
+    fn test_full_prompt_omits_mem0_memory_guidance_without_mcp() {
+        let prompt = build_system_prompt(
+            "ctx",
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            None,
+            false,
+            DispatchProfile::Full,
+            None,
+            None,
+            None,
+            None,
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::Mem0,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+
+        assert!(!prompt.contains("[Proactive Memory Guidance]"));
+        assert!(!prompt.contains("`search_memory` MCP tool"));
+        assert!(!prompt.contains("`add_memories` MCP tool"));
     }
 
     #[test]

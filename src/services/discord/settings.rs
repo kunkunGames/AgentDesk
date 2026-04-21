@@ -793,7 +793,7 @@ memory:
                         None,
                         None,
                         Some(&resolved),
-                        true,
+                        false,
                     );
 
                     assert!(prompt.contains("[Proactive Memory Guidance]"));

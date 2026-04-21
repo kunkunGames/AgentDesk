@@ -10,6 +10,8 @@ const MEM0_SEARCH_PATH: &str = "/v2/memories/search";
 const MEMENTO_HEALTH_PATH: &str = "/health";
 const MEMENTO_MCP_PATH: &str = "/mcp";
 const MEM0_HEALTH_USER_ID: &str = "agentdesk-healthcheck";
+const MEM0_HEALTH_AGENT_ID: &str = "agentdesk-healthcheck";
+const MEM0_HEALTH_RUN_ID: &str = "agentdesk-healthcheck";
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const FAILURE_THRESHOLD: u8 = 3;
 const BACKOFF_DURATION: Duration = Duration::from_secs(5 * 60);
@@ -213,6 +215,15 @@ fn mem0_probe_body(config: &Mem0RuntimeConfig) -> Value {
     body.insert("query".to_string(), json!("agentdesk health check"));
     body.insert("user_id".to_string(), json!(MEM0_HEALTH_USER_ID));
     body.insert("limit".to_string(), json!(1));
+    body.insert(
+        "filters".to_string(),
+        json!({
+            "AND": [
+                { "agent_id": MEM0_HEALTH_AGENT_ID },
+                { "run_id": MEM0_HEALTH_RUN_ID }
+            ]
+        }),
+    );
     body.insert("version".to_string(), json!("v2"));
     body.insert("top_k".to_string(), json!(1));
     body.insert("threshold".to_string(), json!(0.0));
@@ -487,6 +498,28 @@ mod tests {
         restore_env("MEM0_API_KEY", previous_api_key);
         restore_env("MEM0_BASE_URL", previous_base_url);
         reset_for_tests();
+    }
+
+    #[test]
+    fn mem0_probe_body_includes_v2_filters() {
+        let payload = mem0_probe_body(&Mem0RuntimeConfig {
+            api_key: "key".to_string(),
+            base_url: "http://localhost:8000".to_string(),
+            org_id: Some("org-1".to_string()),
+            project_id: Some("proj-1".to_string()),
+        });
+
+        assert_eq!(payload["user_id"], json!(MEM0_HEALTH_USER_ID));
+        assert_eq!(
+            payload["filters"]["AND"][0]["agent_id"],
+            json!(MEM0_HEALTH_AGENT_ID)
+        );
+        assert_eq!(
+            payload["filters"]["AND"][1]["run_id"],
+            json!(MEM0_HEALTH_RUN_ID)
+        );
+        assert_eq!(payload["org_id"], json!("org-1"));
+        assert_eq!(payload["project_id"], json!("proj-1"));
     }
 
     #[tokio::test]

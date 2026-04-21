@@ -490,7 +490,15 @@ pub(in crate::services::discord) async fn start_headless_turn(
 
     let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
-    let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
+    let memory_mcp_available = match memory_settings.backend {
+        settings::MemoryBackendKind::File => false,
+        settings::MemoryBackendKind::Mem0 => {
+            crate::services::mcp_config::provider_has_mcp_server(&provider, "mem0")
+        }
+        settings::MemoryBackendKind::Memento => {
+            crate::services::mcp_config::provider_has_memento_mcp(&provider)
+        }
+    };
     let system_prompt_owned = build_system_prompt(
         &discord_context,
         &current_path,
@@ -504,7 +512,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         sak_for_system,
         longterm_catalog_for_prompt,
         Some(&memory_settings),
-        memento_mcp_available,
+        memory_mcp_available,
     );
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
     let memory_backend_label = memory_settings.backend.as_str();
@@ -2059,7 +2067,15 @@ pub(in crate::services::discord) async fn handle_text_message(
             github_issue_url: info.github_issue_url.as_deref(),
         }
     });
-    let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
+    let memory_mcp_available = match memory_settings.backend {
+        settings::MemoryBackendKind::File => false,
+        settings::MemoryBackendKind::Mem0 => {
+            crate::services::mcp_config::provider_has_mcp_server(&provider, "mem0")
+        }
+        settings::MemoryBackendKind::Memento => {
+            crate::services::mcp_config::provider_has_memento_mcp(&provider)
+        }
+    };
 
     let system_prompt_owned = build_system_prompt(
         &discord_context,
@@ -2074,7 +2090,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         sak_for_system,
         longterm_catalog_for_prompt,
         Some(&memory_settings),
-        memento_mcp_available,
+        memory_mcp_available,
     );
     if sak_for_system.is_some() {
         let ts = chrono::Local::now().format("%H:%M:%S");
