@@ -735,7 +735,7 @@ impl EscalationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MemoryConfig {
     #[serde(default = "default_memory_backend")]
@@ -744,16 +744,6 @@ pub struct MemoryConfig {
     pub file: FileMemoryConfig,
     #[serde(default)]
     pub mcp: McpMemoryConfig,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_memory_backend(),
-            file: FileMemoryConfig::default(),
-            mcp: McpMemoryConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -862,13 +852,13 @@ fn default_memory_backend() -> String {
     "auto".into()
 }
 fn default_sak_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_KNOWLEDGE_RELATIVE_PATH.into()
+    "memories/shared-agent-knowledge/shared_knowledge.md".into()
 }
 fn default_sam_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_MEMORY_RELATIVE_ROOT.into()
+    "memories/shared-agent-memory".into()
 }
 fn default_ltm_root() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_LONG_TERM_RELATIVE_ROOT.into()
+    "memories/long-term".into()
 }
 fn default_auto_memory_root() -> String {
     "~/.claude/projects/*{workspace}*/memory/".into()
