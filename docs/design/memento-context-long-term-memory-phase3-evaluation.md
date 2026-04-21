@@ -21,8 +21,8 @@ Phase 1 correctness in `memento-mcp`:
 
 Phase 2 integration in `AgentDesk`:
 
-- standard Discord turns use bootstrap on first load, then switch to query recall only when `memory.query_recall_after_bootstrap` is enabled
-- meeting orchestration builds targeted recall queries from `agenda + transcript` when the same query-recall gate is enabled
+- standard Discord turns use bootstrap on first load and then skip repeated turn-level recall until the session resets
+- meeting orchestration builds targeted recall queries from `agenda + transcript`
 - memento query recall uses `text`, `contextText`, `sessionId`, `excludeSeen=true`
 - external recall formatting deduplicates across `rankedInjection`, `core`, `working`, and `anchors`
 - query path remains bounded by explicit `pageSize` and `tokenBudget`
@@ -51,26 +51,18 @@ Targeted regression checks used for this phase:
 - `test_format_context_payload_for_external_recall_dedups_across_sections`
 - `test_format_context_payload_for_external_recall_caps_ranked_lines`
 - `test_build_participant_recall_request_uses_query_mode_and_combines_agenda_and_transcript`
-- `recall_mode_defaults_to_bootstrap_until_query_recall_is_enabled_for_memento`
-- `recall_mode_bootstraps_only_on_first_memento_turn_when_query_recall_enabled`
-- `test_resolve_memory_settings_query_recall_uses_runtime_default_and_override`
-- `test_resolve_memory_settings_keeps_query_recall_when_auto_remember_defaults_false`
+- `recall_mode_defaults_to_bootstrap_for_memento_and_query_for_file`
+- `clear_resets_memento_skip_so_next_turn_can_reload_context`
 
 Operational rollout evaluated for this phase used these enabled settings:
 
-- `AgentDesk`: runtime memory config with `memory.query_recall_after_bootstrap = true`
 - `memento-mcp`: runtime memory config with `contextInjection.hardening.enabled = true`
-
-Legacy compatibility remains available via explicit opt-out:
-
-- `AgentDesk`: set `memory.query_recall_after_bootstrap: false`
-- `memento-mcp`: set `contextInjection.hardening.enabled: false`
 
 ## Findings
 
 1. `context()` still serves the right job as a bootstrap loader.
 2. Turn-by-turn targeted retrieval is now handled by the existing `recall()` tool without widening the `context` schema.
-3. Standard Discord turns and meeting turns both have a concrete query path when query recall is enabled.
+3. Meeting turns have a concrete query path, while standard Discord turns remain bootstrap-first with repeated turn recall skipped.
 4. Prompt growth is bounded by `pageSize=8`, `tokenBudget=1200`, and formatter dedup/caps.
 5. The remaining gap was rollout policy and verification artifacts, not a missing `context()` capability.
 
@@ -83,7 +75,6 @@ The current architecture is sufficient because:
 - bootstrap and query responsibilities are now separated
 - targeted recall is already available where it matters
 - the public `context` schema stays stable
-- rollout can still fall back to legacy mode with explicit config
 
 ## Reopen Criteria
 

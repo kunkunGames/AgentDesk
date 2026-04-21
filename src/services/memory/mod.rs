@@ -1,7 +1,5 @@
-mod auto_remember;
-mod auto_remember_quality;
-mod auto_remember_store;
 mod local;
+mod mem0;
 mod memento;
 mod runtime_state;
 
@@ -14,21 +12,11 @@ use crate::services::discord::DispatchProfile;
 use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings, RoleBinding};
 use crate::services::provider::ProviderKind;
 
-pub(crate) use auto_remember::{
-    AutoRememberExecutionResult, AutoRememberTurnRequest, reject_auto_remember_candidate,
-    requeue_auto_remember_candidate, resubmit_auto_remember_candidate, run_auto_remember,
-    verify_auto_remember_candidate,
-};
-#[cfg(test)]
-pub(crate) use auto_remember_store::AutoRememberAuditEntry;
-pub(crate) use auto_remember_store::{
-    AutoRememberAuditDetail, AutoRememberAuditFilter, AutoRememberMemoryStatus, AutoRememberStage,
-    AutoRememberStore,
-};
 pub(crate) use local::LocalMemoryBackend;
+pub(crate) use mem0::Mem0Backend;
 pub(crate) use memento::{
-    MementoBackend, MementoFragmentSummary, MementoRememberRequest, MementoToolFeedbackRequest,
-    resolve_memento_agent_id, resolve_memento_workspace, sanitize_memento_workspace_segment,
+    MementoBackend, MementoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agent_id,
+    resolve_memento_workspace, sanitize_memento_workspace_segment,
 };
 pub(crate) use runtime_state::{backend_is_active, backend_state, refresh_backend_health};
 #[cfg(test)]
@@ -74,10 +62,6 @@ pub(crate) struct RecallRequest {
     pub session_id: String,
     pub dispatch_profile: DispatchProfile,
     pub user_text: String,
-    pub context_text: Option<String>,
-    pub case_id: Option<String>,
-    pub phase: Option<String>,
-    pub resolution_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -162,6 +146,7 @@ pub(crate) fn build_resolved_memory_backend(
 ) -> Box<dyn MemoryBackend + Send + Sync> {
     match settings.backend {
         MemoryBackendKind::File => Box::new(LocalMemoryBackend),
+        MemoryBackendKind::Mem0 => Box::new(Mem0Backend::new(settings.clone())),
         MemoryBackendKind::Memento => Box::new(MementoBackend::new(settings.clone())),
     }
 }
@@ -268,9 +253,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_build_resolved_memory_backend_file_and_memento() {
+    fn test_build_resolved_memory_backend_file_mem0_and_memento() {
         let file = build_resolved_memory_backend(&ResolvedMemorySettings::default());
         let _ = file;
+
+        let mem0 = build_resolved_memory_backend(&ResolvedMemorySettings {
+            backend: MemoryBackendKind::Mem0,
+            ..ResolvedMemorySettings::default()
+        });
+        let _ = mem0;
 
         let memento = build_resolved_memory_backend(&ResolvedMemorySettings {
             backend: MemoryBackendKind::Memento,

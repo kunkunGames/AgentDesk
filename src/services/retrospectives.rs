@@ -177,7 +177,6 @@ fn record_card_retrospective_sqlite(
             topic: draft.memory_payload.topic.clone(),
             kind: draft.memory_payload.kind.clone(),
             keywords: draft.memory_payload.keywords.clone(),
-            importance: None,
             source: Some(draft.memory_payload.source.clone()),
             workspace: Some(draft.memory_payload.workspace.clone()),
             agent_id: Some(draft.memory_payload.agent_id.clone()),
@@ -188,7 +187,6 @@ fn record_card_retrospective_sqlite(
             resolution_status: Some(draft.memory_payload.resolution_status.clone()),
             assertion_status: Some(draft.memory_payload.assertion_status.clone()),
             context_summary: Some(draft.memory_payload.context_summary.clone()),
-            supersedes: Vec::new(),
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -293,7 +291,6 @@ async fn record_card_retrospective_pg(
             topic: draft.memory_payload.topic.clone(),
             kind: draft.memory_payload.kind.clone(),
             keywords: draft.memory_payload.keywords.clone(),
-            importance: None,
             source: Some(draft.memory_payload.source.clone()),
             workspace: Some(draft.memory_payload.workspace.clone()),
             agent_id: Some(draft.memory_payload.agent_id.clone()),
@@ -304,7 +301,6 @@ async fn record_card_retrospective_pg(
             resolution_status: Some(draft.memory_payload.resolution_status.clone()),
             assertion_status: Some(draft.memory_payload.assertion_status.clone()),
             context_summary: Some(draft.memory_payload.context_summary.clone()),
-            supersedes: Vec::new(),
         };
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {

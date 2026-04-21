@@ -735,82 +735,15 @@ impl EscalationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MemoryConfig {
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    #[serde(default = "default_query_recall_after_bootstrap")]
-    pub query_recall_after_bootstrap: bool,
     #[serde(default)]
     pub file: FileMemoryConfig,
     #[serde(default)]
     pub mcp: McpMemoryConfig,
-    #[serde(default)]
-    pub auto_remember: AutoRememberConfig,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_memory_backend(),
-            query_recall_after_bootstrap: default_query_recall_after_bootstrap(),
-            file: FileMemoryConfig::default(),
-            mcp: McpMemoryConfig::default(),
-            auto_remember: AutoRememberConfig::default(),
-        }
-    }
-}
-
-fn default_auto_remember_improver_mode() -> String {
-    "local_llm".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct AutoRememberConfig {
-    /// Keeps auto-remember opt-in. Audit/dedupe state defaults to the runtime-root-local
-    /// SQLite sidecar at `data/memory-auto-remember.sqlite`. Set `sidecar_path` to
-    /// pin the store to a stable location across runtime-root moves; when set, AgentDesk
-    /// migrates the legacy runtime-local sidecar on first use.
-    pub enabled: bool,
-    pub sidecar_path: Option<String>,
-    pub improver: AutoRememberImproverConfig,
-}
-
-impl Default for AutoRememberConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sidecar_path: None,
-            improver: AutoRememberImproverConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct AutoRememberImproverConfig {
-    #[serde(default = "default_auto_remember_improver_mode")]
-    pub mode: String,
-    pub agent: AutoRememberAgentConfig,
-}
-
-impl Default for AutoRememberImproverConfig {
-    fn default() -> Self {
-        Self {
-            mode: default_auto_remember_improver_mode(),
-            agent: AutoRememberAgentConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct AutoRememberAgentConfig {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -842,10 +775,6 @@ impl Default for FileMemoryConfig {
 pub struct McpMemoryConfig {
     pub endpoint: String,
     pub access_key_env: String,
-}
-
-const fn default_query_recall_after_bootstrap() -> bool {
-    false
 }
 
 /// Compile-time defaults loaded from the project-root `defaults.json`.
@@ -923,13 +852,13 @@ fn default_memory_backend() -> String {
     "auto".into()
 }
 fn default_sak_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_KNOWLEDGE_RELATIVE_PATH.into()
+    "memories/shared-agent-knowledge/shared_knowledge.md".into()
 }
 fn default_sam_path() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_SHARED_AGENT_MEMORY_RELATIVE_ROOT.into()
+    "memories/shared-agent-memory".into()
 }
 fn default_ltm_root() -> String {
-    crate::memory_import_guardrails::DIRECT_IMPORT_LONG_TERM_RELATIVE_ROOT.into()
+    "memories/long-term".into()
 }
 fn default_auto_memory_root() -> String {
     "~/.claude/projects/*{workspace}*/memory/".into()
@@ -1261,8 +1190,8 @@ pub(crate) fn set_test_runtime_root_override(path: Option<std::path::PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentChannel, AgentChannels, AgentDef, AutoRememberConfig, AutomationConfig, BotConfig,
-        Config, DEFAULT_MEMENTO_MCP_SERVER_NAME, DEFAULT_MEMENTO_MCP_TOKEN_ENV_VAR,
+        AgentChannel, AgentChannels, AgentDef, AutomationConfig, BotConfig, Config,
+        DEFAULT_MEMENTO_MCP_SERVER_NAME, DEFAULT_MEMENTO_MCP_TOKEN_ENV_VAR,
         DEFAULT_MEMENTO_MCP_URL, DiscordBotAuthConfig, EscalationConfig, EscalationMode,
         EscalationScheduleConfig, FileMemoryConfig, KanbanConfig, McpMemoryConfig,
         McpServerAuthConfig, McpServerAuthType, McpServerConfig, MemoryConfig, ReviewConfig,
@@ -1533,7 +1462,6 @@ mod tests {
         };
         config.memory = Some(MemoryConfig {
             backend: "memento".to_string(),
-            query_recall_after_bootstrap: true,
             file: FileMemoryConfig {
                 sak_path: "/tmp/shared.md".to_string(),
                 sam_path: "/tmp/sam".to_string(),
@@ -1543,10 +1471,6 @@ mod tests {
             mcp: McpMemoryConfig {
                 endpoint: "http://127.0.0.1:8765".to_string(),
                 access_key_env: "MEMENTO_API_KEY".to_string(),
-            },
-            auto_remember: AutoRememberConfig {
-                enabled: true,
-                ..AutoRememberConfig::default()
             },
         });
 
@@ -1699,13 +1623,6 @@ mod tests {
         assert_eq!(
             loaded.memory.as_ref().map(|memory| memory.backend.as_str()),
             Some("memento")
-        );
-        assert_eq!(
-            loaded
-                .memory
-                .as_ref()
-                .map(|memory| memory.query_recall_after_bootstrap),
-            Some(true)
         );
         assert_eq!(
             loaded
