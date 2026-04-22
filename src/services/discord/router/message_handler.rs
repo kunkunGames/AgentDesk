@@ -184,6 +184,59 @@ fn build_headless_trigger_context(
     Some(lines.join("\n"))
 }
 
+fn build_system_discord_context(
+    channel_name: Option<&str>,
+    category_name: Option<&str>,
+    channel_id: ChannelId,
+    headless_fallback: bool,
+) -> String {
+    match channel_name {
+        Some(name) => {
+            let cat_part = category_name
+                .map(|value| format!(" (category: {value})"))
+                .unwrap_or_default();
+            format!(
+                "Discord context: channel #{} (ID: {}){}",
+                name,
+                channel_id.get(),
+                cat_part
+            )
+        }
+        None if headless_fallback => format!(
+            "Discord context: headless channel {} (no bound channel name)",
+            channel_id.get()
+        ),
+        None => "Discord context: DM".to_string(),
+    }
+}
+
+fn normalize_turn_author_name(request_owner_name: &str, request_owner: UserId) -> String {
+    let collapsed = request_owner_name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base = if collapsed.is_empty() {
+        format!("user {}", request_owner.get())
+    } else {
+        collapsed
+    };
+    let sanitized = base
+        .chars()
+        .map(|ch| match ch {
+            '\r' | '\n' => ' ',
+            '[' | '{' => '(',
+            ']' | '}' => ')',
+            _ => ch,
+        })
+        .collect::<String>();
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_turn_author_prefix(request_owner_name: &str, request_owner: UserId) -> String {
+    let author = normalize_turn_author_name(request_owner_name, request_owner);
+    format!("[from {author}]\nauthor_id: {}", request_owner.get())
+}
+
 pub(in crate::services::discord) async fn start_headless_turn(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -457,6 +510,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         dispatch_profile,
         &memory_recall,
     );
+    context_chunks.push(build_turn_author_prefix(request_owner_name, request_owner));
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
@@ -475,28 +529,12 @@ pub(in crate::services::discord) async fn start_headless_turn(
     context_chunks.push(ai_screen::sanitize_user_input(prompt));
     let context_prompt = context_chunks.join("\n\n");
 
-    let discord_context = match channel_name.as_deref() {
-        Some(name) => {
-            let cat_part = category_name
-                .as_deref()
-                .map(|value| format!(" (category: {})", value))
-                .unwrap_or_default();
-            format!(
-                "Discord context: channel #{} (ID: {}){}, user: {} (ID: {})",
-                name,
-                channel_id.get(),
-                cat_part,
-                request_owner_name,
-                request_owner.get()
-            )
-        }
-        None => format!(
-            "Discord context: headless channel {} (no bound channel name), user: {} (ID: {})",
-            channel_id.get(),
-            request_owner_name,
-            request_owner.get()
-        ),
-    };
+    let discord_context = build_system_discord_context(
+        channel_name.as_deref(),
+        category_name.as_deref(),
+        channel_id,
+        true,
+    );
 
     let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
@@ -2022,6 +2060,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         dispatch_profile,
         &memory_recall,
     );
+    context_chunks.push(build_turn_author_prefix(request_owner_name, request_owner));
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
@@ -2041,28 +2080,12 @@ pub(in crate::services::discord) async fn handle_text_message(
     let discord_context = {
         let data = shared.core.lock().await;
         let session = data.sessions.get(&channel_id);
-        let ch_name = session.and_then(|s| s.channel_name.as_deref());
-        let cat_name = session.and_then(|s| s.category_name.as_deref());
-        match ch_name {
-            Some(name) => {
-                let cat_part = cat_name
-                    .map(|c| format!(" (category: {})", c))
-                    .unwrap_or_default();
-                format!(
-                    "Discord context: channel #{} (ID: {}){}, user: {} (ID: {})",
-                    name,
-                    channel_id.get(),
-                    cat_part,
-                    request_owner_name,
-                    request_owner.get()
-                )
-            }
-            None => format!(
-                "Discord context: DM, user: {} (ID: {})",
-                request_owner_name,
-                request_owner.get()
-            ),
-        }
+        build_system_discord_context(
+            session.and_then(|s| s.channel_name.as_deref()),
+            session.and_then(|s| s.category_name.as_deref()),
+            channel_id,
+            false,
+        )
     };
 
     // Claude keeps SAK in the system prompt for prefix-cache stability.
@@ -4008,6 +4031,7 @@ mod tests {
         build_control_intent_system_reminder, detect_natural_language_control_intent,
     };
     use super::*;
+    use crate::services::discord::prompt_builder;
     use crate::services::memory::RecallResponse;
     use crate::ui::ai_screen::{HistoryItem, HistoryType};
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
@@ -4691,5 +4715,87 @@ mod tests {
 
         assert!(!queued.has_reply_boundary);
         assert!(!queued.merge_consecutive);
+    }
+
+    #[test]
+    fn build_system_discord_context_omits_user_identity() {
+        let context = build_system_discord_context(
+            Some("adk-cdx"),
+            Some("agentdesk"),
+            ChannelId::new(42),
+            false,
+        );
+
+        assert_eq!(
+            context,
+            "Discord context: channel #adk-cdx (ID: 42) (category: agentdesk)"
+        );
+        assert!(!context.contains("user:"));
+        assert!(!context.contains("author_id"));
+    }
+
+    #[test]
+    fn build_turn_author_prefix_starts_with_from_header() {
+        let prefix = build_turn_author_prefix("  Alice [ops]\nteam  ", UserId::new(77));
+
+        assert_eq!(prefix, "[from Alice (ops) team]\nauthor_id: 77");
+    }
+
+    #[test]
+    fn multi_user_turns_keep_system_prompt_identical() {
+        let discord_context = build_system_discord_context(
+            Some("multi-user"),
+            Some("agentdesk"),
+            ChannelId::new(9001),
+            false,
+        );
+
+        let alice_system = prompt_builder::build_system_prompt(
+            &discord_context,
+            "/tmp/work",
+            ChannelId::new(9001),
+            "token",
+            None,
+            false,
+            prompt_builder::DispatchProfile::Full,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let bob_system = prompt_builder::build_system_prompt(
+            &discord_context,
+            "/tmp/work",
+            ChannelId::new(9001),
+            "token",
+            None,
+            false,
+            prompt_builder::DispatchProfile::Full,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(alice_system.as_bytes(), bob_system.as_bytes());
+
+        let alice_user_prompt = [
+            build_turn_author_prefix("Alice", UserId::new(101)),
+            "same task".to_string(),
+        ]
+        .join("\n\n");
+        let bob_user_prompt = [
+            build_turn_author_prefix("Bob", UserId::new(202)),
+            "same task".to_string(),
+        ]
+        .join("\n\n");
+
+        assert!(alice_user_prompt.starts_with("[from Alice]\nauthor_id: 101"));
+        assert!(bob_user_prompt.starts_with("[from Bob]\nauthor_id: 202"));
+        assert_ne!(alice_user_prompt, bob_user_prompt);
     }
 }
