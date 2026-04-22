@@ -4,7 +4,7 @@
 
 - Production Rust modules: `260`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `82`
+- Giant files: `83`
 
 ## Namespace Summary
 
@@ -103,7 +103,7 @@
 | `error` | `src/error.rs` | 188 |  |
 | `github` | `src/github/mod.rs` | 833 |  |
 | `github::dod` | `src/github/dod.rs` | 395 |  |
-| `github::sync` | `src/github/sync.rs` | 976 |  |
+| `github::sync` | `src/github/sync.rs` | 1084 | giant-file |
 | `github::triage` | `src/github/triage.rs` | 339 |  |
 | `integration_tests::tests::high_risk_recovery` | `src/integration_tests/tests/high_risk_recovery.rs` | 1204 | giant-file |
 | `kanban` | `src/kanban.rs` | 3675 | giant-file |
@@ -128,7 +128,7 @@
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 1081 | giant-file |
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 1266 | giant-file |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 92 |  |
-| `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 11510 | giant-file |
+| `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 11575 | giant-file |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 155 |  |
 | `server::routes::departments` | `src/server/routes/departments.rs` | 525 |  |
 | `server::routes::discord` | `src/server/routes/discord.rs` | 164 |  |
@@ -139,7 +139,7 @@
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 2520 | giant-file |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 1499 | giant-file |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 61 |  |
-| `server::routes::docs` | `src/server/routes/docs.rs` | 2289 | giant-file |
+| `server::routes::docs` | `src/server/routes/docs.rs` | 2304 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 21 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 78 |  |
@@ -147,7 +147,7 @@
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 65 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 64 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 37 |  |
-| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 173 |  |
+| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 174 |  |
 | `server::routes::domains::reviews` | `src/server/routes/domains/reviews.rs` | 30 |  |
 | `server::routes::escalation` | `src/server/routes/escalation.rs` | 2345 | giant-file |
 | `server::routes::github` | `src/server/routes/github.rs` | 677 |  |
@@ -274,7 +274,7 @@
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 878 |  |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
-| `services::platform::shell` | `src/services/platform/shell.rs` | 1232 | giant-file |
+| `services::platform::shell` | `src/services/platform/shell.rs` | 1298 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 245 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
 | `services::provider` | `src/services/provider.rs` | 1976 | giant-file |
