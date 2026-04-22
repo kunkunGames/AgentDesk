@@ -14,8 +14,8 @@ pub(super) enum McpReloadGate {
 }
 
 /// Decide whether the `/mcp-reload` slash command should proceed for the given provider.
-/// Only Claude is supported because Codex/Qwen/Gemini have different MCP attachment
-/// semantics (or don't support hot-swap via session restart at all).
+/// Only Claude currently supports this hot-reload path. Other providers can still
+/// use MCP, but AgentDesk does not promise mid-session re-attachment via `/mcp-reload`.
 pub(super) fn mcp_reload_gate_for_provider(provider: &ProviderKind) -> McpReloadGate {
     match provider {
         ProviderKind::Claude => McpReloadGate::Allow,
@@ -76,14 +76,14 @@ pub(in crate::services::discord) async fn cmd_mcp_reload(ctx: Context<'_>) -> Re
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!("  [{ts}] ◀ [{user_name}] /mcp-reload");
 
-    // Provider gate — only Claude is supported.
+    // Provider gate — only Claude supports this hot-reload flow.
     if matches!(
         mcp_reload_gate_for_provider(&ctx.data().provider),
         McpReloadGate::UnsupportedProvider
     ) {
         ctx.say(
-            "지원되지 않는 provider입니다 (Claude only). \
-             Codex/Qwen/Gemini는 추후 별도 지원 예정.",
+            "이 명령은 Claude 세션 reload 전용입니다. \
+             Codex/Gemini/Qwen은 새 세션에서 동기화된 MCP를 사용합니다.",
         )
         .await?;
         return Ok(());

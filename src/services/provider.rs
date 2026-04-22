@@ -246,6 +246,38 @@ impl ProviderKind {
             })
     }
 
+    /// Returns true when AgentDesk can treat runtime-config MCP servers as
+    /// available capability surface for this provider.
+    pub fn supports_runtime_mcp_server_config(&self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Gemini | Self::Qwen)
+    }
+
+    /// Returns true when the provider CLI exposes an explicit native fast mode
+    /// toggle that AgentDesk can enable or disable per channel.
+    pub fn supports_native_fast_mode(&self) -> bool {
+        matches!(self, Self::Claude | Self::Codex)
+    }
+
+    /// Returns the provider-specific kv/config key for context compact
+    /// overrides. Providers without an override surface fall back to the
+    /// global `context_compact_percent`.
+    pub fn context_compact_override_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Claude => Some("context_compact_percent_claude"),
+            Self::Codex => Some("context_compact_percent_codex"),
+            Self::Gemini | Self::Qwen | Self::Unsupported(_) => None,
+        }
+    }
+
+    /// Returns the provider-specific default compact threshold override.
+    /// `None` means "inherit the global compact threshold".
+    pub fn default_context_compact_percent_override(&self) -> Option<u64> {
+        match self {
+            Self::Codex => Some(100),
+            _ => None,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn resolve_runtime_path(&self) -> Option<String> {
         match self {
@@ -386,10 +418,16 @@ impl ProviderKind {
 
     /// Returns true when this provider can own a reusable local tmux/process
     /// session that AgentDesk may need to clear or pre-seed in inflight state.
-    pub fn uses_managed_tmux_backend(&self) -> bool {
+    pub fn uses_managed_session_backend(&self) -> bool {
         self.registry_entry()
             .map(|entry| entry.managed_tmux_backend)
             .unwrap_or(false)
+    }
+
+    /// Backward-compatible alias kept for older call sites. This includes
+    /// reusable process-backed sessions in addition to tmux-backed ones.
+    pub fn uses_managed_tmux_backend(&self) -> bool {
+        self.uses_managed_session_backend()
     }
 
     pub fn build_tmux_session_name(&self, channel_name: &str) -> String {
@@ -1495,12 +1533,48 @@ mod tests {
     }
 
     #[test]
-    fn test_uses_managed_tmux_backend_for_claude_codex_and_qwen() {
+    fn test_provider_runtime_affordance_matrix_is_explicit() {
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+            ProviderKind::Qwen,
+        ] {
+            assert!(provider.supports_runtime_mcp_server_config());
+        }
+
+        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+            assert!(provider.context_compact_override_key().is_some());
+        }
+
+        for provider in [ProviderKind::Gemini, ProviderKind::Qwen] {
+            assert!(provider.context_compact_override_key().is_none());
+        }
+
+        assert!(ProviderKind::Claude.supports_native_fast_mode());
+        assert!(ProviderKind::Codex.supports_native_fast_mode());
+        assert!(!ProviderKind::Gemini.supports_native_fast_mode());
+        assert!(!ProviderKind::Qwen.supports_native_fast_mode());
+        assert!(!ProviderKind::Unsupported("gpt".to_string()).supports_runtime_mcp_server_config());
+        assert_eq!(
+            ProviderKind::Codex.default_context_compact_percent_override(),
+            Some(100)
+        );
+        assert_eq!(
+            ProviderKind::Gemini.default_context_compact_percent_override(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_uses_managed_session_backend_for_claude_codex_and_qwen() {
+        assert!(ProviderKind::Claude.uses_managed_session_backend());
+        assert!(ProviderKind::Codex.uses_managed_session_backend());
+        assert!(ProviderKind::Qwen.uses_managed_session_backend());
+        assert!(!ProviderKind::Gemini.uses_managed_session_backend());
+        assert!(!ProviderKind::Unsupported("gpt".to_string()).uses_managed_session_backend());
         assert!(ProviderKind::Claude.uses_managed_tmux_backend());
-        assert!(ProviderKind::Codex.uses_managed_tmux_backend());
-        assert!(ProviderKind::Qwen.uses_managed_tmux_backend());
         assert!(!ProviderKind::Gemini.uses_managed_tmux_backend());
-        assert!(!ProviderKind::Unsupported("gpt".to_string()).uses_managed_tmux_backend());
     }
 
     #[test]

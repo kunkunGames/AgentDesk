@@ -139,7 +139,7 @@ pub(in crate::services::discord) async fn effective_provider_for_channel(
 }
 
 pub(in crate::services::discord) fn native_fast_mode_supported(provider: &ProviderKind) -> bool {
-    matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+    provider.supports_native_fast_mode()
 }
 
 pub(in crate::services::discord) async fn channel_fast_mode_setting(

@@ -666,7 +666,7 @@ pub async fn clear_provider_channel_runtime(
                 crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
             })
             .await;
-        } else if provider.uses_managed_tmux_backend() {
+        } else if provider.uses_managed_session_backend() {
             super::commands::reset_managed_process_session(&name);
         }
     }

@@ -39,6 +39,7 @@ function makePipeline(): PipelineConfigFull {
         on_exit: [],
       },
     },
+    events: {},
     clocks: {
       review: {
         set: "review_entered_at",
@@ -136,16 +137,14 @@ describe("pipeline-visual-editor-model", () => {
     });
   });
 
-  it("keeps non-visual override keys when building save payload", () => {
+  it("keeps non-visual override keys and rebuilds visual sections from the pipeline", () => {
     const extras = extractOverrideExtras({
       events: { on_dispatch_completed: ["OnDispatchCompleted"] },
       note: "keep me",
     });
     const payload = buildOverridePayload(makePipeline(), extras);
 
-    expect(payload.events).toEqual({
-      on_dispatch_completed: ["OnDispatchCompleted"],
-    });
+    expect(payload.events).toEqual({});
     expect(payload.note).toBe("keep me");
     expect(payload.states).toHaveLength(6);
     expect(payload.phase_gate?.dispatch_type).toBe("phase-gate");
