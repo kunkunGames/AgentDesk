@@ -989,7 +989,7 @@ impl TestHealthHarness {
             super::DiscordSession {
                 session_id: session_id.map(str::to_string),
                 memento_context_loaded: super::session_runtime::restored_memento_context_loaded(
-                    false, session_id,
+                    false, None, session_id,
                 ),
                 memento_reflected: false,
                 current_path: None,
