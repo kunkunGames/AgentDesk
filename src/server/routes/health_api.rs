@@ -393,10 +393,23 @@ async fn load_dispatch_outbox_stats_pg(pool: &PgPool) -> Option<DispatchOutboxSt
     .fetch_one(pool)
     .await
     .ok()?;
+    // Use COALESCE(next_attempt_at, created_at) so rows that were re-queued
+    // by boot reconcile (processing→pending) reflect their re-queue time,
+    // not the original creation time. This keeps the promote health gate
+    // accurate after restarts without inflating age with rows that the
+    // outbox worker is about to pick up.
     let oldest_pending_age = sqlx::query_scalar::<_, i64>(
-        "SELECT COALESCE(CAST(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) AS BIGINT), 0)
+        "SELECT COALESCE(
+             CAST(
+                 EXTRACT(
+                     EPOCH FROM (NOW() - MIN(COALESCE(next_attempt_at, created_at)))
+                 ) AS BIGINT
+             ),
+             0
+         )
          FROM dispatch_outbox
-         WHERE status = 'pending'",
+         WHERE status = 'pending'
+           AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())",
     )
     .fetch_one(pool)
     .await
