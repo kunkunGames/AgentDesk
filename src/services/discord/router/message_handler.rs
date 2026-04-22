@@ -79,6 +79,17 @@ fn should_note_memento_context_loaded(
         && memory_recall.memento_context_loaded
 }
 
+fn update_memento_context_loaded_after_restore(
+    memento_context_loaded: bool,
+    restored_session_id: Option<&str>,
+) -> bool {
+    if restored_session_id.is_some() {
+        true
+    } else {
+        memento_context_loaded
+    }
+}
+
 fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
     // #750: announce bot no longer writes lifecycle emojis, so the command bot
     // is now the single source of ⏳ for both regular and dispatch turns.
@@ -232,7 +243,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         }
     }
 
-    let (mut session_id, memento_context_loaded, current_path) = {
+    let (mut session_id, mut memento_context_loaded, current_path) = {
         let mut data = shared.core.lock().await;
         if let Some(info) = load_session_runtime_state(&mut data.sessions, channel_id) {
             if let Some(channel_name_hint) = channel_name_hint.as_ref()
@@ -387,6 +398,10 @@ pub(in crate::services::discord) async fn start_headless_turn(
                 }
             }
             session_id = restored;
+            memento_context_loaded = update_memento_context_loaded_after_restore(
+                memento_context_loaded,
+                session_id.as_deref(),
+            );
         }
     }
 
@@ -1887,6 +1902,10 @@ pub(in crate::services::discord) async fn handle_text_message(
                 .await;
             }
             session_id = restored;
+            memento_context_loaded = update_memento_context_loaded_after_restore(
+                memento_context_loaded,
+                session_id.as_deref(),
+            );
         }
     }
     let reply_context = merge_reply_contexts(
@@ -4282,6 +4301,19 @@ mod tests {
         assert!(!should_note_memento_context_loaded(
             &settings, true, &recall
         ));
+    }
+
+    #[test]
+    fn restored_session_updates_loaded_snapshot() {
+        assert!(update_memento_context_loaded_after_restore(
+            false,
+            Some("session-1")
+        ));
+        assert!(update_memento_context_loaded_after_restore(
+            true,
+            Some("session-1")
+        ));
+        assert!(!update_memento_context_loaded_after_restore(false, None));
     }
 
     #[test]
