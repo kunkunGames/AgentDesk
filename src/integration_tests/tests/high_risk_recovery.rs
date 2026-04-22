@@ -181,8 +181,8 @@ mod failure_recovery {
         }
     }
 
-    #[test]
-    fn scenario_251_boot_reconcile_backfills_missing_notify_outbox() {
+    #[tokio::test]
+    async fn scenario_251_boot_reconcile_backfills_missing_notify_outbox() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -195,7 +195,9 @@ mod failure_recovery {
             "pending",
         );
 
-        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine, None)
+            .await
+            .unwrap();
         assert_eq!(
             stats.missing_notify_outbox_backfilled, 1,
             "boot reconcile must backfill missing notify outbox rows"
@@ -216,8 +218,8 @@ mod failure_recovery {
         );
     }
 
-    #[test]
-    fn scenario_251_boot_reconcile_resets_broken_auto_queue_entries() {
+    #[tokio::test]
+    async fn scenario_251_boot_reconcile_resets_broken_auto_queue_entries() {
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
@@ -285,7 +287,9 @@ mod failure_recovery {
             .unwrap();
         }
 
-        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine, None)
+            .await
+            .unwrap();
         assert_eq!(
             stats.broken_auto_queue_entries_reset, 4,
             "boot reconcile must reset orphan/phantom/cancelled/completed auto-queue entries"
@@ -340,16 +344,18 @@ mod failure_recovery {
     // test uses only the rusqlite `test_db()` fixture so the hook returns
     // `postgres pool required`. Rewriting requires bringing up a PG pool
     // inside the integration test harness — out of scope for #850.
-    #[test]
+    #[tokio::test]
     #[ignore = "rusqlite dispatch path deleted in #850; needs PG fixture rewrite"]
-    fn scenario_251_boot_reconcile_refires_missing_review_dispatch() {
+    async fn scenario_251_boot_reconcile_refires_missing_review_dispatch() {
         let (_repo, _repo_guard) = setup_test_repo();
         let db = test_db();
         let engine = test_engine(&db);
         seed_agent(&db);
         seed_card(&db, "card-251-review", "review");
 
-        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine).unwrap();
+        let stats = crate::reconcile::reconcile_boot_runtime(&db, &engine, None)
+            .await
+            .unwrap();
         assert_eq!(
             stats.missing_review_dispatches_refired, 1,
             "boot reconcile must re-fire OnReviewEnter for review cards missing dispatch"

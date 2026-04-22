@@ -2812,7 +2812,41 @@ pub async fn rereview_card(
     }
 
     let reason = body.reason.as_deref().unwrap_or("manual rereview");
-    let (current_status, assigned_agent_id, card_title, gh_url, caller_source) = {
+    let (current_status, assigned_agent_id, card_title, gh_url, caller_source) = 'lookup: {
+        if let Some(pool) = state.pg_pool.as_ref() {
+            match sqlx::query_as::<_, (String, Option<String>, String, Option<String>)>(
+                "SELECT status, assigned_agent_id, title, github_issue_url
+                 FROM kanban_cards WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(Some((status, agent, title, url))) => {
+                    let caller = if let Ok(conn) = state.db.lock() {
+                        resolve_requesting_agent_id_on_conn(&conn, &headers)
+                            .unwrap_or_else(|| "api".to_string())
+                    } else {
+                        "api".to_string()
+                    };
+                    break 'lookup (status, agent, title, url, caller);
+                }
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": format!("card not found: {id}")})),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        card_id = %id,
+                        %error,
+                        "[rereview] postgres lookup failed, falling back to sqlite"
+                    );
+                }
+            }
+        }
+
         let conn = match state.db.lock() {
             Ok(c) => c,
             Err(e) => {
@@ -3121,14 +3155,35 @@ pub async fn batch_rereview(
     let mut results = Vec::new();
 
     for issue_number in &body.issues {
-        let card_id: Option<String> = state.db.lock().ok().and_then(|conn| {
-            conn.query_row(
-                "SELECT id FROM kanban_cards WHERE github_issue_number = ?1",
-                [issue_number],
-                |row| row.get(0),
+        let mut card_id: Option<String> = None;
+        if let Some(pool) = state.pg_pool.as_ref() {
+            match sqlx::query_scalar::<_, String>(
+                "SELECT id FROM kanban_cards WHERE github_issue_number = $1",
             )
-            .ok()
-        });
+            .bind(*issue_number)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(value) => card_id = value,
+                Err(error) => {
+                    tracing::warn!(
+                        %issue_number,
+                        %error,
+                        "[batch_rereview] postgres lookup failed, falling back to sqlite"
+                    );
+                }
+            }
+        }
+        if card_id.is_none() {
+            card_id = state.db.lock().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT id FROM kanban_cards WHERE github_issue_number = ?1",
+                    [issue_number],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+        }
 
         let card_id = match card_id {
             Some(id) => id,

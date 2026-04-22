@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use libsql_rusqlite::Connection;
 use serde_json::json;
+use sqlx::PgPool;
 
 use crate::db::agents::load_agent_channel_bindings;
 use crate::{db::Db, dispatch, engine::PolicyEngine};
@@ -54,8 +55,39 @@ pub(crate) fn reconcile_boot_db(conn: &Connection) -> Result<BootReconcileStats>
     })
 }
 
-pub(crate) fn reconcile_boot_runtime(db: &Db, engine: &PolicyEngine) -> Result<BootReconcileStats> {
-    let mut stats = {
+pub(crate) async fn reconcile_boot_db_pg(pool: &PgPool) -> Result<BootReconcileStats> {
+    let stale_processing_outbox_reset =
+        sqlx::query("UPDATE dispatch_outbox SET status = 'pending' WHERE status = 'processing'")
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected() as usize)
+            .unwrap_or(0);
+
+    let stale_dispatch_reservations_cleared =
+        sqlx::query("DELETE FROM kv_meta WHERE key LIKE 'dispatch_reserving:%'")
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected() as usize)
+            .unwrap_or(0);
+
+    Ok(BootReconcileStats {
+        stale_processing_outbox_reset,
+        stale_dispatch_reservations_cleared,
+        missing_notify_outbox_backfilled: 0,
+        broken_auto_queue_entries_reset: 0,
+        stale_channel_thread_map_entries_cleared: 0,
+        missing_review_dispatches_refired: 0,
+    })
+}
+
+pub(crate) async fn reconcile_boot_runtime(
+    db: &Db,
+    engine: &PolicyEngine,
+    pg_pool: Option<&PgPool>,
+) -> Result<BootReconcileStats> {
+    let mut stats = if let Some(pool) = pg_pool {
+        reconcile_boot_db_pg(pool).await?
+    } else {
         let conn = db
             .lock()
             .map_err(|e| anyhow!("boot reconcile DB lock poisoned: {e}"))?;
