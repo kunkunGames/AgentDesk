@@ -56,12 +56,21 @@ pub(crate) fn reconcile_boot_db(conn: &Connection) -> Result<BootReconcileStats>
 }
 
 pub(crate) async fn reconcile_boot_db_pg(pool: &PgPool) -> Result<BootReconcileStats> {
-    let stale_processing_outbox_reset =
-        sqlx::query("UPDATE dispatch_outbox SET status = 'pending' WHERE status = 'processing'")
-            .execute(pool)
-            .await
-            .map(|r| r.rows_affected() as usize)
-            .unwrap_or(0);
+    // Touch next_attempt_at so oldest_pending_age reflects "re-queued at boot",
+    // not the original created_at. Without this, rows that were stuck in
+    // 'processing' across a restart show up as multi-minute-aged pending rows
+    // and the promote health gate fails even though the outbox worker picks
+    // them up on the next tick.
+    let stale_processing_outbox_reset = sqlx::query(
+        "UPDATE dispatch_outbox
+            SET status = 'pending',
+                next_attempt_at = NOW()
+          WHERE status = 'processing'",
+    )
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected() as usize)
+    .unwrap_or(0);
 
     let stale_dispatch_reservations_cleared =
         sqlx::query("DELETE FROM kv_meta WHERE key LIKE 'dispatch_reserving:%'")
