@@ -56,7 +56,7 @@
 | `cli::migrate::source` | `src/cli/migrate/source.rs` | 1612 | giant-file |
 | `cli::run` | `src/cli/run.rs` | 398 |  |
 | `cli::utils` | `src/cli/utils.rs` | 274 |  |
-| `config` | `src/config.rs` | 1707 | giant-file |
+| `config` | `src/config.rs` | 1697 | giant-file |
 | `crate` | `src/main.rs` | 42 |  |
 | `credential` | `src/credential.rs` | 24 |  |
 | `db` | `src/db/mod.rs` | 243 |  |
@@ -171,7 +171,7 @@
 | `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 577 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 648 |  |
 | `server::routes::session_activity` | `src/server/routes/session_activity.rs` | 371 |  |
-| `server::routes::settings` | `src/server/routes/settings.rs` | 1158 | giant-file |
+| `server::routes::settings` | `src/server/routes/settings.rs` | 1126 | giant-file |
 | `server::routes::skill_usage_analytics` | `src/server/routes/skill_usage_analytics.rs` | 512 |  |
 | `server::routes::skills_api` | `src/server/routes/skills_api.rs` | 784 |  |
 | `server::routes::stats` | `src/server/routes/stats.rs` | 911 |  |
@@ -276,7 +276,7 @@
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1232 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 245 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
-| `services::provider` | `src/services/provider.rs` | 2045 | giant-file |
+| `services::provider` | `src/services/provider.rs` | 2043 | giant-file |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 357 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 443 |  |

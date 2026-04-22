@@ -179,12 +179,12 @@
 | `POST` | `/api/sessions/{session_key}/force-kill` | `dispatched_sessions::force_kill_session` | `src/server/routes/dispatched_sessions.rs:2785` | `src/server/routes/domains/ops.rs:101` |
 | `GET` | `/api/settings` | `settings::get_settings` | `src/server/routes/settings.rs:34` | `src/server/routes/domains/admin.rs:45` |
 | `PUT` | `/api/settings` | `settings::put_settings` | `src/server/routes/settings.rs:91` | `src/server/routes/domains/admin.rs:45` |
-| `GET` | `/api/settings/config` | `settings::get_config_entries` | `src/server/routes/settings.rs:388` | `src/server/routes/domains/admin.rs:49` |
-| `PATCH` | `/api/settings/config` | `settings::patch_config_entries` | `src/server/routes/settings.rs:460` | `src/server/routes/domains/admin.rs:49` |
+| `GET` | `/api/settings/config` | `settings::get_config_entries` | `src/server/routes/settings.rs:368` | `src/server/routes/domains/admin.rs:49` |
+| `PATCH` | `/api/settings/config` | `settings::patch_config_entries` | `src/server/routes/settings.rs:440` | `src/server/routes/domains/admin.rs:49` |
 | `GET` | `/api/settings/escalation` | `escalation::get_escalation_settings` | `src/server/routes/escalation.rs:1746` | `src/server/routes/domains/admin.rs:57` |
 | `PUT` | `/api/settings/escalation` | `escalation::put_escalation_settings` | `src/server/routes/escalation.rs:1792` | `src/server/routes/domains/admin.rs:57` |
-| `GET` | `/api/settings/runtime-config` | `settings::get_runtime_config` | `src/server/routes/settings.rs:665` | `src/server/routes/domains/admin.rs:53` |
-| `PUT` | `/api/settings/runtime-config` | `settings::put_runtime_config` | `src/server/routes/settings.rs:675` | `src/server/routes/domains/admin.rs:53` |
+| `GET` | `/api/settings/runtime-config` | `settings::get_runtime_config` | `src/server/routes/settings.rs:645` | `src/server/routes/domains/admin.rs:53` |
+| `PUT` | `/api/settings/runtime-config` | `settings::put_runtime_config` | `src/server/routes/settings.rs:655` | `src/server/routes/domains/admin.rs:53` |
 | `GET` | `/api/skills-trend` | `analytics::skills_trend` | `src/server/routes/analytics.rs:913` | `src/server/routes/domains/admin.rs:73` |
 | `GET` | `/api/skills/catalog` | `skills_api::catalog` | `src/server/routes/skills_api.rs:370` | `src/server/routes/domains/ops.rs:113` |
 | `POST` | `/api/skills/prune` | `skills_api::prune` | `src/server/routes/skills_api.rs:651` | `src/server/routes/domains/ops.rs:115` |
