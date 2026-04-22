@@ -47,7 +47,7 @@ pub(crate) fn provider_has_mcp_server(provider: &ProviderKind, server_name: &str
         ProviderKind::Codex => {
             runtime_config_contains_server || codex_config_contains_server(normalized)
         }
-        ProviderKind::Gemini | ProviderKind::Qwen => runtime_config_contains_server,
+        ProviderKind::Gemini | ProviderKind::Qwen => false,
         ProviderKind::Unsupported(_) => false,
     }
 }
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_has_memento_mcp_reflects_runtime_config_for_all_supported_providers() {
+    fn provider_has_memento_mcp_reflects_runtime_config_for_runtime_mcp_providers() {
         with_test_env(|temp_root| {
             let runtime_root = temp_root.join(".adk").join("release");
             let config_path = crate::runtime_layout::config_file_path(&runtime_root);
@@ -414,8 +414,8 @@ mod tests {
 
             assert!(provider_has_memento_mcp(&ProviderKind::Claude));
             assert!(provider_has_memento_mcp(&ProviderKind::Codex));
-            assert!(provider_has_memento_mcp(&ProviderKind::Gemini));
-            assert!(provider_has_memento_mcp(&ProviderKind::Qwen));
+            assert!(!provider_has_memento_mcp(&ProviderKind::Gemini));
+            assert!(!provider_has_memento_mcp(&ProviderKind::Qwen));
         });
     }
 
@@ -450,8 +450,8 @@ mod tests {
             crate::config::save_to_path(&config_path, &config).unwrap();
 
             assert!(provider_has_mcp_server(&ProviderKind::Codex, "manual"));
-            assert!(provider_has_mcp_server(&ProviderKind::Gemini, "manual"));
-            assert!(provider_has_mcp_server(&ProviderKind::Qwen, "manual"));
+            assert!(!provider_has_mcp_server(&ProviderKind::Gemini, "manual"));
+            assert!(!provider_has_mcp_server(&ProviderKind::Qwen, "manual"));
         });
     }
 

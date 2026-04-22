@@ -249,7 +249,7 @@ impl ProviderKind {
     /// Returns true when AgentDesk can treat runtime-config MCP servers as
     /// available capability surface for this provider.
     pub fn supports_runtime_mcp_server_config(&self) -> bool {
-        matches!(self, Self::Claude | Self::Codex | Self::Gemini | Self::Qwen)
+        matches!(self, Self::Claude | Self::Codex)
     }
 
     /// Returns true when the provider CLI exposes an explicit native fast mode
@@ -265,9 +265,7 @@ impl ProviderKind {
         match self {
             Self::Claude => Some("context_compact_percent_claude"),
             Self::Codex => Some("context_compact_percent_codex"),
-            Self::Gemini => Some("context_compact_percent_gemini"),
-            Self::Qwen => Some("context_compact_percent_qwen"),
-            Self::Unsupported(_) => None,
+            Self::Gemini | Self::Qwen | Self::Unsupported(_) => None,
         }
     }
 
@@ -1536,14 +1534,14 @@ mod tests {
 
     #[test]
     fn test_provider_runtime_affordance_matrix_is_explicit() {
-        for provider in [
-            ProviderKind::Claude,
-            ProviderKind::Codex,
-            ProviderKind::Gemini,
-            ProviderKind::Qwen,
-        ] {
+        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
             assert!(provider.supports_runtime_mcp_server_config());
             assert!(provider.context_compact_override_key().is_some());
+        }
+
+        for provider in [ProviderKind::Gemini, ProviderKind::Qwen] {
+            assert!(!provider.supports_runtime_mcp_server_config());
+            assert!(provider.context_compact_override_key().is_none());
         }
 
         assert!(ProviderKind::Claude.supports_native_fast_mode());

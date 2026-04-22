@@ -315,8 +315,6 @@ const NUMERIC_CONFIG_KEYS = new Set([
   "context_compact_percent",
   "context_compact_percent_codex",
   "context_compact_percent_claude",
-  "context_compact_percent_gemini",
-  "context_compact_percent_qwen",
   "server_port",
 ]);
 
@@ -386,14 +384,6 @@ const SYSTEM_CONFIG_DESCRIPTIONS: Record<string, { ko: string; en: string }> = {
   context_compact_percent_claude: {
     ko: "Claude 전용 컨텍스트 compact 기준입니다.",
     en: "Provider-specific context compaction threshold for Claude.",
-  },
-  context_compact_percent_gemini: {
-    ko: "Gemini 전용 컨텍스트 compact 기준입니다.",
-    en: "Provider-specific context compaction threshold for Gemini.",
-  },
-  context_compact_percent_qwen: {
-    ko: "Qwen 전용 컨텍스트 compact 기준입니다.",
-    en: "Provider-specific context compaction threshold for Qwen.",
   },
 };
 

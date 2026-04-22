@@ -247,20 +247,6 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         "Claude Context Compact Threshold (%)",
         None,
     ),
-    (
-        "context_compact_percent_gemini",
-        "context",
-        "Gemini 컨텍스트 compact 임계값 (%)",
-        "Gemini Context Compact Threshold (%)",
-        None,
-    ),
-    (
-        "context_compact_percent_qwen",
-        "context",
-        "Qwen 컨텍스트 compact 임계값 (%)",
-        "Qwen Context Compact Threshold (%)",
-        None,
-    ),
 ];
 
 fn stringified_bool(value: Option<bool>) -> Option<String> {
@@ -291,12 +277,6 @@ fn yaml_section_value(config: &crate::config::Config, key: &str) -> Option<Strin
         }
         "context_compact_percent_claude" => {
             stringified_number(config.runtime.context_compact_percent_claude)
-        }
-        "context_compact_percent_gemini" => {
-            stringified_number(config.runtime.context_compact_percent_gemini)
-        }
-        "context_compact_percent_qwen" => {
-            stringified_number(config.runtime.context_compact_percent_qwen)
         }
         _ => None,
     }
@@ -721,8 +701,6 @@ mod tests {
 
         assert!(keys.contains("context_compact_percent_codex"));
         assert!(keys.contains("context_compact_percent_claude"));
-        assert!(keys.contains("context_compact_percent_gemini"));
-        assert!(keys.contains("context_compact_percent_qwen"));
         assert!(keys.contains("merge_automation_enabled"));
         assert!(keys.contains("merge_strategy"));
         assert!(keys.contains("merge_strategy_mode"));
@@ -826,13 +804,11 @@ mod tests {
                 "merge_allowed_authors": "itismyfield,octocat",
                 "context_compact_percent_codex": "85",
                 "context_compact_percent_claude": "75",
-                "context_compact_percent_gemini": "72",
-                "context_compact_percent_qwen": "69",
             })),
         )
         .await;
         assert_eq!(patch_status, StatusCode::OK);
-        assert_eq!(patch_body["updated"], json!(8));
+        assert_eq!(patch_body["updated"], json!(6));
         assert_eq!(patch_body["rejected"], json!([]));
 
         let (get_status, Json(get_body)) = get_config_entries(State(state)).await;
@@ -851,14 +827,6 @@ mod tests {
         assert_eq!(
             values.get("context_compact_percent_claude"),
             Some(&Some("75"))
-        );
-        assert_eq!(
-            values.get("context_compact_percent_gemini"),
-            Some(&Some("72"))
-        );
-        assert_eq!(
-            values.get("context_compact_percent_qwen"),
-            Some(&Some("69"))
         );
         assert_eq!(values.get("merge_automation_enabled"), Some(&Some("true")));
         assert_eq!(values.get("merge_strategy"), Some(&Some("rebase")));
