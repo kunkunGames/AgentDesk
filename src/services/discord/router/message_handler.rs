@@ -79,17 +79,6 @@ fn should_note_memento_context_loaded(
         && memory_recall.memento_context_loaded
 }
 
-fn update_memento_context_loaded_after_restore(
-    memento_context_loaded: bool,
-    restored_session_id: Option<&str>,
-) -> bool {
-    if restored_session_id.is_some() {
-        true
-    } else {
-        memento_context_loaded
-    }
-}
-
 fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
     // #750: announce bot no longer writes lifecycle emojis, so the command bot
     // is now the single source of ⏳ for both regular and dispatch turns.
@@ -395,13 +384,10 @@ pub(in crate::services::discord) async fn start_headless_turn(
                 let mut data = shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
                     session.restore_provider_session(restored.clone());
+                    memento_context_loaded = session.memento_context_loaded;
                 }
             }
             session_id = restored;
-            memento_context_loaded = update_memento_context_loaded_after_restore(
-                memento_context_loaded,
-                session_id.as_deref(),
-            );
         }
     }
 
@@ -1890,6 +1876,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 let mut data = shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
                     session.restore_provider_session(restored.clone());
+                    memento_context_loaded = session.memento_context_loaded;
                 }
                 // Notify: session restored — send before placeholder so it appears first
                 send_restore_notification(
@@ -1902,10 +1889,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                 .await;
             }
             session_id = restored;
-            memento_context_loaded = update_memento_context_loaded_after_restore(
-                memento_context_loaded,
-                session_id.as_deref(),
-            );
         }
     }
     let reply_context = merge_reply_contexts(
@@ -4304,19 +4287,6 @@ mod tests {
     }
 
     #[test]
-    fn restored_session_updates_loaded_snapshot() {
-        assert!(update_memento_context_loaded_after_restore(
-            false,
-            Some("session-1")
-        ));
-        assert!(update_memento_context_loaded_after_restore(
-            true,
-            Some("session-1")
-        ));
-        assert!(!update_memento_context_loaded_after_restore(false, None));
-    }
-
-    #[test]
     fn dispatch_turns_add_pending_reaction_as_single_source() {
         // #750: announce bot no longer writes ⏳. Command bot must add it on
         // dispatch turn start so the stop-via-reaction-removal path still
@@ -4392,16 +4362,15 @@ mod tests {
         let mut session = make_session(Some("/tmp/project".to_string()), None);
 
         session.restore_provider_session(Some("session-1".to_string()));
+        let mut memento_context_loaded = session.memento_context_loaded;
         assert!(!should_skip_memento_recall(
             &memento,
-            session.memento_context_loaded
+            memento_context_loaded
         ));
 
         session.note_memento_context_loaded();
-        assert!(should_skip_memento_recall(
-            &memento,
-            session.memento_context_loaded
-        ));
+        memento_context_loaded = session.memento_context_loaded;
+        assert!(should_skip_memento_recall(&memento, memento_context_loaded));
     }
 
     #[test]

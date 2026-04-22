@@ -4,7 +4,7 @@
 
 - Production Rust modules: `259`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `80`
+- Giant files: `81`
 
 ## Namespace Summary
 
@@ -40,7 +40,7 @@
 
 | Module | Path | Lines | Flags |
 | --- | --- | ---: | --- |
-| `bootstrap` | `src/bootstrap.rs` | 57 |  |
+| `bootstrap` | `src/bootstrap.rs` | 63 |  |
 | `cli` | `src/cli/mod.rs` | 18 |  |
 | `cli::args` | `src/cli/args.rs` | 822 |  |
 | `cli::client` | `src/cli/client.rs` | 1498 | giant-file |
@@ -190,14 +190,14 @@
 | `services::codex` | `src/services/codex.rs` | 1616 | giant-file |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 537 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 2300 | giant-file |
-| `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 722 |  |
+| `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 747 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 978 |  |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 47 |  |
 | `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1747 | giant-file |
 | `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 808 |  |
 | `services::discord::commands::diagnostics` | `src/services/discord/commands/diagnostics.rs` | 1037 | giant-file |
 | `services::discord::commands::fast_mode` | `src/services/discord/commands/fast_mode.rs` | 147 |  |
-| `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 70 |  |
+| `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 75 |  |
 | `services::discord::commands::mcp_reload` | `src/services/discord/commands/mcp_reload.rs` | 218 |  |
 | `services::discord::commands::meeting_cmd` | `src/services/discord/commands/meeting_cmd.rs` | 105 |  |
 | `services::discord::commands::model_picker` | `src/services/discord/commands/model_picker.rs` | 183 |  |
@@ -232,7 +232,7 @@
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 14 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
 | `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 1103 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 4742 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 4725 | giant-file |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 129 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 1763 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 329 |  |
@@ -264,7 +264,7 @@
 | `services::dispatches` | `src/services/dispatches.rs` | 568 |  |
 | `services::gemini` | `src/services/gemini.rs` | 2546 | giant-file |
 | `services::kanban` | `src/services/kanban.rs` | 177 |  |
-| `services::mcp_config` | `src/services/mcp_config.rs` | 632 |  |
+| `services::mcp_config` | `src/services/mcp_config.rs` | 1067 | giant-file |
 | `services::memory` | `src/services/memory/mod.rs` | 338 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 114 |  |
 | `services::memory::memento` | `src/services/memory/memento.rs` | 1941 | giant-file |
@@ -276,7 +276,7 @@
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1232 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 245 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
-| `services::provider` | `src/services/provider.rs` | 1976 | giant-file |
+| `services::provider` | `src/services/provider.rs` | 2050 | giant-file |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 357 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 443 |  |
