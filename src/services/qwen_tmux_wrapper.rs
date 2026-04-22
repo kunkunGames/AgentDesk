@@ -479,6 +479,10 @@ fn normalize_qwen_line(line: &str, state: &mut TurnNormalizationState) -> Vec<Va
     }
 }
 
+// After normalize_qwen_line expansion, LLM text/thinking/tool-use arrives as "assistant" events
+// and tool results arrive as "user" events.  "system" (session bookkeeping) and "result" (terminal
+// signal) represent protocol framing, not LLM progress, so they intentionally do not qualify.
+// This is consistent with qwen.rs where mark_meaningful_progress is called only on content events.
 fn is_meaningful_progress_event(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(|value| value.as_str()),
