@@ -3036,24 +3036,16 @@ pub async fn rereview_card(
 
     crate::kanban::correct_tn_to_fn_on_reopen(&state.db, state.pg_pool.as_ref(), &id);
 
-    let card = {
-        let conn = match state.db.lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-
-        conn.execute(
+    // Reset completed_at + advance any active auto-queue entries linked to
+    // this card. SQLite work is best-effort because PG-only cards have no
+    // SQLite row; the canonical card view comes from PG below.
+    if let Ok(conn) = state.db.lock() {
+        let _ = conn.execute(
             "UPDATE kanban_cards
              SET completed_at = NULL, updated_at = datetime('now')
              WHERE id = ?1",
             [&id],
-        )
-        .ok();
+        );
 
         let entry_ids: Vec<String> = conn
             .prepare(
@@ -3081,13 +3073,41 @@ pub async fn rereview_card(
                     slot_index: None,
                 },
             ) {
+                tracing::warn!(
+                    card_id = %id,
+                    %error,
+                    "[rereview] sqlite auto-queue entry update failed (entry may live only in PG)"
+                );
+            }
+        }
+    }
+
+    let card = if let Some(pool) = state.pg_pool.as_ref() {
+        match load_card_json_pg(pool, &id).await {
+            Ok(Some(card)) => card,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("card not found: {id}")})),
+                );
+            }
+            Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("{error}")})),
                 );
             }
         }
-
+    } else {
+        let conn = match state.db.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{e}")})),
+                );
+            }
+        };
         match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
             card_row_to_json(row)
         }) {
