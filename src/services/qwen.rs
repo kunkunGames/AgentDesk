@@ -43,7 +43,11 @@ use crate::services::tmux_diagnostics::{
 const QWEN_CANCELLED_MESSAGE: &str = "Qwen request cancelled";
 const QWEN_SESSION_DEAD_MESSAGE: &str = "Qwen stream ended without a terminal result";
 pub(crate) const QWEN_STREAM_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+// Allow up to 60 s for the first token: covers cold start, model loading, and upstream rate-limit
+// backoffs that happen before the session produces any meaningful output.
 pub(crate) const QWEN_STREAM_STARTUP_WATCHDOG: Duration = Duration::from_secs(60);
+// Allow up to 120 s of silence after progress has been seen: covers long-running tool calls
+// (e.g. cargo build, test suites) where the model is waiting for a tool result between turns.
 pub(crate) const QWEN_STREAM_IDLE_WATCHDOG: Duration = Duration::from_secs(120);
 pub(crate) const QWEN_MAX_SESSION_RETRIES: usize = 1;
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
@@ -109,6 +113,10 @@ impl QwenStreamWatchdog {
         self.poll_timeout
     }
 
+    // Called on every received line, not just meaningful ones.  Any stream activity resets both
+    // accumulators so a session that is producing non-content output (init handshake, system
+    // events) does not get prematurely retried.  The startup-vs-idle threshold selection is made
+    // by `on_timeout` based on `meaningful_progress_seen`, not here.
     pub(crate) fn observe_line(&mut self) {
         self.startup_silent_for = Duration::ZERO;
         self.idle_silent_for = Duration::ZERO;
@@ -2235,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen_stream_watchdog_ignores_timeout_after_terminal_result() {
+    fn qwen_stream_watchdog_eof_after_terminal_result() {
         let (tx, rx) = mpsc::channel();
         let mut state = QwenAttemptState::default();
         tx.send(QwenStreamEvent::Line(
@@ -2262,6 +2270,35 @@ mod tests {
         assert_eq!(result, QwenStreamLoopResult::Eof);
         assert!(state.terminal_result_seen);
         assert!(state.meaningful_progress_seen);
+    }
+
+    #[test]
+    fn qwen_stream_watchdog_non_meaningful_line_resets_timer_but_not_progress() {
+        // A system/session_start event resets idle timers (observe_line) but must not set
+        // meaningful_progress_seen, so the startup watchdog fires rather than the idle one.
+        let (tx, rx) = mpsc::channel();
+        let mut state = QwenAttemptState::default();
+        tx.send(QwenStreamEvent::Line(
+            r#"{"type":"system","subtype":"session_start","session_id":"s1"}"#.to_string(),
+        ))
+        .unwrap();
+
+        let watchdog = QwenStreamWatchdog::new(
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+        let expected_message = watchdog.startup_retry_message();
+
+        let result = collect_qwen_stream_events(&rx, None, &mut state, watchdog);
+
+        assert_eq!(
+            result,
+            QwenStreamLoopResult::RetrySession {
+                message: expected_message,
+            }
+        );
+        assert!(!state.meaningful_progress_seen, "system event must not mark progress");
     }
 
     #[test]
