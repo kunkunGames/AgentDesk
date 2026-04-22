@@ -157,7 +157,7 @@ pub async fn run(
         seed_startup_runtime_state(&db, &config);
     }
     crate::pipeline::refresh_override_health_report(&db, pg_pool.as_ref()).await;
-    crate::reconcile::reconcile_boot_runtime(&db, &engine)?;
+    crate::reconcile::reconcile_boot_runtime(&db, &engine, pg_pool.as_ref()).await?;
 
     let mut worker_registry = worker_registry::SupervisedWorkerRegistry::new(
         config.clone(),
