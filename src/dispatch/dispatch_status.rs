@@ -310,6 +310,35 @@ async fn set_dispatch_status_on_pg(
                 anyhow::anyhow!("enqueue postgres status_reaction for {dispatch_id}: {error}")
             })?;
         }
+
+        // Sync any auto_queue_entry bound to this dispatch when the dispatch
+        // reaches a terminal status. The card-terminal SyncAutoQueue intent
+        // (transition.rs) only fires when the *card* goes terminal — but an
+        // implementation dispatch typically completes into `review`, leaving
+        // the entry stuck at `dispatched` until the card eventually reaches
+        // `done`. Mirror dispatch terminal here so the slot frees promptly.
+        if matches!(to_status, "completed" | "failed" | "cancelled") {
+            let entry_status = match to_status {
+                "completed" => crate::db::auto_queue::ENTRY_STATUS_DONE,
+                "failed" => crate::db::auto_queue::ENTRY_STATUS_FAILED,
+                _ => crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
+            };
+            sqlx::query(
+                "UPDATE auto_queue_entries
+                    SET status = $1
+                  WHERE dispatch_id = $2
+                    AND status = 'dispatched'",
+            )
+            .bind(entry_status)
+            .bind(dispatch_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "sync auto_queue_entries on dispatch terminal {dispatch_id}: {error}"
+                )
+            })?;
+        }
     }
 
     tx.commit()
@@ -647,6 +676,24 @@ pub(crate) fn set_dispatch_status_on_conn(
             };
             if enqueue {
                 ensure_dispatch_status_reaction_outbox_on_conn(conn, dispatch_id)?;
+            }
+
+            // Sync any auto_queue_entry bound to this dispatch when the
+            // dispatch reaches a terminal status. See PG twin in
+            // set_dispatch_status_on_pg for the rationale.
+            if matches!(to_status, "completed" | "failed" | "cancelled") {
+                let entry_status = match to_status {
+                    "completed" => crate::db::auto_queue::ENTRY_STATUS_DONE,
+                    "failed" => crate::db::auto_queue::ENTRY_STATUS_FAILED,
+                    _ => crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
+                };
+                conn.execute(
+                    "UPDATE auto_queue_entries
+                        SET status = ?1
+                      WHERE dispatch_id = ?2
+                        AND status = 'dispatched'",
+                    libsql_rusqlite::params![entry_status, dispatch_id],
+                )?;
             }
         }
         Ok(changed)
