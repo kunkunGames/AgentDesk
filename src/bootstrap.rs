@@ -52,6 +52,12 @@ pub(crate) fn initialize() -> Result<BootstrapState> {
     if let Err(error) = crate::services::mcp_config::sync_codex_mcp_servers(&config) {
         tracing::warn!("  [mcp] Failed to sync Codex MCP servers: {error}");
     }
+    if let Err(error) = crate::services::mcp_config::sync_gemini_mcp_servers(&config) {
+        tracing::warn!("  [mcp] Failed to sync Gemini MCP servers: {error}");
+    }
+    if let Err(error) = crate::services::mcp_config::sync_qwen_mcp_servers(&config) {
+        tracing::warn!("  [mcp] Failed to sync Qwen MCP servers: {error}");
+    }
 
     Ok(BootstrapState { config })
 }

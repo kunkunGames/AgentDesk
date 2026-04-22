@@ -9,6 +9,8 @@ use crate::services::discord::runtime_store::atomic_write;
 use crate::services::provider::ProviderKind;
 
 const CODEX_SYNC_STATE_FILE: &str = "codex-mcp-sync-state.json";
+const GEMINI_SYNC_STATE_FILE: &str = "gemini-mcp-sync-state.json";
+const QWEN_SYNC_STATE_FILE: &str = "qwen-mcp-sync-state.json";
 const MEMENTO_SERVER_NAME: &str = "memento";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,16 +21,31 @@ struct ResolvedMcpServer {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct CodexMcpSyncState {
+struct ManagedMcpSyncState {
     #[serde(default)]
     managed_servers: Vec<String>,
 }
 
 pub(crate) fn provider_has_memento_mcp(provider: &ProviderKind) -> bool {
-    provider_has_mcp_server(provider, MEMENTO_SERVER_NAME)
+    provider_has_memento_mcp_in_workspace(provider, None)
+}
+
+pub(crate) fn provider_has_memento_mcp_in_workspace(
+    provider: &ProviderKind,
+    working_dir: Option<&str>,
+) -> bool {
+    provider_has_mcp_server_in_workspace(provider, MEMENTO_SERVER_NAME, working_dir)
 }
 
 pub(crate) fn provider_has_mcp_server(provider: &ProviderKind, server_name: &str) -> bool {
+    provider_has_mcp_server_in_workspace(provider, server_name, None)
+}
+
+pub(crate) fn provider_has_mcp_server_in_workspace(
+    provider: &ProviderKind,
+    server_name: &str,
+    working_dir: Option<&str>,
+) -> bool {
     let normalized = server_name.trim();
     if normalized.is_empty() {
         return false;
@@ -47,7 +64,8 @@ pub(crate) fn provider_has_mcp_server(provider: &ProviderKind, server_name: &str
         ProviderKind::Codex => {
             runtime_config_contains_server || codex_config_contains_server(normalized)
         }
-        ProviderKind::Gemini | ProviderKind::Qwen => false,
+        ProviderKind::Gemini => gemini_settings_contains_server(normalized, working_dir),
+        ProviderKind::Qwen => qwen_settings_contains_server(normalized, working_dir),
         ProviderKind::Unsupported(_) => false,
     }
 }
@@ -69,7 +87,7 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(CODEX_SYNC_STATE_FILE);
     let desired = resolved_mcp_servers(config);
-    let previous = load_codex_sync_state_from_path(&sync_state_path);
+    let previous = load_managed_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
         .managed_servers
@@ -88,7 +106,7 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
     };
 
     for removed in previous_names.difference(&desired_names) {
-        run_codex_command(&codex_bin, ["mcp", "remove", removed.as_str()])?;
+        run_provider_command(&codex_bin, ["mcp", "remove", removed.as_str()])?;
     }
 
     for server in desired.values() {
@@ -108,16 +126,24 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
             args.push("--bearer-token-env-var".to_string());
             args.push(token_env_var.to_string());
         }
-        run_codex_command_vec(&codex_bin, &args)?;
+        run_provider_command_vec(&codex_bin, &args)?;
     }
 
-    let next_state = CodexMcpSyncState {
+    let next_state = ManagedMcpSyncState {
         managed_servers: desired_names.into_iter().collect(),
     };
     let serialized = serde_json::to_string_pretty(&next_state)
         .map_err(|error| format!("Failed to serialize Codex MCP sync state: {error}"))?;
     atomic_write(&sync_state_path, &serialized)?;
     Ok(())
+}
+
+pub(crate) fn sync_gemini_mcp_servers(config: &Config) -> Result<(), String> {
+    sync_http_mcp_servers_via_cli("gemini", GEMINI_SYNC_STATE_FILE, config)
+}
+
+pub(crate) fn sync_qwen_mcp_servers(config: &Config) -> Result<(), String> {
+    sync_http_mcp_servers_via_cli("qwen", QWEN_SYNC_STATE_FILE, config)
 }
 
 fn claude_mcp_config_arg_from_servers(
@@ -229,10 +255,10 @@ fn load_runtime_config() -> Option<Config> {
         .and_then(|path| crate::config::load_from_path(&path).ok())
 }
 
-fn load_codex_sync_state_from_path(path: &Path) -> CodexMcpSyncState {
+fn load_managed_sync_state_from_path(path: &Path) -> ManagedMcpSyncState {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<CodexMcpSyncState>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<ManagedMcpSyncState>(&raw).ok())
         .unwrap_or_default()
 }
 
@@ -264,6 +290,47 @@ fn codex_config_contains_server(server_name: &str) -> bool {
         .any(|candidate| candidate == server_name)
 }
 
+fn gemini_settings_contains_server(server_name: &str, working_dir: Option<&str>) -> bool {
+    json_settings_contains_server(
+        current_home_dir().map(|home| home.join(".gemini").join("settings.json")),
+        server_name,
+    ) || json_settings_contains_server(project_settings_path(working_dir, ".gemini"), server_name)
+}
+
+fn qwen_settings_contains_server(server_name: &str, working_dir: Option<&str>) -> bool {
+    json_settings_contains_server(
+        current_home_dir().map(|home| home.join(".qwen").join("settings.json")),
+        server_name,
+    ) || json_settings_contains_server(project_settings_path(working_dir, ".qwen"), server_name)
+}
+
+fn project_settings_path(working_dir: Option<&str>, provider_dir: &str) -> Option<PathBuf> {
+    let working_dir = working_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(
+        Path::new(working_dir)
+            .join(provider_dir)
+            .join("settings.json"),
+    )
+}
+
+fn json_settings_contains_server(path: Option<PathBuf>, server_name: &str) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .is_some_and(|servers| servers.contains_key(server_name))
+}
+
 fn parse_codex_mcp_section_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let prefix = "[mcp_servers.";
@@ -279,9 +346,9 @@ fn parse_codex_mcp_section_name(line: &str) -> Option<String> {
     Some(section.to_string())
 }
 
-fn run_codex_command(codex_bin: &str, args: [&str; 3]) -> Result<(), String> {
-    run_codex_command_vec(
-        codex_bin,
+fn run_provider_command(provider_bin: &str, args: [&str; 3]) -> Result<(), String> {
+    run_provider_command_vec(
+        provider_bin,
         &args
             .iter()
             .map(|value| (*value).to_string())
@@ -289,11 +356,11 @@ fn run_codex_command(codex_bin: &str, args: [&str; 3]) -> Result<(), String> {
     )
 }
 
-fn run_codex_command_vec(codex_bin: &str, args: &[String]) -> Result<(), String> {
-    let output = Command::new(codex_bin)
+fn run_provider_command_vec(provider_bin: &str, args: &[String]) -> Result<(), String> {
+    let output = Command::new(provider_bin)
         .args(args)
         .output()
-        .map_err(|error| format!("Failed to run `{codex_bin} {}`: {error}", args.join(" ")))?;
+        .map_err(|error| format!("Failed to run `{provider_bin} {}`: {error}", args.join(" ")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -306,11 +373,89 @@ fn run_codex_command_vec(codex_bin: &str, args: &[String]) -> Result<(), String>
         stdout
     } else {
         format!(
-            "`{codex_bin} {}` exited with code {:?}",
+            "`{provider_bin} {}` exited with code {:?}",
             args.join(" "),
             output.status.code()
         )
     })
+}
+
+fn sync_http_mcp_servers_via_cli(
+    provider_id: &str,
+    sync_state_file: &str,
+    config: &Config,
+) -> Result<(), String> {
+    let runtime_root = crate::config::runtime_root()
+        .ok_or_else(|| "AGENTDESK_ROOT_DIR is unavailable".to_string())?;
+    let sync_state_path = crate::runtime_layout::config_dir(&runtime_root).join(sync_state_file);
+    let desired = resolved_mcp_servers(config);
+    let previous = load_managed_sync_state_from_path(&sync_state_path);
+    let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
+    let previous_names = previous
+        .managed_servers
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    let resolution = crate::services::platform::resolve_provider_binary(provider_id);
+    let provider_bin = match resolution.resolved_path {
+        Some(path) => path,
+        None => {
+            if desired_names.is_empty() && previous_names.is_empty() {
+                return Ok(());
+            }
+            let display_name = ProviderKind::from_str(provider_id)
+                .map(|provider| provider.display_name().to_string())
+                .unwrap_or_else(|| provider_id.to_string());
+            return Err(format!("{display_name} CLI not found"));
+        }
+    };
+
+    for removed in previous_names.difference(&desired_names) {
+        let args = vec![
+            "mcp".to_string(),
+            "remove".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+            removed.to_string(),
+        ];
+        run_provider_command_vec(&provider_bin, &args)?;
+    }
+
+    for server in desired.values() {
+        let mut args = vec![
+            "mcp".to_string(),
+            "add".to_string(),
+            "--scope".to_string(),
+            "user".to_string(),
+            "--transport".to_string(),
+            "http".to_string(),
+            "--trust".to_string(),
+        ];
+        if let Some(header_value) = bearer_auth_header_value(server) {
+            args.push("--header".to_string());
+            args.push(header_value);
+        }
+        args.push(server.name.clone());
+        args.push(server.url.clone());
+        run_provider_command_vec(&provider_bin, &args)?;
+    }
+
+    let next_state = ManagedMcpSyncState {
+        managed_servers: desired_names.into_iter().collect(),
+    };
+    let serialized = serde_json::to_string_pretty(&next_state)
+        .map_err(|error| format!("Failed to serialize {provider_id} MCP sync state: {error}"))?;
+    atomic_write(&sync_state_path, &serialized)?;
+    Ok(())
+}
+
+fn bearer_auth_header_value(server: &ResolvedMcpServer) -> Option<String> {
+    server
+        .bearer_token_env_var
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|token_env_var| format!("Authorization: Bearer ${{{token_env_var}}}"))
 }
 
 #[cfg(test)]
@@ -366,6 +511,123 @@ mod tests {
         fs::set_permissions(path, perms).unwrap();
     }
 
+    #[cfg(unix)]
+    fn write_json_mcp_cli_executable(path: &Path) {
+        let script = r#"#!/bin/sh
+set -eu
+provider="$(basename "$0")"
+CONFIG_DIR="${HOME}/.${provider}"
+CONFIG_FILE="${CONFIG_DIR}/settings.json"
+mkdir -p "${CONFIG_DIR}"
+
+if [ "$1" = "mcp" ] && [ "$2" = "add" ]; then
+  shift 2
+  header=""
+  name=""
+  url=""
+  trust=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --scope|--transport)
+        shift 2
+        ;;
+      --header)
+        header="$2"
+        shift 2
+        ;;
+      --trust)
+        trust="1"
+        shift
+        ;;
+      --debug|-d)
+        shift
+        ;;
+      *)
+        if [ -z "$name" ]; then
+          name="$1"
+        elif [ -z "$url" ]; then
+          url="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  python3 - "$CONFIG_FILE" "$provider" "$name" "$url" "$header" "$trust" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+provider, name, url, header, trust = sys.argv[2:7]
+root = {}
+if path.exists() and path.stat().st_size:
+    root = json.loads(path.read_text())
+if not isinstance(root, dict):
+    root = {}
+servers = root.get("mcpServers")
+if not isinstance(servers, dict):
+    servers = {}
+root["mcpServers"] = servers
+entry = {"trust": bool(trust)}
+if provider == "gemini":
+    entry["type"] = "http"
+    entry["url"] = url
+elif provider == "qwen":
+    entry["httpUrl"] = url
+else:
+    raise SystemExit(f"unexpected provider: {provider}")
+if header:
+    key, value = header.split(":", 1)
+    entry["headers"] = {key.strip(): value.strip()}
+servers[name] = entry
+path.write_text(json.dumps(root, indent=2, sort_keys=True) + "\n")
+PY
+  exit 0
+fi
+
+if [ "$1" = "mcp" ] && [ "$2" = "remove" ]; then
+  shift 2
+  name=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --scope)
+        shift 2
+        ;;
+      --debug|-d)
+        shift
+        ;;
+      *)
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+  python3 - "$CONFIG_FILE" "$name" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+name = sys.argv[2]
+if not path.exists():
+    raise SystemExit(0)
+root = json.loads(path.read_text()) if path.stat().st_size else {}
+if not isinstance(root, dict):
+    root = {}
+servers = root.get("mcpServers")
+if isinstance(servers, dict):
+    servers.pop(name, None)
+path.write_text(json.dumps(root, indent=2, sort_keys=True) + "\n")
+PY
+  exit 0
+fi
+
+echo "unexpected args: $*" >&2
+exit 1
+"#;
+        write_executable(path, script);
+    }
+
     #[test]
     fn claude_mcp_config_arg_from_config_renders_http_servers() {
         let mut config = Config::default();
@@ -398,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_has_memento_mcp_reflects_runtime_config_for_runtime_mcp_providers() {
+    fn provider_has_memento_mcp_reflects_runtime_config_for_claude_and_codex() {
         with_test_env(|temp_root| {
             let runtime_root = temp_root.join(".adk").join("release");
             let config_path = crate::runtime_layout::config_file_path(&runtime_root);
@@ -414,8 +676,6 @@ mod tests {
 
             assert!(provider_has_memento_mcp(&ProviderKind::Claude));
             assert!(provider_has_memento_mcp(&ProviderKind::Codex));
-            assert!(!provider_has_memento_mcp(&ProviderKind::Gemini));
-            assert!(!provider_has_memento_mcp(&ProviderKind::Qwen));
         });
     }
 
@@ -435,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_has_mcp_server_falls_back_to_runtime_config_for_supported_non_claude_providers() {
+    fn provider_has_mcp_server_falls_back_to_runtime_config_for_claude_and_codex() {
         with_test_env(|temp_root| {
             let runtime_root = temp_root.join(".adk").join("release");
             let config_path = crate::runtime_layout::config_file_path(&runtime_root);
@@ -449,9 +709,37 @@ mod tests {
             );
             crate::config::save_to_path(&config_path, &config).unwrap();
 
+            assert!(provider_has_mcp_server(&ProviderKind::Claude, "manual"));
             assert!(provider_has_mcp_server(&ProviderKind::Codex, "manual"));
-            assert!(!provider_has_mcp_server(&ProviderKind::Gemini, "manual"));
-            assert!(!provider_has_mcp_server(&ProviderKind::Qwen, "manual"));
+        });
+    }
+
+    #[test]
+    fn provider_has_memento_mcp_detects_manual_gemini_and_qwen_settings() {
+        with_test_env(|temp_root| {
+            let gemini_dir = temp_root.join(".gemini");
+            fs::create_dir_all(&gemini_dir).unwrap();
+            fs::write(
+                gemini_dir.join("settings.json"),
+                r#"{"mcpServers":{"memento":{"type":"http","url":"http://localhost:57332/mcp","trust":true}}}"#,
+            )
+            .unwrap();
+
+            let workspace = temp_root.join("workspace");
+            let qwen_dir = workspace.join(".qwen");
+            fs::create_dir_all(&qwen_dir).unwrap();
+            fs::write(
+                qwen_dir.join("settings.json"),
+                r#"{"mcpServers":{"memento":{"httpUrl":"http://localhost:57332/mcp","trust":true}}}"#,
+            )
+            .unwrap();
+
+            assert!(provider_has_memento_mcp(&ProviderKind::Gemini));
+            assert!(!provider_has_memento_mcp(&ProviderKind::Qwen));
+            assert!(provider_has_memento_mcp_in_workspace(
+                &ProviderKind::Qwen,
+                workspace.to_str()
+            ));
         });
     }
 
@@ -591,7 +879,7 @@ exit 1
                 crate::runtime_layout::config_dir(&runtime_root).join(CODEX_SYNC_STATE_FILE);
             fs::write(
                 &sync_state_path,
-                serde_json::to_string(&CodexMcpSyncState {
+                serde_json::to_string(&ManagedMcpSyncState {
                     managed_servers: vec!["old".to_string()],
                 })
                 .unwrap(),
@@ -618,9 +906,146 @@ exit 1
             assert!(rendered.contains("bearer_token_env_var = \"MEMENTO_ACCESS_KEY\""));
             assert!(!rendered.contains("[mcp_servers.old]"));
 
-            let state = load_codex_sync_state_from_path(&sync_state_path);
+            let state = load_managed_sync_state_from_path(&sync_state_path);
             assert_eq!(state.managed_servers, vec!["memento".to_string()]);
             assert!(provider_has_memento_mcp(&ProviderKind::Codex));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_gemini_mcp_servers_updates_managed_servers_without_touching_others() {
+        with_test_env(|temp_root| {
+            let runtime_root = temp_root.join(".adk").join("release");
+            let bin_dir = temp_root.join("bin");
+            fs::create_dir_all(&bin_dir).unwrap();
+            write_json_mcp_cli_executable(&bin_dir.join("gemini"));
+
+            let previous_path = std::env::var_os("PATH").unwrap_or_default();
+            let combined_path =
+                format!("{}:{}", bin_dir.display(), previous_path.to_string_lossy());
+            unsafe { std::env::set_var("PATH", combined_path) };
+
+            let gemini_dir = temp_root.join(".gemini");
+            fs::create_dir_all(&gemini_dir).unwrap();
+            fs::write(
+                gemini_dir.join("settings.json"),
+                r#"{"approvalMode":"default","mcpServers":{"manual":{"type":"http","url":"http://manual.local/mcp","trust":true},"old":{"type":"http","url":"http://old.local/mcp","trust":true}}}"#,
+            )
+            .unwrap();
+
+            let sync_state_path =
+                crate::runtime_layout::config_dir(&runtime_root).join(GEMINI_SYNC_STATE_FILE);
+            fs::write(
+                &sync_state_path,
+                serde_json::to_string(&ManagedMcpSyncState {
+                    managed_servers: vec!["old".to_string()],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut config = Config::default();
+            config.mcp_servers.insert(
+                "memento".to_string(),
+                McpServerConfig {
+                    url: "http://localhost:57332/mcp".to_string(),
+                    auth: Some(crate::config::McpServerAuthConfig {
+                        auth_type: McpServerAuthType::Bearer,
+                        token_env_var: Some("MEMENTO_ACCESS_KEY".to_string()),
+                    }),
+                },
+            );
+
+            sync_gemini_mcp_servers(&config).unwrap();
+
+            let rendered: Value = serde_json::from_str(
+                &fs::read_to_string(gemini_dir.join("settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(rendered["mcpServers"].get("manual").is_some());
+            assert!(rendered["mcpServers"].get("memento").is_some());
+            assert!(rendered["mcpServers"].get("old").is_none());
+            assert_eq!(
+                rendered["mcpServers"]["memento"]["headers"]["Authorization"],
+                Value::String("Bearer ${MEMENTO_ACCESS_KEY}".to_string())
+            );
+            assert_eq!(
+                rendered["mcpServers"]["memento"]["type"],
+                Value::String("http".to_string())
+            );
+
+            let state = load_managed_sync_state_from_path(&sync_state_path);
+            assert_eq!(state.managed_servers, vec!["memento".to_string()]);
+            assert!(provider_has_memento_mcp(&ProviderKind::Gemini));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_qwen_mcp_servers_updates_managed_servers_without_touching_others() {
+        with_test_env(|temp_root| {
+            let runtime_root = temp_root.join(".adk").join("release");
+            let bin_dir = temp_root.join("bin");
+            fs::create_dir_all(&bin_dir).unwrap();
+            write_json_mcp_cli_executable(&bin_dir.join("qwen"));
+
+            let previous_path = std::env::var_os("PATH").unwrap_or_default();
+            let combined_path =
+                format!("{}:{}", bin_dir.display(), previous_path.to_string_lossy());
+            unsafe { std::env::set_var("PATH", combined_path) };
+
+            let qwen_dir = temp_root.join(".qwen");
+            fs::create_dir_all(&qwen_dir).unwrap();
+            fs::write(
+                qwen_dir.join("settings.json"),
+                r#"{"model":"qwen3","mcpServers":{"manual":{"httpUrl":"http://manual.local/mcp","trust":true},"old":{"httpUrl":"http://old.local/mcp","trust":true}}}"#,
+            )
+            .unwrap();
+
+            let sync_state_path =
+                crate::runtime_layout::config_dir(&runtime_root).join(QWEN_SYNC_STATE_FILE);
+            fs::write(
+                &sync_state_path,
+                serde_json::to_string(&ManagedMcpSyncState {
+                    managed_servers: vec!["old".to_string()],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut config = Config::default();
+            config.mcp_servers.insert(
+                "memento".to_string(),
+                McpServerConfig {
+                    url: "http://localhost:57332/mcp".to_string(),
+                    auth: Some(crate::config::McpServerAuthConfig {
+                        auth_type: McpServerAuthType::Bearer,
+                        token_env_var: Some("MEMENTO_ACCESS_KEY".to_string()),
+                    }),
+                },
+            );
+
+            sync_qwen_mcp_servers(&config).unwrap();
+
+            let rendered: Value =
+                serde_json::from_str(&fs::read_to_string(qwen_dir.join("settings.json")).unwrap())
+                    .unwrap();
+            assert!(rendered["mcpServers"].get("manual").is_some());
+            assert!(rendered["mcpServers"].get("memento").is_some());
+            assert!(rendered["mcpServers"].get("old").is_none());
+            assert_eq!(
+                rendered["mcpServers"]["memento"]["headers"]["Authorization"],
+                Value::String("Bearer ${MEMENTO_ACCESS_KEY}".to_string())
+            );
+            assert_eq!(
+                rendered["mcpServers"]["memento"]["httpUrl"],
+                Value::String("http://localhost:57332/mcp".to_string())
+            );
+
+            let state = load_managed_sync_state_from_path(&sync_state_path);
+            assert_eq!(state.managed_servers, vec!["memento".to_string()]);
+            assert!(provider_has_memento_mcp(&ProviderKind::Qwen));
         });
     }
 

@@ -4,12 +4,19 @@ use crate::services::provider::ProviderKind;
 /// /help — Show help information
 #[poise::command(slash_command, rename = "help")]
 pub(in crate::services::discord) async fn cmd_help(ctx: Context<'_>) -> Result<(), Error> {
-    let provider_name = ctx.data().provider.display_name();
-    let model_section = match ctx.data().provider {
+    let provider = &ctx.data().provider;
+    let provider_name = provider.display_name();
+    let model_section = match provider {
         ProviderKind::Claude | ProviderKind::Codex => {
             "\n`/model` — Open the model picker for this channel\n`/fast` — Toggle native fast mode for this channel"
         }
         _ => "\n`/model` — Open the model picker for this channel",
+    };
+    let mcp_section = match provider {
+        ProviderKind::Claude => {
+            "\n**MCP Reload**\n`/mcp-reload` — Restart Claude session to pick up newly-authenticated MCP servers (preserves conversation via --resume)"
+        }
+        _ => "",
     };
     let help = format!(
         "\
@@ -49,9 +56,7 @@ AI can read, edit, and run commands in your session.
 
 **Skills**
 `/cc <skill>` — Run a provider skill (autocomplete)
-
-**MCP** (Claude only)
-`/mcp-reload` — Restart Claude session to pick up newly-authenticated MCP servers (preserves conversation via --resume)
+{}
 
 **Settings**
 {}
@@ -62,7 +67,7 @@ AI can read, edit, and run commands in your session.
 `/adduser @user` — Allow a user to use the bot
 `/removeuser @user` — Remove a user's access
 `/help` — Show this help",
-        provider_name, provider_name, provider_name, model_section
+        provider_name, provider_name, provider_name, mcp_section, model_section
     );
 
     ctx.say(help).await?;
