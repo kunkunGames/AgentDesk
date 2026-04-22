@@ -7,6 +7,42 @@ use super::super::AppState;
 use super::review_state_repo::update_card_review_state;
 use super::tuning_aggregate::{record_decision_tuning, spawn_aggregate_if_needed_with_pg};
 
+/// PG-first wrapper around `crate::kanban::transition_status_with_opts`.
+///
+/// SQLite-only callers fail with `card not found` after the PG cutover when
+/// the card lives only in Postgres. Prefer `transition_status_with_opts_pg`
+/// when a PG pool is configured and fall through to the legacy SQLite path
+/// only when running without PG.
+async fn transition_status_pg_first(
+    state: &AppState,
+    card_id: &str,
+    new_status: &str,
+    source: &str,
+    force_intent: crate::engine::transition::ForceIntent,
+) -> anyhow::Result<crate::kanban::TransitionResult> {
+    if let Some(pool) = state.pg_pool.as_ref() {
+        crate::kanban::transition_status_with_opts_pg(
+            Some(&state.db),
+            pool,
+            &state.engine,
+            card_id,
+            new_status,
+            source,
+            force_intent,
+        )
+        .await
+    } else {
+        crate::kanban::transition_status_with_opts(
+            &state.db,
+            &state.engine,
+            card_id,
+            new_status,
+            source,
+            force_intent,
+        )
+    }
+}
+
 // ── Review Decision (agent's response to counter-model review) ──────────────
 
 #[cfg(test)]
@@ -1163,24 +1199,26 @@ pub async fn submit_review_decision(
                         );
                     }
                     // Step 1: Transition to rework_target (e.g., in_progress)
-                    match crate::kanban::transition_status_with_opts(
-                        &state.db,
-                        &state.engine,
+                    match transition_status_pg_first(
+                        &state,
                         &body.card_id,
                         &rework_target,
                         "review_decision_accept_skip_rework_step1",
                         crate::engine::transition::ForceIntent::SystemRecovery,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(_) => {
                             // Step 2: Transition to review — fires OnReviewEnter
-                            match crate::kanban::transition_status_with_opts(
-                                &state.db,
-                                &state.engine,
+                            match transition_status_pg_first(
+                                &state,
                                 &body.card_id,
                                 review_st,
                                 "review_decision_accept_skip_rework_step2",
                                 crate::engine::transition::ForceIntent::SystemRecovery,
-                            ) {
+                            )
+                            .await
+                            {
                                 Ok(_) => {
                                     // Materialize any follow-up transitions queued by
                                     // OnReviewEnter (for example, single-provider
@@ -1272,14 +1310,15 @@ pub async fn submit_review_decision(
                     current_card_status_pg_first(&state, &body.card_id).await;
                 let rework_transition_ready = card_status_before_rework.as_deref()
                     == Some(rework_target.as_str())
-                    || match crate::kanban::transition_status_with_opts(
-                        &state.db,
-                        &state.engine,
+                    || match transition_status_pg_first(
+                        &state,
                         &body.card_id,
                         &rework_target,
                         "review_decision_accept",
                         crate::engine::transition::ForceIntent::SystemRecovery,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(_) => true,
                         Err(e) => {
                             accept_failures.push(format!(
@@ -1810,14 +1849,14 @@ pub async fn submit_review_decision(
                 .find(|state| state.terminal)
                 .map(|state| state.id.clone())
                 .unwrap_or_else(|| "done".to_string());
-            let _ = crate::kanban::transition_status_with_opts(
-                &state.db,
-                &state.engine,
+            let _ = transition_status_pg_first(
+                &state,
                 &body.card_id,
                 &terminal_state,
                 "dismiss",
                 crate::engine::transition::ForceIntent::SystemRecovery, // dismiss bypasses review_passed gate
-            );
+            )
+            .await;
 
             // Post-transition cleanup: cancel remaining pending review dispatches to prevent
             // stale dispatches from re-triggering review loops after dismiss.
