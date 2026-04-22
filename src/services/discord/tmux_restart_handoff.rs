@@ -254,6 +254,25 @@ pub(super) async fn start_restart_handoff_from_state(
 
     clear_restart_handoff_provider_session(channel_id, shared, provider_kind, &state).await;
 
+    // tmux death during an inflight turn must fail the bound dispatch.
+    // Without this the dispatch stays `dispatched` forever — inflight state
+    // is cleared a few lines below so restore_inflight_turns won't pick it
+    // up on the next restart, the session reports idle so timeouts [I]
+    // skips it, and only the [G] 24h sweep eventually cleans it. See the
+    // #866 review orphan incident.
+    if let Some(dispatch_id) = state.dispatch_id.as_deref() {
+        let failure_text = format!(
+            "tmux session died mid-turn (watcher death recovery) — session={}",
+            state.tmux_session_name.as_deref().unwrap_or("<unknown>")
+        );
+        super::turn_bridge::fail_dispatch_with_retry(
+            shared.api_port,
+            Some(dispatch_id),
+            &failure_text,
+        )
+        .await;
+    }
+
     let seeded_channel_name = {
         let mut data = shared.core.lock().await;
         seed_restart_handoff_session_metadata(&mut data.sessions, channel_id, &state)

@@ -190,6 +190,34 @@ impl DispatchService {
     pub fn update_dispatch(&self, id: &str, input: UpdateDispatchInput) -> ServiceResult<Value> {
         if input.status.as_deref() == Some("completed") {
             let context = input.result.as_ref();
+
+            // Guard: review dispatches MUST carry an explicit verdict.
+            // /api/review-verdict validates this; this path (PATCH
+            // /api/dispatches/:id) previously accepted `{items, notes}` without
+            // a verdict, leaving review_state in `reviewing` until timeouts [C]
+            // escalated the card to dilemma_pending (see #925 incident).
+            if let Ok(Some(row)) =
+                crate::dispatch::load_dispatch_row_pg_first(&self.db, self.engine.pg_pool(), id)
+            {
+                let dtype = row
+                    .get("dispatch_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if dtype == "review" {
+                    let has_verdict = context
+                        .and_then(|c| c.get("verdict").or_else(|| c.get("decision")))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    if !has_verdict {
+                        return Err(ServiceError::bad_request(
+                            "review dispatch completion requires explicit verdict — use POST /api/review-verdict",
+                        )
+                        .with_code(ErrorCode::Validation)
+                        .with_context("dispatch_id", id));
+                    }
+                }
+            }
+
             let dispatch = dispatch::finalize_dispatch(&self.db, &self.engine, id, "api", context)
                 .map_err(|error| {
                     let message = format!("{error}");
