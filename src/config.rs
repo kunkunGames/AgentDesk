@@ -602,6 +602,10 @@ pub struct RuntimeSettingsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compact_percent_claude: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compact_percent_gemini: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compact_percent_qwen: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_poll_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_sync_sec: Option<u64>,
@@ -640,6 +644,8 @@ impl RuntimeSettingsConfig {
             && self.context_compact_percent.is_none()
             && self.context_compact_percent_codex.is_none()
             && self.context_compact_percent_claude.is_none()
+            && self.context_compact_percent_gemini.is_none()
+            && self.context_compact_percent_qwen.is_none()
             && self.dispatch_poll_sec.is_none()
             && self.agent_sync_sec.is_none()
             && self.github_issue_sync_sec.is_none()
@@ -1419,6 +1425,8 @@ mod tests {
             context_compact_percent: Some(70),
             context_compact_percent_codex: Some(82),
             context_compact_percent_claude: Some(74),
+            context_compact_percent_gemini: Some(68),
+            context_compact_percent_qwen: Some(66),
             dispatch_poll_sec: Some(45),
             agent_sync_sec: Some(420),
             github_issue_sync_sec: Some(1200),
@@ -1572,6 +1580,8 @@ mod tests {
         assert_eq!(loaded.runtime.context_compact_percent, Some(70));
         assert_eq!(loaded.runtime.context_compact_percent_codex, Some(82));
         assert_eq!(loaded.runtime.context_compact_percent_claude, Some(74));
+        assert_eq!(loaded.runtime.context_compact_percent_gemini, Some(68));
+        assert_eq!(loaded.runtime.context_compact_percent_qwen, Some(66));
         assert_eq!(loaded.runtime.dispatch_poll_sec, Some(45));
         assert_eq!(loaded.runtime.agent_sync_sec, Some(420));
         assert_eq!(loaded.runtime.github_issue_sync_sec, Some(1200));

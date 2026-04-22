@@ -84,7 +84,7 @@ fn native_fast_mode_override_for_turn(
     provider: &ProviderKind,
     channel_fast_mode_setting: Option<bool>,
 ) -> Option<bool> {
-    if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
+    if provider.supports_native_fast_mode() {
         channel_fast_mode_setting
     } else {
         None
@@ -667,7 +667,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         #[cfg(unix)]
         {
             if remote_profile.is_none()
-                && provider.uses_managed_tmux_backend()
+                && provider.uses_managed_session_backend()
                 && claude::is_tmux_available()
             {
                 if let Some(ref tmux_name) = tmux_session_name {
@@ -2322,7 +2322,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         #[cfg(unix)]
         {
             if remote_profile.is_none()
-                && provider.uses_managed_tmux_backend()
+                && provider.uses_managed_session_backend()
                 && claude::is_tmux_available()
             {
                 if let Some(ref tmux_name) = tmux_session_name {
@@ -4266,6 +4266,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Codex, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
             native_fast_mode_override_for_turn(&ProviderKind::Claude, Some(false)),
             Some(false)
         );
@@ -4275,6 +4279,10 @@ mod tests {
         );
         assert_eq!(
             native_fast_mode_override_for_turn(&ProviderKind::Gemini, Some(true)),
+            None
+        );
+        assert_eq!(
+            native_fast_mode_override_for_turn(&ProviderKind::Qwen, Some(true)),
             None
         );
     }

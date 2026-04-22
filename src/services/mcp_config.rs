@@ -34,15 +34,21 @@ pub(crate) fn provider_has_mcp_server(provider: &ProviderKind, server_name: &str
         return false;
     }
 
+    if !provider.supports_runtime_mcp_server_config() {
+        return false;
+    }
+
+    let runtime_config_contains_server = runtime_config_contains_server(normalized);
+
     match provider {
         ProviderKind::Claude => {
-            runtime_config_contains_server(normalized)
-                || claude_global_mcp_config_contains_server(normalized)
+            runtime_config_contains_server || claude_global_mcp_config_contains_server(normalized)
         }
         ProviderKind::Codex => {
-            runtime_config_contains_server(normalized) || codex_config_contains_server(normalized)
+            runtime_config_contains_server || codex_config_contains_server(normalized)
         }
-        _ => false,
+        ProviderKind::Gemini | ProviderKind::Qwen => runtime_config_contains_server,
+        ProviderKind::Unsupported(_) => false,
     }
 }
 
@@ -392,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_has_memento_mcp_reflects_runtime_config_for_claude_and_codex() {
+    fn provider_has_memento_mcp_reflects_runtime_config_for_all_supported_providers() {
         with_test_env(|temp_root| {
             let runtime_root = temp_root.join(".adk").join("release");
             let config_path = crate::runtime_layout::config_file_path(&runtime_root);
@@ -408,6 +414,8 @@ mod tests {
 
             assert!(provider_has_memento_mcp(&ProviderKind::Claude));
             assert!(provider_has_memento_mcp(&ProviderKind::Codex));
+            assert!(provider_has_memento_mcp(&ProviderKind::Gemini));
+            assert!(provider_has_memento_mcp(&ProviderKind::Qwen));
         });
     }
 
@@ -427,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_has_mcp_server_falls_back_to_runtime_config_for_codex() {
+    fn provider_has_mcp_server_falls_back_to_runtime_config_for_supported_non_claude_providers() {
         with_test_env(|temp_root| {
             let runtime_root = temp_root.join(".adk").join("release");
             let config_path = crate::runtime_layout::config_file_path(&runtime_root);
@@ -442,6 +450,8 @@ mod tests {
             crate::config::save_to_path(&config_path, &config).unwrap();
 
             assert!(provider_has_mcp_server(&ProviderKind::Codex, "manual"));
+            assert!(provider_has_mcp_server(&ProviderKind::Gemini, "manual"));
+            assert!(provider_has_mcp_server(&ProviderKind::Qwen, "manual"));
         });
     }
 

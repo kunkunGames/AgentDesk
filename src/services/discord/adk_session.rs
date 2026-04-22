@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -660,19 +661,31 @@ mod tests {
 
 /// Context window management thresholds.
 /// Single source of truth used by Rust turn-end compact logic.
-/// Provider-specific overrides: `context_compact_percent_codex`, `context_compact_percent_claude`, etc.
+/// Provider-specific overrides: `context_compact_percent_codex`,
+/// `context_compact_percent_claude`, etc.
 pub(super) struct ContextThresholds {
     pub compact_pct: u64,
     /// Provider-specific override (if set). Falls back to compact_pct.
-    pub compact_pct_codex: u64,
+    pub provider_overrides: BTreeMap<String, u64>,
     pub context_window: u64,
 }
 
 impl Default for ContextThresholds {
     fn default() -> Self {
+        let mut provider_overrides = BTreeMap::new();
+        for provider in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::Gemini,
+            ProviderKind::Qwen,
+        ] {
+            if let Some(default_override) = provider.default_context_compact_percent_override() {
+                provider_overrides.insert(provider.as_str().to_string(), default_override);
+            }
+        }
         Self {
             compact_pct: 60,
-            compact_pct_codex: 100,
+            provider_overrides,
             context_window: 1_000_000,
         }
     }
@@ -681,10 +694,10 @@ impl Default for ContextThresholds {
 impl ContextThresholds {
     /// Get compact percent for a specific provider.
     pub fn compact_pct_for(&self, provider: &crate::services::provider::ProviderKind) -> u64 {
-        match provider {
-            crate::services::provider::ProviderKind::Codex => self.compact_pct_codex,
-            _ => self.compact_pct,
-        }
+        self.provider_overrides
+            .get(provider.as_str())
+            .copied()
+            .unwrap_or(self.compact_pct)
     }
 }
 
@@ -711,12 +724,24 @@ pub(super) async fn fetch_context_thresholds(_api_port: u16) -> ContextThreshold
     };
 
     let compact_pct = find_u64("context_compact_percent").unwrap_or(defaults.compact_pct);
-    let compact_pct_codex =
-        find_u64("context_compact_percent_codex").unwrap_or(defaults.compact_pct_codex);
+    let mut provider_overrides = defaults.provider_overrides.clone();
+    for provider in [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::Gemini,
+        ProviderKind::Qwen,
+    ] {
+        let Some(key) = provider.context_compact_override_key() else {
+            continue;
+        };
+        if let Some(value) = find_u64(key) {
+            provider_overrides.insert(provider.as_str().to_string(), value);
+        }
+    }
 
     ContextThresholds {
         compact_pct,
-        compact_pct_codex,
+        provider_overrides,
         context_window: defaults.context_window,
     }
 }
