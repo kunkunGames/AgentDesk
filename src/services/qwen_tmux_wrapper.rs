@@ -568,7 +568,7 @@ fn normalize_stream_event(json: &Value, state: &mut TurnNormalizationState) -> V
             state.partial_blocks.insert(
                 index,
                 PartialBlockState {
-                    kind: block_type,
+                    kind: block_type.clone(),
                     tool_name: block
                         .get("name")
                         .and_then(|v| v.as_str())
@@ -581,6 +581,11 @@ fn normalize_stream_event(json: &Value, state: &mut TurnNormalizationState) -> V
                     thinking_emitted: false,
                 },
             );
+            if block_type == "thinking" {
+                // Thinking-start is meaningful progress even though this wrapper does not emit
+                // a normalized output event until a later delta or stop arrives.
+                state.meaningful_progress_seen = true;
+            }
             Vec::new()
         }
         Some("content_block_delta") => {
@@ -1115,6 +1120,39 @@ mod tests {
             }
         }
         assert!(state.meaningful_progress_seen);
+
+        let mut watchdog = crate::services::qwen::QwenStreamWatchdog::new(
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
+        watchdog.observe_line();
+        let expected_message = watchdog.idle_retry_message();
+
+        loop {
+            match next_turn_watchdog_outcome(false, &state, &mut watchdog) {
+                TurnWatchdogOutcome::Continue => {}
+                TurnWatchdogOutcome::Retry { message } => {
+                    assert_eq!(message, expected_message);
+                    break;
+                }
+                TurnWatchdogOutcome::Break => panic!("idle watchdog should not break"),
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_tmux_watchdog_treats_thinking_start_as_progress() {
+        let mut state = TurnNormalizationState::default();
+        let thinking_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","signature":"pondering"}}}"#;
+
+        let normalized = normalize_qwen_line(thinking_start, &mut state);
+
+        assert!(normalized.is_empty());
+        assert!(
+            state.meaningful_progress_seen,
+            "thinking start should count as progress even without a normalized output event"
+        );
 
         let mut watchdog = crate::services::qwen::QwenStreamWatchdog::new(
             Duration::from_millis(200),
