@@ -65,6 +65,7 @@ struct ProviderHealthSnapshot {
 #[derive(Debug, Serialize)]
 pub struct DiscordHealthSnapshot {
     status: HealthStatus,
+    fully_recovered: bool,
     version: &'static str,
     uptime_secs: u64,
     global_active: usize,
@@ -683,6 +684,7 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
     let mut provider_entries = Vec::new();
     let mut degraded_reasons = Vec::new();
     let mut status = HealthStatus::Healthy;
+    let mut fully_recovered = !providers.is_empty();
     let mut deferred_hooks = 0usize;
     let mut queue_depth = 0usize;
     let mut watcher_count = 0usize;
@@ -691,6 +693,7 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
     if providers.is_empty() {
         degraded_reasons.push("no_providers_registered".to_string());
         status = HealthStatus::Unhealthy;
+        fully_recovered = false;
     }
 
     for entry in providers.iter() {
@@ -755,6 +758,7 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
         if !reconcile_done {
             status = status.worsen(HealthStatus::Degraded);
             degraded_reasons.push(format!("provider:{}:reconcile_in_progress", entry.name));
+            fully_recovered = false;
         }
         if provider_deferred_hooks > 0 {
             status = status.worsen(HealthStatus::Degraded);
@@ -776,6 +780,7 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
                 "provider:{}:recovering_channels:{}",
                 entry.name, recovering_channels
             ));
+            fully_recovered = false;
         }
 
         provider_entries.push(ProviderHealthSnapshot {
@@ -806,6 +811,7 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
 
     DiscordHealthSnapshot {
         status,
+        fully_recovered,
         version,
         uptime_secs,
         global_active: global_active as usize,
@@ -912,6 +918,24 @@ impl TestHealthHarness {
 
     pub(crate) fn registry(&self) -> Arc<HealthRegistry> {
         self.registry.clone()
+    }
+
+    pub(crate) fn set_reconcile_done(&self, done: bool) {
+        self.shared
+            .reconcile_done
+            .store(done, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_connected(&self, connected: bool) {
+        self.shared
+            .bot_connected
+            .store(connected, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_restart_pending(&self, restart_pending: bool) {
+        self.shared
+            .restart_pending
+            .store(restart_pending, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn shared(&self) -> Arc<SharedData> {
@@ -2536,6 +2560,44 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|reason| reason == "provider:claude:pending_queue_depth:3")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_keeps_fully_recovered_true_for_disconnected_provider_after_startup() {
+        let harness = TestHealthHarness::new().await;
+        harness.set_connected(false);
+
+        let snapshot = build_health_snapshot(&harness.registry()).await;
+        let json = serde_json::to_value(&snapshot).unwrap();
+
+        assert_eq!(snapshot.status(), HealthStatus::Unhealthy);
+        assert_eq!(json["fully_recovered"], true);
+        assert!(
+            json["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "provider:claude:disconnected")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_keeps_fully_recovered_true_for_restart_pending_after_startup() {
+        let harness = TestHealthHarness::new().await;
+        harness.set_restart_pending(true);
+
+        let snapshot = build_health_snapshot(&harness.registry()).await;
+        let json = serde_json::to_value(&snapshot).unwrap();
+
+        assert_eq!(snapshot.status(), HealthStatus::Unhealthy);
+        assert_eq!(json["fully_recovered"], true);
+        assert!(
+            json["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "provider:claude:restart_pending")
         );
     }
 
