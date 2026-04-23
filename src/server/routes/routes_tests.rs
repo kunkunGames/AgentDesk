@@ -15746,6 +15746,139 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_activate_allows_same_agent_parallel_across_runs_when_free_slot_exists() {
+    crate::pipeline::ensure_loaded();
+    let (_repo, _repo_guard) = setup_test_repo();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-cross-run");
+    ensure_auto_queue_tables(&db);
+    seed_auto_queue_card(
+        &db,
+        "card-cross-run-active",
+        1962,
+        "requested",
+        "agent-cross-run",
+    );
+    seed_auto_queue_card(&db, "card-cross-run-next", 1963, "ready", "agent-cross-run");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-cross-run-active', 'test-repo', 'agent-cross-run', 'active', 2, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-cross-run-next', 'test-repo', 'agent-cross-run', 'active', 2, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, priority_rank, thread_group, dispatched_at
+            ) VALUES (
+                'entry-cross-run-active', 'run-cross-run-active', 'card-cross-run-active', 'agent-cross-run',
+                'dispatched', 'dispatch-cross-run-active', 0, 0, 0, datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group
+            ) VALUES (
+                'entry-cross-run-next', 'run-cross-run-next', 'card-cross-run-next', 'agent-cross-run',
+                'pending', 0, 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_slots (
+                agent_id, slot_index, assigned_run_id, assigned_thread_group
+            ) VALUES (
+                'agent-cross-run', 0, 'run-cross-run-active', 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+            ) VALUES (
+                'dispatch-cross-run-active', 'card-cross-run-active', 'agent-cross-run',
+                'implementation', 'pending', 'Cross-run active dispatch', datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-cross-run-next",
+                        "active_only": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["count"], 1,
+        "a second run for the same agent should dispatch when another slot is free"
+    );
+
+    let conn = db.lock().unwrap();
+    let next_entry: (String, Option<i64>) = conn
+        .query_row(
+            "SELECT status, slot_index
+             FROM auto_queue_entries
+             WHERE id = 'entry-cross-run-next'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_entry.0, "dispatched");
+    assert_eq!(next_entry.1, Some(1));
+
+    let next_slot: (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT assigned_run_id, assigned_thread_group
+             FROM auto_queue_slots
+             WHERE agent_id = 'agent-cross-run' AND slot_index = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_slot.0.as_deref(), Some("run-cross-run-next"));
+    assert_eq!(next_slot.1, Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_queue_activate_keeps_single_slot_agent_single_dispatched_group() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
