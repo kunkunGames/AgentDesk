@@ -150,7 +150,21 @@ pub async fn run(
         .await
         .map_err(anyhow::Error::msg)?;
     crate::services::observability::init_observability(db.clone(), pg_pool.clone());
-    if let Some(pool) = pg_pool.as_ref() {
+    let startup_pg_pool = if pg_pool.is_some() {
+        match crate::db::postgres::connect_for_startup(&config).await {
+            Ok(pool) => pool,
+            Err(error) => {
+                tracing::warn!(
+                    "[startup] postgres warmup pool unavailable; falling back to runtime pool: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let startup_pool = startup_pg_pool.as_ref().or(pg_pool.as_ref());
+    if let Some(pool) = startup_pool {
         crate::db::postgres::startup_reseed(pool, &config)
             .await
             .map_err(anyhow::Error::msg)?;
@@ -159,7 +173,21 @@ pub async fn run(
         seed_startup_runtime_state(&db, &config);
     }
     crate::pipeline::refresh_override_health_report(&db, pg_pool.as_ref()).await;
-    crate::reconcile::reconcile_boot_runtime(&db, &engine, pg_pool.as_ref()).await?;
+    let boot_reconcile_engine = match startup_pg_pool.as_ref() {
+        Some(pool) => Some(crate::engine::PolicyEngine::new_with_pg(
+            &config,
+            Some(pool.clone()),
+        )?),
+        None => None,
+    };
+    crate::reconcile::reconcile_boot_runtime(
+        &db,
+        boot_reconcile_engine.as_ref().unwrap_or(&engine),
+        startup_pool,
+    )
+    .await?;
+    drop(boot_reconcile_engine);
+    drop(startup_pg_pool);
 
     let mut worker_registry = worker_registry::SupervisedWorkerRegistry::new(
         config.clone(),
