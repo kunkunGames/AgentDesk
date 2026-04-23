@@ -1,0 +1,32 @@
+name: Main CI Triage
+
+on:
+  workflow_run:
+    workflows:
+      - CI Main
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: main-ci-triage-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Triage main CI red/green streaks
+    if: github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run main CI triage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENTDESK_API_URL: ${{ vars.AGENTDESK_API_URL }}
+          AGENTDESK_API_TOKEN: ${{ secrets.AGENTDESK_API_TOKEN }}
+        run: ./scripts/main-ci-triage.sh
