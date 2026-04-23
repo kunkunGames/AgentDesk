@@ -818,6 +818,30 @@ async fn health_api_reports_server_up_before_full_recovery_on_postgres() {
 }
 
 #[tokio::test]
+async fn health_api_standalone_mode_reports_status_field() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = axum::Router::new().nest("/api", test_api_router(db, engine, None));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let response = reqwest::get(format!("http://{addr}/api/health"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let json: serde_json::Value = response.json().await.unwrap();
+
+    assert_eq!(json["status"], "healthy");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["db"], true);
+    assert_eq!(json["server_up"], true);
+}
+
+#[tokio::test]
 async fn health_wait_script_passes_when_server_is_up_before_full_recovery() {
     let db = test_db();
     let pg_db = TestPostgresDb::create().await;
