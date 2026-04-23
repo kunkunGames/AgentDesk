@@ -108,6 +108,34 @@ fn can_replace_stale_rebind_inflight(state: &inflight::InflightTurnState) -> boo
         && state.last_watcher_relayed_offset.is_none()
 }
 
+fn can_resume_existing_rebind_inflight(state: &inflight::InflightTurnState) -> bool {
+    !state.rebind_origin
+        && state.request_owner_user_id != 0
+        && state.user_msg_id != 0
+        && state.current_msg_id != 0
+        && state.full_response.trim().is_empty()
+        && state.last_watcher_relayed_offset.is_none()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingInflightRebindAction {
+    ReplaceSynthetic,
+    ResumeExisting,
+    RejectConflict,
+}
+
+fn existing_inflight_rebind_action(
+    state: &inflight::InflightTurnState,
+) -> ExistingInflightRebindAction {
+    if can_replace_stale_rebind_inflight(state) {
+        ExistingInflightRebindAction::ReplaceSynthetic
+    } else if can_resume_existing_rebind_inflight(state) {
+        ExistingInflightRebindAction::ResumeExisting
+    } else {
+        ExistingInflightRebindAction::RejectConflict
+    }
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DetectedRebindOutputPath {
@@ -131,6 +159,14 @@ impl LsofOutputCandidate {
 
     fn is_deleted(&self) -> bool {
         self.raw_path.ends_with(" (deleted)")
+    }
+
+    fn as_stale(&self) -> StaleOutputCandidate {
+        StaleOutputCandidate {
+            fd: self.fd.clone(),
+            raw_path: self.raw_path.clone(),
+            inode: self.inode,
+        }
     }
 }
 
@@ -230,45 +266,41 @@ fn detect_rebind_output_path_from_candidates(
     candidates: impl IntoIterator<Item = LsofOutputCandidate>,
 ) -> Result<Option<DetectedRebindOutputPath>, StaleOutputCandidate> {
     let fallback_identity = candidate_identity(fallback_path);
+    let mut first_stale_candidate: Option<StaleOutputCandidate> = None;
     for candidate in candidates {
         let candidate_path = candidate.normalized_path();
         if !candidate_matches_fallback(fallback_path, candidate_path) {
             continue;
         }
         if candidate.is_deleted() {
-            return Err(StaleOutputCandidate {
-                fd: candidate.fd,
-                raw_path: candidate.raw_path,
-                inode: candidate.inode,
-            });
+            first_stale_candidate.get_or_insert_with(|| candidate.as_stale());
+            continue;
         }
         let meta = match std::fs::metadata(candidate_path) {
             Ok(meta) => meta,
             Err(_) => {
-                return Err(StaleOutputCandidate {
-                    fd: candidate.fd,
-                    raw_path: candidate.raw_path,
-                    inode: candidate.inode,
-                });
+                first_stale_candidate.get_or_insert_with(|| candidate.as_stale());
+                continue;
             }
         };
         if candidate.inode.is_some_and(|inode| inode != meta.ino()) {
-            return Err(StaleOutputCandidate {
-                fd: candidate.fd,
-                raw_path: candidate.raw_path,
-                inode: candidate.inode,
-            });
+            first_stale_candidate.get_or_insert_with(|| candidate.as_stale());
+            continue;
         };
         let identity = (meta.dev(), meta.ino());
         if fallback_identity.is_some() && fallback_identity == Some(identity) {
-            continue;
+            return Ok(None);
         }
         return Ok(Some(DetectedRebindOutputPath {
             path: candidate_path.to_string(),
             initial_offset: meta.len(),
         }));
     }
-    Ok(None)
+    if let Some(stale) = first_stale_candidate {
+        Err(stale)
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
@@ -1995,13 +2027,35 @@ pub(crate) async fn rebind_inflight_for_channel(
     // `save_inflight_state_create_new` below which uses `O_CREAT | O_EXCL`
     // so a live turn that wins the race between here and the write cannot
     // be clobbered by the synthetic rebind state.
-    if let Some(existing) = super::inflight::load_inflight_state(provider, channel_id) {
-        if can_replace_stale_rebind_inflight(&existing) {
-            super::inflight::clear_inflight_state(provider, channel_id);
-        } else {
-            return Err(RebindError::InflightAlreadyExists);
-        }
+    let existing_inflight = match super::inflight::load_inflight_state(provider, channel_id) {
+        Some(existing) => match existing_inflight_rebind_action(&existing) {
+            ExistingInflightRebindAction::ReplaceSynthetic => {
+                super::inflight::clear_inflight_state(provider, channel_id);
+                None
+            }
+            ExistingInflightRebindAction::ResumeExisting => Some(existing),
+            ExistingInflightRebindAction::RejectConflict => {
+                return Err(RebindError::InflightAlreadyExists);
+            }
+        },
+        None => None,
+    };
+    let resuming_existing_inflight = existing_inflight.is_some();
+
+    if resuming_existing_inflight {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] ♻ rebind resuming existing inflight turn for channel {} without overwriting canonical state",
+            channel_id
+        );
     }
+
+    let existing_session_id = existing_inflight
+        .as_ref()
+        .and_then(|state| state.session_id.clone());
+    let existing_saved_output_path = existing_inflight
+        .as_ref()
+        .and_then(|state| state.output_path.clone());
 
     // Resolve tmux session name + channel name from the request, falling back
     // to the in-memory session map when no override is provided.
@@ -2061,7 +2115,7 @@ pub(crate) async fn rebind_inflight_for_channel(
     }
 
     let (default_output_path, input_fifo) = tmux_runtime_paths(&tmux_session_name);
-    let (output_path, initial_offset) = {
+    let (output_path, synthetic_initial_offset) = {
         #[cfg(unix)]
         {
             match detect_live_tmux_output_path(&tmux_session_name, &default_output_path) {
@@ -2077,10 +2131,10 @@ pub(crate) async fn rebind_inflight_for_channel(
                     (detected.path, detected.initial_offset)
                 }
                 Ok(None) => {
-                    let initial_offset = std::fs::metadata(&default_output_path)
+                    let synthetic_initial_offset = std::fs::metadata(&default_output_path)
                         .map(|m| m.len())
                         .unwrap_or(0);
-                    (default_output_path.clone(), initial_offset)
+                    (default_output_path.clone(), synthetic_initial_offset)
                 }
                 Err(stale) => {
                     return Err(RebindError::StaleOutputPath {
@@ -2095,50 +2149,78 @@ pub(crate) async fn rebind_inflight_for_channel(
         }
         #[cfg(not(unix))]
         {
-            let initial_offset = std::fs::metadata(&default_output_path)
+            let synthetic_initial_offset = std::fs::metadata(&default_output_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            (default_output_path.clone(), initial_offset)
+            (default_output_path.clone(), synthetic_initial_offset)
         }
     };
 
-    // Build and persist the new inflight state. No request_owner / msg_ids
-    // apply because this recovery has no originating Discord message.
-    //
-    // #897 counter-model re-review (round 2): flag this as `rebind_origin`
-    // so routing / persistence code that keys off "is there a live
-    // foreground turn" treats it as absent. This synthetic state exists only
-    // to expose a recovered tmux session through inflight APIs; it must not
-    // masquerade as a user-authored Discord turn.
-    let mut state = super::inflight::InflightTurnState::new(
-        provider.clone(),
-        channel_id,
-        channel_name.clone(),
-        0, // request_owner_user_id — no originating Discord user
-        0, // user_msg_id
-        0, // current_msg_id (placeholder)
-        String::from("/api/inflight/rebind"),
-        None, // session_id
-        Some(tmux_session_name.clone()),
-        Some(output_path.clone()),
-        Some(input_fifo.clone()),
-        initial_offset,
-    );
-    state.rebind_origin = true;
-
-    // Atomic create-or-fail: if a legitimate turn created its inflight file
-    // between the preflight check above and this point, the write fails
-    // with `AlreadyExists` and we return 409. Without this guard the
-    // synthetic rebind state (user_msg_id=0, placeholder ids zeroed) would
-    // overwrite the real turn's canonical state and break its completion
-    // path — the exact race the #897 P2 #1 review flagged.
-    match super::inflight::save_inflight_state_create_new(&state) {
-        Ok(()) => {}
-        Err(super::inflight::CreateNewInflightError::AlreadyExists) => {
-            return Err(RebindError::InflightAlreadyExists);
+    let initial_offset = if let Some(existing) = existing_inflight.as_ref() {
+        let (resume_offset, current_len, truncated) =
+            recovery_watcher_start_offset(&output_path, existing.last_offset);
+        if truncated {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ↻ rebind restarting existing inflight watcher from 0 for {} (saved offset {}, file len {})",
+                tmux_session_name,
+                existing.last_offset,
+                current_len
+            );
         }
-        Err(super::inflight::CreateNewInflightError::Internal(msg)) => {
-            return Err(RebindError::Internal(msg));
+        if existing_saved_output_path.as_deref() != Some(output_path.as_str()) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ♻ rebind watcher adopted live output path for existing inflight {}: {:?} -> {}",
+                tmux_session_name,
+                existing_saved_output_path,
+                output_path
+            );
+        }
+        resume_offset
+    } else {
+        synthetic_initial_offset
+    };
+
+    if existing_inflight.is_none() {
+        // Build and persist the new inflight state. No request_owner / msg_ids
+        // apply because this recovery has no originating Discord message.
+        //
+        // #897 counter-model re-review (round 2): flag this as `rebind_origin`
+        // so routing / persistence code that keys off "is there a live
+        // foreground turn" treats it as absent. This synthetic state exists only
+        // to expose a recovered tmux session through inflight APIs; it must not
+        // masquerade as a user-authored Discord turn.
+        let mut state = super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            channel_name.clone(),
+            0, // request_owner_user_id — no originating Discord user
+            0, // user_msg_id
+            0, // current_msg_id (placeholder)
+            String::from("/api/inflight/rebind"),
+            None, // session_id
+            Some(tmux_session_name.clone()),
+            Some(output_path.clone()),
+            Some(input_fifo.clone()),
+            initial_offset,
+        );
+        state.rebind_origin = true;
+
+        // Atomic create-or-fail: if a legitimate turn created its inflight file
+        // between the preflight check above and this point, the write fails
+        // with `AlreadyExists` and we return 409. Without this guard the
+        // synthetic rebind state (user_msg_id=0, placeholder ids zeroed) would
+        // overwrite the real turn's canonical state and break its completion
+        // path — the exact race the #897 P2 #1 review flagged.
+        match super::inflight::save_inflight_state_create_new(&state) {
+            Ok(()) => {}
+            Err(super::inflight::CreateNewInflightError::AlreadyExists) => {
+                return Err(RebindError::InflightAlreadyExists);
+            }
+            Err(super::inflight::CreateNewInflightError::Internal(msg)) => {
+                return Err(RebindError::Internal(msg));
+            }
         }
     }
 
@@ -2150,7 +2232,7 @@ pub(crate) async fn rebind_inflight_for_channel(
             .sessions
             .entry(discord_channel_id)
             .or_insert_with(|| DiscordSession {
-                session_id: None,
+                session_id: existing_session_id.clone(),
                 memento_context_loaded: false,
                 memento_reflected: false,
                 current_path: None,
@@ -2487,6 +2569,64 @@ mod tests {
         assert!(!can_replace_stale_rebind_inflight(&state));
     }
 
+    #[test]
+    fn rebind_resumes_existing_real_inflight_when_no_output_was_relayed() {
+        let state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            123,
+            456,
+            789,
+            "real user input".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.input".to_string()),
+            64,
+        );
+
+        assert!(can_resume_existing_rebind_inflight(&state));
+        assert_eq!(
+            existing_inflight_rebind_action(&state),
+            ExistingInflightRebindAction::ResumeExisting
+        );
+    }
+
+    #[test]
+    fn rebind_keeps_conflict_for_existing_real_inflight_after_output_started() {
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            123,
+            456,
+            789,
+            "real user input".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.input".to_string()),
+            64,
+        );
+        state.full_response = "partial".to_string();
+
+        assert!(!can_resume_existing_rebind_inflight(&state));
+        assert_eq!(
+            existing_inflight_rebind_action(&state),
+            ExistingInflightRebindAction::RejectConflict
+        );
+
+        state.full_response.clear();
+        state.last_watcher_relayed_offset = Some(128);
+
+        assert!(!can_resume_existing_rebind_inflight(&state));
+        assert_eq!(
+            existing_inflight_rebind_action(&state),
+            ExistingInflightRebindAction::RejectConflict
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn rebind_adopts_detected_output_path_when_inode_differs() {
@@ -2563,6 +2703,41 @@ mod tests {
         assert_eq!(stale.fd, "7w");
         assert_eq!(stale.raw_path, fallback.to_string_lossy());
         assert_eq!(stale.inode, Some(actual_inode + 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebind_prefers_live_repair_candidate_over_deleted_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("agentdesk-session.jsonl");
+        let rotated = dir.path().join("agentdesk-session.jsonl.1");
+        std::fs::write(&fallback, b"replacement-file\n").unwrap();
+        std::fs::write(&rotated, b"rotated-live-file\n").unwrap();
+        let rotated_inode = std::fs::metadata(&rotated).unwrap().ino();
+
+        let detected = detect_rebind_output_path_from_candidates(
+            fallback.to_str().unwrap(),
+            vec![
+                LsofOutputCandidate {
+                    fd: "5w".to_string(),
+                    raw_path: format!("{} (deleted)", fallback.display()),
+                    inode: Some(90_001),
+                },
+                LsofOutputCandidate {
+                    fd: "7w".to_string(),
+                    raw_path: rotated.to_string_lossy().to_string(),
+                    inode: Some(rotated_inode),
+                },
+            ],
+        )
+        .expect("repairable live candidate should win over stale deleted fd")
+        .expect("rebind should adopt the true live output file");
+
+        assert_eq!(detected.path, rotated.to_string_lossy());
+        assert_eq!(
+            detected.initial_offset,
+            std::fs::metadata(&rotated).unwrap().len()
+        );
     }
 
     #[cfg(unix)]
