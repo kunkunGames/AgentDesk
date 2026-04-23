@@ -116,6 +116,33 @@ struct DetectedRebindOutputPath {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LsofOutputCandidate {
+    fd: String,
+    raw_path: String,
+    inode: Option<u64>,
+}
+
+#[cfg(unix)]
+impl LsofOutputCandidate {
+    fn normalized_path(&self) -> &str {
+        normalize_lsof_path(&self.raw_path)
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.raw_path.ends_with(" (deleted)")
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleOutputCandidate {
+    fd: String,
+    raw_path: String,
+    inode: Option<u64>,
+}
+
+#[cfg(unix)]
 fn candidate_identity(path: &str) -> Option<(u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.dev(), meta.ino()))
@@ -148,30 +175,100 @@ fn candidate_matches_fallback(fallback_path: &str, candidate_path: &str) -> bool
 }
 
 #[cfg(unix)]
+fn parse_lsof_output_candidates(stdout: &str) -> Vec<LsofOutputCandidate> {
+    let mut candidates = Vec::new();
+    let mut current_fd: Option<String> = None;
+    let mut current_path: Option<String> = None;
+    let mut current_inode: Option<u64> = None;
+
+    let flush = |candidates: &mut Vec<LsofOutputCandidate>,
+                 current_fd: &mut Option<String>,
+                 current_path: &mut Option<String>,
+                 current_inode: &mut Option<u64>| {
+        if let (Some(fd), Some(raw_path)) = (current_fd.take(), current_path.take()) {
+            candidates.push(LsofOutputCandidate {
+                fd,
+                raw_path,
+                inode: *current_inode,
+            });
+        }
+        *current_inode = None;
+    };
+
+    for line in stdout.lines() {
+        let Some((field, value)) = line.split_at_checked(1) else {
+            continue;
+        };
+        match field {
+            "f" => {
+                flush(
+                    &mut candidates,
+                    &mut current_fd,
+                    &mut current_path,
+                    &mut current_inode,
+                );
+                current_fd = Some(value.to_string());
+            }
+            "i" => current_inode = value.parse::<u64>().ok(),
+            "n" => current_path = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    flush(
+        &mut candidates,
+        &mut current_fd,
+        &mut current_path,
+        &mut current_inode,
+    );
+    candidates
+}
+
+#[cfg(unix)]
 fn detect_rebind_output_path_from_candidates(
     fallback_path: &str,
-    candidates: impl IntoIterator<Item = String>,
-) -> Option<DetectedRebindOutputPath> {
+    candidates: impl IntoIterator<Item = LsofOutputCandidate>,
+) -> Result<Option<DetectedRebindOutputPath>, StaleOutputCandidate> {
     let fallback_identity = candidate_identity(fallback_path);
-    for raw_path in candidates {
-        let candidate_path = normalize_lsof_path(&raw_path);
+    for candidate in candidates {
+        let candidate_path = candidate.normalized_path();
         if !candidate_matches_fallback(fallback_path, candidate_path) {
             continue;
         }
+        if candidate.is_deleted() {
+            return Err(StaleOutputCandidate {
+                fd: candidate.fd,
+                raw_path: candidate.raw_path,
+                inode: candidate.inode,
+            });
+        }
         let meta = match std::fs::metadata(candidate_path) {
             Ok(meta) => meta,
-            Err(_) => continue,
+            Err(_) => {
+                return Err(StaleOutputCandidate {
+                    fd: candidate.fd,
+                    raw_path: candidate.raw_path,
+                    inode: candidate.inode,
+                });
+            }
+        };
+        if candidate.inode.is_some_and(|inode| inode != meta.ino()) {
+            return Err(StaleOutputCandidate {
+                fd: candidate.fd,
+                raw_path: candidate.raw_path,
+                inode: candidate.inode,
+            });
         };
         let identity = (meta.dev(), meta.ino());
         if fallback_identity.is_some() && fallback_identity == Some(identity) {
             continue;
         }
-        return Some(DetectedRebindOutputPath {
+        return Ok(Some(DetectedRebindOutputPath {
             path: candidate_path.to_string(),
             initial_offset: meta.len(),
-        });
+        }));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -202,22 +299,24 @@ fn tmux_pane_pid(tmux_session_name: &str) -> Option<u32> {
 fn detect_live_tmux_output_path(
     tmux_session_name: &str,
     fallback_path: &str,
-) -> Option<DetectedRebindOutputPath> {
-    let pane_pid = tmux_pane_pid(tmux_session_name)?;
+) -> Result<Option<DetectedRebindOutputPath>, StaleOutputCandidate> {
+    let Some(pane_pid) = tmux_pane_pid(tmux_session_name) else {
+        return Ok(None);
+    };
     let mut cmd = Command::new("lsof");
     binary_resolver::apply_runtime_path(&mut cmd);
-    let output = cmd
-        .args(["-Fn", "-p", &pane_pid.to_string()])
-        .output()
-        .ok()?;
+    let output = match cmd.args(["-Fn", "-p", &pane_pid.to_string()]).output() {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let candidates = stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .map(str::to_string);
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(_) => return Ok(None),
+    };
+    let candidates = parse_lsof_output_candidates(&stdout);
     detect_rebind_output_path_from_candidates(fallback_path, candidates)
 }
 
@@ -1802,6 +1901,15 @@ pub enum RebindError {
     /// An inflight state already exists for this channel. Caller must clear
     /// it (force-kill or natural completion) before rebinding. 409.
     InflightAlreadyExists,
+    /// The tmux pane is still writing to a deleted or replaced output fd, so
+    /// rebinding the pathname would silently follow the wrong file. 409.
+    StaleOutputPath {
+        tmux_session: String,
+        output_path: String,
+        live_fd: String,
+        live_inode: Option<u64>,
+        live_path: String,
+    },
     /// Channel is not bound to the requested provider in the role-map. 400.
     ChannelNotBound,
     /// `tmux_session` not provided and no in-memory session supplies a
@@ -1819,6 +1927,25 @@ impl std::fmt::Display for RebindError {
             }
             Self::InflightAlreadyExists => {
                 write!(f, "inflight state already exists for this channel")
+            }
+            Self::StaleOutputPath {
+                tmux_session,
+                output_path,
+                live_fd,
+                live_inode,
+                live_path,
+            } => {
+                write!(
+                    f,
+                    "StaleOutputPath: tmux session {tmux_session} still writes to fd {live_fd}"
+                )?;
+                if let Some(inode) = live_inode {
+                    write!(f, " (inode {inode})")?;
+                }
+                write!(
+                    f,
+                    " via {live_path}; refusing to rebind pathname {output_path}"
+                )
             }
             Self::ChannelNotBound => write!(f, "channel is not bound for this provider"),
             Self::ChannelNameMissing => write!(
@@ -1934,23 +2061,45 @@ pub(crate) async fn rebind_inflight_for_channel(
     }
 
     let (default_output_path, input_fifo) = tmux_runtime_paths(&tmux_session_name);
-    #[cfg(unix)]
-    let detected_output = detect_live_tmux_output_path(&tmux_session_name, &default_output_path);
-    let (output_path, initial_offset) = if let Some(detected) = detected_output {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] ♻ rebind adopted live tmux output path for {}: {} -> {} (offset {})",
-            tmux_session_name,
-            default_output_path,
-            detected.path,
-            detected.initial_offset
-        );
-        (detected.path, detected.initial_offset)
-    } else {
-        let initial_offset = std::fs::metadata(&default_output_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        (default_output_path, initial_offset)
+    let (output_path, initial_offset) = {
+        #[cfg(unix)]
+        {
+            match detect_live_tmux_output_path(&tmux_session_name, &default_output_path) {
+                Ok(Some(detected)) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] ♻ rebind adopted live tmux output path for {}: {} -> {} (offset {})",
+                        tmux_session_name,
+                        default_output_path,
+                        detected.path,
+                        detected.initial_offset
+                    );
+                    (detected.path, detected.initial_offset)
+                }
+                Ok(None) => {
+                    let initial_offset = std::fs::metadata(&default_output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    (default_output_path.clone(), initial_offset)
+                }
+                Err(stale) => {
+                    return Err(RebindError::StaleOutputPath {
+                        tmux_session: tmux_session_name.clone(),
+                        output_path: default_output_path.clone(),
+                        live_fd: stale.fd,
+                        live_inode: stale.inode,
+                        live_path: stale.raw_path,
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let initial_offset = std::fs::metadata(&default_output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            (default_output_path.clone(), initial_offset)
+        }
     };
 
     // Build and persist the new inflight state. No request_owner / msg_ids
@@ -2346,17 +2495,97 @@ mod tests {
         let rotated = dir.path().join("agentdesk-session.jsonl.stale");
         std::fs::write(&fallback, b"fresh\n").unwrap();
         std::fs::write(&rotated, b"stale-file-content\n").unwrap();
+        let rotated_inode = std::fs::metadata(&rotated).unwrap().ino();
 
         let detected = detect_rebind_output_path_from_candidates(
             fallback.to_str().unwrap(),
-            vec![rotated.to_string_lossy().to_string()],
+            vec![LsofOutputCandidate {
+                fd: "3w".to_string(),
+                raw_path: rotated.to_string_lossy().to_string(),
+                inode: Some(rotated_inode),
+            }],
         )
+        .expect("candidate resolution should succeed")
         .expect("mismatched inode candidate must be adopted");
 
         assert_eq!(detected.path, rotated.to_string_lossy());
         assert_eq!(
             detected.initial_offset,
             std::fs::metadata(&rotated).unwrap().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebind_rejects_deleted_fd_even_if_pathname_now_points_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("agentdesk-session.jsonl");
+        std::fs::write(&fallback, b"replacement-file\n").unwrap();
+
+        let stale = detect_rebind_output_path_from_candidates(
+            fallback.to_str().unwrap(),
+            vec![LsofOutputCandidate {
+                fd: "5w".to_string(),
+                raw_path: format!("{} (deleted)", fallback.display()),
+                inode: Some(99_001),
+            }],
+        )
+        .expect_err("deleted live fd must not silently rebind the replacement pathname");
+
+        assert_eq!(
+            stale,
+            StaleOutputCandidate {
+                fd: "5w".to_string(),
+                raw_path: format!("{} (deleted)", fallback.display()),
+                inode: Some(99_001),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebind_rejects_candidate_when_lsof_inode_disagrees_with_current_path_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("agentdesk-session.jsonl");
+        std::fs::write(&fallback, b"replacement-file\n").unwrap();
+        let actual_inode = std::fs::metadata(&fallback).unwrap().ino();
+
+        let stale = detect_rebind_output_path_from_candidates(
+            fallback.to_str().unwrap(),
+            vec![LsofOutputCandidate {
+                fd: "7w".to_string(),
+                raw_path: fallback.to_string_lossy().to_string(),
+                inode: Some(actual_inode + 1),
+            }],
+        )
+        .expect_err("inode mismatch means lsof points at a different live fd than the pathname");
+
+        assert_eq!(stale.fd, "7w");
+        assert_eq!(stale.raw_path, fallback.to_string_lossy());
+        assert_eq!(stale.inode, Some(actual_inode + 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebind_keeps_fallback_when_live_fd_matches_current_path_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback = dir.path().join("agentdesk-session.jsonl");
+        std::fs::write(&fallback, b"current-file\n").unwrap();
+        let current_inode = std::fs::metadata(&fallback).unwrap().ino();
+
+        let detected = detect_rebind_output_path_from_candidates(
+            fallback.to_str().unwrap(),
+            vec![LsofOutputCandidate {
+                fd: "9w".to_string(),
+                raw_path: fallback.to_string_lossy().to_string(),
+                inode: Some(current_inode),
+            }],
+        )
+        .expect("matching live fd should not fail");
+
+        assert!(
+            detected.is_none(),
+            "when lsof fd/inode still matches the canonical path, recovery should keep the fallback"
         );
     }
 
