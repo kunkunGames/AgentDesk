@@ -200,6 +200,12 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
         let previous = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
@@ -224,6 +230,135 @@ fn write_test_skill(runtime_root: &std::path::Path, skill_name: &str, descriptio
         format!("# {skill_name}\n\n{description}\n"),
     )
     .unwrap();
+}
+
+fn write_announce_token(runtime_root: &std::path::Path) {
+    let credential_dir = crate::runtime_layout::credential_dir(runtime_root);
+    fs::create_dir_all(&credential_dir).unwrap();
+    fs::write(
+        crate::runtime_layout::credential_token_path(runtime_root, "announce"),
+        "announce-token\n",
+    )
+    .unwrap();
+}
+
+#[derive(Default)]
+struct MockDiscordDispatchState {
+    calls: Vec<String>,
+    thread_parents: std::collections::HashMap<String, String>,
+}
+
+async fn spawn_mock_dispatch_delivery_server() -> (
+    String,
+    Arc<std::sync::Mutex<MockDiscordDispatchState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        response::IntoResponse,
+        routing::{get, post},
+    };
+
+    async fn get_channel(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+    ) -> impl IntoResponse {
+        let (parent_id, total_message_sent) = {
+            let mut state = state.lock().unwrap();
+            state.calls.push(format!("GET /channels/{channel_id}"));
+            let parent_id = state
+                .thread_parents
+                .get(&channel_id)
+                .cloned()
+                .unwrap_or_else(|| channel_id.clone());
+            let total_message_sent = if channel_id.starts_with("thread-") {
+                1
+            } else {
+                0
+            };
+            (parent_id, total_message_sent)
+        };
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": channel_id,
+                "name": format!("mock-{channel_id}"),
+                "parent_id": parent_id,
+                "total_message_sent": total_message_sent,
+                "thread_metadata": {
+                    "archived": false,
+                    "locked": false
+                }
+            })),
+        )
+    }
+
+    async fn create_thread(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let thread_id = format!("thread-{channel_id}");
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .calls
+                .push(format!("POST /channels/{channel_id}/threads"));
+            state
+                .thread_parents
+                .insert(thread_id.clone(), channel_id.clone());
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": thread_id,
+                "name": format!("dispatch-{channel_id}"),
+                "parent_id": channel_id,
+                "thread_metadata": {
+                    "archived": false,
+                    "locked": false
+                }
+            })),
+        )
+    }
+
+    async fn create_message(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .calls
+                .push(format!("POST /channels/{channel_id}/messages"));
+        }
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": format!("message-{channel_id}")
+            })),
+        )
+    }
+
+    let state = Arc::new(std::sync::Mutex::new(MockDiscordDispatchState::default()));
+    let app = Router::new()
+        .route("/channels/{channel_id}", get(get_channel))
+        .route("/channels/{channel_id}/threads", post(create_thread))
+        .route("/channels/{channel_id}/messages", post(create_message))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://{addr}"), state, handle)
 }
 
 struct MockGhOverride {
@@ -4839,6 +4974,178 @@ async fn dispatch_create_and_get() {
         .unwrap();
     let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
     assert_eq!(json2["dispatch"]["id"], dispatch_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_routes_allow_same_agent_parallel_delivery_on_different_provider_channels() {
+    let _env_lock = env_lock();
+    let (base_url, state, server_handle) = spawn_mock_dispatch_delivery_server().await;
+    let _api_base = EnvVarGuard::set("AGENTDESK_DISCORD_API_BASE_URL", &base_url);
+    let runtime_root = tempfile::tempdir().unwrap();
+    write_announce_token(runtime_root.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", runtime_root.path());
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (
+                id, name, provider, discord_channel_id, discord_channel_alt,
+                discord_channel_cc, discord_channel_cdx, created_at, updated_at
+             ) VALUES (
+                'agent-parallel-provider', 'Agent Parallel Provider', 'claude', '111', '222',
+                '111', '222', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, created_at, updated_at
+             ) VALUES (
+                'card-parallel-impl', 'Parallel implementation', 'ready', 'medium',
+                'agent-parallel-provider', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, created_at, updated_at
+             ) VALUES (
+                'card-parallel-consult', 'Parallel consultation', 'ready', 'medium',
+                'agent-parallel-provider', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let impl_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"card-parallel-impl","to_agent_id":"agent-parallel-provider","dispatch_type":"implementation","title":"Parallel implementation"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(impl_response.status(), StatusCode::CREATED);
+    let impl_body = axum::body::to_bytes(impl_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let impl_json: serde_json::Value = serde_json::from_slice(&impl_body).unwrap();
+    let impl_dispatch_id = impl_json["dispatch"]["id"]
+        .as_str()
+        .expect("implementation dispatch id")
+        .to_string();
+
+    let consult_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"card-parallel-consult","to_agent_id":"agent-parallel-provider","dispatch_type":"consultation","title":"Parallel consultation"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consult_response.status(), StatusCode::CREATED);
+    let consult_body = axum::body::to_bytes(consult_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let consult_json: serde_json::Value = serde_json::from_slice(&consult_body).unwrap();
+    let consult_dispatch_id = consult_json["dispatch"]["id"]
+        .as_str()
+        .expect("consultation dispatch id")
+        .to_string();
+
+    let (impl_result, consult_result) = tokio::join!(
+        crate::server::routes::dispatches::send_dispatch_to_discord(
+            &db,
+            "agent-parallel-provider",
+            "Parallel implementation",
+            "card-parallel-impl",
+            &impl_dispatch_id,
+        ),
+        crate::server::routes::dispatches::send_dispatch_to_discord(
+            &db,
+            "agent-parallel-provider",
+            "Parallel consultation",
+            "card-parallel-consult",
+            &consult_dispatch_id,
+        ),
+    );
+
+    assert!(
+        impl_result.is_ok(),
+        "implementation delivery should succeed: {impl_result:?}"
+    );
+    assert!(
+        consult_result.is_ok(),
+        "consultation delivery should succeed: {consult_result:?}"
+    );
+
+    server_handle.abort();
+
+    let state = state.lock().unwrap();
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/111/threads".to_string()),
+        "implementation dispatch must use the primary provider channel: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/thread-111/messages".to_string()),
+        "implementation dispatch must post into its primary-thread mailbox: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/222/threads".to_string()),
+        "consultation dispatch must use the counter-model provider channel: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/thread-222/messages".to_string()),
+        "consultation dispatch must post into its counter-model thread mailbox: {:?}",
+        state.calls
+    );
+    drop(state);
+
+    let conn = db.lock().unwrap();
+    let impl_thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM task_dispatches WHERE id = ?1",
+            [&impl_dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(impl_thread_id.as_deref(), Some("thread-111"));
+    let consult_thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM task_dispatches WHERE id = ?1",
+            [&consult_dispatch_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(consult_thread_id.as_deref(), Some("thread-222"));
 }
 
 #[tokio::test]
