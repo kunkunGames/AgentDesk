@@ -467,7 +467,10 @@ async fn connect_test_pool_with_timeout(
 ) -> Result<PgPool, String> {
     let options = PgConnectOptions::from_str(database_url)
         .map_err(|error| format!("{label} parse postgres url: {error}"))?;
-    run_test_postgres_sqlx_op(
+    // Keep the outer test watchdog aligned with the pool's acquire timeout so
+    // helper-specific admin timeouts are actually honored on slow CI runners.
+    run_test_postgres_sqlx_op_with_timeout(
+        acquire_timeout,
         &format!("{label} connect postgres"),
         PgPoolOptions::new()
             .max_connections(max_connections.max(1))
