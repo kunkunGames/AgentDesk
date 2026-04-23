@@ -174,6 +174,24 @@ pub(in crate::services::discord) fn extract_explicit_review_verdict(
     }
 }
 
+fn decode_pg_completion_hint_field<T>(
+    decoded: Result<Option<T>, sqlx::Error>,
+    dispatch_id: &str,
+    column: &'static str,
+) -> Option<T> {
+    match decoded {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                dispatch_id = %dispatch_id,
+                column,
+                "failed to decode postgres completion hint field: {error}"
+            );
+            None
+        }
+    }
+}
+
 pub(in crate::services::discord) fn extract_explicit_work_outcome(
     full_response: &str,
 ) -> Option<&'static str> {
@@ -802,11 +820,22 @@ struct DispatchCompletionHints {
 }
 
 fn resolve_completion_target_repo(
+    dispatch_id: &str,
     context_raw: Option<&str>,
     fallback_repo: Option<String>,
 ) -> Option<String> {
     context_raw
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|raw| match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(
+                    dispatch_id = %dispatch_id,
+                    error = %error,
+                    "failed to parse postgres completion hint context JSON"
+                );
+                None
+            }
+        })
         .as_ref()
         .and_then(|value| value.get("target_repo"))
         .and_then(|value| value.as_str())
@@ -820,58 +849,77 @@ fn lookup_dispatch_completion_hints(
     dispatch_id: &str,
 ) -> DispatchCompletionHints {
     if let Some(pool) = pg_pool {
-        let dispatch_id = dispatch_id.to_string();
-        if let Ok(Some((issue_number, dispatch_created_at, target_repo))) =
-            crate::utils::async_bridge::block_on_pg_result(
-                pool,
-                move |bridge_pool| async move {
-                    let row = sqlx::query(
-                        "SELECT kc.github_issue_number,
-                                td.created_at::text AS created_at,
-                                td.context,
-                                kc.repo_id
-                         FROM task_dispatches td
-                         LEFT JOIN kanban_cards kc ON kc.id = td.kanban_card_id
-                         WHERE td.id = $1",
+        let dispatch_id_owned = dispatch_id.to_string();
+        match crate::utils::async_bridge::block_on_pg_result(
+            pool,
+            move |bridge_pool| async move {
+                let row = sqlx::query(
+                    "SELECT kc.github_issue_number,
+                            td.created_at::text AS created_at,
+                            td.context,
+                            kc.repo_id
+                     FROM task_dispatches td
+                     LEFT JOIN kanban_cards kc ON kc.id = td.kanban_card_id
+                     WHERE td.id = $1",
+                )
+                .bind(&dispatch_id_owned)
+                .fetch_optional(&bridge_pool)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "load postgres completion hints for dispatch {dispatch_id_owned}: {error}"
                     )
-                    .bind(&dispatch_id)
-                    .fetch_optional(&bridge_pool)
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "load postgres completion hints for dispatch {dispatch_id}: {error}"
-                        )
-                    })?;
-                    Ok(row.map(|row| {
-                        let issue_number = row
-                            .try_get::<Option<i64>, _>("github_issue_number")
-                            .ok()
-                            .flatten();
-                        let dispatch_created_at = row
-                            .try_get::<Option<String>, _>("created_at")
-                            .ok()
-                            .flatten();
-                        let context_raw =
-                            row.try_get::<Option<String>, _>("context").ok().flatten();
-                        let fallback_repo =
-                            row.try_get::<Option<String>, _>("repo_id").ok().flatten();
-                        (
-                            issue_number,
-                            dispatch_created_at,
-                            resolve_completion_target_repo(context_raw.as_deref(), fallback_repo),
-                        )
-                    }))
-                },
-                |error| error,
-            )
-        {
-            return DispatchCompletionHints {
-                issue_number,
-                dispatch_created_at,
-                target_repo,
-                output_commit: None,
-                output_commit_repo_dir: None,
-            };
+                })?;
+                Ok(row.map(|row| {
+                    let issue_number = decode_pg_completion_hint_field(
+                        row.try_get::<Option<i64>, _>("github_issue_number"),
+                        &dispatch_id_owned,
+                        "github_issue_number",
+                    );
+                    let dispatch_created_at = decode_pg_completion_hint_field(
+                        row.try_get::<Option<String>, _>("created_at"),
+                        &dispatch_id_owned,
+                        "created_at",
+                    );
+                    let context_raw = decode_pg_completion_hint_field(
+                        row.try_get::<Option<String>, _>("context"),
+                        &dispatch_id_owned,
+                        "context",
+                    );
+                    let fallback_repo = decode_pg_completion_hint_field(
+                        row.try_get::<Option<String>, _>("repo_id"),
+                        &dispatch_id_owned,
+                        "repo_id",
+                    );
+                    (
+                        issue_number,
+                        dispatch_created_at,
+                        resolve_completion_target_repo(
+                            &dispatch_id_owned,
+                            context_raw.as_deref(),
+                            fallback_repo,
+                        ),
+                    )
+                }))
+            },
+            |error| error,
+        ) {
+            Ok(Some((issue_number, dispatch_created_at, target_repo))) => {
+                return DispatchCompletionHints {
+                    issue_number,
+                    dispatch_created_at,
+                    target_repo,
+                    output_commit: None,
+                    output_commit_repo_dir: None,
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    dispatch_id = %dispatch_id,
+                    "failed to load postgres completion hints: {error}"
+                );
+            }
         }
     }
 
@@ -888,6 +936,7 @@ fn lookup_dispatch_completion_hints(
                 |row| {
                     let context_raw: Option<String> = row.get(2)?;
                     let target_repo = resolve_completion_target_repo(
+                        dispatch_id,
                         context_raw.as_deref(),
                         row.get::<_, Option<String>>(3).ok().flatten(),
                     );
@@ -1453,8 +1502,10 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
     use std::path::Path;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
 
     fn run_git(repo_dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1483,6 +1534,39 @@ mod tests {
         repo
     }
 
+    #[derive(Clone)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let log_buffer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || TestLogWriter {
+                buffer: log_buffer.clone(),
+            })
+            .finish();
+
+        let result = tracing::subscriber::with_default(subscriber, run);
+        let captured = buffer.lock().unwrap().clone();
+        (result, String::from_utf8_lossy(&captured).to_string())
+    }
+
     #[test]
     fn summarize_tracked_change_paths_limits_preview() {
         let summary = summarize_tracked_change_paths(&[
@@ -1494,6 +1578,34 @@ mod tests {
             "f".to_string(),
         ]);
         assert_eq!(summary.as_deref(), Some("a, b, c, d, e (+1 more)"));
+    }
+
+    #[test]
+    fn decode_pg_completion_hint_field_logs_decode_errors() {
+        let (value, logs) = capture_logs(|| {
+            decode_pg_completion_hint_field::<String>(
+                Err(sqlx::Error::ColumnNotFound("context".to_string())),
+                "dispatch-1",
+                "context",
+            )
+        });
+
+        assert!(value.is_none());
+        assert!(logs.contains("failed to decode postgres completion hint field"));
+        assert!(logs.contains("dispatch_id=dispatch-1"));
+        assert!(logs.contains("context"));
+    }
+
+    #[test]
+    fn resolve_completion_target_repo_logs_context_parse_failures() {
+        let fallback_repo = Some("agentdesk".to_string());
+        let (value, logs) = capture_logs(|| {
+            resolve_completion_target_repo("dispatch-1", Some("{not-json"), fallback_repo.clone())
+        });
+
+        assert_eq!(value, fallback_repo);
+        assert!(logs.contains("failed to parse postgres completion hint context JSON"));
+        assert!(logs.contains("dispatch_id=dispatch-1"));
     }
 
     #[test]
