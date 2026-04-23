@@ -106,7 +106,7 @@
 | `github::sync` | `src/github/sync.rs` | 1084 | giant-file |
 | `github::triage` | `src/github/triage.rs` | 339 |  |
 | `integration_tests::tests::high_risk_recovery` | `src/integration_tests/tests/high_risk_recovery.rs` | 1204 | giant-file |
-| `kanban` | `src/kanban.rs` | 3749 | giant-file |
+| `kanban` | `src/kanban.rs` | 3750 | giant-file |
 | `launch` | `src/launch.rs` | 39 |  |
 | `logging` | `src/logging.rs` | 160 |  |
 | `manual_intervention` | `src/manual_intervention.rs` | 65 |  |
