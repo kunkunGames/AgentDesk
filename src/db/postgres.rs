@@ -6,6 +6,10 @@ use sqlx::migrate::Migrator;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row};
+#[cfg(test)]
+use sqlx::postgres::PgConnection;
+#[cfg(test)]
+use sqlx::Connection;
 
 use crate::config::{AgentChannel, AgentDef, Config};
 use crate::server::routes::settings::{KvSeedAction, config_default_seed_actions};
@@ -382,8 +386,6 @@ const TEST_POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const TEST_POSTGRES_POOL_MAX_CONNECTIONS: u32 = 1;
 #[cfg(test)]
-const TEST_POSTGRES_ADMIN_POOL_MAX_CONNECTIONS: u32 = 1;
-#[cfg(test)]
 const TEST_POSTGRES_ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 static POSTGRES_TEST_SETUP_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
@@ -481,15 +483,19 @@ async fn connect_test_pool_with_timeout(
 }
 
 #[cfg(test)]
-async fn connect_test_admin_pool(database_url: &str, label: &str) -> Result<PgPool, String> {
-    // Admin create/drop helpers can race with slow pool teardown in PG-heavy CI
-    // lanes. Give only this setup/teardown path a longer acquisition window
-    // instead of weakening runtime or general test-pool behavior.
-    connect_test_pool_with_timeout(
-        database_url,
-        label,
-        TEST_POSTGRES_ADMIN_POOL_MAX_CONNECTIONS,
+async fn connect_test_admin_connection(
+    database_url: &str,
+    label: &str,
+) -> Result<PgConnection, String> {
+    let options = PgConnectOptions::from_str(database_url)
+        .map_err(|error| format!("{label} parse postgres url: {error}"))?;
+    // Admin create/drop helpers need only one dedicated connection. Avoid the
+    // pool acquire path entirely so slow CI runners do not fail before the
+    // first connection is even established.
+    run_test_postgres_sqlx_op_with_timeout(
         TEST_POSTGRES_ADMIN_CONNECT_TIMEOUT,
+        &format!("{label} connect postgres"),
+        PgConnection::connect_with(&options),
     )
     .await
 }
@@ -513,13 +519,13 @@ pub(crate) async fn create_test_database(
     // isolated databases at the same time. Serialize setup/teardown at the
     // shared helper boundary so every test module benefits from the guard.
     let _guard = lock_test_setup();
-    let admin_pool = connect_test_admin_pool(admin_url, &format!("{label} admin")).await?;
+    let mut admin_conn =
+        connect_test_admin_connection(admin_url, &format!("{label} admin")).await?;
     run_test_postgres_sqlx_op(
         &format!("{label} create postgres test db {database_name}"),
-        sqlx::query(&format!("CREATE DATABASE \"{database_name}\"")).execute(&admin_pool),
+        sqlx::query(&format!("CREATE DATABASE \"{database_name}\"")).execute(&mut admin_conn),
     )
     .await?;
-    close_test_pool(admin_pool, &format!("{label} admin")).await?;
     Ok(())
 }
 
@@ -547,7 +553,8 @@ pub(crate) async fn drop_test_database(
     label: &str,
 ) -> Result<(), String> {
     let _guard = lock_test_setup();
-    let admin_pool = connect_test_admin_pool(admin_url, &format!("{label} admin")).await?;
+    let mut admin_conn =
+        connect_test_admin_connection(admin_url, &format!("{label} admin")).await?;
     run_test_postgres_sqlx_op(
         &format!("{label} terminate postgres test db sessions {database_name}"),
         sqlx::query(
@@ -557,15 +564,15 @@ pub(crate) async fn drop_test_database(
                AND pid <> pg_backend_pid()",
         )
         .bind(database_name)
-        .execute(&admin_pool),
+        .execute(&mut admin_conn),
     )
     .await?;
     run_test_postgres_sqlx_op(
         &format!("{label} drop postgres test db {database_name}"),
-        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{database_name}\"")).execute(&admin_pool),
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{database_name}\""))
+            .execute(&mut admin_conn),
     )
     .await?;
-    close_test_pool(admin_pool, &format!("{label} admin")).await?;
     Ok(())
 }
 
