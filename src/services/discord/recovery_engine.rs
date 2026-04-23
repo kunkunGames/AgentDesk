@@ -117,6 +117,54 @@ fn can_resume_existing_rebind_inflight(state: &inflight::InflightTurnState) -> b
         && state.last_watcher_relayed_offset.is_none()
 }
 
+fn can_fast_path_captured_full_response(
+    state: &inflight::InflightTurnState,
+    output_already_completed: bool,
+) -> bool {
+    // Deliberately keep the gate narrow: only real user-authored inflights
+    // with a captured but completely unsent response are eligible, and only
+    // after authoritative completion evidence exists in the output stream.
+    !state.rebind_origin
+        && output_already_completed
+        && !state.full_response.trim().is_empty()
+        && state.response_sent_offset == 0
+        && state.last_watcher_relayed_offset.is_none()
+}
+
+async fn finish_recovered_turn_mailbox(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    stop_source: &'static str,
+) {
+    let finish = mailbox_finish_turn(shared, provider, channel_id).await;
+    if let Some(removed_token) = finish.removed_token {
+        removed_token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .global_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    super::clear_watchdog_deadline_override(channel_id.get()).await;
+    shared
+        .dispatch_thread_parents
+        .retain(|_, thread| *thread != channel_id);
+
+    if !finish.has_pending {
+        shared.dispatch_role_overrides.remove(&channel_id);
+    }
+
+    if finish.mailbox_online && finish.has_pending {
+        super::schedule_deferred_idle_queue_kickoff(
+            shared.clone(),
+            provider.clone(),
+            channel_id,
+            stop_source,
+        );
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistingInflightRebindAction {
     ReplaceSynthetic,
@@ -676,11 +724,11 @@ pub(super) async fn restore_inflight_turns(
                 // normal completion path was lost when dcserver restarted.
                 // #142: implementation/rework need explicit completion. Review
                 // and review-decision stay pending until their API handlers run.
-                // #222: DB lookup first, text parsing as fallback for unified threads.
-                let recovered_dispatch_id =
-                    lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id)
-                        .await
-                        .or_else(|| parse_dispatch_id(&state.user_text));
+                // Parse saved DISPATCH evidence first; reused threads may
+                // already have a newer pending dispatch on the same thread.
+                let recovered_dispatch_id = parse_dispatch_id(&state.user_text).or(
+                    lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id).await,
+                );
                 let role_binding = resolve_role_binding(channel_id, state.channel_name.as_deref());
                 let duration_ms =
                     recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
@@ -1188,6 +1236,207 @@ pub(super) async fn restore_inflight_turns(
             .map(|path| output_has_bytes_after_offset(path, state.last_offset))
             .unwrap_or(false);
 
+        if can_fast_path_captured_full_response(&state, output_already_completed) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ↻ recovery fast-path: delivering captured full_response for channel {}",
+                state.channel_id,
+            );
+
+            let assistant_response = state.full_response.clone();
+            let final_text =
+                super::formatting::format_for_discord_with_provider(&assistant_response, provider);
+            let relay_ok = super::formatting::replace_long_message_raw(
+                http,
+                channel_id,
+                current_msg_id,
+                &final_text,
+                shared,
+            )
+            .await
+            .is_ok();
+
+            super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
+            super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
+
+            let recovered_dispatch_id = parse_dispatch_id(&state.user_text)
+                .or(lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id).await);
+            let role_binding = resolve_role_binding(channel_id, state.channel_name.as_deref());
+            let duration_ms =
+                recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
+            let has_completion_evidence = if shared.sqlite.is_some() || shared.pg_pool.is_some() {
+                super::turn_bridge::persist_turn_analytics_row_with_handles(
+                    shared.sqlite.as_ref(),
+                    shared.pg_pool.as_ref(),
+                    provider,
+                    channel_id,
+                    user_msg_id,
+                    role_binding.as_ref(),
+                    recovered_dispatch_id
+                        .as_deref()
+                        .or(state.dispatch_id.as_deref()),
+                    state.session_key.as_deref(),
+                    state.session_id.as_deref(),
+                    &state,
+                    TurnTokenUsage::default(),
+                    duration_ms,
+                );
+                persist_recovered_transcript(
+                    shared.sqlite.as_ref(),
+                    shared.pg_pool.as_ref(),
+                    provider,
+                    &state,
+                    recovered_dispatch_id
+                        .as_deref()
+                        .or(state.dispatch_id.as_deref()),
+                    &assistant_response,
+                )
+                .await
+            } else {
+                !assistant_response.trim().is_empty()
+            };
+            let completion_context = has_completion_evidence
+                .then(|| serde_json::json!({ "agent_response_present": true }));
+            let fallback_result = completion_context
+                .clone()
+                .map(|mut result| {
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "completion_source".to_string(),
+                            serde_json::Value::String(
+                                "recovery_captured_full_response_db_fallback".to_string(),
+                            ),
+                        );
+                        obj.insert("needs_reconcile".to_string(), serde_json::Value::Bool(true));
+                    }
+                    result
+                })
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "completion_source": "recovery_captured_full_response_db_fallback",
+                        "needs_reconcile": true,
+                    })
+                });
+            let mut dispatch_completed = recovered_dispatch_id.is_none();
+            if let Some(ref did) = recovered_dispatch_id {
+                let dispatch_type = super::internal_api::lookup_dispatch_type(did)
+                    .await
+                    .ok()
+                    .flatten();
+
+                match dispatch_type.as_deref() {
+                    Some("implementation") | Some("rework") => {
+                        if !has_completion_evidence {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] ⚠ recovery: refusing to complete work dispatch {did} without assistant response"
+                            );
+                        } else if let Some(engine) = &shared.engine {
+                            for attempt in 1..=3u8 {
+                                match crate::dispatch::finalize_dispatch_with_backends(
+                                    shared.sqlite.as_ref(),
+                                    engine,
+                                    did,
+                                    "recovery_captured_full_response",
+                                    completion_context.as_ref(),
+                                ) {
+                                    Ok(_) => {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        tracing::info!(
+                                            "  [{ts}] ✓ recovery: completed dispatch {did} via finalize_dispatch"
+                                        );
+                                        let _ =
+                                            super::turn_bridge::queue_dispatch_followup_with_handles(
+                                                shared.sqlite.as_ref(),
+                                                shared.pg_pool.as_ref(),
+                                                did,
+                                                "recovery_captured_full_response",
+                                            )
+                                            .await;
+                                        dispatch_completed = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        tracing::warn!(
+                                            "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
+                                        );
+                                        if attempt < 3 {
+                                            tokio::time::sleep(std::time::Duration::from_secs(1))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            if !dispatch_completed {
+                                dispatch_completed =
+                                    super::turn_bridge::runtime_db_fallback_complete_with_result(
+                                        did,
+                                        &fallback_result,
+                                    );
+                                if dispatch_completed {
+                                    let _ =
+                                        super::turn_bridge::queue_dispatch_followup_with_handles(
+                                            shared.sqlite.as_ref(),
+                                            shared.pg_pool.as_ref(),
+                                            did,
+                                            "recovery_captured_full_response_fallback",
+                                        )
+                                        .await;
+                                }
+                            }
+                        } else {
+                            dispatch_completed =
+                                super::turn_bridge::runtime_db_fallback_complete_with_result(
+                                    did,
+                                    &fallback_result,
+                                );
+                            if dispatch_completed {
+                                let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
+                                    shared.sqlite.as_ref(),
+                                    shared.pg_pool.as_ref(),
+                                    did,
+                                    "recovery_captured_full_response_runtime_fallback",
+                                )
+                                .await;
+                            }
+                        }
+                        if !dispatch_completed {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] ❌ recovery: dispatch {did} completion failed — preserving state for retry"
+                            );
+                        }
+                    }
+                    Some(_) => {
+                        dispatch_completed = true;
+                    }
+                    None => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        tracing::warn!(
+                            "  [{ts}] ⚠ recovery: cannot determine dispatch type for {did} — preserving state"
+                        );
+                    }
+                }
+            }
+
+            if dispatch_completed && relay_ok {
+                finish_recovered_turn_mailbox(
+                    shared,
+                    provider,
+                    channel_id,
+                    "recovery_captured_full_response",
+                )
+                .await;
+                clear_inflight_state(provider, state.channel_id);
+            } else if dispatch_completed && !relay_ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ recovery: dispatch completed but Discord relay failed — preserving inflight for retry"
+                );
+            }
+            continue;
+        }
         if output_already_completed {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -1779,10 +2028,8 @@ pub(super) async fn restore_inflight_turns(
             Some(&adk_session_info),
             None,
             last_path.as_deref(),
-            // #222: DB lookup first for unified thread recovery
-            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
-                .await
-                .or_else(|| parse_dispatch_id(&state.user_text))
+            parse_dispatch_id(&state.user_text)
+                .or(lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get()).await)
                 .as_deref(),
             adk_thread_channel_id,
             role_binding
@@ -1860,11 +2107,8 @@ pub(super) async fn restore_inflight_turns(
             }
         });
 
-        // #222: DB lookup first for unified thread recovery
-        let recovery_dispatch_id =
-            lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get())
-                .await
-                .or_else(|| parse_dispatch_id(&state.user_text));
+        let recovery_dispatch_id = parse_dispatch_id(&state.user_text)
+            .or(lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get()).await);
         // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());
@@ -2323,7 +2567,224 @@ pub(crate) async fn rebind_inflight_for_channel(
 mod tests {
     use super::*;
     use crate::services::provider::ProviderKind;
+    use axum::extract::Query;
+    use axum::extract::{Path as AxumPath, State as AxumState};
+    use axum::http::Uri;
+    use axum::response::IntoResponse;
+    use axum::{Json, Router};
+    use libsql_rusqlite::OptionalExtension;
+    use poise::serenity_prelude as serenity;
+    use std::ffi::OsString;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MockRecoveryDiscordState {
+        edited_messages: Vec<(String, String, String)>,
+        posted_messages: Vec<(String, String)>,
+        reaction_paths: Vec<String>,
+    }
+
+    #[derive(Clone)]
+    struct MockRecoveryInternalApiState {
+        pending_dispatch_id: String,
+        dispatch_types: std::collections::HashMap<String, String>,
+    }
+
+    struct EnvVarReset {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarReset {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarReset {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn mock_discord_message(
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": message_id,
+            "channel_id": channel_id,
+            "author": {
+                "id": "999999999999999999",
+                "username": "mock-bot",
+                "bot": true
+            },
+            "content": content,
+            "timestamp": "2026-04-23T00:00:00.000000+00:00",
+            "edited_timestamp": null,
+            "tts": false,
+            "mention_everyone": false,
+            "mentions": [],
+            "mention_roles": [],
+            "attachments": [],
+            "embeds": [],
+            "pinned": false,
+            "webhook_id": null,
+            "type": 0
+        })
+    }
+
+    async fn spawn_mock_recovery_discord_server() -> (
+        String,
+        Arc<Mutex<MockRecoveryDiscordState>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        async fn edit_message(
+            AxumState(state): AxumState<Arc<Mutex<MockRecoveryDiscordState>>>,
+            AxumPath((channel_id, message_id)): AxumPath<(String, String)>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let content = body
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            state.lock().unwrap().edited_messages.push((
+                channel_id.clone(),
+                message_id.clone(),
+                content.clone(),
+            ));
+            (
+                axum::http::StatusCode::OK,
+                Json(mock_discord_message(&channel_id, &message_id, &content)),
+            )
+        }
+
+        async fn post_message(
+            AxumState(state): AxumState<Arc<Mutex<MockRecoveryDiscordState>>>,
+            AxumPath(channel_id): AxumPath<String>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            let content = body
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            state
+                .lock()
+                .unwrap()
+                .posted_messages
+                .push((channel_id.clone(), content.clone()));
+            (
+                axum::http::StatusCode::OK,
+                Json(mock_discord_message(
+                    &channel_id,
+                    "message-fallback",
+                    &content,
+                )),
+            )
+        }
+
+        async fn add_reaction(
+            AxumState(state): AxumState<Arc<Mutex<MockRecoveryDiscordState>>>,
+            uri: Uri,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .unwrap()
+                .reaction_paths
+                .push(format!("PUT {}", uri.path()));
+            axum::http::StatusCode::NO_CONTENT
+        }
+
+        async fn remove_reaction(
+            AxumState(state): AxumState<Arc<Mutex<MockRecoveryDiscordState>>>,
+            uri: Uri,
+        ) -> impl IntoResponse {
+            state
+                .lock()
+                .unwrap()
+                .reaction_paths
+                .push(format!("DELETE {}", uri.path()));
+            axum::http::StatusCode::NO_CONTENT
+        }
+
+        let state = Arc::new(Mutex::new(MockRecoveryDiscordState::default()));
+        let app = Router::new()
+            .route(
+                "/api/v10/channels/{channel_id}/messages/{message_id}",
+                axum::routing::patch(edit_message),
+            )
+            .route(
+                "/api/v10/channels/{channel_id}/messages",
+                axum::routing::post(post_message),
+            )
+            .route(
+                "/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+                axum::routing::put(add_reaction).delete(remove_reaction),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), state, handle)
+    }
+
+    async fn spawn_mock_recovery_internal_api_server(
+        state: MockRecoveryInternalApiState,
+    ) -> tokio::task::JoinHandle<()> {
+        async fn pending_dispatch(
+            AxumState(state): AxumState<MockRecoveryInternalApiState>,
+        ) -> impl IntoResponse {
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({ "dispatch_id": state.pending_dispatch_id })),
+            )
+        }
+
+        async fn dispatch_info(
+            AxumState(state): AxumState<MockRecoveryInternalApiState>,
+            Query(params): Query<std::collections::HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            let dispatch_id = params.get("dispatch_id").cloned().unwrap_or_default();
+            match state.dispatch_types.get(&dispatch_id) {
+                Some(dispatch_type) => (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "dispatch_type": dispatch_type })),
+                ),
+                None => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "dispatch not found" })),
+                ),
+            }
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/internal/pending-dispatch-for-thread",
+                axum::routing::get(pending_dispatch),
+            )
+            .route(
+                "/api/internal/card-thread",
+                axum::routing::get(dispatch_info),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        super::super::internal_api::init(addr.port(), None);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        })
+    }
 
     #[test]
     fn detects_result_after_offset_only_in_remaining_slice() {
@@ -2978,5 +3439,302 @@ mod tests {
         assert_eq!(offset, 0);
         assert!(current_len < saved_offset);
         assert!(truncated);
+    }
+    #[test]
+    fn fast_path_captured_full_response_requires_unsent_response() {
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            111,
+            222,
+            333,
+            "user input".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.full_response = "captured response".to_string();
+
+        assert!(
+            !can_fast_path_captured_full_response(&state, false),
+            "captured output alone is not authoritative completion evidence"
+        );
+        assert!(can_fast_path_captured_full_response(&state, true));
+
+        state.response_sent_offset = 1;
+        assert!(
+            !can_fast_path_captured_full_response(&state, true),
+            "partially-sent responses must stay on the existing path"
+        );
+    }
+
+    #[test]
+    fn fast_path_captured_full_response_skips_watcher_relayed_output() {
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            111,
+            222,
+            333,
+            "user input".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.full_response = "captured response".to_string();
+        state.last_watcher_relayed_offset = Some(128);
+
+        assert!(
+            !can_fast_path_captured_full_response(&state, true),
+            "watcher-relayed inflights must not duplicate-send on restart"
+        );
+    }
+
+    #[test]
+    fn fast_path_captured_full_response_skips_rebind_origin() {
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            0,
+            0,
+            0,
+            "/api/inflight/rebind".to_string(),
+            None,
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.rebind_origin = true;
+        state.full_response = "captured response".to_string();
+
+        assert!(!can_fast_path_captured_full_response(&state, true));
+    }
+
+    #[test]
+    fn fast_path_captured_full_response_skips_empty_response() {
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            111,
+            222,
+            333,
+            "user input".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.full_response = "   \n\t".to_string();
+
+        assert!(!can_fast_path_captured_full_response(&state, true));
+    }
+
+    #[tokio::test]
+    async fn restore_inflight_turns_fast_path_relays_captured_response_and_clears_inflight() {
+        let _lock = super::super::runtime_store::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("agentdesk-root");
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let _root_reset = EnvVarReset::set("AGENTDESK_ROOT_DIR", &root);
+        let output_path = temp.path().join("agentdesk-test.jsonl");
+        std::fs::write(
+            &output_path,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":\"preface\"}\n",
+                "{\"type\":\"result\",\"result\":\"done\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let db = crate::db::test_db();
+        let shared = super::super::make_shared_data_for_tests_with_storage(Some(db.clone()), None);
+        let (base_url, discord_state, server_handle) = spawn_mock_recovery_discord_server().await;
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("test-token")
+                .proxy(base_url)
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+
+        let channel_id = 1486333430516945008u64;
+        let user_msg_id = 1487795113240559788u64;
+        let current_msg_id = 1487799916758827138u64;
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            343742347365974026,
+            user_msg_id,
+            current_msg_id,
+            "릴리즈하다가 응답이 끊겼어. 이어서 설명해줘.".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some(output_path.to_string_lossy().into_owned()),
+            Some("/tmp/agentdesk-test.input".to_string()),
+            0,
+        );
+        state.full_response =
+            "이미 확인한 내용은 여기까지입니다. 이어서 원인과 대응을 설명하겠습니다.".to_string();
+        state.response_sent_offset = 0;
+        super::super::inflight::save_inflight_state(&state).unwrap();
+
+        restore_inflight_turns(&http, &shared, &ProviderKind::Codex).await;
+        server_handle.abort();
+
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_none(),
+            "fast-path completion must clear the saved inflight state"
+        );
+
+        let discord_state = discord_state.lock().unwrap();
+        assert_eq!(discord_state.edited_messages.len(), 1);
+        assert!(discord_state.posted_messages.is_empty());
+        assert_eq!(discord_state.edited_messages[0].0, channel_id.to_string());
+        assert_eq!(
+            discord_state.edited_messages[0].1,
+            current_msg_id.to_string()
+        );
+        assert_eq!(discord_state.edited_messages[0].2, state.full_response);
+        assert_eq!(discord_state.reaction_paths.len(), 2);
+        drop(discord_state);
+
+        let turn_id = format!("discord:{channel_id}:{user_msg_id}");
+        let conn = db.read_conn().unwrap();
+        let assistant_message: Option<String> = conn
+            .query_row(
+                "SELECT assistant_message FROM session_transcripts WHERE turn_id = ?1",
+                [turn_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            assistant_message.as_deref(),
+            Some("이미 확인한 내용은 여기까지입니다. 이어서 원인과 대응을 설명하겠습니다.")
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_inflight_turns_prefers_saved_dispatch_id_over_reused_thread_lookup() {
+        let _lock = super::super::runtime_store::lock_test_env();
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("agentdesk-root");
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let _root_reset = EnvVarReset::set("AGENTDESK_ROOT_DIR", &root);
+
+        let db = crate::db::test_db();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kanban_cards (
+                    id, title, status, latest_dispatch_id, active_thread_id, created_at, updated_at
+                 ) VALUES (
+                    'card-reuse', 'Reused thread recovery', 'in_progress',
+                    'dispatch-new', '1486333430516945008', datetime('now'), datetime('now')
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, dispatch_type, status, title, thread_id, created_at, updated_at
+                 ) VALUES (
+                    'dispatch-old', 'card-reuse', 'review', 'dispatched',
+                    '[Review R1] card-reuse', '1486333430516945008', datetime('now', '-2 minute'), datetime('now', '-2 minute')
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_dispatches (
+                    id, kanban_card_id, dispatch_type, status, title, thread_id, created_at, updated_at
+                 ) VALUES (
+                    'dispatch-new', 'card-reuse', 'review-decision', 'pending',
+                    '[리뷰 검토] card-reuse', '1486333430516945008', datetime('now', '-1 minute'), datetime('now', '-1 minute')
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+
+        let shared = super::super::make_shared_data_for_tests_with_storage(Some(db.clone()), None);
+        let (base_url, discord_state, server_handle) = spawn_mock_recovery_discord_server().await;
+        let api_handle = spawn_mock_recovery_internal_api_server(MockRecoveryInternalApiState {
+            pending_dispatch_id: "dispatch-new".to_string(),
+            dispatch_types: std::collections::HashMap::from([
+                ("dispatch-old".to_string(), "review".to_string()),
+                ("dispatch-new".to_string(), "review-decision".to_string()),
+            ]),
+        })
+        .await;
+        let http = Arc::new(
+            serenity::http::HttpBuilder::new("test-token")
+                .proxy(base_url)
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+
+        let output =
+            write_jsonl(&[r#"{"type":"result","subtype":"success","result":"복구 완료"}"#]);
+        let channel_id = 1486333430516945008u64;
+        let user_msg_id = 1487795113240559788u64;
+        let current_msg_id = 1487799916758827138u64;
+        let mut state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            343742347365974026,
+            user_msg_id,
+            current_msg_id,
+            "DISPATCH:dispatch-old - original review request".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some(output.path().to_string_lossy().to_string()),
+            Some("/tmp/agentdesk-test.input".to_string()),
+            0,
+        );
+        state.full_response = "복구 완료".to_string();
+        state.response_sent_offset = 0;
+        super::super::inflight::save_inflight_state(&state).unwrap();
+
+        restore_inflight_turns(&http, &shared, &ProviderKind::Codex).await;
+        server_handle.abort();
+        api_handle.abort();
+
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_none(),
+            "completed restart recovery should clear the saved inflight state"
+        );
+
+        let discord_state = discord_state.lock().unwrap();
+        assert_eq!(discord_state.edited_messages.len(), 1);
+        assert_eq!(discord_state.edited_messages[0].2, "복구 완료");
+        drop(discord_state);
+
+        let turn_id = format!("discord:{channel_id}:{user_msg_id}");
+        let conn = db.read_conn().unwrap();
+        let dispatch_id: Option<String> = conn
+            .query_row(
+                "SELECT dispatch_id FROM session_transcripts WHERE turn_id = ?1",
+                [turn_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            dispatch_id.as_deref(),
+            Some("dispatch-old"),
+            "saved DISPATCH evidence must win over a newer pending dispatch on the reused thread"
+        );
     }
 }
