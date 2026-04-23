@@ -142,7 +142,9 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         };
+        let health_status = if server_up { "healthy" } else { "unhealthy" };
         let mut json = serde_json::json!({
+            "status": health_status,
             "ok": server_up,
             "version": env!("CARGO_PKG_VERSION"),
             "db": server_up,
