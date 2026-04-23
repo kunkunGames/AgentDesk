@@ -188,7 +188,7 @@
 | `services::auto_queue::runtime` | `src/services/auto_queue/runtime.rs` | 518 |  |
 | `services::claude` | `src/services/claude.rs` | 2408 | giant-file |
 | `services::codex` | `src/services/codex.rs` | 1679 | giant-file |
-| `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 625 |  |
+| `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 629 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 2375 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 722 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 978 |  |
