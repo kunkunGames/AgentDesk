@@ -2284,6 +2284,7 @@ fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poise::serenity_prelude::{MessageId, UserId};
 
     fn test_db() -> Db {
         crate::db::test_db()
@@ -2631,6 +2632,56 @@ mod tests {
                 .has_active_turn()
                 .await,
             "fallback cleanup should clear the active turn",
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_meeting_mailboxes_allow_parallel_turns_on_different_provider_channels() {
+        let registry = Arc::new(HealthRegistry::new());
+        let codex = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let claude = TestHealthHarness::new_with_provider(ProviderKind::Claude).await;
+        registry
+            .register(ProviderKind::Codex.as_str().to_string(), codex.shared())
+            .await;
+        registry
+            .register(ProviderKind::Claude.as_str().to_string(), claude.shared())
+            .await;
+
+        let codex_channel = ChannelId::new(777_000_000_000_000_101);
+        let claude_channel = ChannelId::new(777_000_000_000_000_102);
+        let codex_shared =
+            resolve_direct_meeting_shared(registry.as_ref(), codex_channel, &ProviderKind::Codex)
+                .await
+                .expect("codex runtime should resolve");
+        let claude_shared =
+            resolve_direct_meeting_shared(registry.as_ref(), claude_channel, &ProviderKind::Claude)
+                .await
+                .expect("claude runtime should resolve");
+
+        let codex_started = codex_shared
+            .mailbox(codex_channel)
+            .try_start_turn(
+                Arc::new(crate::services::provider::CancelToken::new()),
+                UserId::new(7),
+                MessageId::new(70),
+            )
+            .await;
+        let claude_started = claude_shared
+            .mailbox(claude_channel)
+            .try_start_turn(
+                Arc::new(crate::services::provider::CancelToken::new()),
+                UserId::new(8),
+                MessageId::new(80),
+            )
+            .await;
+
+        assert!(
+            codex_started,
+            "first provider/channel mailbox should accept a turn"
+        );
+        assert!(
+            claude_started,
+            "a different provider/channel mailbox should not be blocked by the first turn"
         );
     }
 

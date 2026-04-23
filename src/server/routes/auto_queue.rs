@@ -6777,45 +6777,9 @@ async fn activate_with_deps_pg(
             }
         };
 
-        let busy = match sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM kanban_cards
-                 WHERE assigned_agent_id = $1
-                   AND status IN ('requested', 'in_progress', 'review')
-                   AND id != $2
-                   AND id NOT IN (
-                       SELECT kanban_card_id
-                       FROM auto_queue_entries
-                       WHERE run_id = $3
-                   )
-             )",
-        )
-        .bind(&agent_id)
-        .bind(&card_id)
-        .bind(&run_id)
-        .fetch_one(pool)
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": format!("load postgres busy-agent guard for run {run_id} agent {agent_id}: {error}")}),
-                    ),
-                );
-            }
-        };
-        if busy {
-            crate::auto_queue_log!(
-                info,
-                "activate_busy_agent_guard_blocked_pg",
-                entry_log_ctx.clone(),
-                "[auto-queue] Skipping activate for {agent_id}: agent has active cards outside auto-queue"
-            );
-            continue;
-        }
+        // #953: do not collapse same-agent dispatch capacity to a single
+        // active card. Slot allocation below is the actual concurrency guard.
+        // Same-channel turn races remain blocked by the mailbox/channel lock.
 
         let effective = match resolve_activate_pipeline_pg(
             pool,
@@ -7709,32 +7673,10 @@ pub(crate) fn activate_with_deps(
             }
         };
 
-        // Busy-agent guard (#110): skip if agent has active cards outside auto-queue.
-        // Exclude the card being dispatched (#162) and cards that belong to the
-        // same auto-queue run — those work in isolated worktrees so parallel
-        // execution is safe.
-        let conn = deps.db.separate_conn().unwrap();
-        let busy: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM kanban_cards \
-                 WHERE assigned_agent_id = ?1 AND status IN ('requested', 'in_progress', 'review') \
-                 AND id != ?2 \
-                 AND id NOT IN (SELECT kanban_card_id FROM auto_queue_entries WHERE run_id = ?3)",
-                libsql_rusqlite::params![agent_id, card_id, run_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        drop(conn);
-
-        if busy {
-            crate::auto_queue_log!(
-                info,
-                "activate_busy_agent_guard_blocked",
-                entry_log_ctx.clone(),
-                "[auto-queue] Skipping activate for {agent_id}: agent has active cards outside auto-queue"
-            );
-            continue;
-        }
+        // #953: slot allocation is the concurrency guard. Agent-wide active-card
+        // checks incorrectly cap same-agent work to 1 even when multiple slots
+        // are available. Same-channel races are still blocked later by mailbox
+        // and slot-specific dispatch routing.
 
         // #162/#500: If card is in a non-dispatchable state (e.g. backlog),
         // walk it through free transitions using the same canonical transition

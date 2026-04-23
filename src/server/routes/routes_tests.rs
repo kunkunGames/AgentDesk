@@ -200,6 +200,12 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
         let previous = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
@@ -224,6 +230,135 @@ fn write_test_skill(runtime_root: &std::path::Path, skill_name: &str, descriptio
         format!("# {skill_name}\n\n{description}\n"),
     )
     .unwrap();
+}
+
+fn write_announce_token(runtime_root: &std::path::Path) {
+    let credential_dir = crate::runtime_layout::credential_dir(runtime_root);
+    fs::create_dir_all(&credential_dir).unwrap();
+    fs::write(
+        crate::runtime_layout::credential_token_path(runtime_root, "announce"),
+        "announce-token\n",
+    )
+    .unwrap();
+}
+
+#[derive(Default)]
+struct MockDiscordDispatchState {
+    calls: Vec<String>,
+    thread_parents: std::collections::HashMap<String, String>,
+}
+
+async fn spawn_mock_dispatch_delivery_server() -> (
+    String,
+    Arc<std::sync::Mutex<MockDiscordDispatchState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        response::IntoResponse,
+        routing::{get, post},
+    };
+
+    async fn get_channel(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+    ) -> impl IntoResponse {
+        let (parent_id, total_message_sent) = {
+            let mut state = state.lock().unwrap();
+            state.calls.push(format!("GET /channels/{channel_id}"));
+            let parent_id = state
+                .thread_parents
+                .get(&channel_id)
+                .cloned()
+                .unwrap_or_else(|| channel_id.clone());
+            let total_message_sent = if channel_id.starts_with("thread-") {
+                1
+            } else {
+                0
+            };
+            (parent_id, total_message_sent)
+        };
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": channel_id,
+                "name": format!("mock-{channel_id}"),
+                "parent_id": parent_id,
+                "total_message_sent": total_message_sent,
+                "thread_metadata": {
+                    "archived": false,
+                    "locked": false
+                }
+            })),
+        )
+    }
+
+    async fn create_thread(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let thread_id = format!("thread-{channel_id}");
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .calls
+                .push(format!("POST /channels/{channel_id}/threads"));
+            state
+                .thread_parents
+                .insert(thread_id.clone(), channel_id.clone());
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": thread_id,
+                "name": format!("dispatch-{channel_id}"),
+                "parent_id": channel_id,
+                "thread_metadata": {
+                    "archived": false,
+                    "locked": false
+                }
+            })),
+        )
+    }
+
+    async fn create_message(
+        State(state): State<Arc<std::sync::Mutex<MockDiscordDispatchState>>>,
+        Path(channel_id): Path<String>,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .calls
+                .push(format!("POST /channels/{channel_id}/messages"));
+        }
+
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": format!("message-{channel_id}")
+            })),
+        )
+    }
+
+    let state = Arc::new(std::sync::Mutex::new(MockDiscordDispatchState::default()));
+    let app = Router::new()
+        .route("/channels/{channel_id}", get(get_channel))
+        .route("/channels/{channel_id}/threads", post(create_thread))
+        .route("/channels/{channel_id}/messages", post(create_message))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://{addr}"), state, handle)
 }
 
 struct MockGhOverride {
@@ -5035,6 +5170,285 @@ async fn dispatch_create_and_get() {
         .unwrap();
     let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
     assert_eq!(json2["dispatch"]["id"], dispatch_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_routes_allow_same_agent_parallel_delivery_on_different_provider_channels() {
+    let _env_lock = env_lock();
+    let (base_url, state, server_handle) = spawn_mock_dispatch_delivery_server().await;
+    let _api_base = EnvVarGuard::set("AGENTDESK_DISCORD_API_BASE_URL", &base_url);
+    let runtime_root = tempfile::tempdir().unwrap();
+    write_announce_token(runtime_root.path());
+    let _root_env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", runtime_root.path());
+
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (
+                id, name, provider, discord_channel_id, discord_channel_alt,
+                discord_channel_cc, discord_channel_cdx, created_at, updated_at
+             ) VALUES (
+                'agent-parallel-provider', 'Agent Parallel Provider', 'claude', '111', '222',
+                '111', '222', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, created_at, updated_at
+             ) VALUES (
+                'card-parallel-impl', 'Parallel implementation', 'ready', 'medium',
+                'agent-parallel-provider', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, assigned_agent_id, created_at, updated_at
+             ) VALUES (
+                'card-parallel-consult', 'Parallel consultation', 'ready', 'medium',
+                'agent-parallel-provider', datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, discord_channel_id, discord_channel_alt,
+            discord_channel_cc, discord_channel_cdx, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
+         )",
+    )
+    .bind("agent-parallel-provider")
+    .bind("Agent Parallel Provider")
+    .bind("claude")
+    .bind("111")
+    .bind("222")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, NOW(), NOW()
+         )",
+    )
+    .bind("card-parallel-impl")
+    .bind("Parallel implementation")
+    .bind("ready")
+    .bind("medium")
+    .bind("agent-parallel-provider")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, NOW(), NOW()
+         )",
+    )
+    .bind("card-parallel-consult")
+    .bind("Parallel consultation")
+    .bind("ready")
+    .bind("medium")
+    .bind("agent-parallel-provider")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db.clone(),
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let impl_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"card-parallel-impl","to_agent_id":"agent-parallel-provider","dispatch_type":"implementation","title":"Parallel implementation"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(impl_response.status(), StatusCode::CREATED);
+    let impl_body = axum::body::to_bytes(impl_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let impl_json: serde_json::Value = serde_json::from_slice(&impl_body).unwrap();
+    let impl_dispatch_id = impl_json["dispatch"]["id"]
+        .as_str()
+        .expect("implementation dispatch id")
+        .to_string();
+
+    let consult_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"kanban_card_id":"card-parallel-consult","to_agent_id":"agent-parallel-provider","dispatch_type":"consultation","title":"Parallel consultation"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consult_response.status(), StatusCode::CREATED);
+    let consult_body = axum::body::to_bytes(consult_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let consult_json: serde_json::Value = serde_json::from_slice(&consult_body).unwrap();
+    let consult_dispatch_id = consult_json["dispatch"]["id"]
+        .as_str()
+        .expect("consultation dispatch id")
+        .to_string();
+
+    let pending_notify_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM dispatch_outbox
+          WHERE dispatch_id = ANY($1)
+            AND action = 'notify'
+            AND status = 'pending'",
+    )
+    .bind(vec![impl_dispatch_id.clone(), consult_dispatch_id.clone()])
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_notify_count, 2,
+        "route create must enqueue both notify rows before delivery"
+    );
+
+    let processed = crate::server::routes::dispatches::process_outbox_batch_with_real_notifier(
+        Some(&db),
+        &pg_pool,
+    )
+    .await;
+    assert_eq!(processed, 2, "outbox worker should drain both notify rows");
+
+    server_handle.abort();
+
+    let state = state.lock().unwrap();
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/111/threads".to_string()),
+        "implementation dispatch must use the primary provider channel: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/thread-111/messages".to_string()),
+        "implementation dispatch must post into its primary-thread mailbox: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/222/threads".to_string()),
+        "consultation dispatch must use the counter-model provider channel: {:?}",
+        state.calls
+    );
+    assert!(
+        state
+            .calls
+            .contains(&"POST /channels/thread-222/messages".to_string()),
+        "consultation dispatch must post into its counter-model thread mailbox: {:?}",
+        state.calls
+    );
+    drop(state);
+
+    let impl_thread_id: Option<String> = sqlx::query_scalar(
+        "SELECT thread_id
+           FROM task_dispatches
+          WHERE id = $1",
+    )
+    .bind(&impl_dispatch_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(impl_thread_id.as_deref(), Some("thread-111"));
+    let impl_status: String = sqlx::query_scalar(
+        "SELECT status
+           FROM task_dispatches
+          WHERE id = $1",
+    )
+    .bind(&impl_dispatch_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(impl_status, "dispatched");
+    let consult_thread_id: Option<String> = sqlx::query_scalar(
+        "SELECT thread_id
+           FROM task_dispatches
+          WHERE id = $1",
+    )
+    .bind(&consult_dispatch_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(consult_thread_id.as_deref(), Some("thread-222"));
+    let consult_status: String = sqlx::query_scalar(
+        "SELECT status
+           FROM task_dispatches
+          WHERE id = $1",
+    )
+    .bind(&consult_dispatch_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(consult_status, "dispatched");
+
+    let done_notify_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM dispatch_outbox
+          WHERE dispatch_id = ANY($1)
+            AND action = 'notify'
+            AND status = 'done'",
+    )
+    .bind(vec![impl_dispatch_id.clone(), consult_dispatch_id.clone()])
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(done_notify_count, 2, "notify rows must complete via outbox");
+    let pending_status_reactions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+           FROM dispatch_outbox
+          WHERE dispatch_id = ANY($1)
+            AND action = 'status_reaction'
+            AND status = 'pending'",
+    )
+    .bind(vec![impl_dispatch_id, consult_dispatch_id])
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_status_reactions, 2,
+        "notify delivery must enqueue one status_reaction follow-up per dispatch"
+    );
+
+    pg_pool.close().await;
+    pg_db.drop().await;
 }
 
 #[tokio::test]
@@ -15977,6 +16391,139 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         Some(3),
         "newly expanded slot must be assigned when parallel dispatch fills all slots"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_queue_activate_allows_same_agent_parallel_across_runs_when_free_slot_exists() {
+    crate::pipeline::ensure_loaded();
+    let (_repo, _repo_guard) = setup_test_repo();
+    let db = test_db();
+    let engine = test_engine(&db);
+    seed_agent(&db, "agent-cross-run");
+    ensure_auto_queue_tables(&db);
+    seed_auto_queue_card(
+        &db,
+        "card-cross-run-active",
+        1962,
+        "requested",
+        "agent-cross-run",
+    );
+    seed_auto_queue_card(&db, "card-cross-run-next", 1963, "ready", "agent-cross-run");
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-cross-run-active', 'test-repo', 'agent-cross-run', 'active', 2, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_runs (
+                id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+            ) VALUES (
+                'run-cross-run-next', 'test-repo', 'agent-cross-run', 'active', 2, 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, priority_rank, thread_group, dispatched_at
+            ) VALUES (
+                'entry-cross-run-active', 'run-cross-run-active', 'card-cross-run-active', 'agent-cross-run',
+                'dispatched', 'dispatch-cross-run-active', 0, 0, 0, datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group
+            ) VALUES (
+                'entry-cross-run-next', 'run-cross-run-next', 'card-cross-run-next', 'agent-cross-run',
+                'pending', 0, 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_queue_slots (
+                agent_id, slot_index, assigned_run_id, assigned_thread_group
+            ) VALUES (
+                'agent-cross-run', 0, 'run-cross-run-active', 0
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+            ) VALUES (
+                'dispatch-cross-run-active', 'card-cross-run-active', 'agent-cross-run',
+                'implementation', 'pending', 'Cross-run active dispatch', datetime('now'), datetime('now')
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = test_api_router(db.clone(), engine, None);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/activate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "run_id": "run-cross-run-next",
+                        "active_only": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["count"], 1,
+        "a second run for the same agent should dispatch when another slot is free"
+    );
+
+    let conn = db.lock().unwrap();
+    let next_entry: (String, Option<i64>) = conn
+        .query_row(
+            "SELECT status, slot_index
+             FROM auto_queue_entries
+             WHERE id = 'entry-cross-run-next'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_entry.0, "dispatched");
+    assert_eq!(next_entry.1, Some(1));
+
+    let next_slot: (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT assigned_run_id, assigned_thread_group
+             FROM auto_queue_slots
+             WHERE agent_id = 'agent-cross-run' AND slot_index = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_slot.0.as_deref(), Some("run-cross-run-next"));
+    assert_eq!(next_slot.1, Some(0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
