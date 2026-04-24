@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -564,6 +565,10 @@ async fn agent_exists_pg(pool: &sqlx::PgPool, id: &str) -> Result<bool, sqlx::Er
     Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
 }
 
+fn pg_timestamp_to_rfc3339(value: Option<DateTime<Utc>>) -> Option<String> {
+    value.map(|value| value.to_rfc3339())
+}
+
 async fn find_agent_turn_session_pg(
     pool: &sqlx::PgPool,
     agent_id: &str,
@@ -573,8 +578,8 @@ async fn find_agent_turn_session_pg(
                 s.provider,
                 s.status,
                 s.active_dispatch_id,
-                to_char(s.last_heartbeat, 'YYYY-MM-DD HH24:MI:SS') AS last_heartbeat,
-                to_char(s.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
+                s.last_heartbeat,
+                s.created_at,
                 s.thread_channel_id::TEXT AS thread_channel_id,
                 COALESCE(
                     s.thread_channel_id::TEXT,
@@ -600,8 +605,8 @@ async fn find_agent_turn_session_pg(
         let provider: Option<String> = row.try_get("provider")?;
         let raw_status: Option<String> = row.try_get("status")?;
         let active_dispatch_id: Option<String> = row.try_get("active_dispatch_id")?;
-        let last_heartbeat: Option<String> = row.try_get("last_heartbeat")?;
-        let created_at: Option<String> = row.try_get("created_at")?;
+        let last_heartbeat = pg_timestamp_to_rfc3339(row.try_get("last_heartbeat")?);
+        let created_at = pg_timestamp_to_rfc3339(row.try_get("created_at")?);
         let thread_channel_id: Option<String> = row.try_get("thread_channel_id")?;
         let runtime_channel_id: Option<String> = row.try_get("runtime_channel_id")?;
         let session_key_ref = (!session_key.trim().is_empty()).then_some(session_key.as_str());
@@ -1635,6 +1640,19 @@ mod tests {
     fn test_engine(db: &Db) -> PolicyEngine {
         let config = crate::config::Config::default();
         PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
+    }
+
+    #[test]
+    fn pg_timestamp_to_rfc3339_keeps_timezone_marker_for_activity_resolution() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-04-24T10:15:30+09:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let formatted = pg_timestamp_to_rfc3339(Some(timestamp)).unwrap();
+
+        assert_eq!(formatted, "2026-04-24T01:15:30+00:00");
+        assert!(chrono::DateTime::parse_from_rfc3339(&formatted).is_ok());
+        assert_ne!(formatted, "2026-04-24 01:15:30");
     }
 
     #[tokio::test]

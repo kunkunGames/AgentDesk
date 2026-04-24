@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Result;
 use libsql_rusqlite::{Connection, OptionalExtension}; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
@@ -286,15 +286,15 @@ pub fn sync_agents_from_config(db: &Db, agents: &[AgentDef]) -> Result<usize> {
         .lock()
         .map_err(|e| anyhow::anyhow!("DB lock error: {e}"))?;
 
+    let config_ids: HashSet<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+
     for agent in agents {
         upsert_agent_from_config_sqlite(&conn, agent)?;
     }
-    migrate_legacy_agent_aliases_sqlite(&conn, agents)?;
+    migrate_legacy_agent_aliases_sqlite(&conn, agents, &config_ids)?;
 
     // Remove DB agents that are no longer in yaml config
     {
-        let config_ids: std::collections::HashSet<&str> =
-            agents.iter().map(|a| a.id.as_str()).collect();
         let mut stmt = conn.prepare("SELECT id FROM agents")?;
         let db_ids: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
@@ -370,11 +370,23 @@ fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Resul
     Ok(())
 }
 
-fn migrate_legacy_agent_aliases_sqlite(conn: &Connection, agents: &[AgentDef]) -> Result<()> {
+fn migrate_legacy_agent_aliases_sqlite(
+    conn: &Connection,
+    agents: &[AgentDef],
+    config_ids: &HashSet<&str>,
+) -> Result<()> {
     for agent in agents {
         let Some(legacy_id) = legacy_agent_alias(&agent.id) else {
             continue;
         };
+        if config_ids.contains(legacy_id.as_str()) {
+            tracing::info!(
+                "[agent-sync] Preserving configured legacy agent '{}' while syncing '{}'",
+                legacy_id,
+                agent.id
+            );
+            continue;
+        }
 
         if sqlite_agent_exists(conn, &legacy_id)? {
             copy_runtime_fields_from_legacy_sqlite(conn, &legacy_id, &agent.id)?;
@@ -787,6 +799,84 @@ mod tests {
             let actual: Option<String> = conn.query_row(sql, [], |row| row.get(0)).unwrap();
             assert_eq!(actual, expected, "query `{sql}`");
         }
+    }
+
+    #[test]
+    fn sync_preserves_configured_legacy_openclaw_agent_id() {
+        let db = test_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (
+                id, name, provider, status, xp
+             ) VALUES (?1, ?2, 'codex', 'working', 42)",
+            libsql_rusqlite::params!["openclaw-maker", "Configured Legacy Maker"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO github_repos (id, default_agent_id) VALUES ('owner/repo', 'openclaw-maker')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let agents = vec![
+            AgentDef {
+                id: "maker".into(),
+                name: "Maker".into(),
+                name_ko: None,
+                provider: "codex".into(),
+                channels: AgentChannels {
+                    codex: Some("maker-cdx".into()),
+                    ..Default::default()
+                },
+                keywords: Vec::new(),
+                department: Some("engineering".into()),
+                avatar_emoji: None,
+            },
+            AgentDef {
+                id: "openclaw-maker".into(),
+                name: "Legacy Maker".into(),
+                name_ko: None,
+                provider: "codex".into(),
+                channels: AgentChannels {
+                    codex: Some("legacy-cdx".into()),
+                    ..Default::default()
+                },
+                keywords: Vec::new(),
+                department: Some("legacy".into()),
+                avatar_emoji: None,
+            },
+        ];
+        sync_agents_from_config(&db, &agents).unwrap();
+
+        let conn = db.lock().unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM agents ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|row| row.ok())
+            .collect();
+        assert_eq!(ids, vec!["maker".to_string(), "openclaw-maker".to_string()]);
+
+        let (status, xp): (String, i64) = conn
+            .query_row(
+                "SELECT status, xp FROM agents WHERE id = 'openclaw-maker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "working");
+        assert_eq!(xp, 42);
+
+        let github_default: Option<String> = conn
+            .query_row(
+                "SELECT default_agent_id FROM github_repos WHERE id = 'owner/repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(github_default.as_deref(), Some("openclaw-maker"));
     }
 
     #[test]

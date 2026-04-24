@@ -297,13 +297,14 @@ pub async fn sync_agents_from_config_pg(
     pool: &PgPool,
     agents: &[AgentDef],
 ) -> Result<usize, String> {
+    let config_ids: BTreeSet<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
+
     for agent in agents {
         upsert_agent_from_config_pg(pool, agent).await?;
     }
 
-    migrate_legacy_agent_aliases_pg(pool, agents).await?;
+    migrate_legacy_agent_aliases_pg(pool, agents, &config_ids).await?;
 
-    let config_ids: BTreeSet<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
     let existing_rows = sqlx::query("SELECT id FROM agents")
         .fetch_all(pool)
         .await
@@ -384,11 +385,23 @@ async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<
     Ok(())
 }
 
-async fn migrate_legacy_agent_aliases_pg(pool: &PgPool, agents: &[AgentDef]) -> Result<(), String> {
+async fn migrate_legacy_agent_aliases_pg(
+    pool: &PgPool,
+    agents: &[AgentDef],
+    config_ids: &BTreeSet<&str>,
+) -> Result<(), String> {
     for agent in agents {
         let Some(legacy_id) = legacy_agent_alias(&agent.id) else {
             continue;
         };
+        if config_ids.contains(legacy_id.as_str()) {
+            tracing::info!(
+                "[agent-sync] Preserving configured legacy agent '{}' while syncing '{}'",
+                legacy_id,
+                agent.id
+            );
+            continue;
+        }
 
         if postgres_agent_exists(pool, &legacy_id).await? {
             copy_runtime_fields_from_legacy_pg(pool, &legacy_id, &agent.id).await?;
@@ -1079,6 +1092,92 @@ mod tests {
         assert_eq!(office_agent, "maker");
 
         close_test_pool(pool, "db::postgres legacy reseed test pool")
+            .await
+            .expect("close postgres pool");
+        test_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_startup_reseed_preserves_configured_legacy_openclaw_agent_id() {
+        let test_db = TestDatabase::create().await;
+        let mut config = postgres_test_config(&test_db);
+        config.agents = vec![
+            crate::config::AgentDef {
+                id: "maker".to_string(),
+                name: "Maker".to_string(),
+                name_ko: None,
+                provider: "codex".to_string(),
+                channels: crate::config::AgentChannels {
+                    codex: Some(crate::config::AgentChannel::from("maker-cdx")),
+                    ..Default::default()
+                },
+                keywords: Vec::new(),
+                department: Some("engineering".to_string()),
+                avatar_emoji: None,
+            },
+            crate::config::AgentDef {
+                id: "openclaw-maker".to_string(),
+                name: "Legacy Maker".to_string(),
+                name_ko: None,
+                provider: "codex".to_string(),
+                channels: crate::config::AgentChannels {
+                    codex: Some(crate::config::AgentChannel::from("legacy-cdx")),
+                    ..Default::default()
+                },
+                keywords: Vec::new(),
+                department: Some("legacy".to_string()),
+                avatar_emoji: None,
+            },
+        ];
+
+        let pool = connect_and_migrate(&config)
+            .await
+            .expect("connect and migrate postgres")
+            .expect("postgres pool");
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, status, xp)
+             VALUES ($1, 'Configured Legacy Maker', 'codex', 'working', 42)",
+        )
+        .bind("openclaw-maker")
+        .execute(&pool)
+        .await
+        .expect("insert configured legacy agent");
+        sqlx::query("INSERT INTO github_repos (id, default_agent_id) VALUES ($1, $2)")
+            .bind("owner/repo")
+            .bind("openclaw-maker")
+            .execute(&pool)
+            .await
+            .expect("insert github repo");
+
+        startup_reseed(&pool, &config)
+            .await
+            .expect("startup reseed postgres");
+
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM agents ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("list agent ids");
+        assert_eq!(ids, vec!["maker".to_string(), "openclaw-maker".to_string()]);
+
+        let (status, xp): (String, i64) =
+            sqlx::query_as("SELECT status, xp FROM agents WHERE id = $1")
+                .bind("openclaw-maker")
+                .fetch_one(&pool)
+                .await
+                .expect("load configured legacy agent");
+        assert_eq!(status, "working");
+        assert_eq!(xp, 42);
+
+        let github_default: Option<String> =
+            sqlx::query_scalar("SELECT default_agent_id FROM github_repos WHERE id = $1")
+                .bind("owner/repo")
+                .fetch_one(&pool)
+                .await
+                .expect("load github repo default agent");
+        assert_eq!(github_default.as_deref(), Some("openclaw-maker"));
+
+        close_test_pool(pool, "db::postgres configured legacy reseed test pool")
             .await
             .expect("close postgres pool");
         test_db.drop().await;
