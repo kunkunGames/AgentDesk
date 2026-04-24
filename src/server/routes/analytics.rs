@@ -674,6 +674,7 @@ fn parse_machine_config(value: &str) -> Option<Vec<(String, String)>> {
                 })
                 .collect()
         })
+        .filter(|machines: &Vec<(String, String)>| !machines.is_empty())
 }
 
 fn default_machine_config() -> Vec<(String, String)> {
@@ -1278,6 +1279,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_status_machines_config_uses_hostname_for_empty_postgres_config() {
+        let sqlite_db = crate::db::test_db();
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        sqlx::query(
+            "INSERT INTO kv_meta (key, value)
+             VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind("machines")
+        .bind("[]")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let hostname = crate::services::platform::hostname_short();
+
+        let machines = load_machine_config(&sqlite_db, Some(&pool)).await;
+
+        assert_eq!(machines, vec![(hostname.clone(), hostname)]);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
     async fn machine_status_machines_config_uses_sqlite_without_pg_pool() {
         let sqlite_db = crate::db::test_db();
         {
@@ -1302,6 +1328,27 @@ mod tests {
                 "sqlite-host.local".to_string()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn machine_status_machines_config_uses_hostname_for_invalid_sqlite_entries() {
+        let sqlite_db = crate::db::test_db();
+        {
+            let conn = sqlite_db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
+                libsql_rusqlite::params![
+                    "machines",
+                    serde_json::json!([{ "host": "missing-name" }]).to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let hostname = crate::services::platform::hostname_short();
+
+        let machines = load_machine_config(&sqlite_db, None).await;
+
+        assert_eq!(machines, vec![(hostname.clone(), hostname)]);
     }
 
     #[tokio::test]
