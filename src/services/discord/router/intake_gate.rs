@@ -29,6 +29,42 @@ pub(super) fn should_skip_for_missing_required_mention(
         && !content_has_explicit_user_mention(content, bot_user_id)
 }
 
+fn session_has_usable_path(session: Option<&DiscordSession>) -> bool {
+    session
+        .and_then(|session| session.current_path.as_deref())
+        .is_some_and(|path| !path.trim().is_empty())
+}
+
+async fn has_direct_runtime_session(
+    data: &Data,
+    channel_id: serenity::ChannelId,
+    effective_channel_id: serenity::ChannelId,
+) -> bool {
+    let core = data.shared.core.lock().await;
+    session_has_usable_path(core.sessions.get(&channel_id))
+        || (effective_channel_id != channel_id
+            && session_has_usable_path(core.sessions.get(&effective_channel_id)))
+}
+
+async fn can_route_unbound_direct_session(
+    data: &Data,
+    ctx: &serenity::Context,
+    channel_id: serenity::ChannelId,
+    effective_channel_id: serenity::ChannelId,
+    is_dm: bool,
+) -> bool {
+    if has_direct_runtime_session(data, channel_id, effective_channel_id).await {
+        return true;
+    }
+
+    auto_restore_session_with_dm_hint(&data.shared, channel_id, ctx, Some(is_dm)).await;
+    if effective_channel_id != channel_id {
+        auto_restore_session(&data.shared, effective_channel_id, ctx).await;
+    }
+
+    has_direct_runtime_session(data, channel_id, effective_channel_id).await
+}
+
 fn should_skip_human_slash_message(
     content: &str,
     known_slash_commands: Option<&std::collections::HashSet<String>>,
@@ -576,14 +612,31 @@ pub(in crate::services::discord) async fn handle_event(
                 {
                     RuntimeChannelBindingStatus::Owned => {}
                     RuntimeChannelBindingStatus::Unowned => {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] ⏭ BINDING-GUARD: skipping message {} in unbound channel {} (effective {})",
-                            new_message.id,
+                        if can_route_unbound_direct_session(
+                            data,
+                            ctx,
                             channel_id,
-                            effective_channel_id
-                        );
-                        return Ok(());
+                            effective_channel_id,
+                            is_dm,
+                        )
+                        .await
+                        {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] ↪ BINDING-GUARD: allowing unbound channel {} (effective {}) because a direct session exists",
+                                channel_id,
+                                effective_channel_id
+                            );
+                        } else {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] ⏭ BINDING-GUARD: skipping message {} in unbound channel {} (effective {})",
+                                new_message.id,
+                                channel_id,
+                                effective_channel_id
+                            );
+                            return Ok(());
+                        }
                     }
                     RuntimeChannelBindingStatus::Unknown => {
                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1114,3 +1167,40 @@ pub(in crate::services::discord) async fn handle_event(
 }
 
 use super::super::model_picker_interaction::handle_model_picker_interaction;
+
+#[cfg(test)]
+mod direct_session_tests {
+    use super::*;
+
+    fn session_with_path(path: Option<&str>) -> DiscordSession {
+        DiscordSession {
+            session_id: None,
+            memento_context_loaded: false,
+            memento_reflected: false,
+            current_path: path.map(str::to_string),
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            remote_profile_name: None,
+            channel_id: Some(1),
+            channel_name: None,
+            category_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: 0,
+            assistant_turns: 0,
+        }
+    }
+
+    #[test]
+    fn direct_session_routing_requires_nonblank_path() {
+        assert!(!session_has_usable_path(None));
+        assert!(!session_has_usable_path(Some(&session_with_path(None))));
+        assert!(!session_has_usable_path(Some(&session_with_path(Some(
+            "  "
+        )))));
+        assert!(session_has_usable_path(Some(&session_with_path(Some(
+            "/Users/itismyfield"
+        )))));
+    }
+}
