@@ -1012,6 +1012,15 @@ pub(super) fn spawn_turn_bridge(
                             }
                         }
                         StreamMessage::ToolResult { content, is_error } => {
+                            // #1084: flag oversize tool outputs + record metrics.
+                            // Never mutates `content` — the agent and transcript
+                            // still see the raw output; only a warn log + counters
+                            // fire when thresholds are exceeded.
+                            let _ = crate::services::tool_output_guard::observe(
+                                last_tool_name.as_deref(),
+                                is_error,
+                                &content,
+                            );
                             if let Some(ref tn) = last_tool_name {
                                 let status = if is_error { "✗" } else { "✓" };
                                 let detail = last_tool_summary
