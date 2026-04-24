@@ -17,6 +17,7 @@ pub(crate) mod monitoring_detector;
 pub(crate) mod monitoring_status;
 mod org_schema;
 pub(crate) mod org_writer;
+pub(crate) mod outbound;
 mod prompt_builder;
 mod queue_io;
 mod recovery_engine;
