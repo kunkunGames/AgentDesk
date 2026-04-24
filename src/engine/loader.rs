@@ -15,10 +15,23 @@ pub struct LoadedPolicy {
     pub name: String,
     pub file: PathBuf,
     pub priority: i32,
+    /// Short SHA256 hash (first 12 hex chars) of the policy file contents at
+    /// load time. Used as the `policy_version` stamp in hook observability
+    /// events — changes automatically on hot-reload (#1080).
+    pub policy_version: String,
     pub hooks: HashMap<Hook, Persistent<Function<'static>>>,
     /// Dynamic hooks: custom function names not in the Hook enum.
     /// Keyed by the JS function name (e.g. "onCustomStateEnter").
     pub dynamic_hooks: HashMap<String, Persistent<Function<'static>>>,
+}
+
+/// Compute a short content hash used as the policy version stamp.
+pub fn compute_policy_version(source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    let full = hex::encode(hasher.finalize());
+    full.chars().take(12).collect()
 }
 
 // SAFETY: LoadedPolicy is only accessed while holding a Mutex.
@@ -90,6 +103,7 @@ pub fn load_single_policy(ctx: &Context, path: &Path) -> Result<LoadedPolicy> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    let policy_version = compute_policy_version(&source);
 
     // Use a JS-side capture approach: set up a global __policyCapture holder
     // and a pure-JS registerPolicy that stores the argument there.
@@ -191,6 +205,7 @@ pub fn load_single_policy(ctx: &Context, path: &Path) -> Result<LoadedPolicy> {
             name,
             file: path.to_path_buf(),
             priority,
+            policy_version: policy_version.clone(),
             hooks,
             dynamic_hooks,
         })
