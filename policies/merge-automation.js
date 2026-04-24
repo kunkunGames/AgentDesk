@@ -1,3 +1,4 @@
+/* giant-file-exemption: reason=merge-automation-pending-split ticket=#1078 */
 // ── merge-automation.js ──────────────────────────────────────────────────
 // Automates PR merging and worktree cleanup after review passes.
 //

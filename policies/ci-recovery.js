@@ -1,3 +1,4 @@
+/* giant-file-exemption: reason=ci-recovery-pending-split ticket=#1078 */
 /**
  * ci-recovery.js — ADK Policy: CI Failure Auto-Recovery (#257)
  * priority: 46 (between pipeline policies=45 and review-automation=50)
