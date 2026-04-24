@@ -224,6 +224,56 @@ mod tests {
         );
     }
 
+    // #964: queue-api `cancel_turn` emits `killed=false` when the
+    // `PreserveSessionAndInflight` policy is used. The DoD item #3 pins the
+    // invariant that the watcher registry slot MUST survive such a cancel —
+    // only force-kill (cleanup_tmux=true) is allowed to tear down the watcher.
+    #[tokio::test]
+    async fn stop_turn_preserving_queue_with_killed_false_does_not_cancel_watcher() {
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id = 223_456_789_012_345_679;
+        let channel_name = "watcher-preserve-cancel";
+        let tmux_name = ProviderKind::Codex.build_tmux_session_name(channel_name);
+
+        harness
+            .seed_channel_session(channel_id, channel_name, Some("session-preserve"))
+            .await;
+        harness.seed_active_turn(channel_id, 55, 66).await;
+        let cancel_flag = harness.seed_watcher(channel_id);
+
+        let registry = harness.registry();
+        let result = super::stop_turn_preserving_queue(
+            Some(registry.as_ref()),
+            &super::TurnLifecycleTarget {
+                provider: Some(ProviderKind::Codex),
+                channel_id: Some(poise::serenity_prelude::ChannelId::new(channel_id)),
+                tmux_name,
+            },
+            "queue-api cancel_turn (killed=false preservation test)",
+        )
+        .await;
+
+        // PreserveSessionAndInflight + no actual tmux session → tmux_killed=false.
+        assert!(
+            !result.tmux_killed,
+            "preserve policy must report killed=false"
+        );
+        assert!(!result.inflight_cleared);
+        assert!(result.queue_preserved);
+
+        // Critical DoD invariant: watcher registry slot survives the cancel
+        // and the stale cancel flag was NOT flipped. A future re-dispatch can
+        // reuse or replace this watcher without racing a silent teardown.
+        assert!(
+            harness.has_watcher(channel_id),
+            "watcher registry entry must be preserved across killed=false cancel",
+        );
+        assert!(
+            !cancel_flag.load(std::sync::atomic::Ordering::Relaxed),
+            "watcher cancel flag must NOT be set on killed=false cancel",
+        );
+    }
+
     #[tokio::test]
     async fn direct_fallback_force_kill_clears_mailbox_by_tmux_lookup() {
         let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;

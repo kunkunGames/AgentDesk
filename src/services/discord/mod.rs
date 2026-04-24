@@ -480,6 +480,11 @@ pub(super) struct TmuxRelayCoord {
     /// watcher already relies on for Claude Code's `task_notification`
     /// auto-trigger boundary.
     pub(super) confirmed_end_offset: Arc<std::sync::atomic::AtomicU64>,
+    /// Wall-clock timestamp (ms since epoch) of the most recent confirmed
+    /// relay. 0 = no confirmed relay observed yet. Read by the
+    /// `watcher-state` observability endpoint (#964). Monotonic is NOT
+    /// required — this is a telemetry field only.
+    pub(super) last_relay_ts_ms: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl TmuxRelayCoord {
@@ -487,6 +492,7 @@ impl TmuxRelayCoord {
         Self {
             relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 }

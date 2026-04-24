@@ -2373,6 +2373,12 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "GET",
+            "/api/channels/{id}/watcher-state",
+            "monitoring",
+            "Snapshot tmux-watcher lifecycle state for a channel (#964): attached, tmux_session, last_relay_offset, inflight_state_present, last_relay_ts_ms",
+        ),
+        ep(
+            "GET",
             "/api/dispatches/pending",
             "queue",
             "List pending dispatches",
