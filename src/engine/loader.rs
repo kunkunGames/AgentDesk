@@ -251,7 +251,7 @@ fn resolve_policy_module(
     Ok(resolved)
 }
 
-fn install_policy_module_loader(
+pub(crate) fn install_policy_module_loader(
     ctx: &Ctx<'_>,
     policy_root: &Path,
     entry_dir: &Path,

@@ -748,6 +748,100 @@ fn policies_raw_db_count_stays_within_budget() {
     );
 }
 
+/// #1078 (906-2): Policy modularization budget.
+///
+/// Every `.js` file under `policies/` must stay at or below 10240 bytes
+/// (10 KiB). Files above that threshold must carry a top-of-file marker
+/// comment `/* giant-file-exemption: reason=<short> ticket=#<id> */` so
+/// reviewers see at a glance that the bloat was accepted on purpose.
+///
+/// Hard cap: the exempt-file allowance is tracked below. New oversized
+/// files without the marker fail the test. The allowance shrinks only as
+/// existing giants get split into submodules (see `policies/timeouts/` for
+/// the pattern). Raise this number only with an explicit ticket reference.
+#[test]
+fn policies_js_files_under_10kb_budget() {
+    const POLICY_FILE_SIZE_LIMIT: u64 = 10 * 1024;
+    // Allowance for pre-existing oversized files carrying the
+    // `giant-file-exemption:` marker comment. Shrinks when files are split.
+    const GIANT_FILE_EXEMPTION_ALLOWANCE: usize = 8;
+
+    let policies_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip test fixtures and harnesses
+                    if path.file_name().and_then(|n| n.to_str()) == Some("__tests__") {
+                        continue;
+                    }
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(&policies_dir, &mut files);
+    files.sort();
+
+    let mut oversized_unmarked: Vec<(PathBuf, u64)> = Vec::new();
+    let mut oversized_marked: Vec<(PathBuf, u64)> = Vec::new();
+
+    for file in &files {
+        let size = match fs::metadata(file) {
+            Ok(md) => md.len(),
+            Err(_) => continue,
+        };
+        if size <= POLICY_FILE_SIZE_LIMIT {
+            continue;
+        }
+        // Read just the first ~2 KB to look for the marker — it must be near
+        // the top of the file.
+        let head = {
+            let s = fs::read_to_string(file).unwrap_or_default();
+            s.chars().take(2048).collect::<String>()
+        };
+        if head.contains("giant-file-exemption:") {
+            oversized_marked.push((file.clone(), size));
+        } else {
+            oversized_unmarked.push((file.clone(), size));
+        }
+    }
+
+    assert!(
+        oversized_unmarked.is_empty(),
+        "#1078 policy file size budget exceeded: {} file(s) > {} bytes without \
+         `/* giant-file-exemption: reason=... ticket=#... */` marker. \
+         Either split the file into submodules (see policies/timeouts/ for the \
+         pattern) or add the marker comment at the top of the file. Offenders: {:?}",
+        oversized_unmarked.len(),
+        POLICY_FILE_SIZE_LIMIT,
+        oversized_unmarked
+            .iter()
+            .map(|(p, s)| format!("{}={}B", p.display(), s))
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        oversized_marked.len() <= GIANT_FILE_EXEMPTION_ALLOWANCE,
+        "#1078 giant-file-exemption allowance exceeded: marked={} allowance={}. \
+         Each new exemption should come with a ticket to split the file. \
+         Bump GIANT_FILE_EXEMPTION_ALLOWANCE only with explicit justification. \
+         Currently marked: {:?}",
+        oversized_marked.len(),
+        GIANT_FILE_EXEMPTION_ALLOWANCE,
+        oversized_marked
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads() {
     let db = test_db();
@@ -792,11 +886,15 @@ fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads() {
 
     let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies/auto-queue.js");
     let policy = fs::read_to_string(&policy_path).expect("auto-queue policy must be readable");
+    let policies_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
 
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     ctx.with(|ctx| {
         register_globals(&ctx, db.clone()).unwrap();
+        // #1078: auto-queue now requires() helpers from policies/lib/, so the
+        // module loader must be installed before evaluating the policy source.
+        crate::engine::loader::install_policy_module_loader(&ctx, &policies_root, &policies_root).unwrap();
         let _: rquickjs::Value = ctx.eval(r#"agentdesk.registerPolicy = function(_) {};"#).unwrap();
         let _: rquickjs::Value = ctx.eval(policy.as_str()).unwrap();
         let result: String = ctx
@@ -1622,11 +1720,14 @@ fn js_auto_queue_continue_run_after_entry_passes_agent_id_to_activate() {
     let db = test_db();
     let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies/auto-queue.js");
     let policy = fs::read_to_string(&policy_path).expect("auto-queue policy must be readable");
+    let policies_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
 
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     ctx.with(|ctx| {
         register_globals(&ctx, db.clone()).unwrap();
+        // #1078: auto-queue now requires() helpers from policies/lib/.
+        crate::engine::loader::install_policy_module_loader(&ctx, &policies_root, &policies_root).unwrap();
         let _: rquickjs::Value = ctx.eval(r#"agentdesk.registerPolicy = function(_) {};"#).unwrap();
         let _: rquickjs::Value = ctx.eval(policy.as_str()).unwrap();
         let captured: String = ctx
