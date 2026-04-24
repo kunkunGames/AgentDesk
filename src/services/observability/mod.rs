@@ -13,6 +13,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::db::Db;
 
+// Foundation observability layer introduced by #1070 (Epic #905 Phase 1).
+// `metrics` → lightweight channel/provider atomic counters for hot paths.
+// `events`  → bounded in-memory structured event log + periodic JSONL flush.
+pub mod events;
+pub mod metrics;
+
 const EVENT_BATCH_SIZE: usize = 64;
 const EVENT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const SNAPSHOT_FLUSH_INTERVAL: Duration = Duration::from_secs(15);
@@ -406,6 +412,8 @@ pub fn init_observability(db: Db, pg_pool: Option<PgPool>) {
         storage.pg_pool = pg_pool;
     }
     ensure_worker(&runtime);
+    // #1070: start the periodic JSONL flush task for the in-memory event log.
+    events::ensure_flusher();
 }
 
 pub fn emit_turn_started(
@@ -415,6 +423,18 @@ pub fn emit_turn_started(
     session_key: Option<&str>,
     turn_id: Option<&str>,
 ) {
+    // #1070: lightweight atomic counter for turn_bridge attempt entry.
+    metrics::record_attempt(channel_id, provider);
+    events::record(events::StructuredEvent::new(
+        "turn_started",
+        Some(channel_id),
+        Some(provider),
+        json!({
+            "dispatch_id": dispatch_id,
+            "session_key": session_key,
+            "turn_id": turn_id,
+        }),
+    ));
     emit_event(
         "turn_started",
         Some(provider),
@@ -446,6 +466,25 @@ pub fn emit_turn_finished(
         normalized_outcome.as_deref(),
         Some("completed") | Some("tmux_handoff")
     );
+    // #1070: atomic success/fail counters for dispatch outcome.
+    if is_success {
+        metrics::record_success(channel_id, provider);
+    } else {
+        metrics::record_fail(channel_id, provider);
+    }
+    events::record(events::StructuredEvent::new(
+        "turn_finished",
+        Some(channel_id),
+        Some(provider),
+        json!({
+            "dispatch_id": dispatch_id,
+            "session_key": session_key,
+            "turn_id": turn_id,
+            "outcome": normalized_outcome,
+            "duration_ms": duration_ms.max(0),
+            "tmux_handoff": tmux_handoff,
+        }),
+    ));
     emit_event(
         "turn_finished",
         Some(provider),
@@ -474,6 +513,19 @@ pub fn emit_guard_fired(
     turn_id: Option<&str>,
     guard_type: &str,
 ) {
+    // #1070: atomic guard-fire counter.
+    metrics::record_guard_fire(channel_id, provider);
+    events::record(events::StructuredEvent::new(
+        "guard_fired",
+        Some(channel_id),
+        Some(provider),
+        json!({
+            "dispatch_id": dispatch_id,
+            "session_key": session_key,
+            "turn_id": turn_id,
+            "guard_type": normalize_string(guard_type),
+        }),
+    ));
     emit_event(
         "guard_fired",
         Some(provider),
@@ -493,6 +545,14 @@ pub fn emit_guard_fired(
 }
 
 pub fn emit_watcher_replaced(provider: &str, channel_id: u64, source: &str) {
+    // #1070: atomic watcher-replacement counter for claim_or_replace stale cancel.
+    metrics::record_watcher_replacement(channel_id, provider);
+    events::record(events::StructuredEvent::new(
+        "watcher_replaced",
+        Some(channel_id),
+        Some(provider),
+        json!({ "source": normalize_string(source) }),
+    ));
     emit_event(
         "watcher_replaced",
         Some(provider),
