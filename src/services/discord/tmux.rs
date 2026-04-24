@@ -6197,6 +6197,56 @@ mod tests {
         assert!(watcher.paused.load(Ordering::Relaxed));
     }
 
+    // #964: dedupe single-winner invariant. When two watchers try to register
+    // for the same channel, `claim_or_replace_watcher` must cancel the stale
+    // handle and install the fresh one — only the new watcher relays. The old
+    // cross-watcher path that let both exist and "skip each other" would leave
+    // the channel without any watcher when the incoming loop iteration also
+    // saw its sibling's confirmed_end and skipped relay. This test pins the
+    // replace-not-skip behavior for the registry.
+    #[test]
+    fn claim_or_replace_watcher_dedupes_to_single_winner_and_cancels_stale() {
+        let watchers = dashmap::DashMap::new();
+        let channel_id = ChannelId::new(1485506232256168124);
+
+        let initial = test_watcher_handle();
+        let initial_cancel = initial.cancel.clone();
+        let initial_paused = initial.paused.clone();
+        initial_paused.store(false, Ordering::Relaxed);
+
+        assert!(super::try_claim_watcher(&watchers, channel_id, initial));
+        assert!(!initial_cancel.load(Ordering::Relaxed));
+
+        let incoming = test_watcher_handle();
+        let incoming_cancel = incoming.cancel.clone();
+        let incoming_paused = incoming.paused.clone();
+        // Mark the incoming as distinct from initial to verify the slot
+        // actually swapped to the new handle (not just kept the old one).
+        incoming_paused.store(true, Ordering::Relaxed);
+
+        let fresh = claim_or_replace_watcher(
+            &watchers,
+            channel_id,
+            incoming,
+            &ProviderKind::Codex,
+            "unit-test-dedupe",
+        );
+        assert!(!fresh, "replacement must return false (not a fresh slot)");
+        assert_eq!(watchers.len(), 1, "exactly one watcher entry survives");
+
+        // Stale handle was cancelled so its loop iteration exits quietly
+        // rather than continuing alongside the new watcher.
+        assert!(initial_cancel.load(Ordering::Relaxed));
+        // New handle is NOT cancelled — it relays.
+        assert!(!incoming_cancel.load(Ordering::Relaxed));
+
+        let surviving = watchers.get(&channel_id).expect("watcher should exist");
+        assert!(
+            surviving.paused.load(Ordering::Relaxed),
+            "slot must hold the incoming handle (paused=true), not the stale one",
+        );
+    }
+
     #[test]
     fn missing_inflight_fallback_warns_and_triggers_reattach_on_db_miss() {
         let plan = missing_inflight_fallback_plan(true, false, true);

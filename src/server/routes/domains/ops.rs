@@ -165,6 +165,10 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route("/channels/{id}/queue", get(queue_api::list_channel_queue))
             .route(
+                "/channels/{id}/watcher-state",
+                get(queue_api::get_watcher_state),
+            )
+            .route(
                 "/dispatches/pending",
                 get(queue_api::list_pending_dispatches),
             )

@@ -322,6 +322,15 @@ fn advance_tmux_relay_confirmed_end(
         }
     }
 
+    // #964: observability timestamp — updated whenever the watermark advances
+    // (including the CAS-loser path, since that still proves a peer completed
+    // a relay) so `GET /api/channels/:id/watcher-state` can surface the most
+    // recent relay activity without blocking on disk state.
+    relay_coord.last_relay_ts_ms.store(
+        chrono::Utc::now().timestamp_millis(),
+        std::sync::atomic::Ordering::Release,
+    );
+
     let confirmed_end = relay_coord
         .confirmed_end_offset
         .load(std::sync::atomic::Ordering::Acquire);
