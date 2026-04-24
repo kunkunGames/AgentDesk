@@ -4,7 +4,7 @@
 
 - Production Rust modules: `260`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `83`
+- Giant files: `84`
 
 ## Namespace Summary
 
@@ -52,7 +52,7 @@
 | `cli::migrate` | `src/cli/migrate.rs` | 321 |  |
 | `cli::migrate::apply` | `src/cli/migrate/apply.rs` | 3144 | giant-file |
 | `cli::migrate::plan` | `src/cli/migrate/plan.rs` | 1513 | giant-file |
-| `cli::migrate::postgres_cutover` | `src/cli/migrate/postgres_cutover.rs` | 7405 | giant-file |
+| `cli::migrate::postgres_cutover` | `src/cli/migrate/postgres_cutover.rs` | 7571 | giant-file |
 | `cli::migrate::source` | `src/cli/migrate/source.rs` | 1612 | giant-file |
 | `cli::run` | `src/cli/run.rs` | 398 |  |
 | `cli::utils` | `src/cli/utils.rs` | 274 |  |
@@ -60,11 +60,11 @@
 | `crate` | `src/main.rs` | 42 |  |
 | `credential` | `src/credential.rs` | 24 |  |
 | `db` | `src/db/mod.rs` | 243 |  |
-| `db::agents` | `src/db/agents.rs` | 645 |  |
+| `db::agents` | `src/db/agents.rs` | 955 |  |
 | `db::auto_queue` | `src/db/auto_queue.rs` | 6265 | giant-file |
 | `db::kanban` | `src/db/kanban.rs` | 487 |  |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 255 |  |
-| `db::postgres` | `src/db/postgres.rs` | 913 |  |
+| `db::postgres` | `src/db/postgres.rs` | 1228 | giant-file |
 | `db::schema` | `src/db/schema.rs` | 2942 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 485 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 1246 | giant-file |
@@ -124,7 +124,7 @@
 | `server::boot` | `src/server/boot.rs` | 154 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 80 |  |
 | `server::routes` | `src/server/routes/mod.rs` | 210 |  |
-| `server::routes::agents` | `src/server/routes/agents.rs` | 1627 | giant-file |
+| `server::routes::agents` | `src/server/routes/agents.rs` | 1746 | giant-file |
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 1081 | giant-file |
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 1266 | giant-file |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 92 |  |
