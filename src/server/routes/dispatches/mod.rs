@@ -1,5 +1,5 @@
 mod crud;
-mod discord_delivery;
+pub(crate) mod discord_delivery;
 mod outbox;
 #[cfg(test)]
 mod tests;
