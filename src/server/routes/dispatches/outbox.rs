@@ -149,6 +149,41 @@ const RETRY_BACKOFF_SECS: [i64; 4] = [60, 300, 900, 3600];
 /// Maximum number of retries before marking as permanent failure.
 const MAX_RETRY_COUNT: i64 = 4;
 
+/// Invariant: `dispatch_outbox_retry_count_in_bounds`.
+///
+/// `dispatch_outbox.retry_count` is a `bigint` (i64 in Rust) with
+/// `MAX_RETRY_COUNT = 4`. A valid row satisfies `0 <= retry_count <=
+/// MAX_RETRY_COUNT + 1`. The `+1` slack tolerates the one-tick window between
+/// `new_count = retry_count + 1` and the status flip to `failed`. Violations
+/// are observed via `record_invariant_check` — no panic in release. See
+/// `docs/invariants.md`.
+fn check_dispatch_outbox_retry_count_in_bounds(
+    outbox_id: i64,
+    dispatch_id: &str,
+    retry_count: i64,
+) {
+    let ok = retry_count >= 0 && retry_count <= MAX_RETRY_COUNT + 1;
+    crate::services::observability::record_invariant_check(
+        ok,
+        crate::services::observability::InvariantViolation {
+            provider: None,
+            channel_id: None,
+            dispatch_id: Some(dispatch_id),
+            session_key: None,
+            turn_id: None,
+            invariant: "dispatch_outbox_retry_count_in_bounds",
+            code_location: "src/server/routes/dispatches/outbox.rs:check_dispatch_outbox_retry_count_in_bounds",
+            message: "dispatch_outbox.retry_count is out of valid bounds",
+            details: serde_json::json!({
+                "outbox_id": outbox_id,
+                "dispatch_id": dispatch_id,
+                "retry_count": retry_count,
+                "max_retry_count": MAX_RETRY_COUNT,
+            }),
+        },
+    );
+}
+
 fn dispatch_notify_delivery_suppressed(
     conn: &libsql_rusqlite::Connection,
     dispatch_id: &str,
@@ -381,6 +416,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
 
     let count = pending.len();
     for (id, dispatch_id, action, agent_id, card_id, title, retry_count) in pending {
+        check_dispatch_outbox_retry_count_in_bounds(id, &dispatch_id, retry_count);
         if action == "notify" {
             let suppress_delivery = if let Some(pool) = pg_pool {
                 dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id)
