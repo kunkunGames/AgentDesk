@@ -2483,6 +2483,17 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ]),
         ep(
             "GET",
+            "/api/analytics/observability",
+            "analytics",
+            "Foundation-layer atomic counters per channel×provider + in-memory structured event ring (#1070)",
+        )
+        .with_params([(
+            "recentLimit",
+            query_param("integer", false, "Maximum recent events to return (<=1000)")
+                .with_default(100),
+        )]),
+        ep(
+            "GET",
             "/api/quality/events",
             "analytics",
             "Agent quality raw event stream",

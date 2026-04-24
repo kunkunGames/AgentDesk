@@ -122,6 +122,31 @@ pub async fn quality_events(
     }
 }
 
+/// GET /api/analytics/observability
+///
+/// Lightweight foundation-layer view introduced by #1070 (Epic #905 Phase 1).
+/// Surfaces the atomic channel × provider counters and the latest entries of
+/// the in-memory structured event ring buffer without touching SQL.
+#[derive(Debug, Default, Deserialize)]
+pub struct ObservabilityQuery {
+    #[serde(rename = "recentLimit")]
+    pub recent_limit: Option<usize>,
+}
+
+pub async fn observability(
+    Query(params): Query<ObservabilityQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let limit = params.recent_limit.unwrap_or(100).min(1000);
+    let counters = crate::services::observability::metrics::snapshot();
+    let recent_events = crate::services::observability::events::recent(limit);
+    let body = json!({
+        "counters": counters,
+        "recent_events": recent_events,
+        "generated_at_ms": chrono::Utc::now().timestamp_millis(),
+    });
+    (StatusCode::OK, Json(body))
+}
+
 /// GET /api/analytics/invariants
 pub async fn invariants(
     State(state): State<AppState>,
@@ -1566,5 +1591,97 @@ mod tests {
 
         pool.close().await;
         pg_db.drop().await;
+    }
+
+    /// #1070: foundation-layer `/api/analytics/observability` endpoint shape
+    /// + hot-path wiring check. `emit_turn_started`/`emit_turn_finished` must
+    /// populate the atomic counters that the endpoint exposes.
+    #[tokio::test]
+    async fn observability_route_exposes_atomic_counters_and_recent_events() {
+        let _guard = crate::services::observability::test_runtime_lock();
+        crate::services::observability::reset_for_tests();
+        crate::services::observability::metrics::reset_for_tests();
+        crate::services::observability::events::reset_for_tests();
+
+        let db = crate::db::test_db();
+        crate::services::observability::init_observability(db.clone(), None);
+
+        // Attempt + success
+        crate::services::observability::emit_turn_started(
+            "codex",
+            5150,
+            Some("dispatch-obs"),
+            Some("session-obs"),
+            Some("turn-obs"),
+        );
+        crate::services::observability::emit_turn_finished(
+            "codex",
+            5150,
+            Some("dispatch-obs"),
+            Some("session-obs"),
+            Some("turn-obs"),
+            "completed",
+            42,
+            false,
+        );
+        // Attempt + fail (different turn).
+        crate::services::observability::emit_turn_started(
+            "codex",
+            5150,
+            Some("dispatch-obs-2"),
+            Some("session-obs-2"),
+            Some("turn-obs-2"),
+        );
+        crate::services::observability::emit_turn_finished(
+            "codex",
+            5150,
+            Some("dispatch-obs-2"),
+            Some("session-obs-2"),
+            Some("turn-obs-2"),
+            "error",
+            10,
+            false,
+        );
+        // Watcher replacement + guard fire
+        crate::services::observability::emit_watcher_replaced("codex", 5150, "stale_cancel");
+        crate::services::observability::emit_guard_fired(
+            "codex",
+            5150,
+            Some("dispatch-obs"),
+            None,
+            None,
+            "placeholder_suppress",
+        );
+
+        let (status, Json(body)) = observability(Query(ObservabilityQuery {
+            recent_limit: Some(50),
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let counters = body["counters"].as_array().expect("counters array");
+        let row = counters
+            .iter()
+            .find(|row| row["channel_id"] == json!(5150) && row["provider"] == json!("codex"))
+            .expect("expected counter row for codex/5150");
+        assert_eq!(row["attempts"], json!(2));
+        assert_eq!(row["success"], json!(1));
+        assert_eq!(row["fail"], json!(1));
+        assert_eq!(row["guard_fires"], json!(1));
+        assert_eq!(row["watcher_replacements"], json!(1));
+        let rate = row["success_rate"].as_f64().expect("success_rate f64");
+        assert!((rate - 0.5).abs() < 1e-9, "success_rate={rate}");
+
+        let events = body["recent_events"].as_array().expect("recent_events");
+        assert!(!events.is_empty());
+        let kinds: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|ev| ev["event_type"].as_str())
+            .collect();
+        assert!(kinds.contains("turn_started"));
+        assert!(kinds.contains("turn_finished"));
+        assert!(kinds.contains("watcher_replaced"));
+        assert!(kinds.contains("guard_fired"));
     }
 }
