@@ -103,8 +103,9 @@ src/
 │   │   ├── mock_discord.rs
 │   │   ├── mod.rs
 │   │   └── scenarios.rs
-│   └── tests/
-│       └── high_risk_recovery.rs
+│   ├── tests/
+│   │   └── high_risk_recovery.rs
+│   └── agents_setup_e2e.rs
 ├── runtime_layout/
 │   ├── config_merge.rs
 │   ├── legacy_migration.rs
