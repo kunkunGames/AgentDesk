@@ -221,6 +221,7 @@ fn public_health_json(json: serde_json::Value) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!(false));
     let degraded = status.as_str().is_some_and(|status| status != "healthy");
     serde_json::json!({
+        "ok": !degraded,
         "status": status,
         "version": version,
         "db": db,

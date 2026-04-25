@@ -74,6 +74,15 @@ pub(crate) fn run_startup_diagnostic_once() -> Result<Option<PathBuf>, String> {
             ));
         }
     };
+    // Remove lock on all exit paths (early error returns, panics).
+    struct LockGuard(std::path::PathBuf);
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _lock_guard = LockGuard(in_progress_path.clone());
+
     let started_at = chrono::Local::now().to_rfc3339();
     let _ = writeln!(lock, "started_at={started_at}");
 
@@ -134,6 +143,5 @@ pub(crate) fn run_startup_diagnostic_once() -> Result<Option<PathBuf>, String> {
             artifact_path.display()
         )
     })?;
-    let _ = fs::remove_file(in_progress_path);
     Ok(Some(artifact_path))
 }

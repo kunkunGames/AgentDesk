@@ -457,6 +457,7 @@ fn configured_provider_names(cfg: &config::Config, snapshot: &HealthSnapshot) ->
     configured
 }
 
+// Guidance strings are written in Korean; this project targets Korean-primary operators.
 fn provider_runtime_guidance(provider: &ProviderKind) -> String {
     let provider_name = provider.as_str();
     let log_hint = dcserver_log_hint();
