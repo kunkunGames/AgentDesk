@@ -101,7 +101,11 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
     .and_then(|report| serde_json::to_value(report).ok());
 
     if let Some(ref registry) = state.health_registry {
-        let discord_snapshot = health::build_health_snapshot(registry).await;
+        let discord_snapshot = if detailed {
+            health::build_health_snapshot(registry).await
+        } else {
+            health::build_public_health_snapshot(registry).await
+        };
         let mut status = discord_snapshot.status();
         let mut json =
             serde_json::to_value(discord_snapshot).unwrap_or_else(|_| serde_json::json!({}));

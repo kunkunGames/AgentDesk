@@ -870,8 +870,20 @@ pub async fn clear_provider_channel_runtime(
     true
 }
 
-/// Build the health check snapshot for the API response.
+/// Build the detailed health check snapshot for authenticated/local diagnostics.
 pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSnapshot {
+    build_health_snapshot_with_options(registry, true).await
+}
+
+/// Build the public health check snapshot without detail-only mailbox probes.
+pub async fn build_public_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSnapshot {
+    build_health_snapshot_with_options(registry, false).await
+}
+
+async fn build_health_snapshot_with_options(
+    registry: &HealthRegistry,
+    include_mailbox_details: bool,
+) -> DiscordHealthSnapshot {
     let uptime_secs = registry.started_at.elapsed().as_secs();
     let version = env!("CARGO_PKG_VERSION");
 
@@ -942,40 +954,42 @@ pub async fn build_health_snapshot(registry: &HealthRegistry) -> DiscordHealthSn
         queue_depth += provider_queue_depth;
         watcher_count += provider_watchers;
         recovery_duration = recovery_duration.max(provider_recovery_duration);
-        let provider_kind = ProviderKind::from_str(&entry.name);
-        for (channel_id, snapshot) in &mailbox_snapshots {
-            let inflight_state = provider_kind
-                .as_ref()
-                .and_then(|pk| super::inflight::load_inflight_state(pk, channel_id.get()));
-            let tmux_session_name = inflight_state
-                .as_ref()
-                .and_then(|state| state.tmux_session_name.as_deref());
-            let tmux_present =
-                tmux_session_name.is_some_and(crate::services::platform::tmux::has_session);
-            let process_present = tmux_session_name
-                .is_some_and(|name| crate::services::platform::tmux::pane_pid(name).is_some());
-            mailbox_entries.push(MailboxHealthSnapshot {
-                provider: entry.name.clone(),
-                channel_id: channel_id.get(),
-                has_cancel_token: snapshot.cancel_token.is_some(),
-                queue_depth: snapshot.intervention_queue.len(),
-                recovery_started: snapshot.recovery_started_at.is_some(),
-                active_request_owner: snapshot.active_request_owner.map(|id| id.get()),
-                active_user_message_id: snapshot.active_user_message_id.map(|id| id.get()),
-                agent_turn_status: if snapshot.cancel_token.is_some() {
-                    "active"
-                } else {
-                    "idle"
-                },
-                watcher_attached: entry.shared.tmux_watchers.contains_key(channel_id),
-                inflight_state_present: inflight_state.is_some(),
-                tmux_present,
-                process_present,
-                active_dispatch_present: inflight_state
+        if include_mailbox_details {
+            let provider_kind = ProviderKind::from_str(&entry.name);
+            for (channel_id, snapshot) in &mailbox_snapshots {
+                let inflight_state = provider_kind
                     .as_ref()
-                    .and_then(|state| state.dispatch_id.as_deref())
-                    .is_some(),
-            });
+                    .and_then(|pk| super::inflight::load_inflight_state(pk, channel_id.get()));
+                let tmux_session_name = inflight_state
+                    .as_ref()
+                    .and_then(|state| state.tmux_session_name.as_deref());
+                let tmux_present =
+                    tmux_session_name.is_some_and(crate::services::platform::tmux::has_session);
+                let process_present = tmux_session_name
+                    .is_some_and(|name| crate::services::platform::tmux::pane_pid(name).is_some());
+                mailbox_entries.push(MailboxHealthSnapshot {
+                    provider: entry.name.clone(),
+                    channel_id: channel_id.get(),
+                    has_cancel_token: snapshot.cancel_token.is_some(),
+                    queue_depth: snapshot.intervention_queue.len(),
+                    recovery_started: snapshot.recovery_started_at.is_some(),
+                    active_request_owner: snapshot.active_request_owner.map(|id| id.get()),
+                    active_user_message_id: snapshot.active_user_message_id.map(|id| id.get()),
+                    agent_turn_status: if snapshot.cancel_token.is_some() {
+                        "active"
+                    } else {
+                        "idle"
+                    },
+                    watcher_attached: entry.shared.tmux_watchers.contains_key(channel_id),
+                    inflight_state_present: inflight_state.is_some(),
+                    tmux_present,
+                    process_present,
+                    active_dispatch_present: inflight_state
+                        .as_ref()
+                        .and_then(|state| state.dispatch_id.as_deref())
+                        .is_some(),
+                });
+            }
         }
 
         if !connected {
@@ -3030,6 +3044,22 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "provider:claude:pending_queue_depth:3")
         );
+    }
+
+    #[tokio::test]
+    async fn public_health_snapshot_omits_detail_mailbox_entries() {
+        let harness = TestHealthHarness::new().await;
+        let channel_id = 713_000_000_000_000_001u64;
+        harness.seed_active_turn(channel_id, 42, 9_001).await;
+
+        let public_snapshot = build_public_health_snapshot(&harness.registry()).await;
+        let detail_snapshot = build_health_snapshot(&harness.registry()).await;
+        let public_json = serde_json::to_value(&public_snapshot).unwrap();
+        let detail_json = serde_json::to_value(&detail_snapshot).unwrap();
+
+        assert_eq!(public_json["providers"][0]["active_turns"], 1);
+        assert_eq!(public_json["mailboxes"].as_array().unwrap().len(), 0);
+        assert_eq!(detail_json["mailboxes"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

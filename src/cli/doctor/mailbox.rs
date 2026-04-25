@@ -42,11 +42,11 @@ pub(crate) fn classify_mailbox_snapshot(snapshot: &Value) -> Option<MailboxFindi
     let live_work_present =
         queue_depth > 0 || tmux_present || process_present || active_dispatch_present;
 
-    if has_cancel_token && agent_turn_status == "idle" && queue_depth == 0 {
+    if has_cancel_token && !live_work_present {
         return Some(MailboxFinding {
             id: "mailbox_busy_without_active_turn",
             detail: format!(
-                "channel {} has mailbox cancel token while agent turn status is idle",
+                "channel {} has mailbox cancel token without live queue/tmux/process/dispatch evidence",
                 channel_id
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
@@ -172,6 +172,47 @@ pub(crate) fn classify_mailbox_snapshot(snapshot: &Value) -> Option<MailboxFindi
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_cancel_token_is_detected_independent_of_agent_turn_status() {
+        let finding = classify_mailbox_snapshot(&json!({
+            "channel_id": 123,
+            "has_cancel_token": true,
+            "queue_depth": 0,
+            "watcher_attached": false,
+            "inflight_state_present": false,
+            "tmux_present": false,
+            "process_present": false,
+            "active_dispatch_present": false,
+            "agent_turn_status": "active"
+        }))
+        .expect("stale cancel token should be detected even when derived turn status is active");
+
+        assert_eq!(finding.id, "mailbox_busy_without_active_turn");
+        assert!(!finding.live_work_present);
+    }
+
+    #[test]
+    fn cancel_token_with_live_dispatch_is_not_classified_as_stale() {
+        let finding = classify_mailbox_snapshot(&json!({
+            "channel_id": 123,
+            "has_cancel_token": true,
+            "queue_depth": 0,
+            "watcher_attached": false,
+            "inflight_state_present": true,
+            "tmux_present": false,
+            "process_present": false,
+            "active_dispatch_present": true,
+            "agent_turn_status": "active"
+        }));
+
+        assert!(finding.is_none());
+    }
 }
 
 pub(crate) fn classify_mailbox_findings(body: &Value) -> Vec<MailboxFinding> {
