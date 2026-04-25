@@ -948,6 +948,74 @@ fn ensure_monitor_auto_turn_inflight(
     }
 }
 
+fn reset_stale_relay_watermark_if_output_regressed(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    observed_output_end: u64,
+    context: &str,
+) -> bool {
+    let relay_coord = shared.tmux_relay_coord(channel_id);
+    let mut confirmed = relay_coord
+        .confirmed_end_offset
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    while confirmed != 0 && observed_output_end < confirmed {
+        match relay_coord.confirmed_end_offset.compare_exchange(
+            confirmed,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                relay_coord
+                    .last_relay_ts_ms
+                    .store(0, std::sync::atomic::Ordering::Release);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] 👁 Reset stale tmux relay watermark for {} (channel {}, context={}, observed_output_end={}, stale_confirmed_end={})",
+                    tmux_session_name,
+                    channel_id.get(),
+                    context,
+                    observed_output_end,
+                    confirmed
+                );
+                return true;
+            }
+            Err(observed) => confirmed = observed,
+        }
+    }
+
+    false
+}
+
+fn reset_stale_local_relay_offset_if_output_regressed(
+    last_relayed_offset: &mut Option<u64>,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    observed_output_end: u64,
+    context: &str,
+) -> bool {
+    let Some(prev_offset) = *last_relayed_offset else {
+        return false;
+    };
+    if observed_output_end >= prev_offset {
+        return false;
+    }
+
+    *last_relayed_offset = None;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] 👁 Reset stale tmux local relay offset for {} (channel {}, context={}, observed_output_end={}, stale_last_relayed={})",
+        tmux_session_name,
+        channel_id.get(),
+        context,
+        observed_output_end,
+        prev_offset
+    );
+    true
+}
+
 /// #826 P1 #2 (option b): Decide which of the two offset watermarks
 /// (`last_relayed_offset`, `last_enqueued_offset`) a watcher tick should
 /// advance after attempting to deliver a terminal response.
@@ -2687,6 +2755,23 @@ pub(super) async fn tmux_output_watcher_with_restore(
             None
         }
     };
+    if let Ok(meta) = std::fs::metadata(&output_path) {
+        let observed_output_end = meta.len();
+        reset_stale_relay_watermark_if_output_regressed(
+            &shared,
+            channel_id,
+            &tmux_session_name,
+            observed_output_end,
+            "watcher_start",
+        );
+        reset_stale_local_relay_offset_if_output_regressed(
+            &mut last_relayed_offset,
+            channel_id,
+            &tmux_session_name,
+            observed_output_end,
+            "watcher_start",
+        );
+    }
     // Rolling-size-cap rotation state. The watcher loop spins predictably
     // (~500ms sleeps) so a mod-N gate on an iteration counter gives a
     // regular-ish cadence for the size check without hitting the fs every
@@ -2757,6 +2842,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     if prev_offset > new_size {
                         current_offset = new_size;
                         last_relayed_offset = Some(new_size);
+                        reset_stale_relay_watermark_if_output_regressed(
+                            &shared,
+                            channel_id,
+                            &tmux_session_name,
+                            new_size,
+                            "jsonl_rotation",
+                        );
                     }
                 }
                 Ok(None) => {}
@@ -3867,6 +3959,23 @@ pub(super) async fn tmux_output_watcher_with_restore(
         // Duplicate-relay guard: if we already relayed from this same data
         // range, suppress. Use strict `<` so output starting exactly at the
         // previous boundary is treated as the next turn rather than a re-read.
+        if let Ok(meta) = std::fs::metadata(&output_path) {
+            let observed_output_end = meta.len();
+            reset_stale_relay_watermark_if_output_regressed(
+                &shared,
+                channel_id,
+                &tmux_session_name,
+                observed_output_end,
+                "pre_local_dedupe",
+            );
+            reset_stale_local_relay_offset_if_output_regressed(
+                &mut last_relayed_offset,
+                channel_id,
+                &tmux_session_name,
+                observed_output_end,
+                "pre_local_dedupe",
+            );
+        }
         if let Some(prev_offset) = last_relayed_offset {
             if data_start_offset < prev_offset {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4009,6 +4118,15 @@ pub(super) async fn tmux_output_watcher_with_restore(
         // single-instance case; this coord layer closes the multi-instance
         // duplicate-relay hole.
         let relay_coord = shared.tmux_relay_coord(channel_id);
+        if let Ok(meta) = std::fs::metadata(&output_path) {
+            reset_stale_relay_watermark_if_output_regressed(
+                &shared,
+                channel_id,
+                &tmux_session_name,
+                meta.len(),
+                "pre_relay",
+            );
+        }
         let confirmed_end_pre_claim = relay_coord
             .confirmed_end_offset
             .load(std::sync::atomic::Ordering::Acquire);
@@ -6032,11 +6150,13 @@ mod tests {
         notify_path_offset_advance_decision, orphan_suppressed_placeholder_action,
         parse_bg_trigger_offset_from_session_key, process_watcher_lines,
         record_recent_watcher_reattach_offset, refresh_session_heartbeat_from_tmux_output,
-        restored_watcher_turn_from_inflight, rollback_enqueued_offset_for_reconciled_failures,
-        start_monitor_auto_turn_when_available, strip_inprogress_indicators,
-        suppressed_placeholder_action, terminal_relay_decision, tmux_death_is_normal_completion,
-        wait_for_reacquired_turn_bridge_inflight_state, watcher_ready_for_input_turn_completed,
-        watcher_should_yield_to_inflight_state, watcher_stream_seed,
+        reset_stale_local_relay_offset_if_output_regressed,
+        reset_stale_relay_watermark_if_output_regressed, restored_watcher_turn_from_inflight,
+        rollback_enqueued_offset_for_reconciled_failures, start_monitor_auto_turn_when_available,
+        strip_inprogress_indicators, suppressed_placeholder_action, terminal_relay_decision,
+        tmux_death_is_normal_completion, wait_for_reacquired_turn_bridge_inflight_state,
+        watcher_ready_for_input_turn_completed, watcher_should_yield_to_inflight_state,
+        watcher_stream_seed,
     };
     use crate::services::agent_protocol::TaskNotificationKind;
     use crate::services::discord::inflight::InflightTurnState;
@@ -6245,6 +6365,76 @@ mod tests {
             surviving.paused.load(Ordering::Relaxed),
             "slot must hold the incoming handle (paused=true), not the stale one",
         );
+    }
+
+    #[test]
+    fn stale_relay_watermark_resets_when_output_offset_regresses() {
+        let shared = super::super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(1485506232256168125);
+        let relay_coord = shared.tmux_relay_coord(channel_id);
+        relay_coord
+            .confirmed_end_offset
+            .store(1_548_758, Ordering::Release);
+        relay_coord.last_relay_ts_ms.store(12345, Ordering::Release);
+
+        assert!(reset_stale_relay_watermark_if_output_regressed(
+            shared.as_ref(),
+            channel_id,
+            "AgentDesk-claude-adk-cc-t1494846231539613809",
+            438_675,
+            "unit-test",
+        ));
+        assert_eq!(relay_coord.confirmed_end_offset.load(Ordering::Acquire), 0);
+        assert_eq!(relay_coord.last_relay_ts_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn relay_watermark_does_not_reset_for_same_output_epoch() {
+        let shared = super::super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(1485506232256168126);
+        let relay_coord = shared.tmux_relay_coord(channel_id);
+        relay_coord
+            .confirmed_end_offset
+            .store(1_024, Ordering::Release);
+
+        assert!(!reset_stale_relay_watermark_if_output_regressed(
+            shared.as_ref(),
+            channel_id,
+            "AgentDesk-codex-adk-cdx",
+            1_024,
+            "unit-test",
+        ));
+        assert_eq!(
+            relay_coord.confirmed_end_offset.load(Ordering::Acquire),
+            1_024
+        );
+
+        assert!(!reset_stale_relay_watermark_if_output_regressed(
+            shared.as_ref(),
+            channel_id,
+            "AgentDesk-codex-adk-cdx",
+            2_048,
+            "unit-test",
+        ));
+        assert_eq!(
+            relay_coord.confirmed_end_offset.load(Ordering::Acquire),
+            1_024
+        );
+    }
+
+    #[test]
+    fn stale_local_relay_offset_resets_when_output_offset_regresses() {
+        let channel_id = ChannelId::new(1485506232256168127);
+        let mut last_relayed_offset = Some(1_548_758);
+
+        assert!(reset_stale_local_relay_offset_if_output_regressed(
+            &mut last_relayed_offset,
+            channel_id,
+            "AgentDesk-claude-adk-cc-t1494846231539613809",
+            438_675,
+            "unit-test",
+        ));
+        assert_eq!(last_relayed_offset, None);
     }
 
     #[test]
