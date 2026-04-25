@@ -469,7 +469,11 @@ mod failure_recovery {
 
                     sqlx::query(
                         "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
-                         VALUES ('agent-1', 'Test Agent', '111', '222')",
+                         VALUES ('agent-1', 'Test Agent', '111', '222')
+                         ON CONFLICT (id) DO UPDATE SET
+                             name = EXCLUDED.name,
+                             discord_channel_id = EXCLUDED.discord_channel_id,
+                             discord_channel_alt = EXCLUDED.discord_channel_alt",
                     )
                     .execute(&startup_pool)
                     .await
@@ -489,21 +493,28 @@ mod failure_recovery {
                             'agent-1',
                             NOW(),
                             NOW()
-                         )",
+                         )
+                         ON CONFLICT (id) DO UPDATE SET
+                             status = EXCLUDED.status,
+                             assigned_agent_id = EXCLUDED.assigned_agent_id,
+                             updated_at = EXCLUDED.updated_at",
                     )
                     .execute(&startup_pool)
                     .await
                     .expect("seed postgres review card");
                     sqlx::query(
                         "INSERT INTO dispatch_outbox (dispatch_id, action, status)
-                         VALUES ('dispatch-969', 'notify', 'processing')",
+                         VALUES ('dispatch-969', 'notify', 'processing')
+                         ON CONFLICT (dispatch_id, action) WHERE action IN ('notify', 'followup')
+                         DO UPDATE SET status = EXCLUDED.status",
                     )
                     .execute(&startup_pool)
                     .await
                     .expect("seed stale outbox row");
                     sqlx::query(
                         "INSERT INTO kv_meta (key, value)
-                         VALUES ('dispatch_reserving:dispatch-969', 'agent-1')",
+                         VALUES ('dispatch_reserving:dispatch-969', 'agent-1')
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     )
                     .execute(&startup_pool)
                     .await
