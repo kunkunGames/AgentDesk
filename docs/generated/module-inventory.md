@@ -69,7 +69,7 @@
 | `db::auto_queue` | `src/db/auto_queue.rs` | 6276 | giant-file |
 | `db::kanban` | `src/db/kanban.rs` | 487 |  |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 255 |  |
-| `db::postgres` | `src/db/postgres.rs` | 1327 | giant-file |
+| `db::postgres` | `src/db/postgres.rs` | 1359 | giant-file |
 | `db::schema` | `src/db/schema.rs` | 3170 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 485 |  |
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 1246 | giant-file |
@@ -264,7 +264,7 @@
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 1765 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 329 |  |
 | `services::discord::session_identity` | `src/services/discord/session_identity.rs` | 185 |  |
-| `services::discord::session_runtime` | `src/services/discord/session_runtime.rs` | 1853 | giant-file |
+| `services::discord::session_runtime` | `src/services/discord/session_runtime.rs` | 1861 | giant-file |
 | `services::discord::settings` | `src/services/discord/settings.rs` | 2394 | giant-file |
 | `services::discord::settings::content` | `src/services/discord/settings/content.rs` | 422 |  |
 | `services::discord::settings::memory` | `src/services/discord/settings/memory.rs` | 127 |  |
