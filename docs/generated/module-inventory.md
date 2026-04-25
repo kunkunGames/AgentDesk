@@ -141,7 +141,7 @@
 | `server::routes::agents` | `src/server/routes/agents.rs` | 1833 | giant-file |
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 2573 | giant-file |
 | `server::routes::agents_setup` | `src/server/routes/agents_setup.rs` | 1419 | giant-file |
-| `server::routes::analytics` | `src/server/routes/analytics.rs` | 1841 | giant-file |
+| `server::routes::analytics` | `src/server/routes/analytics.rs` | 1845 | giant-file |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 93 |  |
 | `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 11633 | giant-file |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 189 |  |
@@ -276,7 +276,7 @@
 | `services::discord::settings::validation` | `src/services/discord/settings/validation.rs` | 223 |  |
 | `services::discord::settings::write` | `src/services/discord/settings/write.rs` | 356 |  |
 | `services::discord::shared_memory` | `src/services/discord/shared_memory.rs` | 59 |  |
-| `services::discord::tmux` | `src/services/discord/tmux.rs` | 8505 | giant-file |
+| `services::discord::tmux` | `src/services/discord/tmux.rs` | 8517 | giant-file |
 | `services::discord::tmux_error_detect` | `src/services/discord/tmux_error_detect.rs` | 309 |  |
 | `services::discord::tmux_lifecycle` | `src/services/discord/tmux_lifecycle.rs` | 708 |  |
 | `services::discord::tmux_overload_retry` | `src/services/discord/tmux_overload_retry.rs` | 271 |  |
@@ -312,9 +312,10 @@
 | `services::memory::memento_throttle` | `src/services/memory/memento_throttle.rs` | 274 |  |
 | `services::memory::runtime_state` | `src/services/memory/runtime_state.rs` | 434 |  |
 | `services::message_outbox` | `src/services/message_outbox.rs` | 515 |  |
-| `services::observability` | `src/services/observability/mod.rs` | 4212 | giant-file |
+| `services::observability` | `src/services/observability/mod.rs` | 4214 | giant-file |
 | `services::observability::events` | `src/services/observability/events.rs` | 345 |  |
 | `services::observability::metrics` | `src/services/observability/metrics.rs` | 344 |  |
+| `services::observability::watcher_latency` | `src/services/observability/watcher_latency.rs` | 443 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 878 |  |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
