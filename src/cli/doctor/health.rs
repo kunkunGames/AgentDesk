@@ -137,13 +137,46 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
 
 pub(crate) fn is_loopback_base_url(base: &str) -> bool {
     let trimmed = base.trim();
-    trimmed.starts_with("http://127.0.0.1:")
-        || trimmed.starts_with("http://127.0.0.1/")
-        || trimmed == "http://127.0.0.1"
-        || trimmed.starts_with("http://localhost:")
-        || trimmed.starts_with("http://localhost/")
-        || trimmed == "http://localhost"
-        || trimmed.starts_with("http://[::1]:")
-        || trimmed.starts_with("http://[::1]/")
-        || trimmed == "http://[::1]"
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return false;
+    }
+
+    let Some(authority_and_path) = trimmed.split_once("://").map(|(_, rest)| rest) else {
+        return false;
+    };
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_base_url;
+
+    #[test]
+    fn loopback_base_url_accepts_http_and_https_local_targets() {
+        assert!(is_loopback_base_url("http://127.0.0.1:8791"));
+        assert!(is_loopback_base_url("https://127.0.0.1:8791/api"));
+        assert!(is_loopback_base_url("http://localhost"));
+        assert!(is_loopback_base_url("https://localhost:8791"));
+        assert!(is_loopback_base_url("http://[::1]:8791"));
+        assert!(is_loopback_base_url("https://[::1]/api/health"));
+    }
+
+    #[test]
+    fn loopback_base_url_rejects_remote_and_unsupported_targets() {
+        assert!(!is_loopback_base_url("http://10.0.0.5:8791"));
+        assert!(!is_loopback_base_url("https://example.com"));
+        assert!(!is_loopback_base_url("ftp://localhost"));
+    }
 }

@@ -105,7 +105,9 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         let mut status = discord_snapshot.status();
         let mut json =
             serde_json::to_value(discord_snapshot).unwrap_or_else(|_| serde_json::json!({}));
-        enrich_mailbox_session_state(&mut json, state).await;
+        if detailed {
+            enrich_mailbox_session_state(&mut json, state).await;
+        }
         let mut degraded_reasons = json["degraded_reasons"]
             .as_array()
             .cloned()

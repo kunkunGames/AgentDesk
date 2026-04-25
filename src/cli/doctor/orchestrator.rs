@@ -1845,6 +1845,48 @@ fn apply_service_fix(snapshot: &HealthSnapshot, options: &DoctorOptions) -> Vec<
     Vec::new()
 }
 
+fn stale_mailbox_repair_response_status(response: &Value) -> &str {
+    response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if response.get("ok").and_then(Value::as_bool) == Some(true) {
+                "applied"
+            } else if response.get("skipped").and_then(Value::as_bool) == Some(true)
+                || response.get("safety_gate").is_some()
+            {
+                "skipped"
+            } else {
+                "partial_repair"
+            }
+        })
+}
+
+fn stale_mailbox_repair_safety_gate(response: &Value) -> &'static str {
+    match response
+        .get("safety_gate")
+        .and_then(Value::as_str)
+        .unwrap_or("repair_skipped")
+    {
+        "mailbox_not_found" => "mailbox_not_found",
+        "expected_evidence_mismatch" => "expected_evidence_mismatch",
+        "queue_not_empty" => "queue_not_empty",
+        "active_dispatch_present" => "active_dispatch_present",
+        "tmux_present" => "tmux_present",
+        _ => "repair_skipped",
+    }
+}
+
+fn stale_mailbox_repair_fix_safety(response: &Value) -> FixSafety {
+    match response.get("fix_safety").and_then(Value::as_str) {
+        Some("explicit_restart_required") => FixSafety::ExplicitRestartRequired,
+        Some("explicit_db_repair_required") => FixSafety::ExplicitDbRepairRequired,
+        Some("not_fixable") => FixSafety::NotFixable,
+        Some("read_only") => FixSafety::ReadOnly,
+        _ => FixSafety::SafeLocalRepair,
+    }
+}
+
 fn apply_stale_mailbox_fixes(snapshot: &HealthSnapshot, options: &DoctorOptions) -> Vec<FixAction> {
     let Some(body) = snapshot.body.as_ref() else {
         return Vec::new();
@@ -1897,16 +1939,7 @@ fn apply_stale_mailbox_fixes(snapshot: &HealthSnapshot, options: &DoctorOptions)
             match crate::cli::client::post_json_value("/api/doctor/stale-mailbox/repair", request)
             {
                 Ok(response) => {
-                    let status = response
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or_else(|| {
-                            if response.get("ok").and_then(Value::as_bool) == Some(true) {
-                                "applied"
-                            } else {
-                                "partial_repair"
-                            }
-                        });
+                    let status = stale_mailbox_repair_response_status(&response);
                     let evidence = json!({
                         "finding": finding.evidence,
                         "repair": response
@@ -1927,6 +1960,20 @@ fn apply_stale_mailbox_fixes(snapshot: &HealthSnapshot, options: &DoctorOptions)
                             ),
                         )
                         .with_evidence(evidence),
+                        "skipped" => {
+                            FixAction::skipped(
+                                finding.id,
+                                "Stale Mailbox Repair",
+                                format!("skipped stale mailbox repair for channel {channel_id}"),
+                                stale_mailbox_repair_fix_safety(&response),
+                                response
+                                    .get("skipped_reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("repair safety gate skipped the request"),
+                            )
+                            .with_safety_gate(stale_mailbox_repair_safety_gate(&response))
+                            .with_evidence(evidence)
+                        }
                         _ => FixAction::fail(
                             finding.id,
                             "Stale Mailbox Repair",
@@ -2925,7 +2972,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
             let migration_status = runtime.block_on(crate::db::postgres::migration_status(&pool));
             drop(pool);
             match migration_status {
-                Ok(status) if status.missing_from_resolved.is_empty() => {
+                Ok(status) if postgres_migration_status_is_healthy(&status) => {
                     let pending = status.pending_versions.len();
                     Check::ok(
                         "postgres_connection",
@@ -2950,10 +2997,11 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     CheckGroup::Core,
                     "PostgreSQL",
                     format!(
-                        "{summary} — migration drift: applied versions missing from resolved set {:?}",
-                        status.missing_from_resolved
+                        "{summary} — migration drift: missing_from_resolved={:?} unsuccessful={:?}",
+                        status.missing_from_resolved,
+                        unsuccessful_migration_versions(&status)
                     ),
-                    "Postgres _sqlx_migrations contains applied versions not present in embedded migrations.",
+                    "Postgres _sqlx_migrations contains drift or unsuccessful migration records.",
                 )
                 .with_subsystem("postgres")
                 .with_fix_safety(FixSafety::NotFixable)
@@ -2962,9 +3010,13 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     "applied_count": status.applied.len(),
                     "resolved_count": status.resolved_versions.len(),
                     "missing_from_resolved": status.missing_from_resolved,
+                    "unsuccessful_versions": unsuccessful_migration_versions(&status),
                     "pending_versions": status.pending_versions,
                 }))
-                .with_expected_actual("applied migrations all exist in resolved migrations", "migration drift"),
+                .with_expected_actual(
+                    "applied migrations all exist in resolved migrations and succeeded",
+                    "migration drift or unsuccessful migration",
+                ),
                 Err(error) => Check::fail(
                     "postgres_connection",
                     CheckGroup::Core,
@@ -2995,6 +3047,19 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
         .with_expected_actual("postgres connection succeeds", error)
         .with_next_steps(vec!["agentdesk doctor --json".to_string()]),
     }
+}
+
+fn unsuccessful_migration_versions(status: &crate::db::postgres::MigrationStatus) -> Vec<i64> {
+    status
+        .applied
+        .iter()
+        .filter(|migration| !migration.success)
+        .map(|migration| migration.version)
+        .collect()
+}
+
+fn postgres_migration_status_is_healthy(status: &crate::db::postgres::MigrationStatus) -> bool {
+    status.missing_from_resolved.is_empty() && unsuccessful_migration_versions(status).is_empty()
 }
 
 fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
@@ -3495,7 +3560,10 @@ mod tests {
         check_mailbox_consistency, check_postgres_connection, check_provider_bindings,
         check_provider_cli, check_qwen_auth_hints, check_qwen_runtime_artifacts,
         check_qwen_settings_files, check_server_running, configured_provider_names,
-        discord_bot_check_from_health, provider_capability_summary,
+        discord_bot_check_from_health, postgres_migration_status_is_healthy,
+        provider_capability_summary, stale_mailbox_repair_fix_safety,
+        stale_mailbox_repair_response_status, stale_mailbox_repair_safety_gate,
+        unsuccessful_migration_versions,
     };
     use crate::cli::doctor::contract::{FixSafety, RunContext, Severity};
     use crate::config::{AgentChannel, AgentChannels, AgentDef, ServerConfig};
@@ -4188,6 +4256,53 @@ mod tests {
             value["fixes"][0]["safety_gate"],
             "partial_repair_requires_operator"
         );
+    }
+
+    #[test]
+    fn stale_mailbox_repair_response_mapping_preserves_skipped_safety_gate() {
+        let skipped = json!({
+            "ok": false,
+            "applied": false,
+            "skipped": true,
+            "safety_gate": "queue_not_empty",
+            "fix_safety": "explicit_restart_required",
+            "skipped_reason": "live queue evidence exists"
+        });
+        assert_eq!(stale_mailbox_repair_response_status(&skipped), "skipped");
+        assert_eq!(
+            stale_mailbox_repair_safety_gate(&skipped),
+            "queue_not_empty"
+        );
+        assert_eq!(
+            stale_mailbox_repair_fix_safety(&skipped),
+            FixSafety::ExplicitRestartRequired
+        );
+
+        let partial = json!({
+            "ok": false,
+            "applied": false
+        });
+        assert_eq!(
+            stale_mailbox_repair_response_status(&partial),
+            "partial_repair"
+        );
+    }
+
+    #[test]
+    fn postgres_migration_status_is_unhealthy_when_any_record_failed() {
+        let status = crate::db::postgres::MigrationStatus {
+            applied: vec![crate::db::postgres::AppliedMigrationInfo {
+                version: 202604250001,
+                description: "failed_migration".to_string(),
+                success: false,
+            }],
+            resolved_versions: vec![202604250001],
+            missing_from_resolved: Vec::new(),
+            pending_versions: vec![202604250001],
+        };
+
+        assert!(!postgres_migration_status_is_healthy(&status));
+        assert_eq!(unsuccessful_migration_versions(&status), vec![202604250001]);
     }
 
     #[test]

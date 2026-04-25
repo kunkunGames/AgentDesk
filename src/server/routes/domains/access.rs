@@ -17,13 +17,6 @@ pub(crate) fn router() -> ApiRouter {
     public_api_domain(
         Router::new()
             .route("/health", get(health_api::health_handler))
-            .route("/health/detail", get(health_api::health_detail_handler))
-            // Handler enforces discord_control_endpoints_allowed() (loopback OR auth_token)
-            // which is more permissive than protected_api_domain() for loopback-only setups.
-            .route(
-                "/doctor/stale-mailbox/repair",
-                post(health_api::stale_mailbox_repair_handler),
-            )
             .route("/discord/send", post(health_api::send_handler))
             .route("/send", post(deprecated_send_handler))
             .route(

@@ -50,9 +50,9 @@
 | `cli::discord` | `src/cli/discord.rs` | 123 |  |
 | `cli::doctor` | `src/cli/doctor.rs` | 9 |  |
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
-| `cli::doctor::health` | `src/cli/doctor/health.rs` | 149 |  |
+| `cli::doctor::health` | `src/cli/doctor/health.rs` | 182 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 215 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4247 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4362 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 147 |  |
 | `cli::init` | `src/cli/init.rs` | 1597 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 321 |  |
@@ -147,7 +147,7 @@
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 2573 | giant-file |
 | `server::routes::agents_setup` | `src/server/routes/agents_setup.rs` | 1419 | giant-file |
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 1845 | giant-file |
-| `server::routes::auth` | `src/server/routes/auth.rs` | 95 |  |
+| `server::routes::auth` | `src/server/routes/auth.rs` | 93 |  |
 | `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 11633 | giant-file |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 189 |  |
 | `server::routes::departments` | `src/server/routes/departments.rs` | 525 |  |
@@ -161,18 +161,18 @@
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 61 |  |
 | `server::routes::docs` | `src/server/routes/docs.rs` | 3535 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 |  |
-| `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 69 |  |
+| `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 62 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 88 |  |
 | `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 51 |  |
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 85 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 61 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 |  |
-| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 243 |  |
+| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 248 |  |
 | `server::routes::domains::reviews` | `src/server/routes/domains/reviews.rs` | 69 |  |
 | `server::routes::escalation` | `src/server/routes/escalation.rs` | 2345 | giant-file |
 | `server::routes::github` | `src/server/routes/github.rs` | 676 |  |
 | `server::routes::github_dashboard` | `src/server/routes/github_dashboard.rs` | 188 |  |
-| `server::routes::health_api` | `src/server/routes/health_api.rs` | 933 |  |
+| `server::routes::health_api` | `src/server/routes/health_api.rs` | 935 |  |
 | `server::routes::hooks` | `src/server/routes/hooks.rs` | 202 |  |
 | `server::routes::kanban` | `src/server/routes/kanban.rs` | 4772 | giant-file |
 | `server::routes::kanban_repos` | `src/server/routes/kanban_repos.rs` | 453 |  |
