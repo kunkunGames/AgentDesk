@@ -54,6 +54,8 @@ const MISSING_INFLIGHT_REATTACH_GRACE_DELAY: tokio::time::Duration =
 const RECENT_WATCHER_REATTACH_OFFSET_CAPACITY: usize = 32;
 const RECENT_WATCHER_REATTACH_OFFSET_TTL: std::time::Duration =
     std::time::Duration::from_secs(15 * 60);
+const RECENT_TURN_STOP_CAPACITY: usize = 128;
+const RECENT_TURN_STOP_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MONITOR_AUTO_TURN_REASON_CODE: &str = "lifecycle.monitor_auto_turn";
 const MONITOR_AUTO_TURN_DEFERRED_REASON_CODE: &str = "lifecycle.monitor_auto_turn.deferred";
 
@@ -71,6 +73,16 @@ static RECENT_WATCHER_REATTACH_OFFSETS: LazyLock<Mutex<VecDeque<RecentWatcherRea
             RECENT_WATCHER_REATTACH_OFFSET_CAPACITY,
         ))
     });
+
+#[derive(Debug, Clone)]
+struct RecentTurnStop {
+    channel_id: ChannelId,
+    reason: String,
+    recorded_at: std::time::Instant,
+}
+
+static RECENT_TURN_STOPS: LazyLock<Mutex<VecDeque<RecentTurnStop>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(RECENT_TURN_STOP_CAPACITY)));
 
 fn recent_watcher_reattach_offsets()
 -> std::sync::MutexGuard<'static, VecDeque<RecentWatcherReattachOffset>> {
@@ -130,6 +142,47 @@ fn matching_recent_watcher_reattach_offset(
 #[cfg(test)]
 fn clear_recent_watcher_reattach_offsets_for_tests() {
     recent_watcher_reattach_offsets().clear();
+}
+
+fn recent_turn_stops() -> std::sync::MutexGuard<'static, VecDeque<RecentTurnStop>> {
+    match RECENT_TURN_STOPS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn prune_recent_turn_stops(stops: &mut VecDeque<RecentTurnStop>, now: std::time::Instant) {
+    stops.retain(|entry| now.saturating_duration_since(entry.recorded_at) <= RECENT_TURN_STOP_TTL);
+}
+
+pub(super) fn record_recent_turn_stop(channel_id: ChannelId, reason: &str) {
+    let now = std::time::Instant::now();
+    let mut stops = recent_turn_stops();
+    prune_recent_turn_stops(&mut stops, now);
+    while stops.len() >= RECENT_TURN_STOP_CAPACITY {
+        stops.pop_front();
+    }
+    stops.push_back(RecentTurnStop {
+        channel_id,
+        reason: reason.to_string(),
+        recorded_at: now,
+    });
+}
+
+fn recent_turn_stop_for_channel(channel_id: ChannelId) -> Option<RecentTurnStop> {
+    let now = std::time::Instant::now();
+    let mut stops = recent_turn_stops();
+    prune_recent_turn_stops(&mut stops, now);
+    stops
+        .iter()
+        .rev()
+        .find(|entry| entry.channel_id == channel_id)
+        .cloned()
+}
+
+#[cfg(test)]
+fn clear_recent_turn_stops_for_tests() {
+    recent_turn_stops().clear();
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2214,16 +2267,20 @@ async fn resolve_watcher_dispatch_id(
 struct MissingInflightFallbackPlan {
     warn: bool,
     trigger_reattach: bool,
+    suppressed_by_recent_stop: bool,
 }
 
 fn missing_inflight_fallback_plan(
     inflight_missing: bool,
     dispatch_resolved: bool,
     terminal_output_committed: bool,
+    recent_turn_stop: bool,
 ) -> MissingInflightFallbackPlan {
+    let would_trigger = inflight_missing && !dispatch_resolved && terminal_output_committed;
     MissingInflightFallbackPlan {
         warn: inflight_missing,
-        trigger_reattach: inflight_missing && !dispatch_resolved && terminal_output_committed,
+        trigger_reattach: would_trigger && !recent_turn_stop,
+        suppressed_by_recent_stop: would_trigger && recent_turn_stop,
     }
 }
 
@@ -4771,6 +4828,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             inflight_state.is_none(),
             resolved_did.is_some(),
             relay_ok || relay_suppressed,
+            recent_turn_stop_for_channel(channel_id).is_some(),
         );
         if missing_inflight_plan.trigger_reattach {
             if wait_for_reacquired_turn_bridge_inflight_state(
@@ -4794,6 +4852,15 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     &provider_kind,
                     channel_id,
                     &tmux_session_name,
+                );
+            }
+        } else if missing_inflight_plan.suppressed_by_recent_stop {
+            if let Some(stop) = recent_turn_stop_for_channel(channel_id) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ↻ watcher: explicit reattach skipped for channel {} — recent turn stop still active ({})",
+                    channel_id.get(),
+                    stop.reason
                 );
             }
         }
@@ -6139,7 +6206,7 @@ mod tests {
         PlaceholderSuppressContext, PlaceholderSuppressDecision, PlaceholderSuppressOrigin,
         READY_FOR_INPUT_STUCK_REASON, SUPPRESSED_INTERNAL_LABEL, SUPPRESSED_RESTART_LABEL,
         SuppressedPlaceholderAction, TmuxWatcherHandle, WatcherToolState,
-        build_bg_trigger_session_key, claim_or_replace_watcher,
+        build_bg_trigger_session_key, claim_or_replace_watcher, clear_recent_turn_stops_for_tests,
         clear_recent_watcher_reattach_offsets_for_tests, consume_monitor_auto_turn_preamble_once,
         dead_session_cleanup_plan, decide_placeholder_suppression,
         enqueue_background_trigger_response_to_notify_outbox,
@@ -6149,6 +6216,7 @@ mod tests {
         matching_recent_watcher_reattach_offset, missing_inflight_fallback_plan,
         notify_path_offset_advance_decision, orphan_suppressed_placeholder_action,
         parse_bg_trigger_offset_from_session_key, process_watcher_lines,
+        recent_turn_stop_for_channel, record_recent_turn_stop,
         record_recent_watcher_reattach_offset, refresh_session_heartbeat_from_tmux_output,
         reset_stale_local_relay_offset_if_output_regressed,
         reset_stale_relay_watermark_if_output_regressed, restored_watcher_turn_from_inflight,
@@ -6439,17 +6507,42 @@ mod tests {
 
     #[test]
     fn missing_inflight_fallback_warns_and_triggers_reattach_on_db_miss() {
-        let plan = missing_inflight_fallback_plan(true, false, true);
+        let plan = missing_inflight_fallback_plan(true, false, true, false);
         assert!(plan.warn);
         assert!(plan.trigger_reattach);
+        assert!(!plan.suppressed_by_recent_stop);
 
-        let resolved = missing_inflight_fallback_plan(true, true, true);
+        let resolved = missing_inflight_fallback_plan(true, true, true, false);
         assert!(resolved.warn);
         assert!(!resolved.trigger_reattach);
 
-        let uncommitted = missing_inflight_fallback_plan(true, false, false);
+        let uncommitted = missing_inflight_fallback_plan(true, false, false, false);
         assert!(uncommitted.warn);
         assert!(!uncommitted.trigger_reattach);
+
+        let stopped = missing_inflight_fallback_plan(true, false, true, true);
+        assert!(stopped.warn);
+        assert!(!stopped.trigger_reattach);
+        assert!(stopped.suppressed_by_recent_stop);
+    }
+
+    #[test]
+    fn recent_turn_stop_suppresses_missing_inflight_reattach() {
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1044_002);
+
+        assert!(recent_turn_stop_for_channel(channel).is_none());
+        record_recent_turn_stop(channel, "unit-test stop");
+
+        let recent_stop = recent_turn_stop_for_channel(channel)
+            .expect("recent turn stop tombstone should be visible");
+        assert_eq!(recent_stop.reason, "unit-test stop");
+
+        let plan = missing_inflight_fallback_plan(true, false, true, true);
+        assert!(!plan.trigger_reattach);
+        assert!(plan.suppressed_by_recent_stop);
+
+        clear_recent_turn_stops_for_tests();
     }
 
     #[tokio::test]
@@ -6468,7 +6561,7 @@ mod tests {
         let tmux_name = provider.build_tmux_session_name(channel_name);
         let turn_offset = 44_096_u64;
 
-        let terminal_success_plan = missing_inflight_fallback_plan(true, false, true);
+        let terminal_success_plan = missing_inflight_fallback_plan(true, false, true, false);
         assert!(terminal_success_plan.trigger_reattach);
         assert!(super::super::inflight::load_inflight_state(&provider, channel.get()).is_none());
 
@@ -6558,7 +6651,7 @@ mod tests {
 
         let test_result = async {
             super::super::inflight::clear_inflight_state(&provider, channel.get());
-            let terminal_success_plan = missing_inflight_fallback_plan(true, false, true);
+            let terminal_success_plan = missing_inflight_fallback_plan(true, false, true, false);
             assert!(terminal_success_plan.trigger_reattach);
             assert!(
                 super::super::inflight::load_inflight_state(&provider, channel.get()).is_none()

@@ -1004,7 +1004,12 @@ async fn mailbox_cancel_active_turn(
     shared: &SharedData,
     channel_id: ChannelId,
 ) -> CancelActiveTurnResult {
-    shared.mailbox(channel_id).cancel_active_turn().await
+    let result = shared.mailbox(channel_id).cancel_active_turn().await;
+    #[cfg(unix)]
+    if result.token.is_some() {
+        tmux::record_recent_turn_stop(channel_id, "mailbox_cancel_active_turn");
+    }
+    result
 }
 
 async fn mailbox_has_active_turn(shared: &SharedData, channel_id: ChannelId) -> bool {
