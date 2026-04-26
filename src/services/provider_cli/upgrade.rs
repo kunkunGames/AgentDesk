@@ -1,14 +1,16 @@
 use chrono::Utc;
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use super::registry::{
     MigrationHistoryEntry, MigrationState, ProviderCliChannel, ProviderCliMigrationState,
-    update_strategy_for,
+    ProviderCliUpdateStrategy, update_strategy_for,
 };
 use super::snapshot::snapshot_current_channel;
 
@@ -177,6 +179,181 @@ fn version_is_unknown(version: &str) -> bool {
     value.is_empty() || value.eq_ignore_ascii_case("unknown")
 }
 
+fn preservation_tree_path(entry_path: &Path) -> PathBuf {
+    let mut name = entry_path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("previous-binary"));
+    name.push(".tree");
+
+    entry_path
+        .parent()
+        .map(|parent| parent.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&src_path)?;
+
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&src_path)?;
+            create_symlink_or_copy(&src_path, &target, &dest_path)?;
+        } else if metadata.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            fs::copy(&src_path, &dest_path)?;
+            fs::set_permissions(&dest_path, metadata.permissions())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink_or_copy(
+    src_path: &Path,
+    symlink_target: &Path,
+    dest_path: &Path,
+) -> std::io::Result<()> {
+    let _ = src_path;
+    std::os::unix::fs::symlink(symlink_target, dest_path)
+}
+
+#[cfg(not(unix))]
+fn create_symlink_or_copy(
+    src_path: &Path,
+    _symlink_target: &Path,
+    dest_path: &Path,
+) -> std::io::Result<()> {
+    fs::copy(src_path, dest_path).map(|_| ())
+}
+
+fn npm_package_from_strategy(strategy: &ProviderCliUpdateStrategy) -> Option<&'static str> {
+    if strategy.install_source != "npm-global" {
+        return None;
+    }
+    strategy
+        .command_argv
+        .iter()
+        .rev()
+        .copied()
+        .find(|arg| !arg.starts_with('-'))
+}
+
+fn npm_package_root(canonical_path: &Path, package_name: &str) -> Option<PathBuf> {
+    let (scope, name) = package_name
+        .strip_prefix('@')
+        .and_then(|pkg| pkg.split_once('/'))
+        .map(|(scope, name)| (Some(format!("@{scope}")), name.to_string()))
+        .unwrap_or((None, package_name.to_string()));
+
+    for ancestor in canonical_path.ancestors() {
+        if ancestor.file_name().and_then(|v| v.to_str()) != Some(name.as_str()) {
+            continue;
+        }
+
+        let Some(parent) = ancestor.parent() else {
+            continue;
+        };
+
+        if let Some(scope) = &scope {
+            if parent.file_name().and_then(|v| v.to_str()) != Some(scope.as_str()) {
+                continue;
+            }
+            if parent
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|v| v.to_str())
+                == Some("node_modules")
+            {
+                return Some(ancestor.to_path_buf());
+            }
+        } else if parent.file_name().and_then(|v| v.to_str()) == Some("node_modules") {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+
+    None
+}
+
+fn previous_install_root(
+    strategy: &ProviderCliUpdateStrategy,
+    canonical_path: &Path,
+) -> Option<PathBuf> {
+    npm_package_from_strategy(strategy)
+        .and_then(|package_name| npm_package_root(canonical_path, package_name))
+        .filter(|root| root.is_dir())
+}
+
+fn preserve_previous_install(
+    strategy: &ProviderCliUpdateStrategy,
+    current_snapshot: &ProviderCliChannel,
+    dest_entry: &Path,
+) -> Result<(), UpgradeError> {
+    let canonical_entry = Path::new(&current_snapshot.canonical_path);
+    let source_entry = if canonical_entry.exists() {
+        canonical_entry
+    } else {
+        Path::new(&current_snapshot.path)
+    };
+
+    if !source_entry.exists() {
+        return Err(UpgradeError::PreviousPreservationRequired {
+            reason: format!(
+                "source binary not found at {}",
+                current_snapshot.canonical_path
+            ),
+        });
+    }
+
+    if let Some(parent) = dest_entry.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_exists(dest_entry)?;
+
+    if let Some(source_root) = previous_install_root(strategy, source_entry) {
+        let tree_dest = preservation_tree_path(dest_entry);
+        remove_path_if_exists(&tree_dest)?;
+        copy_dir_recursive(&source_root, &tree_dest)?;
+
+        let relative_entry = source_entry.strip_prefix(&source_root).map_err(|_| {
+            UpgradeError::PreviousPreservationRequired {
+                reason: format!(
+                    "source binary {} is outside preservation root {}",
+                    source_entry.display(),
+                    source_root.display()
+                ),
+            }
+        })?;
+        let preserved_entry = tree_dest.join(relative_entry);
+        create_symlink_or_copy(&preserved_entry, &preserved_entry, dest_entry)?;
+    } else {
+        fs::copy(source_entry, dest_entry)?;
+        let metadata = fs::symlink_metadata(source_entry)?;
+        fs::set_permissions(dest_entry, metadata.permissions())?;
+    }
+
+    Ok(())
+}
+
 /// Run the allowlisted update strategy for `provider`.
 ///
 /// Guards (in order):
@@ -196,22 +373,7 @@ pub fn run_upgrade(
     // Guard: mutates_in_place requires previous preservation.
     if strategy.mutates_in_place && !skip_previous_preservation {
         match previous_preservation_path {
-            Some(dest) => {
-                let src = std::path::Path::new(&current_snapshot.canonical_path);
-                if src.exists() {
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::copy(src, dest)?;
-                } else {
-                    return Err(UpgradeError::PreviousPreservationRequired {
-                        reason: format!(
-                            "source binary not found at {}",
-                            current_snapshot.canonical_path
-                        ),
-                    });
-                }
-            }
+            Some(dest) => preserve_previous_install(strategy, current_snapshot, dest)?,
             None => {
                 return Err(UpgradeError::PreviousPreservationRequired {
                     reason: "mutates_in_place=true but no preservation path provided".to_string(),
@@ -428,5 +590,47 @@ mod tests {
             result,
             Err(UpgradeError::PreviousPreservationRequired { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preservation_copies_npm_package_tree_and_links_entrypoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("npm/lib/node_modules/@openai/codex");
+        let bin_dir = package_root.join("bin");
+        let runtime_dir = package_root.join("dist");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(bin_dir.join("codex.js"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(runtime_dir.join("runtime.js"), "module.exports = {};\n").unwrap();
+
+        let global_bin = temp.path().join("npm/bin");
+        std::fs::create_dir_all(&global_bin).unwrap();
+        let entrypoint = global_bin.join("codex");
+        std::os::unix::fs::symlink(package_root.join("bin/codex.js"), &entrypoint).unwrap();
+
+        let channel = ProviderCliChannel {
+            path: entrypoint.to_string_lossy().to_string(),
+            canonical_path: package_root
+                .join("bin/codex.js")
+                .to_string_lossy()
+                .to_string(),
+            version: "1.0.0".to_string(),
+            version_output: None,
+            source: "current_path".to_string(),
+            checked_at: chrono::Utc::now(),
+            evidence: Default::default(),
+        };
+        let dest = temp.path().join("runtime/codex-previous-binary");
+
+        preserve_previous_install(update_strategy_for("codex").unwrap(), &channel, &dest).unwrap();
+
+        let preserved_tree = temp.path().join("runtime/codex-previous-binary.tree");
+        assert!(preserved_tree.join("bin/codex.js").is_file());
+        assert!(preserved_tree.join("dist/runtime.js").is_file());
+        assert_eq!(
+            dest.canonicalize().unwrap(),
+            preserved_tree.join("bin/codex.js").canonicalize().unwrap()
+        );
     }
 }
