@@ -60,6 +60,7 @@ const RECENT_TURN_STOP_CAPACITY: usize = 128;
 const RECENT_TURN_STOP_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const MONITOR_AUTO_TURN_REASON_CODE: &str = "lifecycle.monitor_auto_turn";
 const MONITOR_AUTO_TURN_DEFERRED_REASON_CODE: &str = "lifecycle.monitor_auto_turn.deferred";
+const TMUX_LIVENESS_PROBE_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct RecentWatcherReattachOffset {
@@ -1083,6 +1084,132 @@ fn reset_stale_local_relay_offset_if_output_regressed(
     true
 }
 
+fn advance_watcher_confirmed_end(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    committed_end_offset: u64,
+    context: &'static str,
+) {
+    let relay_coord = shared.tmux_relay_coord(channel_id);
+    let mut cur = relay_coord
+        .confirmed_end_offset
+        .load(std::sync::atomic::Ordering::Acquire);
+    while cur < committed_end_offset {
+        match relay_coord.confirmed_end_offset.compare_exchange(
+            cur,
+            committed_end_offset,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+    let confirmed_end = relay_coord
+        .confirmed_end_offset
+        .load(std::sync::atomic::Ordering::Acquire);
+    let confirmed_reached_current = confirmed_end >= committed_end_offset;
+    record_watcher_invariant(
+        confirmed_reached_current,
+        Some(provider),
+        channel_id,
+        "tmux_confirmed_end_monotonic",
+        context,
+        "watcher confirmed_end_offset must reach the committed tmux output end",
+        serde_json::json!({
+            "current_offset": committed_end_offset,
+            "confirmed_end": confirmed_end,
+            "tmux_session_name": tmux_session_name,
+        }),
+    );
+    debug_assert!(
+        confirmed_reached_current,
+        "watcher confirmed_end_offset must reach committed output end"
+    );
+}
+
+async fn drain_watcher_output_tail_to_eof(
+    output_path: &str,
+    mut current_offset: u64,
+) -> Result<u64, String> {
+    loop {
+        let read_more = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking({
+                let path = output_path.to_string();
+                let offset = current_offset;
+                move || -> Result<(Vec<u8>, u64), String> {
+                    use std::io::{Read as _, Seek as _};
+
+                    let mut file =
+                        std::fs::File::open(&path).map_err(|e| format!("open: {}", e))?;
+                    file.seek(std::io::SeekFrom::Start(offset))
+                        .map_err(|e| format!("seek: {}", e))?;
+                    let mut buf = vec![0u8; 16384];
+                    let n = file.read(&mut buf).map_err(|e| format!("read: {}", e))?;
+                    buf.truncate(n);
+                    Ok((buf, offset + n as u64))
+                }
+            }),
+        )
+        .await;
+
+        match read_more {
+            Ok(Ok(Ok((chunk, off)))) if !chunk.is_empty() => {
+                current_offset = off;
+            }
+            Ok(Ok(Ok((_, off)))) => return Ok(off),
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Err(error)) => return Err(format!("join error: {error}")),
+            Err(_) => return Err("timeout reading tmux output tail".to_string()),
+        }
+    }
+}
+
+async fn drain_missing_inflight_dead_tmux_tail_to_eof(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    output_path: &str,
+    current_offset: u64,
+) -> u64 {
+    match drain_watcher_output_tail_to_eof(output_path, current_offset).await {
+        Ok(drained_offset) => {
+            if drained_offset > current_offset {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 👁 missing-inflight dead-tmux drain advanced {} from offset {} to EOF {} before watcher shutdown",
+                    tmux_session_name,
+                    current_offset,
+                    drained_offset
+                );
+            }
+            advance_watcher_confirmed_end(
+                shared,
+                provider,
+                channel_id,
+                tmux_session_name,
+                drained_offset,
+                "src/services/discord/tmux.rs:missing_inflight_dead_tmux_tail_drain",
+            );
+            drained_offset
+        }
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ missing-inflight dead-tmux drain failed for {} at offset {}: {}",
+                tmux_session_name,
+                current_offset,
+                error
+            );
+            current_offset
+        }
+    }
+}
+
 /// #826 P1 #2 (option b): Decide which of the two offset watermarks
 /// (`last_relayed_offset`, `last_enqueued_offset`) a watcher tick should
 /// advance after attempting to deliver a terminal response.
@@ -1531,13 +1658,13 @@ fn dead_session_cleanup_plan(dispatch_protected: bool) -> DeadSessionCleanupPlan
     }
 }
 
-/// Default idle window the post-terminal-success watcher waits before stopping
-/// when tmux is still alive and confirmed_end has caught up to the tail offset.
+/// Default idle window the post-terminal-success watcher uses to classify
+/// continuation state while tmux is still alive and confirmed_end has caught up
+/// to the tail offset.
 /// See issue #1137: codex agents (G2/G3/G4) were observed emitting additional
-/// output for several seconds AFTER the terminal-success log, so a sub-second
-/// stop strictness check would still race the tail. 5s is large enough to
-/// catch the observed continuation bursts while staying small enough that an
-/// idle dispatch isn't held open meaningfully longer than today's behavior.
+/// output for several seconds AFTER the terminal-success log. Issue #1171
+/// makes tmux liveness, not post-result idleness, the normal watcher shutdown
+/// authority.
 pub(crate) const WATCHER_POST_TERMINAL_IDLE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(5);
 
@@ -1561,7 +1688,7 @@ pub(crate) struct WatcherStopInput {
     /// Time since the last new-output observation. `None` means we have not
     /// observed any output yet during this watcher iteration.
     pub(crate) idle_duration: Option<std::time::Duration>,
-    /// Idle window required before stopping post-terminal-success.
+    /// Idle window used to classify post-terminal-success continuation state.
     pub(crate) idle_threshold: std::time::Duration,
 }
 
@@ -1577,24 +1704,21 @@ pub(crate) enum WatcherStopDecision {
     /// log "post-terminal-success continuation" exactly once when this
     /// transitions in, then keep the watcher alive.
     PostTerminalSuccessContinuation,
-    /// Watcher may stop quietly. Either the tmux pane died or all three
-    /// strictness invariants hold simultaneously:
-    /// (1) terminal success was relayed,
-    /// (2) confirmed_end has caught up to the tmux tail offset,
-    /// (3) the idle window has elapsed.
+    /// Watcher may stop quietly because the tmux pane died. Normal completion
+    /// must route through tmux death detection rather than post-result idleness.
     Stop,
 }
 
 /// Decide whether the tmux output watcher may stop after a terminal-success
-/// event. Issue #1137 widens the legacy "exit on terminal success" rule:
+/// event. Issue #1137 widened the legacy "exit on terminal success" rule, and
+/// issue #1171 makes tmux liveness the only normal watcher-stop authority:
 ///
 /// - dead tmux pane                                      -> Stop
-/// - terminal success seen + confirmed_end >= tail
-///   + idle_duration >= idle_threshold                   -> Stop
 /// - terminal success seen + tmux still alive + (tail
 ///   has advanced past confirmed_end OR idle window has
 ///   not elapsed yet)                                    -> PostTerminalSuccessContinuation
-/// - otherwise                                           -> Continue
+/// - otherwise, including terminal success with an alive
+///   idle tmux pane                                      -> Continue
 pub(crate) fn watcher_stop_decision_after_terminal_success(
     input: WatcherStopInput,
 ) -> WatcherStopDecision {
@@ -1618,12 +1742,144 @@ pub(crate) fn watcher_stop_decision_after_terminal_success(
         return WatcherStopDecision::PostTerminalSuccessContinuation;
     }
 
-    // Strictness invariant (2): the idle window must have elapsed without
-    // any further output. We require an explicit `Some(_)` reading so the
-    // very first iteration after relay never short-circuits the wait.
+    // Alive tmux owns the watcher until the tmux liveness monitor observes
+    // death. The idle window is now only a continuation classifier.
     match input.idle_duration {
-        Some(idle) if idle >= input.idle_threshold => WatcherStopDecision::Stop,
+        Some(idle) if idle >= input.idle_threshold => WatcherStopDecision::Continue,
         _ => WatcherStopDecision::PostTerminalSuccessContinuation,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxLivenessDecision {
+    Continue,
+    QuietStop,
+    TmuxDied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatcherOutputPollDecision {
+    DrainOutput,
+    Continue,
+    QuietStop,
+    TmuxDied,
+}
+
+fn tmux_liveness_decision(
+    cancelled: bool,
+    shutting_down: bool,
+    tmux_alive: bool,
+) -> TmuxLivenessDecision {
+    if cancelled || shutting_down {
+        TmuxLivenessDecision::QuietStop
+    } else if tmux_alive {
+        TmuxLivenessDecision::Continue
+    } else {
+        TmuxLivenessDecision::TmuxDied
+    }
+}
+
+fn watcher_output_poll_decision(
+    bytes_read: usize,
+    liveness_after_empty_read: Option<TmuxLivenessDecision>,
+) -> WatcherOutputPollDecision {
+    if bytes_read > 0 {
+        return WatcherOutputPollDecision::DrainOutput;
+    }
+
+    match liveness_after_empty_read.expect("empty watcher read must probe tmux liveness") {
+        TmuxLivenessDecision::Continue => WatcherOutputPollDecision::Continue,
+        TmuxLivenessDecision::QuietStop => WatcherOutputPollDecision::QuietStop,
+        TmuxLivenessDecision::TmuxDied => WatcherOutputPollDecision::TmuxDied,
+    }
+}
+
+async fn probe_tmux_session_liveness(tmux_session_name: &str) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking({
+            let name = tmux_session_name.to_string();
+            move || tmux_session_has_live_pane(&name)
+        }),
+    )
+    .await
+    .unwrap_or(Ok(false))
+    .unwrap_or(false)
+}
+
+async fn handle_tmux_watcher_observed_death(
+    channel_id: ChannelId,
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    tmux_session_name: &str,
+    output_path: &str,
+    watcher_provider: &ProviderKind,
+    prompt_too_long_killed: bool,
+    turn_result_relayed: bool,
+) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let diagnostic = build_tmux_death_diagnostic(tmux_session_name, Some(output_path));
+    if let Some(diag) = diagnostic.as_deref() {
+        tracing::info!(
+            "  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping ({diag})"
+        );
+    } else {
+        tracing::info!("  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping");
+    }
+    let reason_short = read_tmux_exit_reason(tmux_session_name);
+    let is_normal_completion =
+        tmux_death_is_normal_completion(reason_short.as_deref(), diagnostic.as_deref());
+    // Notify: tmux session termination with reason
+    if !is_normal_completion {
+        let reason_short_text = reason_short.as_deref().unwrap_or("unknown");
+        let is_force_kill = reason_short_text.contains("force-kill");
+        if !is_force_kill {
+            // Strip timestamp prefix if present (format: "[YYYY-MM-DD HH:MM:SS] reason")
+            let reason_text = reason_short_text
+                .strip_prefix('[')
+                .and_then(|s| s.find("] ").map(|i| &s[i + 2..]))
+                .unwrap_or(reason_short_text);
+            let reason_truncated: String = reason_text.chars().take(100).collect();
+            let session_key =
+                super::adk_session::build_adk_session_key(shared, channel_id, watcher_provider)
+                    .await
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}:{}",
+                            crate::services::platform::hostname_short(),
+                            tmux_session_name
+                        )
+                    });
+            enqueue_lifecycle_notification_best_effort(
+                sqlite_runtime_db(shared.as_ref()),
+                shared.pg_pool.as_ref(),
+                &format!("channel:{}", channel_id.get()),
+                Some(session_key.as_str()),
+                lifecycle_reason_code_for_tmux_exit(reason_text),
+                &format!("🔴 세션 종료: {reason_truncated}"),
+            );
+        }
+    } else {
+        tracing::info!(
+            "  [{ts}] 👁 tmux session {tmux_session_name} ended after normal completion, skipping lifecycle notification"
+        );
+    }
+    if !prompt_too_long_killed && !turn_result_relayed {
+        // Suppress warning for normal dispatch completion — not an error.
+        let suppress_restart = is_normal_completion
+            || reason_short
+                .as_deref()
+                .is_some_and(tmux_exit_reason_is_normal_completion);
+        if !suppress_restart {
+            let _ = resume_aborted_restart_turn(
+                channel_id,
+                http,
+                shared,
+                tmux_session_name,
+                output_path,
+            )
+            .await;
+        }
     }
 }
 
@@ -2385,8 +2641,10 @@ fn missing_inflight_fallback_plan(
     dispatch_resolved: bool,
     terminal_output_committed: bool,
     recent_turn_stop: bool,
+    tmux_alive: bool,
 ) -> MissingInflightFallbackPlan {
-    let would_trigger = inflight_missing && !dispatch_resolved && terminal_output_committed;
+    let would_trigger =
+        inflight_missing && !dispatch_resolved && terminal_output_committed && tmux_alive;
     MissingInflightFallbackPlan {
         warn: inflight_missing,
         trigger_reattach: would_trigger && !recent_turn_stop,
@@ -3172,7 +3430,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
     let mut rotation_tick: u32 = 0;
     const ROTATION_CHECK_EVERY: u32 = 60; // ~30s at 500ms base cadence
 
-    loop {
+    'watcher_loop: loop {
         // Always consume resume_offset first — the turn bridge may have set it
         // between the previous paused check and now, so reading it here prevents
         // the watcher from using a stale current_offset after unpausing.
@@ -3196,10 +3454,40 @@ pub(super) async fn tmux_output_watcher_with_restore(
             break;
         }
 
-        // If paused (Discord handler is processing its own turn), wait
+        // If paused (Discord handler is processing its own turn), keep the
+        // liveness monitor active so a dead pane still clears watcher state.
         if paused.load(Ordering::Relaxed) {
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            continue;
+            match tmux_liveness_decision(
+                cancel.load(Ordering::Relaxed),
+                shared.shutting_down.load(Ordering::Relaxed),
+                probe_tmux_session_liveness(&tmux_session_name).await,
+            ) {
+                TmuxLivenessDecision::Continue => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                TmuxLivenessDecision::QuietStop => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
+                    );
+                    break;
+                }
+                TmuxLivenessDecision::TmuxDied => {
+                    handle_tmux_watcher_observed_death(
+                        channel_id,
+                        &http,
+                        &shared,
+                        &tmux_session_name,
+                        &output_path,
+                        &watcher_provider,
+                        prompt_too_long_killed,
+                        turn_result_relayed,
+                    )
+                    .await;
+                    break;
+                }
+            }
         }
 
         // Periodic size-cap rotation for the session jsonl. Running this off
@@ -3255,110 +3543,6 @@ pub(super) async fn tmux_output_watcher_with_restore(
         // Snapshot pause epoch — if this changes later, a Discord turn claimed this data
         let epoch_snapshot = pause_epoch.load(Ordering::Relaxed);
 
-        // Check if tmux session is still alive (with timeout to prevent
-        // blocking thread pool exhaustion if tmux hangs)
-        let alive = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio::task::spawn_blocking({
-                let name = tmux_session_name.clone();
-                move || tmux_session_has_live_pane(&name)
-            }),
-        )
-        .await
-        .unwrap_or(Ok(false))
-        .unwrap_or(false);
-
-        if !alive {
-            // Re-check shutdown/cancel — SIGTERM handler may have set the flag
-            // between the top-of-loop check and here
-            if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
-                );
-                break;
-            }
-            // Extra grace: wait briefly and re-check, since SIGTERM handler is async
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
-                );
-                break;
-            }
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            let diagnostic = build_tmux_death_diagnostic(&tmux_session_name, Some(&output_path));
-            if let Some(diag) = diagnostic.as_deref() {
-                tracing::info!(
-                    "  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping ({diag})"
-                );
-            } else {
-                tracing::info!(
-                    "  [{ts}] 👁 tmux session {tmux_session_name} ended, watcher stopping"
-                );
-            }
-            let reason_short = read_tmux_exit_reason(&tmux_session_name);
-            let is_normal_completion =
-                tmux_death_is_normal_completion(reason_short.as_deref(), diagnostic.as_deref());
-            // Notify: tmux session termination with reason
-            if !is_normal_completion {
-                let reason_short_text = reason_short.as_deref().unwrap_or("unknown");
-                let is_force_kill = reason_short_text.contains("force-kill");
-                if !is_force_kill {
-                    // Strip timestamp prefix if present (format: "[YYYY-MM-DD HH:MM:SS] reason")
-                    let reason_text = reason_short_text
-                        .strip_prefix('[')
-                        .and_then(|s| s.find("] ").map(|i| &s[i + 2..]))
-                        .unwrap_or(reason_short_text);
-                    let reason_truncated: String = reason_text.chars().take(100).collect();
-                    let session_key = super::adk_session::build_adk_session_key(
-                        &shared,
-                        channel_id,
-                        &watcher_provider,
-                    )
-                    .await
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}:{}",
-                            crate::services::platform::hostname_short(),
-                            tmux_session_name
-                        )
-                    });
-                    enqueue_lifecycle_notification_best_effort(
-                        sqlite_runtime_db(shared.as_ref()),
-                        shared.pg_pool.as_ref(),
-                        &format!("channel:{}", channel_id.get()),
-                        Some(session_key.as_str()),
-                        lifecycle_reason_code_for_tmux_exit(reason_text),
-                        &format!("🔴 세션 종료: {reason_truncated}"),
-                    );
-                }
-            } else {
-                tracing::info!(
-                    "  [{ts}] 👁 tmux session {tmux_session_name} ended after normal completion, skipping lifecycle notification"
-                );
-            }
-            if !prompt_too_long_killed && !turn_result_relayed {
-                // Suppress warning for normal dispatch completion — not an error
-                let suppress_restart = is_normal_completion
-                    || reason_short
-                        .as_deref()
-                        .is_some_and(tmux_exit_reason_is_normal_completion);
-                if !suppress_restart {
-                    let _ = resume_aborted_restart_turn(
-                        channel_id,
-                        &http,
-                        &shared,
-                        &tmux_session_name,
-                        &output_path,
-                    )
-                    .await;
-                }
-            }
-            break;
-        }
-
         // Try to read new data from output file
         let read_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -3382,15 +3566,79 @@ pub(super) async fn tmux_output_watcher_with_restore(
         let (data, new_offset) = match read_result {
             Ok(Ok(Ok((data, off)))) => (data, off),
             _ => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                continue;
+                match tmux_liveness_decision(
+                    cancel.load(Ordering::Relaxed),
+                    shared.shutting_down.load(Ordering::Relaxed),
+                    probe_tmux_session_liveness(&tmux_session_name).await,
+                ) {
+                    TmuxLivenessDecision::Continue => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    TmuxLivenessDecision::QuietStop => {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        tracing::info!(
+                            "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
+                        );
+                        break;
+                    }
+                    TmuxLivenessDecision::TmuxDied => {
+                        handle_tmux_watcher_observed_death(
+                            channel_id,
+                            &http,
+                            &shared,
+                            &tmux_session_name,
+                            &output_path,
+                            &watcher_provider,
+                            prompt_too_long_killed,
+                            turn_result_relayed,
+                        )
+                        .await;
+                        break;
+                    }
+                }
             }
         };
 
-        if data.is_empty() {
-            // No new data, sleep and retry
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            continue;
+        let poll_decision = if data.is_empty() {
+            watcher_output_poll_decision(
+                data.len(),
+                Some(tmux_liveness_decision(
+                    cancel.load(Ordering::Relaxed),
+                    shared.shutting_down.load(Ordering::Relaxed),
+                    probe_tmux_session_liveness(&tmux_session_name).await,
+                )),
+            )
+        } else {
+            watcher_output_poll_decision(data.len(), None)
+        };
+        match poll_decision {
+            WatcherOutputPollDecision::DrainOutput => {}
+            WatcherOutputPollDecision::Continue => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            WatcherOutputPollDecision::QuietStop => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 👁 tmux session {tmux_session_name} ended during shutdown, exiting quietly"
+                );
+                break;
+            }
+            WatcherOutputPollDecision::TmuxDied => {
+                handle_tmux_watcher_observed_death(
+                    channel_id,
+                    &http,
+                    &shared,
+                    &tmux_session_name,
+                    &output_path,
+                    &watcher_provider,
+                    prompt_too_long_killed,
+                    turn_result_relayed,
+                )
+                .await;
+                break;
+            }
         }
 
         // We got new data while not paused — this means terminal input triggered a response
@@ -3510,6 +3758,8 @@ pub(super) async fn tmux_output_watcher_with_restore(
             let mut ready_for_input_tracker =
                 crate::services::provider::ReadyForInputIdleTracker::default();
             let mut last_ready_probe_at: Option<std::time::Instant> = None;
+            let mut last_liveness_probe_at = tokio::time::Instant::now();
+            let mut tmux_death_observed = false;
             let mut ready_for_input_failure_notice: Option<String> = None;
 
             while !found_result && turn_start.elapsed() < turn_timeout {
@@ -3639,6 +3889,25 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     }
                     Ok(Ok(Ok((_, off)))) => {
                         current_offset = off;
+                        if last_liveness_probe_at.elapsed() >= TMUX_LIVENESS_PROBE_INTERVAL {
+                            last_liveness_probe_at = tokio::time::Instant::now();
+                            match watcher_output_poll_decision(
+                                0,
+                                Some(tmux_liveness_decision(
+                                    cancel.load(Ordering::Relaxed),
+                                    shared.shutting_down.load(Ordering::Relaxed),
+                                    probe_tmux_session_liveness(&tmux_session_name).await,
+                                )),
+                            ) {
+                                WatcherOutputPollDecision::DrainOutput => {}
+                                WatcherOutputPollDecision::Continue => {}
+                                WatcherOutputPollDecision::QuietStop => break,
+                                WatcherOutputPollDecision::TmuxDied => {
+                                    tmux_death_observed = true;
+                                    break;
+                                }
+                            }
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         let now = std::time::Instant::now();
                         let should_probe_ready = last_ready_probe_at
@@ -3921,6 +4190,25 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         );
                     }
                 }
+            }
+
+            if tmux_death_observed {
+                handle_tmux_watcher_observed_death(
+                    channel_id,
+                    &http,
+                    &shared,
+                    &tmux_session_name,
+                    &output_path,
+                    &watcher_provider,
+                    prompt_too_long_killed,
+                    turn_result_relayed,
+                )
+                .await;
+                break 'watcher_loop;
+            }
+
+            if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
+                break 'watcher_loop;
             }
 
             if let Some(notice) = ready_for_input_failure_notice {
@@ -4754,40 +5042,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
         // direct emission or empty-turn cleanup. CAS loop ensures we only ever move the
         // watermark FORWARD, even if some other instance has raced ahead.
         if relay_ok || relay_suppressed {
-            let mut cur = relay_coord
-                .confirmed_end_offset
-                .load(std::sync::atomic::Ordering::Acquire);
-            while cur < current_offset {
-                match relay_coord.confirmed_end_offset.compare_exchange(
-                    cur,
-                    current_offset,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => cur = observed,
-                }
-            }
-            let confirmed_end = relay_coord
-                .confirmed_end_offset
-                .load(std::sync::atomic::Ordering::Acquire);
-            let confirmed_reached_current = confirmed_end >= current_offset;
-            record_watcher_invariant(
-                confirmed_reached_current,
-                Some(&watcher_provider),
+            advance_watcher_confirmed_end(
+                &shared,
+                &watcher_provider,
                 channel_id,
-                "tmux_confirmed_end_monotonic",
+                &tmux_session_name,
+                current_offset,
                 "src/services/discord/tmux.rs:tmux_output_watcher_confirmed_end",
-                "watcher confirmed_end_offset must reach the committed tmux output end",
-                serde_json::json!({
-                    "current_offset": current_offset,
-                    "confirmed_end": confirmed_end,
-                    "tmux_session_name": tmux_session_name.as_str(),
-                }),
-            );
-            debug_assert!(
-                confirmed_reached_current,
-                "watcher confirmed_end_offset must reach committed output end"
             );
         }
         // Release the emission slot regardless of success. If delivery failed
@@ -5131,11 +5392,19 @@ pub(super) async fn tmux_output_watcher_with_restore(
             tracing::warn!("  [{ts}] ⚠ watcher: relay failed — preserving inflight for retry");
         }
 
+        let terminal_output_committed = relay_ok || relay_suppressed;
+        let tmux_alive_for_missing_inflight =
+            if inflight_state.is_none() && resolved_did.is_none() && terminal_output_committed {
+                probe_tmux_session_liveness(&tmux_session_name).await
+            } else {
+                true
+            };
         let missing_inflight_plan = missing_inflight_fallback_plan(
             inflight_state.is_none(),
             resolved_did.is_some(),
-            relay_ok || relay_suppressed,
+            terminal_output_committed,
             recent_turn_stop_for_channel(channel_id).is_some(),
+            tmux_alive_for_missing_inflight,
         );
         if missing_inflight_plan.trigger_reattach {
             if wait_for_reacquired_turn_bridge_inflight_state(
@@ -5214,6 +5483,28 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     stop.reason
                 );
             }
+        } else if !tmux_alive_for_missing_inflight {
+            let _drained_offset = drain_missing_inflight_dead_tmux_tail_to_eof(
+                &shared,
+                &watcher_provider,
+                channel_id,
+                &tmux_session_name,
+                &output_path,
+                current_offset,
+            )
+            .await;
+            handle_tmux_watcher_observed_death(
+                channel_id,
+                &http,
+                &shared,
+                &tmux_session_name,
+                &output_path,
+                &watcher_provider,
+                prompt_too_long_killed,
+                turn_result_relayed,
+            )
+            .await;
+            break 'watcher_loop;
         }
 
         // Update session tokens from result event and auto-compact if threshold exceeded
@@ -7240,23 +7531,71 @@ mod tests {
 
     #[test]
     fn missing_inflight_fallback_warns_and_triggers_reattach_on_db_miss() {
-        let plan = missing_inflight_fallback_plan(true, false, true, false);
+        let plan = missing_inflight_fallback_plan(true, false, true, false, true);
         assert!(plan.warn);
         assert!(plan.trigger_reattach);
         assert!(!plan.suppressed_by_recent_stop);
 
-        let resolved = missing_inflight_fallback_plan(true, true, true, false);
+        let resolved = missing_inflight_fallback_plan(true, true, true, false, true);
         assert!(resolved.warn);
         assert!(!resolved.trigger_reattach);
 
-        let uncommitted = missing_inflight_fallback_plan(true, false, false, false);
+        let uncommitted = missing_inflight_fallback_plan(true, false, false, false, true);
         assert!(uncommitted.warn);
         assert!(!uncommitted.trigger_reattach);
 
-        let stopped = missing_inflight_fallback_plan(true, false, true, true);
+        let stopped = missing_inflight_fallback_plan(true, false, true, true, true);
         assert!(stopped.warn);
         assert!(!stopped.trigger_reattach);
         assert!(stopped.suppressed_by_recent_stop);
+
+        let dead_tmux = missing_inflight_fallback_plan(true, false, true, false, false);
+        assert!(dead_tmux.warn);
+        assert!(!dead_tmux.trigger_reattach);
+        assert!(!dead_tmux.suppressed_by_recent_stop);
+    }
+
+    #[tokio::test]
+    async fn missing_inflight_dead_tmux_branch_drains_post_result_tail_to_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let output_path = tmp.path().join("tmux-output.jsonl");
+        let result_chunk = b"{\"type\":\"result\",\"subtype\":\"success\"}\n";
+        let post_result_tail = b"{\"type\":\"session_configured\",\"session_id\":\"tail\"}\n";
+        let mut output = Vec::new();
+        output.extend_from_slice(result_chunk);
+        output.extend_from_slice(post_result_tail);
+        std::fs::write(&output_path, output)?;
+
+        let current_offset = result_chunk.len() as u64;
+        let expected_eof = current_offset + post_result_tail.len() as u64;
+        let shared = super::super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(987_1171_001);
+        let tmux_name = "AgentDesk-codex-test-1171-tail-drain";
+        let relay_coord = shared.tmux_relay_coord(channel_id);
+        relay_coord
+            .confirmed_end_offset
+            .store(current_offset, Ordering::Release);
+
+        let drained_offset = super::drain_missing_inflight_dead_tmux_tail_to_eof(
+            shared.as_ref(),
+            &provider,
+            channel_id,
+            tmux_name,
+            output_path.to_str().expect("utf8 temp path"),
+            current_offset,
+        )
+        .await;
+
+        assert_eq!(drained_offset, expected_eof);
+        assert_eq!(
+            relay_coord.confirmed_end_offset.load(Ordering::Acquire),
+            expected_eof,
+            "missing-inflight dead-tmux shutdown must commit the readable post-result tail"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -7269,7 +7608,7 @@ mod tests {
         // refactor that drops the increment fails loudly.
         crate::services::observability::metrics::reset_for_tests();
 
-        let plan = missing_inflight_fallback_plan(true, false, true, false);
+        let plan = missing_inflight_fallback_plan(true, false, true, false, true);
         assert!(
             plan.trigger_reattach,
             "DB fallback resolve failure on a committed terminal output should request reattach"
@@ -7434,7 +7773,7 @@ mod tests {
             .expect("recent turn stop tombstone should be visible");
         assert_eq!(recent_stop.reason, "unit-test stop");
 
-        let plan = missing_inflight_fallback_plan(true, false, true, true);
+        let plan = missing_inflight_fallback_plan(true, false, true, true, true);
         assert!(!plan.trigger_reattach);
         assert!(plan.suppressed_by_recent_stop);
 
@@ -7457,7 +7796,7 @@ mod tests {
         let tmux_name = provider.build_tmux_session_name(channel_name);
         let turn_offset = 44_096_u64;
 
-        let terminal_success_plan = missing_inflight_fallback_plan(true, false, true, false);
+        let terminal_success_plan = missing_inflight_fallback_plan(true, false, true, false, true);
         assert!(terminal_success_plan.trigger_reattach);
         assert!(super::super::inflight::load_inflight_state(&provider, channel.get()).is_none());
 
@@ -7547,7 +7886,8 @@ mod tests {
 
         let test_result = async {
             super::super::inflight::clear_inflight_state(&provider, channel.get());
-            let terminal_success_plan = missing_inflight_fallback_plan(true, false, true, false);
+            let terminal_success_plan =
+                missing_inflight_fallback_plan(true, false, true, false, true);
             assert!(terminal_success_plan.trigger_reattach);
             assert!(
                 super::super::inflight::load_inflight_state(&provider, channel.get()).is_none()
@@ -7927,10 +8267,10 @@ mod tests {
     }
 
     #[test]
-    fn watcher_stop_terminal_success_alive_idle_window_elapsed_stops() {
+    fn watcher_stop_terminal_success_alive_idle_window_elapsed_continues_until_tmux_death() {
         // (terminal=Y, tmux_alive=Y, confirmed_end == tail, idle >= 5s) —
-        // both strictness invariants satisfied; watcher may stop. This is
-        // the "happy path" the existing single-event exit was approximating.
+        // #1171: a quiet, idle post-result pane is not enough to end watcher
+        // ownership. The watcher stops only after tmux liveness reports death.
         let input = super::WatcherStopInput {
             terminal_success_seen: true,
             tmux_alive: true,
@@ -7941,7 +8281,7 @@ mod tests {
         };
         assert_eq!(
             super::watcher_stop_decision_after_terminal_success(input),
-            super::WatcherStopDecision::Stop
+            super::WatcherStopDecision::Continue
         );
     }
 
@@ -7967,8 +8307,8 @@ mod tests {
     #[test]
     fn watcher_stop_terminal_success_alive_caught_up_but_idle_too_short_continues() {
         // (terminal=Y, tmux_alive=Y, confirmed_end == tail, idle < 5s) —
-        // confirmed_end caught up but the idle window hasn't elapsed; the
-        // watcher must keep waiting in case a continuation burst arrives.
+        // confirmed_end caught up but the idle window hasn't elapsed; classify
+        // this as a continuation wait, not a stop signal.
         let input = super::WatcherStopInput {
             terminal_success_seen: true,
             tmux_alive: true,
@@ -7986,9 +8326,7 @@ mod tests {
     #[test]
     fn watcher_stop_terminal_success_alive_no_idle_observation_yet_continues() {
         // First poll after the relay has `idle_duration: None`. We require
-        // an explicit observation before the idle invariant can fire so the
-        // watcher never short-circuits its wait window on the very first
-        // iteration after terminal success.
+        // an explicit observation before treating the alive pane as settled.
         let input = super::WatcherStopInput {
             terminal_success_seen: true,
             tmux_alive: true,
@@ -8000,6 +8338,57 @@ mod tests {
         assert_eq!(
             super::watcher_stop_decision_after_terminal_success(input),
             super::WatcherStopDecision::PostTerminalSuccessContinuation
+        );
+    }
+
+    #[test]
+    fn tmux_liveness_decision_makes_dead_tmux_the_normal_stop_authority() {
+        assert_eq!(
+            super::tmux_liveness_decision(false, false, true),
+            super::TmuxLivenessDecision::Continue
+        );
+        assert_eq!(
+            super::tmux_liveness_decision(false, false, false),
+            super::TmuxLivenessDecision::TmuxDied
+        );
+        assert_eq!(
+            super::tmux_liveness_decision(true, false, false),
+            super::TmuxLivenessDecision::QuietStop
+        );
+        assert_eq!(
+            super::tmux_liveness_decision(false, true, false),
+            super::TmuxLivenessDecision::QuietStop
+        );
+    }
+
+    #[test]
+    fn watcher_output_poll_drains_final_chunk_before_dead_tmux_shutdown() {
+        assert_eq!(
+            super::watcher_output_poll_decision(128, None),
+            super::WatcherOutputPollDecision::DrainOutput
+        );
+        assert_eq!(
+            super::watcher_output_poll_decision(
+                0,
+                Some(super::tmux_liveness_decision(false, false, false)),
+            ),
+            super::WatcherOutputPollDecision::TmuxDied
+        );
+    }
+
+    #[test]
+    fn paused_watcher_liveness_detects_dead_tmux_unless_operator_stopped() {
+        assert_eq!(
+            super::tmux_liveness_decision(false, false, false),
+            super::TmuxLivenessDecision::TmuxDied
+        );
+        assert_eq!(
+            super::tmux_liveness_decision(true, false, false),
+            super::TmuxLivenessDecision::QuietStop
+        );
+        assert_eq!(
+            super::tmux_liveness_decision(false, true, false),
+            super::TmuxLivenessDecision::QuietStop
         );
     }
 
