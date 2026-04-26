@@ -23,6 +23,13 @@ impl RetentionSet {
         self.protected.contains(&path.as_ref().to_path_buf())
     }
 
+    pub fn is_protected_or_contains_protected(&self, path: impl AsRef<Path>) -> bool {
+        let path = path.as_ref();
+        self.protected
+            .iter()
+            .any(|protected| protected == path || protected.starts_with(path))
+    }
+
     pub fn protected_paths(&self) -> &[PathBuf] {
         &self.protected
     }
@@ -81,7 +88,7 @@ pub fn cleanup_dry_run(scan_dir: &Path, set: &RetentionSet) -> std::io::Result<V
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !set.is_protected(&path) {
+        if !set.is_protected_or_contains_protected(&path) {
             candidates.push(path);
         }
     }
@@ -135,6 +142,24 @@ mod tests {
         let candidates = cleanup_dry_run(&missing, &set).unwrap();
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn cleanup_dry_run_keeps_dirs_that_contain_protected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected_dir = dir.path().join("previous-package");
+        let protected_binary = protected_dir.join("bin").join("codex");
+        let removable_dir = dir.path().join("old-package");
+        std::fs::create_dir_all(protected_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&removable_dir).unwrap();
+        std::fs::write(&protected_binary, b"bin").unwrap();
+
+        let mut set = RetentionSet::new();
+        set.protect(&protected_binary);
+
+        let candidates = cleanup_dry_run(dir.path(), &set).unwrap();
+        assert!(candidates.contains(&removable_dir));
+        assert!(!candidates.contains(&protected_dir));
     }
 
     #[test]
