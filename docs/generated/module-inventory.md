@@ -335,7 +335,7 @@
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 13 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 70 |  |
 | `services::provider_cli::io` | `src/services/provider_cli/io.rs` | 151 |  |
-| `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 73 |  |
+| `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 98 |  |
 | `services::provider_cli::registry` | `src/services/provider_cli/registry.rs` | 303 |  |
 | `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 123 |  |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 381 |  |

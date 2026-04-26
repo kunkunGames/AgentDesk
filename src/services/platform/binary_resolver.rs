@@ -712,7 +712,7 @@ pub fn resolve_provider_binary_for_context(
                     let path = channel.path.clone();
                     let canonical = channel.canonical_path.clone();
                     let source_tag = format!("registry:{channel_name}");
-                    let exec_path = crate::services::platform::merged_runtime_path();
+                    let exec_path = build_exec_path(Path::new(&path), Some(Path::new(&canonical)));
                     return BinaryResolution {
                         requested_binary: ctx.provider.clone(),
                         resolved_path: Some(path),
