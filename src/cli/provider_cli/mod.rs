@@ -501,6 +501,7 @@ fn cmd_promote(
     .map_err(|e| format!("transition error: {e}"))?;
     advance_to(&mut state, MigrationState::ProviderAgentsMigrated, None)
         .map_err(|e| format!("transition error: {e}"))?;
+    save_migration_state(&root, &state).map_err(|e| e.to_string())?;
     promote_registry_candidate(&root, provider)?;
 
     save_migration_state(&root, &state).map_err(|e| e.to_string())?;
@@ -1095,5 +1096,62 @@ mod tests {
         let channels = registry.providers.get("codex").unwrap();
         assert_eq!(channels.current.as_ref(), Some(&candidate));
         assert!(channels.agent_overrides.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promote_does_not_update_registry_when_state_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
+
+        use crate::services::provider_cli::paths::migration_state_path;
+        use crate::services::provider_cli::registry::{
+            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+        };
+        use chrono::Utc;
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = test_channel("/tmp/current-codex");
+        let candidate = test_channel("/tmp/candidate-codex");
+        let ms = ProviderCliMigrationState {
+            schema_version: 1,
+            provider: "codex".to_string(),
+            state: MigrationState::AwaitingOperatorPromote,
+            selected_agent_id: None,
+            current_channel: Some(current.clone()),
+            candidate_channel: Some(candidate.clone()),
+            rollback_target: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            history: vec![],
+        };
+        save_migration_state(dir.path(), &ms).unwrap();
+        let mut registry = ProviderCliRegistry::default();
+        registry.providers.insert(
+            "codex".to_string(),
+            ProviderChannels {
+                current: Some(current.clone()),
+                candidate: Some(candidate),
+                ..Default::default()
+            },
+        );
+        save_registry(dir.path(), &registry).unwrap();
+
+        let state_path = migration_state_path(dir.path(), "codex");
+        let mut read_only = std::fs::metadata(&state_path).unwrap().permissions();
+        read_only.set_mode(0o444);
+        std::fs::set_permissions(&state_path, read_only).unwrap();
+
+        let result = cmd_promote("codex", Some("operator approval"), false);
+
+        let mut writable = std::fs::metadata(&state_path).unwrap().permissions();
+        writable.set_mode(0o644);
+        std::fs::set_permissions(&state_path, writable).unwrap();
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+
+        assert!(result.is_err());
+        let channels = registry.providers.get("codex").unwrap();
+        assert_eq!(channels.current.as_ref(), Some(&current));
     }
 }
