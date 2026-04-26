@@ -58,7 +58,7 @@ fn sanitize_file_component(raw: &str) -> String {
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
+                ch.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn migration_state_path_sanitizes_provider_component() {
         let root = Path::new("/tmp/adk-root");
-        let path = migration_state_path(root, "../codex");
+        let path = migration_state_path(root, "../CoDeX");
 
         assert_eq!(
             path,

@@ -4,7 +4,7 @@
 
 - Production Rust modules: `323`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `91`
+- Giant files: `88`
 
 ## Namespace Summary
 
