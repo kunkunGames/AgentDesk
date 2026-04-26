@@ -59,19 +59,23 @@ fn run_command_status_with_timeout(
     mut command: Command,
     timeout: Duration,
 ) -> std::io::Result<bool> {
+    crate::services::process::configure_child_process_group(&mut command);
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
 
     loop {
-        match child.try_wait()? {
-            Some(status) => return Ok(status.success()),
-            None if Instant::now() < deadline => {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Ok(None) => {
+                crate::services::process::kill_child_tree(&mut child);
                 return Ok(false);
+            }
+            Err(error) => {
+                crate::services::process::kill_child_tree(&mut child);
+                return Err(error);
             }
         }
     }
@@ -187,6 +191,17 @@ mod tests {
         );
         assert!(matches!(result.checks.version, SmokeCheckStatus::Failed));
         assert!(!smoke_passed(&result));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_timeout_returns_failed() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+
+        let result = run_command_status_with_timeout(command, Duration::from_millis(50)).unwrap();
+
+        assert!(!result);
     }
 
     #[test]
