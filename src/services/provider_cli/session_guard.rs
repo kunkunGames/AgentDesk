@@ -72,20 +72,14 @@ pub fn evaluate_session_migration_guards(
     for agent_id in agents {
         let agent_artifacts = artifacts_for_agent(&artifacts, &agent_id);
         if agent_artifacts.is_empty() {
+            // Agent has never been launched — no active session to protect.
             let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
-            guard.safe_to_recreate = false;
+            guard.safe_to_recreate = true;
             guard.recreate_required = true;
-            guard.active_turn_state = "missing_launch_artifact".to_string();
-            let blocker = format!(
-                "{provider}/{agent_id} has no launch artifact; cannot verify current channel before migrating to {target_channel}"
-            );
+            guard.active_turn_state = "no_prior_launch".to_string();
             guard
                 .evidence
-                .insert("status".to_string(), "missing_launch_artifact".to_string());
-            guard
-                .evidence
-                .insert("blocker".to_string(), blocker.clone());
-            blockers.push(blocker);
+                .insert("status".to_string(), "no_prior_launch".to_string());
             guards.push(guard);
             continue;
         }
@@ -239,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_blocks_agent_without_launch_artifact() {
+    fn guard_allows_agent_with_no_prior_launch() {
         let root = tempfile::tempdir().unwrap();
         let evaluation = evaluate_session_migration_guards(
             root.path(),
@@ -249,18 +243,16 @@ mod tests {
             false,
         );
 
-        assert!(!evaluation.is_clear());
+        assert!(evaluation.is_clear());
         assert_eq!(evaluation.guards.len(), 1);
-        assert_eq!(
-            evaluation.guards[0].active_turn_state,
-            "missing_launch_artifact"
-        );
+        assert!(evaluation.guards[0].safe_to_recreate);
+        assert_eq!(evaluation.guards[0].active_turn_state, "no_prior_launch");
         assert_eq!(
             evaluation.guards[0]
                 .evidence
                 .get("status")
                 .map(String::as_str),
-            Some("missing_launch_artifact")
+            Some("no_prior_launch")
         );
     }
 

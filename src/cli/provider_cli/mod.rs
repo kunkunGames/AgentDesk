@@ -1231,7 +1231,8 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
 
         use crate::services::provider_cli::registry::{
-            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+            LaunchArtifact, MigrationState, ProviderChannels, ProviderCliMigrationState,
+            ProviderCliRegistry,
         };
         use chrono::Utc;
         let current = test_channel("/tmp/current-codex");
@@ -1261,6 +1262,26 @@ mod tests {
         registry.providers.insert("codex".to_string(), channels);
         save_registry(dir.path(), &registry).unwrap();
 
+        // Active process on the old "current" channel triggers a session guard block
+        // (different channel than "candidate", process is alive, force=false).
+        crate::services::provider_cli::io::save_launch_artifact(
+            dir.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-active".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/current-codex".to_string(),
+                canonical_path: "/tmp/current-codex".to_string(),
+                cli_version: "test".to_string(),
+                process_id: Some(std::process::id()),
+                tmux_session: None,
+                launched_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
         let result = cmd_promote("codex", Some("operator approval"), false);
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
@@ -1284,7 +1305,8 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
 
         use crate::services::provider_cli::registry::{
-            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+            LaunchArtifact, MigrationState, ProviderChannels, ProviderCliMigrationState,
+            ProviderCliRegistry,
         };
         use chrono::{Duration, Utc};
         let current = test_channel("/tmp/current-codex");
@@ -1312,6 +1334,26 @@ mod tests {
             },
         );
         save_registry(dir.path(), &registry).unwrap();
+
+        // Agent was previously launched (pre-migration artifact) so a canary turn IS required.
+        // Without a candidate artifact after canary activation, promote must fail.
+        crate::services::provider_cli::io::save_launch_artifact(
+            dir.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-prev".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/current-codex".to_string(),
+                canonical_path: "/tmp/current-codex".to_string(),
+                cli_version: "test".to_string(),
+                process_id: None,
+                tmux_session: None,
+                launched_at: Utc::now() - Duration::seconds(120),
+            },
+        )
+        .unwrap();
 
         let result = cmd_promote("codex", Some("operator approval"), false);
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();

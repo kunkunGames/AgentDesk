@@ -64,18 +64,24 @@ pub fn verified_candidate_launch_artifact(
     agent_id: &str,
     candidate: &ProviderCliChannel,
     not_before: DateTime<Utc>,
-) -> Result<LaunchArtifact, String> {
-    let mut artifacts = load_launch_artifacts(root, provider)
+) -> Result<Option<LaunchArtifact>, String> {
+    let all_agent_artifacts: Vec<_> = load_launch_artifacts(root, provider)
         .into_iter()
-        .filter(|artifact| {
-            artifact.agent_id.as_deref() == Some(agent_id)
-                && artifact.channel == "candidate"
-                && artifact.launched_at >= not_before
-        })
-        .collect::<Vec<_>>();
-    artifacts.sort_by_key(|artifact| artifact.launched_at);
+        .filter(|artifact| artifact.agent_id.as_deref() == Some(agent_id))
+        .collect();
 
-    let Some(artifact) = artifacts.pop() else {
+    // Agent was never launched — no session to protect, canary turn not required.
+    if all_agent_artifacts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut candidates: Vec<_> = all_agent_artifacts
+        .into_iter()
+        .filter(|artifact| artifact.channel == "candidate" && artifact.launched_at >= not_before)
+        .collect();
+    candidates.sort_by_key(|artifact| artifact.launched_at);
+
+    let Some(artifact) = candidates.pop() else {
         return Err(format!(
             "no candidate launch artifact recorded for {provider}/{agent_id} after canary activation; run a canary turn before promotion"
         ));
@@ -89,7 +95,7 @@ pub fn verified_candidate_launch_artifact(
         ));
     }
 
-    Ok(artifact)
+    Ok(Some(artifact))
 }
 
 #[cfg(test)]
@@ -141,5 +147,68 @@ mod tests {
         let agents = vec![agent("claude-1", "claude", false)];
         let selected = select_canary_agent("codex", &agents, None);
         assert!(selected.is_none());
+    }
+
+    fn candidate_channel(canonical_path: &str, version: &str) -> ProviderCliChannel {
+        ProviderCliChannel {
+            path: canonical_path.to_string(),
+            canonical_path: canonical_path.to_string(),
+            version: version.to_string(),
+            version_output: None,
+            source: "test".to_string(),
+            checked_at: Utc::now(),
+            evidence: Default::default(),
+        }
+    }
+
+    #[test]
+    fn verified_artifact_returns_none_when_agent_never_launched() {
+        let root = tempfile::tempdir().unwrap();
+        let candidate = candidate_channel("/tmp/codex", "1.0.0");
+        let result = verified_candidate_launch_artifact(
+            root.path(),
+            "codex",
+            "codex-agent",
+            &candidate,
+            Utc::now() - chrono::Duration::seconds(60),
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_artifact_errors_when_launched_but_canary_turn_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        // Agent has a pre-migration artifact on the current channel
+        crate::services::provider_cli::io::save_launch_artifact(
+            root.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-session".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/codex".to_string(),
+                canonical_path: "/tmp/codex".to_string(),
+                cli_version: "0.9.0".to_string(),
+                process_id: None,
+                tmux_session: None,
+                launched_at: Utc::now() - chrono::Duration::seconds(120),
+            },
+        )
+        .unwrap();
+
+        let candidate = candidate_channel("/tmp/codex", "1.0.0");
+        let result = verified_candidate_launch_artifact(
+            root.path(),
+            "codex",
+            "codex-agent",
+            &candidate,
+            Utc::now() - chrono::Duration::seconds(60),
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("run a canary turn before promotion"));
     }
 }
