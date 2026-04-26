@@ -70,10 +70,28 @@ pub fn evaluate_session_migration_guards(
     let mut blockers = Vec::new();
 
     for agent_id in agents {
-        let latest = latest_artifact_for_agent(&artifacts, &agent_id);
-        let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
+        let agent_artifacts = artifacts_for_agent(&artifacts, &agent_id);
+        if agent_artifacts.is_empty() {
+            let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
+            guard.safe_to_recreate = false;
+            guard.recreate_required = true;
+            guard.active_turn_state = "missing_launch_artifact".to_string();
+            let blocker = format!(
+                "{provider}/{agent_id} has no launch artifact; cannot verify current channel before migrating to {target_channel}"
+            );
+            guard
+                .evidence
+                .insert("status".to_string(), "missing_launch_artifact".to_string());
+            guard
+                .evidence
+                .insert("blocker".to_string(), blocker.clone());
+            blockers.push(blocker);
+            guards.push(guard);
+            continue;
+        }
 
-        if let Some(artifact) = latest {
+        for artifact in agent_artifacts {
+            let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
             guard.session_key = artifact.session_key.clone();
             guard.pre_migration_channel = Some(artifact.channel.clone());
             guard.evidence.insert(
@@ -119,23 +137,9 @@ pub fn evaluate_session_migration_guards(
                     },
                 );
             }
-        } else {
-            guard.safe_to_recreate = false;
-            guard.recreate_required = true;
-            guard.active_turn_state = "missing_launch_artifact".to_string();
-            let blocker = format!(
-                "{provider}/{agent_id} has no launch artifact; cannot verify current channel before migrating to {target_channel}"
-            );
-            guard
-                .evidence
-                .insert("status".to_string(), "missing_launch_artifact".to_string());
-            guard
-                .evidence
-                .insert("blocker".to_string(), blocker.clone());
-            blockers.push(blocker);
-        }
 
-        guards.push(guard);
+            guards.push(guard);
+        }
     }
 
     SessionGuardEvaluation {
@@ -169,15 +173,14 @@ fn build_guard(
     }
 }
 
-fn latest_artifact_for_agent(
-    artifacts: &[LaunchArtifact],
-    agent_id: &str,
-) -> Option<LaunchArtifact> {
-    artifacts
+fn artifacts_for_agent(artifacts: &[LaunchArtifact], agent_id: &str) -> Vec<LaunchArtifact> {
+    let mut matches = artifacts
         .iter()
         .filter(|artifact| artifact.agent_id.as_deref() == Some(agent_id))
-        .max_by_key(|artifact| artifact.launched_at)
         .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|artifact| artifact.launched_at);
+    matches
 }
 
 fn load_launch_artifacts(root: &Path, provider: &str) -> Vec<LaunchArtifact> {
@@ -220,11 +223,25 @@ mod tests {
     use super::*;
 
     fn artifact(agent_id: &str, channel: &str, process_id: Option<u32>) -> LaunchArtifact {
+        artifact_with_session(
+            agent_id,
+            channel,
+            process_id,
+            &format!("{agent_id}-{channel}-session"),
+        )
+    }
+
+    fn artifact_with_session(
+        agent_id: &str,
+        channel: &str,
+        process_id: Option<u32>,
+        session_key: &str,
+    ) -> LaunchArtifact {
         LaunchArtifact {
             provider: "codex".to_string(),
             agent_id: Some(agent_id.to_string()),
             channel_id: Some("123".to_string()),
-            session_key: Some(format!("{agent_id}-session")),
+            session_key: Some(session_key.to_string()),
             channel: channel.to_string(),
             cli_path: format!("/tmp/{channel}-codex"),
             canonical_path: format!("/tmp/{channel}-codex"),
@@ -259,6 +276,44 @@ mod tests {
                 .map(String::as_str),
             Some("missing_launch_artifact")
         );
+    }
+
+    #[test]
+    fn guard_evaluates_all_launch_artifacts_for_agent() {
+        let root = tempfile::tempdir().unwrap();
+        crate::services::provider_cli::io::save_launch_artifact(
+            root.path(),
+            &artifact_with_session(
+                "codex-agent",
+                "current",
+                Some(std::process::id()),
+                "codex-agent-current-session",
+            ),
+        )
+        .unwrap();
+        crate::services::provider_cli::io::save_launch_artifact(
+            root.path(),
+            &artifact_with_session(
+                "codex-agent",
+                "candidate",
+                None,
+                "codex-agent-candidate-session",
+            ),
+        )
+        .unwrap();
+
+        let evaluation = evaluate_session_migration_guards(
+            root.path(),
+            "codex",
+            &["codex-agent".to_string()],
+            "candidate",
+            false,
+        );
+
+        assert!(!evaluation.is_clear());
+        assert_eq!(evaluation.guards.len(), 2);
+        assert_eq!(evaluation.blockers.len(), 1);
+        assert!(evaluation.blockers[0].contains("active current session"));
     }
 
     #[test]

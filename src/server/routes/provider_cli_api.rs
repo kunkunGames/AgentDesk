@@ -10,8 +10,8 @@ use crate::services::provider_cli::io::{
     load_migration_state, load_registry, load_smoke_result, save_migration_state,
 };
 use crate::services::provider_cli::orchestration::{
-    evaluate_provider_session_guard, promote_registry_candidate, rollback_registry_previous,
-    session_guard_evidence,
+    clear_provider_channel_overrides, evaluate_provider_session_guard, promote_registry_candidate,
+    rollback_registry_previous, session_guard_evidence,
 };
 use crate::services::provider_cli::registry::MigrationState;
 use crate::services::provider_cli::upgrade::{migration_state_rank, transition};
@@ -180,7 +180,7 @@ pub async fn patch_provider_cli(
             if matches!(action, ProviderCliApiAction::RollbackToPrevious) {
                 rollback_registry_previous(&root, &provider)
             } else {
-                Ok(())
+                clear_provider_channel_overrides(&root, &provider)
             }
         })
     };
@@ -381,6 +381,68 @@ mod tests {
             .unwrap();
         let channels = registry.providers.get("codex").unwrap();
         assert_eq!(channels.current.as_ref(), Some(&candidate));
+        assert!(channels.agent_overrides.is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_rollback_clears_provider_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime_root = RuntimeRootOverrideGuard::set(dir.path());
+
+        use crate::services::provider_cli::registry::{
+            MigrationState, ProviderChannels, ProviderCliChannel, ProviderCliMigrationState,
+            ProviderCliRegistry,
+        };
+        use chrono::Utc;
+        let current = ProviderCliChannel {
+            path: "/tmp/current-codex".to_string(),
+            canonical_path: "/tmp/current-codex".to_string(),
+            version: "current".to_string(),
+            version_output: None,
+            source: "test".to_string(),
+            checked_at: Utc::now(),
+            evidence: Default::default(),
+        };
+        let ms = ProviderCliMigrationState {
+            schema_version: 1,
+            provider: "codex".to_string(),
+            state: MigrationState::CanaryActive,
+            selected_agent_id: Some("codex-agent".to_string()),
+            current_channel: Some(current.clone()),
+            candidate_channel: None,
+            rollback_target: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            history: vec![],
+        };
+        crate::services::provider_cli::io::save_migration_state(dir.path(), &ms).unwrap();
+
+        let mut registry = ProviderCliRegistry::default();
+        let mut channels = ProviderChannels {
+            current: Some(current),
+            ..Default::default()
+        };
+        channels
+            .agent_overrides
+            .insert("codex-agent".to_string(), "candidate".to_string());
+        registry.providers.insert("codex".to_string(), channels);
+        crate::services::provider_cli::io::save_registry(dir.path(), &registry).unwrap();
+
+        let state = make_state();
+        let body = ProviderCliActionRequest {
+            action: "rollback".to_string(),
+            evidence: Some("operator rollback".to_string()),
+            force_recreate_active: false,
+        };
+        let (status, Json(value)) =
+            patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["state"].as_str().unwrap(), "rolled_back");
+
+        let registry = crate::services::provider_cli::io::load_registry(dir.path())
+            .unwrap()
+            .unwrap();
+        let channels = registry.providers.get("codex").unwrap();
         assert!(channels.agent_overrides.is_empty());
     }
 }

@@ -185,7 +185,7 @@
 | `server::routes::offices` | `src/server/routes/offices.rs` | 877 |  |
 | `server::routes::onboarding` | `src/server/routes/onboarding.rs` | 4471 | giant-file |
 | `server::routes::pipeline` | `src/server/routes/pipeline.rs` | 1697 | giant-file |
-| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 386 |  |
+| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 448 |  |
 | `server::routes::queue_api` | `src/server/routes/queue_api.rs` | 387 |  |
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 139 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1499 | giant-file |
@@ -339,11 +339,11 @@
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 74 |  |
 | `services::provider_cli::diagnostics` | `src/services/provider_cli/diagnostics.rs` | 180 |  |
 | `services::provider_cli::io` | `src/services/provider_cli/io.rs` | 151 |  |
-| `services::provider_cli::orchestration` | `src/services/provider_cli/orchestration.rs` | 169 |  |
+| `services::provider_cli::orchestration` | `src/services/provider_cli/orchestration.rs` | 182 |  |
 | `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 152 |  |
 | `services::provider_cli::registry` | `src/services/provider_cli/registry.rs` | 303 |  |
 | `services::provider_cli::retention` | `src/services/provider_cli/retention.rs` | 200 |  |
-| `services::provider_cli::session_guard` | `src/services/provider_cli/session_guard.rs` | 313 |  |
+| `services::provider_cli::session_guard` | `src/services/provider_cli/session_guard.rs` | 368 |  |
 | `services::provider_cli::smoke` | `src/services/provider_cli/smoke.rs` | 234 |  |
 | `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 123 |  |
 | `services::provider_cli::upgrade` | `src/services/provider_cli/upgrade.rs` | 730 |  |

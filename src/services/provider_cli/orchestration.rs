@@ -38,6 +38,19 @@ pub fn clear_canary_override(
     save_registry(root, &registry).map_err(|e| e.to_string())
 }
 
+pub fn clear_provider_channel_overrides(
+    root: &std::path::Path,
+    provider: &str,
+) -> Result<(), String> {
+    let mut registry = load_registry(root)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if let Some(channels) = registry.providers.get_mut(provider) {
+        channels.agent_overrides.clear();
+    }
+    save_registry(root, &registry).map_err(|e| e.to_string())
+}
+
 pub fn promote_registry_candidate(root: &std::path::Path, provider: &str) -> Result<(), String> {
     let mut registry = load_registry(root)
         .map_err(|e| e.to_string())?
