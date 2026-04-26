@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// `~/.adk/{env}/config/provider-cli-registry.json`
@@ -36,6 +37,19 @@ pub fn smoke_result_path(root: &Path, provider: &str, channel: &str) -> PathBuf 
             sanitize_file_component(provider),
             sanitize_file_component(channel)
         ))
+}
+
+pub fn preserved_previous_tree_path(entry_path: &Path) -> PathBuf {
+    let mut name = entry_path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("previous-binary"));
+    name.push(".tree");
+
+    entry_path
+        .parent()
+        .map(|parent| parent.join(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 fn sanitize_file_component(raw: &str) -> String {
@@ -124,5 +138,12 @@ mod tests {
                 .join("provider-cli-smoke")
                 .join("codex-candidate_live.json")
         );
+    }
+
+    #[test]
+    fn preserved_previous_tree_path_uses_entry_sibling_tree() {
+        let path = preserved_previous_tree_path(Path::new("/tmp/runtime/codex-previous-binary"));
+
+        assert_eq!(path, Path::new("/tmp/runtime/codex-previous-binary.tree"));
     }
 }
