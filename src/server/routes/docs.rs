@@ -268,7 +268,7 @@ fn canonical_category(category: &str) -> &'static str {
         "kanban" | "kanban-repos" | "pipeline" | "pm" | "reviews" => "kanban",
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
         "auto-queue" | "cron" | "queue" => "queue",
-        "analytics" | "auth" | "docs" | "health" | "monitoring" | "stats" => "ops",
+        "analytics" | "auth" | "docs" | "health" | "monitoring" | "stats" | "provider-cli" => "ops",
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
         | "skills" => "admin",
@@ -419,6 +419,7 @@ fn category_description(category: &str) -> &'static str {
         "pipeline" => "Pipeline stages, config overrides, graphs, and card history.",
         "pm" => "PM decision workflow for force-only pipeline states.",
         "policies" => "Loaded policy inventory.",
+        "provider-cli" => "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback.",
         "reviews" => "Review verdict submission, decisions, and tuning aggregation.",
         "sessions" => "Sessions, force-kill, and termination events.",
         "settings" => "Settings surfaces, live overrides, precedence, and onboarding contracts.",
@@ -3386,6 +3387,39 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_example(
             json!({"body": {"id": "mem-abc"}}),
             json!({"ok": true, "source": "local"}),
+        ),
+        // provider-cli safe migration
+        ep(
+            "GET",
+            "/api/provider-cli",
+            "provider-cli",
+            "List current channel snapshots and migration states for all providers (codex, claude, gemini, qwen).",
+        )
+        .with_example(
+            json!(null),
+            json!({
+                "providers": [{"provider": "codex", "current": null, "candidate": null}],
+                "migrations": [],
+                "generated_at": "2026-01-01T00:00:00Z"
+            }),
+        ),
+        ep(
+            "PATCH",
+            "/api/provider-cli/{provider}",
+            "provider-cli",
+            "Apply an operator action to a provider migration state. Actions: confirm_promote, rollback, rollback_to_previous.",
+        )
+        .with_params([
+            (
+                "provider",
+                path_param("Provider id: codex, claude, gemini, or qwen"),
+            ),
+            ("action", body_param("string", true, "confirm_promote | rollback | rollback_to_previous")),
+            ("evidence", body_param("string", false, "Optional operator note recorded in migration history")),
+        ])
+        .with_example(
+            json!({"body": {"action": "confirm_promote", "evidence": "operator approved via Discord"}}),
+            json!({"provider": "codex", "action": "confirm_promote", "state": "ProviderSessionsSafeEnding", "updated_at": "2026-01-01T00:00:00Z"}),
         ),
     ]
 }

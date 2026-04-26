@@ -41,6 +41,7 @@ pub mod state;
 pub mod stats;
 pub mod termination_events;
 pub mod v1;
+pub mod provider_cli_api;
 
 use axum::{
     Router,
