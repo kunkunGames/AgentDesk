@@ -6,9 +6,10 @@ use super::super::AppState;
 use crate::services::provider::ProviderKind;
 
 fn legacy_db(state: &AppState) -> &crate::db::Db {
-    match state {
-        AppState { db, .. } => db,
-    }
+    state
+        .engine
+        .legacy_db()
+        .expect("legacy sqlite db unavailable for review verdict fallback")
 }
 
 /// Write a review-passed marker file for the reviewed commit.
@@ -206,8 +207,9 @@ async fn emit_card_updated(state: &AppState, card_id: &str) {
                 tracing::warn!(
                     card_id,
                     %error,
-                    "[review-verdict] falling back to sqlite kanban_card_updated emit"
+                    "[review-verdict] failed to load postgres card for kanban_card_updated emit"
                 );
+                return;
             }
         }
     }

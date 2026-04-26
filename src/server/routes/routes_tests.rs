@@ -1,7 +1,6 @@
 use super::*;
 use axum::body::{Body, HttpBody as _};
 use axum::http::{Request, StatusCode};
-use libsql_rusqlite::OptionalExtension;
 use serde_json::json;
 use sqlx::Row;
 use std::ffi::OsString;
@@ -13,6 +12,12 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use tower::ServiceExt;
+
+macro_rules! sqlite_params {
+    ($($param:expr),* $(,)?) => {
+        ($(&$param,)*)
+    };
+}
 
 fn test_db() -> Db {
     crate::db::test_db()
@@ -5074,7 +5079,7 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
                 ?1, 'agent-manual-backlog', 'codex', 'working', 'dispatch-manual-backlog',
                 datetime('now', '-9 minutes'), datetime('now', '-9 minutes')
             )",
-            libsql_rusqlite::params![session_key],
+            sqlite_params![session_key],
         )
         .unwrap();
         conn.execute(
@@ -5225,7 +5230,7 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
             "SELECT status, active_dispatch_id
              FROM sessions
              WHERE session_key = ?1",
-            libsql_rusqlite::params![session_key],
+            sqlite_params![session_key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -7877,7 +7882,7 @@ async fn create_issue_route_builds_pmd_body_and_agent_label() {
         .unwrap()
         .execute(
             "INSERT INTO agents (id, name) VALUES (?1, ?2)",
-            libsql_rusqlite::params!["adk-backend", "ADK Backend"],
+            sqlite_params!["adk-backend", "ADK Backend"],
         )
         .unwrap();
     let app = test_api_router(db.clone(), engine, None);
@@ -8142,7 +8147,7 @@ async fn github_issues_create_canonical_path_returns_created_issue() {
         .unwrap()
         .execute(
             "INSERT INTO agents (id, name) VALUES (?1, ?2)",
-            libsql_rusqlite::params!["adk-backend", "ADK Backend"],
+            sqlite_params!["adk-backend", "ADK Backend"],
         )
         .unwrap();
     let app = test_api_router(db, engine, None);
@@ -8215,7 +8220,7 @@ async fn sessions_tmux_output_http_route_returns_shape_for_seeded_session() {
             "INSERT INTO sessions
              (session_key, agent_id, provider, status, last_heartbeat, created_at)
              VALUES (?1, 'agent-1067-http', 'codex', 'working', datetime('now'), datetime('now'))",
-            libsql_rusqlite::params![session_key.clone()],
+            sqlite_params![session_key.clone()],
         )
         .unwrap();
         session_id = conn
@@ -8877,7 +8882,7 @@ async fn skills_catalog_filters_stale_entries_and_exposes_disk_presence() {
         conn.execute(
             "INSERT INTO skills (id, name, description, source_path, updated_at)
              VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            libsql_rusqlite::params![
+            sqlite_params![
                 "stale-skill",
                 "stale-skill",
                 "Stale skill description",
@@ -8893,13 +8898,13 @@ async fn skills_catalog_filters_stale_entries_and_exposes_disk_presence() {
         conn.execute(
             "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
              VALUES (?1, ?2, ?3, datetime('now'))",
-            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+            sqlite_params!["stale-skill", "agent-stale", "session-stale"],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
              VALUES (?1, ?2, ?3, datetime('now'))",
-            libsql_rusqlite::params!["live-skill", "agent-live", "session-live"],
+            sqlite_params!["live-skill", "agent-live", "session-live"],
         )
         .unwrap();
     }
@@ -8982,7 +8987,7 @@ async fn skills_prune_dry_run_previews_and_delete_preserves_usage() {
         conn.execute(
             "INSERT INTO skills (id, name, description, source_path, updated_at)
              VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            libsql_rusqlite::params![
+            sqlite_params![
                 "stale-skill",
                 "stale-skill",
                 "Stale skill description",
@@ -8998,7 +9003,7 @@ async fn skills_prune_dry_run_previews_and_delete_preserves_usage() {
         conn.execute(
             "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at)
              VALUES (?1, ?2, ?3, datetime('now'))",
-            libsql_rusqlite::params!["stale-skill", "agent-stale", "session-stale"],
+            sqlite_params!["stale-skill", "agent-stale", "session-stale"],
         )
         .unwrap();
     }
@@ -9852,7 +9857,7 @@ async fn maintenance_jobs_endpoint_lists_seed_job() -> Result<(), Box<dyn std::e
         let conn = db.lock()?;
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-            libsql_rusqlite::params![
+            sqlite_params![
                 "maintenance_job:maintenance.noop_heartbeat:next_run_ms",
                 "1700000000000"
             ],
@@ -10242,7 +10247,7 @@ async fn agent_quality_api_event_fallback_mini_rollup() -> Result<(), Box<dyn st
                     source_event_id, correlation_id, agent_id, provider, channel_id,
                     card_id, dispatch_id, event_type, payload_json, created_at
                  ) VALUES (?1, NULL, 'agent-1', 'codex', '555', NULL, NULL, ?2, '{}', datetime('now'))",
-                libsql_rusqlite::params![format!("evt-{i}"), etype],
+                sqlite_params![format!("evt-{i}"), etype],
             )?;
         }
     }
@@ -11649,7 +11654,7 @@ fn seed_card_with_status(db: &Db, card_id: &str, status: &str) {
     conn.execute(
         "INSERT OR REPLACE INTO kanban_cards (id, title, status, priority, created_at, updated_at) \
              VALUES (?1, 'test', ?2, 'medium', datetime('now'), datetime('now'))",
-        libsql_rusqlite::params![card_id, status],
+        sqlite_params![card_id, status],
     )
     .unwrap();
 }
@@ -11750,7 +11755,7 @@ fn seed_auto_queue_card(db: &Db, card_id: &str, issue_number: i64, status: &str,
         ) VALUES (
             ?1, ?2, ?3, 'medium', ?4, 'test-repo', ?5, datetime('now'), datetime('now')
         )",
-        libsql_rusqlite::params![
+        sqlite_params![
             card_id,
             format!("Issue #{issue_number}"),
             status,
@@ -11762,8 +11767,10 @@ fn seed_auto_queue_card(db: &Db, card_id: &str, issue_number: i64, status: &str,
 }
 
 #[test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 fn auto_queue_schema_migration_drops_legacy_max_concurrent_per_agent_column() {
-    let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+    let db = test_db();
+    let conn = db.separate_conn().unwrap();
     conn.execute_batch(
         "PRAGMA foreign_keys=ON;
          CREATE TABLE kanban_cards (id TEXT PRIMARY KEY);
@@ -11863,7 +11870,7 @@ fn seed_in_progress_stall_case(
             ?1, ?2, 'in_progress', 'medium', ?3, 'test-repo',
             datetime('now', ?4), datetime('now', ?4), datetime('now', ?5)
         )",
-        libsql_rusqlite::params![card_id, title, agent_id, started_offset, updated_offset,],
+        sqlite_params![card_id, title, agent_id, started_offset, updated_offset,],
     )
     .unwrap();
 
@@ -11874,12 +11881,12 @@ fn seed_in_progress_stall_case(
             ) VALUES (
                 ?1, ?2, ?3, 'implementation', 'dispatched', ?4, datetime('now', ?5), datetime('now', ?5)
             )",
-            libsql_rusqlite::params![dispatch_id, card_id, agent_id, format!("{title} Dispatch"), dispatch_offset],
+            sqlite_params![dispatch_id, card_id, agent_id, format!("{title} Dispatch"), dispatch_offset],
         )
         .unwrap();
         conn.execute(
             "UPDATE kanban_cards SET latest_dispatch_id = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![dispatch_id, card_id],
+            sqlite_params![dispatch_id, card_id],
         )
         .unwrap();
     }
@@ -11904,7 +11911,7 @@ fn seed_review_e2e_case(
             ?1, ?2, 'review', 'medium', ?3, 'test-repo',
             datetime('now', ?4), datetime('now', ?4), datetime('now', ?4)
         )",
-        libsql_rusqlite::params![card_id, title, agent_id, review_offset],
+        sqlite_params![card_id, title, agent_id, review_offset],
     )
     .unwrap();
     conn.execute(
@@ -11913,7 +11920,7 @@ fn seed_review_e2e_case(
         ) VALUES (
             ?1, ?2, ?3, 'e2e-test', ?4, ?5, datetime('now', ?6), datetime('now', ?6)
         )",
-        libsql_rusqlite::params![
+        sqlite_params![
             dispatch_id,
             card_id,
             agent_id,
@@ -11925,7 +11932,7 @@ fn seed_review_e2e_case(
     .unwrap();
     conn.execute(
         "UPDATE kanban_cards SET latest_dispatch_id = ?1 WHERE id = ?2",
-        libsql_rusqlite::params![dispatch_id, card_id],
+        sqlite_params![dispatch_id, card_id],
     )
     .unwrap();
 }
@@ -12178,16 +12185,15 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
             |row| row.get(0),
         )
         .unwrap();
-    let first_confirm_marker: Option<String> = conn
+    let first_confirm_marker_count: i64 = conn
         .query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
+            "SELECT COUNT(*) FROM kv_meta WHERE key = ?1",
             [format!(
                 "runtime_supervisor:orphan_confirm:{}",
                 "dispatch-orphan-330"
             )],
             |row| row.get(0),
         )
-        .optional()
         .unwrap();
     let (first_action, first_note): (String, Option<String>) = conn
         .query_row(
@@ -12211,7 +12217,7 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
         "first orphan tick must keep the dispatch pending until confirm succeeds"
     );
     assert!(
-        first_confirm_marker.is_some(),
+        first_confirm_marker_count > 0,
         "first orphan tick must persist a confirm marker"
     );
     assert_eq!(first_action, "Probe");
@@ -12260,16 +12266,15 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
             |row| row.get(0),
         )
         .unwrap();
-    let remaining_confirm_marker: Option<String> = conn
+    let remaining_confirm_marker_count: i64 = conn
         .query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
+            "SELECT COUNT(*) FROM kv_meta WHERE key = ?1",
             [format!(
                 "runtime_supervisor:orphan_confirm:{}",
                 "dispatch-orphan-330"
             )],
             |row| row.get(0),
         )
-        .optional()
         .unwrap();
 
     assert_eq!(
@@ -12299,7 +12304,7 @@ fn on_tick30s_orphan_dispatch_recovers_true_orphan_without_regression() {
     assert_eq!(chosen_action, "Resume");
     assert_eq!(audit_dispatch_id.as_deref(), Some("dispatch-orphan-330"));
     assert!(
-        remaining_confirm_marker.is_none(),
+        remaining_confirm_marker_count == 0,
         "confirmed orphan recovery must clear the confirm marker"
     );
 }
@@ -12363,16 +12368,15 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
             |row| row.get(0),
         )
         .unwrap();
-    let first_confirm_marker: Option<String> = conn
+    let first_confirm_marker_count: i64 = conn
         .query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
+            "SELECT COUNT(*) FROM kv_meta WHERE key = ?1",
             [format!(
                 "runtime_supervisor:orphan_confirm:{}",
                 "dispatch-race-330"
             )],
             |row| row.get(0),
         )
-        .optional()
         .unwrap();
     let (first_action, first_note): (String, Option<String>) = conn
         .query_row(
@@ -12389,7 +12393,7 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
 
     assert_eq!(first_card_status, "in_progress");
     assert_eq!(first_dispatch_status, "pending");
-    assert!(first_confirm_marker.is_some());
+    assert!(first_confirm_marker_count > 0);
     assert_eq!(first_action, "Probe");
     assert!(
         first_note
@@ -12436,16 +12440,15 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    let remaining_confirm_marker: Option<String> = conn
+    let remaining_confirm_marker_count: i64 = conn
         .query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
+            "SELECT COUNT(*) FROM kv_meta WHERE key = ?1",
             [format!(
                 "runtime_supervisor:orphan_confirm:{}",
                 "dispatch-race-330"
             )],
             |row| row.get(0),
         )
-        .optional()
         .unwrap();
 
     assert_eq!(
@@ -12472,7 +12475,7 @@ fn on_tick30s_orphan_dispatch_skips_card_that_moved_to_backlog_mid_recovery() {
         "runtime_decisions audit must explain why the resume transition was skipped"
     );
     assert!(
-        remaining_confirm_marker.is_none(),
+        remaining_confirm_marker_count == 0,
         "race-guarded orphan recovery must clear the confirm marker after confirm completes"
     );
 }
@@ -14169,7 +14172,7 @@ async fn dispute_repeat_does_not_reuse_poisoned_review_target() {
                 'completed', 'impl', ?1, ?2, datetime('now', '-10 minutes'), datetime('now', '-10 minutes'),
                 datetime('now', '-10 minutes')
             )",
-            libsql_rusqlite::params![
+            sqlite_params![
                 serde_json::json!({
                     "worktree_path": worktree_path,
                     "branch": "wt/472-poison"
@@ -15350,6 +15353,7 @@ async fn redispatch_preserves_review_dispatch_type() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_dispatch_prepares_backlog_cards_and_auto_assigns_agent() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -15475,6 +15479,7 @@ async fn auto_queue_dispatch_prepares_backlog_cards_and_auto_assigns_agent() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_dispatch_persists_review_mode_in_run() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -15530,6 +15535,7 @@ async fn auto_queue_dispatch_persists_review_mode_in_run() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_dispatch_rejects_when_live_run_exists_without_force() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -15690,6 +15696,7 @@ async fn auto_queue_dispatch_rejects_when_live_run_exists_without_force() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_dispatch_force_cancels_live_run_and_creates_new_run() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -15819,6 +15826,7 @@ async fn auto_queue_dispatch_force_cancels_live_run_and_creates_new_run() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_add_run_entry_creates_pending_entry_for_active_run() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -15917,6 +15925,7 @@ async fn auto_queue_add_run_entry_creates_pending_entry_for_active_run() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_add_run_entry_rejects_non_active_runs() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -15977,6 +15986,7 @@ async fn auto_queue_add_run_entry_rejects_non_active_runs() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_add_run_entry_rejects_non_ready_cards() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -16037,6 +16047,7 @@ async fn auto_queue_add_run_entry_rejects_non_ready_cards() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_update_entry_moves_pending_entry_and_syncs_run_groups() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -16118,6 +16129,7 @@ async fn auto_queue_update_entry_moves_pending_entry_and_syncs_run_groups() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_update_entry_restores_skipped_entry_to_pending() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -16215,6 +16227,7 @@ async fn auto_queue_update_entry_restores_skipped_entry_to_pending() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_update_entry_updates_batch_phase_only_and_with_priority_rank() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -16331,6 +16344,7 @@ async fn auto_queue_update_entry_updates_batch_phase_only_and_with_priority_rank
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_update_run_updates_max_concurrent_threads_only_and_with_status() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -16526,6 +16540,7 @@ async fn auto_queue_update_run_pg_updates_max_concurrent_threads_only_and_with_s
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_rebind_slot_assigns_run_and_updates_dispatched_entry_slot() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -16609,6 +16624,7 @@ async fn auto_queue_rebind_slot_assigns_run_and_updates_dispatched_entry_slot() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_restore_run_restores_skipped_entries_by_card_state() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -16832,6 +16848,7 @@ async fn auto_queue_restore_run_restores_skipped_entries_by_card_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_restore_reloads_user_cancelled_entries() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -16943,6 +16960,7 @@ async fn auto_queue_cancel_restore_reloads_user_cancelled_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_restore_run_rejects_active_run() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -16986,6 +17004,7 @@ async fn auto_queue_restore_run_rejects_active_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_restore_run_retries_from_restoring_after_partial_failure() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17173,6 +17192,7 @@ async fn auto_queue_restore_run_retries_from_restoring_after_partial_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_run_id_does_not_dispatch_restoring_runs() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17247,6 +17267,7 @@ async fn auto_queue_activate_run_id_does_not_dispatch_restoring_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_active_only_does_not_promote_generated_runs() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17351,6 +17372,7 @@ async fn auto_queue_activate_active_only_does_not_promote_generated_runs() {
 /// #162: A card in 'requested' state, assigned to the same agent, must not
 /// be blocked by the busy-agent guard when that card itself is the dispatch target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_requested_card_not_blocked_by_own_status() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17420,6 +17442,7 @@ async fn auto_queue_activate_requested_card_not_blocked_by_own_status() {
 /// The walk must preserve the same requested-state hook side-effects as a
 /// manual transition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_walks_backlog_card_to_dispatchable_state() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17522,6 +17545,7 @@ async fn auto_queue_activate_walks_backlog_card_to_dispatchable_state() {
 /// #500: If the requested-state hook decides the card is already applied,
 /// activate() must respect that side-effect instead of creating a new dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_walk_respects_requested_hook_skip() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17621,6 +17645,7 @@ async fn auto_queue_activate_walk_respects_requested_hook_skip() {
 
 /// #430: legacy unified_thread runs still dispatch, but via slot pooling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_legacy_unified_thread_run_dispatches_via_slot_pool() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17734,6 +17759,7 @@ async fn auto_queue_activate_legacy_unified_thread_run_dispatches_via_slot_pool(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_consult_required_creates_consultation_dispatch() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17842,6 +17868,7 @@ async fn auto_queue_activate_consult_required_creates_consultation_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_consult_required_prefers_registry_counterpart_provider() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -17924,6 +17951,7 @@ async fn auto_queue_activate_consult_required_prefers_registry_counterpart_provi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_already_applied_skips_entry_and_completes_run() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -18011,6 +18039,7 @@ async fn auto_queue_activate_already_applied_skips_entry_and_completes_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_reuses_released_slot_for_next_group() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -18339,6 +18368,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_dispatch_create_failure_releases_reserved_slot() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -18454,6 +18484,7 @@ async fn auto_queue_activate_dispatch_create_failure_releases_reserved_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -18635,6 +18666,7 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_is_active() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -18819,6 +18851,7 @@ async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -18843,7 +18876,7 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
             conn.execute(
                 "INSERT INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
                  VALUES (?1, ?2, '{}')",
-                libsql_rusqlite::params!["agent-slot-expand", slot_index],
+                sqlite_params!["agent-slot-expand", slot_index],
             )
             .unwrap();
         }
@@ -18862,7 +18895,7 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
                 "INSERT INTO auto_queue_entries (
                     id, run_id, kanban_card_id, agent_id, status, priority_rank, thread_group
                 ) VALUES (?1, 'run-slot-expand', ?2, 'agent-slot-expand', 'pending', ?3, ?4)",
-                libsql_rusqlite::params![
+                sqlite_params![
                     format!("entry-slot-expand-{thread_group}"),
                     format!("card-slot-expand-{thread_group}"),
                     priority_rank as i64,
@@ -18949,6 +18982,7 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_allows_same_agent_parallel_across_runs_when_free_slot_exists() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -19082,6 +19116,7 @@ async fn auto_queue_activate_allows_same_agent_parallel_across_runs_when_free_sl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_keeps_single_slot_agent_single_dispatched_group() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -19512,7 +19547,7 @@ fn seed_similarity_group_cards(db: &Db) -> Vec<String> {
             "INSERT INTO kanban_cards (
                 id, repo_id, title, description, status, priority, assigned_agent_id, github_issue_number
              ) VALUES (?1, 'test-repo', ?2, ?3, 'ready', 'medium', ?4, ?5)",
-            libsql_rusqlite::params![card_id, title, description, agent_id, issue_num],
+            sqlite_params![card_id, title, description, agent_id, issue_num],
         )
         .unwrap();
         ids.push(card_id.to_string());
@@ -19631,6 +19666,7 @@ async fn smart_generate_creates_correct_thread_groups_and_batch_phases() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_rolls_back_when_entry_insert_fails() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -19697,6 +19733,7 @@ async fn auto_queue_generate_rolls_back_when_entry_insert_fails() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_status_exposes_explicit_thread_links_from_configured_channels() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -19786,6 +19823,7 @@ async fn auto_queue_status_exposes_explicit_thread_links_from_configured_channel
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_history_returns_recent_runs_with_summary_metrics() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -20786,6 +20824,7 @@ async fn auto_queue_submit_order_pg_activates_pending_run_and_skips_non_dispatch
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_status_legacy_thread_falls_back_to_active_label_without_url_guessing() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -20860,6 +20899,7 @@ async fn auto_queue_status_legacy_thread_falls_back_to_active_label_without_url_
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_status_scopes_global_run_entries_by_repo_and_agent() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -20952,6 +20992,7 @@ async fn auto_queue_status_scopes_global_run_entries_by_repo_and_agent() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -21039,6 +21080,7 @@ async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() 
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_rejects_when_live_run_exists_without_force() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -21117,6 +21159,7 @@ async fn auto_queue_generate_rejects_when_live_run_exists_without_force() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_empty_state_reports_filtered_counts() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -21180,6 +21223,7 @@ async fn auto_queue_generate_empty_state_reports_filtered_counts() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_accepts_but_ignores_unified_thread_flag() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -21238,6 +21282,7 @@ async fn auto_queue_generate_accepts_but_ignores_unified_thread_flag() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_generate_entries_payload_persists_batch_phases() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -21991,6 +22036,7 @@ async fn activate_waits_for_current_batch_phase_before_dispatching_next_phase() 
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -22228,6 +22274,7 @@ async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots(
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_pause_force_cancels_live_dispatches_and_releases_slots() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -22848,6 +22895,7 @@ async fn auto_queue_reset_slot_thread_pg_clears_slot_binding_without_sqlite_mirr
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_cancels_live_dispatches_skips_entries_and_releases_slots() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -23027,6 +23075,7 @@ async fn auto_queue_cancel_cancels_live_dispatches_skips_entries_and_releases_sl
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_includes_restoring_runs() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -23140,6 +23189,7 @@ async fn auto_queue_cancel_includes_restoring_runs() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_targets_only_requested_run() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -23986,6 +24036,7 @@ async fn auto_queue_cancel_pg_sweeps_user_cancelled_entries() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_surfaces_warning_when_slot_release_fails() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -24113,6 +24164,7 @@ async fn auto_queue_cancel_surfaces_warning_when_slot_release_fails() {
 }
 
 #[tokio::test]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_cancel_also_cancels_phase_gate_dispatches_and_deletes_gate_rows() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -24337,7 +24389,7 @@ async fn activate_run_id_blocks_phase_gate_paused_runs() {
             "INSERT INTO auto_queue_phase_gates (
                 run_id, phase, status, dispatch_id, pass_verdict
              ) VALUES (?1, ?2, ?3, NULL, 'phase_gate_passed')",
-            libsql_rusqlite::params!["run-phase-gate-paused", 1, "pending",],
+            sqlite_params!["run-phase-gate-paused", 1, "pending",],
         )
         .unwrap();
     }
@@ -24431,7 +24483,7 @@ async fn resume_run_skips_phase_gate_blocked_runs() {
             "INSERT INTO auto_queue_phase_gates (
                 run_id, phase, status, dispatch_id, pass_verdict
              ) VALUES (?1, ?2, ?3, NULL, 'phase_gate_passed')",
-            libsql_rusqlite::params!["run-resume-gate", 1, "failed",],
+            sqlite_params!["run-resume-gate", 1, "failed",],
         )
         .unwrap();
     }
@@ -24942,6 +24994,7 @@ async fn resume_run_skips_phase_gate_blocked_runs_pg_path() {
 /// entries that are 'dispatched' but have orphan (NULL), phantom (missing row),
 /// or cancelled/failed dispatch_ids — while leaving valid dispatches untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
     crate::pipeline::ensure_loaded();
     let (_repo, _repo_guard) = setup_test_repo();
@@ -24995,7 +25048,7 @@ async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
                  ELSE thread_group
              END
              WHERE run_id = ?3",
-            libsql_rusqlite::params![
+            sqlite_params![
                 generated_json["entries"][0]["id"].as_str().unwrap(),
                 generated_json["entries"][1]["id"].as_str().unwrap(),
                 run_id
@@ -25339,7 +25392,7 @@ fn auto_queue_recovery_skips_terminal_pending_entries() {
             conn.execute(
                 "INSERT INTO auto_queue_runs (id, repo, agent_id, status) \
                  VALUES (?1, 'test-repo', 'agent-terminal-recovery', ?2)",
-                libsql_rusqlite::params![run_id, status],
+                sqlite_params![run_id, status],
             )
             .unwrap();
         }
@@ -25369,7 +25422,7 @@ fn auto_queue_recovery_skips_terminal_pending_entries() {
             conn.execute(
                 "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status) \
                  VALUES (?1, ?2, ?3, 'agent-terminal-recovery', 'pending')",
-                libsql_rusqlite::params![entry_id, run_id, card_id],
+                sqlite_params![entry_id, run_id, card_id],
             )
             .unwrap();
         }
@@ -25627,7 +25680,7 @@ fn auto_queue_recovery_keeps_finished_phase_gate_runs_blocked_until_gate_resolve
             "INSERT INTO auto_queue_phase_gates (
                 run_id, phase, status, dispatch_id, pass_verdict
              ) VALUES (?1, ?2, ?3, NULL, 'phase_gate_passed')",
-            libsql_rusqlite::params!["run-finished-gate", 1, "pending",],
+            sqlite_params!["run-finished-gate", 1, "pending",],
         )
         .unwrap();
     }
@@ -25753,6 +25806,7 @@ async fn patch_dispatch_rejects_invalid_status() {
 
 /// #265: Valid statuses like "cancelled" must still work through the generic path.
 #[tokio::test]
+#[ignore = "obsolete SQLite dispatch route fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn patch_dispatch_accepts_valid_status_cancelled() {
     let db = test_db();
     let engine = test_engine(&db);
@@ -26340,6 +26394,7 @@ async fn batch_rereview_processes_multiple_issues() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_reset_completes_generated_and_pending_runs() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -26449,6 +26504,7 @@ async fn auto_queue_reset_completes_generated_and_pending_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_reset_with_agent_id_only_clears_matching_agent_scope() {
     crate::pipeline::ensure_loaded();
     let db = test_db();
@@ -26597,6 +26653,7 @@ async fn auto_queue_reset_with_agent_id_only_clears_matching_agent_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "obsolete SQLite auto-queue fixture; PR #868 runtime path is PostgreSQL-only"]
 async fn auto_queue_reset_requires_agent_id_and_reset_global_requires_confirmation() {
     crate::pipeline::ensure_loaded();
     let db = test_db();

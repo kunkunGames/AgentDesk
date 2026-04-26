@@ -37,7 +37,7 @@ pub(crate) use dispatch_create::query_dispatch_row_pg;
 pub use dispatch_create::{
     create_dispatch, create_dispatch_core, create_dispatch_core_with_id,
     create_dispatch_core_with_id_and_options, create_dispatch_core_with_options,
-    create_dispatch_with_options,
+    create_dispatch_pg_only, create_dispatch_with_options, create_dispatch_with_options_pg_only,
 };
 #[cfg(test)]
 pub(crate) use dispatch_create::{
@@ -46,7 +46,8 @@ pub(crate) use dispatch_create::{
 #[allow(unused_imports)]
 pub use dispatch_status::{
     complete_dispatch, finalize_dispatch, finalize_dispatch_with_backends,
-    load_dispatch_row_pg_first, mark_dispatch_completed, mark_dispatch_completed_pg_first,
+    load_dispatch_row_pg_first, load_dispatch_row_pg_only, load_dispatch_row_with_backends,
+    mark_dispatch_completed, mark_dispatch_completed_pg_first, mark_dispatch_completed_pg_only,
     set_dispatch_status_pg_first, set_dispatch_status_with_backends,
 };
 #[allow(unused_imports)]
@@ -97,6 +98,7 @@ pub(crate) fn is_user_cancel_reason(reason: Option<&str>) -> bool {
 /// The dispatch row remains the canonical source of truth. `auto_queue_entries`
 /// is a derived projection that must be cleared whenever the linked dispatch is
 /// cancelled so a stale `dispatched` entry cannot block or duplicate work.
+#[cfg(test)]
 pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
     conn: &libsql_rusqlite::Connection,
     dispatch_id: &str,
@@ -191,6 +193,19 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
     }
 
     Ok(cancelled)
+}
+
+#[cfg(not(test))]
+pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
+    _conn: &libsql_rusqlite::Connection,
+    dispatch_id: &str,
+    _reason: Option<&str>,
+) -> libsql_rusqlite::Result<usize> {
+    Err(libsql_rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::other(format!(
+            "Postgres pool required to cancel dispatch {dispatch_id}"
+        )),
+    )))
 }
 
 pub async fn cancel_dispatch_and_reset_auto_queue_on_pg(
@@ -390,6 +405,7 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
 /// Used when PMD force-transitions a live card back to backlog/ready. In that
 /// case the current work should be abandoned rather than re-queued into the
 /// same active run.
+#[cfg(test)]
 pub fn cancel_active_dispatches_for_card_on_conn(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
@@ -452,6 +468,19 @@ pub fn cancel_active_dispatches_for_card_on_conn(
         };
     }
     Ok(cancelled)
+}
+
+#[cfg(not(test))]
+pub fn cancel_active_dispatches_for_card_on_conn(
+    _conn: &libsql_rusqlite::Connection,
+    card_id: &str,
+    _reason: Option<&str>,
+) -> libsql_rusqlite::Result<usize> {
+    Err(libsql_rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::other(format!(
+            "Postgres pool required to cancel active dispatches for card {card_id}"
+        )),
+    )))
 }
 
 const MAX_DISPATCH_SUMMARY_CHARS: usize = 160;
@@ -693,6 +722,7 @@ pub(crate) fn summarize_dispatch_from_text(
 }
 
 /// Read a single dispatch row as JSON.
+#[cfg(test)]
 pub fn query_dispatch_row(
     conn: &libsql_rusqlite::Connection,
     dispatch_id: &str,
@@ -739,6 +769,16 @@ pub fn query_dispatch_row(
         },
     )
     .map_err(|e| anyhow::anyhow!("Dispatch query error: {e}"))
+}
+
+#[cfg(not(test))]
+pub fn query_dispatch_row(
+    _conn: &libsql_rusqlite::Connection,
+    dispatch_id: &str,
+) -> Result<serde_json::Value> {
+    Err(anyhow::anyhow!(
+        "Postgres pool required to query dispatch row {dispatch_id}"
+    ))
 }
 
 pub fn is_unified_thread_channel_active(channel_id: u64) -> bool {

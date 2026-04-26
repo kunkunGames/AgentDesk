@@ -69,6 +69,13 @@ const TURN_CAPTURE_SCROLLBACK_LINES: i32 = -80;
 const TURN_CAPTURE_TAIL_LINES: usize = 60;
 const TURN_OUTPUT_MAX_CHARS: usize = 4000;
 
+fn pg_required_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "postgres pool unavailable"})),
+    )
+}
+
 /// GET /api/agents/{id}/quality
 pub async fn agent_quality(
     Path(id): Path<String>,
@@ -76,7 +83,7 @@ pub async fn agent_quality(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match crate::services::observability::query_agent_quality_summary(
-        &state.db,
+        state.sqlite_db(),
         state.pg_pool_ref(),
         &id,
         query.days.unwrap_or(30),
@@ -102,7 +109,7 @@ pub async fn agents_quality_ranking(
     let window = QualityRankingWindow::parse(query.window.as_deref());
     let min_sample_size = query.min_sample_size.unwrap_or(5);
     match crate::services::observability::query_agent_quality_ranking_with(
-        &state.db,
+        state.sqlite_db(),
         state.pg_pool_ref(),
         query.limit.unwrap_or(50),
         metric,
@@ -660,64 +667,58 @@ pub async fn agent_offices(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
-    };
-
-    // Check agent exists
-    let exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
     }
 
-    let mut stmt = match conn.prepare(
+    let rows = match sqlx::query(
         "SELECT o.id, o.name, o.layout, oa.department_id, oa.joined_at
          FROM office_agents oa
          INNER JOIN offices o ON o.id = oa.office_id
-         WHERE oa.agent_id = ?1
+         WHERE oa.agent_id = $1
          ORDER BY o.id",
-    ) {
-        Ok(s) => s,
+    )
+    .bind(&id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("prepare: {e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
     };
 
-    let rows = stmt
-        .query_map([&id], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "name": row.get::<_, Option<String>>(1)?,
-                "layout": row.get::<_, Option<String>>(2)?,
+    let offices: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "name": row.try_get::<Option<String>, _>("name").ok().flatten(),
+                "layout": row.try_get::<Option<String>, _>("layout").ok().flatten(),
                 "assigned": true,
-                "office_department_id": row.get::<_, Option<String>>(3)?,
-                "joined_at": row.get::<_, Option<String>>(4)?,
-            }))
+                "office_department_id": row.try_get::<Option<String>, _>("department_id").ok().flatten(),
+                "joined_at": pg_timestamp_to_rfc3339(row.try_get("joined_at").ok().flatten()),
+            })
         })
-        .ok();
-
-    let offices: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-        None => Vec::new(),
-    };
+        .collect();
 
     (StatusCode::OK, Json(json!({"offices": offices})))
 }
@@ -728,29 +729,23 @@ pub async fn agent_cron(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
-    };
-
-    // Check agent exists
-    let exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
     }
 
     // Stub: no cron table yet
@@ -762,65 +757,58 @@ pub async fn agent_skills(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
-    };
-
-    // Check agent exists
-    let exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
     }
 
-    // Query skills used by this agent (via skill_usage join)
-    let mut stmt = match conn.prepare(
+    let rows = match sqlx::query(
         "SELECT DISTINCT s.id, s.name, s.description, s.source_path, s.trigger_patterns, s.updated_at
          FROM skills s
          INNER JOIN skill_usage su ON su.skill_id = s.id
-         WHERE su.agent_id = ?1
+         WHERE su.agent_id = $1
          ORDER BY s.id",
-    ) {
-        Ok(s) => s,
+    )
+    .bind(&id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("prepare: {e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             )
         }
     };
 
-    let rows = stmt
-        .query_map([&id], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "name": row.get::<_, Option<String>>(1)?,
-                "description": row.get::<_, Option<String>>(2)?,
-                "source_path": row.get::<_, Option<String>>(3)?,
-                "trigger_patterns": row.get::<_, Option<String>>(4)?,
-                "updated_at": row.get::<_, Option<String>>(5)?,
-            }))
+    let skills: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "name": row.try_get::<Option<String>, _>("name").ok().flatten(),
+                "description": row.try_get::<Option<String>, _>("description").ok().flatten(),
+                "source_path": row.try_get::<Option<String>, _>("source_path").ok().flatten(),
+                "trigger_patterns": row.try_get::<Option<String>, _>("trigger_patterns").ok().flatten(),
+                "updated_at": pg_timestamp_to_rfc3339(row.try_get("updated_at").ok().flatten()),
+            })
         })
-        .ok();
-
-    let skills: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-        None => Vec::new(),
-    };
+        .collect();
 
     let total_count = skills.len();
 
@@ -839,99 +827,77 @@ pub async fn agent_dispatched_sessions(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
-    };
-
-    if !agent_exists(&conn, &id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
     }
 
-    let mut stmt = match conn.prepare(
+    let rows = match sqlx::query(
         "SELECT id, session_key, agent_id, provider, status, active_dispatch_id,
                 model, tokens, cwd, last_heartbeat, thread_channel_id
          FROM sessions
-         WHERE agent_id = ?1
+         WHERE agent_id = $1
          ORDER BY id",
-    ) {
-        Ok(s) => s,
+    )
+    .bind(&id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("prepare: {e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
     };
 
-    let rows = stmt
-        .query_map([&id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-            ))
-        })
-        .ok();
-
     let mut resolver = SessionActivityResolver::new();
-    let sessions: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter
-            .filter_map(|r| r.ok())
-            .map(
-                |(
-                    session_id,
-                    session_key,
-                    agent_id,
-                    provider,
-                    status,
-                    active_dispatch_id,
-                    model,
-                    tokens,
-                    cwd,
-                    last_heartbeat,
-                    thread_channel_id,
-                )| {
-                    let effective = resolver.resolve(
-                        session_key.as_deref(),
-                        status.as_deref(),
-                        active_dispatch_id.as_deref(),
-                        last_heartbeat.as_deref(),
-                    );
-                    json!({
-                        "id": session_id,
-                        "session_key": session_key,
-                        "agent_id": agent_id,
-                        "provider": provider,
-                        "status": effective.status,
-                        "active_dispatch_id": effective.active_dispatch_id,
-                        "model": model,
-                        "tokens": tokens,
-                        "cwd": cwd,
-                        "last_heartbeat": last_heartbeat,
-                        "thread_channel_id": thread_channel_id,
-                    })
-                },
-            )
-            .collect(),
-        None => Vec::new(),
-    };
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let session_key = row.try_get::<Option<String>, _>("session_key").ok().flatten();
+            let status = row.try_get::<Option<String>, _>("status").ok().flatten();
+            let active_dispatch_id = row
+                .try_get::<Option<String>, _>("active_dispatch_id")
+                .ok()
+                .flatten();
+            let last_heartbeat = pg_timestamp_to_rfc3339(row.try_get("last_heartbeat").ok().flatten());
+            let effective = resolver.resolve(
+                session_key.as_deref(),
+                status.as_deref(),
+                active_dispatch_id.as_deref(),
+                last_heartbeat.as_deref(),
+            );
+            json!({
+                "id": row.try_get::<i64, _>("id").unwrap_or(0),
+                "session_key": session_key,
+                "agent_id": row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
+                "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
+                "status": effective.status,
+                "active_dispatch_id": effective.active_dispatch_id,
+                "model": row.try_get::<Option<String>, _>("model").ok().flatten(),
+                "tokens": row.try_get::<i64, _>("tokens").unwrap_or(0),
+                "cwd": row.try_get::<Option<String>, _>("cwd").ok().flatten(),
+                "last_heartbeat": last_heartbeat,
+                "thread_channel_id": row.try_get::<Option<String>, _>("thread_channel_id").ok().flatten(),
+            })
+        })
+        .collect();
 
     (StatusCode::OK, Json(json!({"sessions": sessions})))
 }
@@ -941,25 +907,27 @@ pub async fn agent_turn(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
     let session = {
-        let conn = match state.sqlite_db().lock() {
-            Ok(c) => c,
+        match agent_exists_pg(pool, &id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "agent not found"})),
+                );
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
+                    Json(json!({"error": format!("query: {e}")})),
                 );
             }
-        };
-
-        if !agent_exists(&conn, &id) {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "agent not found"})),
-            );
         }
 
-        match find_agent_turn_session(&conn, &id) {
+        match find_agent_turn_session_pg(pool, &id).await {
             Ok(session) => session,
             Err(e) => {
                 return (
@@ -1095,25 +1063,31 @@ pub async fn start_agent_turn(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    let Some(pool) = state.pg_pool_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "postgres pool unavailable"})),
+        );
+    };
     let (provider, primary_channel) = {
-        let conn = match state.sqlite_db().lock() {
-            Ok(conn) => conn,
+        match agent_exists_pg(pool, &id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"ok": false, "error": "agent not found"})),
+                );
+            }
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"ok": false, "error": format!("{error}")})),
+                    Json(json!({"ok": false, "error": format!("query: {error}")})),
                 );
             }
-        };
-
-        if !agent_exists(&conn, &id) {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"ok": false, "error": "agent not found"})),
-            );
         }
 
-        let Some(bindings) = crate::db::agents::load_agent_channel_bindings(&conn, &id)
+        let Some(bindings) = crate::db::agents::load_agent_channel_bindings_pg(pool, &id)
+            .await
             .map_err(|error| error.to_string())
             .ok()
             .flatten()
@@ -1262,7 +1236,10 @@ pub async fn stop_agent_turn(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let session = if let Some(pool) = state.pg_pool.as_ref() {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    let session = {
         match agent_exists_pg(pool, &id).await {
             Ok(true) => {}
             Ok(false) => {
@@ -1280,33 +1257,6 @@ pub async fn stop_agent_turn(
         }
 
         match find_agent_turn_session_pg(pool, &id).await {
-            Ok(session) => session,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("query: {e}")})),
-                );
-            }
-        }
-    } else {
-        let conn = match state.sqlite_db().lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-
-        if !agent_exists(&conn, &id) {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "agent not found"})),
-            );
-        }
-
-        match find_agent_turn_session(&conn, &id) {
             Ok(session) => session,
             Err(e) => {
                 return (
@@ -1352,31 +1302,18 @@ pub async fn stop_agent_turn(
     )
     .await;
 
-    if let Some(pool) = state.pg_pool.as_ref() {
-        sqlx::query(
-            "UPDATE sessions
-             SET status = 'disconnected',
-                 active_dispatch_id = NULL,
-                 claude_session_id = NULL,
-                 raw_provider_session_id = NULL
-             WHERE session_key = $1",
-        )
-        .bind(&session_key)
-        .execute(pool)
-        .await
-        .ok();
-    } else if let Ok(conn) = state.sqlite_db().lock() {
-        conn.execute(
-            "UPDATE sessions
-             SET status = 'disconnected',
-                 active_dispatch_id = NULL,
-                 claude_session_id = NULL,
-                 raw_provider_session_id = NULL
-             WHERE session_key = ?1",
-            [&session_key],
-        )
-        .ok();
-    }
+    sqlx::query(
+        "UPDATE sessions
+         SET status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL,
+             raw_provider_session_id = NULL
+         WHERE session_key = $1",
+    )
+    .bind(&session_key)
+    .execute(pool)
+    .await
+    .ok();
 
     let status = StatusCode::OK;
     let Json(mut body) = Json(json!({
@@ -1404,29 +1341,23 @@ pub async fn agent_timeline(
     Path(id): Path<String>,
     Query(params): Query<TimelineQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
-    };
-
-    // Check agent exists
-    let exists: bool = conn
-        .query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [&id], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
     }
 
     let limit = params.limit.unwrap_or(30);
@@ -1439,31 +1370,31 @@ pub async fn agent_timeline(
                 COALESCE(dispatch_type, 'task') AS type,
                 title,
                 status,
-                CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS timestamp,
+                (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS timestamp,
                 CASE
                     WHEN updated_at IS NOT NULL AND created_at IS NOT NULL
-                    THEN (CAST(strftime('%s', updated_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER)) * 1000
+                    THEN ((EXTRACT(EPOCH FROM updated_at) - EXTRACT(EPOCH FROM created_at)) * 1000)::BIGINT
                     ELSE NULL
                 END AS duration_ms
             FROM task_dispatches
-            WHERE to_agent_id = ?1 OR from_agent_id = ?1
+            WHERE to_agent_id = $1 OR from_agent_id = $1
 
             UNION ALL
 
             SELECT
-                CAST(id AS TEXT),
+                id::TEXT,
                 'session' AS source,
                 'session' AS type,
                 COALESCE(session_key, 'session') AS title,
                 status,
-                CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS timestamp,
+                (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS timestamp,
                 CASE
                     WHEN last_heartbeat IS NOT NULL AND created_at IS NOT NULL
-                    THEN (CAST(strftime('%s', last_heartbeat) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER)) * 1000
+                    THEN ((EXTRACT(EPOCH FROM last_heartbeat) - EXTRACT(EPOCH FROM created_at)) * 1000)::BIGINT
                     ELSE NULL
                 END AS duration_ms
             FROM sessions
-            WHERE agent_id = ?1
+            WHERE agent_id = $1
 
             UNION ALL
 
@@ -1473,47 +1404,43 @@ pub async fn agent_timeline(
                 'card' AS type,
                 title,
                 status,
-                CAST(strftime('%s', created_at) AS INTEGER) * 1000 AS timestamp,
+                (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS timestamp,
                 CASE
                     WHEN updated_at IS NOT NULL AND created_at IS NOT NULL
-                    THEN (CAST(strftime('%s', updated_at) AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER)) * 1000
+                    THEN ((EXTRACT(EPOCH FROM updated_at) - EXTRACT(EPOCH FROM created_at)) * 1000)::BIGINT
                     ELSE NULL
                 END AS duration_ms
             FROM kanban_cards
-            WHERE assigned_agent_id = ?1
+            WHERE assigned_agent_id = $1
         )
         ORDER BY timestamp DESC
-        LIMIT ?2
+        LIMIT $2
     ";
 
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
+    let rows = match sqlx::query(sql).bind(&id).bind(limit).fetch_all(pool).await {
+        Ok(rows) => rows,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("prepare: {e}")})),
+                Json(json!({"error": format!("query: {e}")})),
             );
         }
     };
 
-    let rows = stmt
-        .query_map(libsql_rusqlite::params![id, limit], |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "source": row.get::<_, String>(1)?,
-                "type": row.get::<_, String>(2)?,
-                "title": row.get::<_, Option<String>>(3)?,
-                "status": row.get::<_, Option<String>>(4)?,
-                "timestamp": row.get::<_, Option<i64>>(5)?,
-                "duration_ms": row.get::<_, Option<i64>>(6)?,
-            }))
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                "source": row.try_get::<String, _>("source").unwrap_or_default(),
+                "type": row.try_get::<String, _>("type").unwrap_or_default(),
+                "title": row.try_get::<Option<String>, _>("title").ok().flatten(),
+                "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
+                "timestamp": row.try_get::<Option<i64>, _>("timestamp").ok().flatten(),
+                "duration_ms": row.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+            })
         })
-        .ok();
-
-    let events: Vec<serde_json::Value> = match rows {
-        Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-        None => Vec::new(),
-    };
+        .collect();
 
     (StatusCode::OK, Json(json!({"events": events})))
 }
@@ -1524,48 +1451,26 @@ pub async fn agent_transcripts(
     Path(id): Path<String>,
     Query(params): Query<TranscriptQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let agent_exists = if let Some(pool) = state.pg_pool_ref() {
-        match sqlx::query("SELECT COUNT(*)::BIGINT AS count FROM agents WHERE id = $1")
-            .bind(&id)
-            .fetch_one(pool)
-            .await
-        {
-            Ok(row) => row.try_get::<i64, _>("count").unwrap_or(0) > 0,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("query: {e}")})),
-                );
-            }
-        }
-    } else {
-        let conn = match state.sqlite_db().read_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        agent_exists(&conn, &id)
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
     };
-
-    if !agent_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "agent not found"})),
-        );
+    match agent_exists_pg(pool, &id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "agent not found"})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("query: {e}")})),
+            );
+        }
     }
 
-    match crate::db::session_transcripts::list_transcripts_for_agent_db(
-        state.sqlite_db(),
-        state.pg_pool_ref(),
-        &id,
-        params.limit.unwrap_or(8),
-    )
-    .await
-    {
+    match list_agent_transcripts_pg_json(pool, &id, params.limit.unwrap_or(8)).await {
         Ok(transcripts) => (
             StatusCode::OK,
             Json(json!({
@@ -1578,6 +1483,76 @@ pub async fn agent_transcripts(
             Json(json!({"error": format!("transcripts: {e}")})),
         ),
     }
+}
+
+async fn list_agent_transcripts_pg_json(
+    pool: &sqlx::PgPool,
+    agent_id: &str,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT st.id,
+                st.turn_id,
+                st.session_key,
+                st.channel_id,
+                st.agent_id,
+                st.provider,
+                st.dispatch_id,
+                td.kanban_card_id,
+                td.title AS dispatch_title,
+                kc.title AS card_title,
+                kc.github_issue_number,
+                st.user_message,
+                st.assistant_message,
+                st.events_json::text AS events_json,
+                st.duration_ms,
+                to_char(st.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
+         FROM session_transcripts st
+         LEFT JOIN sessions s ON s.session_key = st.session_key
+         LEFT JOIN task_dispatches td ON td.id = st.dispatch_id
+         LEFT JOIN kanban_cards kc ON kc.id = td.kanban_card_id
+         WHERE COALESCE(NULLIF(BTRIM(st.agent_id), ''), NULLIF(BTRIM(s.agent_id), '')) = $1
+            OR (
+                COALESCE(NULLIF(BTRIM(st.agent_id), ''), NULLIF(BTRIM(s.agent_id), '')) IS NULL
+                AND td.to_agent_id = $1
+            )
+         ORDER BY st.created_at DESC, st.id DESC
+         LIMIT $2",
+    )
+    .bind(agent_id)
+    .bind(limit.clamp(1, 100) as i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let events = row
+                .try_get::<Option<String>, _>("events_json")
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .unwrap_or_else(|| json!([]));
+            json!({
+                "id": row.try_get::<i64, _>("id").unwrap_or(0),
+                "turn_id": row.try_get::<String, _>("turn_id").unwrap_or_default(),
+                "session_key": row.try_get::<Option<String>, _>("session_key").ok().flatten(),
+                "channel_id": row.try_get::<Option<String>, _>("channel_id").ok().flatten(),
+                "agent_id": row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
+                "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
+                "dispatch_id": row.try_get::<Option<String>, _>("dispatch_id").ok().flatten(),
+                "kanban_card_id": row.try_get::<Option<String>, _>("kanban_card_id").ok().flatten(),
+                "dispatch_title": row.try_get::<Option<String>, _>("dispatch_title").ok().flatten(),
+                "card_title": row.try_get::<Option<String>, _>("card_title").ok().flatten(),
+                "github_issue_number": row.try_get::<Option<i64>, _>("github_issue_number").ok().flatten(),
+                "user_message": row.try_get::<String, _>("user_message").unwrap_or_default(),
+                "assistant_message": row.try_get::<String, _>("assistant_message").unwrap_or_default(),
+                "events": events,
+                "duration_ms": row.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+                "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+            })
+        })
+        .collect())
 }
 
 /// POST /api/agents/:id/signal
@@ -1597,24 +1572,29 @@ pub async fn agent_signal(
         );
     }
 
-    // Find active card for this agent
-    let conn = match state.sqlite_db().lock() {
-        Ok(c) => c,
-        Err(e) => {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_required_response();
+    };
+
+    let card_id: Option<String> = match sqlx::query_scalar(
+        "SELECT id
+         FROM kanban_cards
+         WHERE assigned_agent_id = $1 AND status = 'in_progress'
+         ORDER BY updated_at DESC
+         LIMIT 1",
+    )
+    .bind(&agent_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(card_id) => card_id,
+        Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("query: {error}")})),
             );
         }
     };
-
-    let card_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM kanban_cards WHERE assigned_agent_id = ?1 AND status = 'in_progress' ORDER BY updated_at DESC LIMIT 1",
-            [&agent_id],
-            |row| row.get(0),
-        )
-        .ok();
 
     let Some(card_id) = card_id else {
         return (
@@ -1623,11 +1603,12 @@ pub async fn agent_signal(
         );
     };
 
-    conn.execute(
-        "UPDATE kanban_cards SET blocked_reason = ?1, updated_at = datetime('now') WHERE id = ?2",
-        libsql_rusqlite::params![reason, card_id],
-    )
-    .ok();
+    sqlx::query("UPDATE kanban_cards SET blocked_reason = $1, updated_at = NOW() WHERE id = $2")
+        .bind(reason)
+        .bind(&card_id)
+        .execute(pool)
+        .await
+        .ok();
 
     (
         StatusCode::OK,

@@ -140,16 +140,62 @@ fn is_five_min_policy_tick(count: u64) -> bool {
     count != 0 && count % FIVE_MIN_POLICY_TICK_INTERVAL == 0
 }
 
-pub async fn run(
-    config: Config,
+pub(crate) struct RunInputs {
     legacy_db: crate::db::Db,
     engine: PolicyEngine,
     health_registry: Option<Arc<HealthRegistry>>,
-) -> Result<()> {
-    let pg_pool = crate::db::postgres::connect_and_migrate(&config)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    crate::services::observability::init_observability(legacy_db.clone(), pg_pool.clone());
+    pg_pool: Option<PgPool>,
+}
+
+pub(crate) trait IntoRunInputs {
+    fn into_run_inputs(self) -> RunInputs;
+}
+
+impl IntoRunInputs for (PolicyEngine, Option<Arc<HealthRegistry>>, Option<PgPool>) {
+    fn into_run_inputs(self) -> RunInputs {
+        let (engine, health_registry, pg_pool) = self;
+        let legacy_db = engine
+            .legacy_db()
+            .cloned()
+            .unwrap_or_else(routes::legacy_sqlite_shim);
+        RunInputs {
+            legacy_db,
+            engine,
+            health_registry,
+            pg_pool,
+        }
+    }
+}
+
+impl IntoRunInputs for (crate::db::Db, PolicyEngine, Option<Arc<HealthRegistry>>) {
+    fn into_run_inputs(self) -> RunInputs {
+        let (legacy_db, engine, health_registry) = self;
+        let pg_pool = engine.pg_pool().cloned();
+        RunInputs {
+            legacy_db,
+            engine,
+            health_registry,
+            pg_pool,
+        }
+    }
+}
+
+pub(crate) async fn run<A, B, C>(config: Config, a: A, b: B, c: C) -> Result<()>
+where
+    (A, B, C): IntoRunInputs,
+{
+    let RunInputs {
+        legacy_db,
+        engine,
+        health_registry,
+        pg_pool,
+    } = (a, b, c).into_run_inputs();
+    let pg_pool = match pg_pool {
+        Some(pool) => Some(pool),
+        None => crate::db::postgres::connect_and_migrate(&config)
+            .await
+            .map_err(anyhow::Error::msg)?,
+    };
     let startup_pg_pool = if pg_pool.is_some() {
         match crate::db::postgres::connect_for_startup(&config).await {
             Ok(pool) => pool,
@@ -163,15 +209,14 @@ pub async fn run(
     } else {
         None
     };
-    let startup_pool = startup_pg_pool.as_ref().or(pg_pool.as_ref());
-    if let Some(pool) = startup_pool {
+    if let Some(pool) = startup_pg_pool.as_ref().or(pg_pool.as_ref()) {
         crate::db::postgres::startup_reseed(pool, &config)
             .await
             .map_err(anyhow::Error::msg)?;
-        seed_sqlite_startup_runtime_state(&legacy_db, &config, false);
     } else {
-        seed_startup_runtime_state(&legacy_db, &config);
+        anyhow::bail!("PostgreSQL is required for AgentDesk server runtime");
     }
+    crate::services::observability::init_observability(legacy_db.clone(), pg_pool.clone());
     crate::pipeline::refresh_override_health_report(&legacy_db, pg_pool.as_ref()).await;
     let boot_reconcile_engine = match startup_pg_pool.as_ref() {
         Some(pool) => Some(crate::engine::PolicyEngine::new_with_pg(
@@ -180,6 +225,7 @@ pub async fn run(
         )?),
         None => None,
     };
+    let startup_pool = startup_pg_pool.as_ref().or(pg_pool.as_ref());
     crate::reconcile::reconcile_boot_runtime(
         &legacy_db,
         boot_reconcile_engine.as_ref().unwrap_or(&engine),
@@ -244,7 +290,7 @@ pub async fn run(
         .nest(
             "/api",
             routes::api_router_with_pg(
-                legacy_db.clone(),
+                legacy_db,
                 engine.clone(),
                 config.clone(),
                 broadcast_tx.clone(),
@@ -263,66 +309,6 @@ pub async fn run(
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;
-    Ok(())
-}
-
-fn seed_startup_runtime_state(legacy_db: &crate::db::Db, config: &Config) {
-    seed_sqlite_startup_runtime_state(legacy_db, config, true);
-}
-
-fn seed_sqlite_startup_runtime_state(
-    legacy_db: &crate::db::Db,
-    config: &Config,
-    seed_runtime_kv: bool,
-) {
-    if seed_runtime_kv {
-        if let Ok(conn) = legacy_db.lock() {
-            routes::settings::seed_config_defaults(&conn, config);
-            // server_port is always overwritten (not INSERT OR IGNORE) to match current config
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
-                [config.server.port.to_string()],
-            )
-            .ok();
-        } else {
-            tracing::warn!("[startup] failed to lock db for config default seeding");
-        }
-    }
-
-    if let Err(error) = seed_github_repos_from_config(legacy_db, config) {
-        tracing::warn!("[startup] failed to seed github repos from config: {error}");
-    }
-    if let Err(error) = crate::db::agents::sync_agents_from_config(legacy_db, &config.agents) {
-        tracing::warn!("[startup] failed to sync agents from config: {error}");
-    }
-}
-
-fn seed_github_repos_from_config(
-    legacy_db: &crate::db::Db,
-    config: &Config,
-) -> std::result::Result<(), String> {
-    use std::collections::BTreeSet;
-
-    let mut repo_ids = BTreeSet::new();
-    for raw_repo_id in &config.github.repos {
-        let repo_id = raw_repo_id.trim();
-        if repo_id.is_empty() {
-            continue;
-        }
-        if !repo_id.contains('/') {
-            tracing::warn!(
-                "[startup] skipping invalid github.repos entry {:?}: expected owner/repo",
-                raw_repo_id
-            );
-            continue;
-        }
-        repo_ids.insert(repo_id.to_string());
-    }
-
-    for repo_id in repo_ids {
-        crate::github::register_repo(legacy_db, &repo_id)?;
-    }
-
     Ok(())
 }
 
@@ -883,6 +869,42 @@ mod tests {
         crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn seed_startup_runtime_state(db: &crate::db::Db, config: &Config) {
+        seed_sqlite_startup_runtime_state(db, config, true);
+    }
+
+    fn seed_sqlite_startup_runtime_state(
+        db: &crate::db::Db,
+        config: &Config,
+        seed_runtime_kv: bool,
+    ) {
+        if seed_runtime_kv {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('server_port', ?1)",
+                [config.server.port.to_string()],
+            )
+            .unwrap();
+        }
+
+        let mut repo_ids = std::collections::BTreeSet::new();
+        for repo in &config.github.repos {
+            let repo = repo.trim();
+            let Some((owner, name)) = repo.split_once('/') else {
+                continue;
+            };
+            if owner.is_empty() || name.is_empty() || name.contains('/') {
+                continue;
+            }
+            repo_ids.insert(format!("{owner}/{name}"));
+        }
+        for repo_id in repo_ids {
+            crate::github::register_repo(db, &repo_id).unwrap();
+        }
+
+        crate::db::agents::sync_agents_from_config(db, &config.agents).unwrap();
     }
 
     fn repo_policies_dir() -> std::path::PathBuf {

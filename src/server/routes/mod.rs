@@ -68,12 +68,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn sqlite_db(&self) -> &crate::db::Db {
+        &self.db
+    }
+
     pub fn pg_pool_ref(&self) -> Option<&sqlx::PgPool> {
         self.pg_pool.as_ref()
     }
 
-    pub fn sqlite_db(&self) -> &Db {
-        &self.db
+    pub fn kanban_service(&self) -> crate::services::kanban::KanbanService {
+        crate::services::kanban::KanbanService::new(self.db.clone(), self.pg_pool.clone())
+    }
+
+    pub fn dispatch_service(&self) -> crate::services::dispatches::DispatchService {
+        crate::services::dispatches::DispatchService::new(self.db.clone(), self.engine.clone())
     }
 
     pub fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
@@ -81,14 +89,6 @@ impl AppState {
             Some(self.db.clone()),
             self.engine.clone(),
         )
-    }
-
-    pub fn dispatch_service(&self) -> crate::services::dispatches::DispatchService {
-        crate::services::dispatches::DispatchService::new(self.db.clone(), self.engine.clone())
-    }
-
-    pub fn kanban_service(&self) -> crate::services::kanban::KanbanService {
-        crate::services::kanban::KanbanService::new(self.db.clone(), self.pg_pool.clone())
     }
 
     pub fn queue_service(&self) -> crate::services::queue::QueueService {
@@ -102,6 +102,12 @@ impl AppState {
             self.config.clone(),
         )
     }
+}
+
+pub(crate) fn legacy_sqlite_shim() -> crate::db::Db {
+    let conn = libsql_rusqlite::Connection::open_in_memory()
+        .expect("open legacy sqlite compatibility shim");
+    crate::db::wrap_conn(conn)
 }
 
 pub(crate) type ApiRouter = Router<AppState>;

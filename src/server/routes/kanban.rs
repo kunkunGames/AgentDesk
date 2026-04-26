@@ -14,9 +14,10 @@ use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 
 fn legacy_db(state: &AppState) -> &crate::db::Db {
-    match state {
-        AppState { db, .. } => db,
-    }
+    state
+        .engine
+        .legacy_db()
+        .expect("legacy sqlite db unavailable for kanban fallback")
 }
 
 /// Common kanban card SELECT columns with dispatch metadata via LEFT JOIN.
@@ -357,8 +358,9 @@ pub async fn list_cards(
     State(state): State<AppState>,
     Query(params): Query<ListCardsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state
-        .kanban_service()
+    let service =
+        crate::services::kanban::KanbanService::new(legacy_db(&state).clone(), state.pg_pool);
+    match service
         .list_cards(crate::services::kanban::ListCardsInput {
             status: params.status,
             repo_id: params.repo_id,
@@ -2482,8 +2484,7 @@ pub async fn pm_decision(
     // Complete any pending pm-decision dispatches (rework handles its own completion after dispatch success)
     if body.decision != "rework" {
         let completion_result = json!({"decision": body.decision, "comment": body.comment});
-        let pending_dispatch_ids: Vec<String> = state
-            .db
+        let pending_dispatch_ids: Vec<String> = legacy_db(&state)
             .lock()
             .ok()
             .and_then(|conn| {
@@ -2613,8 +2614,7 @@ pub async fn pm_decision(
                 Ok(_) => {
                     // Dispatch succeeded — now complete pm-decision dispatch + transition
                     let completion_result = json!({"decision": "rework", "comment": body.comment});
-                    let pending_dispatch_ids: Vec<String> = state
-                        .db
+                    let pending_dispatch_ids: Vec<String> = legacy_db(&state)
                         .lock()
                         .ok()
                         .and_then(|conn| {
@@ -2642,8 +2642,7 @@ pub async fn pm_decision(
                         .ok();
                     }
                     // Pipeline-driven: rework target from current state's review_rework gate
-                    let rework_status: String = state
-                        .db
+                    let rework_status: String = legacy_db(&state)
                         .lock()
                         .ok()
                         .and_then(|c| {
@@ -2958,12 +2957,9 @@ pub async fn rereview_card(
             .await
             {
                 Ok(Some((status, agent, title, url))) => {
-                    let caller = if let Ok(conn) = legacy_db(&state).lock() {
-                        resolve_requesting_agent_id_on_conn(&conn, &headers)
-                            .unwrap_or_else(|| "api".to_string())
-                    } else {
-                        "api".to_string()
-                    };
+                    let caller = resolve_requesting_agent_id_with_pg(pool, &headers)
+                        .await
+                        .unwrap_or_else(|| "api".to_string());
                     break 'lookup (status, agent, title, url, caller);
                 }
                 Ok(None) => {
@@ -2976,7 +2972,11 @@ pub async fn rereview_card(
                     tracing::warn!(
                         card_id = %id,
                         %error,
-                        "[rereview] postgres lookup failed, falling back to sqlite"
+                        "[rereview] postgres lookup failed"
+                    );
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("postgres lookup failed: {error}")})),
                     );
                 }
             }
@@ -3122,8 +3122,7 @@ pub async fn rereview_card(
         crate::kanban::fire_enter_hooks(legacy_db(&state), &state.engine, &id, "review");
     }
 
-    let mut review_dispatch_id = state
-        .db
+    let mut review_dispatch_id = legacy_db(&state)
         .lock()
         .ok()
         .and_then(|conn| find_active_review_dispatch_id(&conn, &id));
@@ -3133,8 +3132,7 @@ pub async fn rereview_card(
             .engine
             .fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": id }));
         crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
-        review_dispatch_id = state
-            .db
+        review_dispatch_id = legacy_db(&state)
             .lock()
             .ok()
             .and_then(|conn| find_active_review_dispatch_id(&conn, &id));
@@ -3324,12 +3322,18 @@ pub async fn batch_rereview(
                     tracing::warn!(
                         %issue_number,
                         %error,
-                        "[batch_rereview] postgres lookup failed, falling back to sqlite"
+                        "[batch_rereview] postgres lookup failed"
                     );
+                    results.push(json!({
+                        "issue": issue_number,
+                        "ok": false,
+                        "error": format!("postgres lookup failed: {error}"),
+                    }));
+                    continue;
                 }
             }
         }
-        if card_id.is_none() {
+        if card_id.is_none() && state.pg_pool_ref().is_none() {
             card_id = legacy_db(&state).lock().ok().and_then(|conn| {
                 conn.query_row(
                     "SELECT id FROM kanban_cards WHERE github_issue_number = ?1",
@@ -3416,7 +3420,11 @@ pub async fn reopen_card(
         return response;
     }
 
-    let caller_source = {
+    let caller_source = if let Some(pool) = state.pg_pool_ref() {
+        resolve_requesting_agent_id_with_pg(pool, &headers)
+            .await
+            .unwrap_or_else(|| "api".to_string())
+    } else {
         let conn = match legacy_db(&state).lock() {
             Ok(c) => c,
             Err(e) => {
@@ -4043,8 +4051,7 @@ pub async fn batch_transition(
             .map(|result| {
                 let counts = if force_transition_needs_cleanup(&body.status, body.cancel_dispatches)
                 {
-                    let conn = state
-                        .db
+                    let conn = legacy_db(&state)
                         .lock()
                         .map_err(|error| anyhow::anyhow!("{error}"))?;
                     cleanup_force_transition_revert_on_conn(&conn, &card_id, &body.status)
@@ -4517,7 +4524,11 @@ pub async fn force_transition(
     let needs_cleanup = force_transition_needs_cleanup(&body.status, body.cancel_dispatches);
     let target_status = body.status;
     let mut cleanup_counts = (0, 0);
-    let caller_source = {
+    let caller_source = if let Some(pool) = state.pg_pool_ref() {
+        resolve_requesting_agent_id_with_pg(pool, &headers)
+            .await
+            .unwrap_or_else(|| "api".to_string())
+    } else {
         let conn = match legacy_db(&state).lock() {
             Ok(c) => c,
             Err(e) => {
@@ -4688,7 +4699,11 @@ pub async fn force_transition(
     match transition_result {
         Ok(result) => {
             let (cancelled_dispatches, skipped_auto_queue_entries) = cleanup_counts;
-            crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+            if state.pg_pool_ref().is_some() {
+                crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
+            } else {
+                crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+            }
 
             let card = if let Some(pool) = state.pg_pool_ref() {
                 load_card_json_pg(pool, &id)

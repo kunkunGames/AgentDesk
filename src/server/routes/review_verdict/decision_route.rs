@@ -8,9 +8,10 @@ use super::review_state_repo::update_card_review_state;
 use super::tuning_aggregate::{record_decision_tuning, spawn_aggregate_if_needed_with_pg};
 
 fn legacy_db(state: &AppState) -> &crate::db::Db {
-    match state {
-        AppState { db, .. } => db,
-    }
+    state
+        .engine
+        .legacy_db()
+        .expect("legacy sqlite db unavailable for review fallback")
 }
 
 /// PG-first wrapper around `crate::kanban::transition_status_with_opts`.
@@ -161,8 +162,7 @@ async fn active_accept_followups_pg_first(
     card_id: &str,
 ) -> ActiveAcceptFollowups {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok((review, rework, review_decision)) =
-            sqlx::query_as::<_, (i64, i64, i64)>(
+        return match sqlx::query_as::<_, (i64, i64, i64)>(
                 "SELECT \
                      COALESCE(SUM(CASE WHEN dispatch_type = 'review' AND status IN ('pending', 'dispatched') THEN 1 ELSE 0 END), 0)::BIGINT, \
                      COALESCE(SUM(CASE WHEN dispatch_type = 'rework' AND status IN ('pending', 'dispatched') THEN 1 ELSE 0 END), 0)::BIGINT, \
@@ -174,12 +174,20 @@ async fn active_accept_followups_pg_first(
             .fetch_one(pool)
             .await
         {
-            return ActiveAcceptFollowups {
+            Ok((review, rework, review_decision)) => ActiveAcceptFollowups {
                 review,
                 rework,
                 review_decision,
-            };
-        }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres accept followups"
+                );
+                ActiveAcceptFollowups::default()
+            }
+        };
     }
 
     active_accept_followups(legacy_db(state), card_id)
@@ -198,14 +206,23 @@ fn current_card_status(db: &crate::db::Db, card_id: &str) -> Option<String> {
 
 async fn current_card_status_pg_first(state: &AppState, card_id: &str) -> Option<String> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(status) =
-            sqlx::query_scalar::<_, String>("SELECT status FROM kanban_cards WHERE id = $1")
-                .bind(card_id)
-                .fetch_optional(pool)
-                .await
+        return match sqlx::query_scalar::<_, String>(
+            "SELECT status FROM kanban_cards WHERE id = $1",
+        )
+        .bind(card_id)
+        .fetch_optional(pool)
+        .await
         {
-            return status;
-        }
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres card status"
+                );
+                None
+            }
+        };
     }
 
     current_card_status(legacy_db(state), card_id)
@@ -224,7 +241,7 @@ async fn load_review_decision_card_context_pg_first(
     card_id: &str,
 ) -> ReviewDecisionCardContext {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(row) = sqlx::query_as::<
+        return match sqlx::query_as::<
             _,
             (
                 Option<String>,
@@ -241,19 +258,25 @@ async fn load_review_decision_card_context_pg_first(
         .fetch_optional(pool)
         .await
         {
-            if let Some((status, repo_id, agent_id, title)) = row {
-                return ReviewDecisionCardContext {
-                    status,
-                    repo_id,
-                    agent_id,
-                    title,
-                };
+            Ok(Some((status, repo_id, agent_id, title))) => ReviewDecisionCardContext {
+                status,
+                repo_id,
+                agent_id,
+                title,
+            },
+            Ok(None) => ReviewDecisionCardContext::default(),
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres card context"
+                );
+                ReviewDecisionCardContext::default()
             }
-        }
+        };
     }
 
-    state
-        .db
+    legacy_db(state)
         .lock()
         .ok()
         .and_then(|conn| {
@@ -300,18 +323,26 @@ async fn resolve_effective_pipeline_pg_first(
 
 async fn card_exists_pg_first(state: &AppState, card_id: &str) -> bool {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(exists) =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM kanban_cards WHERE id = $1)")
-                .bind(card_id)
-                .fetch_one(pool)
-                .await
+        return match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM kanban_cards WHERE id = $1)",
+        )
+        .bind(card_id)
+        .fetch_one(pool)
+        .await
         {
-            return exists;
-        }
+            Ok(exists) => exists,
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to check postgres card existence"
+                );
+                false
+            }
+        };
     }
 
-    state
-        .db
+    legacy_db(state)
         .lock()
         .ok()
         .and_then(|conn| {
@@ -330,7 +361,7 @@ async fn pending_review_decision_dispatch_id_pg_first(
     card_id: &str,
 ) -> Option<String> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(dispatch_id) = sqlx::query_scalar::<_, String>(
+        match sqlx::query_scalar::<_, String>(
             "SELECT td.id
              FROM task_dispatches td
              JOIN card_review_state crs ON crs.pending_dispatch_id = td.id
@@ -342,12 +373,19 @@ async fn pending_review_decision_dispatch_id_pg_first(
         .fetch_optional(pool)
         .await
         {
-            if dispatch_id.is_some() {
-                return dispatch_id;
+            Ok(Some(dispatch_id)) => return Some(dispatch_id),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres pending review-decision by review state"
+                );
+                return None;
             }
         }
 
-        if let Ok(dispatch_id) = sqlx::query_scalar::<_, String>(
+        return match sqlx::query_scalar::<_, String>(
             "SELECT td.id
              FROM task_dispatches td
              JOIN kanban_cards kc ON kc.latest_dispatch_id = td.id
@@ -359,8 +397,16 @@ async fn pending_review_decision_dispatch_id_pg_first(
         .fetch_optional(pool)
         .await
         {
-            return dispatch_id;
-        }
+            Ok(dispatch_id) => dispatch_id,
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres pending review-decision by latest dispatch"
+                );
+                None
+            }
+        };
     }
 
     legacy_db(state).lock().ok().and_then(|conn| {
@@ -399,8 +445,9 @@ async fn emit_card_updated(state: &AppState, card_id: &str) {
                 tracing::warn!(
                     card_id,
                     %error,
-                    "[review-decision] falling back to sqlite kanban_card_updated emit"
+                    "[review-decision] failed to load postgres card for kanban_card_updated emit"
                 );
+                return;
             }
         }
     }
@@ -502,8 +549,7 @@ async fn mark_next_review_round_advance_pg_first(
         return Ok(true);
     }
 
-    let conn = state
-        .db
+    let conn = legacy_db(state)
         .lock()
         .map_err(|error| format!("database lock poisoned: {error}"))?;
     mark_next_review_round_advance_on_conn(&conn, card_id).map_err(|error| error.to_string())
@@ -528,15 +574,23 @@ async fn dispatch_status_and_result_pg_first(
     dispatch_id: &str,
 ) -> Option<(String, Option<String>)> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(row) = sqlx::query_as::<_, (String, Option<String>)>(
+        return match sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT status, result FROM task_dispatches WHERE id = $1",
         )
         .bind(dispatch_id)
         .fetch_optional(pool)
         .await
         {
-            return row;
-        }
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(
+                    dispatch_id,
+                    %error,
+                    "[review-decision] failed to load postgres dispatch status"
+                );
+                None
+            }
+        };
     }
 
     dispatch_status_and_result(legacy_db(state), dispatch_id)
@@ -642,7 +696,7 @@ async fn latest_active_review_dispatch_pg_first(
     card_id: &str,
 ) -> Option<ActiveReviewDispatch> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(row) = sqlx::query_as::<_, (String, Option<String>)>(
+        return match sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT id, context
              FROM task_dispatches
              WHERE kanban_card_id = $1
@@ -655,8 +709,16 @@ async fn latest_active_review_dispatch_pg_first(
         .fetch_optional(pool)
         .await
         {
-            return row.map(|(id, context_raw)| build_active_review_dispatch(id, context_raw));
-        }
+            Ok(row) => row.map(|(id, context_raw)| build_active_review_dispatch(id, context_raw)),
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres active review dispatch"
+                );
+                None
+            }
+        };
     }
 
     latest_active_review_dispatch(legacy_db(state), card_id)
@@ -667,7 +729,7 @@ async fn latest_completed_review_context_pg_first(
     card_id: &str,
 ) -> Option<serde_json::Value> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(context_raw) = sqlx::query_scalar::<_, Option<String>>(
+        return match sqlx::query_scalar::<_, Option<String>>(
             "SELECT context
              FROM task_dispatches
              WHERE kanban_card_id = $1
@@ -680,14 +742,21 @@ async fn latest_completed_review_context_pg_first(
         .fetch_optional(pool)
         .await
         {
-            return context_raw
+            Ok(context_raw) => context_raw
                 .flatten()
-                .and_then(|ctx| serde_json::from_str::<serde_json::Value>(&ctx).ok());
-        }
+                .and_then(|ctx| serde_json::from_str::<serde_json::Value>(&ctx).ok()),
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres completed review context"
+                );
+                None
+            }
+        };
     }
 
-    state
-        .db
+    legacy_db(state)
         .lock()
         .ok()
         .and_then(|c| {
@@ -707,15 +776,23 @@ async fn latest_completed_review_context_pg_first(
 
 async fn card_issue_number_pg_first(state: &AppState, card_id: &str) -> Option<i64> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(issue_number) = sqlx::query_scalar::<_, Option<i64>>(
+        return match sqlx::query_scalar::<_, Option<i64>>(
             "SELECT github_issue_number::BIGINT FROM kanban_cards WHERE id = $1",
         )
         .bind(card_id)
         .fetch_optional(pool)
         .await
         {
-            return issue_number.flatten();
-        }
+            Ok(issue_number) => issue_number.flatten(),
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres card issue number"
+                );
+                None
+            }
+        };
     }
 
     legacy_db(state).lock().ok().and_then(|c| {
@@ -730,7 +807,7 @@ async fn card_issue_number_pg_first(state: &AppState, card_id: &str) -> Option<i
 
 async fn stale_review_dispatch_ids_pg_first(state: &AppState, card_id: &str) -> Vec<String> {
     if let Some(pool) = state.pg_pool_ref() {
-        if let Ok(ids) = sqlx::query_scalar::<_, String>(
+        return match sqlx::query_scalar::<_, String>(
             "SELECT id
              FROM task_dispatches
              WHERE kanban_card_id = $1
@@ -741,12 +818,19 @@ async fn stale_review_dispatch_ids_pg_first(state: &AppState, card_id: &str) -> 
         .fetch_all(pool)
         .await
         {
-            return ids;
-        }
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!(
+                    card_id,
+                    %error,
+                    "[review-decision] failed to load postgres stale review dispatches"
+                );
+                Vec::new()
+            }
+        };
     }
 
-    state
-        .db
+    legacy_db(state)
         .lock()
         .ok()
         .and_then(|conn| {
@@ -802,8 +886,7 @@ async fn prepare_dispute_review_entry_pg_first(
         return Ok(());
     }
 
-    let conn = state
-        .db
+    let conn = legacy_db(state)
         .lock()
         .map_err(|error| format!("database lock poisoned: {error}"))?;
     use crate::engine::transition::{TransitionIntent, execute_intent_on_conn};
@@ -918,8 +1001,7 @@ async fn cancel_dispatch_pg_first(
         .await;
     }
 
-    let conn = state
-        .db
+    let conn = legacy_db(state)
         .lock()
         .map_err(|error| format!("database lock poisoned: {error}"))?;
     crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(&conn, dispatch_id, reason)
@@ -980,8 +1062,7 @@ async fn dismiss_review_cleanup_pg_first(state: &AppState, card_id: &str) -> Res
         return Ok(());
     }
 
-    let conn = state
-        .db
+    let conn = legacy_db(state)
         .lock()
         .map_err(|error| format!("database lock poisoned: {error}"))?;
     let dispatch_ids: Vec<String> = conn
@@ -1683,8 +1764,7 @@ pub async fn submit_review_decision(
                     .await
                     .unwrap_or(false)
                 } else {
-                    state
-                        .db
+                    legacy_db(&state)
                         .lock()
                         .ok()
                         .and_then(|conn| {

@@ -1,11 +1,15 @@
 use anyhow::{Result, anyhow};
+#[cfg(test)]
 use libsql_rusqlite::Connection;
 use serde_json::json;
 use sqlx::PgPool;
 use std::time::Duration;
 
+#[cfg(test)]
 use crate::db::agents::load_agent_channel_bindings;
-use crate::{db::Db, dispatch, engine::PolicyEngine};
+#[cfg(test)]
+use crate::dispatch;
+use crate::{db::Db, engine::PolicyEngine};
 
 /// Hard cutoff for "stale inflight" detection in the periodic reconcile.
 /// Anything older than this with no live tmux pane is considered abandoned.
@@ -38,6 +42,7 @@ impl BootReconcileStats {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_boot_db(conn: &Connection) -> Result<BootReconcileStats> {
     let stale_processing_outbox_reset = conn
         .execute(
@@ -108,13 +113,33 @@ pub(crate) async fn reconcile_boot_runtime(
     let mut stats = if let Some(pool) = pg_pool {
         reconcile_boot_db_pg(pool).await?
     } else {
-        let conn = db
-            .lock()
-            .map_err(|e| anyhow!("boot reconcile DB lock poisoned: {e}"))?;
-        reconcile_boot_db(&conn)?
+        #[cfg(test)]
+        {
+            let conn = db
+                .lock()
+                .map_err(|e| anyhow!("boot reconcile DB lock poisoned: {e}"))?;
+            reconcile_boot_db(&conn)?
+        }
+        #[cfg(not(test))]
+        {
+            return Err(anyhow!("Postgres pool required for boot reconcile"));
+        }
     };
 
-    stats.missing_review_dispatches_refired = refire_missing_review_dispatches(db, engine)?;
+    stats.missing_review_dispatches_refired = if let Some(pool) = pg_pool {
+        refire_missing_review_dispatches_pg(pool, db, engine).await?
+    } else {
+        #[cfg(test)]
+        {
+            refire_missing_review_dispatches(db, engine)?
+        }
+        #[cfg(not(test))]
+        {
+            return Err(anyhow!(
+                "Postgres pool required for review dispatch reconcile"
+            ));
+        }
+    };
 
     if stats.touched() {
         tracing::info!(
@@ -131,6 +156,7 @@ pub(crate) async fn reconcile_boot_runtime(
     Ok(stats)
 }
 
+#[cfg(test)]
 fn backfill_missing_notify_outbox(conn: &Connection) -> Result<usize> {
     let missing_rows: Vec<(String, String, String, String)> = conn
         .prepare(
@@ -167,6 +193,7 @@ fn backfill_missing_notify_outbox(conn: &Connection) -> Result<usize> {
     Ok(inserted)
 }
 
+#[cfg(test)]
 fn reset_broken_auto_queue_entries(conn: &Connection) -> Result<usize> {
     let broken_ids: Vec<String> = conn
         .prepare(
@@ -205,6 +232,7 @@ fn reset_broken_auto_queue_entries(conn: &Connection) -> Result<usize> {
     Ok(reset)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadMapValidation {
     Valid,
@@ -212,6 +240,7 @@ enum ThreadMapValidation {
     Unknown,
 }
 
+#[cfg(test)]
 fn cleanup_stale_channel_thread_map_entries(conn: &Connection) -> Result<usize> {
     let token = crate::credential::read_bot_token("announce");
     cleanup_stale_channel_thread_map_entries_with(conn, |channel_id, thread_id| {
@@ -219,6 +248,7 @@ fn cleanup_stale_channel_thread_map_entries(conn: &Connection) -> Result<usize> 
     })
 }
 
+#[cfg(test)]
 fn cleanup_stale_channel_thread_map_entries_with<F>(
     conn: &Connection,
     mut validate_thread: F,
@@ -331,6 +361,7 @@ where
     Ok(cleared)
 }
 
+#[cfg(test)]
 fn validate_thread_parent_via_discord(
     token: Option<&str>,
     expected_parent: &str,
@@ -380,6 +411,7 @@ fn validate_thread_parent_via_discord(
     }
 }
 
+#[cfg(test)]
 fn refire_missing_review_dispatches(db: &Db, engine: &PolicyEngine) -> Result<usize> {
     crate::pipeline::ensure_loaded();
 
@@ -476,6 +508,88 @@ fn refire_missing_review_dispatches(db: &Db, engine: &PolicyEngine) -> Result<us
                 )
                 .unwrap_or(false)
         };
+        if has_review_dispatch {
+            refired += 1;
+        } else {
+            tracing::warn!(
+                "[boot-reconcile] OnReviewEnter re-fired for card {} but no active review dispatch was created",
+                card_id
+            );
+        }
+    }
+
+    Ok(refired)
+}
+
+async fn refire_missing_review_dispatches_pg(
+    pool: &PgPool,
+    db: &Db,
+    engine: &PolicyEngine,
+) -> Result<usize> {
+    crate::pipeline::ensure_loaded();
+
+    let cards: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, repo_id, assigned_agent_id
+         FROM kanban_cards
+         WHERE status NOT IN ('done', 'backlog', 'ready')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut candidates = Vec::new();
+    for (card_id, status, repo_id, agent_id) in cards {
+        let effective =
+            crate::pipeline::resolve_for_card_pg(pool, repo_id.as_deref(), agent_id.as_deref())
+                .await;
+        let is_review_state = effective.hooks_for_state(&status).map_or(false, |hooks| {
+            hooks.on_enter.iter().any(|name| name == "OnReviewEnter")
+        });
+        if !is_review_state {
+            continue;
+        }
+
+        let has_review_dispatch = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_dispatches
+                WHERE kanban_card_id = $1
+                  AND dispatch_type IN ('review', 'review-decision')
+                  AND status IN ('pending', 'dispatched')
+            )",
+        )
+        .bind(&card_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        if !has_review_dispatch {
+            candidates.push(card_id);
+        }
+    }
+
+    let mut refired = 0usize;
+    for card_id in candidates {
+        if let Err(e) =
+            engine.fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": card_id }))
+        {
+            tracing::warn!(
+                "[boot-reconcile] failed to re-fire OnReviewEnter for card {}: {e}",
+                card_id
+            );
+            continue;
+        }
+        crate::kanban::drain_hook_side_effects(db, engine);
+
+        let has_review_dispatch = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_dispatches
+                WHERE kanban_card_id = $1
+                  AND dispatch_type IN ('review', 'review-decision')
+                  AND status IN ('pending', 'dispatched')
+            )",
+        )
+        .bind(&card_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
         if has_review_dispatch {
             refired += 1;
         } else {

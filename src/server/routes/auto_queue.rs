@@ -190,6 +190,13 @@ fn deploy_phase_api_enabled(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "postgres pool is not configured"})),
+    )
+}
+
 fn slot_thread_map_has_bindings(
     conn: &libsql_rusqlite::Connection,
     agent_id: &str,
@@ -2509,31 +2516,25 @@ fn attempt_restore_dispatch(
         }
     }
 
-    let dispatch_result = run_activate_blocking(|| {
-        let dispatch_context = build_auto_queue_dispatch_context(
-            &entry.entry_id,
-            entry.thread_group,
-            slot_index,
-            reset_slot_thread_before_reuse,
-            [("restored_run", json!(true)), ("run_id", json!(run_id))],
-        );
-        crate::dispatch::create_dispatch(
-            &deps.db,
-            &deps.engine,
-            &entry.card_id,
-            &entry.agent_id,
-            "implementation",
-            &candidate.title,
-            &dispatch_context,
-        )
-    });
+    let dispatch_context = build_auto_queue_dispatch_context(
+        &entry.entry_id,
+        entry.thread_group,
+        slot_index,
+        reset_slot_thread_before_reuse,
+        [("restored_run", json!(true)), ("run_id", json!(run_id))],
+    );
+    let dispatch_result = create_activate_dispatch_prefer_pg(
+        deps,
+        &entry.card_id,
+        &entry.agent_id,
+        "implementation",
+        &candidate.title,
+        &dispatch_context,
+    );
     let created_dispatch = dispatch_result.is_ok();
 
     let dispatch_id = match dispatch_result {
-        Ok(dispatch) => dispatch
-            .get("id")
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
+        Ok(dispatch_id) => Some(dispatch_id),
         Err(error) => {
             let error_text = error.to_string();
             crate::auto_queue_log!(
@@ -3270,6 +3271,50 @@ fn record_consultation_dispatch_prefer_pg(
     .map_err(|error| format!("record sqlite consultation dispatch for {entry_id}: {error}"))
 }
 
+fn create_activate_dispatch_prefer_pg(
+    deps: &AutoQueueActivateDeps,
+    card_id: &str,
+    to_agent_id: &str,
+    dispatch_type: &str,
+    title: &str,
+    context: &serde_json::Value,
+) -> Result<String, String> {
+    if let Some(pool) = deps.pg_pool.as_ref() {
+        let card_id = card_id.to_string();
+        let to_agent_id = to_agent_id.to_string();
+        let dispatch_type = dispatch_type.to_string();
+        let title = title.to_string();
+        let context = context.clone();
+        return crate::utils::async_bridge::block_on_pg_result(
+            pool,
+            move |bridge_pool| async move {
+                create_activate_dispatch_pg(
+                    &bridge_pool,
+                    &card_id,
+                    &to_agent_id,
+                    &dispatch_type,
+                    &title,
+                    &context,
+                )
+                .await
+            },
+            |error| error,
+        );
+    }
+
+    crate::dispatch::create_dispatch(
+        &deps.db,
+        &deps.engine,
+        card_id,
+        to_agent_id,
+        dispatch_type,
+        title,
+        context,
+    )
+    .map(|dispatch| dispatch["id"].as_str().unwrap_or("").to_string())
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn activate_with_bridge_pg(
     db: Option<crate::db::Db>,
     engine: crate::engine::PolicyEngine,
@@ -3717,29 +3762,25 @@ fn handle_activate_preflight_metadata(
                 }
             };
 
-            let dispatch_result = run_activate_blocking(|| {
-                let dispatch_context = build_auto_queue_dispatch_context(
-                    entry_id,
-                    group,
-                    None,
-                    false,
-                    [
-                        ("run_id", json!(run_id)),
-                        ("batch_phase", json!(batch_phase)),
-                    ],
-                );
-                crate::dispatch::create_dispatch(
-                    &deps.db,
-                    &deps.engine,
-                    card_id,
-                    &consult_agent_id,
-                    "consultation",
-                    &format!("[Consultation] {title}"),
-                    &dispatch_context,
-                )
-            });
-            let dispatch = match dispatch_result {
-                Ok(dispatch) => dispatch,
+            let dispatch_context = build_auto_queue_dispatch_context(
+                entry_id,
+                group,
+                None,
+                false,
+                [
+                    ("run_id", json!(run_id)),
+                    ("batch_phase", json!(batch_phase)),
+                ],
+            );
+            let dispatch_id = match create_activate_dispatch_prefer_pg(
+                deps,
+                card_id,
+                &consult_agent_id,
+                "consultation",
+                &format!("[Consultation] {title}"),
+                &dispatch_context,
+            ) {
+                Ok(dispatch_id) => dispatch_id,
                 Err(error) => {
                     let failure = record_entry_dispatch_failure(
                         deps,
@@ -3774,7 +3815,6 @@ fn handle_activate_preflight_metadata(
                 }
             };
 
-            let dispatch_id = dispatch["id"].as_str().unwrap_or("").to_string();
             if let Err(error) = record_consultation_dispatch_prefer_pg(
                 deps,
                 entry_id,
@@ -5427,6 +5467,9 @@ pub async fn generate(
         Ok(mode) => mode,
         Err(err) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": err }))),
     };
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
     let requested_entries = match normalize_generate_entries(&body) {
         Ok(entries) => entries,
         Err(err) => {
@@ -5458,7 +5501,7 @@ pub async fn generate(
                 .collect()
         })
         .unwrap_or_default();
-    let mut cards: Vec<GenerateCandidate> = if let Some(pool) = state.pg_pool_ref() {
+    let mut cards: Vec<GenerateCandidate> = {
         let conflicting_live_runs = match find_matching_active_run_id_pg(
             pool,
             body.repo.as_deref(),
@@ -5522,65 +5565,6 @@ pub async fn generate(
                 .collect(),
             Err(error) => return error.into_json_response(),
         }
-    } else {
-        let conn = match state.sqlite_db().separate_conn() {
-            Ok(conn) => conn,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{error}")})),
-                );
-            }
-        };
-        let conflicting_live_runs = match find_matching_active_run_id(
-            &conn,
-            body.repo.as_deref(),
-            body.agent_id.as_deref(),
-        ) {
-            Ok(runs) => runs,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        };
-        if let Some((run_id, status)) = conflicting_live_runs.first() {
-            if !force {
-                return existing_live_run_conflict_response(run_id, status);
-            }
-            let target_run_ids: Vec<String> = conflicting_live_runs
-                .iter()
-                .map(|(run_id, _)| run_id.clone())
-                .collect();
-            crate::services::auto_queue::cancel_run::cancel_selected_runs_with_conn(
-                state.health_registry.clone(),
-                &conn,
-                &target_run_ids,
-                "auto_queue_force_new_run",
-            );
-        }
-        drop(conn);
-        match state.auto_queue_service().prepare_generate_cards(
-            &crate::services::auto_queue::PrepareGenerateInput {
-                repo: body.repo.clone(),
-                agent_id: body.agent_id.clone(),
-                issue_numbers: requested_issue_numbers.clone(),
-            },
-        ) {
-            Ok(cards) => cards
-                .into_iter()
-                .map(|card| GenerateCandidate {
-                    card_id: card.card_id,
-                    agent_id: card.agent_id,
-                    priority: card.priority,
-                    description: card.description,
-                    metadata: card.metadata,
-                    github_issue_number: card.github_issue_number,
-                })
-                .collect(),
-            Err(error) => return error.into_json_response(),
-        }
     };
 
     if !requested_entry_meta.is_empty() {
@@ -5597,27 +5581,16 @@ pub async fn generate(
         if let Some(pipeline) = crate::pipeline::try_get() {
             for pipeline_state in &pipeline.states {
                 if !pipeline_state.terminal {
-                    let c = if let Some(pool) = state.pg_pool_ref() {
-                        state
-                            .auto_queue_service()
-                            .count_cards_by_status_with_pg(
-                                pool,
-                                body.repo.as_deref(),
-                                body.agent_id.as_deref(),
-                                &pipeline_state.id,
-                            )
-                            .await
-                            .unwrap_or(0)
-                    } else {
-                        state
-                            .auto_queue_service()
-                            .count_cards_by_status(
-                                body.repo.as_deref(),
-                                body.agent_id.as_deref(),
-                                &pipeline_state.id,
-                            )
-                            .unwrap_or(0)
-                    };
+                    let c = state
+                        .auto_queue_service()
+                        .count_cards_by_status_with_pg(
+                            pool,
+                            body.repo.as_deref(),
+                            body.agent_id.as_deref(),
+                            &pipeline_state.id,
+                        )
+                        .await
+                        .unwrap_or(0);
                     counts_map.insert(pipeline_state.id.clone(), serde_json::json!(c));
                 }
             }
@@ -5644,148 +5617,72 @@ pub async fn generate(
         .collect();
     let mut filtered_cards = Vec::with_capacity(cards.len());
     let mut excluded_count = 0usize;
-    if let Some(pool) = state.pg_pool_ref() {
-        let mut dependency_status_cache: HashMap<i64, Option<String>> = HashMap::new();
-        for card in &cards {
-            let dep_parse = extract_dependency_parse_result(card);
-            crate::auto_queue_log!(
-                info,
-                "generate.dependency_parse",
-                AutoQueueLogContext::new()
-                    .card(card.card_id.as_str())
-                    .agent(card.agent_id.as_str()),
-                "issue_number={} parsed_dependencies={:?} signals={:?}",
-                card.github_issue_number
-                    .map(|issue_number| format!("#{issue_number}"))
-                    .unwrap_or_else(|| "<none>".to_string()),
-                dep_parse.numbers,
-                dep_parse.signals
-            );
+    let mut dependency_status_cache: HashMap<i64, Option<String>> = HashMap::new();
+    for card in &cards {
+        let dep_parse = extract_dependency_parse_result(card);
+        crate::auto_queue_log!(
+            info,
+            "generate.dependency_parse",
+            AutoQueueLogContext::new()
+                .card(card.card_id.as_str())
+                .agent(card.agent_id.as_str()),
+            "issue_number={} parsed_dependencies={:?} signals={:?}",
+            card.github_issue_number
+                .map(|issue_number| format!("#{issue_number}"))
+                .unwrap_or_else(|| "<none>".to_string()),
+            dep_parse.numbers,
+            dep_parse.signals
+        );
 
-            let mut unresolved_external_dependencies = Vec::new();
-            for dep_num in &dep_parse.numbers {
-                if issue_to_idx.contains_key(dep_num) {
-                    continue;
-                }
+        let mut unresolved_external_dependencies = Vec::new();
+        for dep_num in &dep_parse.numbers {
+            if issue_to_idx.contains_key(dep_num) {
+                continue;
+            }
 
-                let dep_status = if let Some(status) = dependency_status_cache.get(dep_num) {
-                    status.clone()
-                } else {
-                    let status = sqlx::query_scalar::<_, String>(
-                        "SELECT status
+            let dep_status = if let Some(status) = dependency_status_cache.get(dep_num) {
+                status.clone()
+            } else {
+                let status = sqlx::query_scalar::<_, String>(
+                    "SELECT status
                          FROM kanban_cards
                          WHERE github_issue_number::BIGINT = $1
                          ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
                          LIMIT 1",
-                    )
-                    .bind(*dep_num)
-                    .fetch_optional(pool)
-                    .await
-                    .ok()
-                    .flatten();
-                    dependency_status_cache.insert(*dep_num, status.clone());
-                    status
-                };
+                )
+                .bind(*dep_num)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+                dependency_status_cache.insert(*dep_num, status.clone());
+                status
+            };
 
-                if dep_status.as_deref() != Some("done") {
-                    unresolved_external_dependencies.push(format!(
-                        "#{dep_num}:{}",
-                        dep_status.as_deref().unwrap_or("missing")
-                    ));
-                }
-            }
-
-            if unresolved_external_dependencies.is_empty() {
-                filtered_cards.push(card.clone());
-            } else {
-                crate::auto_queue_log!(
-                    info,
-                    "generate.exclude_unresolved_dependencies",
-                    AutoQueueLogContext::new()
-                        .card(card.card_id.as_str())
-                        .agent(card.agent_id.as_str()),
-                    "issue_number={} unresolved_external_dependencies={:?}",
-                    card.github_issue_number
-                        .map(|issue_number| format!("#{issue_number}"))
-                        .unwrap_or_else(|| "<none>".to_string()),
-                    unresolved_external_dependencies
-                );
-                excluded_count += 1;
+            if dep_status.as_deref() != Some("done") {
+                unresolved_external_dependencies.push(format!(
+                    "#{dep_num}:{}",
+                    dep_status.as_deref().unwrap_or("missing")
+                ));
             }
         }
-    } else {
-        let conn = match state.sqlite_db().separate_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        let mut dependency_status_cache: HashMap<i64, Option<String>> = HashMap::new();
-        for card in &cards {
-            let dep_parse = extract_dependency_parse_result(card);
+
+        if unresolved_external_dependencies.is_empty() {
+            filtered_cards.push(card.clone());
+        } else {
             crate::auto_queue_log!(
                 info,
-                "generate.dependency_parse",
+                "generate.exclude_unresolved_dependencies",
                 AutoQueueLogContext::new()
                     .card(card.card_id.as_str())
                     .agent(card.agent_id.as_str()),
-                "issue_number={} parsed_dependencies={:?} signals={:?}",
+                "issue_number={} unresolved_external_dependencies={:?}",
                 card.github_issue_number
                     .map(|issue_number| format!("#{issue_number}"))
                     .unwrap_or_else(|| "<none>".to_string()),
-                dep_parse.numbers,
-                dep_parse.signals
+                unresolved_external_dependencies
             );
-
-            let unresolved_external_dependencies: Vec<String> = dep_parse
-                .numbers
-                .iter()
-                .filter_map(|dep_num| {
-                    if issue_to_idx.contains_key(dep_num) {
-                        return None;
-                    }
-                    let dep_status = dependency_status_cache
-                        .entry(*dep_num)
-                        .or_insert_with(|| {
-                            conn.query_row(
-                                "SELECT status FROM kanban_cards WHERE github_issue_number = ?1",
-                                [dep_num],
-                                |row| row.get(0),
-                            )
-                            .ok()
-                        })
-                        .clone();
-                    if dep_status.as_deref() == Some("done") {
-                        None
-                    } else {
-                        Some(format!(
-                            "#{dep_num}:{}",
-                            dep_status.as_deref().unwrap_or("missing")
-                        ))
-                    }
-                })
-                .collect();
-
-            if unresolved_external_dependencies.is_empty() {
-                filtered_cards.push(card.clone());
-            } else {
-                crate::auto_queue_log!(
-                    info,
-                    "generate.exclude_unresolved_dependencies",
-                    AutoQueueLogContext::new()
-                        .card(card.card_id.as_str())
-                        .agent(card.agent_id.as_str()),
-                    "issue_number={} unresolved_external_dependencies={:?}",
-                    card.github_issue_number
-                        .map(|issue_number| format!("#{issue_number}"))
-                        .unwrap_or_else(|| "<none>".to_string()),
-                    unresolved_external_dependencies
-                );
-                excluded_count += 1;
-            }
+            excluded_count += 1;
         }
     }
 
@@ -5889,199 +5786,96 @@ pub async fn generate(
     // Create run + entries atomically so partial inserts cannot masquerade as success.
     let run_id = uuid::Uuid::new_v4().to_string();
     let ai_model_str = "smart-planner".to_string();
-    let entry_ids = if let Some(pool) = state.pg_pool_ref() {
-        let mut tx = match pool.begin().await {
-            Ok(tx) => tx,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": format!("begin auto-queue generate transaction: {error}")}),
-                    ),
-                );
-            }
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("begin auto-queue generate transaction: {error}")})),
+            );
+        }
+    };
+    if let Err(error) = sqlx::query(
+        "INSERT INTO auto_queue_runs (
+            id, repo, agent_id, review_mode, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, thread_group_count
+         ) VALUES (
+            $1, $2, $3, $4, 'generated', $5, $6, FALSE, $7, $8
+         )",
+    )
+    .bind(&run_id)
+    .bind(body.repo.as_deref())
+    .bind(body.agent_id.as_deref())
+    .bind(review_mode)
+    .bind(&ai_model_str)
+    .bind(&ai_rationale)
+    .bind(max_concurrent)
+    .bind(thread_group_count)
+    .execute(&mut *tx)
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("create auto-queue run: {error}")})),
+        );
+    }
+
+    let mut entry_ids = Vec::new();
+    for planned in &grouped_entries {
+        let card = &filtered_cards[planned.card_idx];
+        let entry_id = uuid::Uuid::new_v4().to_string();
+        let agent = if card.agent_id.is_empty() {
+            body.agent_id.as_deref().unwrap_or("")
+        } else {
+            card.agent_id.as_str()
         };
         if let Err(error) = sqlx::query(
-            "INSERT INTO auto_queue_runs (
-                id, repo, agent_id, review_mode, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, thread_group_count
+            "INSERT INTO auto_queue_entries (
+                id, run_id, kanban_card_id, agent_id, priority_rank, thread_group, reason, batch_phase
              ) VALUES (
-                $1, $2, $3, $4, 'generated', $5, $6, FALSE, $7, $8
+                $1, $2, $3, $4, $5, $6, $7, $8
              )",
         )
+        .bind(&entry_id)
         .bind(&run_id)
-        .bind(body.repo.as_deref())
-        .bind(body.agent_id.as_deref())
-        .bind(review_mode)
-        .bind(&ai_model_str)
-        .bind(&ai_rationale)
-        .bind(max_concurrent)
-        .bind(thread_group_count)
+        .bind(&card.card_id)
+        .bind(agent)
+        .bind(planned.priority_rank)
+        .bind(planned.thread_group)
+        .bind(&planned.reason)
+        .bind(planned.batch_phase)
         .execute(&mut *tx)
         .await
         {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("create auto-queue run: {error}")})),
+                Json(json!({"error": format!("create auto-queue entry: {error}")})),
             );
         }
-
-        let mut entry_ids = Vec::new();
-        for planned in &grouped_entries {
-            let card = &filtered_cards[planned.card_idx];
-            let entry_id = uuid::Uuid::new_v4().to_string();
-            let agent = if card.agent_id.is_empty() {
-                body.agent_id.as_deref().unwrap_or("")
-            } else {
-                card.agent_id.as_str()
-            };
-            if let Err(error) = sqlx::query(
-                "INSERT INTO auto_queue_entries (
-                    id, run_id, kanban_card_id, agent_id, priority_rank, thread_group, reason, batch_phase
-                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8
-                 )",
-            )
-            .bind(&entry_id)
-            .bind(&run_id)
-            .bind(&card.card_id)
-            .bind(agent)
-            .bind(planned.priority_rank)
-            .bind(planned.thread_group)
-            .bind(&planned.reason)
-            .bind(planned.batch_phase)
-            .execute(&mut *tx)
-            .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("create auto-queue entry: {error}")})),
-                );
-            }
-            entry_ids.push(entry_id);
-        }
-        if let Err(error) = tx.commit().await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("commit auto-queue generate transaction: {error}")})),
-            );
-        }
-        entry_ids
-    } else {
-        let mut conn = match state.sqlite_db().separate_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": format!("begin auto-queue generate transaction: {error}")}),
-                    ),
-                );
-            }
-        };
-        if let Err(error) = tx.execute(
-            "INSERT INTO auto_queue_runs (id, repo, agent_id, review_mode, status, ai_model, ai_rationale, unified_thread, max_concurrent_threads, thread_group_count) \
-             VALUES (?1, ?2, ?3, ?4, 'generated', ?5, ?6, 0, ?7, ?8)",
-            libsql_rusqlite::params![
-                run_id,
-                body.repo,
-                body.agent_id,
-                review_mode,
-                ai_model_str,
-                ai_rationale,
-                max_concurrent,
-                thread_group_count
-            ],
-        ) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("create auto-queue run: {error}")})),
-            );
-        }
-
-        let mut entry_ids = Vec::new();
-        for planned in &grouped_entries {
-            let card = &filtered_cards[planned.card_idx];
-            let entry_id = uuid::Uuid::new_v4().to_string();
-            let agent = if card.agent_id.is_empty() {
-                body.agent_id.as_deref().unwrap_or("")
-            } else {
-                card.agent_id.as_str()
-            };
-            if let Err(error) = tx.execute(
-                "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, priority_rank, thread_group, reason, batch_phase)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                libsql_rusqlite::params![
-                    entry_id,
-                    run_id,
-                    card.card_id,
-                    agent,
-                    planned.priority_rank,
-                    planned.thread_group,
-                    planned.reason,
-                    planned.batch_phase
-                ],
-            ) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("create auto-queue entry: {error}")})),
-                );
-            }
-            entry_ids.push(entry_id);
-        }
-        if let Err(error) = tx.commit() {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("commit auto-queue generate transaction: {error}")})),
-            );
-        }
-        entry_ids
+        entry_ids.push(entry_id);
+    }
+    if let Err(error) = tx.commit().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("commit auto-queue generate transaction: {error}")})),
+        );
     };
 
-    let entries = if let Some(pool) = state.pg_pool_ref() {
-        let mut values = Vec::with_capacity(entry_ids.len());
-        for entry_id in &entry_ids {
-            values.push(
-                state
-                    .auto_queue_service()
-                    .entry_json_with_pg(pool, entry_id, guild_id)
-                    .await
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-        values
-    } else {
-        entry_ids
-            .iter()
-            .map(|entry_id| {
-                state
-                    .auto_queue_service()
-                    .entry_json(entry_id, guild_id)
-                    .unwrap_or(serde_json::Value::Null)
-            })
-            .collect::<Vec<_>>()
-    };
+    let mut entries = Vec::with_capacity(entry_ids.len());
+    for entry_id in &entry_ids {
+        entries.push(
+            state
+                .auto_queue_service()
+                .entry_json_with_pg(pool, entry_id, guild_id)
+                .await
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
 
-    let run = if let Some(pool) = state.pg_pool_ref() {
-        state
-            .auto_queue_service()
-            .run_json_with_pg(pool, &run_id)
-            .await
-            .unwrap_or(serde_json::Value::Null)
-    } else {
-        state
-            .auto_queue_service()
-            .run_json(&run_id)
-            .unwrap_or(serde_json::Value::Null)
-    };
+    let run = state
+        .auto_queue_service()
+        .run_json_with_pg(pool, &run_id)
+        .await
+        .unwrap_or(serde_json::Value::Null);
 
     (
         StatusCode::OK,
@@ -6095,21 +5889,16 @@ pub async fn activate(
     State(state): State<AppState>,
     Json(body): Json<ActivateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
     let deps = AutoQueueActivateDeps::from_state(&state);
-    let body = if let Some(pool) = state.pg_pool_ref() {
-        match activate_preflight_with_pg(pool, body).await {
-            ActivatePgPreflight::Return(response) => return response,
-            ActivatePgPreflight::Continue(body) => body,
-        }
-    } else {
-        body
+    let body = match activate_preflight_with_pg(pool, body).await {
+        ActivatePgPreflight::Return(response) => return response,
+        ActivatePgPreflight::Continue(body) => body,
     };
 
-    if deps.pg_pool.is_some() {
-        activate_with_deps_pg(&deps, body).await
-    } else {
-        activate_with_deps(&deps, body)
-    }
+    activate_with_deps_pg(&deps, body).await
 }
 
 enum ActivatePgPreflight {
@@ -8307,6 +8096,9 @@ pub async fn dispatch(
         Ok(mode) => mode,
         Err(err) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": err }))),
     };
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
     let requested_entries = match normalize_dispatch_entries(&body) {
         Ok(entries) => entries,
         Err(err) => {
@@ -8320,7 +8112,7 @@ pub async fn dispatch(
     let auto_assign_agent = body.auto_assign_agent.unwrap_or(body.agent_id.is_some());
 
     let cards_by_issue =
-        if let Some(pool) = state.pg_pool_ref() {
+        {
             let mut cards =
                 match resolve_dispatch_cards_with_pg(pool, body.repo.as_deref(), &issue_numbers)
                     .await
@@ -8385,68 +8177,6 @@ pub async fn dispatch(
             }
 
             cards
-        } else {
-            let conn = match state.sqlite_db().separate_conn() {
-                Ok(c) => c,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("{e}")})),
-                    );
-                }
-            };
-
-            let mut cards = match resolve_dispatch_cards(&conn, body.repo.as_ref(), &issue_numbers)
-            {
-                Ok(cards) => cards,
-                Err(err) => {
-                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
-                }
-            };
-
-            if let Err(err) = apply_dispatch_agent_assignments(
-                &conn,
-                &mut cards,
-                body.agent_id.as_deref(),
-                auto_assign_agent,
-            ) {
-                return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
-            }
-
-            if let Err(err) = validate_dispatchable_cards(&conn, &cards) {
-                return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
-            }
-
-            let conflicting_live_runs = match find_matching_active_run_id(
-                &conn,
-                body.repo.as_deref(),
-                body.agent_id.as_deref(),
-            ) {
-                Ok(runs) => runs,
-                Err(err) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": err})),
-                    );
-                }
-            };
-            if let Some((run_id, status)) = conflicting_live_runs.first() {
-                if !force {
-                    return existing_live_run_conflict_response(run_id, status);
-                }
-                let target_run_ids: Vec<String> = conflicting_live_runs
-                    .iter()
-                    .map(|(run_id, _)| run_id.clone())
-                    .collect();
-                crate::services::auto_queue::cancel_run::cancel_selected_runs_with_conn(
-                    state.health_registry.clone(),
-                    &conn,
-                    &target_run_ids,
-                    "auto_queue_force_new_run",
-                );
-            }
-            drop(conn);
-            cards
         };
 
     let distinct_groups = requested_entries
@@ -8494,92 +8224,45 @@ pub async fn dispatch(
         }
     };
 
-    if let Some(pool) = state.pg_pool_ref() {
-        if let Some(ref deploy_phases) = body.deploy_phases {
-            if !deploy_phases.is_empty()
-                && let Ok(json_str) = serde_json::to_string(deploy_phases)
-            {
-                let _ = sqlx::query("UPDATE auto_queue_runs SET deploy_phases = $1 WHERE id = $2")
-                    .bind(&json_str)
-                    .bind(&run_id)
-                    .execute(pool)
-                    .await;
-            }
+    if let Some(ref deploy_phases) = body.deploy_phases {
+        if !deploy_phases.is_empty()
+            && let Ok(json_str) = serde_json::to_string(deploy_phases)
+        {
+            let _ = sqlx::query("UPDATE auto_queue_runs SET deploy_phases = $1 WHERE id = $2")
+                .bind(&json_str)
+                .bind(&run_id)
+                .execute(pool)
+                .await;
         }
+    }
 
-        let mut rank_per_group = HashMap::<i64, i64>::new();
-        for entry in &requested_entries {
-            let thread_group = entry.thread_group.unwrap_or(0);
-            let priority_rank = rank_per_group.entry(thread_group).or_insert(0);
-            let Some(card) = cards_by_issue.get(&entry.issue_number) else {
-                continue;
-            };
-            if let Err(err) = sqlx::query(
-                "UPDATE auto_queue_entries
-                 SET thread_group = $1,
-                     priority_rank = $2
-                 WHERE run_id = $3
-                   AND kanban_card_id = $4",
-            )
-            .bind(thread_group)
-            .bind(*priority_rank)
-            .bind(&run_id)
-            .bind(&card.card_id)
-            .execute(pool)
-            .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{err}")})),
-                );
-            }
-            *priority_rank += 1;
-        }
-    } else {
-        let conn = match state.sqlite_db().separate_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
+    let mut rank_per_group = HashMap::<i64, i64>::new();
+    for entry in &requested_entries {
+        let thread_group = entry.thread_group.unwrap_or(0);
+        let priority_rank = rank_per_group.entry(thread_group).or_insert(0);
+        let Some(card) = cards_by_issue.get(&entry.issue_number) else {
+            continue;
         };
-
-        if let Some(ref deploy_phases) = body.deploy_phases {
-            if !deploy_phases.is_empty() {
-                if let Ok(json_str) = serde_json::to_string(deploy_phases) {
-                    let _ = conn.execute(
-                        "UPDATE auto_queue_runs SET deploy_phases = ?1 WHERE id = ?2",
-                        libsql_rusqlite::params![json_str, run_id],
-                    );
-                }
-            }
+        if let Err(err) = sqlx::query(
+            "UPDATE auto_queue_entries
+             SET thread_group = $1,
+                 priority_rank = $2
+             WHERE run_id = $3
+               AND kanban_card_id = $4",
+        )
+        .bind(thread_group)
+        .bind(*priority_rank)
+        .bind(&run_id)
+        .bind(&card.card_id)
+        .execute(pool)
+        .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{err}")})),
+            );
         }
-
-        let mut rank_per_group = HashMap::<i64, i64>::new();
-        for entry in &requested_entries {
-            let thread_group = entry.thread_group.unwrap_or(0);
-            let priority_rank = rank_per_group.entry(thread_group).or_insert(0);
-            let Some(card) = cards_by_issue.get(&entry.issue_number) else {
-                continue;
-            };
-            if let Err(err) = conn.execute(
-                "UPDATE auto_queue_entries
-                 SET thread_group = ?1,
-                     priority_rank = ?2
-                 WHERE run_id = ?3
-                   AND kanban_card_id = ?4",
-                libsql_rusqlite::params![thread_group, *priority_rank, run_id, card.card_id],
-            ) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{err}")})),
-                );
-            }
-            *priority_rank += 1;
-        }
-        drop(conn);
+        *priority_rank += 1;
     }
 
     let activate_now = body.activate.unwrap_or(true);
@@ -8668,17 +8351,16 @@ pub async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
     let input = crate::services::auto_queue::StatusInput {
         repo: query.repo,
         agent_id: query.agent_id,
         guild_id: state.config.discord.guild_id.clone(),
     };
 
-    let result = if let Some(pool) = state.pg_pool_ref() {
-        state.auto_queue_service().status_with_pg(pool, input).await
-    } else {
-        state.auto_queue_service().status(input)
-    };
+    let result = state.auto_queue_service().status_with_pg(pool, input).await;
 
     match result {
         Ok(response) => (StatusCode::OK, Json(json!(response))),
@@ -8696,35 +8378,16 @@ pub async fn history(
         repo: query.repo,
         agent_id: query.agent_id,
     };
-    let records = if let Some(pool) = state.pg_pool_ref() {
-        match crate::db::auto_queue::list_run_history_pg(pool, &filter, limit).await {
-            Ok(records) => records,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("list run history: {error}")})),
-                );
-            }
-        }
-    } else {
-        let conn = match state.sqlite_db().separate_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-
-        match crate::db::auto_queue::list_run_history(&conn, &filter, limit) {
-            Ok(records) => records,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("list run history: {error}")})),
-                );
-            }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
+    let records = match crate::db::auto_queue::list_run_history_pg(pool, &filter, limit).await {
+        Ok(records) => records,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("list run history: {error}")})),
+            );
         }
     };
 
@@ -9021,123 +8684,10 @@ pub async fn update_entry(
         }
     };
 
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return update_entry_with_pg(&state, &id, &body, requested_status, &pg_pool).await;
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    let entry_info: Option<(String, String)> = conn
-        .query_row(
-            "SELECT run_id, status
-             FROM auto_queue_entries
-             WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
-
-    let Some((run_id, status)) = entry_info else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "entry not found"})),
-        );
-    };
-
-    let mut effective_status = status.clone();
-    if let Some(new_status) = requested_status {
-        match crate::db::auto_queue::update_entry_status_on_conn(
-            &conn,
-            &id,
-            new_status,
-            "manual_update",
-            &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
-        ) {
-            Ok(result) => effective_status = result.to_status,
-            Err(crate::db::auto_queue::EntryStatusUpdateError::NotFound { .. }) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": "entry not found"})),
-                );
-            }
-            Err(crate::db::auto_queue::EntryStatusUpdateError::InvalidTransition { .. }) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": format!(
-                            "entry status transition not allowed: {} -> {}",
-                            status, new_status
-                        ),
-                    })),
-                );
-            }
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{error}")})),
-                );
-            }
-        }
-    }
-
-    if body.thread_group.is_some() || body.priority_rank.is_some() || body.batch_phase.is_some() {
-        if effective_status != crate::db::auto_queue::ENTRY_STATUS_PENDING {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "only pending entries can be reprioritized"})),
-            );
-        }
-
-        let changed = conn
-            .execute(
-                "UPDATE auto_queue_entries
-                 SET thread_group = COALESCE(?1, thread_group),
-                     priority_rank = COALESCE(?2, priority_rank),
-                     batch_phase = COALESCE(?3, batch_phase)
-                 WHERE id = ?4
-                   AND status = 'pending'",
-                libsql_rusqlite::params![
-                    body.thread_group,
-                    body.priority_rank,
-                    body.batch_phase,
-                    id
-                ],
-            )
-            .unwrap_or(0);
-        if changed == 0 {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "entry not found or not pending"})),
-            );
-        }
-
-        if body.thread_group.is_some() {
-            if let Err(err) = crate::db::auto_queue::sync_run_group_metadata(&conn, &run_id) {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{err}")})),
-                );
-            }
-        }
-    }
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "entry": state
-                .auto_queue_service()
-                .entry_json(&id, None)
-                .unwrap_or(serde_json::Value::Null),
-        })),
-    )
+    update_entry_with_pg(&state, &id, &body, requested_status, &pg_pool).await
 }
 
 /// POST /api/auto-queue/runs/{id}/entries
@@ -9350,152 +8900,10 @@ pub async fn add_run_entry(
             Json(json!({"error": "batch_phase must be >= 0"})),
         );
     }
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return add_run_entry_with_pg(&state, &run_id, &body, batch_phase, &pg_pool).await;
-    }
-
-    let mut conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    let run_info: Option<(String, Option<String>, Option<String>)> = conn
-        .query_row(
-            "SELECT status, repo, agent_id
-             FROM auto_queue_runs
-             WHERE id = ?1",
-            [&run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .ok();
-    let Some((run_status, run_repo, run_agent_id)) = run_info else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("auto-queue run '{run_id}' not found")})),
-        );
-    };
-    if run_status != "active" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("auto-queue run '{run_id}' is not active (status={run_status})"),
-                "run_id": run_id,
-                "status": run_status,
-            })),
-        );
-    }
-
-    let issue_numbers = [body.issue_number];
-    let cards_by_issue = match resolve_dispatch_cards(&conn, run_repo.as_ref(), &issue_numbers) {
-        Ok(cards) => cards,
-        Err(err) => {
-            let status = if err.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            return (status, Json(json!({"error": err})));
-        }
-    };
-    let Some(card) = cards_by_issue.get(&body.issue_number) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(
-                json!({"error": format!("kanban card not found for issue #{}", body.issue_number)}),
-            ),
-        );
-    };
-    if card.status != "ready" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "issue #{} must be in ready status to be added to an active run (current={})",
-                    body.issue_number,
-                    card.status
-                )
-            })),
-        );
-    }
-
-    let run_agent = run_agent_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let card_agent = card
-        .assigned_agent_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match (run_agent, card_agent) {
-        (_, None) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("issue #{} has no assigned agent", body.issue_number)
-                })),
-            );
-        }
-        (Some(run_agent), Some(card_agent)) if run_agent != card_agent => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!(
-                        "issue #{} is assigned to {}, not the active run agent {}",
-                        body.issue_number,
-                        card_agent,
-                        run_agent
-                    )
-                })),
-            );
-        }
-        _ => {}
-    }
-
-    let inserted = match enqueue_entries_into_existing_run(
-        &mut conn,
-        &run_id,
-        &[GenerateEntryBody {
-            issue_number: body.issue_number,
-            batch_phase: Some(batch_phase),
-            thread_group: body.thread_group,
-        }],
-        &cards_by_issue,
-    ) {
-        Ok(entries) => entries,
-        Err(err) => {
-            let status = if err.contains("already queued") || err.contains("active dispatch") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            return (status, Json(json!({"error": err})));
-        }
-    };
-    let Some(inserted_entry) = inserted.into_iter().next() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "failed to create auto-queue entry"})),
-        );
-    };
-
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "ok": true,
-            "run_id": run_id,
-            "thread_group": inserted_entry.thread_group,
-            "priority_rank": inserted_entry.priority_rank,
-            "entry": state
-                .auto_queue_service()
-                .entry_json(&inserted_entry.entry_id, None)
-                .unwrap_or(serde_json::Value::Null),
-        })),
-    )
+    add_run_entry_with_pg(&state, &run_id, &body, batch_phase, &pg_pool).await
 }
 
 /// POST /api/auto-queue/runs/{id}/restore
@@ -9633,132 +9041,10 @@ pub async fn restore_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return restore_run_with_pg(&state, &run_id, &pg_pool).await;
-    }
-
-    let mut conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    let run_status: Option<String> = conn
-        .query_row(
-            "SELECT status
-             FROM auto_queue_runs
-             WHERE id = ?1",
-            [&run_id],
-            |row| row.get(0),
-        )
-        .ok();
-    match run_status.as_deref() {
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("auto-queue run '{run_id}' not found")})),
-            );
-        }
-        Some("cancelled") | Some(RUN_STATUS_RESTORING) => {}
-        Some("active") => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("auto-queue run '{run_id}' is already active")})),
-            );
-        }
-        Some(status) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!(
-                        "only cancelled or restoring runs can be restored (status={status})"
-                    ),
-                    "run_id": run_id,
-                    "status": status,
-                })),
-            );
-        }
-    }
-
-    let deps = AutoQueueActivateDeps::from_state(&state);
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
-    let mut counts = RestoreRunCounts::default();
-    let mut dispatch_candidates = Vec::new();
-
-    match apply_restore_state_changes(&mut conn, &run_id, run_status.as_deref()) {
-        Ok((applied_counts, candidates)) => {
-            counts = applied_counts;
-            dispatch_candidates = candidates;
-        }
-        Err(error) => errors.push(error),
-    }
-
-    if errors.is_empty() {
-        for candidate in &dispatch_candidates {
-            match attempt_restore_dispatch(&deps, &run_id, candidate) {
-                Ok(result) => {
-                    if result.dispatched {
-                        counts.restored_pending = counts.restored_pending.saturating_sub(1);
-                        counts.restored_dispatched += 1;
-                    }
-                    if result.created_dispatch {
-                        counts.created_dispatches += 1;
-                    }
-                    if result.rebound_slot {
-                        counts.rebound_slots += 1;
-                    }
-                    if result.unbound_dispatch {
-                        counts.unbound_dispatches += 1;
-                    }
-                }
-                Err(error) => warnings.push(error),
-            }
-        }
-
-        if let Err(error) = finalize_restore_run(&conn, &run_id) {
-            errors.push(error);
-        }
-    }
-    let final_run_status = conn
-        .query_row(
-            "SELECT status
-             FROM auto_queue_runs
-             WHERE id = ?1",
-            [&run_id],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap_or_else(|_| "unknown".to_string());
-    drop(conn);
-
-    let mut payload = json!({
-        "ok": errors.is_empty(),
-        "run_id": run_id,
-        "run_status": final_run_status,
-        "restored_pending": counts.restored_pending,
-        "restored_done": counts.restored_done,
-        "restored_dispatched": counts.restored_dispatched,
-        "rebound_slots": counts.rebound_slots,
-        "created_dispatches": counts.created_dispatches,
-        "unbound_dispatches": counts.unbound_dispatches,
-    });
-    if !errors.is_empty() {
-        payload["errors"] = json!(errors);
-    }
-    if counts.unbound_dispatches > 0 {
-        warnings.push(format!(
-            "{} restored dispatch(es) still need slot rebind",
-            counts.unbound_dispatches
-        ));
-    }
-    if !warnings.is_empty() {
-        payload["warning"] = json!(warnings.join("; "));
-    }
-
-    (StatusCode::OK, Json(payload))
+    restore_run_with_pg(&state, &run_id, &pg_pool).await
 }
 
 /// POST /api/auto-queue/slots/{agent_id}/{slot_index}/rebind
@@ -9968,121 +9254,10 @@ pub async fn rebind_slot(
         );
     }
 
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return rebind_slot_with_pg(&agent_id, slot_index, &body, &pg_pool).await;
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    let run_status: Option<String> = conn
-        .query_row(
-            "SELECT status
-             FROM auto_queue_runs
-             WHERE id = ?1",
-            [run_id],
-            |row| row.get(0),
-        )
-        .ok();
-    match run_status.as_deref() {
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("auto-queue run '{run_id}' not found")})),
-            );
-        }
-        Some("active") | Some("paused") => {}
-        Some(status) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("slot rebind requires an active or paused run (status={status})"),
-                    "run_id": run_id,
-                    "status": status,
-                })),
-            );
-        }
-    }
-
-    let slot_pool_size = crate::db::auto_queue::run_slot_pool_size(&conn, run_id);
-    if slot_index >= slot_pool_size {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!(
-                    "slot_index {} is outside the slot pool for run '{}' (size={})",
-                    slot_index,
-                    run_id,
-                    slot_pool_size
-                ),
-            })),
-        );
-    }
-
-    let current_binding: Option<(Option<String>, Option<i64>)> = conn
-        .query_row(
-            "SELECT assigned_run_id, assigned_thread_group
-             FROM auto_queue_slots
-             WHERE agent_id = ?1
-               AND slot_index = ?2",
-            libsql_rusqlite::params![&agent_id, slot_index],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
-    let same_binding = current_binding
-        .as_ref()
-        .is_some_and(|(assigned_run_id, assigned_group)| {
-            assigned_run_id.as_deref() == Some(run_id)
-                && assigned_group.unwrap_or_default() == body.thread_group
-        });
-    if !same_binding
-        && crate::db::auto_queue::slot_has_active_dispatch(&conn, &agent_id, slot_index)
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": format!(
-                    "slot {} for {} has an active dispatch; reset or complete it before rebind",
-                    slot_index, agent_id
-                ),
-            })),
-        );
-    }
-
-    let updated_entries = match crate::db::auto_queue::rebind_slot_for_group_agent(
-        &conn,
-        run_id,
-        body.thread_group,
-        &agent_id,
-        slot_index,
-    ) {
-        Ok(updated_entries) => updated_entries,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            );
-        }
-    };
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "agent_id": agent_id,
-            "slot_index": slot_index,
-            "run_id": run_id,
-            "thread_group": body.thread_group,
-            "rebound": !same_binding,
-            "updated_entries": updated_entries,
-        })),
-    )
+    rebind_slot_with_pg(&agent_id, slot_index, &body, &pg_pool).await
 }
 
 /// PATCH /api/auto-queue/entries/{id}/skip
@@ -10133,54 +9308,10 @@ pub async fn skip_entry(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return skip_entry_with_pg(&id, &pg_pool).await;
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    match crate::db::auto_queue::update_entry_status_on_conn(
-        &conn,
-        &id,
-        crate::db::auto_queue::ENTRY_STATUS_SKIPPED,
-        "manual_skip",
-        &crate::db::auto_queue::EntryStatusUpdateOptions::default(),
-    ) {
-        Ok(result) if result.changed => {}
-        Ok(_) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "entry not found or not pending"})),
-            );
-        }
-        Err(crate::db::auto_queue::EntryStatusUpdateError::NotFound { .. }) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "entry not found"})),
-            );
-        }
-        Err(crate::db::auto_queue::EntryStatusUpdateError::InvalidTransition { .. }) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "only pending entries can be skipped"})),
-            );
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            );
-        }
-    }
-
-    (StatusCode::OK, Json(json!({ "ok": true })))
+    skip_entry_with_pg(&id, &pg_pool).await
 }
 
 /// PATCH /api/auto-queue/runs/{id}
@@ -10203,81 +9334,9 @@ pub async fn update_run(
         );
     }
 
-    if let Some(pool) = state.pg_pool_ref() {
-        if let Some(max_concurrent_threads) = body.max_concurrent_threads {
-            if max_concurrent_threads <= 0 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "max_concurrent_threads must be > 0"})),
-                );
-            }
-        }
-
-        let ignored_unified_thread = body.unified_thread.is_some();
-        if body.status.is_none()
-            && body.deploy_phases.is_none()
-            && body.max_concurrent_threads.is_none()
-            && !ignored_unified_thread
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "no fields to update"})),
-            );
-        }
-
-        return match update_run_with_pg(&id, &body, pool).await {
-            Ok(_) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "ignored": ignored_unified_thread.then_some(vec!["unified_thread"]),
-                })),
-            ),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
-        };
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
-    let mut changed = 0usize;
-
-    if let Some(ref status) = body.status {
-        let completed_at = if status == "completed" {
-            "datetime('now')"
-        } else {
-            "NULL"
-        };
-        changed += conn
-            .execute(
-                &format!(
-                    "UPDATE auto_queue_runs SET status = ?1, completed_at = {completed_at} WHERE id = ?2"
-                ),
-                libsql_rusqlite::params![status, id],
-            )
-            .unwrap_or(0);
-    }
-
-    if let Some(ref deploy_phases) = body.deploy_phases {
-        if let Ok(json_str) = serde_json::to_string(deploy_phases) {
-            changed += conn
-                .execute(
-                    "UPDATE auto_queue_runs SET deploy_phases = ?1 WHERE id = ?2",
-                    libsql_rusqlite::params![json_str, id],
-                )
-                .unwrap_or(0);
-        }
-    }
-
     if let Some(max_concurrent_threads) = body.max_concurrent_threads {
         if max_concurrent_threads <= 0 {
             return (
@@ -10285,19 +9344,10 @@ pub async fn update_run(
                 Json(json!({"error": "max_concurrent_threads must be > 0"})),
             );
         }
-        changed += conn
-            .execute(
-                "UPDATE auto_queue_runs
-                 SET max_concurrent_threads = ?1
-                 WHERE id = ?2",
-                libsql_rusqlite::params![max_concurrent_threads, id],
-            )
-            .unwrap_or(0);
     }
 
     let ignored_unified_thread = body.unified_thread.is_some();
-    if changed == 0
-        && body.status.is_none()
+    if body.status.is_none()
         && body.deploy_phases.is_none()
         && body.max_concurrent_threads.is_none()
         && !ignored_unified_thread
@@ -10308,13 +9358,19 @@ pub async fn update_run(
         );
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "ignored": ignored_unified_thread.then_some(vec!["unified_thread"]),
-        })),
-    )
+    match update_run_with_pg(&id, &body, pool).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "ignored": ignored_unified_thread.then_some(vec!["unified_thread"]),
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        ),
+    }
 }
 
 /// POST /api/auto-queue/slots/{agent_id}/{slot_index}/reset-thread
@@ -10322,37 +9378,11 @@ pub async fn reset_slot_thread(
     State(state): State<AppState>,
     Path((agent_id, slot_index)): Path<(String, i64)>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pool) = state.pg_pool_ref() {
-        return match crate::services::auto_queue::runtime::reset_slot_thread_bindings_pg(
-            pool, &agent_id, slot_index,
-        )
-        .await
-        {
-            Ok((archived_threads, cleared_sessions, cleared_bindings)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ok": true,
-                    "agent_id": agent_id,
-                    "slot_index": slot_index,
-                    "archived_threads": archived_threads,
-                    "cleared_sessions": cleared_sessions,
-                    "cleared_bindings": cleared_bindings,
-                })),
-            ),
-            Err(err) if err.contains("has active dispatch") => {
-                (StatusCode::CONFLICT, Json(json!({"error": err})))
-            }
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": err})),
-            ),
-        };
-    }
-
-    match crate::services::auto_queue::runtime::reset_slot_thread_bindings(
-        state.sqlite_db(),
-        &agent_id,
-        slot_index,
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
+    match crate::services::auto_queue::runtime::reset_slot_thread_bindings_pg(
+        pool, &agent_id, slot_index,
     )
     .await
     {
@@ -10405,48 +9435,16 @@ pub async fn reset(
         }
     };
 
-    if let Some(pool) = state.pg_pool_ref() {
-        return match reset_scoped_with_pg(agent_id, pool).await {
-            Ok(response) => (StatusCode::OK, Json(response)),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
-        };
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
-
-    let deleted_entries = conn
-        .execute(
-            "DELETE FROM auto_queue_entries WHERE agent_id = ?1",
-            libsql_rusqlite::params![agent_id],
-        )
-        .unwrap_or(0);
-    let completed_runs = conn
-        .execute(
-            "UPDATE auto_queue_runs SET status = 'completed', completed_at = datetime('now') \
-             WHERE status IN ('generated', 'pending', 'active', 'paused') AND agent_id = ?1",
-            libsql_rusqlite::params![agent_id],
-        )
-        .unwrap_or(0);
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "deleted_entries": deleted_entries,
-            "completed_runs": completed_runs,
-            "protected_active_runs": 0usize,
-        })),
-    )
+    match reset_scoped_with_pg(agent_id, pool).await {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        ),
+    }
 }
 
 /// POST /api/auto-queue/reset-global
@@ -10474,27 +9472,10 @@ pub async fn reset_global(
         );
     }
 
-    if let Some(pool) = state.pg_pool_ref() {
-        return match reset_global_with_pg(pool).await {
-            Ok(response) => (StatusCode::OK, Json(response)),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
-        };
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
-
-    match reset_global_with_conn(&conn) {
+    match reset_global_with_pg(pool).await {
         Ok(response) => (StatusCode::OK, Json(response)),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10516,50 +9497,20 @@ pub async fn pause(
     };
     let force = body.force.unwrap_or(false);
 
-    if let Some(pool) = state.pg_pool_ref() {
-        return match if force {
-            force_pause_with_pg(state.health_registry.clone(), pool).await
-        } else {
-            soft_pause_with_pg(pool).await
-        } {
-            Ok(response) => (StatusCode::OK, Json(response)),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
-        };
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
-    let response = if force {
-        force_pause_with_conn(state.health_registry.clone(), &conn)
+    match if force {
+        force_pause_with_pg(state.health_registry.clone(), pool).await
     } else {
-        let paused = conn
-            .execute(
-                "UPDATE auto_queue_runs
-                 SET status = 'paused',
-                     completed_at = NULL
-                 WHERE status = 'active'",
-                [],
-            )
-            .unwrap_or(0);
-        json!({
-            "ok": true,
-            "paused_runs": paused,
-            "cancelled_dispatches": 0usize,
-            "released_slots": 0usize,
-            "cleared_slot_sessions": 0usize,
-        })
-    };
-    (StatusCode::OK, Json(response))
+        soft_pause_with_pg(pool).await
+    } {
+        Ok(response) => (StatusCode::OK, Json(response)),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        ),
+    }
 }
 
 fn cancel_route_error_response(
@@ -10577,126 +9528,55 @@ fn cancel_route_error_response(
 
 /// POST /api/auto-queue/resume — resume paused runs and dispatch next entry
 pub async fn resume_run(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pool) = state.pg_pool_ref() {
-        let blocked_runs = match sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM auto_queue_runs r
-             WHERE r.status = 'paused'
-               AND EXISTS (
-                   SELECT 1
-                   FROM auto_queue_phase_gates pg
-                   WHERE pg.run_id = r.id
-                     AND pg.status IN ('pending', 'failed')
-               )",
-        )
-        .fetch_one(pool)
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": format!("count postgres blocked auto-queue runs: {error}")}),
-                    ),
-                );
-            }
-        };
-        let resumed = match sqlx::query(
-            "UPDATE auto_queue_runs
-             SET status = 'active',
-                 completed_at = NULL
-             WHERE status = 'paused'
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM auto_queue_phase_gates pg
-                   WHERE pg.run_id = auto_queue_runs.id
-                     AND pg.status IN ('pending', 'failed')
-               )",
-        )
-        .execute(pool)
-        .await
-        {
-            Ok(result) => result.rows_affected() as i64,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("resume postgres auto-queue runs: {error}")})),
-                );
-            }
-        };
-
-        if resumed > 0 {
-            let (_status, body) = activate(
-                State(state),
-                Json(ActivateBody {
-                    run_id: None,
-                    repo: None,
-                    agent_id: None,
-                    thread_group: None,
-                    unified_thread: None,
-                    active_only: Some(true),
-                }),
-            )
-            .await;
-            let dispatched = body.0.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            return (
-                StatusCode::OK,
-                Json(
-                    json!({"ok": true, "resumed_runs": resumed, "blocked_runs": blocked_runs, "dispatched": dispatched}),
-                ),
-            );
-        }
-
-        return (
-            StatusCode::OK,
-            Json(
-                json!({"ok": true, "resumed_runs": 0, "blocked_runs": blocked_runs, "message": "No resumable runs"}),
-            ),
-        );
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
+    };
+    let blocked_runs = match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM auto_queue_runs r
+         WHERE r.status = 'paused'
+           AND EXISTS (
+               SELECT 1
+               FROM auto_queue_phase_gates pg
+               WHERE pg.run_id = r.id
+                 AND pg.status IN ('pending', 'failed')
+           )",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("count postgres blocked auto-queue runs: {error}")})),
             );
         }
     };
-    let blocked_runs: i64 = conn
-        .query_row(
-            "SELECT COUNT(*)
-             FROM auto_queue_runs r
-             WHERE r.status = 'paused'
-               AND EXISTS (
-                   SELECT 1
-                   FROM auto_queue_phase_gates pg
-                   WHERE pg.run_id = r.id
-                     AND pg.status IN ('pending', 'failed')
-               )",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let resumed = conn
-        .execute(
-            "UPDATE auto_queue_runs
-             SET status = 'active'
-             WHERE status = 'paused'
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM auto_queue_phase_gates pg
-                   WHERE pg.run_id = auto_queue_runs.id
-                     AND pg.status IN ('pending', 'failed')
-               )",
-            [],
-        )
-        .unwrap_or(0);
-    drop(conn);
+    let resumed = match sqlx::query(
+        "UPDATE auto_queue_runs
+         SET status = 'active',
+             completed_at = NULL
+         WHERE status = 'paused'
+           AND NOT EXISTS (
+               SELECT 1
+               FROM auto_queue_phase_gates pg
+               WHERE pg.run_id = auto_queue_runs.id
+                 AND pg.status IN ('pending', 'failed')
+           )",
+    )
+    .execute(pool)
+    .await
+    {
+        Ok(result) => result.rows_affected() as i64,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("resume postgres auto-queue runs: {error}")})),
+            );
+        }
+    };
 
-    // Trigger dispatch of next pending entry
     if resumed > 0 {
         let (_status, body) = activate(
             State(state),
@@ -10732,36 +9612,8 @@ pub async fn cancel(
     State(state): State<AppState>,
     Query(query): Query<CancelQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pool) = state.pg_pool_ref() {
-        let service = state.auto_queue_service();
-        let result = if let Some(run_id) = query
-            .run_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            service
-                .cancel_run_with_pg(state.health_registry.clone(), pool, run_id)
-                .await
-        } else {
-            service
-                .cancel_runs_with_pg(state.health_registry.clone(), pool)
-                .await
-        };
-        return match result {
-            Ok(payload) => (StatusCode::OK, Json(payload)),
-            Err(error) => cancel_route_error_response(error),
-        };
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
     let service = state.auto_queue_service();
     let result = if let Some(run_id) = query
@@ -10770,9 +9622,13 @@ pub async fn cancel(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        service.cancel_run(state.health_registry.clone(), &conn, run_id)
+        service
+            .cancel_run_with_pg(state.health_registry.clone(), pool, run_id)
+            .await
     } else {
-        service.cancel_runs(state.health_registry.clone(), &conn)
+        service
+            .cancel_runs_with_pg(state.health_registry.clone(), pool)
+            .await
     };
     match result {
         Ok(payload) => (StatusCode::OK, Json(payload)),
@@ -10785,121 +9641,29 @@ pub async fn reorder(
     State(state): State<AppState>,
     Json(body): Json<ReorderBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Some(pool) = state.pg_pool_ref() {
-        return match reorder_with_pg(&body, pool).await {
-            Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
-            Err(error) if error.starts_with("not_found:") => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": error.trim_start_matches("not_found:")})),
-            ),
-            Err(error)
-                if error == "orderedIds cannot be empty"
-                    || error == "no pending entries found for reorder scope"
-                    || error == "orderedIds do not match any pending entries in scope"
-                    || error == "replacement sequence exhausted"
-                    || error == "replacement sequence was not fully consumed" =>
-            {
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
-            }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
-        };
-    }
-
-    let mut conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable_response();
     };
-    let run_id = body.ordered_ids.iter().find_map(|id| {
-        conn.query_row(
-            "SELECT run_id FROM auto_queue_entries WHERE id = ?1",
-            [id],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    });
-    let Some(run_id) = run_id else {
-        return (
+    match reorder_with_pg(&body, pool).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(error) if error.starts_with("not_found:") => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "no matching queue entries found"})),
-        );
-    };
-
-    let current_entries: Vec<QueueEntryOrder> = {
-        let mut stmt = match conn.prepare(
-            "SELECT id, COALESCE(status, 'pending'), COALESCE(agent_id, '')
-             FROM auto_queue_entries
-             WHERE run_id = ?1
-             ORDER BY priority_rank ASC, created_at ASC, id ASC",
-        ) {
-            Ok(stmt) => stmt,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        stmt.query_map([&run_id], |row| {
-            Ok(QueueEntryOrder {
-                id: row.get(0)?,
-                status: row.get(1)?,
-                agent_id: row.get(2)?,
-            })
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|row| row.ok()).collect())
-        .unwrap_or_default()
-    };
-
-    let reordered_ids = match reorder_entry_ids(
-        &current_entries,
-        &body.ordered_ids,
-        body.agent_id.as_deref(),
-    ) {
-        Ok(ids) => ids,
-        Err(error) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+            Json(json!({"error": error.trim_start_matches("not_found:")})),
+        ),
+        Err(error)
+            if error == "orderedIds cannot be empty"
+                || error == "no pending entries found for reorder scope"
+                || error == "orderedIds do not match any pending entries in scope"
+                || error == "replacement sequence exhausted"
+                || error == "replacement sequence was not fully consumed" =>
+        {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
         }
-    };
-
-    let tx = match conn.transaction() {
-        Ok(tx) => tx,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    for (rank, id) in reordered_ids.iter().enumerate() {
-        if let Err(e) = tx.execute(
-            "UPDATE auto_queue_entries SET priority_rank = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![rank as i64, id],
-        ) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    }
-
-    if let Err(e) = tx.commit() {
-        return (
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        );
+            Json(json!({"error": error})),
+        ),
     }
-
-    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 // ── Authenticated order submission callback ─────────────────────────────────
@@ -11165,158 +9929,10 @@ pub async fn submit_order(
     {
         return response;
     }
-    if let Some(pg_pool) = state.pg_pool.clone() {
-        return submit_order_with_pg(&state, &run_id, &headers, &body, &pg_pool).await;
-    }
-
-    let conn = match state.sqlite_db().separate_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
+    let Some(pg_pool) = state.pg_pool.clone() else {
+        return pg_unavailable_response();
     };
-    let caller_agent_id =
-        crate::server::routes::kanban::resolve_requesting_agent_id_on_conn(&conn, &headers);
-    // Verify run exists and is pending, get repo for filtering
-    let run_info: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT status, repo FROM auto_queue_runs WHERE id = ?1",
-            [&run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
-
-    match run_info.as_ref().map(|(s, _)| s.as_str()) {
-        Some("pending") => {}
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "run not found or not pending"})),
-            );
-        }
-    }
-    let run_repo = run_info.as_ref().and_then(|(_, r)| r.clone());
-    let run_log_ctx = AutoQueueLogContext::new().run(&run_id);
-
-    // Create entries from the ordered list
-    let mut created = 0;
-    for (rank, item) in body.order.iter().enumerate() {
-        // Item can be issue number (i64) or card_id (string)
-        // When matching by issue number, filter by repo to prevent cross-repo collisions
-        let card_id: Option<String> = if let Some(num) = item.as_i64() {
-            if let Some(ref repo) = run_repo {
-                conn.query_row(
-                    "SELECT id FROM kanban_cards WHERE github_issue_number = ?1 AND repo_id = ?2",
-                    libsql_rusqlite::params![num, repo],
-                    |row| row.get(0),
-                )
-                .ok()
-            } else {
-                conn.query_row(
-                    "SELECT id FROM kanban_cards WHERE github_issue_number = ?1",
-                    [num],
-                    |row| row.get(0),
-                )
-                .ok()
-            }
-        } else if let Some(id) = item.as_str() {
-            Some(id.to_string())
-        } else {
-            None
-        };
-
-        let Some(card_id) = card_id else { continue };
-
-        // Only enqueue cards in dispatchable states (pipeline-driven)
-        let card_status: String = conn
-            .query_row(
-                "SELECT COALESCE(status, '') FROM kanban_cards WHERE id = ?1",
-                [&card_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
-        let dispatchable_check = crate::pipeline::try_get()
-            .map(|p| p.dispatchable_states().iter().any(|s| *s == card_status))
-            .unwrap_or(card_status == "ready");
-        if !dispatchable_check {
-            crate::auto_queue_log!(
-                info,
-                "submit_order_card_not_dispatchable",
-                run_log_ctx.clone().card(&card_id),
-                "[auto-queue] Skipping card {card_id} (status={card_status}, not dispatchable)"
-            );
-            continue;
-        }
-
-        let agent_id: String = conn
-            .query_row(
-                "SELECT COALESCE(assigned_agent_id, '') FROM kanban_cards WHERE id = ?1",
-                [&card_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
-
-        let entry_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, priority_rank)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            libsql_rusqlite::params![entry_id, run_id, card_id, agent_id, rank as i64],
-        )
-        .ok();
-        created += 1;
-    }
-
-    // Only activate if at least one card was enqueued; otherwise leave as pending
-    // to prevent the activate() fallback from filling the run with unintended cards
-    let rationale = body
-        .rationale
-        .clone()
-        .or(body.reasoning.clone())
-        .unwrap_or_else(|| {
-            caller_agent_id
-                .as_deref()
-                .map(|agent_id| format!("{agent_id} order submitted"))
-                .unwrap_or_else(|| "API order submitted".to_string())
-        });
-    if created > 0 {
-        conn.execute(
-            "UPDATE auto_queue_runs SET status = 'active', ai_rationale = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![rationale, run_id],
-        )
-        .ok();
-    } else {
-        crate::auto_queue_log!(
-            warn,
-            "submit_order_no_ready_cards",
-            run_log_ctx.clone(),
-            "[auto-queue] submit_order: no ready cards enqueued, run {run_id} stays pending"
-        );
-        conn.execute(
-            "UPDATE auto_queue_runs SET status = 'completed', ai_rationale = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![
-                format!("{rationale} (no ready cards — auto-completed)"),
-                run_id
-            ],
-        )
-        .ok();
-    }
-
-    // Queue created and activated — dispatch is a separate step via POST /api/auto-queue/dispatch-next
-    // This allows the caller to review/adjust the order before dispatching begins.
-    drop(conn);
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "created": created,
-            "run_id": run_id,
-            "message": "Queue active. Call POST /api/auto-queue/dispatch-next to start dispatching.",
-        })),
-    )
+    submit_order_with_pg(&state, &run_id, &headers, &body, &pg_pool).await
 }
 
 #[cfg(test)]

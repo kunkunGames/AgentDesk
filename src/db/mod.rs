@@ -169,7 +169,10 @@ pub fn init(config: &Config) -> Result<Db> {
     )?;
     schema::migrate(&conn)?;
 
-    tracing::info!("Database initialized at {}", db_path.display());
+    tracing::info!(
+        "Legacy SQLite compatibility DB initialized at {}",
+        db_path.display()
+    );
     Ok(Arc::new(DbPool {
         path: db_path,
         write_gate: Mutex::new(()),
