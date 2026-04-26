@@ -110,6 +110,13 @@ pub async fn patch_provider_cli(
         }
     };
 
+    if !is_supported_provider(&provider) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unsupported provider: {provider}")})),
+        );
+    }
+
     let Some(root) = crate::config::runtime_root() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -208,6 +215,10 @@ pub async fn patch_provider_cli(
             "updated_at": migration.updated_at,
         })),
     )
+}
+
+fn is_supported_provider(provider: &str) -> bool {
+    ALL_PROVIDERS.contains(&provider)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,6 +322,27 @@ mod tests {
         let (status, _) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn patch_unknown_provider_returns_bad_request_before_file_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime_root = RuntimeRootOverrideGuard::set(dir.path());
+
+        let state = make_state();
+        let body = ProviderCliActionRequest {
+            action: "rollback".to_string(),
+            evidence: None,
+            force_recreate_active: false,
+        };
+        let (status, Json(value)) =
+            patch_provider_cli(State(state), Path("../codex".to_string()), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            value["error"].as_str(),
+            Some("unsupported provider: ../codex")
+        );
     }
 
     #[tokio::test]

@@ -185,7 +185,7 @@
 | `server::routes::offices` | `src/server/routes/offices.rs` | 877 |  |
 | `server::routes::onboarding` | `src/server/routes/onboarding.rs` | 4471 | giant-file |
 | `server::routes::pipeline` | `src/server/routes/pipeline.rs` | 1697 | giant-file |
-| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 448 |  |
+| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 480 |  |
 | `server::routes::queue_api` | `src/server/routes/queue_api.rs` | 387 |  |
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 139 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1499 | giant-file |
@@ -328,7 +328,7 @@
 | `services::observability::metrics` | `src/services/observability/metrics.rs` | 391 |  |
 | `services::observability::watcher_latency` | `src/services/observability/watcher_latency.rs` | 443 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 20 |  |
-| `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 1348 | giant-file |
+| `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 1330 | giant-file |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1507 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 270 |  |

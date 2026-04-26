@@ -882,24 +882,6 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
-    struct RuntimeRootOverrideGuard {
-        previous: Option<PathBuf>,
-    }
-
-    impl RuntimeRootOverrideGuard {
-        fn set(path: &Path) -> Self {
-            let previous = crate::config::current_test_runtime_root_override();
-            crate::config::set_test_runtime_root_override(Some(path.to_path_buf()));
-            Self { previous }
-        }
-    }
-
-    impl Drop for RuntimeRootOverrideGuard {
-        fn drop(&mut self) {
-            crate::config::set_test_runtime_root_override(self.previous.take());
-        }
-    }
-
     fn registry_channel(path: &Path) -> crate::services::provider_cli::ProviderCliChannel {
         crate::services::provider_cli::ProviderCliChannel {
             path: path.to_string_lossy().to_string(),
