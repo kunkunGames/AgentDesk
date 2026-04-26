@@ -7,8 +7,10 @@ pub fn registry_path(root: &Path) -> PathBuf {
 
 /// `~/.adk/{env}/state/provider-cli-migration-{provider}.json`
 pub fn migration_state_path(root: &Path, provider: &str) -> PathBuf {
-    root.join("state")
-        .join(format!("provider-cli-migration-{provider}.json"))
+    root.join("state").join(format!(
+        "provider-cli-migration-{}.json",
+        sanitize_file_component(provider)
+    ))
 }
 
 /// `~/.adk/{env}/runtime/provider-cli-launch/{session_key}.json`
@@ -29,7 +31,11 @@ pub fn diagnostics_snapshot_path(root: &Path, timestamp_ms: u128) -> PathBuf {
 pub fn smoke_result_path(root: &Path, provider: &str, channel: &str) -> PathBuf {
     root.join("runtime")
         .join("provider-cli-smoke")
-        .join(format!("{provider}-{channel}.json"))
+        .join(format!(
+            "{}-{}.json",
+            sanitize_file_component(provider),
+            sanitize_file_component(channel)
+        ))
 }
 
 fn sanitize_file_component(raw: &str) -> String {
@@ -93,6 +99,30 @@ mod tests {
         assert_ne!(
             launch_artifact_path(root, "codex/live session"),
             launch_artifact_path(root, "codex_live_session")
+        );
+    }
+
+    #[test]
+    fn migration_state_path_sanitizes_provider_component() {
+        let root = Path::new("/tmp/adk-root");
+        let path = migration_state_path(root, "../codex");
+
+        assert_eq!(
+            path,
+            root.join("state").join("provider-cli-migration-codex.json")
+        );
+    }
+
+    #[test]
+    fn smoke_result_path_sanitizes_provider_and_channel_components() {
+        let root = Path::new("/tmp/adk-root");
+        let path = smoke_result_path(root, "../codex", "candidate/live");
+
+        assert_eq!(
+            path,
+            root.join("runtime")
+                .join("provider-cli-smoke")
+                .join("codex-candidate_live.json")
         );
     }
 }
