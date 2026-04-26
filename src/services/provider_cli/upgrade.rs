@@ -131,12 +131,17 @@ fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeErr
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(UpgradeError::UpgradeCommandTimedOut {
                     seconds: UPGRADE_COMMAND_TIMEOUT.as_secs(),
                 });
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(UpgradeError::Io(error));
             }
         }
     };
