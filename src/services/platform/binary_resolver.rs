@@ -700,12 +700,15 @@ pub fn resolve_provider_binary_for_context(
                     .and_then(|id| registry.agent_channel(&ctx.provider, id))
                     .unwrap_or("current");
 
-                let maybe_channel = match channel_name {
+                let selected_channel = match channel_name {
                     "candidate" => channels.candidate.as_ref(),
                     "default" => channels.default.as_ref(),
                     "previous" => channels.previous.as_ref(),
                     _ => channels.current.as_ref(),
                 };
+                let (channel_name, maybe_channel) = selected_channel
+                    .map(|channel| (channel_name, Some(channel)))
+                    .unwrap_or(("current", channels.current.as_ref()));
 
                 if let Some(channel) = maybe_channel {
                     let path = channel.path.clone();
