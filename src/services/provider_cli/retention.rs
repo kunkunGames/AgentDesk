@@ -61,6 +61,9 @@ pub fn build_retention_set(
             set.protect(&ch.path);
             set.protect(&ch.canonical_path);
         }
+        if let Some(path) = state.rollback_target.as_deref() {
+            set.protect(path);
+        }
     }
 
     set
@@ -84,7 +87,8 @@ pub fn cleanup_dry_run(scan_dir: &Path, set: &RetentionSet) -> std::io::Result<V
 mod tests {
     use super::*;
     use crate::services::provider_cli::registry::{
-        ProviderChannels, ProviderCliChannel, ProviderCliRegistry,
+        MigrationState, ProviderChannels, ProviderCliChannel, ProviderCliMigrationState,
+        ProviderCliRegistry,
     };
     use chrono::Utc;
     use std::collections::HashMap;
@@ -128,5 +132,24 @@ mod tests {
         let set = build_retention_set(&registry, &[]);
         assert!(set.is_protected("/usr/local/bin/codex"));
         assert!(set.is_protected("/usr/local/bin/codex.prev"));
+    }
+
+    #[test]
+    fn build_retention_set_includes_rollback_target() {
+        let state = ProviderCliMigrationState {
+            schema_version: 1,
+            provider: "codex".to_string(),
+            state: MigrationState::CanaryActive,
+            selected_agent_id: None,
+            current_channel: None,
+            candidate_channel: None,
+            rollback_target: Some("/tmp/codex.rollback".to_string()),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            history: vec![],
+        };
+
+        let set = build_retention_set(&ProviderCliRegistry::default(), &[state]);
+        assert!(set.is_protected("/tmp/codex.rollback"));
     }
 }

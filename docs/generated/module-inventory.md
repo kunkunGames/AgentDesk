@@ -335,11 +335,11 @@
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 26 |  |
 | `services::provider_cli::canary` | `src/services/provider_cli/canary.rs` | 107 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 70 |  |
-| `services::provider_cli::diagnostics` | `src/services/provider_cli/diagnostics.rs` | 170 |  |
+| `services::provider_cli::diagnostics` | `src/services/provider_cli/diagnostics.rs` | 177 |  |
 | `services::provider_cli::io` | `src/services/provider_cli/io.rs` | 151 |  |
 | `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 149 |  |
 | `services::provider_cli::registry` | `src/services/provider_cli/registry.rs` | 303 |  |
-| `services::provider_cli::retention` | `src/services/provider_cli/retention.rs` | 132 |  |
+| `services::provider_cli::retention` | `src/services/provider_cli/retention.rs` | 155 |  |
 | `services::provider_cli::smoke` | `src/services/provider_cli/smoke.rs` | 234 |  |
 | `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 123 |  |
 | `services::provider_cli::upgrade` | `src/services/provider_cli/upgrade.rs` | 706 |  |
