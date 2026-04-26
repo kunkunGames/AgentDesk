@@ -207,8 +207,10 @@ mod tests {
             Utc::now() - chrono::Duration::seconds(60),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("run a canary turn before promotion"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("run a canary turn before promotion")
+        );
     }
 }

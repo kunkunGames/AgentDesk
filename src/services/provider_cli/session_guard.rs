@@ -134,11 +134,7 @@ pub fn evaluate_session_migration_guards(
     }
 }
 
-fn build_guard(
-    provider: &str,
-    agent_id: &str,
-    target_channel: &str,
-) -> SessionMigrationGuard {
+fn build_guard(provider: &str, agent_id: &str, target_channel: &str) -> SessionMigrationGuard {
     SessionMigrationGuard {
         provider: provider.to_string(),
         agent_id: agent_id.to_string(),
