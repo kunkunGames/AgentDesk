@@ -5,8 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::registry::{
     MigrationHistoryEntry, MigrationState, ProviderCliChannel, ProviderCliMigrationState,
@@ -15,7 +14,6 @@ use super::registry::{
 use super::snapshot::snapshot_current_channel;
 
 const UPGRADE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const UPGRADE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const UPGRADE_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -90,59 +88,73 @@ struct UpgradeCommandOutput {
     stderr: String,
 }
 
-fn drain_limited_output<R>(mut reader: R) -> Vec<u8>
-where
-    R: Read + Send + 'static,
-{
-    let mut output = Vec::new();
-    let mut buf = [0u8; 1024];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let remaining = UPGRADE_OUTPUT_LIMIT_BYTES.saturating_sub(output.len());
-                if remaining > 0 {
-                    output.extend_from_slice(&buf[..n.min(remaining)]);
-                }
+struct UpgradeOutputTempFile {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl UpgradeOutputTempFile {
+    fn create(label: &str) -> std::io::Result<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100 {
+            let path = std::env::temp_dir().join(format!(
+                "agentdesk-provider-cli-upgrade-{label}-{}-{nonce}-{attempt}.log",
+                std::process::id()
+            ));
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
             }
-            Err(_) => break,
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted provider CLI upgrade output temp file names",
+        ))
     }
-    output
 }
 
-fn spawn_limited_output_drain<R>(reader: R) -> Receiver<Vec<u8>>
-where
-    R: Read + Send + 'static,
-{
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(drain_limited_output(reader));
-    });
-    receiver
+impl Drop for UpgradeOutputTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
-fn receive_limited_output(receiver: Option<Receiver<Vec<u8>>>) -> Vec<u8> {
-    let Some(receiver) = receiver else {
+fn read_limited_output_file(path: &Path) -> Vec<u8> {
+    let Ok(file) = fs::File::open(path) else {
         return Vec::new();
     };
 
-    receiver
-        .recv_timeout(UPGRADE_OUTPUT_DRAIN_TIMEOUT)
+    let mut output = Vec::new();
+    let mut limited = file.take(UPGRADE_OUTPUT_LIMIT_BYTES as u64);
+    limited
+        .read_to_end(&mut output)
+        .map(|_| output)
         .unwrap_or_default()
 }
 
 fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeError> {
     let (cmd, args) = argv.split_first().expect("command_argv is non-empty");
+    let stdout_file = UpgradeOutputTempFile::create("stdout")?;
+    let stderr_file = UpgradeOutputTempFile::create("stderr")?;
+
     let mut command = Command::new(cmd);
     command.args(args);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdout(Stdio::from(stdout_file.file.try_clone()?))
+        .stderr(Stdio::from(stderr_file.file.try_clone()?));
     crate::services::platform::binary_resolver::apply_runtime_path(&mut command);
     crate::services::process::configure_child_process_group(&mut command);
 
     let mut child = command.spawn().map_err(UpgradeError::Io)?;
-    let stdout_reader = child.stdout.take().map(spawn_limited_output_drain);
-    let stderr_reader = child.stderr.take().map(spawn_limited_output_drain);
 
     let deadline = Instant::now() + UPGRADE_COMMAND_TIMEOUT;
     let status = loop {
@@ -164,8 +176,7 @@ fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeErr
         }
     };
 
-    let _stdout = receive_limited_output(stdout_reader);
-    let stderr = receive_limited_output(stderr_reader);
+    let stderr = read_limited_output_file(&stderr_file.path);
 
     Ok(UpgradeCommandOutput {
         success: status.success(),
