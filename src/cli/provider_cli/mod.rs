@@ -73,9 +73,6 @@ pub enum ProviderCliAction {
         /// Operator note recorded in migration history
         #[arg(long)]
         evidence: Option<String>,
-        /// Allow promotion when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
     },
     /// Roll back migration to previous state
     Rollback {
@@ -109,9 +106,6 @@ pub enum ProviderCliAction {
         /// Auto-promote without waiting for operator confirmation
         #[arg(long)]
         auto_promote: bool,
-        /// Allow migration when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
     },
     /// Resume migration from the current persisted state
     Resume {
@@ -120,9 +114,6 @@ pub enum ProviderCliAction {
         /// Auto-promote without waiting for operator confirmation
         #[arg(long)]
         auto_promote: bool,
-        /// Allow migration when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
     },
 }
 
@@ -182,13 +173,9 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
             let provider = normalize_provider_arg(&provider)?;
             cmd_canary(&provider, canary_agent.as_deref())
         }
-        ProviderCliAction::Promote {
-            provider,
-            evidence,
-            force_recreate_active,
-        } => {
+        ProviderCliAction::Promote { provider, evidence } => {
             let provider = normalize_provider_arg(&provider)?;
-            cmd_promote(&provider, evidence.as_deref(), force_recreate_active)
+            cmd_promote(&provider, evidence.as_deref())
         }
         ProviderCliAction::Rollback { provider, evidence } => {
             let provider = normalize_provider_arg(&provider)?;
@@ -204,7 +191,6 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
             canary_agent,
             skip_upgrade,
             auto_promote,
-            force_recreate_active,
         } => {
             let provider = normalize_provider_arg(&provider)?;
             cmd_run(
@@ -213,16 +199,14 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
                 canary_agent.as_deref(),
                 skip_upgrade,
                 auto_promote,
-                force_recreate_active,
             )
         }
         ProviderCliAction::Resume {
             provider,
             auto_promote,
-            force_recreate_active,
         } => {
             let provider = normalize_provider_arg(&provider)?;
-            cmd_resume(&provider, auto_promote, force_recreate_active)
+            cmd_resume(&provider, auto_promote)
         }
     }
 }
@@ -474,11 +458,7 @@ fn canary_override_allowed(state: &MigrationState) -> bool {
     )
 }
 
-fn cmd_promote(
-    provider: &str,
-    evidence: Option<&str>,
-    force_recreate_active: bool,
-) -> Result<(), String> {
+fn cmd_promote(provider: &str, evidence: Option<&str>) -> Result<(), String> {
     let root = runtime_root()?;
     let mut state = load_migration_state(&root, provider)
         .map_err(|e| e.to_string())?
@@ -530,7 +510,6 @@ fn cmd_promote(
         provider,
         state.selected_agent_id.as_deref(),
         "candidate",
-        force_recreate_active,
     );
     if !guard.is_clear() {
         let selected_agent_id = state.selected_agent_id.clone();
@@ -693,7 +672,6 @@ fn cmd_run(
     canary_agent: Option<&str>,
     skip_upgrade: bool,
     auto_promote: bool,
-    force_recreate_active: bool,
 ) -> Result<(), String> {
     let root = runtime_root()?;
 
@@ -822,7 +800,6 @@ fn cmd_run(
             provider,
             std::slice::from_ref(&selected_agent_id),
             "candidate",
-            force_recreate_active,
         );
     if !canary_guard.is_clear() {
         transition(
@@ -877,11 +854,7 @@ fn cmd_run(
 }
 
 /// Resume migration from the current persisted state.
-fn cmd_resume(
-    provider: &str,
-    auto_promote: bool,
-    force_recreate_active: bool,
-) -> Result<(), String> {
+fn cmd_resume(provider: &str, auto_promote: bool) -> Result<(), String> {
     let root = runtime_root()?;
     let state = load_migration_state(&root, provider)
         .map_err(|e| e.to_string())?
@@ -898,7 +871,6 @@ fn cmd_resume(
                 cmd_promote(
                     provider,
                     Some("resumed with --auto-promote after verified canary"),
-                    force_recreate_active,
                 )
             } else {
                 eprintln!(
@@ -910,11 +882,7 @@ fn cmd_resume(
         }
         MigrationState::CanaryPassed => {
             if auto_promote {
-                cmd_promote(
-                    provider,
-                    Some("resumed with --auto-promote"),
-                    force_recreate_active,
-                )
+                cmd_promote(provider, Some("resumed with --auto-promote"))
             } else {
                 eprintln!(
                     "Migration is at CanaryPassed. Use --auto-promote or run `agentdesk provider-cli promote {provider}`."
@@ -925,11 +893,7 @@ fn cmd_resume(
         }
         MigrationState::AwaitingOperatorPromote => {
             if auto_promote {
-                cmd_promote(
-                    provider,
-                    Some("resumed with --auto-promote"),
-                    force_recreate_active,
-                )
+                cmd_promote(provider, Some("resumed with --auto-promote"))
             } else {
                 eprintln!(
                     "Migration is at AwaitingOperatorPromote. Use --auto-promote or run `agentdesk provider-cli promote {provider}`."
@@ -964,7 +928,6 @@ fn cmd_resume(
                 state.selected_agent_id.as_deref(),
                 skip_upgrade,
                 auto_promote,
-                force_recreate_active,
             )
         }
     }
@@ -1214,7 +1177,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1262,8 +1225,8 @@ mod tests {
         registry.providers.insert("codex".to_string(), channels);
         save_registry(dir.path(), &registry).unwrap();
 
-        // Active process on the old "current" channel triggers a session guard block
-        // (different channel than "candidate", process is alive, force=false).
+        // An active process on the old "current" channel is recorded in evidence but
+        // no longer blocks promotion — the guard allows recreation unconditionally.
         crate::services::provider_cli::io::save_launch_artifact(
             dir.path(),
             &LaunchArtifact {
@@ -1282,13 +1245,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
 
-        assert!(result.is_err());
-        assert_eq!(state.state, MigrationState::Failed);
+        // Promote succeeds even with an active old-channel session.
+        assert!(result.is_ok());
+        assert_eq!(state.state, MigrationState::ProviderAgentsMigrated);
         assert!(
             registry
                 .providers
@@ -1355,7 +1319,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1420,7 +1384,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1476,7 +1440,7 @@ mod tests {
         read_only.set_mode(0o444);
         std::fs::set_permissions(&state_path, read_only).unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
 
         let mut writable = std::fs::metadata(&state_path).unwrap().permissions();
         writable.set_mode(0o644);

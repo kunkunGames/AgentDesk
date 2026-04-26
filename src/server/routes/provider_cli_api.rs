@@ -229,7 +229,6 @@ pub async fn patch_provider_cli(
             &provider,
             migration.selected_agent_id.as_deref(),
             "candidate",
-            body.force_recreate_active,
         );
 
         if let Err(error) = canary_ready_result {
@@ -457,7 +456,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "invalid_action".to_string(),
             evidence: None,
-            force_recreate_active: false,
         };
         let (status, _) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
@@ -473,7 +471,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "rollback".to_string(),
             evidence: None,
-            force_recreate_active: false,
         };
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("../codex".to_string()), Json(body)).await;
@@ -542,7 +539,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "confirm_promote".to_string(),
             evidence: Some("operator approved".to_string()),
-            force_recreate_active: false,
         };
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
@@ -621,7 +617,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "confirm_promote".to_string(),
             evidence: Some("operator approved".to_string()),
-            force_recreate_active: false,
         };
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
@@ -691,7 +686,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "rollback".to_string(),
             evidence: Some("operator rollback".to_string()),
-            force_recreate_active: false,
         };
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
@@ -742,7 +736,6 @@ mod tests {
         let body = ProviderCliActionRequest {
             action: "rollback".to_string(),
             evidence: Some("operator rollback".to_string()),
-            force_recreate_active: false,
         };
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;

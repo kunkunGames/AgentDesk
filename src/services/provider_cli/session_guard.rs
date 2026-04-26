@@ -54,7 +54,6 @@ pub fn evaluate_session_migration_guards(
     provider: &str,
     target_agent_ids: &[String],
     target_channel: &str,
-    force_recreate_active: bool,
 ) -> SessionGuardEvaluation {
     let artifacts = load_launch_artifacts(root, provider);
     let mut agents: HashSet<String> = target_agent_ids.iter().cloned().collect();
@@ -73,7 +72,7 @@ pub fn evaluate_session_migration_guards(
         let agent_artifacts = artifacts_for_agent(&artifacts, &agent_id);
         if agent_artifacts.is_empty() {
             // Agent has never been launched — no active session to protect.
-            let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
+            let mut guard = build_guard(provider, &agent_id, target_channel);
             guard.safe_to_recreate = true;
             guard.recreate_required = true;
             guard.active_turn_state = "no_prior_launch".to_string();
@@ -85,7 +84,7 @@ pub fn evaluate_session_migration_guards(
         }
 
         for artifact in agent_artifacts {
-            let mut guard = build_guard(provider, &agent_id, target_channel, force_recreate_active);
+            let mut guard = build_guard(provider, &agent_id, target_channel);
             guard.session_key = artifact.session_key.clone();
             guard.pre_migration_channel = Some(artifact.channel.clone());
             guard.evidence.insert(
@@ -106,18 +105,6 @@ pub fn evaluate_session_migration_guards(
                     "status".to_string(),
                     "already_on_target_channel".to_string(),
                 );
-            } else if active && !force_recreate_active {
-                guard.safe_to_recreate = false;
-                guard.recreate_required = true;
-                guard.active_turn_state = "active_old_channel_session".to_string();
-                let blocker = format!(
-                    "{provider}/{agent_id} has active {old} session; target={target_channel}",
-                    old = artifact.channel
-                );
-                guard
-                    .evidence
-                    .insert("blocker".to_string(), blocker.clone());
-                blockers.push(blocker);
             } else {
                 guard.safe_to_recreate = true;
                 guard.recreate_required = true;
@@ -125,11 +112,14 @@ pub fn evaluate_session_migration_guards(
                 guard.evidence.insert(
                     "status".to_string(),
                     if active {
-                        "force_recreate_active".to_string()
+                        "active_old_channel_session".to_string()
                     } else {
                         "old_channel_session_not_active".to_string()
                     },
                 );
+                if active {
+                    guard.active_turn_state = "active_old_channel_session".to_string();
+                }
             }
 
             guards.push(guard);
@@ -148,7 +138,6 @@ fn build_guard(
     provider: &str,
     agent_id: &str,
     target_channel: &str,
-    force_recreate_active: bool,
 ) -> SessionMigrationGuard {
     SessionMigrationGuard {
         provider: provider.to_string(),
@@ -162,7 +151,7 @@ fn build_guard(
         safe_end_timeout_seconds: DEFAULT_SAFE_END_TIMEOUT_SECONDS,
         safe_to_recreate: false,
         recreate_required: false,
-        force_recreate_active,
+        force_recreate_active: false,
         evidence: HashMap::new(),
     }
 }
@@ -240,7 +229,6 @@ mod tests {
             "codex",
             &["codex-agent".to_string()],
             "candidate",
-            false,
         );
 
         assert!(evaluation.is_clear());
@@ -285,17 +273,16 @@ mod tests {
             "codex",
             &["codex-agent".to_string()],
             "candidate",
-            false,
         );
 
-        assert!(!evaluation.is_clear());
+        // Active old-channel session is recorded in evidence but no longer blocks.
+        assert!(evaluation.is_clear());
         assert_eq!(evaluation.guards.len(), 2);
-        assert_eq!(evaluation.blockers.len(), 1);
-        assert!(evaluation.blockers[0].contains("active current session"));
+        assert!(evaluation.blockers.is_empty());
     }
 
     #[test]
-    fn guard_blocks_active_old_channel_without_force() {
+    fn guard_allows_active_old_channel_session() {
         let root = tempfile::tempdir().unwrap();
         crate::services::provider_cli::io::save_launch_artifact(
             root.path(),
@@ -308,29 +295,6 @@ mod tests {
             "codex",
             &["codex-agent".to_string()],
             "candidate",
-            false,
-        );
-
-        assert!(!evaluation.is_clear());
-        assert_eq!(evaluation.blockers.len(), 1);
-        assert!(!evaluation.guards[0].safe_to_recreate);
-    }
-
-    #[test]
-    fn guard_allows_forced_active_old_channel() {
-        let root = tempfile::tempdir().unwrap();
-        crate::services::provider_cli::io::save_launch_artifact(
-            root.path(),
-            &artifact("codex-agent", "current", Some(std::process::id())),
-        )
-        .unwrap();
-
-        let evaluation = evaluate_session_migration_guards(
-            root.path(),
-            "codex",
-            &["codex-agent".to_string()],
-            "candidate",
-            true,
         );
 
         assert!(evaluation.is_clear());
@@ -340,7 +304,31 @@ mod tests {
                 .evidence
                 .get("status")
                 .map(String::as_str),
-            Some("force_recreate_active")
+            Some("active_old_channel_session")
+        );
+    }
+
+    #[test]
+    fn guard_records_active_state_in_evidence_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        crate::services::provider_cli::io::save_launch_artifact(
+            root.path(),
+            &artifact("codex-agent", "current", Some(std::process::id())),
+        )
+        .unwrap();
+
+        let evaluation = evaluate_session_migration_guards(
+            root.path(),
+            "codex",
+            &["codex-agent".to_string()],
+            "candidate",
+        );
+
+        assert!(evaluation.is_clear());
+        assert!(evaluation.guards[0].safe_to_recreate);
+        assert_eq!(
+            evaluation.guards[0].active_turn_state,
+            "active_old_channel_session"
         );
     }
 }
