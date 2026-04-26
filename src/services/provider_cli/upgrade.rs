@@ -1,12 +1,18 @@
 use chrono::Utc;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::registry::{
     MigrationHistoryEntry, MigrationState, ProviderCliChannel, ProviderCliMigrationState,
     update_strategy_for,
 };
 use super::snapshot::snapshot_current_channel;
+
+const UPGRADE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const UPGRADE_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum UpgradeError {
@@ -18,6 +24,13 @@ pub enum UpgradeError {
     UpgradeCommandFailed {
         exit_code: Option<i32>,
         stderr: String,
+    },
+    UpgradeCommandTimedOut {
+        seconds: u64,
+    },
+    VersionUnknown {
+        pre_version: String,
+        post_version: String,
     },
     VersionUnchanged {
         version: String,
@@ -36,6 +49,16 @@ impl std::fmt::Display for UpgradeError {
             UpgradeError::UpgradeCommandFailed { exit_code, stderr } => {
                 write!(f, "upgrade_command_failed(exit={exit_code:?}): {stderr}")
             }
+            UpgradeError::UpgradeCommandTimedOut { seconds } => {
+                write!(f, "upgrade_command_timed_out_after_{seconds}s")
+            }
+            UpgradeError::VersionUnknown {
+                pre_version,
+                post_version,
+            } => write!(
+                f,
+                "upgrade_version_unknown(pre={pre_version:?}, post={post_version:?})"
+            ),
             UpgradeError::VersionUnchanged { version } => {
                 write!(f, "upgrade_version_unchanged: {version}")
             }
@@ -57,6 +80,88 @@ pub struct UpgradeResult {
     pub evidence: HashMap<String, String>,
 }
 
+struct UpgradeCommandOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stderr: String,
+}
+
+fn drain_limited_output<R>(mut reader: R) -> Vec<u8>
+where
+    R: Read + Send + 'static,
+{
+    let mut output = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let remaining = UPGRADE_OUTPUT_LIMIT_BYTES.saturating_sub(output.len());
+                if remaining > 0 {
+                    output.extend_from_slice(&buf[..n.min(remaining)]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    output
+}
+
+fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeError> {
+    let (cmd, args) = argv.split_first().expect("command_argv is non-empty");
+    let mut command = Command::new(cmd);
+    command.args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::services::platform::binary_resolver::apply_runtime_path(&mut command);
+
+    let mut child = command.spawn().map_err(UpgradeError::Io)?;
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|reader| std::thread::spawn(move || drain_limited_output(reader)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|reader| std::thread::spawn(move || drain_limited_output(reader)));
+
+    let deadline = Instant::now() + UPGRADE_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.and_then(|reader| reader.join().ok());
+                let _ = stderr_reader.and_then(|reader| reader.join().ok());
+                return Err(UpgradeError::UpgradeCommandTimedOut {
+                    seconds: UPGRADE_COMMAND_TIMEOUT.as_secs(),
+                });
+            }
+        }
+    };
+
+    let _stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+
+    Ok(UpgradeCommandOutput {
+        success: status.success(),
+        exit_code: status.code(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+fn version_is_unknown(version: &str) -> bool {
+    let value = version.trim();
+    value.is_empty() || value.eq_ignore_ascii_case("unknown")
+}
+
 /// Run the allowlisted update strategy for `provider`.
 ///
 /// Guards (in order):
@@ -76,9 +181,7 @@ pub fn run_upgrade(
     // Guard: mutates_in_place requires previous preservation.
     if strategy.mutates_in_place && !skip_previous_preservation {
         match previous_preservation_path {
-            Some(dest) if dest.exists() => {}
             Some(dest) => {
-                // Copy current binary to the preservation path.
                 let src = std::path::Path::new(&current_snapshot.canonical_path);
                 if src.exists() {
                     if let Some(parent) = dest.parent() {
@@ -106,17 +209,12 @@ pub fn run_upgrade(
 
     // Run the update command.
     let argv = strategy.command_argv;
-    let (cmd, args) = argv.split_first().expect("command_argv is non-empty");
+    let output = run_upgrade_command(argv)?;
 
-    let output = std::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| UpgradeError::Io(e))?;
-
-    if !output.status.success() {
+    if !output.success {
         return Err(UpgradeError::UpgradeCommandFailed {
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.exit_code,
+            stderr: output.stderr,
         });
     }
 
@@ -130,10 +228,18 @@ pub fn run_upgrade(
     let post_version = post_channel.version.clone();
 
     // Guard: version must change (for mutates_in_place providers).
-    if strategy.mutates_in_place && pre_version == post_version && !pre_version.is_empty() {
-        return Err(UpgradeError::VersionUnchanged {
-            version: post_version,
-        });
+    if strategy.mutates_in_place {
+        if version_is_unknown(&pre_version) || version_is_unknown(&post_version) {
+            return Err(UpgradeError::VersionUnknown {
+                pre_version,
+                post_version,
+            });
+        }
+        if pre_version == post_version {
+            return Err(UpgradeError::VersionUnchanged {
+                version: post_version,
+            });
+        }
     }
 
     let mut evidence = HashMap::new();

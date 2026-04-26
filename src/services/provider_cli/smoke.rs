@@ -1,6 +1,7 @@
 use chrono::Utc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::registry::{SmokeCheckStatus, SmokeChecks, SmokeResult};
 
@@ -9,17 +10,19 @@ const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct CheckRunner<'a> {
     binary: &'a str,
     canonical_path: &'a str,
-    provider: &'a str,
-    channel: &'a str,
 }
 
 impl<'a> CheckRunner<'a> {
     fn run_version(&self) -> SmokeCheckStatus {
-        match std::process::Command::new(self.binary)
+        let mut command = Command::new(self.binary);
+        command
             .arg("--version")
-            .output()
-        {
-            Ok(out) if out.status.success() => SmokeCheckStatus::Ok,
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::services::platform::augment_exec_path(&mut command, self.canonical_path);
+
+        match run_command_status_with_timeout(command, SMOKE_TIMEOUT) {
+            Ok(true) => SmokeCheckStatus::Ok,
             _ => SmokeCheckStatus::Failed,
         }
     }
@@ -49,6 +52,28 @@ impl<'a> CheckRunner<'a> {
 
     fn run_cancel(&self) -> SmokeCheckStatus {
         SmokeCheckStatus::Skipped
+    }
+}
+
+fn run_command_status_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status.success()),
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+        }
     }
 }
 
@@ -89,8 +114,6 @@ pub fn run_smoke(
     let runner = CheckRunner {
         binary: binary_path,
         canonical_path,
-        provider,
-        channel,
     };
 
     let checks = SmokeChecks {
