@@ -326,7 +326,7 @@
 | `services::observability::metrics` | `src/services/observability/metrics.rs` | 391 |  |
 | `services::observability::watcher_latency` | `src/services/observability/watcher_latency.rs` | 443 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 20 |  |
-| `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 1023 | giant-file |
+| `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 1034 | giant-file |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1507 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 270 |  |
@@ -335,9 +335,9 @@
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 13 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 70 |  |
 | `services::provider_cli::io` | `src/services/provider_cli/io.rs` | 151 |  |
-| `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 33 |  |
+| `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 73 |  |
 | `services::provider_cli::registry` | `src/services/provider_cli/registry.rs` | 303 |  |
-| `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 119 |  |
+| `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 123 |  |
 | `services::provider_exec` | `src/services/provider_exec.rs` | 381 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 706 |  |

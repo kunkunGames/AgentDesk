@@ -47,6 +47,10 @@ pub fn resolve_binary_with_login_shell(name: &str) -> Option<String> {
 }
 
 pub fn resolve_provider_binary(provider: &str) -> BinaryResolution {
+    resolve_provider_binary_legacy(provider)
+}
+
+fn resolve_provider_binary_legacy(provider: &str) -> BinaryResolution {
     let requested_binary = normalize_name(provider);
     let override_var = override_var_name(&requested_binary);
     let cwd = current_dir_fallback();
