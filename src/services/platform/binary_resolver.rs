@@ -706,30 +706,50 @@ pub fn resolve_provider_binary_for_context(
                     "previous" => channels.previous.as_ref(),
                     _ => channels.current.as_ref(),
                 };
-                let (channel_name, maybe_channel) = selected_channel
-                    .map(|channel| (channel_name, Some(channel)))
-                    .unwrap_or(("current", channels.current.as_ref()));
 
-                if let Some(channel) = maybe_channel {
-                    let path = channel.path.clone();
-                    let canonical = channel.canonical_path.clone();
-                    let source_tag = format!("registry:{channel_name}");
-                    let exec_path = build_exec_path(Path::new(&path), Some(Path::new(&canonical)));
-                    return BinaryResolution {
-                        requested_binary: ctx.provider.clone(),
-                        resolved_path: Some(path),
-                        canonical_path: Some(canonical),
-                        source: Some(source_tag),
-                        attempts: vec![],
-                        failure_kind: None,
-                        exec_path,
-                    };
+                if let Some(channel) = selected_channel {
+                    if let Some(resolution) =
+                        registry_channel_resolution(&ctx.provider, channel_name, channel)
+                    {
+                        return resolution;
+                    }
+                }
+
+                if channel_name != "current" {
+                    if let Some(channel) = channels.current.as_ref() {
+                        if let Some(resolution) =
+                            registry_channel_resolution(&ctx.provider, "current", channel)
+                        {
+                            return resolution;
+                        }
+                    }
                 }
             }
         }
     }
     // 3. Fall back to legacy resolver.
     resolve_provider_binary_legacy(&ctx.provider)
+}
+
+fn registry_channel_resolution(
+    provider: &str,
+    channel_name: &str,
+    channel: &crate::services::provider_cli::ProviderCliChannel,
+) -> Option<BinaryResolution> {
+    let cwd = current_dir_fallback();
+    let resolved_path = resolve_candidate_path(Path::new(&channel.path), &cwd).ok()?;
+    let canonical_path = std::fs::canonicalize(&resolved_path).ok();
+    let exec_path = build_exec_path(&resolved_path, canonical_path.as_deref());
+
+    Some(BinaryResolution {
+        requested_binary: provider.to_string(),
+        resolved_path: Some(resolved_path.to_string_lossy().to_string()),
+        canonical_path: canonical_path.map(|path| path.to_string_lossy().to_string()),
+        source: Some(format!("registry:{channel_name}")),
+        attempts: vec![],
+        failure_kind: None,
+        exec_path,
+    })
 }
 
 #[cfg(test)]
@@ -739,6 +759,24 @@ mod tests {
 
     fn env_guard() -> MutexGuard<'static, ()> {
         crate::services::discord::runtime_store::lock_test_env()
+    }
+
+    struct RuntimeRootOverrideGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl RuntimeRootOverrideGuard {
+        fn set(path: &Path) -> Self {
+            let previous = crate::config::current_test_runtime_root_override();
+            crate::config::set_test_runtime_root_override(Some(path.to_path_buf()));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RuntimeRootOverrideGuard {
+        fn drop(&mut self) {
+            crate::config::set_test_runtime_root_override(self.previous.take());
+        }
     }
 
     #[cfg(unix)]
@@ -909,6 +947,64 @@ mod tests {
                 .iter()
                 .any(|attempt| attempt.contains("permission_denied"))
         );
+
+        unsafe {
+            std::env::remove_var("AGENTDESK_CODEX_PATH");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_resolver_falls_back_when_registry_path_is_not_executable() {
+        use crate::services::provider_cli::registry::{
+            ProviderChannels, ProviderCliChannel, ProviderCliRegistry,
+        };
+        use chrono::Utc;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _runtime_root = RuntimeRootOverrideGuard::set(temp.path());
+        let invalid_registry_path = temp.path().join("registry-codex");
+        let fallback_path = temp.path().join("env-codex");
+        std::fs::write(&invalid_registry_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&invalid_registry_path)
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&invalid_registry_path, perms).unwrap();
+        write_executable(&fallback_path);
+
+        let mut registry = ProviderCliRegistry::default();
+        registry.providers.insert(
+            "codex".to_string(),
+            ProviderChannels {
+                current: Some(ProviderCliChannel {
+                    path: invalid_registry_path.to_string_lossy().to_string(),
+                    canonical_path: invalid_registry_path.to_string_lossy().to_string(),
+                    version: "registry".to_string(),
+                    version_output: None,
+                    source: "test".to_string(),
+                    checked_at: Utc::now(),
+                    evidence: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        crate::services::provider_cli::io::save_registry(temp.path(), &registry).unwrap();
+
+        unsafe {
+            std::env::set_var("AGENTDESK_CODEX_PATH", &fallback_path);
+        }
+        let resolution = resolve_provider_binary_for_context(
+            &crate::services::provider_cli::ProviderExecutionContext::for_provider("codex"),
+        );
+
+        assert_eq!(
+            resolution.resolved_path.as_deref(),
+            Some(fallback_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(resolution.source.as_deref(), Some("env_override"));
 
         unsafe {
             std::env::remove_var("AGENTDESK_CODEX_PATH");
