@@ -3958,9 +3958,10 @@ pub(super) async fn tmux_output_watcher_with_restore(
             }
         };
 
-        let poll_decision = if data.is_empty() && all_data.is_empty() {
+        let bytes_available = data.len().saturating_add(all_data.len());
+        let poll_decision = if bytes_available == 0 {
             watcher_output_poll_decision(
-                data.len(),
+                bytes_available,
                 Some(tmux_liveness_decision(
                     cancel.load(Ordering::Relaxed),
                     shared.shutting_down.load(Ordering::Relaxed),
@@ -3968,7 +3969,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 )),
             )
         } else {
-            watcher_output_poll_decision(data.len(), None)
+            watcher_output_poll_decision(bytes_available, None)
         };
         match poll_decision {
             WatcherOutputPollDecision::DrainOutput => {}
