@@ -479,8 +479,11 @@ pub fn transition(
 
 fn is_valid_transition(from: &MigrationState, to: &MigrationState) -> bool {
     use MigrationState::*;
-    if matches!(from, RolledBack | Failed) {
+    if matches!(from, RolledBack) {
         return from == to;
+    }
+    if matches!(from, Failed) {
+        return matches!(to, Failed | RolledBack);
     }
 
     matches!(
@@ -570,7 +573,9 @@ mod tests {
 
         let mut failed = new_migration_state("codex", make_channel());
         transition(&mut failed, MigrationState::Failed, None).unwrap();
-        assert!(transition(&mut failed, MigrationState::RolledBack, None).is_err());
+        assert!(transition(&mut failed, MigrationState::CurrentSnapshotted, None).is_err());
+        transition(&mut failed, MigrationState::RolledBack, None).unwrap();
+        assert_eq!(failed.state, MigrationState::RolledBack);
     }
 
     #[test]
