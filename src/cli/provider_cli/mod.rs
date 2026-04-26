@@ -11,7 +11,9 @@ use crate::services::provider_cli::orchestration::{
 use crate::services::provider_cli::registry::{MigrationState, PROVIDER_UPDATE_STRATEGIES};
 use crate::services::provider_cli::smoke::run_smoke;
 use crate::services::provider_cli::snapshot::snapshot_current_channel;
-use crate::services::provider_cli::upgrade::{new_migration_state, run_upgrade, transition};
+use crate::services::provider_cli::upgrade::{
+    migration_state_rank, new_migration_state, run_upgrade, transition,
+};
 use crate::services::provider_cli::{build_retention_set, cleanup_dry_run};
 
 #[derive(Args)]
@@ -283,6 +285,14 @@ fn cmd_upgrade(
         state.candidate_channel = Some(candidate.clone());
         save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
+        let mut registry = load_registry(&root)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let channels = registry.providers.entry(provider.to_string()).or_default();
+        channels.current.get_or_insert_with(|| current.clone());
+        channels.candidate = Some(candidate);
+        save_registry(&root, &registry).map_err(|e| e.to_string())?;
+
         print_json(&json!({
             "provider": provider,
             "candidate_path": path,
@@ -376,8 +386,15 @@ fn cmd_canary(provider: &str, canary_agent: Option<&str>) -> Result<(), String> 
 
     // In a CLI context we don't have live session info; set the agent id directly.
     let agent_id = canary_agent
+        .filter(|agent| !agent.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| state.selected_agent_id.clone())
+        .or_else(|| {
+            state
+                .selected_agent_id
+                .as_deref()
+                .filter(|agent| !agent.trim().is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| "no canary agent specified (use --agent <agent-id>)".to_string())?;
 
     state.selected_agent_id = Some(agent_id.clone());
@@ -466,7 +483,7 @@ fn cmd_rollback(provider: &str, evidence: Option<&str>) -> Result<(), String> {
 
     // Restore previous binary to current slot in registry if rollback_target is set.
     if state.rollback_target.is_some() || state.current_channel.is_some() {
-        let _ = rollback_registry_previous(&root, provider);
+        rollback_registry_previous(&root, provider)?;
     }
 
     save_migration_state(&root, &state).map_err(|e| e.to_string())?;
@@ -806,10 +823,17 @@ fn advance_to(
     next: MigrationState,
     evidence: Option<String>,
 ) -> Result<(), String> {
-    if state.state == next {
+    if state_is_at_or_past(&state.state, &next) {
         return Ok(());
     }
     transition(state, next, evidence).map_err(|e| format!("advance_to: {e}"))
+}
+
+fn state_is_at_or_past(current: &MigrationState, next: &MigrationState) -> bool {
+    match (migration_state_rank(current), migration_state_rank(next)) {
+        (Some(current_rank), Some(next_rank)) => current_rank >= next_rank,
+        _ => current == next,
+    }
 }
 
 #[cfg(test)]

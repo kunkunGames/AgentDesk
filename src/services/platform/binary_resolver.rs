@@ -833,7 +833,7 @@ fn record_context_launch_artifact(
         canonical_path,
         cli_version: cli_version.to_string(),
         process_id: None,
-        tmux_session: ctx.session_key.clone(),
+        tmux_session: ctx.tmux_session.clone(),
         launched_at: chrono::Utc::now(),
     };
 
@@ -954,6 +954,7 @@ mod tests {
             agent_id: Some("codex-agent".to_string()),
             channel_id: Some("123".to_string()),
             session_key: Some("session-1".to_string()),
+            tmux_session: Some("agentdesk-codex-agent-sandbox".to_string()),
             channel_name: Some("agent-sandbox".to_string()),
             execution_mode: Some("discord_turn".to_string()),
         };
@@ -972,6 +973,10 @@ mod tests {
         assert_eq!(artifact.provider, "codex");
         assert_eq!(artifact.agent_id.as_deref(), Some("codex-agent"));
         assert_eq!(artifact.channel, "candidate");
+        assert_eq!(
+            artifact.tmux_session.as_deref(),
+            Some("agentdesk-codex-agent-sandbox")
+        );
         assert_eq!(
             artifact.canonical_path,
             std::fs::canonicalize(&candidate)

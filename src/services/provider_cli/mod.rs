@@ -16,6 +16,7 @@ pub use context::ProviderExecutionContext;
 pub use diagnostics::{
     DiagnosticsSnapshot, MigrationDiagnostics, ProviderCliActionRequest, ProviderCliStatusResponse,
     ProviderDiagnostics, RuntimeConsistency, SessionDiagnostics, build_snapshot,
+    migration_state_wire_value,
 };
 pub use registry::{
     LaunchArtifact, MigrationHistoryEntry, MigrationState, PROVIDER_UPDATE_STRATEGIES,

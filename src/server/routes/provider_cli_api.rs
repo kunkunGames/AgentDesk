@@ -10,12 +10,14 @@ use crate::services::provider_cli::io::{
     load_migration_state, load_registry, load_smoke_result, save_migration_state,
 };
 use crate::services::provider_cli::orchestration::{
-    promote_registry_candidate, rollback_registry_previous, session_guard_evidence,
+    evaluate_provider_session_guard, promote_registry_candidate, rollback_registry_previous,
+    session_guard_evidence,
 };
 use crate::services::provider_cli::registry::MigrationState;
-use crate::services::provider_cli::upgrade::transition;
+use crate::services::provider_cli::upgrade::{migration_state_rank, transition};
 use crate::services::provider_cli::{
     MigrationDiagnostics, ProviderCliActionRequest, ProviderCliStatusResponse, ProviderDiagnostics,
+    migration_state_wire_value,
 };
 
 use super::AppState;
@@ -64,7 +66,7 @@ pub async fn get_provider_cli_status(State(_state): State<AppState>) -> (StatusC
         if let Ok(Some(ms)) = load_migration_state(&root, provider) {
             migrations.push(MigrationDiagnostics {
                 provider: provider.to_string(),
-                state: format!("{:?}", ms.state),
+                state: migration_state_wire_value(&ms.state),
                 canary_agent_id: ms.selected_agent_id.clone(),
                 started_at: Some(ms.started_at),
                 updated_at: Some(ms.updated_at),
@@ -96,9 +98,10 @@ pub async fn patch_provider_cli(
     Path(provider): Path<String>,
     Json(body): Json<ProviderCliActionRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let confirm_promote = match body.action.as_str() {
-        "confirm_promote" => true,
-        "rollback" | "rollback_to_previous" => false,
+    let action = match body.action.as_str() {
+        "confirm_promote" => ProviderCliApiAction::ConfirmPromote,
+        "rollback" => ProviderCliApiAction::Rollback,
+        "rollback_to_previous" => ProviderCliApiAction::RollbackToPrevious,
         action => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -130,12 +133,11 @@ pub async fn patch_provider_cli(
         }
     };
 
-    let transition_result = if confirm_promote {
-        let target_agent_ids: Vec<String> = migration.selected_agent_id.iter().cloned().collect();
-        let guard = crate::services::provider_cli::session_guard::evaluate_session_migration_guards(
+    let transition_result = if matches!(action, ProviderCliApiAction::ConfirmPromote) {
+        let guard = evaluate_provider_session_guard(
             &root,
             &provider,
-            &target_agent_ids,
+            migration.selected_agent_id.as_deref(),
             "candidate",
             body.force_recreate_active,
         );
@@ -174,7 +176,13 @@ pub async fn patch_provider_cli(
             body.evidence.clone(),
         )
         .map_err(|e| e.to_string())
-        .and_then(|_| rollback_registry_previous(&root, &provider))
+        .and_then(|_| {
+            if matches!(action, ProviderCliApiAction::RollbackToPrevious) {
+                rollback_registry_previous(&root, &provider)
+            } else {
+                Ok(())
+            }
+        })
     };
 
     if let Err(e) = transition_result {
@@ -196,10 +204,17 @@ pub async fn patch_provider_cli(
         Json(json!({
             "provider": provider,
             "action": body.action,
-            "state": format!("{:?}", migration.state),
+            "state": migration_state_wire_value(&migration.state),
             "updated_at": migration.updated_at,
         })),
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderCliApiAction {
+    ConfirmPromote,
+    Rollback,
+    RollbackToPrevious,
 }
 
 fn advance_to(
@@ -207,10 +222,17 @@ fn advance_to(
     next: MigrationState,
     evidence: Option<String>,
 ) -> Result<(), String> {
-    if state.state == next {
+    if state_is_at_or_past(&state.state, &next) {
         return Ok(());
     }
     transition(state, next, evidence).map_err(|e| e.to_string())
+}
+
+fn state_is_at_or_past(current: &MigrationState, next: &MigrationState) -> bool {
+    match (migration_state_rank(current), migration_state_rank(next)) {
+        (Some(current_rank), Some(next_rank)) => current_rank >= next_rank,
+        _ => current == next,
+    }
 }
 
 #[cfg(test)]
@@ -353,7 +375,7 @@ mod tests {
         let (status, Json(value)) =
             patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value["state"].as_str().unwrap(), "ProviderAgentsMigrated");
+        assert_eq!(value["state"].as_str().unwrap(), "provider_agents_migrated");
         let registry = crate::services::provider_cli::io::load_registry(dir.path())
             .unwrap()
             .unwrap();

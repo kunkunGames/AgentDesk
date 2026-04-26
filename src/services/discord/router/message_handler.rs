@@ -1381,6 +1381,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         agent_id: role_binding.as_ref().map(|binding| binding.role_id.clone()),
         channel_id: Some(channel_id.get().to_string()),
         session_key: adk_session_key.clone(),
+        tmux_session: tmux_session_name.clone(),
         channel_name: channel_name.clone(),
         execution_mode: Some("discord_turn".to_string()),
     };
@@ -3349,6 +3350,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         agent_id: role_binding.as_ref().map(|binding| binding.role_id.clone()),
         channel_id: Some(channel_id.get().to_string()),
         session_key: adk_session_key.clone(),
+        tmux_session: tmux_session_name.clone(),
         channel_name: channel_name.clone(),
         execution_mode: Some("discord_turn".to_string()),
     };

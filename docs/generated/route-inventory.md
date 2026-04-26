@@ -179,8 +179,8 @@
 | `PUT` | `/api/pipeline/stages` | `pipeline::put_stages` | `src/server/routes/pipeline.rs:177` | `src/server/routes/domains/ops.rs:46` |
 | `POST` | `/api/pm-decision` | `kanban::pm_decision` | `src/server/routes/kanban.rs:2430` | `src/server/routes/domains/kanban.rs:58` |
 | `GET` | `/api/policies` | `agents_crud::list_policies` | `src/server/routes/agents_crud.rs:2558` | `src/server/routes/domains/agents.rs:48` |
-| `GET` | `/api/provider-cli` | `provider_cli_api::get_provider_cli_status` | `src/server/routes/provider_cli_api.rs:26` | `src/server/routes/domains/ops.rs:237` |
-| `PATCH` | `/api/provider-cli/{provider}` | `provider_cli_api::patch_provider_cli` | `src/server/routes/provider_cli_api.rs:94` | `src/server/routes/domains/ops.rs:241` |
+| `GET` | `/api/provider-cli` | `provider_cli_api::get_provider_cli_status` | `src/server/routes/provider_cli_api.rs:28` | `src/server/routes/domains/ops.rs:237` |
+| `PATCH` | `/api/provider-cli/{provider}` | `provider_cli_api::patch_provider_cli` | `src/server/routes/provider_cli_api.rs:96` | `src/server/routes/domains/ops.rs:241` |
 | `GET` | `/api/quality/events` | `analytics::quality_events` | `src/server/routes/analytics.rs:95` | `src/server/routes/domains/admin.rs:72` |
 | `POST` | `/api/queue/cancel` | `auto_queue::cancel` | `src/server/routes/auto_queue.rs:10731` | `src/server/routes/domains/ops.rs:204` |
 | `POST` | `/api/queue/dispatch` | `auto_queue::dispatch` | `src/server/routes/auto_queue.rs:8287` | `src/server/routes/domains/ops.rs:151` |
