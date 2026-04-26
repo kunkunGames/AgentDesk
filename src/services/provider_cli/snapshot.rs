@@ -11,7 +11,8 @@ pub fn snapshot_current_channel(provider: &str) -> Option<ProviderCliChannel> {
     let resolved_path = resolution.resolved_path.as_ref()?;
 
     let binary_path = std::path::Path::new(resolved_path);
-    let (version_output, _err) = probe_resolved_binary_version(binary_path, &resolution);
+    let (version_output, version_probe_error) =
+        probe_resolved_binary_version(binary_path, &resolution);
 
     let version = version_output
         .as_deref()
@@ -28,6 +29,9 @@ pub fn snapshot_current_channel(provider: &str) -> Option<ProviderCliChannel> {
     let mut evidence = HashMap::new();
     if let Some(output) = &version_output {
         evidence.insert("version_output_len".to_string(), output.len().to_string());
+    }
+    if let Some(error) = &version_probe_error {
+        evidence.insert("version_probe_error".to_string(), error.clone());
     }
     if let Some(failure) = &resolution.failure_kind {
         evidence.insert("failure_kind".to_string(), failure.clone());

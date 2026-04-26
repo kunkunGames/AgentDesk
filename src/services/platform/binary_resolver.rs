@@ -681,7 +681,7 @@ fn join_paths_lossy(paths: Vec<PathBuf>) -> Option<OsString> {
 ///
 /// Resolution order:
 /// 1. Per-agent channel override in registry (`agent_overrides`)
-/// 2. Named channel in registry (`current`, `candidate`, `default`)
+/// 2. Explicit registry channel name (`current`, `candidate`, `default`, `previous`)
 /// 3. Legacy env-override / PATH / login-shell / fallback (unchanged behaviour)
 pub fn resolve_provider_binary_for_context(
     ctx: &crate::services::provider_cli::ProviderExecutionContext,
@@ -691,13 +691,10 @@ pub fn resolve_provider_binary_for_context(
             if let Some(channels) = registry.providers.get(&ctx.provider) {
                 // 1. Per-agent override → named channel
                 let channel_name = ctx
-                    .channel_name
+                    .agent_id
                     .as_deref()
-                    .or_else(|| {
-                        ctx.agent_id
-                            .as_deref()
-                            .and_then(|id| registry.agent_channel(&ctx.provider, id))
-                    })
+                    .and_then(|id| registry.agent_channel(&ctx.provider, id))
+                    .or_else(|| ctx.channel_name.as_deref().and_then(registry_channel_name))
                     .unwrap_or("current");
 
                 let maybe_channel = match channel_name {
@@ -726,7 +723,17 @@ pub fn resolve_provider_binary_for_context(
         }
     }
     // 3. Fall back to legacy resolver.
-    resolve_provider_binary(&ctx.provider)
+    resolve_provider_binary_legacy(&ctx.provider)
+}
+
+fn registry_channel_name(name: &str) -> Option<&'static str> {
+    match name {
+        "current" => Some("current"),
+        "candidate" => Some("candidate"),
+        "default" => Some("default"),
+        "previous" => Some("previous"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
