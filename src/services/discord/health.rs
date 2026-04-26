@@ -2678,34 +2678,51 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
         Err(resp) => return resp,
     };
     let user_id_text = request.user_id.to_string();
+    let dm_delivery_id = request.delivery_id();
 
-    use poise::serenity_prelude::{CreateMessage, UserId};
+    use poise::serenity_prelude::UserId;
     let user_id = UserId::new(request.user_id);
     match user_id.create_dm_channel(&*http).await {
-        Ok(dm_channel) => {
-            match dm_channel
-                .id
-                .send_message(&*http, CreateMessage::new().content(&request.content))
-                .await
-            {
-                Ok(_) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!("  [{ts}] 📨 DM: → user {}", request.user_id);
-                    (
-                        "200 OK",
-                        serde_json::json!({
-                            "ok": true,
-                            "user_id": user_id_text,
-                        })
-                        .to_string(),
-                    )
+        Ok(dm_channel) => match deliver_manual_notification(
+            &SerenityManualOutboundClient { http },
+            manual_notification_deduper(),
+            &dm_channel.id.get().to_string(),
+            &request.content,
+            &request.bot,
+            None,
+            dm_delivery_id
+                .as_ref()
+                .map(|delivery_id| ManualOutboundDeliveryId {
+                    correlation_id: &delivery_id.0,
+                    semantic_event_id: &delivery_id.1,
+                }),
+        )
+        .await
+        {
+            ManualDeliveryOutcome::Sent {
+                message_id,
+                delivery,
+            } => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 📨 DM: → user {} via shared outbound",
+                    request.user_id
+                );
+                let mut response = serde_json::json!({
+                    "ok": true,
+                    "user_id": user_id_text,
+                    "message_id": message_id,
+                });
+                if let Some(delivery) = delivery {
+                    response["delivery"] = serde_json::Value::String(delivery.to_string());
                 }
-                Err(e) => (
-                    "500 Internal Server Error",
-                    format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, e),
-                ),
+                ("200 OK", response.to_string())
             }
-        }
+            ManualDeliveryOutcome::Failed { detail } => (
+                "500 Internal Server Error",
+                format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
+            ),
+        },
         Err(e) => (
             "500 Internal Server Error",
             format!(
@@ -2721,6 +2738,54 @@ struct SendDmRequest {
     user_id: u64,
     content: String,
     bot: String,
+    correlation_id: Option<String>,
+    semantic_event_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+impl SendDmRequest {
+    fn delivery_id(&self) -> Option<(String, String)> {
+        let correlation_id = self
+            .correlation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("senddm:{}", self.user_id));
+        let semantic_event_id = self
+            .semantic_event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.idempotency_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|key| format!("senddm:{}:{}", self.user_id, normalize_senddm_key(key)))
+            });
+        semantic_event_id.map(|semantic_event_id| (correlation_id, semantic_event_id))
+    }
+}
+
+fn normalize_senddm_key(value: &str) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(160)
+        .collect();
+    if normalized.is_empty() {
+        "message".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn parse_senddm_body(body: &str) -> Result<SendDmRequest, String> {
@@ -2740,11 +2805,30 @@ fn parse_senddm_body(body: &str) -> Result<SendDmRequest, String> {
         .ok_or("content required")?
         .to_string();
     let bot = parsed["bot"].as_str().unwrap_or("announce").to_string();
+    let correlation_id = parsed["correlation_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let semantic_event_id = parsed["semantic_event_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let idempotency_key = parsed["idempotency_key"]
+        .as_str()
+        .or_else(|| parsed["idempotency_id"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     Ok(SendDmRequest {
         user_id,
         content,
         bot,
+        correlation_id,
+        semantic_event_id,
+        idempotency_key,
     })
 }
 
@@ -3029,6 +3113,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_notification_without_delivery_id_does_not_dedupe_same_content() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+
+        let first =
+            deliver_manual_notification(&client, &dedup, "123", "hello", "announce", None, None)
+                .await;
+        let second =
+            deliver_manual_notification(&client, &dedup, "123", "hello", "announce", None, None)
+                .await;
+
+        assert_eq!(
+            first,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-1".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(
+            second,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-2".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(client.posts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn api_send_announce_long_content_preserves_full_payload_as_attachment() {
         let client = MockManualOutboundClient::default();
         let dedup = OutboundDeduper::new();
@@ -3193,6 +3306,9 @@ mod tests {
                 user_id: 123,
                 content: "hello".to_string(),
                 bot: "claude".to_string(),
+                correlation_id: None,
+                semantic_event_id: None,
+                idempotency_key: None,
             }
         );
     }
@@ -3212,6 +3328,51 @@ mod tests {
         assert_eq!(parsed.user_id, 123);
         assert_eq!(parsed.content, "건강검진 요즘 했어?");
         assert_eq!(parsed.bot, "claude");
+    }
+
+    #[test]
+    fn test_parse_senddm_body_accepts_delivery_ids() {
+        let body = r#"{
+            "user_id":"123",
+            "content":"hello",
+            "bot":"claude",
+            "correlation_id":"senddm:custom",
+            "semantic_event_id":"senddm:custom:event"
+        }"#;
+        let parsed = parse_senddm_body(body).expect("senddm body should parse");
+        assert_eq!(
+            parsed.delivery_id(),
+            Some((
+                "senddm:custom".to_string(),
+                "senddm:custom:event".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_senddm_delivery_id_is_absent_without_explicit_ids() {
+        let first =
+            parse_senddm_body(r#"{"user_id":"123","content":"hello","bot":"claude"}"#).unwrap();
+        let second =
+            parse_senddm_body(r#"{"user_id":"123","content":"hello","bot":"claude"}"#).unwrap();
+
+        assert_eq!(first.delivery_id(), None);
+        assert_eq!(second.delivery_id(), None);
+    }
+
+    #[test]
+    fn test_senddm_delivery_id_uses_idempotency_key() {
+        let parsed = parse_senddm_body(
+            r#"{"user_id":"123","content":"hello","bot":"claude","idempotency_key":"family/checkup 1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.delivery_id(),
+            Some((
+                "senddm:123".to_string(),
+                "senddm:123:family_checkup_1".to_string()
+            ))
+        );
     }
 
     #[test]
