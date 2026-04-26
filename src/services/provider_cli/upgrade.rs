@@ -134,8 +134,6 @@ fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeErr
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_reader.and_then(|reader| reader.join().ok());
-                let _ = stderr_reader.and_then(|reader| reader.join().ok());
                 return Err(UpgradeError::UpgradeCommandTimedOut {
                     seconds: UPGRADE_COMMAND_TIMEOUT.as_secs(),
                 });
