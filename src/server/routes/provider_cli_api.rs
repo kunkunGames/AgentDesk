@@ -291,14 +291,22 @@ pub async fn patch_provider_cli(
                 MigrationState::Failed,
                 Some(guard.evidence_json()),
             );
+            let clear_result = clear_provider_channel_overrides(&root, &provider);
             let _ = save_migration_state(&root, &migration);
-            Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "safe session guard blocked promotion: {}",
-                    guard.blockers.join("; ")
-                ),
-            ))
+            if let Err(error) = clear_result {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("update provider registry: {error}"),
+                ))
+            } else {
+                Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "safe session guard blocked promotion: {}",
+                        guard.blockers.join("; ")
+                    ),
+                ))
+            }
         }
     } else {
         transition(

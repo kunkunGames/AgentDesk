@@ -329,13 +329,7 @@ fn cmd_upgrade(
         state.candidate_channel = Some(candidate.clone());
         save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
-        let mut registry = load_registry(&root)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_default();
-        let channels = registry.providers.entry(provider.to_string()).or_default();
-        channels.current.get_or_insert_with(|| current.clone());
-        channels.candidate = Some(candidate);
-        save_registry(&root, &registry).map_err(|e| e.to_string())?;
+        persist_upgrade_candidate(&root, provider, &current, candidate)?;
 
         print_json(&json!({
             "provider": provider,
@@ -364,17 +358,11 @@ fn cmd_upgrade(
     // Persist candidate in migration state.
     let mut state = load_migration_state(&root, provider)
         .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| new_migration_state(provider, current));
+        .unwrap_or_else(|| new_migration_state(provider, current.clone()));
     state.candidate_channel = Some(result.candidate_channel.clone());
     save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
-    // Update registry candidate channel.
-    let mut registry = load_registry(&root)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    let channels = registry.providers.entry(provider.to_string()).or_default();
-    channels.candidate = Some(result.candidate_channel.clone());
-    save_registry(&root, &registry).map_err(|e| e.to_string())?;
+    persist_upgrade_candidate(&root, provider, &current, result.candidate_channel.clone())?;
 
     print_json(&json!({
         "provider": provider,
@@ -382,6 +370,22 @@ fn cmd_upgrade(
         "post_version": result.post_version,
         "candidate_path": result.candidate_channel.canonical_path,
     }));
+    Ok(())
+}
+
+fn persist_upgrade_candidate(
+    root: &std::path::Path,
+    provider: &str,
+    current: &ProviderCliChannel,
+    candidate: ProviderCliChannel,
+) -> Result<(), String> {
+    let mut registry = load_registry(root)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let channels = registry.providers.entry(provider.to_string()).or_default();
+    channels.current.get_or_insert_with(|| current.clone());
+    channels.candidate = Some(candidate);
+    save_registry(root, &registry).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -529,13 +533,24 @@ fn cmd_promote(
         force_recreate_active,
     );
     if !guard.is_clear() {
+        let selected_agent_id = state.selected_agent_id.clone();
         transition(
             &mut state,
             MigrationState::Failed,
             Some(guard.evidence_json()),
         )
         .map_err(|e| format!("transition error: {e}"))?;
+        let clear_result = selected_agent_id
+            .as_deref()
+            .map(|agent_id| clear_canary_override(&root, provider, agent_id))
+            .transpose();
         save_migration_state(&root, &state).map_err(|e| e.to_string())?;
+        if let Err(error) = clear_result {
+            return Err(format!(
+                "safe session guard blocked promotion: {}; additionally failed to clear canary override: {error}",
+                guard.blockers.join("; ")
+            ));
+        }
         return Err(format!(
             "safe session guard blocked promotion: {}",
             guard.blockers.join("; ")
@@ -1058,6 +1073,20 @@ mod tests {
     }
 
     #[test]
+    fn persist_upgrade_candidate_records_current_when_registry_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = test_channel("/tmp/current-codex");
+        let candidate = test_channel("/tmp/candidate-codex");
+
+        persist_upgrade_candidate(dir.path(), "codex", &current, candidate.clone()).unwrap();
+
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+        let channels = registry.providers.get("codex").unwrap();
+        assert_eq!(channels.current.as_ref(), Some(&current));
+        assert_eq!(channels.candidate.as_ref(), Some(&candidate));
+    }
+
+    #[test]
     fn rollback_transitions_to_rolled_back() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
@@ -1194,6 +1223,59 @@ mod tests {
         let channels = registry.providers.get("codex").unwrap();
         assert_eq!(channels.current.as_ref(), Some(&candidate));
         assert!(channels.agent_overrides.is_empty());
+    }
+
+    #[test]
+    fn promote_guard_failure_clears_canary_override() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
+
+        use crate::services::provider_cli::registry::{
+            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+        };
+        use chrono::Utc;
+        let current = test_channel("/tmp/current-codex");
+        let candidate = test_channel("/tmp/candidate-codex");
+        let ms = ProviderCliMigrationState {
+            schema_version: 1,
+            provider: "codex".to_string(),
+            state: MigrationState::AwaitingOperatorPromote,
+            selected_agent_id: Some("codex-agent".to_string()),
+            current_channel: Some(current.clone()),
+            candidate_channel: Some(candidate.clone()),
+            rollback_target: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            history: vec![],
+        };
+        save_migration_state(dir.path(), &ms).unwrap();
+        let mut registry = ProviderCliRegistry::default();
+        let mut channels = ProviderChannels {
+            current: Some(current),
+            candidate: Some(candidate),
+            ..Default::default()
+        };
+        channels
+            .agent_overrides
+            .insert("codex-agent".to_string(), "candidate".to_string());
+        registry.providers.insert("codex".to_string(), channels);
+        save_registry(dir.path(), &registry).unwrap();
+
+        let result = cmd_promote("codex", Some("operator approval"), false);
+        let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+
+        assert!(result.is_err());
+        assert_eq!(state.state, MigrationState::Failed);
+        assert!(
+            registry
+                .providers
+                .get("codex")
+                .unwrap()
+                .agent_overrides
+                .is_empty()
+        );
     }
 
     #[test]
