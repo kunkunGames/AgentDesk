@@ -64,6 +64,8 @@ use stale_resume::{
 };
 use tmux_runtime::{is_dcserver_restart_command, should_resume_watcher_after_turn};
 
+use super::formatting::ReplaceLongMessageOutcome;
+
 fn sync_inflight_restart_mode_from_cancel(
     cancel_token: &crate::services::provider::CancelToken,
     inflight_state: &mut InflightTurnState,
@@ -356,6 +358,90 @@ fn advance_tmux_relay_confirmed_end(
         confirmed_reached_target,
         "tmux relay confirmed_end_offset must reach target end"
     );
+}
+
+fn record_turn_bridge_terminal_replace_cleanup(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    tmux_session_name: Option<&str>,
+    outcome: super::placeholder_cleanup::PlaceholderCleanupOutcome,
+    source: &'static str,
+) {
+    if let super::placeholder_cleanup::PlaceholderCleanupOutcome::Failed { class, detail } =
+        &outcome
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ placeholder cleanup {} failed ({}) for channel {} msg {}: {}",
+            super::placeholder_cleanup::PlaceholderCleanupOperation::EditTerminal.as_str(),
+            class.as_str(),
+            channel_id.get(),
+            message_id.get(),
+            detail
+        );
+    }
+    shared
+        .placeholder_cleanup
+        .record(super::placeholder_cleanup::PlaceholderCleanupRecord {
+            provider: provider.clone(),
+            channel_id,
+            message_id,
+            tmux_session_name: tmux_session_name.map(str::to_string),
+            operation: super::placeholder_cleanup::PlaceholderCleanupOperation::EditTerminal,
+            outcome,
+            source,
+        });
+}
+
+fn turn_bridge_replace_outcome_committed(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    tmux_session_name: Option<&str>,
+    replace_result: Result<ReplaceLongMessageOutcome, String>,
+    source: &'static str,
+) -> bool {
+    match replace_result {
+        Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
+            record_turn_bridge_terminal_replace_cleanup(
+                shared,
+                provider,
+                channel_id,
+                message_id,
+                tmux_session_name,
+                super::placeholder_cleanup::PlaceholderCleanupOutcome::Succeeded,
+                source,
+            );
+            true
+        }
+        Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
+            record_turn_bridge_terminal_replace_cleanup(
+                shared,
+                provider,
+                channel_id,
+                message_id,
+                tmux_session_name,
+                super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(edit_error),
+                source,
+            );
+            false
+        }
+        Err(error) => {
+            record_turn_bridge_terminal_replace_cleanup(
+                shared,
+                provider,
+                channel_id,
+                message_id,
+                tmux_session_name,
+                super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(error),
+                source,
+            );
+            false
+        }
+    }
 }
 
 fn active_turn_thread_channel_id(
@@ -1665,6 +1751,7 @@ pub(super) fn spawn_turn_bridge(
             shared_owned.dispatch_role_overrides.remove(&channel_id);
         }
         let has_queued_turns = finish.has_pending;
+        let mut preserve_inflight_for_cleanup_retry = false;
 
         // Remove ⏳ only if NOT handing off to tmux watcher.
         // When tmux watcher is handling the response, it will do ⏳→✅ after delivery.
@@ -1769,16 +1856,25 @@ pub(super) fn spawn_turn_bridge(
                 format!("{}\n\n[Stopped]", formatted)
             };
 
-            if gateway
-                .replace_message(channel_id, current_msg_id, &terminal_response)
-                .await
-                .is_ok()
-            {
+            let replace_committed = turn_bridge_replace_outcome_committed(
+                shared_owned.as_ref(),
+                &provider,
+                channel_id,
+                current_msg_id,
+                inflight_state.tmux_session_name.as_deref(),
+                gateway
+                    .replace_message_with_outcome(channel_id, current_msg_id, &terminal_response)
+                    .await,
+                "turn_bridge_cancelled_terminal_replace",
+            );
+            if replace_committed {
                 advance_tmux_relay_confirmed_end(
                     shared_owned.as_ref(),
                     watcher_owner_channel_id,
                     tmux_last_offset,
                 );
+            } else {
+                preserve_inflight_for_cleanup_retry = true;
             }
 
             if preserved_restart_mode.is_none() {
@@ -1795,16 +1891,25 @@ pub(super) fn spawn_turn_bridge(
                  컨텍스트를 줄이려면 `/compact` 또는 `/clear`를 사용해 주세요.",
                 mention
             );
-            if gateway
-                .replace_message(channel_id, current_msg_id, &full_response)
-                .await
-                .is_ok()
-            {
+            let replace_committed = turn_bridge_replace_outcome_committed(
+                shared_owned.as_ref(),
+                &provider,
+                channel_id,
+                current_msg_id,
+                inflight_state.tmux_session_name.as_deref(),
+                gateway
+                    .replace_message_with_outcome(channel_id, current_msg_id, &full_response)
+                    .await,
+                "turn_bridge_prompt_too_long_replace",
+            );
+            if replace_committed {
                 advance_tmux_relay_confirmed_end(
                     shared_owned.as_ref(),
                     watcher_owner_channel_id,
                     tmux_last_offset,
                 );
+            } else {
+                preserve_inflight_for_cleanup_retry = true;
             }
 
             gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
@@ -1829,14 +1934,54 @@ pub(super) fn spawn_turn_bridge(
                 current_tool_line.as_deref(),
                 None,
             );
-            let _ = gateway
+            let handoff_edit = gateway
                 .edit_message(channel_id, current_msg_id, &placeholder_text)
                 .await;
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ✓ tmux handoff complete, placeholder cleaned up, watcher handles response (channel {})",
-                channel_id
+            let handoff_operation =
+                super::placeholder_cleanup::PlaceholderCleanupOperation::EditHandoff;
+            let handoff_outcome = match handoff_edit {
+                Ok(_) => super::placeholder_cleanup::PlaceholderCleanupOutcome::Succeeded,
+                Err(error) => super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(error),
+            };
+            if let super::placeholder_cleanup::PlaceholderCleanupOutcome::Failed {
+                class,
+                detail,
+            } = &handoff_outcome
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ placeholder cleanup {} failed ({}) for channel {} msg {}: {}",
+                    handoff_operation.as_str(),
+                    class.as_str(),
+                    channel_id.get(),
+                    current_msg_id.get(),
+                    detail
+                );
+            }
+            let handoff_committed = handoff_outcome.is_committed();
+            shared_owned.placeholder_cleanup.record(
+                super::placeholder_cleanup::PlaceholderCleanupRecord {
+                    provider: provider.clone(),
+                    channel_id,
+                    message_id: current_msg_id,
+                    tmux_session_name: inflight_state.tmux_session_name.clone(),
+                    operation: handoff_operation,
+                    outcome: handoff_outcome,
+                    source: "turn_bridge_tmux_handoff",
+                },
             );
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            if handoff_committed {
+                tracing::warn!(
+                    "  [{ts}] ✓ tmux handoff complete, placeholder updated, watcher handles response (channel {})",
+                    channel_id
+                );
+            } else {
+                tracing::warn!(
+                    "  [{ts}] ⚠ tmux handoff complete, but placeholder update failed; watcher still handles response (channel {})",
+                    channel_id
+                );
+            }
         } else {
             // Check for stale resume failure BEFORE any other response handling.
             // This path is driven by explicit error/result events, not assistant text.
@@ -2069,16 +2214,29 @@ pub(super) fn spawn_turn_bridge(
                     &provider,
                 );
                 if can_chain_locally {
-                    if gateway
-                        .replace_message(channel_id, current_msg_id, &delivery_response)
-                        .await
-                        .is_ok()
-                    {
+                    let replace_committed = turn_bridge_replace_outcome_committed(
+                        shared_owned.as_ref(),
+                        &provider,
+                        channel_id,
+                        current_msg_id,
+                        inflight_state.tmux_session_name.as_deref(),
+                        gateway
+                            .replace_message_with_outcome(
+                                channel_id,
+                                current_msg_id,
+                                &delivery_response,
+                            )
+                            .await,
+                        "turn_bridge_terminal_replace",
+                    );
+                    if replace_committed {
                         advance_tmux_relay_confirmed_end(
                             shared_owned.as_ref(),
                             watcher_owner_channel_id,
                             tmux_last_offset,
                         );
+                    } else {
+                        preserve_inflight_for_cleanup_retry = true;
                     }
                 } else if let Err(error) = enqueue_headless_delivery(
                     &shared_owned,
@@ -2099,11 +2257,16 @@ pub(super) fn spawn_turn_bridge(
 
             // Signal the watcher that this turn's response was already delivered.
             // Prevents the watcher from relaying the same response when it resumes.
-            if let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id) {
+            if !preserve_inflight_for_cleanup_retry
+                && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
+            {
                 watcher.turn_delivered.store(true, Ordering::Relaxed);
             }
 
-            if can_chain_locally && !delivery_response.trim().is_empty() {
+            if can_chain_locally
+                && !preserve_inflight_for_cleanup_retry
+                && !delivery_response.trim().is_empty()
+            {
                 gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
 
@@ -2566,6 +2729,9 @@ pub(super) fn spawn_turn_bridge(
         if cancelled && cancel_token.restart_mode().is_some() {
             let _ = save_inflight_state(&inflight_state);
             inflight_guard.provider.take();
+        } else if preserve_inflight_for_cleanup_retry {
+            let _ = save_inflight_state(&inflight_state);
+            inflight_guard.provider.take();
         } else {
             clear_inflight_state(&provider, channel_id.get());
             // Defuse the guard — cleanup already done above.
@@ -2591,7 +2757,13 @@ pub(super) fn spawn_turn_bridge(
         if has_queued_turns {
             // Drain mode: if restart is pending, don't start new turns from queue.
             // The queued messages will be saved to disk and processed after restart.
-            if shared_owned
+            if preserve_inflight_for_cleanup_retry {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} until placeholder cleanup retry commits",
+                    channel_id
+                );
+            } else if shared_owned
                 .restart_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
