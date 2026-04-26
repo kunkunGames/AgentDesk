@@ -70,20 +70,14 @@ pub fn load_migration_state(
     read_json(&paths::migration_state_path(root, provider))
 }
 
-pub fn save_migration_state(
-    root: &Path,
-    state: &ProviderCliMigrationState,
-) -> Result<(), IoError> {
+pub fn save_migration_state(root: &Path, state: &ProviderCliMigrationState) -> Result<(), IoError> {
     write_json(&paths::migration_state_path(root, &state.provider), state)
 }
 
 // ── Launch artifact ───────────────────────────────────────────────────────────
 
 pub fn save_launch_artifact(root: &Path, artifact: &LaunchArtifact) -> Result<(), IoError> {
-    let key = artifact
-        .session_key
-        .as_deref()
-        .unwrap_or("default");
+    let key = artifact.session_key.as_deref().unwrap_or("default");
     write_json(&paths::launch_artifact_path(root, key), artifact)
 }
 

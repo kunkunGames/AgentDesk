@@ -1,8 +1,8 @@
 use chrono::Utc;
 use std::collections::HashMap;
 
-use crate::services::platform::{probe_resolved_binary_version, resolve_provider_binary};
 use super::registry::ProviderCliChannel;
+use crate::services::platform::{probe_resolved_binary_version, resolve_provider_binary};
 
 /// Probe the currently-resolved binary for `provider` and produce a channel snapshot.
 /// Returns `None` when the binary cannot be found.
@@ -60,48 +60,30 @@ pub fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hex_encode(hasher.finalize()))
 }
 
-// ── Minimal SHA-256 without pulling in a heavy dep ───────────────────────────
-// We use the `sha2` crate that's already transitively available via `ring` /
-// `rustls`. If it's not in Cargo.toml we fall back to a no-op that returns "".
-
 fn sha2_hasher() -> Sha256State {
     Sha256State::new()
 }
 
 struct Sha256State {
-    #[cfg(feature = "__sha2")]
     inner: sha2::Sha256,
-    #[cfg(not(feature = "__sha2"))]
-    _marker: (),
 }
 
 impl Sha256State {
     fn new() -> Self {
-        #[cfg(feature = "__sha2")]
-        {
-            use sha2::Digest;
-            Self { inner: sha2::Sha256::new() }
+        use sha2::Digest;
+        Self {
+            inner: sha2::Sha256::new(),
         }
-        #[cfg(not(feature = "__sha2"))]
-        Self { _marker: () }
     }
 
-    fn update(&mut self, _data: &[u8]) {
-        #[cfg(feature = "__sha2")]
-        {
-            use sha2::Digest;
-            self.inner.update(_data);
-        }
+    fn update(&mut self, data: &[u8]) {
+        use sha2::Digest;
+        self.inner.update(data);
     }
 
     fn finalize(self) -> Vec<u8> {
-        #[cfg(feature = "__sha2")]
-        {
-            use sha2::Digest;
-            self.inner.finalize().to_vec()
-        }
-        #[cfg(not(feature = "__sha2"))]
-        vec![]
+        use sha2::Digest;
+        self.inner.finalize().to_vec()
     }
 }
 

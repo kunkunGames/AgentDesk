@@ -6,9 +6,8 @@ pub mod snapshot;
 
 pub use context::ProviderExecutionContext;
 pub use registry::{
-    LaunchArtifact, MigrationState, MigrationHistoryEntry, PROVIDER_UPDATE_STRATEGIES,
+    LaunchArtifact, MigrationHistoryEntry, MigrationState, PROVIDER_UPDATE_STRATEGIES,
     ProviderChannels, ProviderCliChannel, ProviderCliMigrationState, ProviderCliRegistry,
-    ProviderCliUpdateStrategy, SmokeCheckStatus, SmokeChecks, SmokeResult,
-    update_strategy_for,
+    ProviderCliUpdateStrategy, SmokeCheckStatus, SmokeChecks, SmokeResult, update_strategy_for,
 };
 pub use snapshot::snapshot_current_channel;
