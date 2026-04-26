@@ -2,16 +2,15 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use crate::services::provider_cli::io::{
-    load_migration_state, load_registry, load_smoke_result, save_migration_state, save_registry,
-    save_smoke_result,
+    load_migration_state, load_registry, save_migration_state, save_registry, save_smoke_result,
 };
 use crate::services::provider_cli::registry::{
     MigrationState, PROVIDER_UPDATE_STRATEGIES, ProviderChannels,
 };
-use crate::services::provider_cli::snapshot::snapshot_current_channel;
 use crate::services::provider_cli::smoke::run_smoke;
+use crate::services::provider_cli::snapshot::snapshot_current_channel;
 use crate::services::provider_cli::upgrade::{new_migration_state, run_upgrade, transition};
-use crate::services::provider_cli::{RetentionSet, build_retention_set, cleanup_dry_run};
+use crate::services::provider_cli::{build_retention_set, cleanup_dry_run};
 
 #[derive(Args)]
 pub struct ProviderCliArgs {
@@ -128,7 +127,11 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
             provider,
             skip_previous_preservation,
             candidate_path,
-        } => cmd_upgrade(&provider, skip_previous_preservation, candidate_path.as_deref()),
+        } => cmd_upgrade(
+            &provider,
+            skip_previous_preservation,
+            candidate_path.as_deref(),
+        ),
         ProviderCliAction::Smoke { provider, channel } => cmd_smoke(&provider, &channel),
         ProviderCliAction::Canary {
             provider,
@@ -177,9 +180,7 @@ fn cmd_status(provider: Option<&str>) -> Result<(), String> {
     let mut output = Vec::new();
     for p in filter {
         let channels = registry.providers.get(p);
-        let migration = load_migration_state(&root, p)
-            .ok()
-            .flatten();
+        let migration = load_migration_state(&root, p).ok().flatten();
 
         output.push(json!({
             "provider": p,
@@ -248,15 +249,17 @@ fn cmd_upgrade(
                 ch.source = "manual_override".to_string();
                 ch
             })
-            .unwrap_or_else(|| crate::services::provider_cli::registry::ProviderCliChannel {
-                path: path.to_string(),
-                canonical_path: path.to_string(),
-                version: "unknown".to_string(),
-                version_output: None,
-                source: "manual_override".to_string(),
-                checked_at: chrono::Utc::now(),
-                evidence: Default::default(),
-            });
+            .unwrap_or_else(
+                || crate::services::provider_cli::registry::ProviderCliChannel {
+                    path: path.to_string(),
+                    canonical_path: path.to_string(),
+                    version: "unknown".to_string(),
+                    version_output: None,
+                    source: "manual_override".to_string(),
+                    checked_at: chrono::Utc::now(),
+                    evidence: Default::default(),
+                },
+            );
 
         let mut state = load_migration_state(&root, provider)
             .map_err(|e| e.to_string())?
@@ -283,7 +286,10 @@ fn cmd_upgrade(
     )
     .map_err(|e| format!("upgrade failed: {e}"))?;
 
-    eprintln!("Upgraded {provider}: {} -> {}", result.pre_version, result.post_version);
+    eprintln!(
+        "Upgraded {provider}: {} -> {}",
+        result.pre_version, result.post_version
+    );
 
     // Persist candidate in migration state.
     let mut state = load_migration_state(&root, provider)
@@ -296,10 +302,7 @@ fn cmd_upgrade(
     let mut registry = load_registry(&root)
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    let channels = registry
-        .providers
-        .entry(provider.to_string())
-        .or_default();
+    let channels = registry.providers.entry(provider.to_string()).or_default();
     channels.candidate = Some(result.candidate_channel.clone());
     save_registry(&root, &registry).map_err(|e| e.to_string())?;
 
@@ -449,8 +452,8 @@ fn cmd_cleanup(provider: &str, _dry_run: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let candidates = cleanup_dry_run(&scan_dir, &retention)
-        .map_err(|e| format!("cleanup scan: {e}"))?;
+    let candidates =
+        cleanup_dry_run(&scan_dir, &retention).map_err(|e| format!("cleanup scan: {e}"))?;
 
     print_json(&json!({
         "provider": provider,
@@ -498,7 +501,11 @@ fn cmd_run(
 
     // Step 3: preserve previous + upgrade (unless skip_upgrade or candidate_path provided).
     let candidate = if let Some(path) = candidate_path {
-        advance_to(&mut state, MigrationState::PreviousPreserved, Some("skipped: candidate_path provided".to_string()))?;
+        advance_to(
+            &mut state,
+            MigrationState::PreviousPreserved,
+            Some("skipped: candidate_path provided".to_string()),
+        )?;
         advance_to(&mut state, MigrationState::UpgradePlanned, None)?;
         advance_to(&mut state, MigrationState::UpgradeSucceeded, None)?;
         crate::services::provider_cli::registry::ProviderCliChannel {
@@ -511,7 +518,11 @@ fn cmd_run(
             evidence: Default::default(),
         }
     } else if skip_upgrade {
-        advance_to(&mut state, MigrationState::PreviousPreserved, Some("skipped: --skip-upgrade".to_string()))?;
+        advance_to(
+            &mut state,
+            MigrationState::PreviousPreserved,
+            Some("skipped: --skip-upgrade".to_string()),
+        )?;
         advance_to(&mut state, MigrationState::UpgradePlanned, None)?;
         advance_to(&mut state, MigrationState::UpgradeSucceeded, None)?;
         current.clone()
@@ -523,7 +534,10 @@ fn cmd_run(
         advance_to(&mut state, MigrationState::UpgradePlanned, None)?;
         let result = run_upgrade(provider, &current, Some(prev_path.as_path()), false)
             .map_err(|e| format!("upgrade: {e}"))?;
-        eprintln!("[3/7] Upgraded: {} -> {}", result.pre_version, result.post_version);
+        eprintln!(
+            "[3/7] Upgraded: {} -> {}",
+            result.pre_version, result.post_version
+        );
         advance_to(&mut state, MigrationState::UpgradeSucceeded, None)?;
         result.candidate_channel
     };
@@ -547,7 +561,12 @@ fn cmd_run(
     save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
     // Step 4: smoke candidate.
-    let smoke_cand = run_smoke(provider, "candidate", &candidate.path, &candidate.canonical_path);
+    let smoke_cand = run_smoke(
+        provider,
+        "candidate",
+        &candidate.path,
+        &candidate.canonical_path,
+    );
     let _ = save_smoke_result(&root, &smoke_cand);
     if !crate::services::provider_cli::smoke::smoke_passed(&smoke_cand) {
         return Err(format!("smoke check failed on candidate {provider} binary"));
@@ -578,13 +597,19 @@ fn cmd_run(
 
     // Step 7: auto-promote if requested.
     if auto_promote {
-        advance_to(&mut state, MigrationState::ProviderSessionsSafeEnding, Some("auto-promote".to_string()))?;
+        advance_to(
+            &mut state,
+            MigrationState::ProviderSessionsSafeEnding,
+            Some("auto-promote".to_string()),
+        )?;
         advance_to(&mut state, MigrationState::ProviderSessionsRecreated, None)?;
         advance_to(&mut state, MigrationState::ProviderAgentsMigrated, None)?;
         save_migration_state(&root, &state).map_err(|e| e.to_string())?;
         eprintln!("[7/7] Auto-promoted — migration complete");
     } else {
-        eprintln!("[7/7] Stopped at AwaitingOperatorPromote — run `agentdesk provider-cli promote {provider}` to continue");
+        eprintln!(
+            "[7/7] Stopped at AwaitingOperatorPromote — run `agentdesk provider-cli promote {provider}` to continue"
+        );
     }
 
     print_json(&json!({
@@ -602,14 +627,19 @@ fn cmd_resume(provider: &str, auto_promote: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no migration state for provider: {provider}. Run `agentdesk provider-cli run {provider}` first."))?;
 
-    eprintln!("Resuming {provider} migration from state: {:?}", state.state);
+    eprintln!(
+        "Resuming {provider} migration from state: {:?}",
+        state.state
+    );
 
     match state.state {
         MigrationState::AwaitingOperatorPromote => {
             if auto_promote {
                 cmd_promote(provider, Some("resumed with --auto-promote"))
             } else {
-                eprintln!("Migration is at AwaitingOperatorPromote. Use --auto-promote or run `agentdesk provider-cli promote {provider}`.");
+                eprintln!(
+                    "Migration is at AwaitingOperatorPromote. Use --auto-promote or run `agentdesk provider-cli promote {provider}`."
+                );
                 print_json(&json!({ "provider": provider, "state": "awaiting_operator_promote" }));
                 Ok(())
             }
@@ -619,13 +649,23 @@ fn cmd_resume(provider: &str, auto_promote: bool) -> Result<(), String> {
             print_json(&json!({ "provider": provider, "state": "provider_agents_migrated" }));
             Ok(())
         }
-        MigrationState::RolledBack | MigrationState::Failed => {
-            Err(format!("Migration is in terminal state {:?}; start a new migration with `agentdesk provider-cli run {provider}`.", state.state))
-        }
+        MigrationState::RolledBack | MigrationState::Failed => Err(format!(
+            "Migration is in terminal state {:?}; start a new migration with `agentdesk provider-cli run {provider}`.",
+            state.state
+        )),
         other => {
             // Re-run from current state by delegating to cmd_run with skip_upgrade.
-            eprintln!("State {:?} is mid-migration; re-running orchestration from scratch (use run --skip-upgrade to skip the upgrade step).", other);
-            cmd_run(provider, None, state.selected_agent_id.as_deref(), true, auto_promote)
+            eprintln!(
+                "State {:?} is mid-migration; re-running orchestration from scratch (use run --skip-upgrade to skip the upgrade step).",
+                other
+            );
+            cmd_run(
+                provider,
+                None,
+                state.selected_agent_id.as_deref(),
+                true,
+                auto_promote,
+            )
         }
     }
 }

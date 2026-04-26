@@ -419,7 +419,9 @@ fn category_description(category: &str) -> &'static str {
         "pipeline" => "Pipeline stages, config overrides, graphs, and card history.",
         "pm" => "PM decision workflow for force-only pipeline states.",
         "policies" => "Loaded policy inventory.",
-        "provider-cli" => "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback.",
+        "provider-cli" => {
+            "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback."
+        }
         "reviews" => "Review verdict submission, decisions, and tuning aggregation.",
         "sessions" => "Sessions, force-kill, and termination events.",
         "settings" => "Settings surfaces, live overrides, precedence, and onboarding contracts.",

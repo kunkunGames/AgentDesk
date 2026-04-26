@@ -27,6 +27,7 @@ pub mod monitoring;
 pub mod offices;
 pub mod onboarding;
 pub mod pipeline;
+pub mod provider_cli_api;
 mod queue_api;
 pub mod receipt;
 pub mod resume;
@@ -41,7 +42,6 @@ pub mod state;
 pub mod stats;
 pub mod termination_events;
 pub mod v1;
-pub mod provider_cli_api;
 
 use axum::{
     Router,

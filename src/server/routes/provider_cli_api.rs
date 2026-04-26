@@ -6,21 +6,21 @@ use axum::{
 use chrono::Utc;
 use serde_json::{Value, json};
 
+use crate::services::provider_cli::io::{
+    load_migration_state, load_registry, load_smoke_result, save_migration_state,
+};
+use crate::services::provider_cli::registry::MigrationState;
+use crate::services::provider_cli::upgrade::transition;
 use crate::services::provider_cli::{
     MigrationDiagnostics, ProviderCliActionRequest, ProviderCliStatusResponse, ProviderDiagnostics,
 };
-use crate::services::provider_cli::io::{load_migration_state, load_registry, load_smoke_result, save_migration_state};
-use crate::services::provider_cli::registry::MigrationState;
-use crate::services::provider_cli::upgrade::transition;
 
 use super::AppState;
 
 const ALL_PROVIDERS: &[&str] = &["codex", "claude", "gemini", "qwen"];
 
 /// GET /api/provider-cli — current registry channels + migration states.
-pub async fn get_provider_cli_status(
-    State(_state): State<AppState>,
-) -> (StatusCode, Json<Value>) {
+pub async fn get_provider_cli_status(State(_state): State<AppState>) -> (StatusCode, Json<Value>) {
     let Some(root) = crate::config::runtime_root() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -48,7 +48,9 @@ pub async fn get_provider_cli_status(
                 candidate: channels.and_then(|c| c.candidate.clone()),
                 previous: channels.and_then(|c| c.previous.clone()),
                 smoke_current: load_smoke_result(&root, provider, "current").ok().flatten(),
-                smoke_candidate: load_smoke_result(&root, provider, "candidate").ok().flatten(),
+                smoke_candidate: load_smoke_result(&root, provider, "candidate")
+                    .ok()
+                    .flatten(),
                 evidence: Default::default(),
             }
         })
@@ -91,6 +93,17 @@ pub async fn patch_provider_cli(
     Path(provider): Path<String>,
     Json(body): Json<ProviderCliActionRequest>,
 ) -> (StatusCode, Json<Value>) {
+    let next_state = match body.action.as_str() {
+        "confirm_promote" => MigrationState::ProviderSessionsSafeEnding,
+        "rollback" | "rollback_to_previous" => MigrationState::RolledBack,
+        action => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown action: {action}")})),
+            );
+        }
+    };
+
     let Some(root) = crate::config::runtime_root() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -103,26 +116,13 @@ pub async fn patch_provider_cli(
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(
-                    json!({"error": format!("no migration state for provider: {provider}")}),
-                ),
+                Json(json!({"error": format!("no migration state for provider: {provider}")})),
             );
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("load migration state: {e}")})),
-            );
-        }
-    };
-
-    let next_state = match body.action.as_str() {
-        "confirm_promote" => MigrationState::ProviderSessionsSafeEnding,
-        "rollback" | "rollback_to_previous" => MigrationState::RolledBack,
-        action => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("unknown action: {action}")})),
             );
         }
     };
@@ -158,9 +158,30 @@ mod tests {
     use crate::engine::PolicyEngine;
     use crate::server::routes::AppState;
 
+    struct RuntimeRootOverrideGuard {
+        previous: Option<std::path::PathBuf>,
+    }
+
+    impl RuntimeRootOverrideGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = crate::config::current_test_runtime_root_override();
+            crate::config::set_test_runtime_root_override(Some(path.to_path_buf()));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RuntimeRootOverrideGuard {
+        fn drop(&mut self) {
+            crate::config::set_test_runtime_root_override(self.previous.take());
+        }
+    }
+
     fn make_state() -> AppState {
         let db = crate::db::init(&crate::config::Config::default()).unwrap();
-        AppState::test_state(db, PolicyEngine::new(&crate::config::Config::default()).unwrap())
+        AppState::test_state(
+            db,
+            PolicyEngine::new(&crate::config::Config::default()).unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -179,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn patch_unknown_action_returns_bad_request() {
         let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
+        let _runtime_root = RuntimeRootOverrideGuard::set(dir.path());
 
         // Create a migration state file first.
         use crate::services::provider_cli::registry::{MigrationState, ProviderCliMigrationState};
@@ -203,20 +224,15 @@ mod tests {
             action: "invalid_action".to_string(),
             evidence: None,
         };
-        let (status, _) = patch_provider_cli(
-            State(state),
-            Path("codex".to_string()),
-            Json(body),
-        )
-        .await;
+        let (status, _) =
+            patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 
     #[tokio::test]
     async fn patch_confirm_promote_transitions_state() {
         let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
+        let _runtime_root = RuntimeRootOverrideGuard::set(dir.path());
 
         use crate::services::provider_cli::registry::{MigrationState, ProviderCliMigrationState};
         use chrono::Utc;
@@ -239,17 +255,12 @@ mod tests {
             action: "confirm_promote".to_string(),
             evidence: Some("operator approved".to_string()),
         };
-        let (status, Json(value)) = patch_provider_cli(
-            State(state),
-            Path("codex".to_string()),
-            Json(body),
-        )
-        .await;
+        let (status, Json(value)) =
+            patch_provider_cli(State(state), Path("codex".to_string()), Json(body)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             value["state"].as_str().unwrap(),
             "ProviderSessionsSafeEnding"
         );
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 }
