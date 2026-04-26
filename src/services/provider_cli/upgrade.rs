@@ -120,28 +120,14 @@ where
     receiver
 }
 
-fn receive_limited_output(
-    receiver: Option<Receiver<Vec<u8>>>,
-    child_pid: u32,
-    process_tree_killed: &mut bool,
-) -> Vec<u8> {
+fn receive_limited_output(receiver: Option<Receiver<Vec<u8>>>) -> Vec<u8> {
     let Some(receiver) = receiver else {
         return Vec::new();
     };
 
-    match receiver.recv_timeout(UPGRADE_OUTPUT_DRAIN_TIMEOUT) {
-        Ok(output) => output,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            if !*process_tree_killed {
-                crate::services::process::kill_pid_tree(child_pid);
-                *process_tree_killed = true;
-            }
-            receiver
-                .recv_timeout(UPGRADE_OUTPUT_DRAIN_TIMEOUT)
-                .unwrap_or_default()
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
-    }
+    receiver
+        .recv_timeout(UPGRADE_OUTPUT_DRAIN_TIMEOUT)
+        .unwrap_or_default()
 }
 
 fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeError> {
@@ -155,7 +141,6 @@ fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeErr
     let mut child = command.spawn().map_err(UpgradeError::Io)?;
     let stdout_reader = child.stdout.take().map(spawn_limited_output_drain);
     let stderr_reader = child.stderr.take().map(spawn_limited_output_drain);
-    let child_pid = child.id();
 
     let deadline = Instant::now() + UPGRADE_COMMAND_TIMEOUT;
     let status = loop {
@@ -177,9 +162,8 @@ fn run_upgrade_command(argv: &[&str]) -> Result<UpgradeCommandOutput, UpgradeErr
         }
     };
 
-    let mut process_tree_killed = false;
-    let _stdout = receive_limited_output(stdout_reader, child_pid, &mut process_tree_killed);
-    let stderr = receive_limited_output(stderr_reader, child_pid, &mut process_tree_killed);
+    let _stdout = receive_limited_output(stdout_reader);
+    let stderr = receive_limited_output(stderr_reader);
 
     Ok(UpgradeCommandOutput {
         success: status.success(),
