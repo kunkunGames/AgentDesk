@@ -25,7 +25,6 @@ pub struct SessionMigrationGuard {
     pub safe_end_timeout_seconds: u64,
     pub safe_to_recreate: bool,
     pub recreate_required: bool,
-    pub force_recreate_active: bool,
     #[serde(default)]
     pub evidence: HashMap<String, String>,
 }
@@ -71,10 +70,10 @@ pub fn evaluate_session_migration_guards(
     for agent_id in agents {
         let agent_artifacts = artifacts_for_agent(&artifacts, &agent_id);
         if agent_artifacts.is_empty() {
-            // Agent has never been launched — no active session to protect.
+            // Agent has never been launched — no active session to protect, nothing to recreate.
             let mut guard = build_guard(provider, &agent_id, target_channel);
             guard.safe_to_recreate = true;
-            guard.recreate_required = true;
+            guard.recreate_required = false;
             guard.active_turn_state = "no_prior_launch".to_string();
             guard
                 .evidence
@@ -108,7 +107,8 @@ pub fn evaluate_session_migration_guards(
             } else {
                 guard.safe_to_recreate = true;
                 guard.recreate_required = true;
-                guard.safe_end_completed_at = Some(Utc::now());
+                // Do not set safe_end_completed_at — no actual safe-end procedure was run;
+                // active sessions are allowed with evidence rather than drained.
                 guard.evidence.insert(
                     "status".to_string(),
                     if active {
@@ -119,6 +119,12 @@ pub fn evaluate_session_migration_guards(
                 );
                 if active {
                     guard.active_turn_state = "active_old_channel_session".to_string();
+                    guard.evidence.insert(
+                        "safe_end_skipped_reason".to_string(),
+                        "active_session_auto_allowed".to_string(),
+                    );
+                } else {
+                    guard.safe_end_completed_at = Some(Utc::now());
                 }
             }
 
@@ -147,7 +153,6 @@ fn build_guard(provider: &str, agent_id: &str, target_channel: &str) -> SessionM
         safe_end_timeout_seconds: DEFAULT_SAFE_END_TIMEOUT_SECONDS,
         safe_to_recreate: false,
         recreate_required: false,
-        force_recreate_active: false,
         evidence: HashMap::new(),
     }
 }

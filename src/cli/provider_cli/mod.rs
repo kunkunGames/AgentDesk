@@ -110,7 +110,7 @@ pub enum ProviderCliAction {
         #[arg(long)]
         skip_upgrade: bool,
         /// Skip operator confirmation gate after canary passes
-        #[arg(long)]
+        #[arg(long, alias = "auto-promote")]
         skip_confirm: bool,
     },
     /// Resume migration from the current persisted state
@@ -118,7 +118,7 @@ pub enum ProviderCliAction {
         /// Provider to resume
         provider: String,
         /// Skip operator confirmation gate after canary passes
-        #[arg(long)]
+        #[arg(long, alias = "auto-promote")]
         skip_confirm: bool,
     },
 }
@@ -150,7 +150,9 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
                 .as_deref()
                 .map(normalize_provider_arg)
                 .transpose()?;
-            cmd_status(provider.as_deref(), json)
+            // --json explicit flag, or non-TTY stdout (piped/scripted) → JSON output.
+            let json_output = json || !std::io::IsTerminal::is_terminal(&std::io::stdout());
+            cmd_status(provider.as_deref(), json_output)
         }
         ProviderCliAction::Plan { provider } => {
             let provider = normalize_provider_arg(&provider)?;

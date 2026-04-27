@@ -58,26 +58,26 @@ pub fn canary_evidence(agent_id: &str, channel: &ProviderCliChannel) -> HashMap<
     m
 }
 
+/// Returns the most recent candidate launch artifact for the given agent recorded after
+/// `not_before`, verifying path and version match the registered candidate channel.
+///
+/// Always returns `Err` when no qualifying artifact exists — "agent was never launched"
+/// does NOT exempt from canary runtime validation; it only means the session guard need
+/// not protect an existing session.
 pub fn verified_candidate_launch_artifact(
     root: &Path,
     provider: &str,
     agent_id: &str,
     candidate: &ProviderCliChannel,
     not_before: DateTime<Utc>,
-) -> Result<Option<LaunchArtifact>, String> {
-    let all_agent_artifacts: Vec<_> = load_launch_artifacts(root, provider)
+) -> Result<LaunchArtifact, String> {
+    let mut candidates: Vec<_> = load_launch_artifacts(root, provider)
         .into_iter()
-        .filter(|artifact| artifact.agent_id.as_deref() == Some(agent_id))
-        .collect();
-
-    // Agent was never launched — no session to protect, canary turn not required.
-    if all_agent_artifacts.is_empty() {
-        return Ok(None);
-    }
-
-    let mut candidates: Vec<_> = all_agent_artifacts
-        .into_iter()
-        .filter(|artifact| artifact.channel == "candidate" && artifact.launched_at >= not_before)
+        .filter(|artifact| {
+            artifact.agent_id.as_deref() == Some(agent_id)
+                && artifact.channel == "candidate"
+                && artifact.launched_at >= not_before
+        })
         .collect();
     candidates.sort_by_key(|artifact| artifact.launched_at);
 
@@ -95,7 +95,7 @@ pub fn verified_candidate_launch_artifact(
         ));
     }
 
-    Ok(Some(artifact))
+    Ok(artifact)
 }
 
 #[cfg(test)]
@@ -162,7 +162,8 @@ mod tests {
     }
 
     #[test]
-    fn verified_artifact_returns_none_when_agent_never_launched() {
+    fn verified_artifact_errors_when_agent_never_launched() {
+        // "No prior launch" exempts from session guard but NOT from canary proof.
         let root = tempfile::tempdir().unwrap();
         let candidate = candidate_channel("/tmp/codex", "1.0.0");
         let result = verified_candidate_launch_artifact(
@@ -172,8 +173,12 @@ mod tests {
             &candidate,
             Utc::now() - chrono::Duration::seconds(60),
         );
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("run a canary turn before promotion")
+        );
     }
 
     #[test]
