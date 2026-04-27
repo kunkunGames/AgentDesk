@@ -16,6 +16,7 @@ pub enum ProviderKind {
     Claude,
     Codex,
     Gemini,
+    OpenCode,
     Qwen,
     Unsupported(String),
 }
@@ -58,10 +59,11 @@ pub struct ProviderRegistryEntry {
     pub managed_tmux_backend: bool,
 }
 
-const CLAUDE_COUNTERPARTS: &[&str] = &["codex", "gemini", "qwen"];
-const CODEX_COUNTERPARTS: &[&str] = &["claude", "gemini", "qwen"];
-const GEMINI_COUNTERPARTS: &[&str] = &["codex", "claude", "qwen"];
-const QWEN_COUNTERPARTS: &[&str] = &["codex", "claude", "gemini"];
+const CLAUDE_COUNTERPARTS: &[&str] = &["codex", "gemini", "opencode", "qwen"];
+const CODEX_COUNTERPARTS: &[&str] = &["claude", "gemini", "opencode", "qwen"];
+const GEMINI_COUNTERPARTS: &[&str] = &["codex", "claude", "opencode", "qwen"];
+const OPENCODE_COUNTERPARTS: &[&str] = &["codex", "claude", "gemini", "qwen"];
+const QWEN_COUNTERPARTS: &[&str] = &["codex", "claude", "gemini", "opencode"];
 
 const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
     ProviderRegistryEntry {
@@ -128,6 +130,27 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         managed_tmux_backend: false,
     },
     ProviderRegistryEntry {
+        id: "opencode",
+        display_name: "OpenCode",
+        cli_init_label: "opencode (OpenCode)",
+        channel_suffix: Some("-oc"),
+        default_channel_provider: false,
+        counterpart_provider_ids: OPENCODE_COUNTERPARTS,
+        capabilities: ProviderCapabilities {
+            binary_name: "opencode",
+            supports_structured_output: true,
+            supports_resume: true,
+            supports_tool_stream: true,
+        },
+        default_behavior: ProviderDefaultBehavior {
+            resume_without_reset: true,
+            runtime_model: None,
+            source_label: "provider default",
+        },
+        default_context_window: 128_000,
+        managed_tmux_backend: false,
+    },
+    ProviderRegistryEntry {
         id: "qwen",
         display_name: "Qwen Code",
         cli_init_label: "qwen (Alibaba)",
@@ -166,6 +189,7 @@ impl ProviderKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::OpenCode => "opencode",
             Self::Qwen => "qwen",
             Self::Unsupported(s) => s.as_str(),
         }
@@ -252,6 +276,7 @@ impl ProviderKind {
             Self::Claude => crate::services::claude::resolve_claude_path(),
             Self::Codex => crate::services::codex::resolve_codex_path(),
             Self::Gemini => crate::services::gemini::resolve_gemini_path(),
+            Self::OpenCode => crate::services::opencode::resolve_opencode_path(),
             Self::Qwen => crate::services::qwen::resolve_qwen_path(),
             Self::Unsupported(_) => None,
         }
@@ -284,6 +309,7 @@ impl ProviderKind {
                 "claude" => Some(Self::Claude),
                 "codex" => Some(Self::Codex),
                 "gemini" => Some(Self::Gemini),
+                "opencode" => Some(Self::OpenCode),
                 "qwen" => Some(Self::Qwen),
                 _ => None,
             })
@@ -1273,11 +1299,16 @@ mod tests {
                 "claude (Anthropic)",
                 "codex (OpenAI)",
                 "gemini (Google)",
+                "opencode (OpenCode)",
                 "qwen (Alibaba)"
             ]
         );
         assert_eq!(
             ProviderKind::provider_for_cli_init_index(3),
+            Some(ProviderKind::OpenCode)
+        );
+        assert_eq!(
+            ProviderKind::provider_for_cli_init_index(4),
             Some(ProviderKind::Qwen)
         );
     }
@@ -1513,6 +1544,7 @@ mod tests {
             ProviderKind::Claude,
             ProviderKind::Codex,
             ProviderKind::Gemini,
+            ProviderKind::OpenCode,
             ProviderKind::Qwen,
         ] {
             let capabilities = provider.capabilities().expect("supported provider");
