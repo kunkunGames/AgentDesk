@@ -19,7 +19,7 @@ use crate::services::provider_cli::upgrade::{
 };
 use crate::services::provider_cli::{build_retention_set, cleanup_dry_run};
 
-const SUPPORTED_PROVIDERS: &[&str] = &["codex", "claude", "gemini", "qwen"];
+const SUPPORTED_PROVIDERS: &[&str] = &["codex", "claude", "gemini", "opencode", "qwen"];
 
 #[derive(Args)]
 pub struct ProviderCliArgs {
@@ -658,7 +658,7 @@ fn cmd_cleanup(provider: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
 
-    let migration_states: Vec<_> = ["codex", "claude", "gemini", "qwen"]
+    let migration_states: Vec<_> = ["codex", "claude", "gemini", "opencode", "qwen"]
         .iter()
         .filter_map(|p| load_migration_state(&root, p).ok().flatten())
         .collect();

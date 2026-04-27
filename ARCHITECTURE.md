@@ -357,6 +357,7 @@ src/
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── mod.rs
+│   ├── opencode.rs
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_exec.rs

@@ -218,9 +218,16 @@ pub const PROVIDER_UPDATE_STRATEGIES: &[ProviderCliUpdateStrategy] = &[
         mutates_in_place: true,
     },
     ProviderCliUpdateStrategy {
+        provider: "opencode",
+        install_source: "npm-global",
+        command_argv: &["npm", "install", "-g", "opencode-ai"],
+        expected_binary_name: "opencode",
+        mutates_in_place: true,
+    },
+    ProviderCliUpdateStrategy {
         provider: "qwen",
-        install_source: "pip-user",
-        command_argv: &["pip", "install", "--user", "--upgrade", "qwen-cli"],
+        install_source: "homebrew",
+        command_argv: &["brew", "upgrade", "qwen-code"],
         expected_binary_name: "qwen",
         mutates_in_place: true,
     },
@@ -237,8 +244,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_four_providers_have_update_strategies() {
-        for id in ["codex", "claude", "gemini", "qwen"] {
+    fn all_supported_providers_have_update_strategies() {
+        for id in ["codex", "claude", "gemini", "opencode", "qwen"] {
             let strategy = update_strategy_for(id);
             assert!(strategy.is_some(), "missing strategy for {id}");
             let s = strategy.unwrap();
@@ -249,12 +256,9 @@ mod tests {
 
     #[test]
     fn all_current_providers_mutate_in_place() {
-        for id in ["codex", "claude", "gemini", "qwen"] {
+        for id in ["codex", "claude", "gemini", "opencode", "qwen"] {
             let s = update_strategy_for(id).unwrap();
-            assert!(
-                s.mutates_in_place,
-                "{id} expected mutates_in_place=true (all current providers use npm/pip global)"
-            );
+            assert!(s.mutates_in_place, "{id} expected mutates_in_place=true");
         }
     }
 
