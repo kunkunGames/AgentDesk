@@ -856,6 +856,35 @@ pub(super) fn spawn_turn_bridge(
         let mut any_tool_used = bridge.inflight_state.any_tool_used;
         let mut has_post_tool_text = bridge.inflight_state.has_post_tool_text;
         let mut tmux_handed_off = false;
+        // #1255 live-turn long-running tool placeholder card.
+        //
+        // `last_assistant_text_line` captures the last non-empty single-line
+        // assistant prose emission so we can surface it as the placeholder
+        // card's `요약` slot (the "⏳ CI 통과 신호 대기" use case from the
+        // issue). It is reset on tool result / completion so a stale line
+        // never leaks into the next tool placeholder.
+        //
+        // `long_running_placeholder_active` is `Some(...)` while a Monitor /
+        // background-Bash call is mid-flight. It records the placeholder key
+        // we are driving so the matching ToolResult / Done event can call
+        // `controller.transition(Completed)`. The cancel / abort paths use
+        // the same handle.
+        let mut last_assistant_text_line: Option<String> = None;
+        // Pair the active key with the input snapshot, close-trigger kind, and
+        // an `ack_consumed` flag.
+        //
+        // Rollover uses the snapshot to retarget the controller onto the new
+        // `current_msg_id`; the close-trigger distinguishes Monitor-style
+        // ToolResult-closes from background-dispatch ack events; and
+        // `ack_consumed` (codex round-6 P2 on #1308) prevents subsequent
+        // unrelated ToolResults — for example a failing `Read`/`Grep` later
+        // in the same turn — from closing a still-running background card.
+        let mut long_running_placeholder_active: Option<(
+            super::placeholder_controller::PlaceholderKey,
+            super::placeholder_controller::PlaceholderActiveInput,
+            super::formatting::LongRunningCloseTrigger,
+            bool, // ack_consumed
+        )> = None;
         let mut transport_error = false;
         let mut api_friction_reports = Vec::new();
         let mut transcript_events = Vec::<SessionTranscriptEvent>::new();
@@ -863,6 +892,13 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_session_reset_required = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
+        // codex round-8 P1 on PR #1308: while a long-running placeholder is
+        // active, bump the inflight file's mtime so the sweeper sees the turn
+        // as alive. Without this, a healthy 5+ minute background tool would
+        // exceed `ABANDON_THRESHOLD_SECS` and the sweeper would cancel it.
+        let mut last_inflight_long_run_heartbeat = std::time::Instant::now();
+        const LIVE_LONG_RUN_HEARTBEAT_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(30);
         let mut last_activity_heartbeat_at: Option<std::time::Instant> = None;
         let mut current_msg_id = bridge.current_msg_id;
         let mut response_sent_offset = bridge.response_sent_offset;
@@ -907,6 +943,22 @@ pub(super) fn spawn_turn_bridge(
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
         let turn_start = std::time::Instant::now();
+
+        // codex round-5 P2 on PR #1308: a dcserver restart resumed an inflight
+        // turn whose persisted state still flags `long_running_placeholder_active`.
+        // The in-memory controller is empty here and the original
+        // `PlaceholderActiveInput` snapshot was never persisted, so we cannot
+        // reconstruct the Active entry. Edit the stale 🔄 card to a generic
+        // resumed-aborted notice and clear the flag so subsequent streaming /
+        // sweeper logic treats this turn as a fresh resume.
+        if inflight_state.long_running_placeholder_active {
+            let resumed_notice =
+                "🛑 백그라운드 카드 종료됨 — 서버 재시작으로 이전 흐름이 끊겨 새 응답으로 이어집니다.";
+            let _ = gateway
+                .edit_message(channel_id, current_msg_id, resumed_notice)
+                .await;
+            inflight_state.long_running_placeholder_active = false;
+        }
 
         let _ = save_inflight_state(&inflight_state);
         crate::services::observability::emit_turn_started(
@@ -993,6 +1045,24 @@ pub(super) fn spawn_turn_bridge(
                         }
                         StreamMessage::Text { content } => {
                             full_response.push_str(&content);
+                            // #1255: remember the last non-empty single-line
+                            // assistant prose so we can surface it on a
+                            // long-running tool placeholder card. Mid-stream
+                            // chunks routinely contain newlines, so we walk
+                            // backwards through the lines and pick the most
+                            // recent non-empty one.  `Text` events arrive
+                            // before the immediately-following `ToolUse` event
+                            // in Claude Code's stream ordering, so this
+                            // captures the right hint without buffering.
+                            if let Some(line) = content
+                                .lines()
+                                .filter(|l| !l.trim().is_empty())
+                                .next_back()
+                                .map(str::trim)
+                                .map(str::to_string)
+                            {
+                                last_assistant_text_line = Some(line);
+                            }
                             push_transcript_event(
                                 &mut transcript_events,
                                 SessionTranscriptEvent {
@@ -1128,9 +1198,74 @@ pub(super) fn spawn_turn_bridge(
                                 prev_for_preserve.as_deref(),
                                 Some(display.as_str()),
                             );
-                            current_tool_line = Some(display);
+                            current_tool_line = Some(display.clone());
                             last_tool_name = Some(name.clone());
-                            last_tool_summary = Some(display_summary);
+                            last_tool_summary = Some(display_summary.clone());
+                            // #1255 live-turn long-running tool detection.
+                            //
+                            // Classifier returns `Some` for Monitor and for
+                            // Bash/Task/Agent calls with explicit
+                            // `run_in_background=true`.  Everything else
+                            // streams its result inline and never touches the
+                            // placeholder card.
+                            // codex round-11 P2 on PR #1308: restart commands
+                            // already own a planned ♻️ handoff message via the
+                            // `is_dcserver_restart_command(&input)` branch
+                            // below; opening a long-running placeholder on
+                            // the same message_id would let a later
+                            // Done/Result write a generic background card
+                            // over the planned restart notice. Skip setup
+                            // for those.
+                            if long_running_placeholder_active.is_none()
+                                && !is_dcserver_restart_command(&input)
+                            {
+                                if let Some((reason, close_trigger)) =
+                                    super::formatting::classify_long_running_tool(&name, &input)
+                                {
+                                    let started_at_unix = chrono::Utc::now().timestamp();
+                                    let key =
+                                        super::placeholder_controller::PlaceholderKey {
+                                            provider: provider.clone(),
+                                            channel_id,
+                                            message_id: current_msg_id,
+                                        };
+                                    let input_payload =
+                                        super::placeholder_controller::PlaceholderActiveInput {
+                                            reason,
+                                            started_at_unix,
+                                            tool_summary: Some(name.clone()),
+                                            command_summary: Some(display_summary.clone()),
+                                            context_line: last_assistant_text_line.clone(),
+                                        };
+                                    let outcome = shared_owned
+                                        .placeholder_controller
+                                        .ensure_active(
+                                            gateway.as_ref(),
+                                            key.clone(),
+                                            input_payload.clone(),
+                                        )
+                                        .await;
+                                    // codex round-2 P2: only commit the active
+                                    // pointer when the controller actually
+                                    // committed (or coalesced an existing
+                                    // edit); otherwise the regular streaming
+                                    // path stays in charge so the turn isn't
+                                    // visually frozen on a transient edit
+                                    // failure.
+                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                    if matches!(outcome, Edited | Coalesced) {
+                                        long_running_placeholder_active = Some((
+                                            key,
+                                            input_payload,
+                                            close_trigger,
+                                            false, // ack not yet consumed
+                                        ));
+                                        inflight_state
+                                            .long_running_placeholder_active = true;
+                                        state_dirty = true;
+                                    }
+                                }
+                            }
                             push_transcript_event(
                                 &mut transcript_events,
                                 SessionTranscriptEvent {
@@ -1187,6 +1322,82 @@ pub(super) fn spawn_turn_bridge(
                                 is_error,
                                 &content,
                             );
+                            // #1255: a long-running tool's ToolResult means the
+                            // background card can transition to its terminal
+                            // state.  We still keep the placeholder around for
+                            // the rest of the turn so the user can see the
+                            // status line; the controller's idempotent terminal
+                            // transition keeps duplicate edits free.
+                            // codex round-2 P1: only `Monitor`-style tools
+                            // deliver their real completion via `ToolResult`.
+                            // Background `Bash`/`Task`/`Agent` dispatches send
+                            // back a job/task id ack on `ToolResult` and the
+                            // actual work continues — terminating here would
+                            // close the card while the background job is
+                            // still running. Keep those open until `Done` /
+                            // cancel.
+                            if let Some((key, snapshot, close_trigger, ack_consumed)) =
+                                long_running_placeholder_active.take()
+                            {
+                                let monitor_like = matches!(
+                                    close_trigger,
+                                    super::formatting::LongRunningCloseTrigger::MonitorLike
+                                );
+                                // codex round-6 P2: only the FIRST ToolResult
+                                // after the background ToolUse can be its
+                                // dispatch ack. Subsequent ToolResults belong
+                                // to other foreground tools and must not close
+                                // the still-running background card. Once the
+                                // ack is consumed, re-stash unconditionally
+                                // until `Done`/cancel.
+                                let is_dispatch_ack =
+                                    !monitor_like && !ack_consumed;
+                                // codex round-5 P2: an `is_error` ToolResult on
+                                // the background dispatch ack (launch failure)
+                                // closes the card as Aborted; otherwise `Done`
+                                // would later mark it Completed and Discord
+                                // would report a failed background launch as ✅.
+                                if monitor_like || (is_dispatch_ack && is_error) {
+                                    let target = if is_error {
+                                        super::placeholder_controller::PlaceholderLifecycle::Aborted
+                                    } else {
+                                        super::placeholder_controller::PlaceholderLifecycle::Completed
+                                    };
+                                    let outcome = shared_owned
+                                        .placeholder_controller
+                                        .transition(gateway.as_ref(), key.clone(), target)
+                                        .await;
+                                    // codex round-10 P2: only clear flag on
+                                    // committed/already-terminal outcome.
+                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                    if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                                        inflight_state
+                                            .long_running_placeholder_active = false;
+                                        state_dirty = true;
+                                    } else {
+                                        // EditFailed — keep the placeholder
+                                        // active so the next event/sweeper
+                                        // can retry the terminal edit.
+                                        long_running_placeholder_active =
+                                            Some((key, snapshot, close_trigger, ack_consumed));
+                                    }
+                                } else {
+                                    // Successful background dispatch ack OR a
+                                    // later unrelated ToolResult — re-stash so
+                                    // `Done`/cancel can close the card. Mark
+                                    // the ack consumed so future is_error
+                                    // results from other tools don't abort us.
+                                    long_running_placeholder_active = Some((
+                                        key,
+                                        snapshot,
+                                        close_trigger,
+                                        true,
+                                    ));
+                                }
+                            }
+                            // Reset the assistant-line summary so the next
+                            // long-running tool call captures its own context.
+                            last_assistant_text_line = None;
                             if let Some(ref tn) = last_tool_name {
                                 let status = if is_error { "✗" } else { "✓" };
                                 let detail = last_tool_summary
@@ -1244,6 +1455,38 @@ pub(super) fn spawn_turn_bridge(
                                 // Discord-history auto-retry path when the
                                 // resumed session dies before completion.
                                 recovery_retry = true;
+                            }
+                            // #1255: turn finished while a long-running
+                            // placeholder is still flagged as Active — close
+                            // it now so the user does not stare at a stale
+                            // 🔄 card forever. Idempotent if a prior
+                            // ToolResult already fired Completed.
+                            if let Some((key, snapshot, close_trigger, ack_consumed)) =
+                                long_running_placeholder_active.take()
+                            {
+                                let target = if result == "__session_died_retry__" {
+                                    super::placeholder_controller::PlaceholderLifecycle::Aborted
+                                } else {
+                                    super::placeholder_controller::PlaceholderLifecycle::Completed
+                                };
+                                let outcome = shared_owned
+                                    .placeholder_controller
+                                    .transition(gateway.as_ref(), key.clone(), target)
+                                    .await;
+                                // codex round-10/11 P2/P3: on `EditFailed`,
+                                // re-stash the tuple so subsequent
+                                // streaming/sweeper paths can retry the
+                                // terminal edit. Only clear the persisted
+                                // flag on a committed (or already-terminal)
+                                // transition.
+                                use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                                    inflight_state.long_running_placeholder_active = false;
+                                    state_dirty = true;
+                                } else {
+                                    long_running_placeholder_active =
+                                        Some((key, snapshot, close_trigger, ack_consumed));
+                                }
                             }
                             if let Some(resolved) = resolve_done_response(
                                 &full_response,
@@ -1545,6 +1788,60 @@ pub(super) fn spawn_turn_bridge(
                             inflight_state.response_sent_offset = response_sent_offset;
                             inflight_state.full_response = full_response.clone();
                             state_dirty = true;
+                            // #1255 codex round-1 P2: rollover advanced
+                            // `current_msg_id` past the message that owned the
+                            // active long-running placeholder. The old message
+                            // now holds delivered response content; retarget
+                            // the controller onto the new message_id so the
+                            // eventual terminal transition lands on the live
+                            // card instead of overwriting that frozen chunk.
+                            // codex round-2 P2: drop the active pointer if the
+                            // retarget edit fails — otherwise we'd suppress
+                            // streaming with no card visible.
+                            // codex round-4 P2: detach the old key first so
+                            // its `Active` controller entry doesn't linger as
+                            // a non-evictable row in the cap-bounded map.
+                            if let Some((old_key, snapshot, close_trigger, ack_consumed)) =
+                                long_running_placeholder_active.take()
+                            {
+                                shared_owned
+                                    .placeholder_controller
+                                    .detach(&old_key);
+                                let new_key =
+                                    super::placeholder_controller::PlaceholderKey {
+                                        provider: provider.clone(),
+                                        channel_id,
+                                        message_id: current_msg_id,
+                                    };
+                                let outcome = shared_owned
+                                    .placeholder_controller
+                                    .ensure_active(
+                                        gateway.as_ref(),
+                                        new_key.clone(),
+                                        snapshot.clone(),
+                                    )
+                                    .await;
+                                use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                if matches!(outcome, Edited | Coalesced) {
+                                    long_running_placeholder_active = Some((
+                                        new_key,
+                                        snapshot,
+                                        close_trigger,
+                                        ack_consumed,
+                                    ));
+                                    // Flag is already true; refresh
+                                    // updated_at-side bookkeeping by writing
+                                    // through state_dirty.
+                                    state_dirty = true;
+                                } else {
+                                    // Retarget edit failed — drop the flag so
+                                    // the regular streaming loop and sweeper
+                                    // resume normal handling.
+                                    inflight_state.long_running_placeholder_active =
+                                        false;
+                                    state_dirty = true;
+                                }
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -1582,9 +1879,14 @@ pub(super) fn spawn_turn_bridge(
             let stable_display_text =
                 super::formatting::build_streaming_placeholder_text(current_portion, &status_block);
 
+            // #1255 codex round-1 P2: while a long-running placeholder owns
+            // `current_msg_id`, the controller is the sole writer. Skipping the
+            // regular streaming edit prevents `stable_display_text` from
+            // overwriting the `🔄 백그라운드 처리 중` card mid-flight.
             if stable_display_text != last_edit_text
                 && !done
                 && last_status_edit.elapsed() >= status_interval
+                && long_running_placeholder_active.is_none()
             {
                 let _ = gateway
                     .edit_message(channel_id, current_msg_id, &stable_display_text)
@@ -1628,6 +1930,53 @@ pub(super) fn spawn_turn_bridge(
                 )
                 .await;
                 last_adk_heartbeat = std::time::Instant::now();
+            }
+
+            // codex round-8 P1: keep `placeholder_sweeper` from abandoning a
+            // healthy long-running tool wait by bumping inflight mtime every
+            // 30s while a placeholder is owned. If the turn dies, this loop
+            // stops firing → mtime stops advancing → sweeper can abandon
+            // normally past `ABANDON_THRESHOLD_SECS`.
+            if long_running_placeholder_active.is_some()
+                && last_inflight_long_run_heartbeat.elapsed()
+                    >= LIVE_LONG_RUN_HEARTBEAT_INTERVAL
+            {
+                inflight_state.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = save_inflight_state(&inflight_state);
+                last_inflight_long_run_heartbeat = std::time::Instant::now();
+            }
+        }
+
+        // codex round-9 P3 on PR #1308: drain any active long-running
+        // placeholder on stream-error / receive-disconnect exits too. The
+        // cancel branch already drives the controller to `Aborted`; here we
+        // also need to handle `StreamMessage::Error` and `rx_disconnected`
+        // exits so the controller does not leak an `Active` row and the
+        // persisted `long_running_placeholder_active` flag does not survive
+        // for the sweeper to abandon the card. Skip when `cancelled` (the
+        // dedicated cancel block below handles it). For tmux-handoff exits
+        // the dedicated handoff branch already calls `detach`, so we leave
+        // those alone.
+        if !cancelled
+            && !(rx_disconnected && tmux_handed_off && full_response.is_empty())
+        {
+            if let Some((key, _, _, _)) = long_running_placeholder_active.take() {
+                let target = if transport_error || rx_disconnected {
+                    super::placeholder_controller::PlaceholderLifecycle::Aborted
+                } else {
+                    super::placeholder_controller::PlaceholderLifecycle::Completed
+                };
+                let outcome = shared_owned
+                    .placeholder_controller
+                    .transition(gateway.as_ref(), key, target)
+                    .await;
+                // codex round-10 P2: keep the persisted flag on EditFailed so
+                // the sweeper can finalize the still-visible 🔄 card later.
+                use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                    inflight_state.long_running_placeholder_active = false;
+                }
+                let _ = save_inflight_state(&inflight_state);
             }
         }
 
@@ -1834,6 +2183,23 @@ pub(super) fn spawn_turn_bridge(
         }
 
         if cancelled {
+            // #1255: cancelled turn → drive any active long-running placeholder
+            // into Aborted before the rest of the cleanup machinery runs. The
+            // controller's idempotent terminal transition guarantees this is
+            // safe even if the ToolResult event already fired Completed.
+            if let Some((key, _, _, _)) = long_running_placeholder_active.take() {
+                let _ = shared_owned
+                    .placeholder_controller
+                    .transition(
+                        gateway.as_ref(),
+                        key,
+                        super::placeholder_controller::PlaceholderLifecycle::Aborted,
+                    )
+                    .await;
+                inflight_state.long_running_placeholder_active = false;
+                let _ = save_inflight_state(&inflight_state);
+            }
+
             if let Some(pid) = cancel_token.child_pid.lock().ok().and_then(|guard| *guard) {
                 crate::services::process::kill_pid_tree(pid);
             }
@@ -1963,18 +2329,50 @@ pub(super) fn spawn_turn_bridge(
             // <t:UNIX:R> for client-side relative-time rendering (no server
             // refresh needed) and surfaces the last seen tool/command + the
             // handoff reason so the user knows what's still in flight.
+            //
+            // #1255: route through PlaceholderController so this edit
+            // serializes against any concurrent live-turn Monitor placeholder
+            // edit on the same message_id. If the live-turn placeholder
+            // already reached a terminal state, the controller rejects this
+            // re-activation and we fall through to the legacy direct-edit
+            // path so the watcher still surfaces something to the user.
             let started_at_unix = chrono::Utc::now().timestamp()
                 - i64::try_from(turn_start.elapsed().as_secs()).unwrap_or(0);
-            let placeholder_text = super::formatting::build_monitor_handoff_placeholder(
-                super::formatting::MonitorHandoffStatus::Active,
-                super::formatting::MonitorHandoffReason::AsyncDispatch,
+            let key = super::placeholder_controller::PlaceholderKey {
+                provider: provider.clone(),
+                channel_id,
+                message_id: current_msg_id,
+            };
+            let controller_input = super::placeholder_controller::PlaceholderActiveInput {
+                reason: super::formatting::MonitorHandoffReason::AsyncDispatch,
                 started_at_unix,
-                current_tool_line.as_deref(),
-                None,
-            );
-            let handoff_edit = gateway
-                .edit_message(channel_id, current_msg_id, &placeholder_text)
+                tool_summary: current_tool_line.clone(),
+                command_summary: None,
+                context_line: last_assistant_text_line.clone(),
+            };
+            let controller_outcome = shared_owned
+                .placeholder_controller
+                .ensure_active(gateway.as_ref(), key.clone(), controller_input)
                 .await;
+            // Fall back to a direct edit only when the controller refused or
+            // failed — `Edited`/`Coalesced` already cover the happy path.
+            let handoff_edit: Result<(), String> = match controller_outcome {
+                super::placeholder_controller::PlaceholderControllerOutcome::Edited
+                | super::placeholder_controller::PlaceholderControllerOutcome::Coalesced => Ok(()),
+                _ => {
+                    let placeholder_text =
+                        super::formatting::build_monitor_handoff_placeholder(
+                            super::formatting::MonitorHandoffStatus::Active,
+                            super::formatting::MonitorHandoffReason::AsyncDispatch,
+                            started_at_unix,
+                            current_tool_line.as_deref(),
+                            None,
+                        );
+                    gateway
+                        .edit_message(channel_id, current_msg_id, &placeholder_text)
+                        .await
+                }
+            };
             let handoff_operation =
                 super::placeholder_cleanup::PlaceholderCleanupOperation::EditHandoff;
             let handoff_outcome = match handoff_edit {
@@ -2008,6 +2406,12 @@ pub(super) fn spawn_turn_bridge(
                     source: "turn_bridge_tmux_handoff",
                 },
             );
+            // codex round-5 P2 on PR #1308: after handoff, the watcher owns
+            // the placeholder lifecycle through `placeholder_cleanup` and
+            // direct edits — it never calls `transition`/`detach`. Drop the
+            // controller's `Active` entry now so it does not survive as a
+            // non-evictable row in the cap-bounded map.
+            shared_owned.placeholder_controller.detach(&key);
             let ts = chrono::Local::now().format("%H:%M:%S");
             if handoff_committed {
                 tracing::warn!(

@@ -158,7 +158,14 @@ async fn run_placeholder_sweep_pass(
         // The "stalled after partial output" case is intentionally left for
         // a follow-up: it requires an append (rather than replace) strategy
         // so the partial response stays visible above the badge.
-        if !state.full_response.is_empty() || state.response_sent_offset > 0 {
+        // codex round-2 P2 on PR #1308: a long-running tool placeholder may
+        // be opened after assistant prose has already streamed, so
+        // `full_response` is non-empty even though `current_msg_id` now points
+        // at a pure background card. Honour the explicit flag from the turn
+        // loop and let those flow through to the stalled/abandoned branches.
+        if !state.long_running_placeholder_active
+            && (!state.full_response.is_empty() || state.response_sent_offset > 0)
+        {
             continue;
         }
         // Re-stat guard for the EDIT path: between
@@ -171,6 +178,12 @@ async fn run_placeholder_sweep_pass(
         if !inflight_state_still_same_turn(provider, &state, age_secs) {
             continue;
         }
+        // codex round-8 P1 on PR #1308: long-running placeholders rely on the
+        // turn loop bumping `updated_at` every 30s (see
+        // `LIVE_LONG_RUN_HEARTBEAT_INTERVAL` in `turn_bridge::mod`) so the
+        // sweeper can still abandon them if the owning process actually dies
+        // — only the live ones keep advancing mtime. Treat all states
+        // uniformly here.
         match classify_age(age_secs) {
             SweepDecision::Active => {}
             SweepDecision::Stalled => {
@@ -219,6 +232,22 @@ async fn run_placeholder_sweep_pass(
                     finalize_abandoned_mailbox(shared, provider, &state).await;
                     if delete_inflight_state_file(provider, state.channel_id) {
                         report.abandoned += 1;
+                    }
+                    // codex round-10 P3 on PR #1308: detach the controller's
+                    // Active row that was tracking this card so the
+                    // cap-bounded map does not retain a non-evictable entry.
+                    if let (Some(provider_kind), msg_id) = (
+                        ProviderKind::from_str(&state.provider),
+                        state.current_msg_id,
+                    ) {
+                        if msg_id != 0 {
+                            let key = super::placeholder_controller::PlaceholderKey {
+                                provider: provider_kind,
+                                channel_id: serenity::ChannelId::new(state.channel_id),
+                                message_id: serenity::MessageId::new(msg_id),
+                            };
+                            shared.placeholder_controller.detach(&key);
+                        }
                     }
                 }
             }
