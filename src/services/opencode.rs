@@ -113,8 +113,9 @@ pub fn execute_command_streaming(
         );
     }
 
-    let bin = resolve_opencode_path()
-        .ok_or_else(|| "OpenCode CLI not found — install with: npm install -g opencode-ai".to_string())?;
+    let bin = resolve_opencode_path().ok_or_else(|| {
+        "OpenCode CLI not found — install with: npm install -g opencode-ai".to_string()
+    })?;
 
     let port = allocate_port()?;
     let password = generate_password();
@@ -166,9 +167,7 @@ fn spawn_server(bin: &str, port: u16, password: &str, working_dir: &str) -> Resu
 }
 
 fn dispose_server(base_url: &str, auth: &str) {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(DISPOSE_TIMEOUT)
-        .build();
+    let agent = ureq::AgentBuilder::new().timeout(DISPOSE_TIMEOUT).build();
     let _ = agent
         .post(&format!("{base_url}/instance/dispose"))
         .set("Authorization", auth)
@@ -368,12 +367,9 @@ fn consume_sse(
             let data = current_data.clone();
             current_data.clear();
 
-            if let Some(should_stop) = process_sse_event(
-                &data,
-                session_id,
-                sender,
-                &mut accumulated_text,
-            ) {
+            if let Some(should_stop) =
+                process_sse_event(&data, session_id, sender, &mut accumulated_text)
+            {
                 if should_stop {
                     idle_seen = true;
                     // Send Done
@@ -471,11 +467,11 @@ fn process_sse_event(
                     let _ = sender.send(StreamMessage::Thinking { summary });
                 }
                 "tool-use" => {
-                    let name = part.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let input = part
-                        .get("input")
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
+                    let name = part
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let input = part.get("input").map(|v| v.to_string()).unwrap_or_default();
                     let _ = sender.send(StreamMessage::ToolUse {
                         name: name.to_string(),
                         input,
@@ -631,14 +627,20 @@ mod tests {
         let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"text","text":"hello world"}}}"#;
         let (msgs, stop) = parse_event(data, "s1");
         assert_eq!(stop, Some(false));
-        assert!(msgs.iter().any(|m| matches!(m, StreamMessage::Text { content } if content == "hello world")));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Text { content } if content == "hello world"))
+        );
     }
 
     #[test]
     fn test_tool_use_emitted() {
         let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"tool-use","name":"bash","input":{"command":"ls"}}}}"#;
         let (msgs, _) = parse_event(data, "s1");
-        assert!(msgs.iter().any(|m| matches!(m, StreamMessage::ToolUse { name, .. } if name == "bash")));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::ToolUse { name, .. } if name == "bash"))
+        );
     }
 
     #[test]
@@ -671,7 +673,10 @@ mod tests {
         let data = r#"{"type":"error","properties":{"message":"boom","sessionID":"s1"}}"#;
         let (msgs, stop) = parse_event(data, "s1");
         assert_eq!(stop, Some(true));
-        assert!(msgs.iter().any(|m| matches!(m, StreamMessage::Error { .. })));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Error { .. }))
+        );
     }
 
     #[test]
@@ -687,7 +692,10 @@ mod tests {
         let password = "super-secret";
         let header = build_auth_header(password);
         assert!(header.starts_with("Basic "));
-        assert!(!header.contains(password), "raw password must not appear in auth header");
+        assert!(
+            !header.contains(password),
+            "raw password must not appear in auth header"
+        );
     }
 
     #[test]
@@ -695,7 +703,10 @@ mod tests {
         let key = "AGENTDESK_OPENCODE_PATH";
         let original = std::env::var_os(key);
         unsafe { std::env::set_var(key, "/custom/opencode") };
-        assert_eq!(resolve_opencode_path(), Some("/custom/opencode".to_string()));
+        assert_eq!(
+            resolve_opencode_path(),
+            Some("/custom/opencode".to_string())
+        );
         match original {
             Some(v) => unsafe { std::env::set_var(key, v) },
             None => unsafe { std::env::remove_var(key) },

@@ -52,9 +52,9 @@
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 182 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 256 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4362 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4364 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 357 |  |
-| `cli::init` | `src/cli/init.rs` | 1597 | giant-file |
+| `cli::init` | `src/cli/init.rs` | 1598 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
 | `cli::migrate::apply` | `src/cli/migrate/apply.rs` | 3144 | giant-file |
 | `cli::migrate::plan` | `src/cli/migrate/plan.rs` | 1513 | giant-file |
@@ -82,7 +82,7 @@
 | `db::table_metadata` | `src/db/table_metadata.rs` | 231 |  |
 | `db::turns` | `src/db/turns.rs` | 166 |  |
 | `dispatch` | `src/dispatch/mod.rs` | 4897 | giant-file |
-| `dispatch::dispatch_channel` | `src/dispatch/dispatch_channel.rs` | 23 |  |
+| `dispatch::dispatch_channel` | `src/dispatch/dispatch_channel.rs` | 24 |  |
 | `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 3778 | giant-file |
 | `dispatch::dispatch_create` | `src/dispatch/dispatch_create.rs` | 2517 | giant-file |
 | `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 1823 | giant-file |
@@ -203,7 +203,7 @@
 | `server::state` | `src/server/state.rs` | 235 |  |
 | `server::worker_registry` | `src/server/worker_registry.rs` | 582 |  |
 | `server::ws` | `src/server/ws.rs` | 236 |  |
-| `services` | `src/services/mod.rs` | 48 |  |
+| `services` | `src/services/mod.rs` | 49 |  |
 | `services::agent_protocol` | `src/services/agent_protocol.rs` | 199 |  |
 | `services::agent_quality` | `src/services/agent_quality/mod.rs` | 24 |  |
 | `services::agent_quality::regression_alerts` | `src/services/agent_quality/regression_alerts.rs` | 616 |  |
@@ -219,8 +219,8 @@
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1164 | giant-file |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 97 |  |
 | `services::discord::commands::command_policy` | `src/services/discord/commands/command_policy.rs` | 521 |  |
-| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1809 | giant-file |
-| `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 838 |  |
+| `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1810 | giant-file |
+| `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 842 |  |
 | `services::discord::commands::diagnostics` | `src/services/discord/commands/diagnostics.rs` | 1047 | giant-file |
 | `services::discord::commands::fast_mode` | `src/services/discord/commands/fast_mode.rs` | 147 |  |
 | `services::discord::commands::help` | `src/services/discord/commands/help.rs` | 126 |  |
@@ -230,7 +230,7 @@
 | `services::discord::commands::receipt` | `src/services/discord/commands/receipt.rs` | 160 |  |
 | `services::discord::commands::restart` | `src/services/discord/commands/restart.rs` | 346 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 370 |  |
-| `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 384 |  |
+| `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 397 |  |
 | `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1271 | giant-file |
 | `services::discord::discord_io` | `src/services/discord/discord_io.rs` | 578 |  |
 | `services::discord::formatting` | `src/services/discord/formatting.rs` | 2995 | giant-file |
@@ -245,7 +245,7 @@
 | `services::discord::meeting_orchestrator` | `src/services/discord/meeting_orchestrator.rs` | 3777 | giant-file |
 | `services::discord::meeting_state_machine` | `src/services/discord/meeting_state_machine.rs` | 302 |  |
 | `services::discord::metrics` | `src/services/discord/metrics.rs` | 148 |  |
-| `services::discord::model_catalog` | `src/services/discord/model_catalog.rs` | 1224 | giant-file |
+| `services::discord::model_catalog` | `src/services/discord/model_catalog.rs` | 1225 | giant-file |
 | `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 424 |  |
 | `services::discord::monitoring_status` | `src/services/discord/monitoring_status.rs` | 550 |  |
 | `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 938 |  |
@@ -272,7 +272,7 @@
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 17 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
 | `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 1250 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 6978 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 7008 | giant-file |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 129 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 2716 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 365 |  |
@@ -328,12 +328,13 @@
 | `services::observability::watcher_latency` | `src/services/observability/watcher_latency.rs` | 443 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 19 |  |
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 971 |  |
+| `services::opencode` | `src/services/opencode.rs` | 715 |  |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 1507 | giant-file |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 298 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
-| `services::provider` | `src/services/provider.rs` | 2100 | giant-file |
-| `services::provider_exec` | `src/services/provider_exec.rs` | 381 |  |
+| `services::provider` | `src/services/provider.rs` | 2132 | giant-file |
+| `services::provider_exec` | `src/services/provider_exec.rs` | 399 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 499 |  |
 | `services::qwen` | `src/services/qwen.rs` | 2446 | giant-file |
