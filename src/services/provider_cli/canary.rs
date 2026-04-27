@@ -58,6 +58,12 @@ pub fn canary_evidence(agent_id: &str, channel: &ProviderCliChannel) -> HashMap<
     m
 }
 
+/// Returns the most recent candidate launch artifact for the given agent recorded after
+/// `not_before`, verifying path and version match the registered candidate channel.
+///
+/// Always returns `Err` when no qualifying artifact exists — "agent was never launched"
+/// does NOT exempt from canary runtime validation; it only means the session guard need
+/// not protect an existing session.
 pub fn verified_candidate_launch_artifact(
     root: &Path,
     provider: &str,
@@ -65,17 +71,17 @@ pub fn verified_candidate_launch_artifact(
     candidate: &ProviderCliChannel,
     not_before: DateTime<Utc>,
 ) -> Result<LaunchArtifact, String> {
-    let mut artifacts = load_launch_artifacts(root, provider)
+    let mut candidates: Vec<_> = load_launch_artifacts(root, provider)
         .into_iter()
         .filter(|artifact| {
             artifact.agent_id.as_deref() == Some(agent_id)
                 && artifact.channel == "candidate"
                 && artifact.launched_at >= not_before
         })
-        .collect::<Vec<_>>();
-    artifacts.sort_by_key(|artifact| artifact.launched_at);
+        .collect();
+    candidates.sort_by_key(|artifact| artifact.launched_at);
 
-    let Some(artifact) = artifacts.pop() else {
+    let Some(artifact) = candidates.pop() else {
         return Err(format!(
             "no candidate launch artifact recorded for {provider}/{agent_id} after canary activation; run a canary turn before promotion"
         ));
@@ -141,5 +147,75 @@ mod tests {
         let agents = vec![agent("claude-1", "claude", false)];
         let selected = select_canary_agent("codex", &agents, None);
         assert!(selected.is_none());
+    }
+
+    fn candidate_channel(canonical_path: &str, version: &str) -> ProviderCliChannel {
+        ProviderCliChannel {
+            path: canonical_path.to_string(),
+            canonical_path: canonical_path.to_string(),
+            version: version.to_string(),
+            version_output: None,
+            source: "test".to_string(),
+            checked_at: Utc::now(),
+            evidence: Default::default(),
+        }
+    }
+
+    #[test]
+    fn verified_artifact_errors_when_agent_never_launched() {
+        // "No prior launch" exempts from session guard but NOT from canary proof.
+        let root = tempfile::tempdir().unwrap();
+        let candidate = candidate_channel("/tmp/codex", "1.0.0");
+        let result = verified_candidate_launch_artifact(
+            root.path(),
+            "codex",
+            "codex-agent",
+            &candidate,
+            Utc::now() - chrono::Duration::seconds(60),
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("run a canary turn before promotion")
+        );
+    }
+
+    #[test]
+    fn verified_artifact_errors_when_launched_but_canary_turn_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        // Agent has a pre-migration artifact on the current channel
+        crate::services::provider_cli::io::save_launch_artifact(
+            root.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-session".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/codex".to_string(),
+                canonical_path: "/tmp/codex".to_string(),
+                cli_version: "0.9.0".to_string(),
+                process_id: None,
+                tmux_session: None,
+                launched_at: Utc::now() - chrono::Duration::seconds(120),
+            },
+        )
+        .unwrap();
+
+        let candidate = candidate_channel("/tmp/codex", "1.0.0");
+        let result = verified_candidate_launch_artifact(
+            root.path(),
+            "codex",
+            "codex-agent",
+            &candidate,
+            Utc::now() - chrono::Duration::seconds(60),
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("run a canary turn before promotion")
+        );
     }
 }

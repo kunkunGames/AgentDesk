@@ -91,16 +91,9 @@ pub fn evaluate_provider_session_guard(
     provider: &str,
     selected_agent_id: Option<&str>,
     target_channel: &str,
-    force_recreate_active: bool,
 ) -> SessionGuardEvaluation {
     let target_agent_ids = provider_target_agent_ids(provider, selected_agent_id);
-    evaluate_session_migration_guards(
-        root,
-        provider,
-        &target_agent_ids,
-        target_channel,
-        force_recreate_active,
-    )
+    evaluate_session_migration_guards(root, provider, &target_agent_ids, target_channel)
 }
 
 pub fn session_guard_evidence(

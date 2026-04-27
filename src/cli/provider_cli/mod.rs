@@ -33,13 +33,18 @@ pub enum ProviderCliAction {
     Status {
         /// Restrict output to a single provider (codex, claude, gemini, qwen)
         provider: Option<String>,
+        /// Output raw JSON instead of the default table
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a migration would do without running it
     Plan {
         /// Provider to plan (codex, claude, gemini, qwen)
         provider: String,
     },
-    /// Snapshot current binary and run upgrade
+    /// [step] Snapshot current binary and run upgrade
+    ///
+    /// Use `agentdesk provider-cli run` for the full automated migration.
     Upgrade {
         /// Provider to upgrade
         provider: String,
@@ -50,7 +55,9 @@ pub enum ProviderCliAction {
         #[arg(long)]
         candidate_path: Option<String>,
     },
-    /// Run smoke checks against current or candidate binary
+    /// [step] Run smoke checks against current or candidate binary
+    ///
+    /// Smoke is run automatically by `agentdesk provider-cli run`.
     Smoke {
         /// Provider to smoke-test
         provider: String,
@@ -58,7 +65,9 @@ pub enum ProviderCliAction {
         #[arg(long, default_value = "current")]
         channel: String,
     },
-    /// Select a canary agent for the migration
+    /// [step] Select a canary agent for the migration
+    ///
+    /// Canary selection is handled automatically by `agentdesk provider-cli run`.
     Canary {
         /// Provider to select canary for
         provider: String,
@@ -73,9 +82,6 @@ pub enum ProviderCliAction {
         /// Operator note recorded in migration history
         #[arg(long)]
         evidence: Option<String>,
-        /// Allow promotion when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
     },
     /// Roll back migration to previous state
     Rollback {
@@ -85,13 +91,10 @@ pub enum ProviderCliAction {
         #[arg(long)]
         evidence: Option<String>,
     },
-    /// List paths eligible for cleanup (dry-run only)
+    /// List paths eligible for cleanup (dry-run only — deletion not implemented)
     Cleanup {
         /// Provider to inspect
         provider: String,
-        /// Print candidates without deleting (default behavior — only dry-run is implemented)
-        #[arg(long, default_value_t = true)]
-        dry_run: bool,
     },
     /// Run full migration orchestration up to CanaryActive
     Run {
@@ -106,23 +109,17 @@ pub enum ProviderCliAction {
         /// Skip binary preservation (use with caution)
         #[arg(long)]
         skip_upgrade: bool,
-        /// Auto-promote without waiting for operator confirmation
-        #[arg(long)]
-        auto_promote: bool,
-        /// Allow migration when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
+        /// Skip operator confirmation gate after canary passes
+        #[arg(long, alias = "auto-promote")]
+        skip_confirm: bool,
     },
     /// Resume migration from the current persisted state
     Resume {
         /// Provider to resume
         provider: String,
-        /// Auto-promote without waiting for operator confirmation
-        #[arg(long)]
-        auto_promote: bool,
-        /// Allow migration when an old-channel launch artifact still appears active
-        #[arg(long)]
-        force_recreate_active: bool,
+        /// Skip operator confirmation gate after canary passes
+        #[arg(long, alias = "auto-promote")]
+        skip_confirm: bool,
     },
 }
 
@@ -148,12 +145,14 @@ fn normalize_provider_arg(provider: &str) -> Result<String, String> {
 
 pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
     match args.action {
-        ProviderCliAction::Status { provider } => {
+        ProviderCliAction::Status { provider, json } => {
             let provider = provider
                 .as_deref()
                 .map(normalize_provider_arg)
                 .transpose()?;
-            cmd_status(provider.as_deref())
+            // --json explicit flag, or non-TTY stdout (piped/scripted) → JSON output.
+            let json_output = json || !std::io::IsTerminal::is_terminal(&std::io::stdout());
+            cmd_status(provider.as_deref(), json_output)
         }
         ProviderCliAction::Plan { provider } => {
             let provider = normalize_provider_arg(&provider)?;
@@ -182,29 +181,24 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
             let provider = normalize_provider_arg(&provider)?;
             cmd_canary(&provider, canary_agent.as_deref())
         }
-        ProviderCliAction::Promote {
-            provider,
-            evidence,
-            force_recreate_active,
-        } => {
+        ProviderCliAction::Promote { provider, evidence } => {
             let provider = normalize_provider_arg(&provider)?;
-            cmd_promote(&provider, evidence.as_deref(), force_recreate_active)
+            cmd_promote(&provider, evidence.as_deref())
         }
         ProviderCliAction::Rollback { provider, evidence } => {
             let provider = normalize_provider_arg(&provider)?;
             cmd_rollback(&provider, evidence.as_deref())
         }
-        ProviderCliAction::Cleanup { provider, dry_run } => {
+        ProviderCliAction::Cleanup { provider } => {
             let provider = normalize_provider_arg(&provider)?;
-            cmd_cleanup(&provider, dry_run)
+            cmd_cleanup(&provider)
         }
         ProviderCliAction::Run {
             provider,
             candidate_path,
             canary_agent,
             skip_upgrade,
-            auto_promote,
-            force_recreate_active,
+            skip_confirm,
         } => {
             let provider = normalize_provider_arg(&provider)?;
             cmd_run(
@@ -212,22 +206,20 @@ pub fn cmd_provider_cli(args: ProviderCliArgs) -> Result<(), String> {
                 candidate_path.as_deref(),
                 canary_agent.as_deref(),
                 skip_upgrade,
-                auto_promote,
-                force_recreate_active,
+                skip_confirm,
             )
         }
         ProviderCliAction::Resume {
             provider,
-            auto_promote,
-            force_recreate_active,
+            skip_confirm,
         } => {
             let provider = normalize_provider_arg(&provider)?;
-            cmd_resume(&provider, auto_promote, force_recreate_active)
+            cmd_resume(&provider, skip_confirm)
         }
     }
 }
 
-fn cmd_status(provider: Option<&str>) -> Result<(), String> {
+fn cmd_status(provider: Option<&str>, json_output: bool) -> Result<(), String> {
     let root = runtime_root()?;
     let registry = load_registry(&root)
         .map_err(|e| format!("load registry: {e}"))?
@@ -239,22 +231,77 @@ fn cmd_status(provider: Option<&str>) -> Result<(), String> {
         SUPPORTED_PROVIDERS.to_vec()
     };
 
-    let mut output = Vec::new();
+    if json_output {
+        let mut output = Vec::new();
+        for p in filter {
+            let channels = registry.providers.get(p);
+            let migration = load_migration_state(&root, p).ok().flatten();
+            output.push(json!({
+                "provider": p,
+                "current": channels.and_then(|c| c.current.as_ref()).map(|ch| &ch.version),
+                "candidate": channels.and_then(|c| c.candidate.as_ref()).map(|ch| &ch.version),
+                "previous": channels.and_then(|c| c.previous.as_ref()).map(|ch| &ch.version),
+                "migration_state": migration.as_ref().map(|m| format!("{:?}", m.state)),
+                "canary_agent": migration.as_ref().and_then(|m| m.selected_agent_id.clone()),
+            }));
+        }
+        print_json(&json!({ "providers": output }));
+        return Ok(());
+    }
+
+    // Tabular output.
+    let d = |v: Option<&str>| v.unwrap_or("-").to_string();
+    let mut rows: Vec<[String; 5]> = Vec::new();
     for p in filter {
         let channels = registry.providers.get(p);
         let migration = load_migration_state(&root, p).ok().flatten();
-
-        output.push(json!({
-            "provider": p,
-            "current": channels.and_then(|c| c.current.as_ref()).map(|ch| &ch.version),
-            "candidate": channels.and_then(|c| c.candidate.as_ref()).map(|ch| &ch.version),
-            "previous": channels.and_then(|c| c.previous.as_ref()).map(|ch| &ch.version),
-            "migration_state": migration.as_ref().map(|m| format!("{:?}", m.state)),
-            "canary_agent": migration.as_ref().and_then(|m| m.selected_agent_id.clone()),
-        }));
+        let state_str = migration.as_ref().map(|m| format!("{:?}", m.state));
+        rows.push([
+            p.to_string(),
+            d(channels
+                .and_then(|c| c.current.as_ref())
+                .map(|ch| ch.version.as_str())),
+            d(channels
+                .and_then(|c| c.candidate.as_ref())
+                .map(|ch| ch.version.as_str())),
+            d(state_str.as_deref()),
+            d(migration
+                .as_ref()
+                .and_then(|m| m.selected_agent_id.as_deref())),
+        ]);
     }
 
-    print_json(&json!({ "providers": output }));
+    const HEADERS: [&str; 5] = ["PROVIDER", "CURRENT", "CANDIDATE", "STATE", "CANARY AGENT"];
+    let mut col_widths: [usize; 5] = HEADERS.map(|h| h.len());
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            col_widths[i] = col_widths[i].max(cell.len());
+        }
+    }
+
+    let fmt_row = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .zip(col_widths.iter())
+            .map(|(cell, &w)| format!("{cell:<w$}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    let header_strs: Vec<String> = HEADERS.iter().map(|s| s.to_string()).collect();
+    println!("{}", fmt_row(&header_strs));
+    println!(
+        "{}",
+        col_widths
+            .iter()
+            .map(|&w| "-".repeat(w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for row in &rows {
+        println!("{}", fmt_row(row));
+    }
+
     Ok(())
 }
 
@@ -474,11 +521,7 @@ fn canary_override_allowed(state: &MigrationState) -> bool {
     )
 }
 
-fn cmd_promote(
-    provider: &str,
-    evidence: Option<&str>,
-    force_recreate_active: bool,
-) -> Result<(), String> {
+fn cmd_promote(provider: &str, evidence: Option<&str>) -> Result<(), String> {
     let root = runtime_root()?;
     let mut state = load_migration_state(&root, provider)
         .map_err(|e| e.to_string())?
@@ -530,7 +573,6 @@ fn cmd_promote(
         provider,
         state.selected_agent_id.as_deref(),
         "candidate",
-        force_recreate_active,
     );
     if !guard.is_clear() {
         let selected_agent_id = state.selected_agent_id.clone();
@@ -610,7 +652,7 @@ fn cmd_rollback(provider: &str, evidence: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_cleanup(provider: &str, _dry_run: bool) -> Result<(), String> {
+fn cmd_cleanup(provider: &str) -> Result<(), String> {
     let root = runtime_root()?;
     let registry = load_registry(&root)
         .map_err(|e| e.to_string())?
@@ -692,8 +734,7 @@ fn cmd_run(
     candidate_path: Option<&str>,
     canary_agent: Option<&str>,
     skip_upgrade: bool,
-    auto_promote: bool,
-    force_recreate_active: bool,
+    skip_confirm: bool,
 ) -> Result<(), String> {
     let root = runtime_root()?;
 
@@ -822,7 +863,6 @@ fn cmd_run(
             provider,
             std::slice::from_ref(&selected_agent_id),
             "candidate",
-            force_recreate_active,
         );
     if !canary_guard.is_clear() {
         transition(
@@ -858,9 +898,9 @@ fn cmd_run(
     eprintln!("[6/7] Canary override active — run one canary turn before promotion");
 
     // Step 7: auto-promote if requested.
-    if auto_promote {
+    if skip_confirm {
         return Err(format!(
-            "--auto-promote requires a recorded candidate canary launch artifact; run a canary turn, then `agentdesk provider-cli resume {provider} --auto-promote`"
+            "--skip-confirm requires a recorded candidate canary launch artifact; run a canary turn, then `agentdesk provider-cli resume {provider} --skip-confirm`"
         ));
     } else {
         eprintln!(
@@ -877,11 +917,7 @@ fn cmd_run(
 }
 
 /// Resume migration from the current persisted state.
-fn cmd_resume(
-    provider: &str,
-    auto_promote: bool,
-    force_recreate_active: bool,
-) -> Result<(), String> {
+fn cmd_resume(provider: &str, skip_confirm: bool) -> Result<(), String> {
     let root = runtime_root()?;
     let state = load_migration_state(&root, provider)
         .map_err(|e| e.to_string())?
@@ -894,45 +930,36 @@ fn cmd_resume(
 
     match state.state {
         MigrationState::CanaryActive => {
-            if auto_promote {
+            if skip_confirm {
                 cmd_promote(
                     provider,
-                    Some("resumed with --auto-promote after verified canary"),
-                    force_recreate_active,
+                    Some("resumed with --skip-confirm after verified canary"),
                 )
             } else {
                 eprintln!(
-                    "Migration is at CanaryActive. Run a canary turn, then use --auto-promote or run `agentdesk provider-cli promote {provider} --evidence <note>`."
+                    "Migration is at CanaryActive. Run a canary turn, then use --skip-confirm or run `agentdesk provider-cli promote {provider} --evidence <note>`."
                 );
                 print_json(&json!({ "provider": provider, "state": "canary_active" }));
                 Ok(())
             }
         }
         MigrationState::CanaryPassed => {
-            if auto_promote {
-                cmd_promote(
-                    provider,
-                    Some("resumed with --auto-promote"),
-                    force_recreate_active,
-                )
+            if skip_confirm {
+                cmd_promote(provider, Some("resumed with --skip-confirm"))
             } else {
                 eprintln!(
-                    "Migration is at CanaryPassed. Use --auto-promote or run `agentdesk provider-cli promote {provider}`."
+                    "Migration is at CanaryPassed. Use --skip-confirm or run `agentdesk provider-cli promote {provider}`."
                 );
                 print_json(&json!({ "provider": provider, "state": "canary_passed" }));
                 Ok(())
             }
         }
         MigrationState::AwaitingOperatorPromote => {
-            if auto_promote {
-                cmd_promote(
-                    provider,
-                    Some("resumed with --auto-promote"),
-                    force_recreate_active,
-                )
+            if skip_confirm {
+                cmd_promote(provider, Some("resumed with --skip-confirm"))
             } else {
                 eprintln!(
-                    "Migration is at AwaitingOperatorPromote. Use --auto-promote or run `agentdesk provider-cli promote {provider}`."
+                    "Migration is at AwaitingOperatorPromote. Use --skip-confirm or run `agentdesk provider-cli promote {provider}`."
                 );
                 print_json(&json!({ "provider": provider, "state": "awaiting_operator_promote" }));
                 Ok(())
@@ -963,8 +990,7 @@ fn cmd_resume(
                 None,
                 state.selected_agent_id.as_deref(),
                 skip_upgrade,
-                auto_promote,
-                force_recreate_active,
+                skip_confirm,
             )
         }
     }
@@ -1067,7 +1093,7 @@ mod tests {
     fn status_empty_when_no_registry() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
-        let result = cmd_status(None);
+        let result = cmd_status(None, false);
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
         assert!(result.is_ok());
     }
@@ -1214,7 +1240,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1231,7 +1257,8 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
 
         use crate::services::provider_cli::registry::{
-            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+            LaunchArtifact, MigrationState, ProviderChannels, ProviderCliMigrationState,
+            ProviderCliRegistry,
         };
         use chrono::Utc;
         let current = test_channel("/tmp/current-codex");
@@ -1261,13 +1288,34 @@ mod tests {
         registry.providers.insert("codex".to_string(), channels);
         save_registry(dir.path(), &registry).unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        // An active process on the old "current" channel is recorded in evidence but
+        // no longer blocks promotion — the guard allows recreation unconditionally.
+        crate::services::provider_cli::io::save_launch_artifact(
+            dir.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-active".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/current-codex".to_string(),
+                canonical_path: "/tmp/current-codex".to_string(),
+                cli_version: "test".to_string(),
+                process_id: Some(std::process::id()),
+                tmux_session: None,
+                launched_at: Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
 
-        assert!(result.is_err());
-        assert_eq!(state.state, MigrationState::Failed);
+        // Promote succeeds even with an active old-channel session.
+        assert!(result.is_ok());
+        assert_eq!(state.state, MigrationState::ProviderAgentsMigrated);
         assert!(
             registry
                 .providers
@@ -1284,7 +1332,8 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
 
         use crate::services::provider_cli::registry::{
-            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+            LaunchArtifact, MigrationState, ProviderChannels, ProviderCliMigrationState,
+            ProviderCliRegistry,
         };
         use chrono::{Duration, Utc};
         let current = test_channel("/tmp/current-codex");
@@ -1313,7 +1362,27 @@ mod tests {
         );
         save_registry(dir.path(), &registry).unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        // Agent was previously launched (pre-migration artifact) so a canary turn IS required.
+        // Without a candidate artifact after canary activation, promote must fail.
+        crate::services::provider_cli::io::save_launch_artifact(
+            dir.path(),
+            &LaunchArtifact {
+                provider: "codex".to_string(),
+                agent_id: Some("codex-agent".to_string()),
+                channel_id: None,
+                session_key: Some("codex-agent-current-prev".to_string()),
+                channel: "current".to_string(),
+                cli_path: "/tmp/current-codex".to_string(),
+                canonical_path: "/tmp/current-codex".to_string(),
+                cli_version: "test".to_string(),
+                process_id: None,
+                tmux_session: None,
+                launched_at: Utc::now() - Duration::seconds(120),
+            },
+        )
+        .unwrap();
+
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1378,7 +1447,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
         let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
@@ -1434,7 +1503,7 @@ mod tests {
         read_only.set_mode(0o444);
         std::fs::set_permissions(&state_path, read_only).unwrap();
 
-        let result = cmd_promote("codex", Some("operator approval"), false);
+        let result = cmd_promote("codex", Some("operator approval"));
 
         let mut writable = std::fs::metadata(&state_path).unwrap().permissions();
         writable.set_mode(0o644);
