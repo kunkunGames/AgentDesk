@@ -258,10 +258,7 @@ mod tests {
     fn all_current_providers_mutate_in_place() {
         for id in ["codex", "claude", "gemini", "opencode", "qwen"] {
             let s = update_strategy_for(id).unwrap();
-            assert!(
-                s.mutates_in_place,
-                "{id} expected mutates_in_place=true"
-            );
+            assert!(s.mutates_in_place, "{id} expected mutates_in_place=true");
         }
     }
 

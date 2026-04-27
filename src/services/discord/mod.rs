@@ -2534,7 +2534,10 @@ pub(super) fn scan_skills(
                 }
             }
         }
-        ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => {
+        ProviderKind::Codex
+        | ProviderKind::Gemini
+        | ProviderKind::OpenCode
+        | ProviderKind::Qwen => {
             scan_directory_skills(
                 collect_provider_skill_roots(provider, project_path),
                 &mut seen,
