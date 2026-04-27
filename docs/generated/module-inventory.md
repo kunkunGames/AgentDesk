@@ -61,7 +61,7 @@
 | `cli::migrate::postgres_cutover` | `src/cli/migrate/postgres_cutover.rs` | 7669 | giant-file |
 | `cli::migrate::source` | `src/cli/migrate/source.rs` | 1612 | giant-file |
 | `cli::monitoring` | `src/cli/monitoring.rs` | 141 |  |
-| `cli::provider_cli` | `src/cli/provider_cli/mod.rs` | 1449 | giant-file |
+| `cli::provider_cli` | `src/cli/provider_cli/mod.rs` | 1518 | giant-file |
 | `cli::run` | `src/cli/run.rs` | 435 |  |
 | `cli::utils` | `src/cli/utils.rs` | 274 |  |
 | `compat` | `src/compat/mod.rs` | 206 |  |
@@ -159,7 +159,7 @@
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 2882 | giant-file |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 1332 | giant-file |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 60 |  |
-| `server::routes::docs` | `src/server/routes/docs.rs` | 3734 | giant-file |
+| `server::routes::docs` | `src/server/routes/docs.rs` | 3733 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 62 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 89 |  |
@@ -185,7 +185,7 @@
 | `server::routes::offices` | `src/server/routes/offices.rs` | 547 |  |
 | `server::routes::onboarding` | `src/server/routes/onboarding.rs` | 4541 | giant-file |
 | `server::routes::pipeline` | `src/server/routes/pipeline.rs` | 1394 | giant-file |
-| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 757 |  |
+| `server::routes::provider_cli_api` | `src/server/routes/provider_cli_api.rs` | 750 |  |
 | `server::routes::queue_api` | `src/server/routes/queue_api.rs` | 315 |  |
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 343 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1260 | giant-file |
@@ -338,15 +338,15 @@
 | `services::process` | `src/services/process.rs` | 706 |  |
 | `services::provider` | `src/services/provider.rs` | 2177 | giant-file |
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 29 |  |
-| `services::provider_cli::canary` | `src/services/provider_cli/canary.rs` | 145 |  |
+| `services::provider_cli::canary` | `src/services/provider_cli/canary.rs` | 221 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 74 |  |
-| `services::provider_cli::diagnostics` | `src/services/provider_cli/diagnostics.rs` | 180 |  |
+| `services::provider_cli::diagnostics` | `src/services/provider_cli/diagnostics.rs` | 177 |  |
 | `services::provider_cli::io` | `src/services/provider_cli/io.rs` | 165 |  |
-| `services::provider_cli::orchestration` | `src/services/provider_cli/orchestration.rs` | 229 |  |
+| `services::provider_cli::orchestration` | `src/services/provider_cli/orchestration.rs` | 222 |  |
 | `services::provider_cli::paths` | `src/services/provider_cli/paths.rs` | 152 |  |
 | `services::provider_cli::registry` | `src/services/provider_cli/registry.rs` | 303 |  |
 | `services::provider_cli::retention` | `src/services/provider_cli/retention.rs` | 200 |  |
-| `services::provider_cli::session_guard` | `src/services/provider_cli/session_guard.rs` | 354 |  |
+| `services::provider_cli::session_guard` | `src/services/provider_cli/session_guard.rs` | 335 |  |
 | `services::provider_cli::smoke` | `src/services/provider_cli/smoke.rs` | 234 |  |
 | `services::provider_cli::snapshot` | `src/services/provider_cli/snapshot.rs` | 123 |  |
 | `services::provider_cli::upgrade` | `src/services/provider_cli/upgrade.rs` | 730 |  |
