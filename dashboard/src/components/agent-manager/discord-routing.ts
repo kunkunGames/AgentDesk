@@ -129,6 +129,10 @@ export function describeDispatchedSession(
     | "guild_id"
     | "channel_web_url"
     | "channel_deeplink_url"
+    | "channel_id"
+    | "thread_id"
+    | "deeplink_url"
+    | "thread_deeplink_url"
   >,
   channelInfo?: DiscordChannelInfo | null,
   parentInfo?: DiscordChannelInfo | null,
@@ -137,24 +141,41 @@ export function describeDispatchedSession(
     parseChannelNameFromSessionKey(session.session_key)
     ?? session.name
     ?? session.session_key;
+  // Issue #1241: prefer the canonical channel_id / thread_id aliases the
+  // backend now returns. Fall back to thread_channel_id so older server
+  // builds (or fixtures that only set the legacy field) still resolve.
+  const channelId =
+    session.channel_id
+    ?? session.thread_id
+    ?? session.thread_channel_id
+    ?? null;
   const summary = describeDiscordTarget(
-    session.thread_channel_id ?? null,
+    channelId,
     channelInfo,
     parentInfo,
     fallbackName,
   );
 
-  // Backend agents.rs:849-927 now returns guild_id + channel_*_url directly on
-  // each session row, so we can fall back to those when the per-channel
-  // DiscordChannelInfo lookup hasn't filled in (or before it has resolved).
-  if (!summary.webUrl && session.channel_web_url) {
-    summary.webUrl = session.channel_web_url;
+  // #1241 contract: agents.rs returns canonical `deeplink_url` and
+  // `thread_deeplink_url` (with legacy `channel_web_url` / `channel_deeplink_url`
+  // kept for older server builds). The dashboard MUST paste these canonical
+  // values into anchor `href` instead of rebuilding URLs from `channelInfo`.
+  // Codex P2 on #1295: previously these guards were `if (!summary.webUrl)`,
+  // which skipped the canonical fields whenever `describeDiscordTarget` had
+  // already populated a rebuilt URL — defeating the contract. Prefer
+  // canonical fields first, fall back to the rebuilt summary only when the
+  // backend didn't supply a value.
+  const canonicalWebUrl = session.deeplink_url ?? session.channel_web_url ?? null;
+  const canonicalDeepLink =
+    session.thread_deeplink_url ?? session.channel_deeplink_url ?? null;
+  if (canonicalWebUrl) {
+    summary.webUrl = canonicalWebUrl;
   }
-  if (!summary.deepLink && session.channel_deeplink_url) {
-    summary.deepLink = session.channel_deeplink_url;
+  if (canonicalDeepLink) {
+    summary.deepLink = canonicalDeepLink;
   }
-  if (!summary.webUrl && !summary.deepLink && session.thread_channel_id && session.guild_id) {
-    const links = buildDiscordChannelLinks(session.thread_channel_id, session.guild_id);
+  if (!summary.webUrl && !summary.deepLink && channelId && session.guild_id) {
+    const links = buildDiscordChannelLinks(channelId, session.guild_id);
     summary.webUrl = links.webUrl;
     summary.deepLink = links.deepLink;
   }
