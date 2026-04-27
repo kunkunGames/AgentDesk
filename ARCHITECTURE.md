@@ -162,6 +162,7 @@ src/
 │   │   ├── github.rs
 │   │   ├── github_dashboard.rs
 │   │   ├── health_api.rs
+│   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
@@ -277,6 +278,7 @@ src/
 │   │   ├── org_schema.rs
 │   │   ├── org_writer.rs
 │   │   ├── placeholder_cleanup.rs
+│   │   ├── placeholder_controller.rs
 │   │   ├── placeholder_sweeper.rs
 │   │   ├── prompt_builder.rs
 │   │   ├── queue_io.rs

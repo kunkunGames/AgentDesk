@@ -26,6 +26,7 @@ import {
   type StageDraft,
 } from "./pipeline-visual-editor-model";
 import { SurfaceCard } from "../common/SurfacePrimitives";
+import AgentAvatar from "../AgentAvatar";
 
 interface Props {
   tr: (ko: string, en: string) => string;
@@ -566,18 +567,18 @@ function fsmStateTone(stateId: string) {
   }
 }
 
-function selectedAgentLabel(
+function selectedAgentInfo(
   agents: Agent[],
   locale: UiLanguage,
   selectedAgentId?: string | null,
-) {
+): { agent: Agent; name: string } | null {
   const agent = selectedAgentId
     ? agents.find((candidate) => candidate.id === selectedAgentId)
     : null;
   if (!agent) {
     return null;
   }
-  return `${agent.avatar_emoji} ${localeName(locale, agent)}`;
+  return { agent, name: localeName(locale, agent) };
 }
 
 export default function PipelineVisualEditor({
@@ -873,7 +874,7 @@ export default function PipelineVisualEditor({
     };
   }, [fsmDraftScopeKey, level, persistSnapshot, reloadKey, repo, selectedAgentId]);
 
-  const selectedAgentName = selectedAgentLabel(agents, locale, selectedAgentId);
+  const selectedAgentDetail = selectedAgentInfo(agents, locale, selectedAgentId);
   const useScrollableMobileFsmCanvas = isFsmVariant && compactGraph;
   const graph = useMemo(
     () =>
@@ -1761,10 +1762,20 @@ export default function PipelineVisualEditor({
                     kv_meta.kanban_fsm
                   </code>
                 </div>
-                {selectedAgentName && (
-                  <p className="text-xs leading-5" style={MUTED_TEXT_STYLE}>
+                {selectedAgentDetail && (
+                  <p
+                    className="flex flex-wrap items-center gap-1.5 text-xs leading-5"
+                    style={MUTED_TEXT_STYLE}
+                  >
                     {tr("현재 선택된 에이전트", "Selected agent")}:{" "}
-                    <span style={{ color: "var(--th-text-primary)" }}>{selectedAgentName}</span>
+                    <AgentAvatar
+                      agent={selectedAgentDetail.agent}
+                      agents={agents}
+                      size={18}
+                    />
+                    <span style={{ color: "var(--th-text-primary)" }}>
+                      {selectedAgentDetail.name}
+                    </span>
                   </p>
                 )}
                 <div className="flex flex-wrap gap-2">
@@ -1798,17 +1809,17 @@ export default function PipelineVisualEditor({
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center justify-end gap-2">
+              <div className="fsm-actions flex flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={addState}
-                  className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
+                  className="btn rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
                   style={BUTTON_INFO_STYLE}
                 >
                   + {tr("상태 추가", "State")}
                 </button>
                 <button
                   onClick={addTransition}
-                  className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
+                  className="btn rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
                   style={BUTTON_ACCENT_STYLE}
                 >
                   + {tr("전환 추가", "Edge")}
@@ -1816,7 +1827,7 @@ export default function PipelineVisualEditor({
                 <button
                   onClick={handleExportJson}
                   disabled={!pipelineDraft}
-                  className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
+                  className="btn rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
                   style={{
                     ...BUTTON_NEUTRAL_STYLE,
                     opacity: pipelineDraft ? 1 : 0.45,
@@ -1827,7 +1838,7 @@ export default function PipelineVisualEditor({
                 <button
                   onClick={() => void handleClearOverride()}
                   disabled={saving || !overrideExists}
-                  className="rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
+                  className="btn rounded-lg border px-2.5 py-1.5 text-[11px] font-medium"
                   style={{
                     ...BUTTON_NEUTRAL_STYLE,
                     opacity: saving || !overrideExists ? 0.45 : 1,
@@ -1903,10 +1914,20 @@ export default function PipelineVisualEditor({
               <p className="text-xs leading-6 sm:text-sm sm:leading-6" style={MUTED_TEXT_STYLE}>
                 {editorHelpText}
               </p>
-              {selectedAgentName && (
-                <p className="text-xs leading-6 sm:text-sm sm:leading-6" style={MUTED_TEXT_STYLE}>
+              {selectedAgentDetail && (
+                <p
+                  className="flex flex-wrap items-center gap-1.5 text-xs leading-6 sm:text-sm sm:leading-6"
+                  style={MUTED_TEXT_STYLE}
+                >
                   {tr("현재 선택된 에이전트", "Selected agent")}:{" "}
-                  <span style={{ color: "var(--th-text-primary)" }}>{selectedAgentName}</span>
+                  <AgentAvatar
+                    agent={selectedAgentDetail.agent}
+                    agents={agents}
+                    size={20}
+                  />
+                  <span style={{ color: "var(--th-text-primary)" }}>
+                    {selectedAgentDetail.name}
+                  </span>
                 </p>
               )}
             </div>
@@ -2088,7 +2109,7 @@ export default function PipelineVisualEditor({
               )}
 
               <div
-                className={`${useScrollableMobileFsmCanvas ? "rounded-[24px] border p-3 sm:p-4" : "overflow-hidden rounded-[24px] border p-3 sm:p-4"}`}
+                className={`${useScrollableMobileFsmCanvas ? "rounded-[24px] border p-3 sm:p-4" : "overflow-hidden rounded-[24px] border p-3 sm:p-4"} ${isFsmVariant ? "fsm-graph-desktop" : ""}`}
                 style={isFsmVariant ? FSM_CANVAS_SHELL_STYLE : CANVAS_SHELL_STYLE}
               >
                 <div
@@ -2538,7 +2559,7 @@ export default function PipelineVisualEditor({
             >
               {useScrollableMobileFsmCanvas && pipelineDraft && (
                 <div
-                  className="rounded-[20px] border p-3 space-y-4"
+                  className="fsm-stack-mobile rounded-[20px] border p-3 space-y-4"
                   style={FSM_DETAIL_PANEL_STYLE}
                   data-testid="fsm-mobile-selector"
                 >
@@ -3445,7 +3466,7 @@ export default function PipelineVisualEditor({
                   {tr("파이프라인 스테이지", "Pipeline Stages")}
                 </h4>
                 <p className="text-xs" style={MUTED_TEXT_STYLE}>
-                  {selectedAgentName
+                  {selectedAgentDetail
                     ? tr(
                         "선택된 에이전트에 보이는 스테이지만 편집합니다. 저장 시 다른 에이전트 전용 스테이지는 유지됩니다.",
                         "You are editing only stages visible to the selected agent. Saving preserves other-agent stages.",
@@ -3597,7 +3618,7 @@ export default function PipelineVisualEditor({
                           <option value="">{tr("카드 담당자", "Card assignee")}</option>
                           {agents.map((agent) => (
                             <option key={agent.id} value={agent.id}>
-                              {agent.avatar_emoji} {localeName(locale, agent)}
+                              {localeName(locale, agent)}
                             </option>
                           ))}
                         </select>
@@ -3617,7 +3638,7 @@ export default function PipelineVisualEditor({
                           <option value="">{tr("전체", "All agents")}</option>
                           {agents.map((agent) => (
                             <option key={agent.id} value={agent.id}>
-                              {agent.avatar_emoji} {localeName(locale, agent)}
+                              {localeName(locale, agent)}
                             </option>
                           ))}
                         </select>

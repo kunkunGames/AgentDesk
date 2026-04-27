@@ -267,6 +267,14 @@ export interface AuditLogEntry {
   summary: string;
   metadata?: Record<string, unknown> | null;
   created_at: number;
+  /* Enrichment fields populated by the audit-logs LEFT JOIN with kanban_cards
+     when entity_type === "kanban_card". Used by the agent drawer's restored
+     "감사 / Audit" panel so rows can render the human-readable card title +
+     issue number instead of raw `kanban_card:UUID` strings (#1258 follow-up). */
+  card_title?: string | null;
+  card_issue_number?: number | null;
+  card_issue_url?: string | null;
+  card_assigned_agent_id?: string | null;
 }
 
 // CLI Status
@@ -759,6 +767,25 @@ export interface DispatchedSession {
   department_name_ko?: string | null;
   department_color?: string | null;
   thread_channel_id?: string | null;
+  guild_id?: string | null;
+  channel_web_url?: string | null;
+  channel_deeplink_url?: string | null;
+  /* Issue #1241: canonical Discord deeplink fields. The dashboard renders
+     these straight into anchor `href`s; the backend already formats them as
+     https://discord.com/channels/{guild}/{channel} (web) and
+     discord://discord.com/channels/{guild}/{channel} (Discord app). For
+     thread-bound sessions `channel_id` === `thread_id` because every
+     dispatched session lives inside its agent thread. */
+  channel_id?: string | null;
+  thread_id?: string | null;
+  deeplink_url?: string | null;
+  thread_deeplink_url?: string | null;
+  /* The kanban card this session's active dispatch is bound to. Lets the
+     restored "감사 / Audit" panel on the agent drawer deeplink each audit
+     row to the most recent Discord turn for the same card without an extra
+     round-trip. Returned via LEFT JOIN with task_dispatches in
+     /api/agents/:id/dispatched-sessions. */
+  kanban_card_id?: string | null;
 }
 
 // Dashboard Stats

@@ -65,6 +65,14 @@ const RECENT_TURN_STOP_CAPACITY: usize = 128;
 const RECENT_TURN_STOP_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const RECENT_TURN_STOP_METADATA_FALLBACK_TTL: std::time::Duration =
     std::time::Duration::from_secs(60);
+/// Slack between the cancel boundary recorded at stop time and the wrapper's
+/// post-cancel teardown bytes that flush into the same jsonl before the
+/// session actually dies. Anything beyond this boundary is treated as
+/// follow-up turn output and disqualifies the death from
+/// `cancel_induced_watcher_death`. Empirically the wrapper writes <2 KB of
+/// teardown lines (final stream item, "[stderr] killed", etc.) so 16 KB is
+/// generous yet far below the multi-KB output of even a tiny new turn.
+const CANCEL_TEARDOWN_GRACE_BYTES: u64 = 16 * 1024;
 const MONITOR_AUTO_TURN_REASON_CODE: &str = "lifecycle.monitor_auto_turn";
 const MONITOR_AUTO_TURN_DEFERRED_REASON_CODE: &str = "lifecycle.monitor_auto_turn.deferred";
 const TMUX_LIVENESS_PROBE_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
@@ -211,6 +219,76 @@ fn recent_turn_stop_for_channel(channel_id: ChannelId) -> Option<RecentTurnStop>
         .rev()
         .find(|entry| entry.channel_id == channel_id)
         .cloned()
+}
+
+/// Returns true if a watcher death for `(channel_id, tmux_session_name)` was
+/// preceded by an explicit user-initiated turn-stop (cancel) within
+/// `RECENT_TURN_STOP_METADATA_FALLBACK_TTL`. The watcher cleanup path that
+/// follows a cancel writes
+/// `record_tmux_exit_reason("watcher cleanup: dead session after turn")`
+/// and tears the session down — surfacing that as a 🔴 lifecycle notification
+/// or as the "대화를 이어붙이지 못했습니다" handoff is misleading because the
+/// death IS the cancel, not a crash.
+///
+/// IMPORTANT: this consumes ALL matching in-window tombstones on a true
+/// return so the suppression is one-shot per cancel (codex P1/P2 on #1277).
+/// A single user cancel commonly records two tombstones —
+/// `mailbox_cancel_active_turn` records one, and
+/// `turn_lifecycle::stop_provider_turn_with_outcome` records another via
+/// `record_turn_stop_tombstone` — so draining only the newest leaves the
+/// duplicate alive to suppress a follow-up turn's real failure that
+/// reuses the same `(channel_id, tmux_session_name)` pair within the 60s
+/// metadata-fallback TTL.
+///
+/// `current_output_offset` is the jsonl size at the moment the watcher
+/// observed the death. When the tombstone was recorded with a known
+/// `stop_output_offset`, this lets us bound the suppression to the
+/// canceled turn's data range (codex P2 round 3 on #1277): for
+/// preserve-session stops the tmux session is reused, the wrapper keeps
+/// writing past the cancel EOF, and a real crash on the follow-up turn
+/// would otherwise be silently swallowed. We allow a small
+/// `CANCEL_TEARDOWN_GRACE_BYTES` to accommodate the wrapper's normal
+/// post-cancel teardown bytes that flush before the session actually dies.
+fn cancel_induced_watcher_death(
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    current_output_offset: Option<u64>,
+) -> bool {
+    let now = std::time::Instant::now();
+    let mut stops = recent_turn_stops();
+    prune_recent_turn_stops(&mut stops, now);
+    let initial_len = stops.len();
+    stops.retain(|entry| {
+        if entry.channel_id != channel_id {
+            return true;
+        }
+        if now.saturating_duration_since(entry.recorded_at) > RECENT_TURN_STOP_METADATA_FALLBACK_TTL
+        {
+            return true;
+        }
+        let session_matches = match entry.tmux_session_name.as_deref() {
+            Some(entry_tmux) => entry_tmux == tmux_session_name,
+            None => true,
+        };
+        if !session_matches {
+            return true;
+        }
+        // codex P2 round 3: when both offsets are known, only consume the
+        // tombstone if the watcher has not moved past the cancel boundary
+        // (with a small grace for the wrapper's teardown bytes between
+        // cancel record and session kill). Past that boundary means a
+        // follow-up turn produced new output, so the death is unrelated to
+        // the cancel and must surface its own lifecycle/handoff signal.
+        if let (Some(stop_offset), Some(current_offset)) =
+            (entry.stop_output_offset, current_output_offset)
+        {
+            if current_offset > stop_offset.saturating_add(CANCEL_TEARDOWN_GRACE_BYTES) {
+                return true;
+            }
+        }
+        false
+    });
+    stops.len() != initial_len
 }
 
 fn recent_turn_stop_for_watcher_range(
@@ -432,6 +510,29 @@ fn lifecycle_reason_code_for_tmux_exit(reason: &str) -> &'static str {
     } else {
         "lifecycle.tmux_terminated"
     }
+}
+
+fn tmux_death_lifecycle_notification_reason(reason: Option<&str>) -> Option<&str> {
+    let reason = reason?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+
+    let reason = reason
+        .strip_prefix('[')
+        .and_then(|s| s.find("] ").map(|i| &s[i + 2..]))
+        .unwrap_or(reason)
+        .trim();
+    if reason.is_empty() || reason.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
+    let lower = reason.to_ascii_lowercase();
+    if tmux_exit_reason_is_normal_completion(reason) || lower.contains("force-kill") {
+        return None;
+    }
+
+    Some(reason)
 }
 
 fn tmux_death_is_normal_completion(reason: Option<&str>, _diagnostic: Option<&str>) -> bool {
@@ -1344,6 +1445,115 @@ fn ensure_monitor_auto_turn_inflight(
     }
 }
 
+/// Read the `.generation` marker file mtime in nanoseconds since the unix
+/// epoch. Returns 0 when the marker is missing in BOTH the canonical
+/// persistent location (`runtime_root()/runtime/sessions/`) and the legacy
+/// `/tmp/` fallback supported by `resolve_session_temp_path` (#892
+/// migration window). All of those conditions are treated by callers as
+/// "fresh wrapper".
+///
+/// `.generation` is written exactly once per spawn by `claude.rs` after
+/// `tmux::create_session` and never touched by the live wrapper, so its
+/// mtime uniquely identifies the wrapper instance even when jsonl
+/// rotation changes the jsonl inode (#1270).
+pub(super) fn read_generation_file_mtime_ns(tmux_session_name: &str) -> i64 {
+    let Some(path) =
+        crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "generation")
+    else {
+        return 0;
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+/// Rewrite a file's contents while preserving its prior modified time. Used
+/// by the adoption path to refresh the `.generation` marker payload (so the
+/// generation number on disk matches the current dcserver runtime) without
+/// changing the file's mtime — the mtime is the wrapper-identity signal that
+/// the regression resolver uses to distinguish "same wrapper, mid-flight
+/// rotation" from "fresh wrapper after cancel→respawn" (see
+/// `watermark_after_output_regression`). Adoption changes the runtime that
+/// owns the wrapper, but it does NOT respawn the wrapper itself, so the
+/// identity signal must stay pinned.
+///
+/// Failures are logged and swallowed: the worst case is a redundant fresh-
+/// wrapper reset on a restored offset, which is the same behaviour the
+/// codebase had before #1271. Returning an error would not unblock the
+/// adoption.
+pub(super) fn preserve_mtime_after_write(path: &str, content: &[u8], context: &str) {
+    let prior_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    if let Err(e) = std::fs::write(path, content) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ preserve_mtime_after_write: failed to write {} (context={}, error={})",
+            path,
+            context,
+            e
+        );
+        return;
+    }
+    let Some(prior) = prior_mtime else {
+        // No prior mtime to preserve (file did not exist or metadata unavailable).
+        // The post-write mtime is the only baseline we have, which is the same
+        // outcome as before this helper existed.
+        return;
+    };
+    let times = std::fs::FileTimes::new().set_modified(prior);
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ preserve_mtime_after_write: failed to reopen {} for set_times (context={}, error={})",
+                path,
+                context,
+                e
+            );
+            return;
+        }
+    };
+    if let Err(e) = file.set_times(times) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ preserve_mtime_after_write: set_times failed for {} (context={}, error={})",
+            path,
+            context,
+            e
+        );
+    }
+}
+
+/// Decide what watermark a stale-output regression (current EOF lower than
+/// `confirmed`) should land on, based on whether the wrapper instance is
+/// the same one that advanced the watermark in the first place.
+///
+/// - Same wrapper (`.generation` mtime unchanged): mid-flight rotation
+///   (`truncate_jsonl_head_safe` rename). The byte stream beyond the
+///   surviving content is genuinely new, so we pin to `observed_output_end`
+///   to avoid re-relaying surviving content (PR #1256 intent).
+/// - Different wrapper (mtime changed, mtime missing, or first observation
+///   with stored mtime == 0): cancel→respawn or any fresh spawn. The
+///   current file is fully new content — reset to 0 so the watcher walks
+///   it from the beginning (#1270 regression fix).
+fn watermark_after_output_regression(
+    stored_generation_mtime_ns: i64,
+    current_generation_mtime_ns: i64,
+    observed_output_end: u64,
+) -> u64 {
+    let same_wrapper = stored_generation_mtime_ns != 0
+        && stored_generation_mtime_ns == current_generation_mtime_ns;
+    if same_wrapper { observed_output_end } else { 0 }
+}
+
 fn reset_stale_relay_watermark_if_output_regressed(
     shared: &SharedData,
     channel_id: ChannelId,
@@ -1357,9 +1567,19 @@ fn reset_stale_relay_watermark_if_output_regressed(
         .load(std::sync::atomic::Ordering::Acquire);
 
     while confirmed != 0 && observed_output_end < confirmed {
+        let stored_gen_mtime_ns = relay_coord
+            .confirmed_end_generation_mtime_ns
+            .load(std::sync::atomic::Ordering::Acquire);
+        let current_gen_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
+        let new_watermark = watermark_after_output_regression(
+            stored_gen_mtime_ns,
+            current_gen_mtime_ns,
+            observed_output_end,
+        );
+
         match relay_coord.confirmed_end_offset.compare_exchange(
             confirmed,
-            0,
+            new_watermark,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         ) {
@@ -1367,14 +1587,19 @@ fn reset_stale_relay_watermark_if_output_regressed(
                 relay_coord
                     .last_relay_ts_ms
                     .store(0, std::sync::atomic::Ordering::Release);
+                relay_coord
+                    .confirmed_end_generation_mtime_ns
+                    .store(current_gen_mtime_ns, std::sync::atomic::Ordering::Release);
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!(
-                    "  [{ts}] 👁 Reset stale tmux relay watermark for {} (channel {}, context={}, observed_output_end={}, stale_confirmed_end={})",
+                    "  [{ts}] 👁 Reset stale tmux relay watermark for {} (channel {}, context={}, observed_output_end={}, stale_confirmed_end={}, new_watermark={}, generation_mtime_changed={})",
                     tmux_session_name,
                     channel_id.get(),
                     context,
                     observed_output_end,
-                    confirmed
+                    confirmed,
+                    new_watermark,
+                    stored_gen_mtime_ns != current_gen_mtime_ns
                 );
                 return true;
             }
@@ -1387,6 +1612,7 @@ fn reset_stale_relay_watermark_if_output_regressed(
 
 fn reset_stale_local_relay_offset_if_output_regressed(
     last_relayed_offset: &mut Option<u64>,
+    last_observed_generation_mtime_ns: &mut Option<i64>,
     channel_id: ChannelId,
     tmux_session_name: &str,
     observed_output_end: u64,
@@ -1399,15 +1625,34 @@ fn reset_stale_local_relay_offset_if_output_regressed(
         return false;
     }
 
-    *last_relayed_offset = None;
+    let stored_gen_mtime_ns = last_observed_generation_mtime_ns.unwrap_or(0);
+    let current_gen_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
+    let new_offset = watermark_after_output_regression(
+        stored_gen_mtime_ns,
+        current_gen_mtime_ns,
+        observed_output_end,
+    );
+    let new_local = if new_offset == 0 {
+        // Fresh wrapper — clear the local watermark entirely so the next
+        // tick walks the file from offset 0 (matches the global reset
+        // semantics for cancel→respawn).
+        None
+    } else {
+        Some(new_offset)
+    };
+    *last_relayed_offset = new_local;
+    *last_observed_generation_mtime_ns = Some(current_gen_mtime_ns);
+
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::warn!(
-        "  [{ts}] 👁 Reset stale tmux local relay offset for {} (channel {}, context={}, observed_output_end={}, stale_last_relayed={})",
+        "  [{ts}] 👁 Reset stale tmux local relay offset for {} (channel {}, context={}, observed_output_end={}, stale_last_relayed={}, new_local_offset={:?}, generation_mtime_changed={})",
         tmux_session_name,
         channel_id.get(),
         context,
         observed_output_end,
-        prev_offset
+        prev_offset,
+        new_local,
+        stored_gen_mtime_ns != current_gen_mtime_ns
     );
     true
 }
@@ -1424,6 +1669,19 @@ fn advance_watcher_confirmed_end(
     let mut cur = relay_coord
         .confirmed_end_offset
         .load(std::sync::atomic::Ordering::Acquire);
+    // #1270 codex P2 (round 4): capture the `.generation` mtime BEFORE
+    // the CAS so the stored mtime reflects what was on disk when we
+    // decided to label `committed_end_offset` as delivered. Reading after
+    // the CAS opens a TOCTOU window where a fresh respawn writes a new
+    // `.generation` between our advance and our marker store, then the
+    // new mtime ends up paired with the OLD offset and the next
+    // regression check mis-classifies the next fresh respawn as
+    // same-wrapper rotation.
+    let mtime_at_attempt = {
+        let m = read_generation_file_mtime_ns(tmux_session_name);
+        if m == 0 { None } else { Some(m) }
+    };
+    let mut won_advance = false;
     while cur < committed_end_offset {
         match relay_coord.confirmed_end_offset.compare_exchange(
             cur,
@@ -1431,9 +1689,24 @@ fn advance_watcher_confirmed_end(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         ) {
-            Ok(_) => break,
+            Ok(_) => {
+                won_advance = true;
+                break;
+            }
             Err(observed) => cur = observed,
         }
+    }
+    // Pair the pre-CAS mtime with the offset only on a real advance. If
+    // the loop exits because the stored watermark is already at/past
+    // `committed_end_offset` (the stale-high watermark from an older
+    // session — exactly the regression case this PR is trying to
+    // recover from), refreshing the mtime would associate the OLD offset
+    // with the NEW wrapper and break the next regression check
+    // (PR #1271 round 3).
+    if won_advance && let Some(mtime) = mtime_at_attempt {
+        relay_coord
+            .confirmed_end_generation_mtime_ns
+            .store(mtime, std::sync::atomic::Ordering::Release);
     }
     let confirmed_end = relay_coord
         .confirmed_end_offset
@@ -2157,16 +2430,28 @@ async fn handle_tmux_watcher_observed_death(
     let reason_short = read_tmux_exit_reason(tmux_session_name);
     let is_normal_completion =
         tmux_death_is_normal_completion(reason_short.as_deref(), diagnostic.as_deref());
+    // The watcher cleanup path that follows an explicit cancel (user removed
+    // the activity reaction or invoked /stop) writes
+    // `record_tmux_exit_reason("watcher cleanup: dead session after turn")`
+    // and tears the session down. Without this gate that synthetic reason
+    // surfaces as a 🔴 lifecycle notification AND as the "대화를 이어붙이지
+    // 못했습니다" handoff — both of which are noise for a user who just
+    // canceled the turn themselves. The same suppression applies to the
+    // immediate-respawn watcher death that can fire seconds later when the
+    // next message arrives, since both are direct consequences of the cancel.
+    let cancel_induced = cancel_induced_watcher_death(
+        channel_id,
+        tmux_session_name,
+        tmux_output_offset(tmux_session_name),
+    );
     // Notify: tmux session termination with reason
-    if !is_normal_completion {
-        let reason_short_text = reason_short.as_deref().unwrap_or("unknown");
-        let is_force_kill = reason_short_text.contains("force-kill");
-        if !is_force_kill {
-            // Strip timestamp prefix if present (format: "[YYYY-MM-DD HH:MM:SS] reason")
-            let reason_text = reason_short_text
-                .strip_prefix('[')
-                .and_then(|s| s.find("] ").map(|i| &s[i + 2..]))
-                .unwrap_or(reason_short_text);
+    if cancel_induced {
+        tracing::info!(
+            "  [{ts}] 👁 tmux session {tmux_session_name} ended after recent cancel/turn-stop, skipping lifecycle notification + restart handoff"
+        );
+    } else if !is_normal_completion {
+        if let Some(reason_text) = tmux_death_lifecycle_notification_reason(reason_short.as_deref())
+        {
             let reason_truncated: String = reason_text.chars().take(100).collect();
             let session_key =
                 super::adk_session::build_adk_session_key(shared, channel_id, watcher_provider)
@@ -2186,13 +2471,17 @@ async fn handle_tmux_watcher_observed_death(
                 lifecycle_reason_code_for_tmux_exit(reason_text),
                 &format!("🔴 세션 종료: {reason_truncated}"),
             );
+        } else {
+            tracing::info!(
+                "  [{ts}] 👁 tmux session {tmux_session_name} ended without an actionable lifecycle reason, skipping lifecycle notification"
+            );
         }
     } else {
         tracing::info!(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after normal completion, skipping lifecycle notification"
         );
     }
-    if !prompt_too_long_killed && !turn_result_relayed {
+    if !cancel_induced && !prompt_too_long_killed && !turn_result_relayed {
         // Suppress warning for normal dispatch completion — not an error.
         let suppress_restart = is_normal_completion
             || reason_short
@@ -3756,14 +4045,28 @@ pub(super) async fn tmux_output_watcher_with_restore(
     // the relay is suppressed.
     // Initialize from persisted inflight state so replacement watcher instances skip
     // already-delivered output (fixes double-reply on stale watcher replacement).
-    let mut last_relayed_offset: Option<u64> = {
-        if let Some((pk, _)) = parse_provider_and_channel_from_tmux_name(&tmux_session_name) {
-            super::inflight::load_inflight_state(&pk, channel_id.get())
-                .and_then(|s| s.last_watcher_relayed_offset)
-        } else {
-            None
-        }
-    };
+    // #1270: load both the persisted offset AND its matching
+    // `.generation` mtime so a replacement watcher can correctly classify
+    // an output regression on restored state. When we have a persisted
+    // mtime, it labels the wrapper that produced the persisted offset:
+    //   - matches current `.generation` mtime → same wrapper after
+    //     `truncate_jsonl_head_safe` → pin to EOF (don't re-flood
+    //     surviving content; codex P2 on PR #1271).
+    //   - differs from current `.generation` mtime → cancel→respawn into
+    //     the same session name → reset to 0 to pick up the fresh
+    //     response.
+    // When the persisted state predates this field (legacy `None`), we
+    // fall back to "no baseline known" semantics — the regression check
+    // treats it as a first observation and resets to 0, which is the
+    // safer choice for not silently dropping a fresh response.
+    let restored_inflight = parse_provider_and_channel_from_tmux_name(&tmux_session_name)
+        .and_then(|(pk, _)| super::inflight::load_inflight_state(&pk, channel_id.get()));
+    let mut last_relayed_offset: Option<u64> = restored_inflight
+        .as_ref()
+        .and_then(|s| s.last_watcher_relayed_offset);
+    let mut last_observed_generation_mtime_ns: Option<i64> = restored_inflight
+        .as_ref()
+        .and_then(|s| s.last_watcher_relayed_generation_mtime_ns);
     if let Ok(meta) = std::fs::metadata(&output_path) {
         let observed_output_end = meta.len();
         reset_stale_relay_watermark_if_output_regressed(
@@ -3775,6 +4078,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
         );
         reset_stale_local_relay_offset_if_output_regressed(
             &mut last_relayed_offset,
+            &mut last_observed_generation_mtime_ns,
             channel_id,
             &tmux_session_name,
             observed_output_end,
@@ -3802,6 +4106,20 @@ pub(super) async fn tmux_output_watcher_with_restore(
             } else {
                 None
             };
+            // #1275 P2 #2: snapshot the current `.generation` mtime alongside
+            // the resumed offset. Without this, the local mtime baseline stays
+            // at whatever the previous setter left it (often `None` for
+            // restored offsets that haven't gone through a relay/rotation
+            // cycle yet). A later same-wrapper jsonl rotation would then take
+            // the fresh-wrapper branch in `watermark_after_output_regression`,
+            // clear `last_relayed_offset`, and re-relay surviving bytes.
+            // Pair the mtime with the offset only when we keep the offset (the
+            // turn_delivered branch); otherwise the next loop walks from 0
+            // anyway and a baseline would be misleading.
+            if last_relayed_offset.is_some() {
+                last_observed_generation_mtime_ns =
+                    Some(read_generation_file_mtime_ns(&tmux_session_name));
+            }
             // Clear turn_delivered after preserving the duplicate-relay guard so
             // future turns beyond this resume point can be relayed normally.
             turn_delivered.store(false, Ordering::Relaxed);
@@ -3881,6 +4199,15 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     if prev_offset > new_size {
                         current_offset = new_size;
                         last_relayed_offset = Some(new_size);
+                        // #1270 codex P2: snapshot the current `.generation`
+                        // mtime alongside the local offset so a later regression
+                        // check has a real baseline. Without this, the local
+                        // mtime would still be `None` after a normal relay path
+                        // and any subsequent regression would misclassify
+                        // same-wrapper rotation as fresh-respawn and clear the
+                        // local offset to None — re-relaying surviving content.
+                        last_observed_generation_mtime_ns =
+                            Some(read_generation_file_mtime_ns(&tmux_session_name));
                         reset_stale_relay_watermark_if_output_regressed(
                             &shared,
                             channel_id,
@@ -5099,6 +5426,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             );
             reset_stale_local_relay_offset_if_output_regressed(
                 &mut last_relayed_offset,
+                &mut last_observed_generation_mtime_ns,
                 channel_id,
                 &tmux_session_name,
                 observed_output_end,
@@ -5280,6 +5608,11 @@ pub(super) async fn tmux_output_watcher_with_restore(
             );
             if cleanup_committed {
                 last_relayed_offset = Some(current_offset);
+                // #1270 codex P2: snapshot the current `.generation` mtime so
+                // the local regression check has a real baseline (see the
+                // matching snapshot in the rotation path).
+                last_observed_generation_mtime_ns =
+                    Some(read_generation_file_mtime_ns(&tmux_session_name));
                 advance_watcher_confirmed_end(
                     &shared,
                     &watcher_provider,
@@ -5488,6 +5821,15 @@ pub(super) async fn tmux_output_watcher_with_restore(
             if relay_ok {
                 if direct_send_delivered || !has_current_response {
                     last_relayed_offset = Some(data_start_offset);
+                    // #1270 codex P2: snapshot the current `.generation` mtime
+                    // on every successful relay so the local regression check
+                    // has a real baseline. Without this, normal relay paths
+                    // (which never enter the reset helper) leave the baseline
+                    // at None, and any later regression misclassifies
+                    // same-wrapper rotation as fresh-respawn — clearing the
+                    // local offset and re-relaying surviving bytes.
+                    last_observed_generation_mtime_ns =
+                        Some(read_generation_file_mtime_ns(&tmux_session_name));
                     // #1134: first successful relay for this attach. The
                     // watcher_latency module is idempotent — only the first
                     // call after `record_attach` actually observes a sample,
@@ -5502,6 +5844,14 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             super::inflight::load_inflight_state(&pk, channel_id.get())
                         {
                             inflight.last_watcher_relayed_offset = Some(data_start_offset);
+                            // #1270: persist the matching `.generation` mtime
+                            // alongside the offset so a replacement watcher
+                            // (e.g. after dcserver restart) can disambiguate
+                            // same-wrapper rotation (mtime unchanged → pin to
+                            // EOF) from cancel→respawn (mtime changed → reset
+                            // to 0) when restoring this offset.
+                            inflight.last_watcher_relayed_generation_mtime_ns =
+                                last_observed_generation_mtime_ns;
                             let _ = super::inflight::save_inflight_state(&inflight);
                         }
                     }
@@ -6305,10 +6655,61 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         None,
                     );
                     record_tmux_exit_reason(&sess, "watcher cleanup: dead session after turn");
-                    crate::services::platform::tmux::kill_session_with_reason(
-                        &sess,
-                        "watcher cleanup: dead session after turn",
-                    );
+
+                    // #1261 (Fix B): the wrapper's stderr `[stderr] ...` lines and
+                    // synthetic `[fatal startup error]` markers go to the PTY, not
+                    // to the structured jsonl that `recent_output_tail` reads. Dump
+                    // the current pane buffer to a `death_pane_log` file BEFORE we
+                    // kill the session so the wrapper-level death context is still
+                    // recoverable post-mortem. Kept out of `cleanup_session_temp_files`
+                    // EXTS on purpose — the file persists past the cleanup and is
+                    // overwritten on the next death of the same session.
+                    if let Some(pane_content) =
+                        crate::services::platform::tmux::capture_pane(&sess, -1000)
+                    {
+                        let stamped = format!(
+                            "[{}] post-mortem capture for session={}\n{}",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                            sess,
+                            pane_content
+                        );
+                        let path = crate::services::tmux_common::session_temp_path(
+                            &sess,
+                            "death_pane_log",
+                        );
+                        if let Some(parent) = std::path::Path::new(&path).parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&path, stamped);
+                    }
+
+                    // #1261 (codex P2): the `capture_pane` subprocess above
+                    // widens the gap between the outer dead-pane gate and the
+                    // kill. In that window a concurrent follow-up could run
+                    // claude.rs::start_claude, which kills the stale session
+                    // (line 1294), respawns a fresh live session with the
+                    // same name (line 1379), and we'd then kill the brand-new
+                    // session here. Revalidate the dead-pane condition right
+                    // before the kill so we only tear down the same
+                    // dead-paned session we capture-paned.
+                    if tmux_session_exists(&sess) && !tmux_session_has_live_pane(&sess) {
+                        crate::services::platform::tmux::kill_session_with_reason(
+                            &sess,
+                            "watcher cleanup: dead session after turn",
+                        );
+                    }
+                    // NOTE: jsonl/FIFO/etc. cleanup intentionally NOT done here.
+                    // `claude.rs::start_claude` calls
+                    // `cleanup_session_temp_files` at spawn time
+                    // (`claude.rs:1304`) before recreating the canonical paths,
+                    // which already covers the "next-spawn against stale jsonl"
+                    // case. Pairing a watcher-side cleanup with the kill races
+                    // with that spawn-side cleanup + recreate (#1261 codex P1):
+                    // if the next message lands between our `kill_session` and
+                    // our cleanup, claude's spawn already laid down fresh files
+                    // and our cleanup deletes them, breaking the new turn.
+                    // Keep cleanup as a single-source-of-truth on the spawn
+                    // path.
                 }
             })
             .await;
@@ -7040,8 +7441,24 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 session_gen,
                 current_gen
             );
-            // Update generation marker to current gen
-            let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
+            // Update generation marker to current gen, preserving the
+            // existing mtime.
+            //
+            // #1275 P2 #1: the `.generation` mtime is the wrapper-identity
+            // signal used by `watermark_after_output_regression`. Adoption
+            // does NOT respawn the wrapper (the tmux session and Claude CLI
+            // process are still alive from the previous dcserver), so the
+            // mtime must stay pinned to its original value. Otherwise a
+            // restored watcher with `last_watcher_relayed_generation_mtime_ns`
+            // captured before the dcserver restart will mismatch the freshly
+            // touched `.generation` mtime, the regression check classifies
+            // as fresh wrapper, clears `last_relayed_offset`, and a rotated
+            // jsonl re-relays surviving content.
+            preserve_mtime_after_write(
+                &gen_marker_path,
+                current_gen.to_string().as_bytes(),
+                "adoption_marker_rewrite",
+            );
         }
 
         if !tmux_session_has_live_pane(session_name) {
@@ -7508,16 +7925,17 @@ async fn sweep_orphan_session_files() {
 mod tests {
     use super::FallbackPlaceholderCleanupDecision;
     use super::{
-        DeadSessionCleanupPlan, MONITOR_AUTO_TURN_DEFERRED_REASON_CODE,
-        MONITOR_AUTO_TURN_PREAMBLE_HINT, MONITOR_AUTO_TURN_REASON_CODE,
-        MissingInflightReattachOutcome, OffsetAdvanceDecision, PlaceholderSuppressContext,
-        PlaceholderSuppressDecision, PlaceholderSuppressOrigin, READY_FOR_INPUT_STUCK_REASON,
-        SUPPRESSED_INTERNAL_LABEL, SUPPRESSED_RESTART_LABEL, SuppressedPlaceholderAction,
-        TmuxWatcherHandle, TmuxWatcherRegistry, WatcherClaimAction, WatcherToolState,
-        build_bg_trigger_session_key, claim_or_force_replace_watcher, claim_or_reuse_watcher,
-        clear_recent_turn_stops_for_tests, clear_recent_watcher_reattach_offsets_for_tests,
-        consume_monitor_auto_turn_preamble_once, dead_session_cleanup_plan,
-        decide_placeholder_suppression, enqueue_background_trigger_response_to_notify_outbox,
+        CANCEL_TEARDOWN_GRACE_BYTES, DeadSessionCleanupPlan,
+        MONITOR_AUTO_TURN_DEFERRED_REASON_CODE, MONITOR_AUTO_TURN_PREAMBLE_HINT,
+        MONITOR_AUTO_TURN_REASON_CODE, MissingInflightReattachOutcome, OffsetAdvanceDecision,
+        PlaceholderSuppressContext, PlaceholderSuppressDecision, PlaceholderSuppressOrigin,
+        READY_FOR_INPUT_STUCK_REASON, SUPPRESSED_INTERNAL_LABEL, SUPPRESSED_RESTART_LABEL,
+        SuppressedPlaceholderAction, TmuxWatcherHandle, TmuxWatcherRegistry, WatcherClaimAction,
+        WatcherToolState, build_bg_trigger_session_key, cancel_induced_watcher_death,
+        claim_or_force_replace_watcher, claim_or_reuse_watcher, clear_recent_turn_stops_for_tests,
+        clear_recent_watcher_reattach_offsets_for_tests, consume_monitor_auto_turn_preamble_once,
+        dead_session_cleanup_plan, decide_placeholder_suppression,
+        enqueue_background_trigger_response_to_notify_outbox,
         enqueue_monitor_auto_turn_suppressed_notification, fail_dispatch_for_ready_for_input_stall,
         fallback_placeholder_cleanup_decision, finish_monitor_auto_turn,
         format_monitor_suppressed_body, format_monitor_suppressed_label,
@@ -7534,9 +7952,10 @@ mod tests {
         should_suppress_streaming_placeholder_after_recent_stop,
         should_suppress_terminal_output_after_recent_stop, start_monitor_auto_turn_when_available,
         strip_inprogress_indicators, suppressed_placeholder_action, terminal_relay_decision,
-        tmux_death_is_normal_completion, trigger_missing_inflight_reattach,
-        wait_for_reacquired_turn_bridge_inflight_state, watcher_ready_for_input_turn_completed,
-        watcher_should_yield_to_inflight_state, watcher_stream_seed,
+        tmux_death_is_normal_completion, tmux_death_lifecycle_notification_reason,
+        trigger_missing_inflight_reattach, wait_for_reacquired_turn_bridge_inflight_state,
+        watcher_ready_for_input_turn_completed, watcher_should_yield_to_inflight_state,
+        watcher_stream_seed,
     };
     use crate::services::agent_protocol::TaskNotificationKind;
     use crate::services::discord::inflight::InflightTurnState;
@@ -7586,6 +8005,34 @@ mod tests {
             None,
             Some("recent_output=completed_result_present")
         ));
+    }
+
+    #[test]
+    fn tmux_death_lifecycle_notification_skips_missing_or_unknown_reason() {
+        assert_eq!(tmux_death_lifecycle_notification_reason(None), None);
+        assert_eq!(tmux_death_lifecycle_notification_reason(Some("")), None);
+        assert_eq!(
+            tmux_death_lifecycle_notification_reason(Some("unknown")),
+            None
+        );
+        assert_eq!(
+            tmux_death_lifecycle_notification_reason(Some("[2026-04-26 22:26:38] unknown")),
+            None
+        );
+    }
+
+    #[test]
+    fn tmux_death_lifecycle_notification_keeps_actionable_cleanup_reason() {
+        assert_eq!(
+            tmux_death_lifecycle_notification_reason(Some(
+                "[2026-04-26 22:26:38] idle 60분 초과 — 자동 정리"
+            )),
+            Some("idle 60분 초과 — 자동 정리")
+        );
+        assert_eq!(
+            tmux_death_lifecycle_notification_reason(Some("explicit cleanup via force-kill API")),
+            None
+        );
     }
 
     #[test]
@@ -8128,25 +8575,52 @@ mod tests {
         );
     }
 
+    // #1270 unit table: pure-logic decision for the watermark-after-output-
+    // regression policy. No file I/O — pins down the
+    // (stored_mtime, current_mtime, observed_eof) → new_watermark mapping
+    // so it can't drift without these tests catching it.
     #[test]
-    fn stale_relay_watermark_resets_when_output_offset_regresses() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel_id = ChannelId::new(1485506232256168125);
-        let relay_coord = shared.tmux_relay_coord(channel_id);
-        relay_coord
-            .confirmed_end_offset
-            .store(1_548_758, Ordering::Release);
-        relay_coord.last_relay_ts_ms.store(12345, Ordering::Release);
+    fn watermark_after_output_regression_pins_to_eof_when_generation_mtime_unchanged() {
+        // Same wrapper instance: jsonl was rotated by truncate_jsonl_head_safe.
+        // Pinning to current EOF avoids re-relaying surviving content
+        // (PR #1256 intent).
+        assert_eq!(
+            super::watermark_after_output_regression(123_456_789, 123_456_789, 438_675),
+            438_675
+        );
+    }
 
-        assert!(reset_stale_relay_watermark_if_output_regressed(
-            shared.as_ref(),
-            channel_id,
-            "AgentDesk-claude-adk-cc-t1494846231539613809",
-            438_675,
-            "unit-test",
-        ));
-        assert_eq!(relay_coord.confirmed_end_offset.load(Ordering::Acquire), 0);
-        assert_eq!(relay_coord.last_relay_ts_ms.load(Ordering::Acquire), 0);
+    #[test]
+    fn watermark_after_output_regression_resets_to_zero_for_fresh_generation() {
+        // Cancel→respawn: claude.rs cleanup_session_temp_files deleted the
+        // old `.generation`, then claude.rs wrote a fresh one with a new
+        // mtime. The current jsonl is fully new content, so the watcher
+        // must walk it from offset 0 (#1270).
+        assert_eq!(
+            super::watermark_after_output_regression(123_456_789, 999_999_999, 92_566),
+            0
+        );
+    }
+
+    #[test]
+    fn watermark_after_output_regression_resets_to_zero_when_generation_missing() {
+        // `.generation` file deleted (cancel→respawn mid-stream) — treat as
+        // fresh. read_generation_file_mtime_ns returns 0 in that case.
+        assert_eq!(
+            super::watermark_after_output_regression(123_456_789, 0, 92_566),
+            0
+        );
+    }
+
+    #[test]
+    fn watermark_after_output_regression_resets_to_zero_on_first_observation() {
+        // First time the watermark is being adjusted (stored mtime still 0
+        // from the AtomicI64 default). We have no baseline to claim
+        // "rotation", so default to fresh-file semantics.
+        assert_eq!(
+            super::watermark_after_output_regression(0, 123_456_789, 92_566),
+            0
+        );
     }
 
     #[test]
@@ -8184,18 +8658,263 @@ mod tests {
     }
 
     #[test]
-    fn stale_local_relay_offset_resets_when_output_offset_regresses() {
-        let channel_id = ChannelId::new(1485506232256168127);
-        let mut last_relayed_offset = Some(1_548_758);
+    fn stale_relay_watermark_resets_to_zero_when_generation_file_missing() {
+        let shared = super::super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(1485506232256168125);
+        let relay_coord = shared.tmux_relay_coord(channel_id);
+        relay_coord
+            .confirmed_end_offset
+            .store(1_548_758, Ordering::Release);
+        relay_coord.last_relay_ts_ms.store(12345, Ordering::Release);
+        // Stored mtime is non-zero, simulating a watermark previously
+        // captured against a now-vanished `.generation` file (the cancel→
+        // respawn timing window where claude.rs deleted the marker but has
+        // not yet written the new one).
+        relay_coord
+            .confirmed_end_generation_mtime_ns
+            .store(123_456_789, Ordering::Release);
 
-        assert!(reset_stale_local_relay_offset_if_output_regressed(
-            &mut last_relayed_offset,
+        // No `.generation` file on disk for this synthetic session — the
+        // helper returns 0 for current_gen_mtime, the stored value differs,
+        // so the regression resolver picks the fresh-file branch and the
+        // watermark drops to 0 instead of pinning to the observed end.
+        // Otherwise the user's response (which lives below the observed end
+        // in the new fresh jsonl) would be silently skipped (#1270).
+        assert!(reset_stale_relay_watermark_if_output_regressed(
+            shared.as_ref(),
             channel_id,
-            "AgentDesk-claude-adk-cc-t1494846231539613809",
+            "AgentDesk-claude-adk-cc-issue-1270-no-genfile",
             438_675,
             "unit-test",
         ));
-        assert_eq!(last_relayed_offset, None);
+        assert_eq!(relay_coord.confirmed_end_offset.load(Ordering::Acquire), 0);
+        assert_eq!(relay_coord.last_relay_ts_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stale_local_relay_offset_clears_to_none_for_fresh_generation() {
+        // #1270: when the wrapper is fresh (mtime changed or file missing),
+        // the local last_relayed_offset must be cleared so the next loop
+        // tick walks the fresh jsonl from offset 0 and relays the new
+        // response. Pinning to the regressed observed_output_end (the old
+        // PR #1256 behavior) drops the entire response body that's already
+        // landed below the EOF.
+        let channel_id = ChannelId::new(1485506232256168127);
+        let mut last_relayed_offset = Some(1_548_758);
+        let mut last_observed_generation_mtime_ns: Option<i64> = Some(123_456_789);
+
+        assert!(reset_stale_local_relay_offset_if_output_regressed(
+            &mut last_relayed_offset,
+            &mut last_observed_generation_mtime_ns,
+            channel_id,
+            "AgentDesk-claude-adk-cc-issue-1270-local-no-genfile",
+            438_675,
+            "unit-test",
+        ));
+        assert_eq!(
+            last_relayed_offset, None,
+            "fresh wrapper must clear local offset so next tick starts at 0"
+        );
+    }
+
+    // ─── #1275 P2 #1: adoption preserves `.generation` mtime ──────────────
+    #[test]
+    fn preserve_mtime_after_write_pins_mtime_across_content_rewrite() {
+        // The adoption path rewrites the `.generation` payload from the old
+        // generation number to the current one. If the rewrite bumps the
+        // mtime, a restored watcher with `last_watcher_relayed_generation_mtime_ns`
+        // captured before the dcserver restart will mismatch the freshly
+        // touched mtime, the regression resolver classifies as fresh wrapper,
+        // and a rotated jsonl re-relays surviving content.
+        //
+        // This test pins the helper's contract: same content rewrite, but
+        // mtime stays at the prior value within filesystem resolution.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("adoption.generation");
+        std::fs::write(&path, b"42").expect("seed generation");
+
+        // Backdate the file so the post-write set_times target is far
+        // enough from "now" that any drift would be detectable.
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24);
+        let times = std::fs::FileTimes::new().set_modified(backdated);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen for backdate");
+        f.set_times(times).expect("backdate set_times");
+        drop(f);
+        let prior_mtime = std::fs::metadata(&path)
+            .expect("metadata before")
+            .modified()
+            .expect("modified before");
+
+        super::preserve_mtime_after_write(
+            path.to_str().expect("utf8 path"),
+            b"99",
+            "unit-test-adoption",
+        );
+
+        let after_content = std::fs::read_to_string(&path).expect("read after");
+        assert_eq!(after_content, "99", "content must reflect new generation");
+        let after_mtime = std::fs::metadata(&path)
+            .expect("metadata after")
+            .modified()
+            .expect("modified after");
+        // Tolerate ≤1ms slop: APFS records sub-microsecond mtimes, but some
+        // filesystems clamp to microseconds. We backdated by 24h, so any
+        // difference within a millisecond means the helper successfully
+        // restored the prior mtime instead of letting `std::fs::write` stamp
+        // "now".
+        let drift = after_mtime
+            .duration_since(prior_mtime)
+            .unwrap_or_else(|_| prior_mtime.duration_since(after_mtime).unwrap_or_default());
+        assert!(
+            drift < std::time::Duration::from_millis(1),
+            "mtime drift {:?} after preserve_mtime_after_write — adoption \
+             would mis-classify the wrapper as fresh-respawn",
+            drift
+        );
+    }
+
+    #[test]
+    fn preserve_mtime_after_write_creates_file_when_missing() {
+        // If the prior file does not exist, the helper still writes the new
+        // content. Without a prior mtime to restore, the post-write mtime is
+        // accepted as the new baseline — this is the same behaviour as the
+        // pre-#1275 raw `std::fs::write` and is the only safe fallback.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("missing.generation");
+        super::preserve_mtime_after_write(
+            path.to_str().expect("utf8 path"),
+            b"7",
+            "unit-test-missing",
+        );
+        let content = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(content, "7");
+    }
+
+    // ─── #1275 P2 #2: resume_offset path snapshots `.generation` mtime ────
+    //
+    // The race itself is in the watcher loop body, which is hundreds of
+    // lines of async I/O behind a `tmux_session_alive` poll — extracting it
+    // for a unit test would require a refactor on the scale of this PR
+    // itself. We pin the policy by exercising the helpers the watcher loop
+    // calls (which is what the bug report describes: a missing
+    // `last_observed_generation_mtime_ns` snapshot lets the next regression
+    // check take the fresh-wrapper branch on a same-wrapper rotation).
+    #[test]
+    fn same_wrapper_rotation_does_not_clear_local_offset_when_mtime_baseline_present() {
+        // The fix at the resume_offset site stores the current `.generation`
+        // mtime in `last_observed_generation_mtime_ns` whenever it preserves
+        // `last_relayed_offset` across the resume. Once that baseline is in
+        // place, a later jsonl rotation that regresses `observed_output_end`
+        // below the stored offset must classify as same-wrapper (mtime
+        // unchanged) and pin to the new EOF — NOT clear to None.
+        //
+        // We model this with a temp `.generation` file whose mtime stays
+        // pinned across the regression check, mimicking same-wrapper jsonl
+        // rotation right after the resume_offset consumer ran.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let tmux_name = format!(
+            "AgentDesk-claude-adk-issue-1275-resume-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let gen_path = crate::services::tmux_common::session_temp_path(&tmux_name, "generation");
+        if let Some(parent) = std::path::Path::new(&gen_path).parent() {
+            std::fs::create_dir_all(parent).expect("runtime dir");
+        }
+        std::fs::write(&gen_path, b"42").expect("seed generation");
+        let baseline_mtime = super::read_generation_file_mtime_ns(&tmux_name);
+        assert!(
+            baseline_mtime > 0,
+            "test fixture must produce a non-zero generation mtime"
+        );
+
+        // Simulate the post-resume state: offset preserved + mtime baseline
+        // captured (the #1275 P2 #2 fix). The same-wrapper jsonl rotation
+        // then regresses observed_output_end below the stored offset.
+        let channel_id = ChannelId::new(1485506232256168129);
+        let mut last_relayed_offset = Some(1_548_758_u64);
+        let mut last_observed_generation_mtime_ns: Option<i64> = Some(baseline_mtime);
+
+        let observed_after_rotation = 438_675_u64;
+        assert!(reset_stale_local_relay_offset_if_output_regressed(
+            &mut last_relayed_offset,
+            &mut last_observed_generation_mtime_ns,
+            channel_id,
+            &tmux_name,
+            observed_after_rotation,
+            "unit-test-1275-p2-2",
+        ));
+        assert_eq!(
+            last_relayed_offset,
+            Some(observed_after_rotation),
+            "same-wrapper rotation must pin the local offset to current \
+             EOF, NOT clear it (would re-relay surviving content)"
+        );
+
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    }
+
+    #[test]
+    fn missing_mtime_baseline_clears_local_offset_on_regression() {
+        // Reverse-direction guard: when the resume_offset path forgets to
+        // snapshot the mtime baseline (the pre-#1275 bug), a same-wrapper
+        // rotation falls through to the fresh-wrapper branch and clears the
+        // local offset to None — re-relaying surviving content. This test
+        // documents that bad behaviour so flipping the snapshot OFF would
+        // immediately fail `same_wrapper_rotation_does_not_clear_local_offset_*`.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let tmux_name = format!(
+            "AgentDesk-claude-adk-issue-1275-no-baseline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let gen_path = crate::services::tmux_common::session_temp_path(&tmux_name, "generation");
+        if let Some(parent) = std::path::Path::new(&gen_path).parent() {
+            std::fs::create_dir_all(parent).expect("runtime dir");
+        }
+        std::fs::write(&gen_path, b"42").expect("seed generation");
+
+        let channel_id = ChannelId::new(1485506232256168130);
+        let mut last_relayed_offset = Some(1_548_758_u64);
+        // The bug state: no baseline captured at the resume site.
+        let mut last_observed_generation_mtime_ns: Option<i64> = None;
+
+        assert!(reset_stale_local_relay_offset_if_output_regressed(
+            &mut last_relayed_offset,
+            &mut last_observed_generation_mtime_ns,
+            channel_id,
+            &tmux_name,
+            438_675,
+            "unit-test-1275-no-baseline",
+        ));
+        assert_eq!(
+            last_relayed_offset, None,
+            "without an mtime baseline, the regression check must \
+             conservatively classify as fresh-wrapper (this is the bug \
+             P2 #2 closes — the baseline is now snapshotted at the \
+             resume_offset site)"
+        );
+
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 
     #[test]
@@ -8564,6 +9283,223 @@ mod tests {
         );
         assert!(later.trigger_reattach);
         assert!(!later.suppressed_by_recent_stop);
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_matches_session_after_recent_stop() {
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1271_001);
+        let tmux_name = "AgentDesk-claude-cancel-induced";
+
+        assert!(
+            !cancel_induced_watcher_death(channel, tmux_name, None),
+            "no tombstone yet → not cancel-induced"
+        );
+
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            128,
+            "mailbox_cancel_active_turn",
+        );
+
+        assert!(
+            !cancel_induced_watcher_death(channel, "AgentDesk-claude-other-session", None),
+            "tombstone bound to a different tmux name must NOT suppress unrelated session deaths"
+        );
+        assert!(
+            !cancel_induced_watcher_death(ChannelId::new(987_1271_002), tmux_name, None),
+            "tombstone for a different channel must NOT suppress this channel's death"
+        );
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, None),
+            "watcher death right after a cancel for the same session must be classified as cancel-induced"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_consumes_tombstone_so_later_failures_surface() {
+        // Codex P1 on PR #1277: without consumption a follow-up turn that
+        // reuses the same channel/tmux name would inherit the cancel
+        // tombstone for the full 60s TTL, silently swallowing an unrelated
+        // crash. After a true return the tombstone must be gone.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1276_001);
+        let tmux_name = "AgentDesk-claude-cancel-consume";
+
+        record_recent_turn_stop_with_offset_for_tests(channel, tmux_name, 256, "user-cancel");
+
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, None),
+            "first post-cancel watcher death is the legitimate consumer"
+        );
+        assert!(
+            !cancel_induced_watcher_death(channel, tmux_name, None),
+            "tombstone must be consumed so a later real failure on the reused session is NOT suppressed"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_drains_duplicate_tombstones_per_cancel() {
+        // Codex P2 on PR #1277: a single cancel commonly records two
+        // tombstones — `mailbox_cancel_active_turn` writes one, and
+        // `turn_lifecycle::stop_provider_turn_with_outcome` writes another
+        // via `record_turn_stop_tombstone`. If we removed only one entry,
+        // the duplicate would remain and silently swallow a follow-up
+        // turn's real failure on the reused (channel, tmux) pair.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1276_020);
+        let tmux_name = "AgentDesk-claude-duplicate-cancel-tombstones";
+
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            128,
+            "mailbox_cancel_active_turn",
+        );
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            128,
+            "turn_lifecycle::stop",
+        );
+
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, None),
+            "first cancel-induced death must consume both duplicate tombstones"
+        );
+        assert!(
+            !cancel_induced_watcher_death(channel, tmux_name, None),
+            "no in-window tombstone must remain after the first consumer drains the duplicates"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_does_not_suppress_real_failure_past_cancel_eof() {
+        // Codex P2 round 3 on PR #1277: for preserve-session stops the same
+        // tmux session is reused, the wrapper writes follow-up turn output
+        // past the cancel boundary, then crashes. With only the
+        // channel/session/time match the death would inherit the cancel
+        // tombstone and silently swallow the lifecycle notification +
+        // restart handoff. The current_output_offset boundary check must
+        // surface the real failure.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1276_030);
+        let tmux_name = "AgentDesk-claude-cancel-eof-boundary";
+        let stop_offset: u64 = 1024;
+
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            stop_offset,
+            "user-cancel",
+        );
+
+        // 1) Watcher death observed at the cancel boundary (no follow-up
+        //    writes) must classify as cancel-induced.
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, Some(stop_offset)),
+            "death at the cancel boundary is the legitimate cleanup"
+        );
+
+        // 2) Re-record so the second case has a fresh tombstone, then a
+        //    crash that observed bytes well past the cancel boundary +
+        //    teardown grace must NOT be suppressed.
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            stop_offset,
+            "user-cancel",
+        );
+        let post_followup_eof = stop_offset + CANCEL_TEARDOWN_GRACE_BYTES + 4096;
+        assert!(
+            !cancel_induced_watcher_death(channel, tmux_name, Some(post_followup_eof)),
+            "death observed past cancel EOF + teardown grace must surface its own signal"
+        );
+
+        // 3) Within the teardown grace window, still treat as cancel-induced
+        //    (wrapper's normal post-cancel flush bytes).
+        let teardown_eof = stop_offset + (CANCEL_TEARDOWN_GRACE_BYTES / 2);
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, Some(teardown_eof)),
+            "death within teardown grace window stays cancel-induced"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_consumes_only_matching_tombstone() {
+        // When two channels independently cancel turns, consuming one
+        // channel's tombstone must NOT remove the other channel's.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel_a = ChannelId::new(987_1276_010);
+        let channel_b = ChannelId::new(987_1276_011);
+        let tmux_a = "AgentDesk-claude-channel-a";
+        let tmux_b = "AgentDesk-claude-channel-b";
+
+        record_recent_turn_stop_with_offset_for_tests(channel_a, tmux_a, 100, "user-cancel-a");
+        record_recent_turn_stop_with_offset_for_tests(channel_b, tmux_b, 100, "user-cancel-b");
+
+        assert!(cancel_induced_watcher_death(channel_a, tmux_a, None));
+        assert!(
+            cancel_induced_watcher_death(channel_b, tmux_b, None),
+            "channel-b tombstone must remain intact after channel-a's was consumed"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_allows_session_unscoped_tombstone() {
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_1271_003);
+        let tmux_name = "AgentDesk-claude-no-session-tombstone";
+
+        record_recent_turn_stop_for_tests(
+            channel,
+            None,
+            None,
+            "session-less cancel",
+            std::time::Instant::now(),
+        );
+
+        assert!(
+            cancel_induced_watcher_death(channel, tmux_name, None),
+            "tombstones recorded without a tmux session name still cover any death on the same channel"
+        );
 
         clear_recent_turn_stops_for_tests();
     }

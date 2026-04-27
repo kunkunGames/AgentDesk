@@ -910,7 +910,46 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/agents/{id}/dispatched-sessions",
             "agents",
-            "List dispatched sessions for agent // TODO: example",
+            "List dispatched sessions for agent. Rows are de-duplicated by \
+             (channel_id, agent_id) so the same agent never appears twice for \
+             the same Discord channel even when stale provider snapshots \
+             linger. Each row carries Discord deeplink fields the dashboard \
+             can drop straight into an anchor `href`: `channel_id`, \
+             `deeplink_url` (web — https://discord.com/channels/{guild}/{channel}), \
+             plus thread aliases `thread_id` and `thread_deeplink_url` \
+             (Discord app — discord://discord.com/channels/{guild}/{channel}). \
+             Legacy fields `thread_channel_id`, `channel_web_url`, \
+             `channel_deeplink_url` are preserved for backwards compatibility \
+             with existing dashboard code paths.",
+        )
+        .with_params([("id", path_param("Agent id"))])
+        .with_example(
+            json!({"path": {"id": "project-agentdesk"}}),
+            json!({
+                "sessions": [
+                    {
+                        "id": 42,
+                        "session_key": "mac-mini:AgentDesk-codex-adk-cdx-t1485506232256168011",
+                        "agent_id": "project-agentdesk",
+                        "provider": "codex",
+                        "status": "working",
+                        "active_dispatch_id": "dispatch-1",
+                        "model": null,
+                        "tokens": 0,
+                        "cwd": null,
+                        "last_heartbeat": "2026-04-27T12:34:56+00:00",
+                        "thread_channel_id": "1485506232256168011",
+                        "channel_id": "1485506232256168011",
+                        "thread_id": "1485506232256168011",
+                        "guild_id": "1490141479707086938",
+                        "channel_web_url": "https://discord.com/channels/1490141479707086938/1485506232256168011",
+                        "channel_deeplink_url": "discord://discord.com/channels/1490141479707086938/1485506232256168011",
+                        "deeplink_url": "https://discord.com/channels/1490141479707086938/1485506232256168011",
+                        "thread_deeplink_url": "discord://discord.com/channels/1490141479707086938/1485506232256168011",
+                        "kanban_card_id": null
+                    }
+                ]
+            }),
         ),
         ep(
             "GET",
@@ -3166,6 +3205,35 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             .with_enum(&["7d", "30d", "90d"])
             .with_default("30d"),
         )]),
+        ep(
+            "GET",
+            "/api/home/kpi-trends",
+            "analytics",
+            "Home KPI sparkline data — tokens, cost, in-progress dispatch counts, and rate-limit utilization in a single payload (#1242). Each series exposes `label`, `unit`, and a `values` array sized to the requested `days` window so a sparkline component can render any tile with the same axis. The rate-limit section returns one entry per provider with `current_pct`, `unsupported`, `stale`, `reason`, and a flat `values` sparkline; providers without telemetry come back with `unsupported: true` and an empty `values` array so the dashboard can render a placeholder.",
+        )
+        .with_params([(
+            "days",
+            query_param("integer", false, "Lookback window in days (default 14, clamped to [1, 30])"),
+        )])
+        .with_example(
+            json!({"query": {"days": 14}}),
+            json!({
+                "days": 14,
+                "generated_at": "2026-04-27T00:00:00Z",
+                "dates": ["2026-04-14", "2026-04-15", "..."],
+                "tokens":      {"label": "Today's tokens", "unit": "tokens",     "values": [0, 0]},
+                "cost":        {"label": "API cost",       "unit": "usd",        "values": [0.0, 0.0]},
+                "in_progress": {"label": "In progress",    "unit": "dispatches", "values": [0, 0]},
+                "rate_limit": {
+                    "label": "Rate limit",
+                    "unit": "percent",
+                    "providers": [
+                        {"provider": "claude", "current_pct": 25.0, "unsupported": false, "stale": false, "reason": null, "values": [25.0, 25.0]},
+                        {"provider": "qwen",   "current_pct": null, "unsupported": true,  "stale": false, "reason": "no telemetry yet", "values": []}
+                    ]
+                }
+            }),
+        ),
         ep(
             "GET",
             "/api/skills-trend",

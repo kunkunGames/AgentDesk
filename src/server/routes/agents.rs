@@ -69,6 +69,19 @@ const TURN_CAPTURE_SCROLLBACK_LINES: i32 = -80;
 const TURN_CAPTURE_TAIL_LINES: usize = 60;
 const TURN_OUTPUT_MAX_CHARS: usize = 4000;
 
+/// TODO(#1238 / 843g): observability::query_agent_quality_* expects a `&Db`.
+/// Production runtimes always have a `pg_pool` and short-circuit before
+/// reading from this handle; the placeholder shim only satisfies signatures.
+fn agent_quality_legacy_db(state: &AppState) -> &crate::db::Db {
+    use std::sync::OnceLock;
+    static PLACEHOLDER: OnceLock<crate::db::Db> = OnceLock::new();
+    state
+        .engine
+        .legacy_db()
+        .or_else(|| state.legacy_db())
+        .unwrap_or_else(|| PLACEHOLDER.get_or_init(super::pending_migration_shim_for_callers))
+}
+
 fn pg_required_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -82,8 +95,12 @@ pub async fn agent_quality(
     Query(query): Query<AgentQualityQuery>,
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // TODO(#1238 / 843g): query_agent_quality_summary still expects a `&Db`
+    // for its SQLite branch. PG runtimes always have a pool and never
+    // consult the SQLite path; fall through to the legacy_db helper for
+    // shape compatibility until #1238 removes the parameter.
     match crate::services::observability::query_agent_quality_summary(
-        state.sqlite_db(),
+        agent_quality_legacy_db(&state),
         state.pg_pool_ref(),
         &id,
         query.days.unwrap_or(30),
@@ -109,7 +126,7 @@ pub async fn agents_quality_ranking(
     let window = QualityRankingWindow::parse(query.window.as_deref());
     let min_sample_size = query.min_sample_size.unwrap_or(5);
     match crate::services::observability::query_agent_quality_ranking_with(
-        state.sqlite_db(),
+        agent_quality_legacy_db(&state),
         state.pg_pool_ref(),
         query.limit.unwrap_or(50),
         metric,
@@ -846,12 +863,23 @@ pub async fn agent_dispatched_sessions(
         }
     }
 
+    // SQL only orders by recency now. Dedupe + activity-aware ranking are
+    // both done in application code below using SessionActivityResolver,
+    // because raw status='working' can lag behind the resolver's view
+    // (Codex review PR #1258, 9th pass).
+    // LEFT JOIN task_dispatches via active_dispatch_id so the response can
+    // expose the kanban_card_id this session is currently working on. The
+    // dashboard's restored "감사 / Audit" panel uses that mapping to
+    // deeplink each audit row to the most recent Discord turn for the same
+    // card without a separate API round-trip.
     let rows = match sqlx::query(
-        "SELECT id, session_key, agent_id, provider, status, active_dispatch_id,
-                model, tokens, cwd, last_heartbeat, thread_channel_id
-         FROM sessions
-         WHERE agent_id = $1
-         ORDER BY id",
+        "SELECT s.id, s.session_key, s.agent_id, s.provider, s.status, s.active_dispatch_id,
+                s.model, s.tokens, s.cwd, s.last_heartbeat, s.thread_channel_id,
+                td.kanban_card_id AS kanban_card_id
+         FROM sessions s
+         LEFT JOIN task_dispatches td ON td.id = s.active_dispatch_id
+         WHERE s.agent_id = $1
+         ORDER BY COALESCE(s.last_heartbeat, s.created_at) DESC NULLS LAST, s.id DESC",
     )
     .bind(&id)
     .fetch_all(pool)
@@ -866,40 +894,171 @@ pub async fn agent_dispatched_sessions(
         }
     };
 
+    let guild_id = state
+        .config
+        .discord
+        .guild_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // Resolve every row first — SessionActivityResolver translates raw
+    // status + active_dispatch_id + heartbeat freshness into the effective
+    // status the dashboard renders. We need that view *before* the dedupe
+    // so the live row beats a stale 'working' sibling for the same
+    // (thread_channel_id, provider).
     let mut resolver = SessionActivityResolver::new();
-    let sessions: Vec<serde_json::Value> = rows
+    let resolved: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
-            let session_key = row.try_get::<Option<String>, _>("session_key").ok().flatten();
+            let session_key = row
+                .try_get::<Option<String>, _>("session_key")
+                .ok()
+                .flatten();
             let status = row.try_get::<Option<String>, _>("status").ok().flatten();
             let active_dispatch_id = row
                 .try_get::<Option<String>, _>("active_dispatch_id")
                 .ok()
                 .flatten();
-            let last_heartbeat = pg_timestamp_to_rfc3339(row.try_get("last_heartbeat").ok().flatten());
+            let last_heartbeat =
+                pg_timestamp_to_rfc3339(row.try_get("last_heartbeat").ok().flatten());
+            let provider = row.try_get::<Option<String>, _>("provider").ok().flatten();
+            let thread_channel_id = row
+                .try_get::<Option<String>, _>("thread_channel_id")
+                .ok()
+                .flatten();
+
             let effective = resolver.resolve(
                 session_key.as_deref(),
                 status.as_deref(),
                 active_dispatch_id.as_deref(),
                 last_heartbeat.as_deref(),
             );
+
+            let (channel_web_url, channel_deeplink_url) =
+                build_channel_deeplinks(thread_channel_id.as_deref(), guild_id.as_deref());
+            let kanban_card_id = row
+                .try_get::<Option<String>, _>("kanban_card_id")
+                .ok()
+                .flatten();
+
+            // Issue #1241: expose canonical {channel_id, deeplink_url, thread_id,
+            // thread_deeplink_url} so the dashboard can drop the field straight
+            // into an anchor `href` without rebuilding Discord URLs client-side.
+            // Legacy thread_channel_id / channel_web_url / channel_deeplink_url
+            // remain for backwards compatibility — every dispatched session
+            // lives inside its agent thread, so channel_id === thread_id and
+            // deeplink_url === thread web URL.
             json!({
                 "id": row.try_get::<i64, _>("id").unwrap_or(0),
                 "session_key": session_key,
                 "agent_id": row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
-                "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
+                "provider": provider,
                 "status": effective.status,
                 "active_dispatch_id": effective.active_dispatch_id,
                 "model": row.try_get::<Option<String>, _>("model").ok().flatten(),
                 "tokens": row.try_get::<i64, _>("tokens").unwrap_or(0),
                 "cwd": row.try_get::<Option<String>, _>("cwd").ok().flatten(),
                 "last_heartbeat": last_heartbeat,
-                "thread_channel_id": row.try_get::<Option<String>, _>("thread_channel_id").ok().flatten(),
+                "thread_channel_id": thread_channel_id.clone(),
+                "channel_id": thread_channel_id.clone(),
+                "thread_id": thread_channel_id,
+                "guild_id": guild_id.clone(),
+                "channel_web_url": channel_web_url.clone(),
+                "channel_deeplink_url": channel_deeplink_url.clone(),
+                "deeplink_url": channel_web_url,
+                "thread_deeplink_url": channel_deeplink_url,
+                "kanban_card_id": kanban_card_id,
             })
         })
         .collect();
 
+    let sessions = dedup_dispatched_sessions(resolved);
+
     (StatusCode::OK, Json(json!({"sessions": sessions})))
+}
+
+/// Issue #1241: dedupe dispatched-session rows by `(channel_id, agent_id)`.
+///
+/// The previous key was `(channel_id, provider)`; that let two rows for the
+/// same agent in the same Discord channel survive whenever a stale alt-provider
+/// session lingered, which surfaced as the duplicated "#agent-manager
+/// #agent-manager" labels the issue calls out. Using `(channel_id, agent_id)`
+/// collapses each agent ↔ channel pairing to a single canonical row even when
+/// the legacy session row carries a different provider snapshot.
+///
+/// Within each (channel, agent) bucket we keep the row with the highest
+/// effective priority — Codex review (PR #1258, 9th pass): dedupe AFTER the
+/// SessionActivityResolver translation so the resolved 'working' row outranks
+/// a stale sibling that still has raw status='working' but no fresh heartbeat
+/// / no active dispatch.
+fn dedup_dispatched_sessions(resolved: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    fn effective_priority(value: &serde_json::Value) -> u8 {
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let has_dispatch = value
+            .get("active_dispatch_id")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        match status {
+            "working" => 0,
+            _ if has_dispatch => 1,
+            "idle" => 2,
+            _ => 3,
+        }
+    }
+
+    let mut best_index_for_key: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut keep: Vec<bool> = vec![true; resolved.len()];
+    for (idx, value) in resolved.iter().enumerate() {
+        let channel = value
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("thread_channel_id").and_then(|v| v.as_str()));
+        let agent_id = value.get("agent_id").and_then(|v| v.as_str());
+        if let (Some(cid), Some(aid)) = (channel, agent_id) {
+            let key = (cid.to_string(), aid.to_string());
+            match best_index_for_key.get(&key) {
+                None => {
+                    best_index_for_key.insert(key, idx);
+                }
+                Some(&prev_idx) => {
+                    let prev_priority = effective_priority(&resolved[prev_idx]);
+                    let curr_priority = effective_priority(value);
+                    if curr_priority < prev_priority {
+                        keep[prev_idx] = false;
+                        best_index_for_key.insert(key, idx);
+                    } else {
+                        keep[idx] = false;
+                    }
+                }
+            }
+        }
+    }
+
+    resolved
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, value)| if keep[idx] { Some(value) } else { None })
+        .collect()
+}
+
+/// Build Discord web + deep-link URLs for a channel. Returns (None, None) when either
+/// channel_id or guild_id is missing so the caller can render plain text fallback.
+fn build_channel_deeplinks(
+    channel_id: Option<&str>,
+    guild_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let channel = channel_id.map(str::trim).filter(|s| !s.is_empty());
+    let guild = guild_id.map(str::trim).filter(|s| !s.is_empty());
+    match (channel, guild) {
+        (Some(c), Some(g)) => (
+            Some(format!("https://discord.com/channels/{g}/{c}")),
+            Some(format!("discord://discord.com/channels/{g}/{c}")),
+        ),
+        _ => (None, None),
+    }
 }
 
 /// GET /api/agents/:id/turn
@@ -1652,33 +1811,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_dispatched_sessions_include_thread_channel_id() {
+    async fn agent_dispatched_sessions_returns_503_when_pg_pool_missing() {
+        // The endpoint requires the Postgres pool — sqlite shim alone is not
+        // enough — so without pg_pool we expect a clean 503 instead of a
+        // panic. Pre-#1241 this test asserted a 200 OK happy path with the
+        // sqlite shim alone, which always failed because the route bails out
+        // early without pg_pool. Use the new dedup_dispatched_sessions unit
+        // tests below for the response-shape contract.
         let db = test_db();
         let engine = test_engine(&db);
         let state = AppState::test_state(db.clone(), engine);
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('project-agentdesk', 'AgentDesk', 'codex', 'idle', 0)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO sessions (session_key, agent_id, provider, status, active_dispatch_id, thread_channel_id, last_heartbeat)
-                 VALUES (?1, 'project-agentdesk', 'codex', 'working', 'dispatch-1', '1485506232256168011', datetime('now'))",
-                ["mac-mini:AgentDesk-codex-adk-cdx-t1485506232256168011"],
-            )
-            .unwrap();
-        }
-
-        let (status, Json(body)) =
+        let (status, _) =
             agent_dispatched_sessions(State(state), Path("project-agentdesk".to_string())).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Issue #1241: the dashboard surfaced the same `#agent-manager` channel
+    /// twice because the dedup key was `(channel_id, provider)` — a stale
+    /// codex row alongside a fresh claude row both survived. The new key
+    /// `(channel_id, agent_id)` collapses any (agent, channel) pair to one
+    /// canonical row regardless of provider snapshot drift.
+    #[test]
+    fn dedup_dispatched_sessions_collapses_same_agent_channel_across_providers() {
+        let stale = json!({
+            "agent_id": "project-agentdesk",
+            "provider": "codex",
+            "status": "idle",
+            "active_dispatch_id": null,
+            "thread_channel_id": "1485506232256168011",
+            "channel_id": "1485506232256168011",
+        });
+        let fresh = json!({
+            "agent_id": "project-agentdesk",
+            "provider": "claude",
+            "status": "working",
+            "active_dispatch_id": "dispatch-1",
+            "thread_channel_id": "1485506232256168011",
+            "channel_id": "1485506232256168011",
+        });
+
+        let result = dedup_dispatched_sessions(vec![stale, fresh]);
+        assert_eq!(result.len(), 1, "duplicates should collapse to one row");
+        assert_eq!(result[0]["status"], "working");
+        assert_eq!(result[0]["provider"], "claude");
+    }
+
+    /// Issue #1241: distinct agents in the same Discord channel must NOT be
+    /// merged. Pre-#1241 the (channel, provider) key would collapse them
+    /// whenever they shared a provider snapshot.
+    #[test]
+    fn dedup_dispatched_sessions_keeps_distinct_agents_in_same_channel() {
+        let alpha = json!({
+            "agent_id": "agent-alpha",
+            "provider": "claude",
+            "status": "working",
+            "active_dispatch_id": "dispatch-a",
+            "thread_channel_id": "1485506232256168011",
+            "channel_id": "1485506232256168011",
+        });
+        let beta = json!({
+            "agent_id": "agent-beta",
+            "provider": "claude",
+            "status": "idle",
+            "active_dispatch_id": null,
+            "thread_channel_id": "1485506232256168011",
+            "channel_id": "1485506232256168011",
+        });
+
+        let result = dedup_dispatched_sessions(vec![alpha, beta]);
+        assert_eq!(result.len(), 2, "different agents must each survive");
+    }
+
+    /// Issue #1241: build_channel_deeplinks must mint the canonical
+    /// {web,deeplink} pair the dashboard renders straight into anchor `href`s.
+    /// Web URL is `https://discord.com/channels/{guild}/{channel}`; deeplink
+    /// uses the `discord://` scheme so Discord's app handler picks it up.
+    #[test]
+    fn build_channel_deeplinks_emits_https_and_discord_scheme_pair() {
+        let (web, deep) =
+            build_channel_deeplinks(Some("1485506232256168011"), Some("1490141479707086938"));
         assert_eq!(
-            body["sessions"][0]["thread_channel_id"],
-            serde_json::Value::String("1485506232256168011".to_string())
+            web.as_deref(),
+            Some("https://discord.com/channels/1490141479707086938/1485506232256168011"),
         );
+        assert_eq!(
+            deep.as_deref(),
+            Some("discord://discord.com/channels/1490141479707086938/1485506232256168011"),
+        );
+
+        // Missing guild → both fall back to None so callers render plain text.
+        let (web_none, deep_none) = build_channel_deeplinks(Some("1485506232256168011"), None);
+        assert!(web_none.is_none());
+        assert!(deep_none.is_none());
     }
 
     #[tokio::test]

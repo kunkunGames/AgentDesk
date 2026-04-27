@@ -12,24 +12,23 @@ const ROUTES = [
   { path: "/settings", label: /설정|Settings/ },
 ];
 
+// PR #1258: home IA reshuffle (#1245) — drop m_streak/office/roster/activity,
+// move kanban above quality+missions, add m_rate_limit placeholder. Smoke
+// expectations follow the new HOME_DEFAULT_WIDGETS in src/app/AppShell.tsx.
 const DEFAULT_HOME_WIDGET_ORDER = [
   "m_tokens",
   "m_cost",
   "m_progress",
-  "m_streak",
-  "office",
-  "missions",
-  "roster",
-  "activity",
+  "m_rate_limit",
   "kanban",
+  "quality",
+  "missions",
 ];
 const CUSTOM_HOME_WIDGET_ORDER = [
-  "kanban",
-  "activity",
-  "roster",
   "missions",
-  "office",
-  "m_streak",
+  "quality",
+  "kanban",
+  "m_rate_limit",
   "m_progress",
   "m_cost",
   "m_tokens",
@@ -38,12 +37,10 @@ const DRAGGED_HOME_WIDGET_ORDER = [
   "m_tokens",
   "m_cost",
   "m_progress",
-  "m_streak",
   "missions",
-  "office",
-  "roster",
-  "activity",
+  "m_rate_limit",
   "kanban",
+  "quality",
 ];
 const PIPELINE_VISUAL_CACHE_KEY = "agentdesk.settings.pipeline.visual-cache.v1";
 
@@ -1606,10 +1603,11 @@ test.describe("Dashboard smoke tests", () => {
 
     await page.goto("/home");
 
-    await expect(page.getByTestId("home-widget-office")).toBeVisible({ timeout: 15000 });
+    // PR #1258: office widget no longer in default; quality is in its place.
+    await expect(page.getByTestId("home-widget-quality")).toBeVisible({ timeout: 15000 });
     await page.getByTestId("home-edit-toggle").click();
 
-    await page.getByTestId("home-widget-missions").dragTo(page.getByTestId("home-widget-office"));
+    await page.getByTestId("home-widget-missions").dragTo(page.getByTestId("home-widget-m_rate_limit"));
 
     await expect.poll(() => getHomeWidgetOrder(page)).toEqual(DRAGGED_HOME_WIDGET_ORDER);
     await expect
@@ -1629,7 +1627,8 @@ test.describe("Dashboard smoke tests", () => {
     }
 
     await expect(page.getByTestId("sidebar-user-level-ring")).toBeVisible();
-    await expect(page.getByTestId("home-streak-counter")).toBeVisible();
+    // PR #1258: home-streak-counter widget removed from default home IA.
+    // The streak surface still exists on the Achievements page.
     await expect(page.getByTestId("home-daily-missions")).toBeVisible();
     await expect(page.getByTestId("home-daily-mission-dispatches_today")).toBeVisible();
     await expect(page.getByTestId("home-daily-mission-dispatches_today")).toContainText(
@@ -1731,10 +1730,15 @@ test.describe("Dashboard smoke tests", () => {
     }
   });
 
-  test("kanban: failed lane exposes trace, audit history, and pipeline hooks", async ({ page }) => {
+  test("kanban: failed lane exposes trace, audit history, and pipeline hooks", async ({ page }, testInfo) => {
     await page.goto("/kanban");
 
     await expect(page.getByTestId("kanban-page")).toBeVisible({ timeout: 15000 });
+    // #1253: on mobile only the focused column renders, so switch to the
+    // failed lane via the minimap before asserting on the column.
+    if (testInfo.project.name === "mobile") {
+      await page.getByTestId("kanban-mobile-summary-failed").click();
+    }
     await expect(page.getByTestId("kanban-column-failed")).toBeVisible();
     await expect(page.getByTestId("kanban-pipeline-hooks")).toBeVisible();
 
@@ -1744,22 +1748,29 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("kanban-state-history")).toBeVisible();
   });
 
-  test("kanban: mobile keeps horizontal board scroll and opens card details as a sheet", async ({ page }, testInfo) => {
+  test("kanban: mobile shows minimap with single focused column and opens card details as a sheet", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "desktop", "Mobile-only test");
 
     await page.goto("/kanban");
 
     await expect(page.getByTestId("kanban-page")).toBeVisible({ timeout: 15000 });
+    // #1253: at the mobile breakpoint we render a minimap of column counts
+    // plus the single focused column at full width — the previous build
+    // kept the desktop horizontal-scroll layout on mobile, which forced
+    // two-finger panning and broke at-a-glance scanning.
+    await expect(page.getByTestId("kanban-mobile-minimap")).toBeVisible();
     await expect(page.getByTestId("kanban-mobile-summary-failed")).toBeVisible();
     await expect
       .poll(() =>
         page
           .getByTestId("kanban-board-scroll")
-          .evaluate((element) => element.scrollWidth > element.clientWidth),
+          .evaluate((element) => element.scrollWidth <= element.clientWidth + 1),
       )
       .toBe(true);
 
     await page.getByTestId("kanban-mobile-summary-failed").click();
+    await expect(page.getByTestId("kanban-column-failed")).toBeVisible();
+
     await page.getByTestId("kanban-card-card-779-1").click();
 
     const sheet = page.getByRole("dialog", { name: /카드 상세|Card details/ });

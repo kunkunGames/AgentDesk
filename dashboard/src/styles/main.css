@@ -111,6 +111,11 @@
   --th-accent-info: var(--info);
   --th-accent-warn: var(--warn);
   --th-accent-danger: var(--err);
+  /* `--th-accent-success` was missing from the theme tokens, so callers like
+     HomeMetricTile that referenced it for the API-cost sparkline accent
+     resolved to an empty string and stroked nothing. Map it to the existing
+     `--ok` green so the cost graph appears alongside the token graph. */
+  --th-accent-success: var(--ok);
   --th-badge-sky-bg: color-mix(in oklch, var(--info) 16%, var(--bg-2) 84%);
   --th-badge-sky-text: color-mix(in oklch, var(--info) 74%, var(--fg) 26%);
   --th-badge-blue-bg: color-mix(in oklch, var(--accent) 18%, var(--bg-2) 82%);
@@ -140,6 +145,40 @@
   --th-overlay-light: color-mix(in oklch, black 5%, transparent);
   --th-overlay-medium: color-mix(in oklch, black 7%, transparent);
   --th-overlay-strong: color-mix(in oklch, black 10%, transparent);
+  /* Provider colors: lower L by ~0.18 and slightly bump C so the same hue stays
+     legible against the near-white bg. Soft variants use the white surface (bg-2)
+     as the mix anchor for consistent badge contrast. Per issue #1202 follow-up
+     spec: provider palette must stay consistent across light/dark via oklch
+     L/C tweaks. */
+  --claude: oklch(0.59 0.18 71);
+  --claude-soft: color-mix(in oklch, var(--claude) 14%, var(--bg-2) 86%);
+  --codex: oklch(0.56 0.14 214);
+  --codex-soft: color-mix(in oklch, var(--codex) 14%, var(--bg-2) 86%);
+  --gemini: oklch(0.54 0.18 258);
+  --gemini-soft: color-mix(in oklch, var(--gemini) 14%, var(--bg-2) 86%);
+  --qwen: oklch(0.55 0.2 319);
+  --qwen-soft: color-mix(in oklch, var(--qwen) 14%, var(--bg-2) 86%);
+  --opencode: oklch(0.56 0.13 195);
+  --opencode-soft: color-mix(in oklch, var(--opencode) 14%, var(--bg-2) 86%);
+  --copilot: oklch(0.55 0.16 160);
+  --copilot-soft: color-mix(in oklch, var(--copilot) 14%, var(--bg-2) 86%);
+  --antigravity: oklch(0.56 0.19 45);
+  --antigravity-soft: color-mix(in oklch, var(--antigravity) 14%, var(--bg-2) 86%);
+  --api: oklch(0.5 0.02 250);
+  --api-soft: color-mix(in oklch, var(--api) 12%, var(--bg-2) 88%);
+  /* Semantic accents also need a darker L on light bg so badge text passes AA. */
+  --ok: oklch(0.55 0.17 150);
+  --warn: oklch(0.62 0.16 85);
+  --err: oklch(0.55 0.22 22);
+  --info: oklch(0.55 0.13 230);
+}
+
+/* Accent swatch buttons (Tweaks panel). Keyboard focus must surface a clear
+   ring so accessibility audits pass — the inactive swatch state otherwise
+   has no focus indicator distinct from its hover state. */
+.dash-accent-swatch:focus-visible {
+  outline: 2px solid var(--th-accent-primary, var(--accent));
+  outline-offset: 2px;
 }
 
 [data-accent="indigo"] {
@@ -655,4 +694,55 @@ textarea {
 .pcd-markdown th {
   background: var(--th-overlay-medium);
   color: var(--th-text-heading);
+}
+
+/* === Settings page (issue #1257) === */
+.setting-row-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px auto;
+  align-items: center;
+}
+/* Desktop default: 2-col grid (220px nav + 1fr content). On <768px the nav
+   collapses into a horizontal scroll tab bar and SettingRow becomes a 1-col
+   stack. The Tailwind classes already drive desktop layout; these media
+   overrides apply the spec mobile rules. */
+@media (max-width: 767px) {
+  .settings-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .settings-nav {
+    position: relative !important;
+    top: 0 !important;
+    align-self: stretch !important;
+  }
+  .settings-nav .settings-nav-items {
+    flex-direction: row !important;
+    display: flex !important;
+    overflow-x: auto;
+    gap: 0.5rem;
+    padding-bottom: 0.25rem;
+  }
+  .settings-nav .settings-nav-items > * {
+    flex: 0 0 auto;
+    min-width: 12rem;
+  }
+  .setting-row .setting-row-grid {
+    grid-template-columns: 1fr !important;
+    gap: 0.625rem !important;
+  }
+  /* FSM editor PC/mobile split — JS controls which surface renders, but the
+     spec class names provide a CSS-driven fallback for grid sizing. */
+  .fsm-actions {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 0.4rem !important;
+    width: 100% !important;
+  }
+  .fsm-actions > button,
+  .fsm-actions > .btn {
+    font-size: 11px !important;
+    padding: 7px 8px !important;
+    justify-content: center !important;
+    white-space: nowrap !important;
+  }
 }

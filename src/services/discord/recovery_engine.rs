@@ -3966,9 +3966,11 @@ mod tests {
             session_key: Some("host:tmux-1".to_string()),
             dispatch_id: Some("dispatch-from-state".to_string()),
             last_watcher_relayed_offset: None,
+            last_watcher_relayed_generation_mtime_ns: None,
             restart_mode: None,
             restart_generation: None,
             rebind_origin: false,
+            long_running_placeholder_active: false,
         };
 
         assert!(
@@ -4081,9 +4083,11 @@ mod tests {
             session_key: None,
             dispatch_id: None,
             last_watcher_relayed_offset: None,
+            last_watcher_relayed_generation_mtime_ns: None,
             restart_mode: None,
             restart_generation: None,
             rebind_origin: false,
+            long_running_placeholder_active: false,
         };
 
         save_missing_session_handoff(

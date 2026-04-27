@@ -14,10 +14,19 @@ use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 
 fn legacy_db(state: &AppState) -> &crate::db::Db {
+    /* TODO(#1238 / 843g): kept as a placeholder for KanbanService and
+    related callers that still take a `&Db`. The PG-only runtime never
+    reads from the placeholder — every kanban handler below routes through
+    `KanbanService`, which always prefers the PG branch when
+    `state.pg_pool` is set. Once #1238 migrates the constructor signatures
+    to `Option<Db>` (or PG-only), drop this helper entirely. */
+    use std::sync::OnceLock;
+    static PLACEHOLDER: OnceLock<crate::db::Db> = OnceLock::new();
     state
         .engine
         .legacy_db()
-        .expect("legacy sqlite db unavailable for kanban fallback")
+        .or_else(|| state.legacy_db())
+        .unwrap_or_else(|| PLACEHOLDER.get_or_init(super::pending_migration_shim_for_callers))
 }
 
 /// Common kanban card SELECT columns with dispatch metadata via LEFT JOIN.

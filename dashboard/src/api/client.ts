@@ -456,12 +456,13 @@ export async function getAgentOffices(
 
 export async function getAuditLogs(
   limit = 20,
-  filter?: { entityType?: string; entityId?: string },
+  filter?: { entityType?: string; entityId?: string; agentId?: string },
 ): Promise<AuditLogEntry[]> {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   if (filter?.entityType) params.set("entityType", filter.entityType);
   if (filter?.entityId) params.set("entityId", filter.entityId);
+  if (filter?.agentId) params.set("agentId", filter.agentId);
   const data = await request<{ logs: AuditLogEntry[] }>(
     `/api/audit-logs?${params.toString()}`,
   );
@@ -634,11 +635,22 @@ export async function getStats(officeId?: string): Promise<DashboardStats> {
 
 export async function getTokenAnalytics(
   period: "7d" | "30d" | "90d" = "30d",
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; forceRefresh?: boolean },
 ): Promise<TokenAnalyticsResponse> {
-  return request(`/api/token-analytics?period=${period}`, {
+  // The endpoint now ships with `Cache-Control: max-age=15, swr=300` so a
+  // background re-entry to /stats can paint instantly. The Refresh button
+  // and any other "user explicitly asked for fresh data" caller passes
+  // forceRefresh=true so we bypass:
+  //   - the browser cache via fetch's `cache: "reload"` directive
+  //   - the new server-side in-process cache via `&fresh=1` query param
+  //     (the server short-circuits to its 30s memo without it).
+  // Together these restore the explicit-refresh contract Codex flagged on
+  // PR #1258 while still letting background traffic skip the ~9s scan.
+  const force = opts?.forceRefresh ? "&fresh=1" : "";
+  return request(`/api/token-analytics?period=${period}${force}`, {
     signal: opts?.signal,
     timeoutMs: TOKEN_ANALYTICS_TIMEOUT_MS,
+    cache: opts?.forceRefresh ? "reload" : "default",
   });
 }
 
@@ -648,6 +660,47 @@ export function getCachedTokenAnalytics(
   return readCachedGet<TokenAnalyticsResponse>(
     `/api/token-analytics?period=${period}`,
   );
+}
+
+// ── Home KPI sparklines (#1242) ──
+export interface HomeKpiSeries {
+  label: string;
+  unit: string;
+  values: number[];
+}
+
+export interface HomeKpiRateLimitProvider {
+  provider: string;
+  current_pct: number | null;
+  unsupported: boolean;
+  stale: boolean;
+  reason: string | null;
+  values: number[];
+}
+
+export interface HomeKpiRateLimit {
+  label: string;
+  unit: string;
+  providers: HomeKpiRateLimitProvider[];
+}
+
+export interface HomeKpiTrendsResponse {
+  days: number;
+  generated_at: string;
+  dates: string[];
+  tokens: HomeKpiSeries;
+  cost: HomeKpiSeries;
+  in_progress: HomeKpiSeries;
+  rate_limit: HomeKpiRateLimit;
+}
+
+export async function getHomeKpiTrends(
+  days: number = 14,
+  opts?: { signal?: AbortSignal },
+): Promise<HomeKpiTrendsResponse> {
+  return request(`/api/home/kpi-trends?days=${days}`, {
+    signal: opts?.signal,
+  });
 }
 
 // ── Kanban & Dispatches ──

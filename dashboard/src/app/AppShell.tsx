@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Flame,
   FolderKanban,
+  Gauge,
   GripVertical,
   Home,
   LayoutDashboard,
@@ -45,12 +46,13 @@ import * as api from "../api/client";
 import { useKanban } from "../contexts/KanbanContext";
 import { useOffice } from "../contexts/OfficeContext";
 import { useSettings } from "../contexts/SettingsContext";
-import { useSpriteMap } from "../components/AgentAvatar";
+import AgentAvatar, { useSpriteMap } from "../components/AgentAvatar";
 import {
   ToastOverlay,
   type Notification,
 } from "../components/NotificationCenter";
 import { deriveOfficeAgentState } from "../components/office-view/officeAgentState";
+import { MiniRateLimitBar } from "../components/office-view/OfficeInsightPanel";
 import OfficeSelectorBar from "../components/OfficeSelectorBar";
 import { MOBILE_LAYOUT_MEDIA_QUERY } from "./breakpoints";
 import {
@@ -118,17 +120,15 @@ type AgentsPageTab = "agents" | "departments" | "backlog" | "dispatch";
 type KanbanSignalFocus = "review" | "blocked" | "requested" | "stalled";
 
 const MOBILE_TABBAR_SAFE_AREA_HEIGHT = "calc(3.5rem + env(safe-area-inset-bottom))";
+
 const HOME_DEFAULT_WIDGETS = [
   "m_tokens",
   "m_cost",
   "m_progress",
-  "m_streak",
-  "office",
-  "missions",
-  "quality",
-  "roster",
-  "activity",
+  "m_rate_limit",
   "kanban",
+  "quality",
+  "missions",
 ];
 const MOBILE_PRIMARY_ROUTE_IDS: AppRouteId[] = [
   "home",
@@ -612,12 +612,12 @@ export default function AppShell({
           }}
         >
           <div
-            className="border-b px-4 py-5"
+            className="flex h-16 shrink-0 items-center border-b px-4"
             style={{ borderColor: "var(--th-border-subtle)" }}
           >
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2.5">
               <div
-                className="flex h-11 w-11 items-center justify-center rounded-2xl text-sm font-semibold"
+                className="flex h-9 w-9 items-center justify-center rounded-xl text-[13px] font-semibold"
                 style={{
                   background: "var(--th-accent-primary-soft)",
                   color: "var(--th-accent-primary)",
@@ -625,7 +625,7 @@ export default function AppShell({
               >
                 AD
               </div>
-              <div className="min-w-0">
+              <div className="min-w-0 leading-tight">
                 <div
                   className="truncate text-sm font-semibold"
                   style={{ color: "var(--th-text-heading)" }}
@@ -633,7 +633,7 @@ export default function AppShell({
                   AgentDesk
                 </div>
                 <div
-                  className="truncate text-xs"
+                  className="truncate text-[11px]"
                   style={{ color: "var(--th-text-muted)" }}
                 >
                   v2.4.1
@@ -754,7 +754,7 @@ export default function AppShell({
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header
           data-testid="topbar"
-          className="relative shrink-0 border-b px-4 py-2.5 sm:px-5"
+          className="relative flex min-h-16 shrink-0 items-center border-b px-4 py-2 sm:px-5"
           style={{
             zIndex: SHELL_HEADER_Z_INDEX,
             borderColor: "var(--th-border-subtle)",
@@ -763,7 +763,7 @@ export default function AppShell({
             backdropFilter: "blur(14px)",
           }}
         >
-          <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+          <div className="flex w-full flex-wrap items-center gap-2 sm:flex-nowrap">
             <div className="min-w-0 basis-full sm:flex-1">
               <div
                 data-testid="topbar-breadcrumb"
@@ -871,7 +871,15 @@ export default function AppShell({
 
                 {showNotificationPanel && (
                   <div
-                    className="absolute right-0 top-12 w-[min(22rem,calc(100vw-2rem))] rounded-3xl border p-3 shadow-2xl"
+                    /* The bell sits on the left side of the topbar action
+                       cluster on mobile (it follows the theme toggle), so
+                       anchoring with `right-0` made the popup expand
+                       leftward off the viewport. Anchor to `left-0` so the
+                       popup grows toward the empty topbar area to the right
+                       on every breakpoint, and cap width to the actual
+                       viewport so a 22rem popup can never overflow on a
+                       narrow phone (#1253 follow-up). */
+                    className="absolute left-0 top-12 w-[min(22rem,calc(100vw-1.5rem))] max-w-[calc(100vw-1.5rem)] rounded-3xl border p-3 shadow-2xl"
                     style={{
                       zIndex: SHELL_POPOVER_Z_INDEX,
                       borderColor: "var(--th-border-subtle)",
@@ -1619,10 +1627,11 @@ export default function AppShell({
                         key={option.id}
                         type="button"
                         title={option.label}
-                        aria-label={option.label}
+                        aria-label={`${option.label} accent`}
                         aria-pressed={active}
+                        data-accent-preset={option.id}
                         onClick={() => setAccentPreset(option.id)}
-                        className="flex h-9 w-9 items-center justify-center rounded-full transition-transform"
+                        className="dash-accent-swatch flex h-9 w-9 items-center justify-center rounded-full transition-transform"
                         style={{
                           border: active
                             ? "2px solid var(--th-text-heading)"
@@ -1804,6 +1813,10 @@ function HomeOverviewPage({
   const [analytics, setAnalytics] = useState<TokenAnalyticsResponse | null>(
     () => api.getCachedTokenAnalytics("7d")?.data ?? null,
   );
+  // #1242: single combined endpoint that hydrates the in-progress sparkline
+  // (and, going forward, can replace the analytics-derived token/cost
+  // sparklines once we trust this codepath in production).
+  const [homeKpiTrends, setHomeKpiTrends] = useState<api.HomeKpiTrendsResponse | null>(null);
   const [gamification, setGamification] = useState<api.AchievementsResponse | null>(null);
   const [streaks, setStreaks] = useState<api.AgentStreak[]>([]);
   const defaultWidgets = useMemo(
@@ -1939,6 +1952,28 @@ function HomeOverviewPage({
     };
   }, []);
 
+  // #1242: fetch the combined home KPI trend payload so the in-progress tile
+  // (and eventually the others) can render real sparklines instead of a
+  // hardcoded fallback.
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    api
+      .getHomeKpiTrends(14, { signal: controller.signal })
+      .then((next) => {
+        if (!active) return;
+        setHomeKpiTrends(next);
+      })
+      .catch((error) => {
+        if (!active || controller.signal.aborted) return;
+        console.error("Failed to load home KPI trends", error);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, []);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (window.localStorage.getItem(STORAGE_KEYS.homeOrder) !== null) return;
@@ -1999,6 +2034,9 @@ function HomeOverviewPage({
   const latestAnalyticsDay = analytics?.daily.at(-1) ?? null;
   const tokenTrend = analytics?.daily.slice(-7).map((day) => day.total_tokens) ?? [];
   const costTrend = analytics?.daily.slice(-7).map((day) => day.cost) ?? [];
+  // #1242: pull the dispatch-count sparkline from the new endpoint so the
+  // "진행 중" tile gets the same visual rhythm as the token/cost tiles.
+  const inProgressTrend = homeKpiTrends?.in_progress.values ?? [];
   const activityStreak = useMemo(() => {
     const daily = [...(analytics?.daily ?? [])].sort((left, right) =>
       left.date.localeCompare(right.date),
@@ -2010,14 +2048,17 @@ function HomeOverviewPage({
     }
     return streak;
   }, [analytics]);
-  const formatCompact = useCallback(
-    (value: number) =>
-      new Intl.NumberFormat(isKo ? "ko-KR" : "en-US", {
-        notation: "compact",
-        maximumFractionDigits: value >= 1_000_000 ? 1 : 0,
-      }).format(value),
-    [isKo],
-  );
+  /* Match StatsPageView.formatTokens — always use M/B/K units regardless of
+     locale so the home KPI tiles read the same as the stats receipt. The
+     previous Intl compact formatter switched to 만/억 in Korean locale,
+     which was inconsistent with /stats and made cross-page mental math
+     harder. */
+  const formatCompact = useCallback((value: number): string => {
+    if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`;
+    if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+    if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+    return Math.round(value).toString();
+  }, []);
   const formatCurrency = useCallback(
     (value: number) =>
       new Intl.NumberFormat(isKo ? "en-US" : "en-US", {
@@ -2092,11 +2133,23 @@ function HomeOverviewPage({
           <HomeMetricTile
             icon={<Zap size={14} />}
             title={tr("오늘 토큰", "Today's tokens")}
-            value={formatCompact(latestAnalyticsDay?.total_tokens ?? 0)}
-            sub={tr(
-              `7일 평균 ${formatCompact(Math.round(analytics?.summary.average_daily_tokens ?? 0))}`,
-              `7d avg ${formatCompact(Math.round(analytics?.summary.average_daily_tokens ?? 0))}`,
-            )}
+            /* `analytics` is null on the first home visit until
+               /api/token-analytics resolves (~9 s cold path on PG-only
+               runtimes; ~10 ms once the server-side in-process cache is
+               warm). The previous fallback `?? 0` showed a real-looking
+               "0" while the fetch was inflight, which made the tile look
+               broken. Render the loading placeholder explicitly and
+               mark the trend slot as pending too so the dashed line
+               doesn't briefly show as the real sparkline. */
+            value={analytics ? formatCompact(latestAnalyticsDay?.total_tokens ?? 0) : "…"}
+            sub={
+              analytics
+                ? tr(
+                    `7일 평균 ${formatCompact(Math.round(analytics.summary.average_daily_tokens ?? 0))}`,
+                    `7d avg ${formatCompact(Math.round(analytics.summary.average_daily_tokens ?? 0))}`,
+                  )
+                : tr("7일 평균 집계 중", "Loading 7-day average")
+            }
             delta={
               analytics?.summary.total_tokens
                 ? tr(`7일 ${formatCompact(analytics.summary.total_tokens)}`, `7d ${formatCompact(analytics.summary.total_tokens)}`)
@@ -2114,11 +2167,15 @@ function HomeOverviewPage({
           <HomeMetricTile
             icon={<Sparkles size={14} />}
             title={tr("API 비용", "API cost")}
-            value={formatCurrency(latestAnalyticsDay?.cost ?? 0)}
-            sub={tr(
-              `캐시 절감 ${formatCurrency(analytics?.summary.cache_discount ?? 0)}`,
-              `Cache saved ${formatCurrency(analytics?.summary.cache_discount ?? 0)}`,
-            )}
+            value={analytics ? formatCurrency(latestAnalyticsDay?.cost ?? 0) : "…"}
+            sub={
+              analytics
+                ? tr(
+                    `캐시 절감 ${formatCurrency(analytics.summary.cache_discount ?? 0)}`,
+                    `Cache saved ${formatCurrency(analytics.summary.cache_discount ?? 0)}`,
+                  )
+                : tr("비용 집계 중", "Loading cost")
+            }
             delta={
               analytics?.summary.total_cost != null
                 ? tr(`7일 ${formatCurrency(analytics.summary.total_cost)}`, `7d ${formatCurrency(analytics.summary.total_cost)}`)
@@ -2144,6 +2201,7 @@ function HomeOverviewPage({
             delta={tr(`${totalActionableCards} 전체`, `${totalActionableCards} total`)}
             deltaTone="flat"
             accent="var(--th-accent-warn)"
+            trend={inProgressTrend}
           />
         ),
       },
@@ -2174,6 +2232,37 @@ function HomeOverviewPage({
             }
             accent="var(--th-accent-danger)"
           />
+        ),
+      },
+      m_rate_limit: {
+        className: "lg:col-span-3",
+        /* User reported "한도 UI 정보 밀도 낮음" — replace the previous
+           single-percentage HomeMetricTile + sparkline with the same
+           per-provider/per-bucket gauge rows used by the office "운영신호"
+           panel (`MiniRateLimitBar`). One card now shows every provider's
+           5h/7d bucket utilization with the same color/glow language as
+           /stats, and fetches its own data on a 30 s timer so the home
+           tile no longer needs the manual fetch + summary state. */
+        render: () => (
+          <div
+            className="h-full overflow-hidden rounded-[1.15rem] border"
+            style={{
+              borderColor: "var(--th-border-subtle)",
+              background:
+                "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 96%, transparent) 100%)",
+            }}
+          >
+            <div className="px-4 py-4 sm:px-5">
+              <div
+                className="flex items-center gap-2 text-[11.5px] font-medium uppercase tracking-[0.08em]"
+                style={{ color: "var(--th-text-muted)" }}
+              >
+                <Gauge size={14} />
+                <span>{tr("한도", "Rate limit")}</span>
+              </div>
+              <MiniRateLimitBar isKo={isKo} />
+            </div>
+          </div>
         ),
       },
       office: {
@@ -2215,8 +2304,8 @@ function HomeOverviewPage({
                     const progress = Math.min(100, Math.max(12, Math.round(agent.stats_tokens / 100_000)));
                     return (
                       <div key={agent.id} className="rounded-2xl border px-3 py-3 text-center" style={{ borderColor: "var(--th-border-subtle)", background: "color-mix(in srgb, var(--th-bg-surface) 90%, transparent)" }}>
-                        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border text-xl" style={{ borderColor: "var(--th-border-subtle)", background: "var(--th-card-bg)" }}>
-                          {agent.avatar_emoji || "🤖"}
+                        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl border" style={{ borderColor: "var(--th-border-subtle)", background: "var(--th-card-bg)" }}>
+                          <AgentAvatar agent={agent} agents={agents} size={40} rounded="2xl" />
                         </div>
                         <div className="mt-3 truncate text-sm font-semibold" style={{ color: "var(--th-text-heading)" }}>
                           {isKo ? agent.name_ko : agent.name}
@@ -2237,7 +2326,7 @@ function HomeOverviewPage({
         ),
       },
       missions: {
-        className: "lg:col-span-4",
+        className: "lg:col-span-6",
         render: () => (
           <HomeWidgetShell
             title={tr("데일리 미션", "Daily missions")}
@@ -2285,8 +2374,8 @@ function HomeOverviewPage({
               ) : (
                 topAgents.map((agent) => (
                   <div key={agent.id} className="grid grid-cols-[auto_1fr_auto] items-center gap-3 rounded-2xl border px-3 py-3" style={{ borderColor: "var(--th-border-subtle)", background: "color-mix(in srgb, var(--th-card-bg) 90%, transparent)" }}>
-                    <div className="flex h-10 w-10 items-center justify-center rounded-2xl border text-lg" style={{ borderColor: "var(--th-border-subtle)", background: "var(--th-bg-surface)" }}>
-                      {agent.avatar_emoji || "🤖"}
+                    <div className="flex h-10 w-10 items-center justify-center rounded-2xl border" style={{ borderColor: "var(--th-border-subtle)", background: "var(--th-bg-surface)" }}>
+                      <AgentAvatar agent={agent} agents={agents} size={32} rounded="2xl" />
                     </div>
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold" style={{ color: "var(--th-text-heading)" }}>
@@ -2422,6 +2511,7 @@ function HomeOverviewPage({
       doneCards,
       fallbackActivity,
       inProgressCards,
+      inProgressTrend,
       isKo,
       kanbanCards,
       meetings.length,
@@ -2662,13 +2752,13 @@ function HomeMetricTile({
         <div className="mt-1 text-xs" style={{ color: "var(--th-text-muted)" }}>
           {sub}
         </div>
-        {strokePoints ? (
-          <svg
-            viewBox="0 0 100 30"
-            preserveAspectRatio="none"
-            className="mt-3 h-8 w-full"
-            aria-hidden="true"
-          >
+        <svg
+          viewBox="0 0 100 30"
+          preserveAspectRatio="none"
+          className="mt-3 h-8 w-full"
+          aria-hidden="true"
+        >
+          {strokePoints ? (
             <polyline
               fill="none"
               stroke={accent}
@@ -2677,12 +2767,20 @@ function HomeMetricTile({
               strokeLinecap="round"
               points={strokePoints}
             />
-          </svg>
-        ) : (
-          <div className="mt-3 h-1.5 rounded-full" style={{ background: "color-mix(in srgb, var(--th-border-subtle) 68%, transparent)" }}>
-            <div className="h-full rounded-full" style={{ width: "100%", background: accent }} />
-          </div>
-        )}
+          ) : (
+            <line
+              x1="0"
+              x2="100"
+              y1="16"
+              y2="16"
+              stroke={accent}
+              strokeWidth="1.4"
+              strokeDasharray="2.5 4"
+              strokeLinecap="round"
+              opacity="0.55"
+            />
+          )}
+        </svg>
       </div>
     </div>
   );
