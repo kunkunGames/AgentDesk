@@ -872,6 +872,7 @@ fn provider_check_id(provider: &ProviderKind) -> &'static str {
         ProviderKind::Claude => "provider_claude",
         ProviderKind::Codex => "provider_codex",
         ProviderKind::Gemini => "provider_gemini",
+        ProviderKind::OpenCode => "provider_opencode",
         ProviderKind::Qwen => "provider_qwen",
         ProviderKind::Unsupported(_) => "provider_unsupported",
     }
@@ -2253,6 +2254,7 @@ fn check_provider_cli(
         ProviderKind::Claude => "claude CLI",
         ProviderKind::Codex => "codex CLI",
         ProviderKind::Gemini => "gemini CLI",
+        ProviderKind::OpenCode => "opencode CLI",
         ProviderKind::Qwen => "qwen CLI",
         ProviderKind::Unsupported(_) => "provider CLI",
     };

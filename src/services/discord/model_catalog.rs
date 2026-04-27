@@ -827,6 +827,7 @@ pub(in crate::services::discord) fn model_hint(
         ProviderKind::Gemini => {
             "default + models resolved from local Gemini catalog + custom model id".to_string()
         }
+        ProviderKind::OpenCode => "default + custom model id".to_string(),
         ProviderKind::Qwen => {
             let catalog = resolve_qwen_model_catalog(working_dir);
             if catalog.entries.is_empty() {
@@ -844,7 +845,7 @@ pub(crate) fn known_models(provider: &ProviderKind) -> Vec<ModelCatalogEntry> {
         ProviderKind::Claude => CLAUDE_MODEL_CATALOG.to_vec(),
         ProviderKind::Codex => build_codex_model_catalog(),
         ProviderKind::Gemini => build_gemini_model_catalog(),
-        ProviderKind::Qwen => Vec::new(),
+        ProviderKind::OpenCode | ProviderKind::Qwen => Vec::new(),
         ProviderKind::Unsupported(_) => Vec::new(),
     }
 }
@@ -854,7 +855,7 @@ fn model_aliases(provider: &ProviderKind) -> &'static [(&'static str, &'static s
         ProviderKind::Claude => CLAUDE_MODEL_ALIASES,
         ProviderKind::Codex => CODEX_MODEL_ALIASES,
         ProviderKind::Gemini => GEMINI_MODEL_ALIASES,
-        ProviderKind::Qwen => &[],
+        ProviderKind::OpenCode | ProviderKind::Qwen => &[],
         ProviderKind::Unsupported(_) => &[],
     }
 }

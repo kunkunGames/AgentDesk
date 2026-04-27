@@ -84,6 +84,7 @@ use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
 use crate::services::claude;
 use crate::services::codex;
 use crate::services::gemini;
+use crate::services::opencode;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::qwen;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
@@ -2533,7 +2534,7 @@ pub(super) fn scan_skills(
                 }
             }
         }
-        ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::Qwen => {
+        ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => {
             scan_directory_skills(
                 collect_provider_skill_roots(provider, project_path),
                 &mut seen,
@@ -2639,7 +2640,11 @@ fn skill_dir_fingerprint_with_projects(
 fn provider_supports_directory_skills(provider: &ProviderKind) -> bool {
     matches!(
         provider,
-        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::Qwen
+        ProviderKind::Claude
+            | ProviderKind::Codex
+            | ProviderKind::Gemini
+            | ProviderKind::OpenCode
+            | ProviderKind::Qwen
     )
 }
 
@@ -2648,6 +2653,7 @@ fn provider_home_skill_dir(provider: &ProviderKind, home: &Path) -> Option<std::
         ProviderKind::Claude => Some(home.join(".claude").join("commands")),
         ProviderKind::Codex => Some(home.join(".codex").join("skills")),
         ProviderKind::Gemini => Some(home.join(".gemini").join("skills")),
+        ProviderKind::OpenCode => Some(home.join(".opencode").join("skills")),
         ProviderKind::Qwen => Some(home.join(".qwen").join("skills")),
         ProviderKind::Unsupported(_) => None,
     }
@@ -2662,6 +2668,7 @@ fn provider_project_skill_dir(
         ProviderKind::Claude => Some(project_root.join(".claude").join("commands")),
         ProviderKind::Codex => Some(project_root.join(".codex").join("skills")),
         ProviderKind::Gemini => Some(project_root.join(".gemini").join("skills")),
+        ProviderKind::OpenCode => Some(project_root.join(".opencode").join("skills")),
         ProviderKind::Qwen => Some(project_root.join(".qwen").join("skills")),
         ProviderKind::Unsupported(_) => None,
     }

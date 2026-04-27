@@ -29,7 +29,7 @@ use crate::services::platform::with_provider_execution_context;
 use crate::services::process::kill_pid_tree;
 use crate::services::provider::{CancelToken, ProviderKind};
 use crate::services::provider_cli::ProviderExecutionContext;
-use crate::services::{claude, codex, gemini, qwen};
+use crate::services::{claude, codex, gemini, opencode, qwen};
 
 pub async fn execute_simple(provider: ProviderKind, prompt: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || execute_simple_blocking(provider, prompt, None, None))
@@ -120,6 +120,9 @@ fn execute_simple_blocking_inner(
         }
         ProviderKind::Gemini => {
             gemini::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
+        }
+        ProviderKind::OpenCode => {
+            opencode::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
         }
         ProviderKind::Qwen => {
             qwen::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
@@ -223,6 +226,21 @@ pub async fn execute_structured_with_context(
                     None,
                 ),
                 ProviderKind::Qwen => qwen::execute_command_streaming(
+                    &prompt,
+                    None,
+                    &working_dir,
+                    sender.clone(),
+                    system_prompt_ref,
+                    allowed_tools_ref,
+                    Some(Arc::clone(&cancel_token)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    model_ref,
+                    None,
+                ),
+                ProviderKind::OpenCode => opencode::execute_command_streaming(
                     &prompt,
                     None,
                     &working_dir,
