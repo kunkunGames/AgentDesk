@@ -4,11 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
-use libsql_rusqlite::OptionalExtension;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
-
-use crate::db::Db;
 
 type MaintenanceFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -62,6 +59,7 @@ impl MaintenanceJobRegistry {
             Arc::new(NoopHeartbeatJob),
             Arc::new(AgentQualityRollupJob),
             Arc::new(QualityRegressionAlerterJob),
+            Arc::new(CancelTombstonePruneJob),
         ])
     }
 
@@ -147,6 +145,38 @@ impl MaintenanceJob for QualityRegressionAlerterJob {
     }
 }
 
+/// #1309 — sweep expired `cancel_tombstones` rows every 30 minutes so the
+/// table cannot grow without bound when no watcher ever observes the
+/// cancel-induced death. The 10-minute TTL × 3 safety margin is generous so
+/// repeated PG-enabled idle channels do not retain stale rows.
+struct CancelTombstonePruneJob;
+
+impl MaintenanceJob for CancelTombstonePruneJob {
+    fn name(&self) -> &'static str {
+        "storage.cancel_tombstone_prune"
+    }
+
+    fn schedule(&self) -> MaintenanceSchedule {
+        MaintenanceSchedule::every(Duration::from_secs(30 * 60), Duration::from_secs(20))
+    }
+
+    fn run<'a>(&'a self, pool: &'a PgPool) -> MaintenanceFuture<'a> {
+        Box::pin(async move {
+            let deleted = crate::db::cancel_tombstones::prune_expired_cancel_tombstones(pool)
+                .await
+                .map_err(|error| anyhow::anyhow!("cancel_tombstone_prune failed: {error}"))?;
+            if deleted > 0 {
+                tracing::info!(
+                    job = self.name(),
+                    deleted,
+                    "[maintenance] cancel_tombstone_prune removed expired rows"
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
 trait MaintenanceJobStore: Send + Sync {
     fn read<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<String>>;
     fn upsert<'a>(&'a self, key: &'a str, value: &'a str) -> StoreFuture<'a, ()>;
@@ -193,48 +223,6 @@ impl MaintenanceJobStore for PgMaintenanceJobStore {
             .await
             .map(|_| ())
             .map_err(|error| format!("upsert maintenance kv_meta {key}: {error}"))
-        })
-    }
-}
-
-struct SqliteMaintenanceJobStore {
-    db: Db,
-}
-
-impl SqliteMaintenanceJobStore {
-    fn new(db: Db) -> Self {
-        Self { db }
-    }
-}
-
-impl MaintenanceJobStore for SqliteMaintenanceJobStore {
-    fn read<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<String>> {
-        Box::pin(async move {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|error| format!("lock sqlite maintenance store: {error}"))?;
-            conn.query_row("SELECT value FROM kv_meta WHERE key = ?1", [key], |row| {
-                row.get::<_, Option<String>>(0)
-            })
-            .optional()
-            .map_err(|error| format!("read sqlite maintenance kv_meta {key}: {error}"))
-            .map(|value| value.flatten())
-        })
-    }
-
-    fn upsert<'a>(&'a self, key: &'a str, value: &'a str) -> StoreFuture<'a, ()> {
-        Box::pin(async move {
-            let conn = self
-                .db
-                .lock()
-                .map_err(|error| format!("lock sqlite maintenance store: {error}"))?;
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                libsql_rusqlite::params![key, value],
-            )
-            .map(|_| ())
-            .map_err(|error| format!("upsert sqlite maintenance kv_meta {key}: {error}"))
         })
     }
 }
@@ -293,11 +281,6 @@ pub(crate) async fn scheduler_loop(pg_pool: Arc<PgPool>) {
 
 pub(crate) async fn list_job_statuses_pg(pg_pool: PgPool) -> Vec<MaintenanceJobStatus> {
     let store: Arc<dyn MaintenanceJobStore> = Arc::new(PgMaintenanceJobStore::new(pg_pool));
-    build_job_statuses(&MaintenanceJobRegistry::static_registry(), store).await
-}
-
-pub(crate) async fn list_job_statuses_sqlite(db: Db) -> Vec<MaintenanceJobStatus> {
-    let store: Arc<dyn MaintenanceJobStore> = Arc::new(SqliteMaintenanceJobStore::new(db));
     build_job_statuses(&MaintenanceJobRegistry::static_registry(), store).await
 }
 

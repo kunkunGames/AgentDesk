@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::Row as SqlxRow;
 
 use crate::config::{Config, EscalationMode};
-use crate::db::agents::{load_agent_channel_bindings, load_agent_channel_bindings_pg};
+use crate::db::agents::load_agent_channel_bindings_pg;
 use crate::server::routes::AppState;
 use crate::services::discord::health::active_request_owner_for_channel;
 
@@ -147,17 +147,6 @@ fn escalation_defaults(config: &Config) -> EscalationSettings {
     }
 }
 
-fn load_override(conn: &libsql_rusqlite::Connection) -> Option<EscalationSettings> {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM kv_meta WHERE key = ?1",
-            [ESCALATION_SETTINGS_OVERRIDE_KEY],
-            |row| row.get(0),
-        )
-        .ok();
-    raw.and_then(|raw| serde_json::from_str::<EscalationSettings>(&raw).ok())
-}
-
 async fn load_override_pg_async(pool: &sqlx::PgPool) -> Result<Option<EscalationSettings>, String> {
     let raw = sqlx::query_scalar::<_, String>(
         "SELECT value
@@ -176,10 +165,6 @@ async fn load_override_pg_async(pool: &sqlx::PgPool) -> Result<Option<Escalation
     Ok(raw.and_then(|value| serde_json::from_str::<EscalationSettings>(&value).ok()))
 }
 
-fn merged_settings(conn: &libsql_rusqlite::Connection, config: &Config) -> EscalationSettings {
-    load_override(conn).unwrap_or_else(|| escalation_defaults(config))
-}
-
 fn merged_settings_pg(pool: &sqlx::PgPool, config: &Config) -> Result<EscalationSettings, String> {
     let defaults = escalation_defaults(config);
     crate::utils::async_bridge::block_on_pg_result(
@@ -193,15 +178,8 @@ fn merged_settings_pg(pool: &sqlx::PgPool, config: &Config) -> Result<Escalation
     )
 }
 
-pub(in crate::server::routes) fn effective_owner_user_id(
-    conn: &libsql_rusqlite::Connection,
-    config: &Config,
-) -> Option<u64> {
-    merged_settings(conn, config).owner_user_id
-}
-
 pub(in crate::server::routes) fn effective_owner_user_id_with_backends(
-    db: Option<&crate::db::Db>,
+    _db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     config: &Config,
 ) -> Option<u64> {
@@ -214,26 +192,7 @@ pub(in crate::server::routes) fn effective_owner_user_id_with_backends(
         }
     }
 
-    if let Some(db) = db {
-        if let Ok(conn) = db.lock() {
-            return effective_owner_user_id(&conn, config);
-        }
-    }
-
     escalation_defaults(config).owner_user_id
-}
-
-fn store_override(
-    conn: &libsql_rusqlite::Connection,
-    settings: &EscalationSettings,
-) -> Result<(), String> {
-    let raw = serde_json::to_string(settings).map_err(|err| err.to_string())?;
-    conn.execute(
-        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-        libsql_rusqlite::params![ESCALATION_SETTINGS_OVERRIDE_KEY, raw],
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 fn store_override_pg(pool: &sqlx::PgPool, settings: &EscalationSettings) -> Result<(), String> {
@@ -331,53 +290,6 @@ fn resolve_mode_at(settings: &EscalationSettings, now: DateTime<Utc>) -> Escalat
     }
 }
 
-fn load_card_summary(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-) -> Result<CardEscalationSummary, String> {
-    conn.query_row(
-        "SELECT
-             title,
-             github_issue_number,
-             assigned_agent_id,
-             description,
-             status,
-             review_status,
-             blocked_reason,
-             (
-                 SELECT COUNT(*)
-                 FROM task_dispatches
-                 WHERE kanban_card_id = ?1
-             ) AS dispatch_count,
-             (
-                 SELECT to_agent_id
-                 FROM task_dispatches
-                 WHERE kanban_card_id = ?1
-                   AND to_agent_id IS NOT NULL
-                   AND TRIM(to_agent_id) != ''
-                 ORDER BY datetime(COALESCE(completed_at, updated_at, created_at)) DESC, rowid DESC
-                 LIMIT 1
-             ) AS last_agent_id
-         FROM kanban_cards
-         WHERE id = ?1",
-        [card_id],
-        |row| {
-            Ok(CardEscalationSummary {
-                title: row.get(0)?,
-                issue_number: row.get(1)?,
-                assigned_agent_id: row.get(2)?,
-                description: row.get(3)?,
-                status: row.get(4)?,
-                review_status: row.get(5)?,
-                blocked_reason: row.get(6)?,
-                dispatch_count: row.get(7)?,
-                last_agent_id: row.get(8)?,
-            })
-        },
-    )
-    .map_err(|_| format!("card not found: {card_id}"))
-}
-
 async fn load_card_summary_pg_async(
     pool: &sqlx::PgPool,
     card_id: &str,
@@ -449,21 +361,6 @@ async fn load_card_summary_pg_async(
     })
 }
 
-fn latest_dispatch_agent_id(conn: &libsql_rusqlite::Connection, card_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT to_agent_id
-         FROM task_dispatches
-         WHERE kanban_card_id = ?1
-           AND to_agent_id IS NOT NULL
-           AND TRIM(to_agent_id) != ''
-         ORDER BY datetime(created_at) DESC, rowid DESC
-         LIMIT 1",
-        [card_id],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
 async fn latest_dispatch_agent_id_pg_async(
     pool: &sqlx::PgPool,
     card_id: &str,
@@ -481,41 +378,6 @@ async fn latest_dispatch_agent_id_pg_async(
     .fetch_optional(pool)
     .await
     .map_err(|error| format!("load postgres latest dispatch agent {card_id}: {error}"))
-}
-
-fn candidate_parent_channels(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-    assigned_agent_id: Option<&str>,
-) -> Vec<u64> {
-    let mut agent_ids = Vec::new();
-    if let Some(agent_id) = latest_dispatch_agent_id(conn, card_id) {
-        agent_ids.push(agent_id);
-    }
-    if let Some(agent_id) = assigned_agent_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !agent_ids.iter().any(|existing| existing == agent_id) {
-            agent_ids.push(agent_id.to_string());
-        }
-    }
-
-    let mut channels = Vec::new();
-    for agent_id in agent_ids {
-        let Ok(Some(bindings)) = load_agent_channel_bindings(conn, &agent_id) else {
-            continue;
-        };
-        for channel in bindings.all_channels() {
-            let Some(channel_id) = parse_channel_reference(&channel) else {
-                continue;
-            };
-            if !channels.contains(&channel_id) {
-                channels.push(channel_id);
-            }
-        }
-    }
-    channels
 }
 
 async fn candidate_parent_channels_pg_async(
@@ -596,15 +458,6 @@ fn escalation_thread_key(card_id: &str) -> String {
     format!("{ESCALATION_THREAD_KEY_PREFIX}{card_id}")
 }
 
-fn load_cached_thread_id(conn: &libsql_rusqlite::Connection, card_id: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM kv_meta WHERE key = ?1",
-        [escalation_thread_key(card_id)],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
 async fn load_cached_thread_id_pg_async(
     pool: &sqlx::PgPool,
     card_id: &str,
@@ -620,19 +473,6 @@ async fn load_cached_thread_id_pg_async(
     .fetch_optional(pool)
     .await
     .map_err(|error| format!("load postgres cached escalation thread {key}: {error}"))
-}
-
-fn save_cached_thread_id(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-    thread_id: &str,
-) -> Result<(), String> {
-    conn.execute(
-        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-        libsql_rusqlite::params![escalation_thread_key(card_id), thread_id],
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 fn save_cached_thread_id_pg(
@@ -660,15 +500,6 @@ fn save_cached_thread_id_pg(
         },
         |error| error,
     )
-}
-
-fn clear_cached_thread_id(conn: &libsql_rusqlite::Connection, card_id: &str) -> Result<(), String> {
-    conn.execute(
-        "DELETE FROM kv_meta WHERE key = ?1",
-        [escalation_thread_key(card_id)],
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(())
 }
 
 fn clear_cached_thread_id_pg(pool: &sqlx::PgPool, card_id: &str) -> Result<(), String> {
@@ -905,52 +736,6 @@ fn summarize_dispatch_result_text(raw: &str) -> Option<String> {
         })
 }
 
-fn load_recent_dispatch_results(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT dispatch_type, result
-             FROM task_dispatches
-             WHERE kanban_card_id = ?1
-               AND status IN ('completed', 'failed')
-             ORDER BY datetime(COALESCE(completed_at, updated_at, created_at)) DESC, rowid DESC
-             LIMIT ?2",
-        )
-        .map_err(|err| err.to_string())?;
-    let rows = stmt
-        .query_map(
-            libsql_rusqlite::params![card_id, ESCALATION_RECENT_RESULT_LIMIT as i64],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
-        .map_err(|err| err.to_string())?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        let (dispatch_type, result) = row.map_err(|err| err.to_string())?;
-        let Some(summary) = result
-            .as_deref()
-            .and_then(summarize_dispatch_result_text)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let label = dispatch_type
-            .as_deref()
-            .map(normalize_whitespace)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "dispatch".to_string());
-        results.push(format!("{label}: {summary}"));
-    }
-    Ok(results)
-}
-
 async fn load_recent_dispatch_results_pg_async(
     pool: &sqlx::PgPool,
     card_id: &str,
@@ -992,39 +777,6 @@ async fn load_recent_dispatch_results_pg_async(
         results.push(format!("{label}: {summary}"));
     }
     Ok(results)
-}
-
-fn load_card_context(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-    summary: &CardEscalationSummary,
-) -> Result<Option<CardContext>, String> {
-    let issue_summary = summarize_issue_description(summary.description.as_deref());
-    let progress_summary = format_progress_summary(summary);
-    let recent_results = load_recent_dispatch_results(conn, card_id)?;
-    let blocked_reason = summary
-        .blocked_reason
-        .as_deref()
-        .map(normalize_whitespace)
-        .filter(|value| !value.is_empty())
-        .map(|value| truncate_chars(&value, ESCALATION_REASON_CHAR_LIMIT));
-
-    let context = CardContext {
-        issue_summary,
-        progress_summary,
-        recent_results,
-        blocked_reason,
-    };
-
-    if context.issue_summary.is_none()
-        && context.progress_summary.is_none()
-        && context.recent_results.is_empty()
-        && context.blocked_reason.is_none()
-    {
-        Ok(None)
-    } else {
-        Ok(Some(context))
-    }
 }
 
 async fn load_card_context_pg_async(
@@ -1830,6 +1582,101 @@ mod tests {
         crate::engine::PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
     }
 
+    fn test_engine_with_pg(pg_pool: sqlx::PgPool) -> crate::engine::PolicyEngine {
+        let mut config = crate::config::Config::default();
+        config.policies.dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+        config.policies.hot_reload = false;
+        crate::engine::PolicyEngine::new_with_pg(&config, Some(pg_pool)).unwrap()
+    }
+
+    /// Per-test Postgres database lifecycle for the #1238 migration of
+    /// escalation handler tests, which now require a PG pool.
+    struct EscalationPgDatabase {
+        _lifecycle: crate::db::postgres::PostgresTestLifecycleGuard,
+        admin_url: String,
+        database_name: String,
+        database_url: String,
+    }
+
+    impl EscalationPgDatabase {
+        async fn create() -> Self {
+            let lifecycle = crate::db::postgres::lock_test_lifecycle();
+            let admin_url = pg_test_admin_database_url();
+            let database_name = format!("agentdesk_escalation_{}", uuid::Uuid::new_v4().simple());
+            let database_url = format!("{}/{}", pg_test_base_database_url(), database_name);
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "escalation handler pg",
+            )
+            .await
+            .expect("create escalation postgres test db");
+
+            Self {
+                _lifecycle: lifecycle,
+                admin_url,
+                database_name,
+                database_url,
+            }
+        }
+
+        async fn migrate(&self) -> sqlx::PgPool {
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "escalation handler pg",
+            )
+            .await
+            .expect("connect + migrate escalation postgres test db")
+        }
+
+        async fn drop(self) {
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "escalation handler pg",
+            )
+            .await
+            .expect("drop escalation postgres test db");
+        }
+    }
+
+    fn pg_test_base_database_url() -> String {
+        if let Ok(base) = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE") {
+            let trimmed = base.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+        let user = std::env::var("PGUSER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("USER").ok().filter(|v| !v.trim().is_empty()))
+            .unwrap_or_else(|| "postgres".to_string());
+        let password = std::env::var("PGPASSWORD")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let host = std::env::var("PGHOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let port = std::env::var("PGPORT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "5432".to_string());
+        match password {
+            Some(password) => format!("postgresql://{user}:{password}@{host}:{port}"),
+            None => format!("postgresql://{user}@{host}:{port}"),
+        }
+    }
+
+    fn pg_test_admin_database_url() -> String {
+        let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        format!("{}/{}", pg_test_base_database_url(), admin_db)
+    }
+
     #[test]
     fn scheduled_mode_switches_between_pm_and_user() {
         let settings = EscalationSettings {
@@ -1923,12 +1770,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_and_get_escalation_settings_round_trip() {
+    async fn put_and_get_pg_escalation_settings_round_trip() {
+        let pg_db = EscalationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let db = test_db();
-        let state = AppState::test_state_with_config(
+        let state = AppState::test_state_with_pg(
             db.clone(),
-            test_engine(&db),
-            crate::config::Config::default(),
+            test_engine_with_pg(pool.clone()),
+            pool.clone(),
         );
 
         let (status, Json(body)) = put_escalation_settings(
@@ -1951,10 +1800,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["current"]["mode"], json!("user"));
         assert_eq!(body["current"]["pm_channel_id"], json!("123456789"));
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]
-    async fn user_mode_reuses_existing_thread_for_same_card() {
+    async fn user_mode_pg_reuses_existing_thread_for_same_card() {
         let _env_lock = env_lock();
         let runtime_root = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", runtime_root.path());
@@ -2020,51 +1872,85 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let pg_db = EscalationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let db = test_db();
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
-                 VALUES ('agent-1', 'Agent One', 'claude', '111', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, priority, review_status, github_issue_number, assigned_agent_id, created_at, updated_at)
-                 VALUES ('card-1', 'Escalation card', 'review', 'high', 'dilemma_pending', 422, 'agent-1', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE kanban_cards
-                 SET description = ?1,
-                     blocked_reason = ?2
-                 WHERE id = 'card-1'",
-                libsql_rusqlite::params![
-                    "리뷰 루프가 반복되고 있습니다.\n브랜치 상태를 직접 확인해야 합니다.\n이전 결과를 요약합니다.",
-                    "rework 디스패치가 terminal card 에서 취소됨",
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task_dispatches (
-                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, result, created_at, updated_at, completed_at
-                 ) VALUES (
-                    'dispatch-escalation-1', 'card-1', 'project-agentdesk', 'review', 'completed', 'Review finished', ?1,
-                    datetime('now', '-10 minutes'), datetime('now', '-10 minutes'), datetime('now', '-10 minutes')
-                 )",
-                libsql_rusqlite::params![serde_json::json!({
-                    "summary": "Codex review에서 P1 1건과 P2 2건이 남았습니다."
-                })
-                .to_string()],
-            )
-            .unwrap();
-        }
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, NOW(), NOW())",
+        )
+        .bind("agent-1")
+        .bind("Agent One")
+        .bind("claude")
+        .bind("111")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, review_status, github_issue_number,
+                assigned_agent_id, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())",
+        )
+        .bind("card-1")
+        .bind("Escalation card")
+        .bind("review")
+        .bind("high")
+        .bind("dilemma_pending")
+        .bind(422_i32)
+        .bind("agent-1")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kanban_cards
+             SET description = $1,
+                 blocked_reason = $2
+             WHERE id = 'card-1'",
+        )
+        .bind("리뷰 루프가 반복되고 있습니다.\n브랜치 상태를 직접 확인해야 합니다.\n이전 결과를 요약합니다.")
+        .bind("rework 디스패치가 terminal card 에서 취소됨")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, result,
+                created_at, updated_at, completed_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                NOW() - INTERVAL '10 minutes',
+                NOW() - INTERVAL '10 minutes',
+                NOW() - INTERVAL '10 minutes'
+             )",
+        )
+        .bind("dispatch-escalation-1")
+        .bind("card-1")
+        .bind("project-agentdesk")
+        .bind("review")
+        .bind("completed")
+        .bind("Review finished")
+        .bind(
+            serde_json::json!({
+                "summary": "Codex review에서 P1 1건과 P2 2건이 남았습니다."
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let mut config = crate::config::Config::default();
         config.escalation.mode = EscalationMode::User;
         config.escalation.owner_user_id = Some(343742347365974026);
-        let state = AppState::test_state_with_config(db.clone(), test_engine(&db), config);
+        let mut state = AppState::test_state_with_pg(
+            db.clone(),
+            test_engine_with_pg(pool.clone()),
+            pool.clone(),
+        );
+        state.config = std::sync::Arc::new(config);
 
         let body = EmitEscalationBody {
             card_id: "card-1".to_string(),
@@ -2093,10 +1979,12 @@ mod tests {
         assert!(first_message.contains("⛔ 기존 차단 사유:"));
 
         server.abort();
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]
-    async fn user_mode_falls_back_to_pm_when_owner_routing_unavailable() {
+    async fn user_mode_pg_falls_back_to_pm_when_owner_routing_unavailable() {
         let _env_lock = env_lock();
         let runtime_root = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", runtime_root.path());
@@ -2132,51 +2020,84 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let pg_db = EscalationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let db = test_db();
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
-                 VALUES ('agent-2', 'Agent Two', 'claude', NULL, datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, priority, review_status, github_issue_number, assigned_agent_id, created_at, updated_at)
-                 VALUES ('card-2', 'Fallback card', 'review', 'high', 'dilemma_pending', 434, 'agent-2', datetime('now'), datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE kanban_cards
-                 SET description = ?1,
-                     blocked_reason = ?2
-                 WHERE id = 'card-2'",
-                libsql_rusqlite::params![
-                    "오너 라우팅이 불가한 카드입니다.\nPM 채널 폴백이 필요합니다.",
-                    "owner routing unavailable",
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO task_dispatches (
-                    id, kanban_card_id, to_agent_id, dispatch_type, status, title, result, created_at, updated_at, completed_at
-                 ) VALUES (
-                    'dispatch-escalation-2', 'card-2', 'agent-2', 'implementation', 'failed', 'Implement failed', ?1,
-                    datetime('now', '-20 minutes'), datetime('now', '-20 minutes'), datetime('now', '-20 minutes')
-                 )",
-                libsql_rusqlite::params![serde_json::json!({
-                    "notes": "CI failure after implementation dispatch"
-                })
-                .to_string()],
-            )
-            .unwrap();
-        }
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id, created_at, updated_at)
+             VALUES ($1, $2, $3, NULL, NOW(), NOW())",
+        )
+        .bind("agent-2")
+        .bind("Agent Two")
+        .bind("claude")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kanban_cards (
+                id, title, status, priority, review_status, github_issue_number,
+                assigned_agent_id, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())",
+        )
+        .bind("card-2")
+        .bind("Fallback card")
+        .bind("review")
+        .bind("high")
+        .bind("dilemma_pending")
+        .bind(434_i32)
+        .bind("agent-2")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE kanban_cards
+             SET description = $1,
+                 blocked_reason = $2
+             WHERE id = 'card-2'",
+        )
+        .bind("오너 라우팅이 불가한 카드입니다.\nPM 채널 폴백이 필요합니다.")
+        .bind("owner routing unavailable")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, result,
+                created_at, updated_at, completed_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                NOW() - INTERVAL '20 minutes',
+                NOW() - INTERVAL '20 minutes',
+                NOW() - INTERVAL '20 minutes'
+             )",
+        )
+        .bind("dispatch-escalation-2")
+        .bind("card-2")
+        .bind("agent-2")
+        .bind("implementation")
+        .bind("failed")
+        .bind("Implement failed")
+        .bind(
+            serde_json::json!({
+                "notes": "CI failure after implementation dispatch"
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let mut config = crate::config::Config::default();
         config.escalation.mode = EscalationMode::User;
         config.escalation.pm_channel_id = Some("222".to_string());
-        let state = AppState::test_state_with_config(db.clone(), test_engine(&db), config);
+        let mut state = AppState::test_state_with_pg(
+            db.clone(),
+            test_engine_with_pg(pool.clone()),
+            pool.clone(),
+        );
+        state.config = std::sync::Arc::new(config);
 
         let (status, Json(body)) = emit_escalation_with_base_url(
             &state,
@@ -2201,5 +2122,7 @@ mod tests {
         assert!(sent.contains("결정 API: `POST /api/pm-decision`"));
 
         server.abort();
+        pool.close().await;
+        pg_db.drop().await;
     }
 }

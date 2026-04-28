@@ -69,19 +69,6 @@ const TURN_CAPTURE_SCROLLBACK_LINES: i32 = -80;
 const TURN_CAPTURE_TAIL_LINES: usize = 60;
 const TURN_OUTPUT_MAX_CHARS: usize = 4000;
 
-/// TODO(#1238 / 843g): observability::query_agent_quality_* expects a `&Db`.
-/// Production runtimes always have a `pg_pool` and short-circuit before
-/// reading from this handle; the placeholder shim only satisfies signatures.
-fn agent_quality_legacy_db(state: &AppState) -> &crate::db::Db {
-    use std::sync::OnceLock;
-    static PLACEHOLDER: OnceLock<crate::db::Db> = OnceLock::new();
-    state
-        .engine
-        .legacy_db()
-        .or_else(|| state.legacy_db())
-        .unwrap_or_else(|| PLACEHOLDER.get_or_init(super::pending_migration_shim_for_callers))
-}
-
 fn pg_required_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -95,12 +82,7 @@ pub async fn agent_quality(
     Query(query): Query<AgentQualityQuery>,
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // TODO(#1238 / 843g): query_agent_quality_summary still expects a `&Db`
-    // for its SQLite branch. PG runtimes always have a pool and never
-    // consult the SQLite path; fall through to the legacy_db helper for
-    // shape compatibility until #1238 removes the parameter.
     match crate::services::observability::query_agent_quality_summary(
-        agent_quality_legacy_db(&state),
         state.pg_pool_ref(),
         &id,
         query.days.unwrap_or(30),
@@ -126,7 +108,6 @@ pub async fn agents_quality_ranking(
     let window = QualityRankingWindow::parse(query.window.as_deref());
     let min_sample_size = query.min_sample_size.unwrap_or(5);
     match crate::services::observability::query_agent_quality_ranking_with(
-        agent_quality_legacy_db(&state),
         state.pg_pool_ref(),
         query.limit.unwrap_or(50),
         metric,
@@ -179,14 +160,6 @@ struct ParsedTurnToolEvent {
     event: TurnToolEvent,
     identity_kind: &'static str,
     identity_value: String,
-}
-
-fn agent_exists(conn: &libsql_rusqlite::Connection, id: &str) -> bool {
-    conn.query_row("SELECT COUNT(*) FROM agents WHERE id = ?1", [id], |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|count| count > 0)
-    .unwrap_or(false)
 }
 
 fn resolve_channel_identifier(value: &str) -> Option<u64> {
@@ -518,82 +491,6 @@ fn collect_turn_tool_events(
         .skip(len.saturating_sub(24))
         .map(|entry| entry.event)
         .collect()
-}
-
-fn find_agent_turn_session(
-    conn: &libsql_rusqlite::Connection,
-    agent_id: &str,
-) -> Result<Option<AgentTurnSession>, libsql_rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT COALESCE(s.session_key, ''), s.provider, s.status, s.active_dispatch_id,
-                s.last_heartbeat, s.created_at, s.thread_channel_id,
-                COALESCE(
-                    s.thread_channel_id,
-                    a.discord_channel_id,
-                    a.discord_channel_alt,
-                    a.discord_channel_cc,
-                    a.discord_channel_cdx
-                ) AS runtime_channel_id
-         FROM sessions s
-         LEFT JOIN agents a ON a.id = s.agent_id
-         WHERE s.agent_id = ?1
-         ORDER BY s.last_heartbeat DESC, s.created_at DESC, s.id DESC",
-    )?;
-
-    let rows = stmt.query_map([agent_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-        ))
-    })?;
-
-    let mut resolver = SessionActivityResolver::new();
-    let mut latest = None;
-
-    for row in rows {
-        let (
-            session_key,
-            provider,
-            raw_status,
-            active_dispatch_id,
-            last_heartbeat,
-            created_at,
-            thread_channel_id,
-            runtime_channel_id,
-        ) = row?;
-        let session_key_ref = (!session_key.trim().is_empty()).then_some(session_key.as_str());
-        let effective = resolver.resolve(
-            session_key_ref,
-            raw_status.as_deref(),
-            active_dispatch_id.as_deref(),
-            last_heartbeat.as_deref(),
-        );
-        let candidate = AgentTurnSession {
-            session_key,
-            provider,
-            last_heartbeat,
-            created_at,
-            thread_channel_id,
-            runtime_channel_id,
-            effective_status: effective.status,
-            effective_active_dispatch_id: effective.active_dispatch_id,
-            is_working: effective.is_working,
-        };
-        if latest.is_none() {
-            latest = Some(candidate.clone());
-        }
-        if candidate.is_working {
-            return Ok(Some(candidate));
-        }
-    }
-
-    Ok(latest)
 }
 
 async fn agent_exists_pg(pool: &sqlx::PgPool, id: &str) -> Result<bool, sqlx::Error> {
@@ -1779,10 +1676,7 @@ pub async fn agent_signal(
 mod tests {
     use super::*;
     use crate::db::Db;
-    use crate::db::session_transcripts::{
-        PersistSessionTranscript, SessionTranscriptEvent, SessionTranscriptEventKind,
-        persist_turn_on_conn,
-    };
+    use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
     use crate::engine::PolicyEngine;
 
     fn test_db() -> Db {
@@ -1795,6 +1689,101 @@ mod tests {
     fn test_engine(db: &Db) -> PolicyEngine {
         let config = crate::config::Config::default();
         PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap()
+    }
+
+    fn test_engine_with_pg(pg_pool: sqlx::PgPool) -> PolicyEngine {
+        let mut config = crate::config::Config::default();
+        config.policies.dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+        config.policies.hot_reload = false;
+        PolicyEngine::new_with_pg(&config, Some(pg_pool)).unwrap()
+    }
+
+    /// Per-test Postgres database lifecycle for the #1238 migration of
+    /// agents handler tests, which now require a PG pool.
+    struct AgentsPgDatabase {
+        _lifecycle: crate::db::postgres::PostgresTestLifecycleGuard,
+        admin_url: String,
+        database_name: String,
+        database_url: String,
+    }
+
+    impl AgentsPgDatabase {
+        async fn create() -> Self {
+            let lifecycle = crate::db::postgres::lock_test_lifecycle();
+            let admin_url = pg_test_admin_database_url();
+            let database_name = format!("agentdesk_agents_{}", uuid::Uuid::new_v4().simple());
+            let database_url = format!("{}/{}", pg_test_base_database_url(), database_name);
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "agents handler pg",
+            )
+            .await
+            .expect("create agents postgres test db");
+
+            Self {
+                _lifecycle: lifecycle,
+                admin_url,
+                database_name,
+                database_url,
+            }
+        }
+
+        async fn migrate(&self) -> sqlx::PgPool {
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "agents handler pg",
+            )
+            .await
+            .expect("connect + migrate agents postgres test db")
+        }
+
+        async fn drop(self) {
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "agents handler pg",
+            )
+            .await
+            .expect("drop agents postgres test db");
+        }
+    }
+
+    fn pg_test_base_database_url() -> String {
+        if let Ok(base) = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE") {
+            let trimmed = base.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+        let user = std::env::var("PGUSER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("USER").ok().filter(|v| !v.trim().is_empty()))
+            .unwrap_or_else(|| "postgres".to_string());
+        let password = std::env::var("PGPASSWORD")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let host = std::env::var("PGHOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let port = std::env::var("PGPORT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "5432".to_string());
+        match password {
+            Some(password) => format!("postgresql://{user}:{password}@{host}:{port}"),
+            None => format!("postgresql://{user}@{host}:{port}"),
+        }
+    }
+
+    fn pg_test_admin_database_url() -> String {
+        let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        format!("{}/{}", pg_test_base_database_url(), admin_db)
     }
 
     #[test]
@@ -1907,44 +1896,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_transcripts_returns_structured_events() {
+    async fn agent_transcripts_pg_returns_structured_events() {
+        let pg_db = AgentsPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let db = test_db();
-        let engine = test_engine(&db);
-        let state = AppState::test_state(db.clone(), engine);
+        let state = AppState::test_state_with_pg(
+            db.clone(),
+            test_engine_with_pg(pool.clone()),
+            pool.clone(),
+        );
 
-        {
-            let mut conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('agent-transcript', 'Transcript Agent', 'codex', 'idle', 0)",
-                [],
-            )
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, status, xp) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("agent-transcript")
+        .bind("Transcript Agent")
+        .bind("codex")
+        .bind("idle")
+        .bind(0_i32)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-            let events = vec![SessionTranscriptEvent {
-                kind: SessionTranscriptEventKind::ToolUse,
-                tool_name: Some("Bash".to_string()),
-                summary: Some("cargo test".to_string()),
-                content: "cargo test --no-run".to_string(),
-                status: Some("success".to_string()),
-                is_error: false,
-            }];
-            persist_turn_on_conn(
-                &mut conn,
-                PersistSessionTranscript {
-                    turn_id: "discord:agent-transcript:1",
-                    session_key: Some("host:agent-transcript"),
-                    channel_id: Some("chan-1"),
-                    agent_id: Some("agent-transcript"),
-                    provider: Some("codex"),
-                    dispatch_id: None,
-                    user_message: "verify build",
-                    assistant_message: "build verified",
-                    events: &events,
-                    duration_ms: Some(4200),
-                },
-            )
-            .unwrap();
-        }
+        let events = vec![SessionTranscriptEvent {
+            kind: SessionTranscriptEventKind::ToolUse,
+            tool_name: Some("Bash".to_string()),
+            summary: Some("cargo test".to_string()),
+            content: "cargo test --no-run".to_string(),
+            status: Some("success".to_string()),
+            is_error: false,
+        }];
+        let events_json = serde_json::to_string(&events).unwrap();
+        sqlx::query(
+            "INSERT INTO session_transcripts (
+                turn_id, session_key, channel_id, agent_id, provider, dispatch_id,
+                user_message, assistant_message, events_json, duration_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CAST($9 AS jsonb), $10)",
+        )
+        .bind("discord:agent-transcript:1")
+        .bind("host:agent-transcript")
+        .bind("chan-1")
+        .bind("agent-transcript")
+        .bind("codex")
+        .bind(Option::<String>::None)
+        .bind("verify build")
+        .bind("build verified")
+        .bind(events_json)
+        .bind(4200_i32)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let (status, Json(body)) = agent_transcripts(
             State(state),
@@ -1967,45 +1968,62 @@ mod tests {
         assert_eq!(body["transcripts"][0]["duration_ms"], 4200);
         assert_eq!(body["transcripts"][0]["events"][0]["kind"], "tool_use");
         assert_eq!(body["transcripts"][0]["events"][0]["tool_name"], "Bash");
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]
-    async fn agent_transcripts_falls_back_to_session_agent_for_legacy_rows() {
+    async fn agent_transcripts_pg_falls_back_to_session_agent_for_legacy_rows() {
+        let pg_db = AgentsPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let db = test_db();
-        let engine = test_engine(&db);
-        let state = AppState::test_state(db.clone(), engine);
+        let state = AppState::test_state_with_pg(
+            db.clone(),
+            test_engine_with_pg(pool.clone()),
+            pool.clone(),
+        );
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO agents (id, name, provider, status, xp) VALUES ('agent-transcript-fallback', 'Transcript Fallback', 'codex', 'idle', 0)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat)
-                 VALUES ('host:agent-transcript-fallback', 'agent-transcript-fallback', 'codex', 'idle', datetime('now'))",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO session_transcripts (
-                    turn_id, session_key, channel_id, agent_id, provider, dispatch_id, user_message, assistant_message, events_json
-                 ) VALUES (
-                    'discord:agent-transcript-fallback:1',
-                    'host:agent-transcript-fallback',
-                    'chan-fallback',
-                    NULL,
-                    'codex',
-                    NULL,
-                    'legacy question',
-                    'legacy answer',
-                    '[]'
-                 )",
-                [],
-            )
-            .unwrap();
-        }
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, status, xp) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("agent-transcript-fallback")
+        .bind("Transcript Fallback")
+        .bind("codex")
+        .bind("idle")
+        .bind(0_i32)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat)
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind("host:agent-transcript-fallback")
+        .bind("agent-transcript-fallback")
+        .bind("codex")
+        .bind("idle")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO session_transcripts (
+                turn_id, session_key, channel_id, agent_id, provider, dispatch_id,
+                user_message, assistant_message, events_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CAST($9 AS jsonb))",
+        )
+        .bind("discord:agent-transcript-fallback:1")
+        .bind("host:agent-transcript-fallback")
+        .bind("chan-fallback")
+        .bind(Option::<String>::None)
+        .bind("codex")
+        .bind(Option::<String>::None)
+        .bind("legacy question")
+        .bind("legacy answer")
+        .bind("[]")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let (status, Json(body)) = agent_transcripts(
             State(state),
@@ -2021,6 +2039,9 @@ mod tests {
             "discord:agent-transcript-fallback:1"
         );
         assert_eq!(body["transcripts"][0]["agent_id"], serde_json::Value::Null);
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[test]

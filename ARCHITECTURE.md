@@ -54,6 +54,7 @@ src/
 ├── db/
 │   ├── agents.rs
 │   ├── auto_queue.rs
+│   ├── cancel_tombstones.rs
 │   ├── kanban.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
@@ -188,13 +189,11 @@ src/
 │   │   ├── stats.rs
 │   │   ├── termination_events.rs
 │   │   └── v1.rs
-│   ├── background.rs
 │   ├── boot.rs
 │   ├── cron_catalog.rs
 │   ├── maintenance.rs
 │   ├── mod.rs
 │   ├── state.rs
-│   ├── tick.rs
 │   ├── worker_registry.rs
 │   └── ws.rs
 ├── services/
