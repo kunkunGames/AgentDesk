@@ -2402,7 +2402,7 @@ pub async fn send_message(
 
 pub async fn handle_send<'a>(
     registry: &HealthRegistry,
-    sqlite: &Db,
+    sqlite: Option<&Db>,
     pg_pool: Option<&PgPool>,
     body: &str,
 ) -> (&'a str, String) {
@@ -2446,7 +2446,7 @@ pub async fn handle_send<'a>(
     // agent target through `/api/discord/send`.
     send_message_with_backends_and_delivery_id(
         registry,
-        Some(sqlite),
+        sqlite,
         pg_pool,
         target,
         content,
@@ -2648,7 +2648,7 @@ fn parse_send_to_agent_body(body: &str) -> Result<ParsedSendToAgentRequest, &'st
 
 pub async fn handle_send_to_agent(
     registry: &HealthRegistry,
-    sqlite: &Db,
+    sqlite: Option<&Db>,
     pg_pool: Option<&PgPool>,
     body: &str,
 ) -> (&'static str, String) {
@@ -2667,7 +2667,7 @@ pub async fn handle_send_to_agent(
     // resolver so the role lookup can hit Postgres on PG-only deployments.
     send_message_with_backends(
         registry,
-        Some(sqlite),
+        sqlite,
         pg_pool,
         &target,
         &request.message,
@@ -3451,7 +3451,7 @@ mod tests {
         let db = test_db();
         let (status, body) = handle_send_to_agent(
             &registry,
-            &db,
+            Some(&db),
             None,
             r#"{"role_id":"missing","message":"hello"}"#,
         )
