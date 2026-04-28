@@ -2279,7 +2279,6 @@ async fn finalize_restore_run_pg(pool: &sqlx::PgPool, run_id: &str) -> Result<()
 
 #[derive(Clone)]
 pub(crate) struct AutoQueueActivateDeps {
-    db: Option<crate::db::Db>,
     pg_pool: Option<sqlx::PgPool>,
     engine: crate::engine::PolicyEngine,
     config: Arc<crate::config::Config>,
@@ -2290,7 +2289,6 @@ pub(crate) struct AutoQueueActivateDeps {
 impl AutoQueueActivateDeps {
     fn from_state(state: &AppState) -> Self {
         Self {
-            db: state.legacy_db().cloned(),
             pg_pool: state.pg_pool.clone(),
             engine: state.engine.clone(),
             config: state.config.clone(),
@@ -2299,9 +2297,8 @@ impl AutoQueueActivateDeps {
         }
     }
 
-    pub(crate) fn for_bridge(db: crate::db::Db, engine: crate::engine::PolicyEngine) -> Self {
+    pub(crate) fn for_bridge(_db: crate::db::Db, engine: crate::engine::PolicyEngine) -> Self {
         Self {
-            db: Some(db),
             pg_pool: engine.pg_pool().cloned(),
             engine,
             config: Arc::new(crate::config::Config::default()),
@@ -2346,7 +2343,7 @@ impl AutoQueueActivateDeps {
             )
             .unwrap_or(serde_json::Value::Null);
         }
-        self.entry_json(entry_id)
+        serde_json::Value::Null
     }
 }
 
@@ -2367,15 +2364,8 @@ fn load_activate_card_state_prefer_pg(
         );
     }
 
-    let db = deps
-        .db
-        .as_ref()
-        .ok_or_else(|| "postgres backend required for auto-queue activation".to_string())?;
-    let conn = db
-        .separate_conn()
-        .map_err(|error| format!("open sqlite activate card state DB for {card_id}: {error}"))?;
-    load_activate_card_state(&conn, card_id, entry_id)
-        .map_err(|error| format!("load sqlite activate card state for {card_id}: {error}"))
+    let _ = (card_id, entry_id);
+    Err("postgres backend required for auto-queue activation".to_string())
 }
 
 fn update_entry_status_prefer_pg(
@@ -2463,20 +2453,13 @@ fn slot_requires_thread_reset_before_reuse_prefer_pg(
         );
     }
 
-    let db = deps
-        .db
-        .as_ref()
-        .ok_or_else(|| "postgres backend required for auto-queue slot reset".to_string())?;
-    let conn = db.separate_conn().map_err(|error| {
-        format!("open sqlite slot reset DB for {agent_id}:{slot_index}: {error}")
-    })?;
-    Ok(slot_requires_thread_reset_before_reuse(
-        &conn,
+    let _ = (
         agent_id,
         slot_index,
         newly_assigned,
         reassigned_from_other_group,
-    ))
+    );
+    Err("postgres backend required for auto-queue slot reset".to_string())
 }
 
 async fn select_consultation_counterpart_pg(
@@ -2621,36 +2604,28 @@ fn create_activate_dispatch_prefer_pg(
         );
     }
 
-    let db = deps
-        .db
-        .as_ref()
-        .ok_or_else(|| "postgres backend required for auto-queue dispatch creation".to_string())?;
-    crate::dispatch::create_dispatch(
-        db,
-        &deps.engine,
-        card_id,
-        to_agent_id,
-        dispatch_type,
-        title,
-        context,
-    )
-    .map(|dispatch| dispatch["id"].as_str().unwrap_or("").to_string())
-    .map_err(|error| error.to_string())
+    let _ = (deps, card_id, to_agent_id, dispatch_type, title, context);
+    Err("postgres backend required for auto-queue dispatch creation".to_string())
 }
 
 pub(crate) async fn activate_with_bridge_pg(
-    db: Option<crate::db::Db>,
+    _db: Option<crate::db::Db>,
     engine: crate::engine::PolicyEngine,
     body: ActivateBody,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let Some(db) = db.or_else(|| engine.legacy_db().cloned()) else {
+    let Some(pg_pool) = engine.pg_pool().cloned() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "sqlite backend is unavailable"})),
+            Json(json!({"error": "postgres pool is not configured"})),
         );
     };
-    let mut deps = AutoQueueActivateDeps::for_bridge(db, engine.clone());
-    deps.pg_pool = engine.pg_pool().cloned();
+    let deps = AutoQueueActivateDeps {
+        pg_pool: Some(pg_pool),
+        engine,
+        config: Arc::new(crate::config::Config::default()),
+        health_registry: None,
+        guild_id: None,
+    };
     activate_with_deps_pg(&deps, body).await
 }
 
