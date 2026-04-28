@@ -187,7 +187,9 @@ fn validate_post_upgrade_channel(
             post_version,
         });
     }
-    if current_snapshot.canonical_path != post_channel.canonical_path {
+    if !strategy.allow_candidate_path_change
+        && current_snapshot.canonical_path != post_channel.canonical_path
+    {
         return Err(UpgradeError::CandidatePathChanged {
             pre_canonical_path: current_snapshot.canonical_path.clone(),
             post_canonical_path: post_channel.canonical_path.clone(),

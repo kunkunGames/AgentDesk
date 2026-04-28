@@ -3,6 +3,7 @@
 //! Architecture: spawns `opencode serve --hostname 127.0.0.1 --port <N>`, drives the
 //! HTTP REST + SSE API, and normalizes events to AgentDesk `StreamMessage`.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -321,7 +322,7 @@ fn consume_sse(
     base_url: &str,
     auth: &str,
 ) -> Result<(), String> {
-    let mut accumulated_text = String::new();
+    let mut state = SseMessageState::default();
     let mut current_data = String::new();
     let mut idle_seen = false;
     let mut last_event = Instant::now();
@@ -367,14 +368,12 @@ fn consume_sse(
             let data = current_data.clone();
             current_data.clear();
 
-            if let Some(should_stop) =
-                process_sse_event(&data, session_id, sender, &mut accumulated_text)
-            {
+            if let Some(should_stop) = process_sse_event(&data, session_id, sender, &mut state) {
                 if should_stop {
                     idle_seen = true;
                     // Send Done
                     let _ = sender.send(StreamMessage::Done {
-                        result: accumulated_text.trim().to_string(),
+                        result: state.accumulated_text.trim().to_string(),
                         session_id: Some(session_id.to_string()),
                     });
                     break;
@@ -383,11 +382,96 @@ fn consume_sse(
         }
     }
 
-    if !idle_seen && accumulated_text.trim().is_empty() {
+    if !idle_seen && state.accumulated_text.trim().is_empty() {
         return Err("OpenCode stream ended without a terminal event".to_string());
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct SseMessageState {
+    accumulated_text: String,
+    text_part_snapshots: HashMap<String, String>,
+}
+
+fn append_text_delta(sender: &Sender<StreamMessage>, state: &mut SseMessageState, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    state.accumulated_text.push_str(text);
+    let _ = sender.send(StreamMessage::Text {
+        content: text.to_string(),
+    });
+}
+
+fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
+    let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.is_empty() {
+        return;
+    }
+
+    let Some(part_id) = part
+        .get("id")
+        .or_else(|| part.get("partID"))
+        .and_then(|v| v.as_str())
+    else {
+        append_text_delta(sender, state, text);
+        return;
+    };
+
+    let previous = state
+        .text_part_snapshots
+        .get(part_id)
+        .map(String::as_str)
+        .unwrap_or("");
+    let delta = text.strip_prefix(previous).unwrap_or(text);
+    state
+        .text_part_snapshots
+        .insert(part_id.to_string(), text.to_string());
+    append_text_delta(sender, state, delta);
+}
+
+fn emit_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
+    let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match part_type {
+        "text" => emit_text_part(part, sender, state),
+        "thinking" | "redactedThinking" => {
+            let summary = part
+                .get("thinking")
+                .or_else(|| part.get("summary"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let _ = sender.send(StreamMessage::Thinking { summary });
+        }
+        "tool-use" => {
+            let name = part
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let input = part.get("input").map(|v| v.to_string()).unwrap_or_default();
+            let _ = sender.send(StreamMessage::ToolUse {
+                name: name.to_string(),
+                input,
+            });
+        }
+        "tool-result" => {
+            let content = part
+                .get("output")
+                .or_else(|| part.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_error = part
+                .get("isError")
+                .or_else(|| part.get("is_error"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let _ = sender.send(StreamMessage::ToolResult { content, is_error });
+        }
+        _ => {}
+    }
 }
 
 /// Returns `Some(true)` if the session is done (idle), `Some(false)` to continue, `None` to ignore.
@@ -395,7 +479,7 @@ fn process_sse_event(
     data: &str,
     session_id: &str,
     sender: &Sender<StreamMessage>,
-    accumulated_text: &mut String,
+    state: &mut SseMessageState,
 ) -> Option<bool> {
     let event: Value = serde_json::from_str(data).ok()?;
     let event_type = event.get("type").and_then(|v| v.as_str())?;
@@ -446,53 +530,31 @@ fn process_sse_event(
 
         "part" => {
             let part = props.and_then(|p| p.get("part"))?;
-            let part_type = part.get("type").and_then(|v| v.as_str())?;
+            emit_part(part, sender, state);
+            Some(false)
+        }
 
-            match part_type {
-                "text" => {
-                    let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if !text.is_empty() {
-                        accumulated_text.push_str(text);
-                        let _ = sender.send(StreamMessage::Text {
-                            content: text.to_string(),
-                        });
-                    }
+        "message.part.delta" => {
+            if props.and_then(|p| p.get("field")).and_then(|v| v.as_str()) == Some("text") {
+                let delta = props
+                    .and_then(|p| p.get("delta"))
+                    .and_then(|v| v.as_str())?;
+                let part_id = props
+                    .and_then(|p| p.get("partID"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if let Some(part_id) = part_id {
+                    let entry = state.text_part_snapshots.entry(part_id).or_default();
+                    entry.push_str(delta);
                 }
-                "thinking" | "redactedThinking" => {
-                    let summary = part
-                        .get("thinking")
-                        .or_else(|| part.get("summary"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let _ = sender.send(StreamMessage::Thinking { summary });
-                }
-                "tool-use" => {
-                    let name = part
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let input = part.get("input").map(|v| v.to_string()).unwrap_or_default();
-                    let _ = sender.send(StreamMessage::ToolUse {
-                        name: name.to_string(),
-                        input,
-                    });
-                }
-                "tool-result" => {
-                    let content = part
-                        .get("output")
-                        .or_else(|| part.get("content"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let is_error = part
-                        .get("isError")
-                        .or_else(|| part.get("is_error"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let _ = sender.send(StreamMessage::ToolResult { content, is_error });
-                }
-                _ => {}
+                append_text_delta(sender, state, delta);
             }
+            Some(false)
+        }
+
+        "message.part.updated" => {
+            let part = props.and_then(|p| p.get("part"))?;
+            emit_part(part, sender, state);
             Some(false)
         }
 
@@ -504,11 +566,8 @@ fn process_sse_event(
                         if part.get("type").and_then(|v| v.as_str()) == Some("text") {
                             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                 // Only emit if we haven't already streamed it
-                                if accumulated_text.is_empty() && !text.trim().is_empty() {
-                                    accumulated_text.push_str(text);
-                                    let _ = sender.send(StreamMessage::Text {
-                                        content: text.to_string(),
-                                    });
+                                if state.accumulated_text.is_empty() && !text.trim().is_empty() {
+                                    append_text_delta(sender, state, text);
                                 }
                             }
                         }
@@ -598,10 +657,21 @@ mod tests {
     // Helper to process a raw SSE data string and collect messages
     fn parse_event(data: &str, session_id: &str) -> (Vec<StreamMessage>, Option<bool>) {
         let (tx, rx) = mpsc::channel::<StreamMessage>();
-        let mut acc = String::new();
-        let stop = process_sse_event(data, session_id, &tx, &mut acc);
+        let mut state = SseMessageState::default();
+        let stop = process_sse_event(data, session_id, &tx, &mut state);
         drop(tx);
         (rx.try_iter().collect(), stop)
+    }
+
+    fn parse_events(events: &[&str], session_id: &str) -> (Vec<StreamMessage>, Vec<Option<bool>>) {
+        let (tx, rx) = mpsc::channel::<StreamMessage>();
+        let mut state = SseMessageState::default();
+        let stops = events
+            .iter()
+            .map(|event| process_sse_event(event, session_id, &tx, &mut state))
+            .collect::<Vec<_>>();
+        drop(tx);
+        (rx.try_iter().collect(), stops)
     }
 
     #[test]
@@ -631,6 +701,47 @@ mod tests {
             msgs.iter()
                 .any(|m| matches!(m, StreamMessage::Text { content } if content == "hello world"))
         );
+    }
+
+    #[test]
+    fn test_message_part_updated_text_emitted() {
+        let data = r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-1","type":"text","text":"OK"}}}"#;
+        let (msgs, stop) = parse_event(data, "s1");
+        assert_eq!(stop, Some(false));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Text { content } if content == "OK"))
+        );
+    }
+
+    #[test]
+    fn test_message_part_updated_wrong_session_ignored() {
+        let data = r#"{"type":"message.part.updated","properties":{"sessionID":"other-session","part":{"id":"part-1","type":"text","text":"OK"}}}"#;
+        let (msgs, stop) = parse_event(data, "s1");
+        assert!(
+            msgs.is_empty(),
+            "wrong-session updated text must be ignored"
+        );
+        assert_eq!(stop, None);
+    }
+
+    #[test]
+    fn test_message_part_delta_then_updated_does_not_duplicate_text() {
+        let events = [
+            r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"O"}}"#,
+            r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"K"}}"#,
+            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-1","messageID":"m1","sessionID":"s1","type":"text","text":"OK"}}}"#,
+        ];
+        let (msgs, stops) = parse_events(&events, "s1");
+        assert_eq!(stops, vec![Some(false), Some(false), Some(false)]);
+        let text = msgs
+            .iter()
+            .filter_map(|msg| match msg {
+                StreamMessage::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "OK");
     }
 
     #[test]
