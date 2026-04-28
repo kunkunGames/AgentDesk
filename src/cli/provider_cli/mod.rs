@@ -726,7 +726,8 @@ fn should_reuse_migration_state(state: &ProviderCliMigrationState) -> bool {
 }
 
 /// Full migration orchestration: runs through the state machine up to
-/// `CanaryActive`. Promotion requires a recorded candidate canary launch.
+/// `CanaryActive`. Promotion verifies a recorded candidate canary launch when
+/// present, or records a warning when no launch artifact exists.
 fn cmd_run(
     provider: &str,
     candidate_path: Option<&str>,
@@ -931,7 +932,7 @@ fn cmd_resume(provider: &str, skip_confirm: bool) -> Result<(), String> {
             if skip_confirm {
                 cmd_promote(
                     provider,
-                    Some("resumed with --skip-confirm after verified canary"),
+                    Some("resumed with --skip-confirm after canary decision"),
                 )
             } else {
                 eprintln!(
@@ -1325,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_from_canary_active_requires_verified_candidate_launch() {
+    fn promote_from_canary_active_warns_when_candidate_launch_missing() {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
 
@@ -1354,14 +1355,14 @@ mod tests {
             "codex".to_string(),
             ProviderChannels {
                 current: Some(current.clone()),
-                candidate: Some(candidate),
+                candidate: Some(candidate.clone()),
                 ..Default::default()
             },
         );
         save_registry(dir.path(), &registry).unwrap();
 
-        // Agent was previously launched (pre-migration artifact) so a canary turn IS required.
-        // Without a candidate artifact after canary activation, promote must fail.
+        // A missing post-activation candidate launch now records warning evidence but does not
+        // block promotion; this covers quota-exhausted canary turns.
         crate::services::provider_cli::io::save_launch_artifact(
             dir.path(),
             &LaunchArtifact {
@@ -1385,10 +1386,10 @@ mod tests {
         let registry = load_registry(dir.path()).unwrap().unwrap();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
 
-        assert!(result.is_err());
-        assert_eq!(state.state, MigrationState::CanaryActive);
+        assert!(result.is_ok());
+        assert_eq!(state.state, MigrationState::ProviderAgentsMigrated);
         let channels = registry.providers.get("codex").unwrap();
-        assert_eq!(channels.current.as_ref(), Some(&current));
+        assert_eq!(channels.current.as_ref(), Some(&candidate));
     }
 
     #[test]
