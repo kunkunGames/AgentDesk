@@ -86,7 +86,7 @@
 | `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 3802 | giant-file |
 | `dispatch::dispatch_create` | `src/dispatch/dispatch_create.rs` | 2517 | giant-file |
 | `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 1877 | giant-file |
-| `engine` | `src/engine/mod.rs` | 2363 | giant-file |
+| `engine` | `src/engine/mod.rs` | 2364 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 |  |
 | `engine::intent` | `src/engine/intent.rs` | 995 |  |
 | `engine::loader` | `src/engine/loader.rs` | 731 |  |
@@ -124,7 +124,7 @@
 | `integration_tests::discord_flow::harness` | `src/integration_tests/discord_flow/harness.rs` | 265 |  |
 | `integration_tests::discord_flow::mock_discord` | `src/integration_tests/discord_flow/mock_discord.rs` | 154 |  |
 | `integration_tests::discord_flow::scenarios` | `src/integration_tests/discord_flow/scenarios.rs` | 652 |  |
-| `integration_tests::tests::high_risk_recovery` | `src/integration_tests/tests/high_risk_recovery.rs` | 1570 | giant-file |
+| `integration_tests::tests::high_risk_recovery` | `src/integration_tests/tests/high_risk_recovery.rs` | 1573 | giant-file |
 | `kanban` | `src/kanban.rs` | 3817 | giant-file |
 | `launch` | `src/launch.rs` | 64 |  |
 | `logging` | `src/logging.rs` | 160 |  |
