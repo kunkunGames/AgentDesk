@@ -1786,6 +1786,95 @@ async fn js_auto_queue_consultation_bridge_updates_card_metadata_and_entry_statu
 }
 
 #[tokio::test]
+async fn pg_consultation_dispatch_rolls_back_when_entry_status_is_stale() {
+    crate::pipeline::ensure_loaded();
+
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, provider, status, discord_channel_id)
+         VALUES ('aq-consult-stale-agent', 'AQ Consult Stale Agent', 'claude', 'idle', '123456789012345678')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, metadata, created_at, updated_at
+         ) VALUES (
+            'aq-consult-stale-card', 'AQ Consult Stale Card', 'requested', 'medium',
+            'aq-consult-stale-agent', CAST($1 AS jsonb), NOW(), NOW()
+         )",
+    )
+    .bind(
+        serde_json::json!({
+            "keep": "yes",
+            "preflight_status": "consult_required"
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ('aq-consult-stale-run', 'repo-1', 'aq-consult-stale-agent', 'active')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, dispatch_id, priority_rank
+         ) VALUES (
+            'aq-consult-stale-entry', 'aq-consult-stale-run', 'aq-consult-stale-card',
+            'aq-consult-stale-agent', 'dispatched', 'dispatch-consult-stale', 0
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = crate::db::auto_queue::record_consultation_dispatch_on_pg(
+        &pool,
+        "aq-consult-stale-entry",
+        "aq-consult-stale-card",
+        "dispatch-consult-stale",
+        "test_consultation_dispatch",
+        r#"{"keep":"yes","preflight_status":"consult_required"}"#,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.contains("stale postgres consultation dispatch entry"),
+        "unexpected consultation dispatch error: {error}"
+    );
+    let metadata: serde_json::Value =
+        sqlx::query_scalar("SELECT metadata FROM kanban_cards WHERE id = 'aq-consult-stale-card'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let entry_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, dispatch_id FROM auto_queue_entries WHERE id = 'aq-consult-stale-entry'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (entry_status, dispatch_id) = entry_row;
+    assert_eq!(metadata["keep"], "yes");
+    assert_eq!(metadata["preflight_status"], "consult_required");
+    assert!(metadata.get("consultation_status").is_none());
+    assert!(metadata.get("consultation_dispatch_id").is_none());
+    assert_eq!(entry_status, "dispatched");
+    assert_eq!(dispatch_id.as_deref(), Some("dispatch-consult-stale"));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
 async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows() {
     crate::pipeline::ensure_loaded();
 
