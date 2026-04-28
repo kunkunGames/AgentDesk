@@ -80,6 +80,30 @@ This means OpenCode is not receiving the same role separation that Claude gets
 through `--append-system-prompt`, and it is not receiving the same structured
 turn wrapper that Codex gets through `compose_structured_turn_prompt`.
 
+### Verified OpenCode API constraints
+
+Reviewed against local `opencode --version` `1.14.28` and the matching
+OpenCode source snapshot on 2026-04-28.
+
+- `/session/:sessionID/message` and `/session/:sessionID/prompt_async` validate
+  request bodies as `SessionPrompt.PromptInput` without `sessionID`
+  (`packages/opencode/src/server/routes/instance/session.ts:871`,
+  `:909`; `packages/opencode/src/server/routes/instance/httpapi/session.ts:75`,
+  `:311-318`).
+- `PromptInput` supports top-level `system?: string`, `tools?: Record<string,
+  boolean>`, `agent`, `model`, `format`, `variant`, and `parts`
+  (`packages/opencode/src/session/prompt.ts:1677-1704`).
+- OpenCode message roles are still only `user` and `assistant`
+  (`packages/opencode/src/session/message.ts:140`).
+- The `system` value is stored on the user message metadata and later merged
+  into the LLM system prompt with the provider/agent prompt
+  (`packages/opencode/src/session/prompt.ts:887-918`,
+  `packages/opencode/src/session/llm.ts:99-106`).
+
+Therefore AgentDesk should use OpenCode's top-level `system` field when the
+target runtime accepts it, but must not invent unsupported
+`role: "system"` / `role: "developer"` message objects or text parts.
+
 ### OpenCode SSE handling
 
 OpenCode currently normalizes these event shapes:
@@ -148,6 +172,14 @@ MCP parity is currently partial:
   in `src/services/mcp_config.rs`.
 - server memory API only considers Claude/Codex for memento-MCP availability
   (`src/server/routes/memory_api.rs:57-61`).
+
+That last point is an actual AgentDesk API gap, not just missing UI copy:
+`detect_memory_backend()` only checks Claude/Codex before selecting the
+Memento backend, and `provider_has_mcp_server(...)` returns `false` for
+providers outside the Claude/Codex match arms
+(`src/services/mcp_config.rs:37-46`). Until OpenCode detection is implemented,
+an OpenCode-side `opencode.json` MCP entry can be present but invisible to the
+memory API and related health/status surfaces.
 
 Skill command prompting does recognize OpenCode:
 
@@ -234,21 +266,31 @@ Acceptance:
 Replace the raw `system_prompt + "\n\n" + prompt` concatenation with an
 OpenCode-specific prompt composer.
 
-Preferred order:
+Required behavior:
 
-1. If OpenCode's HTTP API supports a system/developer message or equivalent
-   role, send the AgentDesk system prompt through that field.
-2. If the API only accepts text parts, compose a structured prompt equivalent
-   to `compose_structured_turn_prompt(...)` so hidden instructions and user
-   request boundaries are unambiguous.
-3. Include allowed tool policy in the composed prompt, because
-   `_allowed_tools` is currently ignored in `src/services/opencode.rs:100`.
+1. Build the `/prompt_async` JSON body with AgentDesk hidden instructions in
+   OpenCode's top-level `system` field, not prepended to the first text part.
+2. Keep `parts` focused on the visible user request and supported file/agent
+   parts.
+3. Map `_allowed_tools` into OpenCode's top-level `tools` permission map only
+   when the AgentDesk tool names can be translated to OpenCode permission keys.
+   If that mapping is not exact yet, include a concise advisory tool policy in
+   `system` and surface the limitation in diagnostics.
+4. Keep a compatibility fallback for older or drifted OpenCode runtimes: if the
+   runtime rejects top-level `system`, use a structured text wrapper equivalent
+   to `compose_structured_turn_prompt(...)` and log the API drift.
+5. Never send unsupported `role: "system"` or `role: "developer"` message
+   objects; OpenCode persisted message roles are only `user` and `assistant`.
 
 Acceptance:
 
-- unit tests assert that the OpenCode prompt contains separate authoritative
-  instructions, tool policy, and user request sections;
+- unit tests assert that the OpenCode request body keeps `system` separate from
+  `parts`, and never includes unsupported message role fields;
+- tests assert that the user request remains in `parts` and hidden
+  instructions do not get prepended to the user text;
 - tests cover empty system prompt and empty tool policy;
+- tests cover successful tool permission mapping and the documented advisory
+  fallback for unmapped tools;
 - the final Discord sanitizer remains required as defense-in-depth.
 
 ### P0. OpenCode SSE text-state parity
@@ -304,7 +346,9 @@ Required behavior:
 - record sync state under the AgentDesk runtime config directory, analogous to
   `codex-mcp-sync-state.json`;
 - update `provider_has_memento_mcp(...)` so `ProviderKind::OpenCode` reflects
-  runtime or OpenCode config state.
+  runtime or OpenCode config state;
+- update `detect_memory_backend()` so the memory API can select Memento when
+  OpenCode is the configured provider with memento MCP available.
 
 Acceptance:
 
