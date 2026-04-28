@@ -153,8 +153,8 @@ impl AppState {
 /// PG-only APIs yet. It is never read at runtime — production deployments
 /// always go through the `pg_pool` branch inside each service.
 fn legacy_pending_migration_shim() -> crate::db::Db {
-    let conn = libsql_rusqlite::Connection::open_in_memory()
-        .expect("open legacy compatibility placeholder");
+    let conn =
+        rusqlite::Connection::open_in_memory().expect("open legacy compatibility placeholder");
     crate::db::wrap_conn(conn)
 }
 

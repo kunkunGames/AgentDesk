@@ -11,7 +11,7 @@ pub mod table_metadata;
 pub mod turns;
 
 use anyhow::Result;
-use libsql_rusqlite::Connection; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+use rusqlite::Connection; // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -28,7 +28,7 @@ pub struct DbPool {
 #[derive(Debug)]
 pub enum DbLockError {
     Poisoned,
-    Open(libsql_rusqlite::Error), // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+    Open(rusqlite::Error), // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
 }
 
 impl std::fmt::Display for DbLockError {
@@ -78,7 +78,7 @@ impl DbPool {
 
     /// Open a new read-only connection for non-blocking reads.
     /// SQLite WAL mode allows concurrent readers without blocking writers.
-    pub fn read_conn(&self) -> std::result::Result<Connection, libsql_rusqlite::Error> {
+    pub fn read_conn(&self) -> std::result::Result<Connection, rusqlite::Error> {
         // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         open_read_only_connection(&self.path)
     }
@@ -86,7 +86,7 @@ impl DbPool {
     /// Open a new read-write connection that bypasses the Mutex.
     /// Used by the policy engine (QuickJS) to avoid blocking request handlers.
     /// SQLite WAL serializes concurrent writers via busy_timeout.
-    pub fn separate_conn(&self) -> std::result::Result<Connection, libsql_rusqlite::Error> {
+    pub fn separate_conn(&self) -> std::result::Result<Connection, rusqlite::Error> {
         // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
         open_write_connection(&self.path)
     }
@@ -94,12 +94,12 @@ impl DbPool {
 
 pub(crate) fn open_read_only_connection(
     path: &Path,
-) -> std::result::Result<Connection, libsql_rusqlite::Error> {
+) -> std::result::Result<Connection, rusqlite::Error> {
     // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
     let conn = Connection::open_with_flags(
         path,
-        libsql_rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
-            | libsql_rusqlite::OpenFlags::SQLITE_OPEN_URI, // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI, // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
     )?;
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")?;
     Ok(conn)
@@ -107,14 +107,14 @@ pub(crate) fn open_read_only_connection(
 
 pub(crate) fn open_write_connection(
     path: &Path,
-) -> std::result::Result<Connection, libsql_rusqlite::Error> {
+) -> std::result::Result<Connection, rusqlite::Error> {
     // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
     let conn = Connection::open_with_flags(
         path,
-        libsql_rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
-            | libsql_rusqlite::OpenFlags::SQLITE_OPEN_CREATE // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
-            | libsql_rusqlite::OpenFlags::SQLITE_OPEN_URI // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
-            | libsql_rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX, // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX, // TODO(#839): sqlite compatibility retained for out-of-scope callers or legacy tests.
     )?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",

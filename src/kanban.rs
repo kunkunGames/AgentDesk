@@ -19,12 +19,12 @@ use serde_json::json;
 use sqlx::Row as SqlxRow;
 
 fn clear_escalation_alert_state_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
         "DELETE FROM kv_meta WHERE key IN (?1, ?2)",
-        libsql_rusqlite::params![
+        rusqlite::params![
             format!("pm_pending:{card_id}"),
             format!("pm_decision_sent:{card_id}")
         ],
@@ -33,7 +33,7 @@ fn clear_escalation_alert_state_on_conn(
 }
 
 pub(crate) fn cleanup_force_transition_revert_fields_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
@@ -90,7 +90,7 @@ pub(crate) fn cleanup_force_transition_revert_fields_on_conn(
 /// preserved so audit history remains intact. Rows whose JSON is malformed or
 /// already lacks the keys are left untouched.
 fn strip_stale_worktree_metadata_from_dispatches_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     const STALE_KEYS: &[&str] = &[
@@ -127,7 +127,7 @@ fn strip_stale_worktree_metadata_from_dispatches_on_conn(
 
         conn.execute(
             "UPDATE task_dispatches SET context = ?1, result = ?2, updated_at = datetime('now') WHERE id = ?3",
-            libsql_rusqlite::params![context_value, result_value, dispatch_id],
+            rusqlite::params![context_value, result_value, dispatch_id],
         )?;
     }
     Ok(())
@@ -509,7 +509,7 @@ async fn cleanup_force_transition_revert_fields_on_pg_tx(
 }
 
 pub(crate) fn log_audit_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     from: &str,
     to: &str,
@@ -1721,7 +1721,7 @@ fn github_sync_target_for_card(db: &Db, card_id: &str) -> Option<(String, i64)> 
 
 /// Log a kanban state transition to audit_logs table.
 fn log_audit(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     from: &str,
     to: &str,
@@ -1742,7 +1742,7 @@ fn log_audit(
     .ok();
     conn.execute(
         "INSERT INTO kanban_audit_logs (card_id, from_status, to_status, source, result) VALUES (?1, ?2, ?3, ?4, ?5)",
-        libsql_rusqlite::params![card_id, from, to, source, result],
+        rusqlite::params![card_id, from, to, source, result],
     )
     .ok();
     conn.execute_batch(
@@ -1759,7 +1759,7 @@ fn log_audit(
     conn.execute(
         "INSERT INTO audit_logs (entity_type, entity_id, action, actor)
          VALUES ('kanban_card', ?1, ?2, ?3)",
-        libsql_rusqlite::params![card_id, format!("{from}->{to} ({result})"), source],
+        rusqlite::params![card_id, format!("{from}->{to} ({result})"), source],
     )
     .ok();
 }
@@ -1943,7 +1943,7 @@ fn record_true_negative_if_pass_with_backends(
                     "INSERT INTO review_tuning_outcomes \
                      (card_id, dispatch_id, review_round, verdict, decision, outcome, finding_categories) \
                      VALUES (?1, NULL, ?2, ?3, 'done', 'true_negative', ?4)",
-                    libsql_rusqlite::params![card_id, review_round, last_verdict.as_deref().unwrap_or("pass"), finding_cats],
+                    rusqlite::params![card_id, review_round, last_verdict.as_deref().unwrap_or("pass"), finding_cats],
                 )
                 .map(|n| n > 0)
                 .unwrap_or(false);
@@ -2164,7 +2164,7 @@ pub fn correct_tn_to_fn_on_reopen(db: &Db, pg_pool: Option<&sqlx::PgPool>, card_
                             "UPDATE review_tuning_outcomes SET finding_categories = ?1 \
                              WHERE card_id = ?2 AND outcome = 'false_negative' \
                              AND (finding_categories IS NULL OR finding_categories = '' OR finding_categories = '[]')",
-                            libsql_rusqlite::params![cats, card_id],
+                            rusqlite::params![cats, card_id],
                         )
                         .unwrap_or(0);
                     if backfilled > 0 {
@@ -2187,7 +2187,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_db() -> Db {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -2402,7 +2402,7 @@ mod tests {
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at)
              VALUES (?1, 'Test Card', ?2, 'agent-1', datetime('now'), datetime('now'))",
-            libsql_rusqlite::params![card_id, status],
+            rusqlite::params![card_id, status],
         ).unwrap();
     }
 
@@ -2411,7 +2411,7 @@ mod tests {
         conn.execute(
             "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
              VALUES (?1, ?2, 'agent-1', 'implementation', ?3, 'Test Dispatch', datetime('now'), datetime('now'))",
-            libsql_rusqlite::params![format!("dispatch-{}-{}", card_id, dispatch_status), card_id, dispatch_status],
+            rusqlite::params![format!("dispatch-{}-{}", card_id, dispatch_status), card_id, dispatch_status],
         ).unwrap();
     }
 
@@ -2426,7 +2426,7 @@ mod tests {
         conn.execute(
             "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at)
              VALUES (?1, ?2, 'agent-1', ?3, ?4, 'Typed Dispatch', datetime('now'), datetime('now'))",
-            libsql_rusqlite::params![dispatch_id, card_id, dispatch_type, dispatch_status],
+            rusqlite::params![dispatch_id, card_id, dispatch_type, dispatch_status],
         )
         .unwrap();
     }
@@ -3101,7 +3101,7 @@ mod tests {
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at)
              VALUES (?1, 'Test Card', ?2, 'agent-1', ?3, datetime('now'), datetime('now'))",
-            libsql_rusqlite::params![card_id, status, repo_id],
+            rusqlite::params![card_id, status, repo_id],
         ).unwrap();
     }
 
@@ -3133,17 +3133,17 @@ mod tests {
         let entry_b = "entry-b";
         conn.execute(
             "INSERT INTO auto_queue_runs (id, status, agent_id, created_at) VALUES (?1, 'active', ?2, datetime('now'))",
-            libsql_rusqlite::params![run_id, agent_id],
+            rusqlite::params![run_id, agent_id],
         ).unwrap();
         conn.execute(
             "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank)
              VALUES (?1, ?2, 'card-q1', ?3, 'dispatched', 1)",
-            libsql_rusqlite::params![entry_a, run_id, agent_id],
+            rusqlite::params![entry_a, run_id, agent_id],
         ).unwrap();
         conn.execute(
             "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank)
              VALUES (?1, ?2, 'card-q2', ?3, 'pending', 2)",
-            libsql_rusqlite::params![entry_b, run_id, agent_id],
+            rusqlite::params![entry_b, run_id, agent_id],
         ).unwrap();
         (run_id.to_string(), entry_a.to_string(), entry_b.to_string())
     }
@@ -3583,7 +3583,7 @@ mod tests {
                 'd-800-completed', 'card-800-strip-wt', 'agent-1', 'implementation', 'completed',
                 'Old impl', ?1, ?2, datetime('now'), datetime('now')
              )",
-            libsql_rusqlite::params![
+            rusqlite::params![
                 serde_json::json!({
                     "worktree_path": "/tmp/agentdesk-800-stale",
                     "worktree_branch": "wt/800-old",
@@ -3607,7 +3607,7 @@ mod tests {
                 'd-800-pending', 'card-800-strip-wt', 'agent-1', 'implementation', 'pending',
                 'New impl', ?1, NULL, datetime('now'), datetime('now')
              )",
-            libsql_rusqlite::params![
+            rusqlite::params![
                 serde_json::json!({
                     "worktree_path": "/tmp/agentdesk-800-also-stale",
                     "worktree_branch": "wt/800-also-old",
@@ -3631,7 +3631,7 @@ mod tests {
                 'd-800-other-card', 'card-800-other', 'agent-1', 'implementation', 'completed',
                 'Other impl', ?1, ?2, datetime('now'), datetime('now')
              )",
-            libsql_rusqlite::params![
+            rusqlite::params![
                 serde_json::json!({
                     "worktree_path": "/tmp/agentdesk-800-other-keep",
                     "worktree_branch": "wt/800-other-keep"

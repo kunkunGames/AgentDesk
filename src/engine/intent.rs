@@ -581,7 +581,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> crate::db::Db {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -677,7 +677,7 @@ mod tests {
 
     // ── #158: card_review_state guard tests ─────────────────────
 
-    fn insert_test_card(conn: &libsql_rusqlite::Connection, card_id: &str) {
+    fn insert_test_card(conn: &rusqlite::Connection, card_id: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Test', '111')",
             [],
@@ -689,7 +689,7 @@ mod tests {
         ).unwrap();
     }
 
-    fn legacy_review_sync_for_tests(conn: &libsql_rusqlite::Connection, json_str: &str) -> String {
+    fn legacy_review_sync_for_tests(conn: &rusqlite::Connection, json_str: &str) -> String {
         let params: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let card_id = params["card_id"].as_str().unwrap_or("");
         let state = params["state"].as_str().unwrap_or("");
@@ -703,7 +703,7 @@ mod tests {
              last_verdict = COALESCE(?3, last_verdict), \
              pending_dispatch_id = CASE WHEN ?4 IS NOT NULL THEN ?4 WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id ELSE NULL END, \
              updated_at = datetime('now')",
-            libsql_rusqlite::params![card_id, state, last_verdict, pending_dispatch_id],
+            rusqlite::params![card_id, state, last_verdict, pending_dispatch_id],
         );
         match result {
             Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),

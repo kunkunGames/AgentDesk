@@ -3023,8 +3023,8 @@ mod tests {
     use axum::http::Uri;
     use axum::response::IntoResponse;
     use axum::{Json, Router};
-    use libsql_rusqlite::OptionalExtension;
     use poise::serenity_prelude as serenity;
+    use rusqlite::OptionalExtension;
     use std::ffi::OsString;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -3155,7 +3155,7 @@ mod tests {
             64,
         );
 
-        let conn = libsql_rusqlite::Connection::open_in_memory()
+        let conn = rusqlite::Connection::open_in_memory()
             .expect("in-memory sqlite should open for recovery phase test");
         conn.execute_batch(
             "CREATE TABLE recovery_phase_roundtrip (
@@ -3169,7 +3169,7 @@ mod tests {
         assert_eq!(initial_phase, RecoveryPhase::InflightRestore);
         conn.execute(
             "INSERT INTO recovery_phase_roundtrip (id, state) VALUES (?1, ?2)",
-            libsql_rusqlite::params!["phase-1", initial_phase.as_str()],
+            rusqlite::params!["phase-1", initial_phase.as_str()],
         )
         .expect("initial recovery phase should be inserted");
 
@@ -3193,7 +3193,7 @@ mod tests {
         assert_eq!(next_phase, RecoveryPhase::Pending);
         conn.execute(
             "UPDATE recovery_phase_roundtrip SET state = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![next_phase.as_str(), "phase-1"],
+            rusqlite::params![next_phase.as_str(), "phase-1"],
         )
         .expect("updated recovery phase should be written");
 

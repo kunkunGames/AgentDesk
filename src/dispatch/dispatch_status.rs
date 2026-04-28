@@ -1,6 +1,6 @@
 use anyhow::Result;
 #[cfg(test)]
-use libsql_rusqlite::OptionalExtension;
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 
@@ -83,7 +83,7 @@ fn is_noop_completion_result(result: Option<&serde_json::Value>) -> bool {
 
 #[cfg(test)]
 fn auto_queue_review_disabled_for_dispatch_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
 ) -> bool {
     conn.query_row(
@@ -102,7 +102,7 @@ fn auto_queue_review_disabled_for_dispatch_on_conn(
 
 #[cfg(test)]
 fn restore_auto_queue_mainline_after_review_skip_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     dispatch_id: &str,
 ) -> Result<()> {
@@ -145,7 +145,7 @@ fn restore_auto_queue_mainline_after_review_skip_on_conn(
              deferred_dod_json = NULL,
              updated_at = datetime('now')
          WHERE id = ?3",
-        libsql_rusqlite::params![target_status, dispatch_id, card_id],
+        rusqlite::params![target_status, dispatch_id, card_id],
     )
     .map_err(|error| anyhow::anyhow!("restore mainline card state for {card_id}: {error}"))?;
     Ok(())
@@ -743,14 +743,14 @@ async fn maybe_inject_phase_gate_verdict_pg(
 /// fallback/backfill paths that must avoid duplicate notify entries.
 #[cfg(test)]
 pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
     agent_id: &str,
     card_id: &str,
     title: &str,
-) -> libsql_rusqlite::Result<bool> {
+) -> rusqlite::Result<bool> {
     conn.execute_batch("SAVEPOINT dispatch_notify_outbox")?;
-    let result = (|| -> libsql_rusqlite::Result<bool> {
+    let result = (|| -> rusqlite::Result<bool> {
         let dispatch_status: Option<String> = conn
             .query_row(
                 "SELECT status FROM task_dispatches WHERE id = ?1",
@@ -768,7 +768,7 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO dispatch_outbox (dispatch_id, action, agent_id, card_id, title) \
              VALUES (?1, 'notify', ?2, ?3, ?4)",
-            libsql_rusqlite::params![dispatch_id, agent_id, card_id, title],
+            rusqlite::params![dispatch_id, agent_id, card_id, title],
         )?;
         Ok(inserted > 0)
     })();
@@ -788,13 +788,13 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
 
 #[cfg(not(test))]
 pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
-    _conn: &libsql_rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     dispatch_id: &str,
     _agent_id: &str,
     _card_id: &str,
     _title: &str,
-) -> libsql_rusqlite::Result<bool> {
-    Err(libsql_rusqlite::Error::ToSqlConversionFailure(Box::new(
+) -> rusqlite::Result<bool> {
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
         std::io::Error::other(format!(
             "Postgres pool required to ensure notify outbox for dispatch {dispatch_id}"
         )),
@@ -818,9 +818,9 @@ pub(crate) fn ensure_dispatch_notify_outbox_on_conn(
 /// turn_bridge entirely (queue/API cancellation, orphan recovery).
 #[cfg(test)]
 pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
-) -> libsql_rusqlite::Result<bool> {
+) -> rusqlite::Result<bool> {
     let exists: bool = conn.query_row(
         "SELECT COUNT(*) > 0
          FROM dispatch_outbox
@@ -842,10 +842,10 @@ pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
 
 #[cfg(not(test))]
 pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
-    _conn: &libsql_rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     dispatch_id: &str,
-) -> libsql_rusqlite::Result<bool> {
-    Err(libsql_rusqlite::Error::ToSqlConversionFailure(Box::new(
+) -> rusqlite::Result<bool> {
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
         std::io::Error::other(format!(
             "Postgres pool required to ensure status reaction outbox for dispatch {dispatch_id}"
         )),
@@ -854,13 +854,13 @@ pub(crate) fn ensure_dispatch_status_reaction_outbox_on_conn(
 
 #[cfg(test)]
 pub(crate) fn record_dispatch_status_event_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
     from_status: Option<&str>,
     to_status: &str,
     transition_source: &str,
     payload: Option<&serde_json::Value>,
-) -> libsql_rusqlite::Result<()> {
+) -> rusqlite::Result<()> {
     let (kanban_card_id, agent_id, dispatch_type): (
         Option<String>,
         Option<String>,
@@ -884,7 +884,7 @@ pub(crate) fn record_dispatch_status_event_on_conn(
             transition_source,
             payload_json
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        libsql_rusqlite::params![
+        rusqlite::params![
             dispatch_id,
             kanban_card_id,
             dispatch_type,
@@ -918,14 +918,14 @@ pub(crate) fn record_dispatch_status_event_on_conn(
 
 #[cfg(not(test))]
 pub(crate) fn record_dispatch_status_event_on_conn(
-    _conn: &libsql_rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     dispatch_id: &str,
     _from_status: Option<&str>,
     _to_status: &str,
     _transition_source: &str,
     _payload: Option<&serde_json::Value>,
-) -> libsql_rusqlite::Result<()> {
-    Err(libsql_rusqlite::Error::ToSqlConversionFailure(Box::new(
+) -> rusqlite::Result<()> {
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
         std::io::Error::other(format!(
             "Postgres pool required to record dispatch status event for {dispatch_id}"
         )),
@@ -934,7 +934,7 @@ pub(crate) fn record_dispatch_status_event_on_conn(
 
 #[cfg(test)]
 fn set_dispatch_status_on_conn_with_sync(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
     to_status: &str,
     result: Option<&serde_json::Value>,
@@ -976,12 +976,7 @@ fn set_dispatch_status_on_conn_with_sync(
                          ELSE completed_at
                      END
                  WHERE id = ?3 AND status = ?4",
-                libsql_rusqlite::params![
-                    to_status,
-                    result.to_string(),
-                    dispatch_id,
-                    current_status
-                ],
+                rusqlite::params![to_status, result.to_string(), dispatch_id, current_status],
             )?,
             (Some(result), false) => conn.execute(
                 "UPDATE task_dispatches
@@ -989,12 +984,7 @@ fn set_dispatch_status_on_conn_with_sync(
                      result = ?2,
                      updated_at = datetime('now')
                  WHERE id = ?3 AND status = ?4",
-                libsql_rusqlite::params![
-                    to_status,
-                    result.to_string(),
-                    dispatch_id,
-                    current_status
-                ],
+                rusqlite::params![to_status, result.to_string(), dispatch_id, current_status],
             )?,
             (None, true) => conn.execute(
                 "UPDATE task_dispatches
@@ -1005,14 +995,14 @@ fn set_dispatch_status_on_conn_with_sync(
                          ELSE completed_at
                      END
                  WHERE id = ?2 AND status = ?3",
-                libsql_rusqlite::params![to_status, dispatch_id, current_status],
+                rusqlite::params![to_status, dispatch_id, current_status],
             )?,
             (None, false) => conn.execute(
                 "UPDATE task_dispatches
                  SET status = ?1,
                      updated_at = datetime('now')
                  WHERE id = ?2 AND status = ?3",
-                libsql_rusqlite::params![to_status, dispatch_id, current_status],
+                rusqlite::params![to_status, dispatch_id, current_status],
             )?,
         };
 
@@ -1083,7 +1073,7 @@ fn set_dispatch_status_on_conn_with_sync(
                              completed_at = {completed_at_sql}
                          WHERE dispatch_id = ?2 AND status = 'dispatched'"
                     ),
-                    libsql_rusqlite::params![entry_status, dispatch_id],
+                    rusqlite::params![entry_status, dispatch_id],
                 )?;
                 let _ = transition_source;
             }
@@ -1108,7 +1098,7 @@ fn set_dispatch_status_on_conn_with_sync(
 
 #[cfg(not(test))]
 fn set_dispatch_status_on_conn_with_sync(
-    _conn: &libsql_rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     dispatch_id: &str,
     _to_status: &str,
     _result: Option<&serde_json::Value>,
@@ -1123,7 +1113,7 @@ fn set_dispatch_status_on_conn_with_sync(
 }
 
 pub(crate) fn set_dispatch_status_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
     to_status: &str,
     result: Option<&serde_json::Value>,
@@ -1321,7 +1311,7 @@ pub(crate) fn set_dispatch_status_without_queue_sync_with_backends(
 }
 
 pub(crate) fn set_dispatch_status_without_queue_sync_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     dispatch_id: &str,
     to_status: &str,
     result: Option<&serde_json::Value>,

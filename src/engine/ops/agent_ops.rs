@@ -155,7 +155,7 @@ pub(super) fn register_agent_ops<'js>(
 
 #[cfg(test)]
 fn agent_get_raw_sqlite_test(db: &Db, agent_id: &str) -> String {
-    use libsql_rusqlite::OptionalExtension;
+    use rusqlite::OptionalExtension;
 
     let result = (|| -> anyhow::Result<serde_json::Value> {
         let conn = db.read_conn()?;

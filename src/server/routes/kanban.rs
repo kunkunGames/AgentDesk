@@ -313,53 +313,50 @@ fn review_state_sync_pg(state: &AppState, payload: serde_json::Value) -> anyhow:
     Ok(result)
 }
 
-fn load_retry_dispatch_spec(
-    conn: &libsql_rusqlite::Connection,
+async fn load_retry_dispatch_spec_pg(
+    pool: &sqlx::PgPool,
     card_id: &str,
-) -> Option<(String, String, String)> {
-    let card_row: (Option<String>, String, Option<String>) = conn
-        .query_row(
-            "SELECT assigned_agent_id, title, latest_dispatch_id FROM kanban_cards WHERE id = ?1",
-            [card_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    let Some((card_agent_id, card_title, latest_dispatch_id)) =
+        sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
+            "SELECT assigned_agent_id, title, latest_dispatch_id
+             FROM kanban_cards
+             WHERE id = $1",
         )
-        .ok()?;
+        .bind(card_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
 
-    let (card_agent_id, card_title, latest_dispatch_id) = card_row;
-    let latest_dispatch = latest_dispatch_id
-        .as_deref()
-        .and_then(|dispatch_id| {
-            conn.query_row(
-                "SELECT to_agent_id, dispatch_type, title FROM task_dispatches WHERE id = ?1",
-                [dispatch_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .ok()
-        })
-        .or_else(|| {
-            conn.query_row(
+    let latest_dispatch = if let Some(dispatch_id) = latest_dispatch_id.as_deref() {
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT to_agent_id, dispatch_type, title
+             FROM task_dispatches
+             WHERE id = $1",
+        )
+        .bind(dispatch_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
+    let latest_dispatch = match latest_dispatch {
+        Some(row) => Some(row),
+        None => {
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
                 "SELECT to_agent_id, dispatch_type, title
              FROM task_dispatches
-             WHERE kanban_card_id = ?1
-             ORDER BY datetime(created_at) DESC, rowid DESC
+             WHERE kanban_card_id = $1
+             ORDER BY created_at DESC, id DESC
              LIMIT 1",
-                [card_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
             )
-            .ok()
-        });
+            .bind(card_id)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
 
     let (dispatch_agent_id, dispatch_type, dispatch_title) =
         latest_dispatch.unwrap_or((None, None, None));
@@ -372,7 +369,11 @@ fn load_retry_dispatch_spec(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(card_title);
 
-    Some((effective_agent_id, effective_dispatch_type, effective_title))
+    Ok(Some((
+        effective_agent_id,
+        effective_dispatch_type,
+        effective_title,
+    )))
 }
 
 // ── Handlers ───────────────────────────────────────────────────
@@ -416,29 +417,7 @@ pub async fn get_card(
         };
     }
 
-    let conn = match legacy_db(&state).lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    }) {
-        Ok(card) => (StatusCode::OK, Json(json!({"card": card}))),
-        Err(libsql_rusqlite::Error::QueryReturnedNoRows) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "card not found"})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
-    }
+    pg_pool_required_error()
 }
 
 /// POST /api/kanban-cards
@@ -501,44 +480,7 @@ pub async fn create_card(
         };
     }
 
-    let conn = match legacy_db(&state).lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    // Pipeline-driven initial state
-    crate::pipeline::ensure_loaded();
-    let initial_state = crate::pipeline::get().initial_state().to_string();
-    let result = conn.execute(
-        "INSERT INTO kanban_cards (id, repo_id, title, status, priority, github_issue_url, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))",
-        libsql_rusqlite::params![id, body.repo_id, body.title, initial_state, priority, body.github_issue_url],
-    );
-
-    if let Err(e) = result {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        );
-    }
-
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    }) {
-        Ok(card) => {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_created", card.clone());
-            (StatusCode::CREATED, Json(json!({"card": card})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
-    }
+    pg_pool_required_error()
 }
 
 /// PATCH /api/kanban-cards/:id
@@ -547,32 +489,31 @@ pub async fn update_card(
     Path(id): Path<String>,
     Json(body): Json<UpdateCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let old_status: Option<String> = {
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-
-        conn.query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .ok()
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_pool_required_error();
     };
 
-    if old_status.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "card not found"})),
-        );
-    }
-    let old_status = old_status.unwrap();
+    let old_status = match sqlx::query_scalar::<_, String>(
+        "SELECT status FROM kanban_cards WHERE id = $1 LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "card not found"})),
+            );
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{error}")})),
+            );
+        }
+    };
 
     let has_non_status_updates = body.title.is_some()
         || body.priority.is_some()
@@ -609,9 +550,6 @@ pub async fn update_card(
                 );
             }
 
-            let Some(pool) = state.pg_pool_ref() else {
-                return pg_pool_required_error();
-            };
             let transition_result = if new_s == "backlog" {
                 transition_card_to_backlog_with_cleanup(&state, &id, "api:manual-backlog").await
             } else {
@@ -640,100 +578,74 @@ pub async fn update_card(
 
     // ── Non-status field updates (only after status transition succeeds) ──
     if has_non_status_updates {
-        let mut sets: Vec<String> = Vec::new();
-        let mut values: Vec<Box<dyn libsql_rusqlite::types::ToSql>> = Vec::new();
-        let mut idx = 1;
-
-        macro_rules! push_field {
-            ($field:expr, $val:expr) => {
-                if let Some(ref v) = $val {
-                    sets.push(format!("{} = ?{}", $field, idx));
-                    values.push(Box::new(v.clone()));
-                    idx += 1;
-                }
-            };
-        }
-
-        push_field!("title", body.title);
-        push_field!("priority", body.priority);
-        let agent_id = body.assignee_agent_id;
-        push_field!("assigned_agent_id", agent_id);
-        push_field!("repo_id", body.repo_id);
-        push_field!("github_issue_url", body.github_issue_url);
-        push_field!("description", body.description);
-
-        let meta_str = body
+        let metadata_json = body
             .metadata
             .as_ref()
             .map(|metadata| serde_json::to_string(metadata).unwrap_or_default())
-            .or(body.metadata_json);
-        if let Some(ref metadata) = meta_str {
-            sets.push(format!("metadata = ?{}", idx));
-            values.push(Box::new(metadata.clone()));
-            idx += 1;
-        }
+            .or(body.metadata_json.clone());
 
-        push_field!("review_status", body.review_status);
-        push_field!("review_notes", body.review_notes);
-
-        sets.push(format!("updated_at = datetime('now')"));
-        let sql = format!(
-            "UPDATE kanban_cards SET {} WHERE id = ?{}",
-            sets.join(", "),
-            idx
-        );
-        values.push(Box::new(id.clone()));
-
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-
-        let params_ref: Vec<&dyn libsql_rusqlite::types::ToSql> =
-            values.iter().map(|v| v.as_ref()).collect();
-        match conn.execute(&sql, params_ref.as_slice()) {
-            Ok(0) => {
+        match sqlx::query(
+            "UPDATE kanban_cards
+             SET title = COALESCE($1, title),
+                 priority = COALESCE($2, priority),
+                 assigned_agent_id = COALESCE($3, assigned_agent_id),
+                 repo_id = COALESCE($4, repo_id),
+                 github_issue_url = COALESCE($5, github_issue_url),
+                 description = COALESCE($6, description),
+                 metadata = COALESCE($7::jsonb, metadata),
+                 review_status = COALESCE($8, review_status),
+                 review_notes = COALESCE($9, review_notes),
+                 updated_at = NOW()
+             WHERE id = $10",
+        )
+        .bind(body.title.as_deref())
+        .bind(body.priority.as_deref())
+        .bind(body.assignee_agent_id.as_deref())
+        .bind(body.repo_id.as_deref())
+        .bind(body.github_issue_url.as_deref())
+        .bind(body.description.as_deref())
+        .bind(metadata_json.as_deref())
+        .bind(body.review_status.as_deref())
+        .bind(body.review_notes.as_deref())
+        .bind(&id)
+        .execute(pool)
+        .await
+        {
+            Ok(result) if result.rows_affected() == 0 => {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "card not found"})),
                 );
             }
             Ok(_) => {}
-            Err(e) => {
+            Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
+                    Json(json!({"error": format!("{error}")})),
                 );
             }
         }
     }
-
-    let conn = legacy_db(&state).lock().unwrap();
-    let card = conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    });
-    drop(conn);
 
     // #108: Drain pending intents from hooks fired during transition_status_with_opts.
     // fire_dynamic_hooks fires policy hooks that may create dispatch intents, but
     // doesn't drain them itself. drain_hook_side_effects now also queues Discord
     // notifications for created dispatches, replacing the previous latest_dispatch_id
     // re-query that was susceptible to race conditions.
-    crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+    crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
 
-    match card {
-        Ok(c) => {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", c.clone());
-            (StatusCode::OK, Json(json!({"card": c})))
+    match load_card_json_pg(pool, &id).await {
+        Ok(Some(card)) => {
+            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
+            (StatusCode::OK, Json(json!({"card": card})))
         }
-        Err(e) => (
+        Ok(None) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
+            Json(json!({"error": "failed to read card after update"})),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
         ),
     }
 }
@@ -891,34 +803,7 @@ pub async fn delete_card(
         };
     }
 
-    let conn = match legacy_db(&state).lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    match conn.execute("DELETE FROM kanban_cards WHERE id = ?1", [&id]) {
-        Ok(0) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "card not found"})),
-        ),
-        Ok(_) => {
-            crate::server::ws::emit_event(
-                &state.broadcast_tx,
-                "kanban_card_deleted",
-                json!({"id": id}),
-            );
-            (StatusCode::OK, Json(json!({"ok": true})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
-    }
+    pg_pool_required_error()
 }
 
 /// POST /api/kanban-cards/:id/retry
@@ -927,159 +812,125 @@ pub async fn retry_card(
     Path(id): Path<String>,
     Json(body): Json<RetryCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 1. Update assignee if provided
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_pool_required_error();
+    };
+    let (stored_agent_id, retry_dispatch_type, retry_title) =
+        match load_retry_dispatch_spec_pg(pool, &id).await {
+            Ok(Some(spec)) => spec,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "card not found"})),
+                );
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
+        };
+
+    let existing_dispatch_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    if let Some(dispatch_id) = existing_dispatch_id.as_deref()
+        && let Err(error) =
+            crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(pool, dispatch_id, None)
+                .await
     {
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error}")})),
+        );
+    }
 
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM kanban_cards WHERE id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !exists {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "card not found"})),
-            );
-        }
-
-        let (stored_agent_id, retry_dispatch_type, retry_title) =
-            match load_retry_dispatch_spec(&conn, &id) {
-                Some(spec) => spec,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({"error": "card not found"})),
-                    );
-                }
-            };
-
-        conn.execute_batch("BEGIN").ok();
-
-        // Cancel existing pending/dispatched dispatch
-        let existing_dispatch_id: Option<String> = conn
-            .query_row(
-                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-        if let Some(ref did) = existing_dispatch_id {
-            if let Err(e) =
-                crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(&conn, did, None)
-            {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        }
-
-        // #155: Clear latest_dispatch_id via intent, assignee via direct (not CardState)
-        use crate::engine::transition::TransitionIntent as TI2;
-        let agent_id_for_dispatch: String = if let Some(ref agent_id) = body.assignee_agent_id {
-            if let Err(e) = conn.execute(
-                "UPDATE kanban_cards SET assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-                libsql_rusqlite::params![agent_id, id],
-            ) {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-            if let Err(e) = execute_transition_intent_pg(
-                &state,
-                &TI2::SetLatestDispatchId {
-                    card_id: id.clone(),
-                    dispatch_id: None,
-                },
-            ) {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-            agent_id.clone()
-        } else {
-            let current: String = conn
-                .query_row(
-                    "SELECT COALESCE(assigned_agent_id, '') FROM kanban_cards WHERE id = ?1",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
-            if let Err(e) = execute_transition_intent_pg(
-                &state,
-                &TI2::SetLatestDispatchId {
-                    card_id: id.clone(),
-                    dispatch_id: None,
-                },
-            ) {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-            current
-        };
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            conn.execute_batch("ROLLBACK").ok();
+    use crate::engine::transition::TransitionIntent as TI2;
+    let agent_id_for_dispatch = if let Some(agent_id) = body.assignee_agent_id.as_deref() {
+        if let Err(error) = sqlx::query(
+            "UPDATE kanban_cards
+             SET assigned_agent_id = $1,
+                 updated_at = NOW()
+             WHERE id = $2",
+        )
+        .bind(agent_id)
+        .bind(&id)
+        .execute(pool)
+        .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
+                Json(json!({"error": format!("{error}")})),
             );
         }
-        // Note: status → 'requested' is handled by create_dispatch() below
+        agent_id.to_string()
+    } else {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT assigned_agent_id FROM kanban_cards WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or_default()
+    };
 
-        let dispatch_agent_id = if agent_id_for_dispatch.is_empty() {
-            stored_agent_id
-        } else {
-            agent_id_for_dispatch
-        };
-        let card_id_owned = id.clone();
-        drop(conn);
+    if let Err(error) = execute_transition_intent_pg(
+        &state,
+        &TI2::SetLatestDispatchId {
+            card_id: id.clone(),
+            dispatch_id: None,
+        },
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error}")})),
+        );
+    }
 
-        // Create dispatch directly (bypass policy to avoid from===requested skip)
-        if !dispatch_agent_id.is_empty() {
-            let _retry_result = crate::dispatch::create_dispatch(
-                legacy_db(&state),
-                &state.engine,
-                &card_id_owned,
-                &dispatch_agent_id,
-                &retry_dispatch_type,
-                &retry_title,
-                &json!({"retry": true, "preserved_dispatch_type": retry_dispatch_type.clone()}),
-            );
-        }
-    } // drop conn lock
+    let dispatch_agent_id = if agent_id_for_dispatch.is_empty() {
+        stored_agent_id
+    } else {
+        agent_id_for_dispatch
+    };
+    if !dispatch_agent_id.is_empty()
+        && let Err(error) = crate::dispatch::create_dispatch_pg_only(
+            pool,
+            &state.engine,
+            &id,
+            &dispatch_agent_id,
+            &retry_dispatch_type,
+            &retry_title,
+            &json!({"retry": true, "preserved_dispatch_type": retry_dispatch_type.clone()}),
+        )
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error}")})),
+        );
+    }
 
-    // Return updated card
-    let conn = legacy_db(&state).lock().unwrap();
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    }) {
-        Ok(card) => {
+    match load_card_json_pg(pool, &id).await {
+        Ok(Some(card)) => {
             crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
             (StatusCode::OK, Json(json!({"card": card})))
         }
-        Err(e) => (
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        ),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
+            Json(json!({"error": error})),
         ),
     }
 }
@@ -1090,114 +941,99 @@ pub async fn redispatch_card(
     Path(id): Path<String>,
     Json(_body): Json<RedispatchCardBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 1. Cancel current dispatch, then transition to "requested"
-    // The OnCardTransition hook (kanban-rules.js) creates the new dispatch + Discord message
-    {
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_pool_required_error();
+    };
 
-        let (agent_id, dispatch_type, dispatch_title) = match load_retry_dispatch_spec(&conn, &id) {
-            Some(spec) => spec,
-            None => {
+    let (agent_id, dispatch_type, dispatch_title) =
+        match load_retry_dispatch_spec_pg(pool, &id).await {
+            Ok(Some(spec)) => spec,
+            Ok(None) => {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": "card not found"})),
                 );
             }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
         };
 
-        conn.execute_batch("BEGIN").ok();
+    let dispatch_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    if let Some(dispatch_id) = dispatch_id.as_deref()
+        && let Err(error) =
+            crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(pool, dispatch_id, None)
+                .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error}")})),
+        );
+    }
 
-        // Cancel existing dispatch
-        let dispatch_id: Option<String> = conn
-            .query_row(
-                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-        if let Some(ref did) = dispatch_id {
-            if let Err(e) =
-                crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(&conn, did, None)
-            {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        }
-
-        // #155: Clear review_status and latest_dispatch_id via intents (executor boundary)
-        use crate::engine::transition::TransitionIntent;
-        let clear_intents = vec![
-            TransitionIntent::SetReviewStatus {
-                card_id: id.clone(),
-                review_status: None,
-            },
-            TransitionIntent::SetLatestDispatchId {
-                card_id: id.clone(),
-                dispatch_id: None,
-            },
-            TransitionIntent::SyncReviewState {
-                card_id: id.clone(),
-                state: "idle".to_string(),
-            },
-        ];
-        for intent in &clear_intents {
-            if let Err(e) = execute_transition_intent_pg(&state, intent) {
-                conn.execute_batch("ROLLBACK").ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        }
-        if let Err(e) = conn.execute_batch("COMMIT") {
-            conn.execute_batch("ROLLBACK").ok();
+    use crate::engine::transition::TransitionIntent;
+    for intent in [
+        TransitionIntent::SetReviewStatus {
+            card_id: id.clone(),
+            review_status: None,
+        },
+        TransitionIntent::SetLatestDispatchId {
+            card_id: id.clone(),
+            dispatch_id: None,
+        },
+        TransitionIntent::SyncReviewState {
+            card_id: id.clone(),
+            state: "idle".to_string(),
+        },
+    ] {
+        if let Err(error) = execute_transition_intent_pg(&state, &intent) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-
-        let card_id_owned = id.clone();
-        drop(conn);
-
-        // Create dispatch directly (bypass policy to avoid from===requested skip)
-        if !agent_id.is_empty() {
-            let _redispatch_result = crate::dispatch::create_dispatch(
-                legacy_db(&state),
-                &state.engine,
-                &card_id_owned,
-                &agent_id,
-                &dispatch_type,
-                &dispatch_title,
-                &json!({"redispatch": true, "preserved_dispatch_type": dispatch_type.clone()}),
+                Json(json!({"error": format!("{error}")})),
             );
         }
     }
 
-    // 2. Return updated card
-    let conn = legacy_db(&state).lock().unwrap();
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    }) {
-        Ok(card) => {
+    if !agent_id.is_empty()
+        && let Err(error) = crate::dispatch::create_dispatch_pg_only(
+            pool,
+            &state.engine,
+            &id,
+            &agent_id,
+            &dispatch_type,
+            &dispatch_title,
+            &json!({"redispatch": true, "preserved_dispatch_type": dispatch_type.clone()}),
+        )
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error}")})),
+        );
+    }
+
+    match load_card_json_pg(pool, &id).await {
+        Ok(Some(card)) => {
             crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
             (StatusCode::OK, Json(json!({"card": card})))
         }
-        Err(e) => (
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "card not found"})),
+        ),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
+            Json(json!({"error": error})),
         ),
     }
 }
@@ -1318,7 +1154,7 @@ pub async fn defer_dod(
     let dod_str = serde_json::to_string(&dod).unwrap_or_default();
     conn.execute(
         "UPDATE kanban_cards SET deferred_dod_json = ?1, updated_at = datetime('now') WHERE id = ?2",
-        libsql_rusqlite::params![dod_str, id],
+        rusqlite::params![dod_str, id],
     ).ok();
 
     // #128: Check if all DoD items are now complete AND card is awaiting_dod.
@@ -1870,9 +1706,7 @@ pub async fn assign_issue(
 
 // ── Helpers ────────────────────────────────────────────────────
 
-pub(super) fn card_row_to_json(
-    row: &libsql_rusqlite::Row,
-) -> libsql_rusqlite::Result<serde_json::Value> {
+pub(super) fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
     let repo_id = row.get::<_, Option<String>>(1)?;
     let assigned_agent_id = row.get::<_, Option<String>>(5)?;
     let metadata_raw = row.get::<_, Option<String>>(10).unwrap_or(None);
@@ -2183,7 +2017,7 @@ pub async fn card_github_comments(
                 let _ = conn.execute(
                     "UPDATE kanban_cards SET description = ?1, updated_at = datetime('now') \
                      WHERE id = ?2 AND (description IS NOT ?1 OR description IS NULL)",
-                    libsql_rusqlite::params![body, card_id],
+                    rusqlite::params![body, card_id],
                 );
             }
 
@@ -2588,10 +2422,7 @@ pub struct RereviewBody {
     pub reason: Option<String>,
 }
 
-fn find_active_review_dispatch_id(
-    conn: &libsql_rusqlite::Connection,
-    card_id: &str,
-) -> Option<String> {
+fn find_active_review_dispatch_id(conn: &rusqlite::Connection, card_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT id FROM task_dispatches
          WHERE kanban_card_id = ?1
@@ -2652,7 +2483,7 @@ pub(super) fn require_explicit_bearer_token(
 }
 
 fn resolve_agent_id_from_channel_id_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     channel_id: &str,
 ) -> Option<String> {
     conn.query_row(
@@ -2689,7 +2520,7 @@ async fn resolve_agent_id_from_channel_id_with_pg(
 }
 
 pub(super) fn resolve_requesting_agent_id_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     headers: &HeaderMap,
 ) -> Option<String> {
     if let Some(agent_id) = trimmed_header_value(headers, "x-agent-id") {
@@ -3891,7 +3722,7 @@ fn force_transition_needs_cleanup(target_status: &str, cancel_dispatches: Option
 }
 
 fn count_live_auto_queue_entries_for_card_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<usize> {
     let count: i64 = conn
@@ -3911,7 +3742,7 @@ fn count_live_auto_queue_entries_for_card_on_conn(
 }
 
 fn clear_force_transition_terminalized_links_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
@@ -3937,7 +3768,7 @@ fn clear_force_transition_terminalized_links_on_conn(
 }
 
 fn cleanup_force_transition_revert_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     target_status: &str,
 ) -> anyhow::Result<(usize, usize)> {
@@ -3958,9 +3789,9 @@ fn cleanup_force_transition_revert_on_conn(
 }
 
 fn skip_live_auto_queue_entries_for_card_legacy(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
-) -> libsql_rusqlite::Result<usize> {
+) -> rusqlite::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT id FROM auto_queue_entries
          WHERE kanban_card_id = ?1
@@ -3991,11 +3822,11 @@ fn skip_live_auto_queue_entries_for_card_legacy(
 }
 
 fn move_auto_queue_entry_to_dispatched_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     entry_id: &str,
     trigger_source: &str,
     options: &crate::db::auto_queue::EntryStatusUpdateOptions,
-) -> libsql_rusqlite::Result<()> {
+) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE auto_queue_entries
          SET status = 'dispatched',
@@ -4005,7 +3836,7 @@ fn move_auto_queue_entry_to_dispatched_on_conn(
              completed_at = NULL,
              updated_at = datetime('now')
          WHERE id = ?1 AND status IN ('pending', 'dispatched', 'done')",
-        libsql_rusqlite::params![entry_id, options.dispatch_id, options.slot_index],
+        rusqlite::params![entry_id, options.dispatch_id, options.slot_index],
     )?;
     let _ = trigger_source;
     Ok(())
@@ -4054,7 +3885,7 @@ async fn reactivate_done_auto_queue_entries_pg(
 }
 
 fn load_card_metadata_map_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let metadata_raw: Option<String> = conn.query_row(
@@ -4095,7 +3926,7 @@ async fn load_card_metadata_map_pg(
 }
 
 fn save_card_metadata_map_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     metadata: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -4107,7 +3938,7 @@ fn save_card_metadata_map_on_conn(
     } else {
         conn.execute(
             "UPDATE kanban_cards SET metadata = ?1 WHERE id = ?2",
-            libsql_rusqlite::params![serde_json::to_string(metadata)?, card_id],
+            rusqlite::params![serde_json::to_string(metadata)?, card_id],
         )?;
     }
     Ok(())
@@ -4146,7 +3977,7 @@ async fn save_card_metadata_map_pg(
 }
 
 fn mark_api_reopen_skip_preflight_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -4170,7 +4001,7 @@ async fn mark_api_reopen_skip_preflight_on_pg(
 }
 
 fn clear_api_reopen_skip_preflight_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -4188,7 +4019,7 @@ async fn clear_api_reopen_skip_preflight_on_pg(
 }
 
 fn consume_api_reopen_preflight_skip_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -4246,7 +4077,7 @@ async fn consume_api_reopen_preflight_skip_on_pg(
 }
 
 fn clear_reopen_preflight_cache_on_conn(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;

@@ -1,4 +1,4 @@
-use libsql_rusqlite::Connection;
+use rusqlite::Connection;
 use sqlx::{PgPool, Row as SqlxRow};
 
 use crate::db::agents::AgentChannelBindings;

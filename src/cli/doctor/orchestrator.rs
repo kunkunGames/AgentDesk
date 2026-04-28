@@ -7,7 +7,7 @@ use super::contract::{DoctorProfile, FixSafety, RunContext, SecurityExposure, Se
 use super::{health, mailbox};
 use crate::cli::dcserver;
 use crate::config;
-use crate::db::schema;
+use crate::db::{open_write_connection, schema};
 use crate::services::provider::ProviderKind;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1662,7 +1662,7 @@ fn apply_safe_fixes(cfg: &config::Config, options: &DoctorOptions) -> Vec<FixAct
             "rerun with --fix --repair-sqlite-cache to allow SQLite schema mutation",
         ));
     } else {
-        match libsql_rusqlite::Connection::open(&db_path) {
+        match open_write_connection(&db_path) {
             Ok(conn) => match schema::migrate(&conn) {
                 Ok(()) => actions.push(
                     FixAction::ok(
@@ -2879,7 +2879,7 @@ fn check_db_integrity(cfg: &config::Config) -> Check {
         .with_expected_actual("database file exists", "database file missing")
         .with_next_steps(vec!["agentdesk doctor --fix".to_string()]);
     }
-    match libsql_rusqlite::Connection::open(&db_path) {
+    match open_write_connection(&db_path) {
         Ok(conn) => {
             match conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)) {
                 Ok(result) if result == "ok" => {
@@ -3243,8 +3243,7 @@ fn normalized_config_repo_ids(cfg: &config::Config) -> (BTreeSet<String>, Vec<St
 }
 
 fn open_registered_github_repo_ids(db_path: &std::path::Path) -> Result<BTreeSet<String>, String> {
-    let conn =
-        libsql_rusqlite::Connection::open(db_path).map_err(|e| format!("cannot open: {e}"))?;
+    let conn = open_write_connection(db_path).map_err(|e| format!("cannot open: {e}"))?;
     let mut stmt = conn
         .prepare("SELECT id FROM github_repos ORDER BY id")
         .map_err(|e| format!("prepare: {e}"))?;
@@ -3567,7 +3566,7 @@ mod tests {
     };
     use crate::cli::doctor::contract::{FixSafety, RunContext, Severity};
     use crate::config::{AgentChannel, AgentChannels, AgentDef, ServerConfig};
-    use crate::db::schema;
+    use crate::db::{open_write_connection, schema};
     use crate::services::provider::ProviderKind;
     use serde_json::json;
     use std::path::Path;
@@ -3624,7 +3623,7 @@ mod tests {
     }
 
     fn write_github_repo_registry(db_path: &Path, repos: &[&str]) {
-        let conn = libsql_rusqlite::Connection::open(db_path).unwrap();
+        let conn = open_write_connection(db_path).unwrap();
         schema::migrate(&conn).unwrap();
         for repo in repos {
             conn.execute(

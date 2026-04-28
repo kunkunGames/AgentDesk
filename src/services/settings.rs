@@ -410,67 +410,11 @@ fn write_runtime_config_pg(
     })
 }
 
-fn write_runtime_config(
-    conn: &libsql_rusqlite::Connection,
-    values: &Map<String, Value>,
-) -> ServiceResult<()> {
-    let value_str =
-        serde_json::to_string(&Value::Object(values.clone())).unwrap_or_else(|_| "{}".to_string());
-    conn.execute(
-        "INSERT OR REPLACE INTO kv_meta (key, value) VALUES ('runtime-config', ?1)",
-        [&value_str],
-    )
-    .map_err(|error| {
-        ServiceError::internal(format!("{error}"))
-            .with_code(ErrorCode::Database)
-            .with_operation("write_runtime_config.upsert_runtime_config")
-    })?;
-
-    for key in RUNTIME_CONFIG_KEYS {
-        conn.execute("DELETE FROM kv_meta WHERE key = ?1", [key])
-            .map_err(|error| {
-                ServiceError::internal(format!("{error}"))
-                    .with_code(ErrorCode::Database)
-                    .with_operation("write_runtime_config.delete_legacy_key")
-                    .with_context("key", key)
-            })?;
-    }
-    for (key, value) in values {
-        if let Some(text) = runtime_scalar_to_string(value) {
-            conn.execute(
-                "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                libsql_rusqlite::params![key, text],
-            )
-            .map_err(|error| {
-                ServiceError::internal(format!("{error}"))
-                    .with_code(ErrorCode::Database)
-                    .with_operation("write_runtime_config.upsert_scalar")
-                    .with_context("key", key)
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-pub fn seed_runtime_config_defaults(
-    conn: &libsql_rusqlite::Connection,
-    config: &crate::config::Config,
-) {
-    let saved_obj = conn
-        .query_row(
-            "SELECT value FROM kv_meta WHERE key = 'runtime-config'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.as_object().cloned());
-    let target = seeded_runtime_config_map(saved_obj, config);
-
-    if let Err(error) = write_runtime_config(conn, &target) {
-        tracing::warn!("[settings] failed to seed runtime config defaults: {error}");
-    }
+#[cfg(test)]
+pub fn seed_runtime_config_defaults<T>(_conn: &T, _config: &crate::config::Config) {
+    tracing::debug!(
+        "[settings] legacy SQLite runtime-config seeding skipped; Postgres seeding is authoritative"
+    );
 }
 
 pub async fn seed_runtime_config_defaults_pg(

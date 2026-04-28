@@ -12,10 +12,7 @@ fn test_db() -> Db {
     crate::db::test_db()
 }
 
-fn legacy_review_state_sync_for_tests(
-    conn: &libsql_rusqlite::Connection,
-    json_str: &str,
-) -> String {
+fn legacy_review_state_sync_for_tests(conn: &rusqlite::Connection, json_str: &str) -> String {
     let params: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(e) => return format!(r#"{{"error":"invalid JSON: {}"}}"#, e),
@@ -30,7 +27,7 @@ fn legacy_review_state_sync_for_tests(
     if state == "clear_verdict" {
         let result = conn.execute(
             "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
-            libsql_rusqlite::params![card_id],
+            rusqlite::params![card_id],
         );
         return match result {
             Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
@@ -55,7 +52,7 @@ fn legacy_review_state_sync_for_tests(
          pending_dispatch_id = CASE WHEN ?6 IS NOT NULL THEN ?6 WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id ELSE NULL END, \
          review_entered_at = COALESCE(?7, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
          updated_at = datetime('now')",
-        libsql_rusqlite::params![
+        rusqlite::params![
             card_id,
             state,
             review_round,
@@ -1311,170 +1308,6 @@ fn seed_card_for_review(db: &Db, card_id: &str) {
         [card_id],
     )
     .unwrap();
-}
-
-// #158: legacy_review_state_sync_for_tests — idle state sets state and clears pending_dispatch_id
-#[test]
-fn test_review_state_sync_idle() {
-    let db = test_db();
-    seed_card_for_review(&db, "rs-1");
-    let conn = db.separate_conn().unwrap();
-    // Seed existing review state with pending_dispatch_id
-    conn.execute(
-        "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
-         VALUES ('rs-1', 'suggestion_pending', 'disp-1', datetime('now'))",
-        [],
-    )
-    .unwrap();
-
-    let result = legacy_review_state_sync_for_tests(
-        &conn,
-        &serde_json::json!({"card_id": "rs-1", "state": "idle"}).to_string(),
-    );
-    assert!(
-        result.contains("\"ok\":true"),
-        "sync should succeed: {result}"
-    );
-
-    let (state, pd): (String, Option<String>) = conn
-        .query_row(
-            "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "idle");
-    assert!(pd.is_none(), "idle should clear pending_dispatch_id");
-}
-
-// #158: leaving suggestion_pending must clear stale pending_dispatch_id
-#[test]
-fn test_review_state_sync_non_suggestion_pending_clears_pending_dispatch_id() {
-    let db = test_db();
-    seed_card_for_review(&db, "rs-1b");
-    let conn = db.separate_conn().unwrap();
-    conn.execute(
-        "INSERT INTO card_review_state (card_id, state, pending_dispatch_id, updated_at) \
-         VALUES ('rs-1b', 'suggestion_pending', 'disp-2', datetime('now'))",
-        [],
-    )
-    .unwrap();
-
-    let result = legacy_review_state_sync_for_tests(
-        &conn,
-        &serde_json::json!({
-            "card_id": "rs-1b",
-            "state": "rework_pending",
-            "last_decision": "pm_rework"
-        })
-        .to_string(),
-    );
-    assert!(
-        result.contains("\"ok\":true"),
-        "sync should succeed: {result}"
-    );
-
-    let (state, pd): (String, Option<String>) = conn
-        .query_row(
-            "SELECT state, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-1b'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "rework_pending");
-    assert!(
-        pd.is_none(),
-        "non-suggestion_pending states must clear stale pending_dispatch_id"
-    );
-}
-
-// #158: legacy_review_state_sync_for_tests — reviewing state auto-sets review_entered_at
-#[test]
-fn test_review_state_sync_reviewing() {
-    let db = test_db();
-    seed_card_for_review(&db, "rs-2");
-    let conn = db.separate_conn().unwrap();
-
-    let result = legacy_review_state_sync_for_tests(
-        &conn,
-        &serde_json::json!({"card_id": "rs-2", "state": "reviewing", "review_round": 1})
-            .to_string(),
-    );
-    assert!(result.contains("\"ok\":true"));
-
-    let (state, rr, entered): (String, Option<i64>, Option<String>) = conn
-        .query_row(
-            "SELECT state, review_round, review_entered_at FROM card_review_state WHERE card_id = 'rs-2'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "reviewing");
-    assert_eq!(rr, Some(1));
-    assert!(
-        entered.is_some(),
-        "reviewing should auto-set review_entered_at"
-    );
-}
-
-// #158: legacy_review_state_sync_for_tests — clear_verdict only NULLs last_verdict
-#[test]
-fn test_review_state_sync_clear_verdict() {
-    let db = test_db();
-    seed_card_for_review(&db, "rs-3");
-    let conn = db.separate_conn().unwrap();
-    conn.execute(
-        "INSERT INTO card_review_state (card_id, state, last_verdict, updated_at) \
-         VALUES ('rs-3', 'reviewing', 'improve', datetime('now'))",
-        [],
-    )
-    .unwrap();
-
-    let result = legacy_review_state_sync_for_tests(
-        &conn,
-        &serde_json::json!({"card_id": "rs-3", "state": "clear_verdict"}).to_string(),
-    );
-    assert!(
-        result.contains("\"ok\":true"),
-        "sync should succeed: {result}"
-    );
-
-    let (state, verdict): (String, Option<String>) = conn
-        .query_row(
-            "SELECT state, last_verdict FROM card_review_state WHERE card_id = 'rs-3'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "reviewing", "clear_verdict should not change state");
-    assert!(verdict.is_none(), "clear_verdict should NULL last_verdict");
-}
-
-// #158: review_state_sync (JSON wrapper) — round-trip test
-#[test]
-fn test_review_state_sync_json_wrapper() {
-    let db = test_db();
-    seed_card_for_review(&db, "rs-4");
-    let conn = db.separate_conn().unwrap();
-    let result = legacy_review_state_sync_for_tests(
-        &conn,
-        r#"{"card_id":"rs-4","state":"suggestion_pending","last_verdict":"improve","pending_dispatch_id":"d-99"}"#,
-    );
-    assert!(
-        result.contains("\"ok\":true"),
-        "sync should succeed: {result}"
-    );
-
-    let (state, verdict, pd): (String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT state, last_verdict, pending_dispatch_id FROM card_review_state WHERE card_id = 'rs-4'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(state, "suggestion_pending");
-    assert_eq!(verdict.as_deref(), Some("improve"));
-    assert_eq!(pd.as_deref(), Some("d-99"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

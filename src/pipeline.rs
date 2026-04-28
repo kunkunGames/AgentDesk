@@ -583,7 +583,7 @@ pub fn resolve(
 /// Resolve effective pipeline from DB, looking up repo and agent overrides.
 #[cfg(test)]
 pub fn resolve_for_card(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     repo_id: Option<&str>,
     agent_id: Option<&str>,
 ) -> PipelineConfig {
@@ -620,7 +620,7 @@ pub fn resolve_for_card(
 /// pipeline override resolution is PG-only.
 #[cfg(not(test))]
 pub fn resolve_for_card(
-    _conn: &libsql_rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     repo_id: Option<&str>,
     agent_id: Option<&str>,
 ) -> PipelineConfig {

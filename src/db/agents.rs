@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Result;
-use libsql_rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use sqlx::{PgPool, Row as SqlxRow};
 
 use crate::config::{AgentChannel, AgentDef};
@@ -121,7 +121,7 @@ fn normalized_channel(value: Option<String>) -> Option<String> {
 pub fn load_agent_channel_bindings(
     conn: &Connection,
     agent_id: &str,
-) -> libsql_rusqlite::Result<Option<AgentChannelBindings>> {
+) -> rusqlite::Result<Option<AgentChannelBindings>> {
     conn.query_row(
         "SELECT provider, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx
          FROM agents WHERE id = ?1",
@@ -142,7 +142,7 @@ pub fn load_agent_channel_bindings(
 pub fn resolve_agent_primary_channel_on_conn(
     conn: &Connection,
     agent_id: &str,
-) -> libsql_rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Option<String>> {
     Ok(load_agent_channel_bindings(conn, agent_id)?.and_then(|b| b.primary_channel()))
 }
 
@@ -150,7 +150,7 @@ pub fn resolve_agent_channel_for_provider_on_conn(
     conn: &Connection,
     agent_id: &str,
     provider: Option<&str>,
-) -> libsql_rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Option<String>> {
     Ok(load_agent_channel_bindings(conn, agent_id)?.and_then(|b| b.channel_for_provider(provider)))
 }
 
@@ -158,7 +158,7 @@ pub fn resolve_agent_dispatch_channel_on_conn(
     conn: &Connection,
     agent_id: &str,
     dispatch_type: Option<&str>,
-) -> libsql_rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Option<String>> {
     Ok(
         load_agent_channel_bindings(conn, agent_id)?.and_then(|bindings| {
             if matches!(dispatch_type, Some("review" | "e2e-test" | "consultation")) {
@@ -340,7 +340,7 @@ fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Resul
             discord_channel_cc = excluded.discord_channel_cc,
             discord_channel_cdx = excluded.discord_channel_cdx,
             updated_at = CURRENT_TIMESTAMP",
-        libsql_rusqlite::params![
+        rusqlite::params![
             agent.id,
             agent.name,
             agent.name_ko,
@@ -413,7 +413,7 @@ fn copy_runtime_fields_from_legacy_sqlite(
              system_prompt = COALESCE((SELECT system_prompt FROM agents WHERE id = ?1), system_prompt),
              pipeline_config = COALESCE((SELECT pipeline_config FROM agents WHERE id = ?1), pipeline_config)
          WHERE id = ?2",
-        libsql_rusqlite::params![legacy_id, canonical_id],
+        rusqlite::params![legacy_id, canonical_id],
     )?;
 
     Ok(())
@@ -443,7 +443,7 @@ fn move_legacy_agent_references_sqlite(
         "UPDATE session_transcripts SET agent_id = ?1 WHERE agent_id = ?2",
         "UPDATE memento_feedback_turn_stats SET agent_id = ?1 WHERE agent_id = ?2",
     ] {
-        conn.execute(sql, libsql_rusqlite::params![canonical_id, legacy_id])?;
+        conn.execute(sql, rusqlite::params![canonical_id, legacy_id])?;
     }
 
     conn.execute(
@@ -451,7 +451,7 @@ fn move_legacy_agent_references_sqlite(
          SELECT office_id, ?1, department_id, joined_at
            FROM office_agents
           WHERE agent_id = ?2",
-        libsql_rusqlite::params![canonical_id, legacy_id],
+        rusqlite::params![canonical_id, legacy_id],
     )?;
     conn.execute("DELETE FROM office_agents WHERE agent_id = ?1", [legacy_id])?;
 
@@ -462,7 +462,7 @@ fn move_legacy_agent_references_sqlite(
          SELECT ?1, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at
            FROM auto_queue_slots
           WHERE agent_id = ?2",
-        libsql_rusqlite::params![canonical_id, legacy_id],
+        rusqlite::params![canonical_id, legacy_id],
     )?;
     conn.execute(
         "DELETE FROM auto_queue_slots WHERE agent_id = ?1",
@@ -478,7 +478,7 @@ mod tests {
     use crate::config::AgentChannels;
 
     fn test_db() -> Db {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -611,7 +611,7 @@ mod tests {
             "INSERT INTO agents (
                 id, name, provider, status, xp, sprite_number, description, system_prompt, pipeline_config
              ) VALUES (?1, ?2, 'codex', 'working', 42, 7, 'legacy-desc', 'legacy-prompt', '{\"k\":1}')",
-            libsql_rusqlite::params!["openclaw-maker", "Legacy Maker"],
+            rusqlite::params!["openclaw-maker", "Legacy Maker"],
         )
         .unwrap();
         conn.execute(
@@ -796,7 +796,7 @@ mod tests {
             "INSERT INTO agents (
                 id, name, provider, status, xp
              ) VALUES (?1, ?2, 'codex', 'working', 42)",
-            libsql_rusqlite::params!["openclaw-maker", "Configured Legacy Maker"],
+            rusqlite::params!["openclaw-maker", "Configured Legacy Maker"],
         )
         .unwrap();
         conn.execute(

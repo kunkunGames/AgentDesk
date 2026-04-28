@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use libsql_rusqlite::{Connection, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 #[cfg(test)]

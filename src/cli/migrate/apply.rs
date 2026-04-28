@@ -1767,18 +1767,18 @@ fn upsert_imported_sessions(
                thread_channel_id = COALESCE(excluded.thread_channel_id, sessions.thread_channel_id),
                claude_session_id = excluded.claude_session_id,
                last_heartbeat = excluded.last_heartbeat",
-            libsql_rusqlite::params![
-                session_map.db_session_key,
-                session.final_role_id,
-                provider,
-                status,
-                session_info,
-                model,
+            (
+                &session_map.db_session_key,
+                &session.final_role_id,
+                &provider,
+                &status,
+                &session_info,
+                &model,
                 0,
-                cwd,
-                thread_channel_id,
-                last_heartbeat,
-            ],
+                &cwd,
+                &thread_channel_id,
+                &last_heartbeat,
+            ),
         )
         .map_err(|e| format!("Failed to upsert imported session '{}': {e}", session.session_key))?;
     }

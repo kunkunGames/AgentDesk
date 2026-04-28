@@ -198,7 +198,7 @@ fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 fn slot_thread_map_has_bindings(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     agent_id: &str,
     slot_index: i64,
 ) -> bool {
@@ -207,7 +207,7 @@ fn slot_thread_map_has_bindings(
             "SELECT thread_id_map
              FROM auto_queue_slots
              WHERE agent_id = ?1 AND slot_index = ?2",
-            libsql_rusqlite::params![agent_id, slot_index],
+            rusqlite::params![agent_id, slot_index],
             |row| row.get(0),
         )
         .ok()
@@ -229,7 +229,7 @@ fn slot_thread_map_has_bindings(
 }
 
 fn slot_has_dispatch_thread_history(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     agent_id: &str,
     slot_index: i64,
 ) -> bool {
@@ -244,14 +244,14 @@ fn slot_has_dispatch_thread_history(
                      THEN NULL
                  ELSE CAST(json_extract(context, '$.slot_index') AS INTEGER)
                END = ?2",
-        libsql_rusqlite::params![agent_id, slot_index],
+        rusqlite::params![agent_id, slot_index],
         |row| row.get(0),
     )
     .unwrap_or(false)
 }
 
 fn slot_requires_thread_reset_before_reuse(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     agent_id: &str,
     slot_index: i64,
     newly_assigned: bool,
@@ -1615,7 +1615,7 @@ impl ActivateCardState {
             )
     }
 
-    fn is_terminal(&self, conn: &libsql_rusqlite::Connection) -> bool {
+    fn is_terminal(&self, conn: &rusqlite::Connection) -> bool {
         crate::pipeline::ensure_loaded();
         crate::pipeline::resolve_for_card(
             conn,
@@ -1669,10 +1669,10 @@ struct RestoreDispatchAttemptResult {
 }
 
 fn load_activate_card_state(
-    conn: &libsql_rusqlite::Connection,
+    conn: &rusqlite::Connection,
     card_id: &str,
     entry_id: &str,
-) -> libsql_rusqlite::Result<ActivateCardState> {
+) -> rusqlite::Result<ActivateCardState> {
     let (status, title, metadata, latest_dispatch_id, repo_id, assigned_agent_id): (
         String,
         String,
@@ -7889,7 +7889,7 @@ mod tests {
         extract_dependency_parse_result, reorder_entry_ids,
         slot_requires_thread_reset_before_reuse,
     };
-    use libsql_rusqlite::Connection;
+    use rusqlite::Connection;
     use std::collections::HashMap;
 
     fn entry(id: &str, status: &str, agent_id: &str) -> QueueEntryOrder {

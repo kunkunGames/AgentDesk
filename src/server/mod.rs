@@ -374,9 +374,13 @@ async fn policy_tick_loop(engine: PolicyEngine, pg_pool: Option<Arc<PgPool>>) {
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick5min", "5min").await;
             refresh_memory_health_for_five_min_tick().await;
             if let Some(db) = engine.legacy_db() {
-                if let Err(error) =
-                    crate::services::api_friction::process_api_friction_patterns(db, None, None)
-                        .await
+                if let Err(error) = crate::services::api_friction::process_api_friction_patterns(
+                    db,
+                    pg_pool.as_deref().or_else(|| engine.pg_pool()),
+                    None,
+                    None,
+                )
+                .await
                 {
                     tracing::warn!("[policy-tick] api-friction aggregation failed: {error}");
                 }
@@ -569,12 +573,12 @@ fn record_tick_hook_execution(
         // always ZERO, which is fine.
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-            libsql_rusqlite::params![key_status, status],
+            [key_status.as_str(), status],
         )
         .ok();
         conn.execute(
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-            libsql_rusqlite::params![key_skip_ms, now_ms],
+            [key_skip_ms.as_str(), now_ms.as_str()],
         )
         .ok();
         // The global last-skip marker is useful for at-a-glance health.
@@ -596,12 +600,13 @@ fn record_tick_hook_execution(
             // overdue on `/api/cron-jobs` instead of looking "recent".
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                libsql_rusqlite::params![key_ms, now_ms],
+                [key_ms.as_str(), now_ms.as_str()],
             )
             .ok();
+            let elapsed_ms = execution.elapsed.as_millis().to_string();
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                libsql_rusqlite::params![key_duration, execution.elapsed.as_millis().to_string()],
+                [key_duration.as_str(), elapsed_ms.as_str()],
             )
             .ok();
             conn.execute(
@@ -960,7 +965,7 @@ mod tests {
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT INTO message_outbox (target, content, bot, source) VALUES (?1, ?2, 'notify', 'system')",
-            libsql_rusqlite::params![target, content],
+            [target, content],
         )
         .unwrap();
         conn.last_insert_rowid()
@@ -3187,6 +3192,7 @@ where
         } else {
             let error_text = format!("{status}: {err_text}");
             if let Ok(conn) = sqlite_db.lock() {
+                let row_id = row.id.to_string();
                 conn.execute(
                     "UPDATE message_outbox
                         SET status = 'failed',
@@ -3194,7 +3200,7 @@ where
                             claimed_at = NULL,
                             claim_owner = NULL
                       WHERE id = ?2",
-                    libsql_rusqlite::params![error_text, row.id],
+                    [error_text.as_str(), row_id.as_str()],
                 )
                 .ok();
             }
