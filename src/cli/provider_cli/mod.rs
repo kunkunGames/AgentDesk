@@ -789,15 +789,17 @@ fn cmd_run(
                 ch.source = "manual_override".to_string();
                 ch
             })
-            .unwrap_or_else(|| crate::services::provider_cli::registry::ProviderCliChannel {
-                path: path.to_string(),
-                canonical_path: canonical,
-                version: "unknown".to_string(),
-                version_output: None,
-                source: "manual_override".to_string(),
-                checked_at: chrono::Utc::now(),
-                evidence: Default::default(),
-            })
+            .unwrap_or_else(
+                || crate::services::provider_cli::registry::ProviderCliChannel {
+                    path: path.to_string(),
+                    canonical_path: canonical,
+                    version: "unknown".to_string(),
+                    version_output: None,
+                    source: "manual_override".to_string(),
+                    checked_at: chrono::Utc::now(),
+                    evidence: Default::default(),
+                },
+            )
     } else if skip_upgrade {
         advance_to(
             &mut state,

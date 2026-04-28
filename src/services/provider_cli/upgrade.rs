@@ -782,6 +782,9 @@ mod tests {
             "entry point must be removed so npm install -g can create its own symlink"
         );
         // Backup must still be intact.
-        assert!(dest.exists(), "preserved backup must still exist after removal");
+        assert!(
+            dest.exists(),
+            "preserved backup must still exist after removal"
+        );
     }
 }
