@@ -1136,6 +1136,9 @@ fn process_sse_event(
                 match (snapshot_key, part_type.as_deref()) {
                     (Some(snapshot_key), Some("text")) => {
                         flush_pending_text_delta(sender, state, &snapshot_key);
+                        state
+                            .part_types
+                            .insert(snapshot_key.clone(), "text".to_string());
                         let entry = state.text_part_snapshots.entry(snapshot_key).or_default();
                         entry.push_str(delta);
                         append_text_delta(sender, state, delta);
@@ -1406,6 +1409,24 @@ mod tests {
         let events = [
             r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"O"}}"#,
             r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","partType":"text","field":"text","delta":"K"}}"#,
+        ];
+        let (msgs, stops) = parse_events(&events, "s1");
+        assert_eq!(stops, vec![Some(false), Some(false)]);
+        let text = msgs
+            .iter()
+            .filter_map(|msg| match msg {
+                StreamMessage::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "OK");
+    }
+
+    #[test]
+    fn test_typed_text_delta_persists_type_for_later_untyped_delta() {
+        let events = [
+            r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","partType":"text","field":"text","delta":"O"}}"#,
+            r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"K"}}"#,
         ];
         let (msgs, stops) = parse_events(&events, "s1");
         assert_eq!(stops, vec![Some(false), Some(false)]);
