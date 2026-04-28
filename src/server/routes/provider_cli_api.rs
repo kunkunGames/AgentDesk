@@ -410,7 +410,7 @@ mod tests {
     }
 
     fn make_state() -> AppState {
-        let db = crate::db::init(&crate::config::Config::default()).unwrap();
+        let db = crate::db::test_db();
         AppState::test_state(
             db,
             PolicyEngine::new(&crate::config::Config::default()).unwrap(),

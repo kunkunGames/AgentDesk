@@ -491,11 +491,10 @@ pub async fn patch_config_entries(
 /// SQLite-backed; retained as a `cfg(test)`-only helper. Production runtime seeds
 /// kv_meta defaults via `crate::db::postgres::apply_kv_seed_actions` (PG-only since #1306).
 #[cfg(test)]
-pub fn seed_config_defaults(conn: &libsql_rusqlite::Connection, config: &crate::config::Config) {
+pub fn seed_config_defaults(conn: &rusqlite::Connection, config: &crate::config::Config) {
     apply_kv_seed_actions(conn, &config_default_seed_actions(config));
 
     crate::services::settings::seed_runtime_config_defaults(conn, config);
-    crate::server::routes::escalation::seed_escalation_defaults(conn, config);
 }
 
 pub(crate) fn config_default_seed_actions(config: &crate::config::Config) -> Vec<KvSeedAction> {
@@ -550,20 +549,20 @@ pub(crate) fn config_default_seed_actions(config: &crate::config::Config) -> Vec
 }
 
 #[cfg(test)]
-fn apply_kv_seed_actions(conn: &libsql_rusqlite::Connection, actions: &[KvSeedAction]) {
+fn apply_kv_seed_actions(conn: &rusqlite::Connection, actions: &[KvSeedAction]) {
     for action in actions {
         match action {
             KvSeedAction::Put { key, value } => {
                 conn.execute(
                     "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                    libsql_rusqlite::params![key, value],
+                    rusqlite::params![key, value],
                 )
                 .ok();
             }
             KvSeedAction::PutIfAbsent { key, value } => {
                 conn.execute(
                     "INSERT OR IGNORE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                    libsql_rusqlite::params![key, value],
+                    rusqlite::params![key, value],
                 )
                 .ok();
             }
@@ -754,7 +753,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_db() -> db::Db {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db::schema::migrate(&conn).unwrap();
         db::wrap_conn(conn)
@@ -1121,7 +1120,7 @@ mod tests {
 
     #[test]
     fn seed_config_defaults_removes_retired_config_keys() {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db::schema::migrate(&conn).unwrap();
 
@@ -1160,7 +1159,7 @@ mod tests {
 
     #[test]
     fn seed_config_defaults_prefers_yaml_values_and_preserves_other_runtime_overrides() {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db::schema::migrate(&conn).unwrap();
 
@@ -1264,7 +1263,7 @@ mod tests {
 
     #[test]
     fn seed_config_defaults_can_reset_runtime_overrides_on_restart() {
-        let conn = libsql_rusqlite::Connection::open_in_memory().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         db::schema::migrate(&conn).unwrap();
 
