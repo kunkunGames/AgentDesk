@@ -1221,6 +1221,7 @@ impl TestHealthHarness {
             token_hash: super::settings::discord_token_hash("test-token"),
             provider: provider.clone(),
             api_port: 8791,
+            #[cfg(test)]
             sqlite: None,
             pg_pool: None,
             engine: None,
