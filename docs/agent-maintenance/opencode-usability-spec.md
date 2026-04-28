@@ -521,10 +521,12 @@ Required behavior:
    instead of duplicating hard-coded provider lists.
    The helper should include OpenCode and derive from
    `src/services/provider.rs` where possible.
-2. Update `/api/provider-cli` to include OpenCode in status, migration state,
-   and action validation (`src/server/routes/provider_cli_api.rs`).
-3. Update generated API docs so `/api/agents/setup`, `/api/provider-cli`,
-   `/api/analytics`, and `/api/analytics/invariants` all document OpenCode
+2. Do not add `/api/provider-cli` in the upstream port unless the upstream
+   provider-cli API subsystem lands first. The fork-only
+   `src/server/routes/provider_cli_api.rs` surface is intentionally excluded
+   from this PR to avoid introducing a partial unsupported API.
+3. Update generated API docs so `/api/agents/setup`, `/api/analytics`,
+   and `/api/analytics/invariants` all document OpenCode
    when they accept provider filters or provider ids
    (`src/server/routes/docs.rs`).
 4. Update `agentdesk.inflight.list()` to scan the provider registry or at
@@ -547,10 +549,8 @@ Required behavior:
 
 Acceptance:
 
-- `GET /api/provider-cli` returns an OpenCode row when no registry entry is
-  present and reports OpenCode migration state when it exists;
-- `PATCH /api/provider-cli/opencode` validates exactly like the other
-  supported providers;
+- no `/api/provider-cli` route is introduced by the upstream port while the
+  upstream API does not support that subsystem;
 - dashboard TypeScript builds with OpenCode in onboarding and meeting provider
   selectors;
 - `agentdesk.inflight.list()` includes `runtime/discord_inflight/opencode`;
@@ -608,9 +608,11 @@ Implemented in this PR:
 - Doctor/provider diagnostics now include OpenCode binary, non-managed-backend,
   MCP config, and `opencode serve` health checks; startup failures include
   bounded stdout/stderr context.
-- `/api/provider-cli`, provider CLI commands, API docs, embedded inflight
-  listing, restart/report copy, meeting provider validation, and review verdict
-  provider help all include OpenCode where the provider registry supports it.
+- provider CLI runtime commands, API docs, embedded inflight listing,
+  restart/report copy, meeting provider validation, and review verdict provider
+  help include OpenCode where the upstream provider registry supports it.
+  Fork-only `/api/provider-cli` status/action routes remain excluded because
+  upstream does not have that API surface.
 - Dashboard onboarding, meeting provider selectors, and rate-limit/token
   dashboard copy include OpenCode.
 - Rate-limit analytics includes OpenCode in the unsupported-provider telemetry
@@ -643,8 +645,6 @@ Not implemented in this PR:
   - SSE delta/update behavior listed in P0.
 - `src/services/mcp_config.rs`
   - OpenCode MCP sync/detection behavior listed in P1.
-- `src/server/routes/provider_cli_api.rs`
-  - OpenCode included in provider status and patch validation.
 - `src/server/routes/docs.rs`
   - OpenCode appears in provider enum/help text for supported API endpoints.
 - `src/engine/ops/exec_ops.rs`
@@ -664,17 +664,17 @@ Not implemented in this PR:
   should either use the MCP tools or report that AgentDesk cannot verify them.
 - Run the same hidden-context fixture through Codex and Claude formatting to
   ensure the shared sanitizer does not regress existing providers.
-- Open `/api/provider-cli` and the dashboard provider selectors and verify
-  OpenCode appears anywhere provider operations are offered.
+- Open the dashboard provider selectors and verify OpenCode appears anywhere
+  upstream-supported provider operations are offered. Do not expect
+  `/api/provider-cli` on this upstream port.
 
 ### Suggested commands
 
 - `cargo fmt --all --check`
-- `cargo test opencode --lib`
-- `cargo test response_sanitizer --lib`
-- `cargo test mcp_config --lib`
-- `cargo test provider_cli_api --lib`
-- `cargo test test_supported_provider_ids_follow_registry_order --lib`
+- `cargo test opencode`
+- `cargo test response_sanitizer`
+- `cargo test mcp_config`
+- `cargo test test_supported_provider_ids_follow_registry_order`
 - `cargo check --all-targets`
 - `npm --prefix dashboard run build`
 
@@ -719,7 +719,8 @@ Not implemented in this PR:
       serialization.
 - [x] Add OpenCode MCP sync/detection, preserving manual config.
 - [x] Update memory/health surfaces that currently only check Claude/Codex MCP.
-- [x] Include OpenCode in provider-cli server API status/action validation.
+- [x] Exclude fork-only `/api/provider-cli` server API changes from the
+      upstream port while upstream lacks that API surface.
 - [x] Update API docs for OpenCode-capable provider params.
 - [x] Include OpenCode in `agentdesk.inflight.list()`.
 - [x] Include OpenCode in dashboard onboarding and meeting provider selectors.

@@ -1019,6 +1019,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",
         ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCode => "opencode",
         ProviderKind::Qwen => "qwen",
         ProviderKind::Unsupported(_) => "unsupported",
     };
@@ -3373,6 +3374,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",
         ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCode => "opencode",
         ProviderKind::Qwen => "qwen",
         ProviderKind::Unsupported(_) => "unsupported",
     };
