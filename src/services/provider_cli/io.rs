@@ -108,7 +108,17 @@ pub fn load_launch_artifacts(root: &Path, provider: &str) -> Result<Vec<LaunchAr
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let content = std::fs::read_to_string(path)?;
+        let path_provider = launch_artifact_provider_hint_from_path(&path);
+        if path_provider
+            .as_deref()
+            .is_some_and(|value| value != provider)
+        {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => return Err(error.into()),
+        };
         if launch_artifact_provider_hint(&content).as_deref() != Some(provider) {
             continue;
         }
@@ -116,6 +126,14 @@ pub fn load_launch_artifacts(root: &Path, provider: &str) -> Result<Vec<LaunchAr
         artifacts.push(artifact);
     }
     Ok(artifacts)
+}
+
+fn launch_artifact_provider_hint_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    ["codex", "claude", "gemini", "opencode", "qwen"]
+        .into_iter()
+        .find(|provider| stem.starts_with(&format!("{provider}-")))
+        .map(str::to_string)
 }
 
 fn launch_artifact_provider_hint(content: &str) -> Option<String> {
@@ -236,6 +254,28 @@ mod tests {
             r#"{"provider":"codex","agent_id":123}"#,
         )
         .unwrap();
+
+        let result = load_launch_artifacts(dir.path(), "codex");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_launch_artifacts_skips_unreadable_artifact_for_other_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch_dir = paths::launch_artifacts_dir(dir.path());
+        std::fs::create_dir_all(launch_dir.join("qwen-unreadable.json")).unwrap();
+
+        let artifacts = load_launch_artifacts(dir.path(), "codex").unwrap();
+
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn load_launch_artifacts_fails_unreadable_artifact_for_requested_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch_dir = paths::launch_artifacts_dir(dir.path());
+        std::fs::create_dir_all(launch_dir.join("codex-unreadable.json")).unwrap();
 
         let result = load_launch_artifacts(dir.path(), "codex");
 

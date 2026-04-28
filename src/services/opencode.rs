@@ -679,7 +679,20 @@ fn text_part_snapshot_key(part_id: &str, message_id: Option<&str>) -> String {
         .unwrap_or_else(|| part_id.to_string())
 }
 
-fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
+fn message_id_from_value(value: &Value) -> Option<&str> {
+    value
+        .get("messageID")
+        .or_else(|| value.get("messageId"))
+        .or_else(|| value.get("message_id"))
+        .and_then(|v| v.as_str())
+}
+
+fn emit_text_part(
+    part: &Value,
+    sender: &Sender<StreamMessage>,
+    state: &mut SseMessageState,
+    event_message_id: Option<&str>,
+) {
     let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
     if text.is_empty() {
         return;
@@ -693,11 +706,7 @@ fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseM
         append_text_delta(sender, state, text);
         return;
     };
-    let message_id = part
-        .get("messageID")
-        .or_else(|| part.get("messageId"))
-        .or_else(|| part.get("message_id"))
-        .and_then(|v| v.as_str());
+    let message_id = message_id_from_value(part).or(event_message_id);
     let snapshot_key = text_part_snapshot_key(part_id, message_id);
 
     let previous = state
@@ -712,11 +721,16 @@ fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseM
     append_text_delta(sender, state, delta);
 }
 
-fn emit_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
+fn emit_part(
+    part: &Value,
+    sender: &Sender<StreamMessage>,
+    state: &mut SseMessageState,
+    event_message_id: Option<&str>,
+) {
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match part_type {
-        "text" => emit_text_part(part, sender, state),
+        "text" => emit_text_part(part, sender, state, event_message_id),
         "thinking" | "redactedThinking" => {
             let summary = part
                 .get("thinking")
@@ -810,7 +824,8 @@ fn process_sse_event(
 
         "part" => {
             let part = props.and_then(|p| p.get("part"))?;
-            emit_part(part, sender, state);
+            let message_id = props.and_then(message_id_from_value);
+            emit_part(part, sender, state, message_id);
             Some(false)
         }
 
@@ -824,11 +839,7 @@ fn process_sse_event(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 if let Some(part_id) = part_id {
-                    let message_id = props
-                        .and_then(|p| p.get("messageID"))
-                        .or_else(|| props.and_then(|p| p.get("messageId")))
-                        .or_else(|| props.and_then(|p| p.get("message_id")))
-                        .and_then(|v| v.as_str());
+                    let message_id = props.and_then(message_id_from_value);
                     let snapshot_key = text_part_snapshot_key(&part_id, message_id);
                     let entry = state.text_part_snapshots.entry(snapshot_key).or_default();
                     entry.push_str(delta);
@@ -840,7 +851,8 @@ fn process_sse_event(
 
         "message.part.updated" => {
             let part = props.and_then(|p| p.get("part"))?;
-            emit_part(part, sender, state);
+            let message_id = props.and_then(message_id_from_value);
+            emit_part(part, sender, state, message_id);
             Some(false)
         }
 
@@ -1007,7 +1019,7 @@ mod tests {
         let events = [
             r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"O"}}"#,
             r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"K"}}"#,
-            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-1","messageID":"m1","sessionID":"s1","type":"text","text":"OK"}}}"#,
+            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","messageID":"m1","part":{"id":"part-1","sessionID":"s1","type":"text","text":"OK"}}}"#,
         ];
         let (msgs, stops) = parse_events(&events, "s1");
         assert_eq!(stops, vec![Some(false), Some(false), Some(false)]);
