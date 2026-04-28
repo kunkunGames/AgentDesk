@@ -177,6 +177,10 @@ pub fn provider_registry() -> &'static [ProviderRegistryEntry] {
     PROVIDER_REGISTRY
 }
 
+pub fn supported_provider_ids() -> Vec<&'static str> {
+    provider_registry().iter().map(|entry| entry.id).collect()
+}
+
 impl ProviderKind {
     pub fn registry_entry(&self) -> Option<&'static ProviderRegistryEntry> {
         provider_registry()
@@ -1070,6 +1074,7 @@ mod tests {
         fold_read_output_result, followup_result_from_read_output_result, is_readonly_tool_policy,
         parse_provider_and_channel_from_tmux_name, poll_output_file_until_result,
         provider_registry, register_child_pid, run_retrying_stream_attempts,
+        supported_provider_ids,
     };
     use crate::dispatch::extract_thread_channel_id;
 
@@ -1163,6 +1168,10 @@ mod tests {
             ProviderKind::Gemini
         );
         assert_eq!(
+            ProviderKind::from_str_or_unsupported("OpenCode"),
+            ProviderKind::OpenCode
+        );
+        assert_eq!(
             ProviderKind::from_str_or_unsupported("Qwen"),
             ProviderKind::Qwen
         );
@@ -1213,12 +1222,24 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_from_str_opencode() {
+        assert_eq!(
+            ProviderKind::from_str("opencode"),
+            Some(ProviderKind::OpenCode)
+        );
+    }
+
+    #[test]
     fn test_provider_from_str_case_insensitive() {
         assert_eq!(ProviderKind::from_str("Claude"), Some(ProviderKind::Claude));
         assert_eq!(ProviderKind::from_str("CLAUDE"), Some(ProviderKind::Claude));
         assert_eq!(ProviderKind::from_str("CODEX"), Some(ProviderKind::Codex));
         assert_eq!(ProviderKind::from_str("Codex"), Some(ProviderKind::Codex));
         assert_eq!(ProviderKind::from_str("Gemini"), Some(ProviderKind::Gemini));
+        assert_eq!(
+            ProviderKind::from_str("OpenCode"),
+            Some(ProviderKind::OpenCode)
+        );
         assert_eq!(ProviderKind::from_str("Qwen"), Some(ProviderKind::Qwen));
     }
 
@@ -1242,9 +1263,13 @@ mod tests {
         assert!(name3.starts_with("AgentDesk-gemini-"));
         assert!(name3.contains("research-gm"));
 
-        let name4 = ProviderKind::Qwen.build_tmux_session_name("sandbox-qw");
-        assert!(name4.starts_with("AgentDesk-qwen-"));
-        assert!(name4.contains("sandbox-qw"));
+        let name4 = ProviderKind::OpenCode.build_tmux_session_name("sandbox-oc");
+        assert!(name4.starts_with("AgentDesk-opencode-"));
+        assert!(name4.contains("sandbox-oc"));
+
+        let name5 = ProviderKind::Qwen.build_tmux_session_name("sandbox-qw");
+        assert!(name5.starts_with("AgentDesk-qwen-"));
+        assert!(name5.contains("sandbox-qw"));
     }
 
     #[test]
@@ -1268,11 +1293,17 @@ mod tests {
         assert_eq!(provider3, ProviderKind::Gemini);
         assert_eq!(parsed_channel3, "research-gm");
 
-        let session4 = ProviderKind::Qwen.build_tmux_session_name("sandbox-qw");
+        let session4 = ProviderKind::OpenCode.build_tmux_session_name("sandbox-oc");
         let (provider4, parsed_channel4) =
             parse_provider_and_channel_from_tmux_name(&session4).unwrap();
-        assert_eq!(provider4, ProviderKind::Qwen);
-        assert_eq!(parsed_channel4, "sandbox-qw");
+        assert_eq!(provider4, ProviderKind::OpenCode);
+        assert_eq!(parsed_channel4, "sandbox-oc");
+
+        let session5 = ProviderKind::Qwen.build_tmux_session_name("sandbox-qw");
+        let (provider5, parsed_channel5) =
+            parse_provider_and_channel_from_tmux_name(&session5).unwrap();
+        assert_eq!(provider5, ProviderKind::Qwen);
+        assert_eq!(parsed_channel5, "sandbox-qw");
     }
 
     #[test]
@@ -1310,6 +1341,14 @@ mod tests {
         assert_eq!(
             ProviderKind::provider_for_cli_init_index(4),
             Some(ProviderKind::Qwen)
+        );
+    }
+
+    #[test]
+    fn test_supported_provider_ids_follow_registry_order() {
+        assert_eq!(
+            supported_provider_ids(),
+            vec!["claude", "codex", "gemini", "opencode", "qwen"]
         );
     }
 

@@ -1,6 +1,6 @@
 # OpenCode Usability Parity Spec
 
-> Status: implementation-ready spec
+> Status: PR #95 implementation spec and status record
 >
 > Last reviewed: 2026-04-28 against `origin/main` @ `fd052ce5`
 >
@@ -10,9 +10,9 @@
 
 ## Problem
 
-OpenCode is registered as a first-class provider, but its current runtime path
-is not yet as defensive as the Claude/Codex paths. In the monitoring channel
-case that motivated this spec, Discord-visible output included prompt/context
+OpenCode is registered as a first-class provider, but its pre-PR #95 runtime
+path was not yet as defensive as the Claude/Codex paths. In the monitoring
+channel case that motivated this spec, Discord-visible output included prompt/context
 blocks such as authoritative instructions, tool policy, role binding, and
 process narration that should have remained hidden implementation context.
 
@@ -21,22 +21,22 @@ This is not just a prompt-writing issue. The code paths differ:
 - Claude and Codex run through mature CLI/tmux-oriented provider paths.
 - OpenCode starts `opencode serve`, sends a REST prompt, reads SSE events, and
   normalizes those events into AgentDesk `StreamMessage`s.
-- The shared Discord formatter currently has a Codex-specific tool-log filter,
-  but no provider-neutral hidden-context sanitizer.
-- The runtime MCP sync path explicitly handles Claude and Codex, while OpenCode
-  currently relies on external `opencode.json` configuration.
+- Before PR #95, the shared Discord formatter had a Codex-specific tool-log
+  filter but no provider-neutral hidden-context sanitizer.
+- Before PR #95, the runtime MCP sync path explicitly handled Claude and Codex,
+  while OpenCode relied on external `opencode.json` configuration.
 
 The goal is therefore usability parity, not identical implementation.
 
-## Current Implementation
+## Pre-PR #95 Baseline
 
 ### Provider registry and execution
 
-OpenCode is present in the provider registry:
+At the start of PR #95, OpenCode was present in the provider registry:
 
 - `src/services/provider.rs:133` registers `id: "opencode"`.
-- `src/services/provider.rs:139-143` advertises structured output, resume, and
-  tool-stream support.
+- `src/services/provider.rs:139-143` advertised structured output, resume, and
+  tool-stream support, even though real HTTP session resume was not implemented.
 - `src/services/provider.rs:150-151` sets a 128k default context window and
   `managed_tmux_backend: false`.
 
@@ -54,7 +54,7 @@ execution switch:
 
 The OpenCode provider backend is `src/services/opencode.rs`.
 
-The current flow is:
+The baseline flow was:
 
 1. Resolve the binary from `AGENTDESK_OPENCODE_PATH` or `PATH`
    (`src/services/opencode.rs:29-38`).
@@ -66,7 +66,7 @@ The current flow is:
 4. Read SSE lines until `session.idle` and emit `StreamMessage::Done`
    (`src/services/opencode.rs:316-390`).
 
-The prompt is currently sent as a single text part:
+The prompt was sent as a single text part:
 
 - `src/services/opencode.rs:283-290` concatenates `system_prompt` and `prompt`
   as plain text.
@@ -76,8 +76,8 @@ The prompt is currently sent as a single text part:
 - `remote_profile` is explicitly unsupported
   (`src/services/opencode.rs:109-113`).
 
-This means OpenCode is not receiving the same role separation that Claude gets
-through `--append-system-prompt`, and it is not receiving the same structured
+This meant OpenCode did not receive the same role separation that Claude gets
+through `--append-system-prompt`, and it did not receive the same structured
 turn wrapper that Codex gets through `compose_structured_turn_prompt`.
 
 ### Verified OpenCode API constraints
@@ -106,7 +106,7 @@ target runtime accepts it, but must not invent unsupported
 
 ### OpenCode SSE handling
 
-OpenCode currently normalizes these event shapes:
+The baseline OpenCode SSE normalizer handled these event shapes:
 
 - `session.status` -> `StreamMessage::StatusUpdate`
   (`src/services/opencode.rs:423-444`)
@@ -161,40 +161,37 @@ deliver them.
 
 ### MCP and skills
 
-MCP parity is currently partial:
+PR #95 implements OpenCode MCP detection and managed sync as an AgentDesk
+consumer surface:
 
-- Claude receives runtime MCP config through
-  `src/services/mcp_config.rs:49-51`.
-- Codex syncs managed MCP servers with `codex mcp add/remove`
-  (`src/services/mcp_config.rs:60-110`).
-- `provider_has_memento_mcp(...)` checks runtime config, Claude global config,
-  and Codex config, but there is no OpenCode-specific config detector/syncer
-  in `src/services/mcp_config.rs`.
-- server memory API only considers Claude/Codex for memento-MCP availability
-  (`src/server/routes/memory_api.rs:57-61`).
-
-That last point is an actual AgentDesk API gap, not just missing UI copy:
-`detect_memory_backend()` only checks Claude/Codex before selecting the
-Memento backend, and `provider_has_mcp_server(...)` returns `false` for
-providers outside the Claude/Codex match arms
-(`src/services/mcp_config.rs:37-46`). Until OpenCode detection is implemented,
-an OpenCode-side `opencode.json` MCP entry can be present but invisible to the
-memory API and related health/status surfaces.
+- Claude receives runtime MCP config through `~/.claude/.mcp.json`.
+- Codex syncs managed MCP servers with `codex mcp add/remove`.
+- OpenCode syncs managed runtime MCP servers into
+  `~/.config/opencode/opencode.json` while preserving manual top-level fields
+  and manual `mcp` entries.
+- OpenCode MCP entries use the verified remote shape
+  `{"type":"remote","url":"...","enabled":true,"headers":{"Authorization":"Bearer {env:...}"}}`.
+- AgentDesk records managed OpenCode MCP state under the runtime config
+  directory so later syncs remove only entries previously managed by AgentDesk.
+- `provider_has_memento_mcp(...)` and the memory API backend detector now check
+  all registry providers, so OpenCode memento-MCP availability is not hidden
+  behind Claude/Codex-only detection.
 
 Skill command prompting does recognize OpenCode:
 
 - `src/services/discord/commands/skill.rs:75-85` renders an OpenCode skill
   instruction.
 
-However, the skill path depends on the active OpenCode runtime having the
-expected skill files/config available. There is no AgentDesk-level OpenCode
-skill-sync or MCP-sync contract in this repo yet.
+However, the skill path still depends on the active OpenCode runtime having the
+expected skill files/config available. The runtime skill-sync contract lives in
+the managed `skill-sync` skill; this repo only documents and consumes the
+resulting OpenCode skill roots.
 
-### Additional OpenCode parity gaps
+### Additional OpenCode parity gaps found
 
 The 2026-04-28 code audit found several gaps beyond prompt/output cleanup:
 
-- OpenCode advertises `supports_resume: true` and `resume_without_reset: true`
+- OpenCode advertised `supports_resume: true` and `resume_without_reset: true`
   (`src/services/provider.rs:139-147`), but
   `src/services/opencode.rs:94-107` ignores `_session_id`, always creates a new
   OpenCode session (`src/services/opencode.rs:197-199`), then disposes and
@@ -202,58 +199,19 @@ The 2026-04-28 code audit found several gaps beyond prompt/output cleanup:
   Discord callers pass the session id through
   `src/services/discord/router/message_handler.rs:1461-1474` and
   `:3389-3402`, so the public capability currently overpromises.
-- OpenCode simple execution does not honor the caller's cancellation token:
+- OpenCode simple execution did not honor the caller's cancellation token:
   `execute_command_simple_cancellable(...)` accepts `_cancel_token` but creates
   a new local token instead (`src/services/opencode.rs:40-55`). The timeout
   path in `src/services/provider_exec.rs:68-87` cancels the caller token and
   kills the PID registered on that token, so simple OpenCode timeouts can leave
   the spawned `opencode serve` path running until it exits on its own.
-- OpenCode model overrides are not wired to the actual OpenCode API shape.
+- OpenCode model overrides were not wired to the actual OpenCode API shape.
   AgentDesk sends `{"modelID": ...}` when creating a session
   (`src/services/opencode.rs:251-256`), but OpenCode `Session.CreateInput`
   only accepts session metadata such as `parentID`, `title`, `permission`, and
   `workspaceID` (`packages/opencode/src/session/session.ts:179-185`). The model
   belongs in `PromptInput.model` as `{ providerID, modelID }`
   (`packages/opencode/src/session/prompt.ts:1677-1688`).
-- Doctor/provider health has an OpenCode check id and display label
-  (`src/cli/doctor/orchestrator.rs:870-877`, `:2252-2258`), but
-  `build_provider_checks(...)` only schedules Claude, Codex, Gemini, and Qwen
-  (`src/cli/doctor/orchestrator.rs:903-920`).
-- Runtime skill sync still targets Claude/Codex/Gemini/Qwen but not OpenCode:
-  `src/runtime_layout/skill_sync.rs:569-576` falls unknown providers back to
-  Codex, `src/server/routes/skills_api.rs:100-117` scans only release skills,
-  Codex, and Claude roots, and `skills/manifest.json` exposes the built-in
-  memory skills only to Claude/Codex. This conflicts with the Discord runtime
-  scanner, which already knows OpenCode's `.opencode/skills` roots
-  (`src/services/discord/mod.rs:2657-2678`).
-- `opencode serve` stdout/stderr are both discarded
-  (`src/services/opencode.rs:151-166`), so failed startup or health timeout
-  diagnostics lose provider-side error text that would help operators.
-- Provider CLI support is split: the CLI registry/update path includes
-  OpenCode (`src/cli/provider_cli/mod.rs:22`,
-  `src/services/provider_cli/registry.rs:221-224`), but the server API still
-  hides and rejects OpenCode because `src/server/routes/provider_cli_api.rs:25`
-  hard-codes `ALL_PROVIDERS = ["codex", "claude", "gemini", "qwen"]` and
-  `is_supported_provider(...)` delegates to that list
-  (`src/server/routes/provider_cli_api.rs:359-360`).
-- Server API docs are stale for OpenCode-capable flows: `/api/agents/setup`
-  validates through `ProviderKind::from_str(...)`
-  (`src/server/routes/agents_setup.rs:205`), but
-  `src/server/routes/docs.rs:838-884` still documents only
-  Claude/Codex/Gemini/Qwen. Provider CLI and analytics docs repeat the same
-  omission (`src/server/routes/docs.rs:3076-3102`, `:3461-3486`).
-- The JS embedded runtime cannot see OpenCode inflight turns:
-  `src/engine/ops/exec_ops.rs:160-170` scans only
-  `runtime/discord_inflight/{claude,codex,gemini,qwen}`.
-- Dashboard provider selectors are inconsistent. Agent manager types include
-  OpenCode (`dashboard/src/types/index.ts:37-45`), but onboarding and meeting
-  surfaces restrict command/reviewer providers to Claude/Codex/Gemini/Qwen
-  (`dashboard/src/components/OnboardingWizard.tsx:22`,
-  `dashboard/src/components/onboardingDraft.ts:15-17`,
-  `dashboard/src/components/MeetingMinutesView.tsx:56`).
-- Rate-limit analytics has an explicit unsupported-provider mechanism for
-  Qwen but not OpenCode (`src/server/routes/analytics.rs:21-24`), and the
-  provider sort order also omits OpenCode (`src/server/routes/analytics.rs:1354-1358`).
 - DB channel bindings have dedicated Claude/Codex columns but no dedicated
   OpenCode channel field. Config supports `AgentChannels.opencode`
   (`src/config.rs:245-255`), while DB sync folds OpenCode into
@@ -261,12 +219,6 @@ The 2026-04-28 code audit found several gaps beyond prompt/output cleanup:
   (`src/db/agents.rs:325-341`, `src/db/postgres.rs:437-451`). This is workable
   for one primary non-Claude/Codex provider, but it is not full per-provider
   channel parity.
-- Meeting and CLI help copy still excludes OpenCode even where parsing goes
-  through `ProviderKind::from_str(...)`
-  (`src/services/discord/commands/meeting_cmd.rs:10-43`,
-  `src/services/discord/meeting_orchestrator.rs:1375-1432`,
-  `src/cli/provider_cli/mod.rs:34-42`,
-  `src/cli/dcserver.rs:468-500`).
 
 ## Target Experience
 
@@ -369,7 +321,7 @@ Rationale: existing DB sync already treats Gemini/OpenCode/Qwen as
 provider-primary providers, while only Claude/Codex have dedicated channel
 columns.
 
-## Proposed Implementation Contract
+## Implementation Contract
 
 ### P0. OpenCode runtime contract correctness
 
@@ -560,13 +512,13 @@ Acceptance:
 
 ### P1. OpenCode provider-surface completeness
 
-Remove the remaining hard-coded Claude/Codex/Gemini/Qwen provider lists from
-server, dashboard, CLI, and embedded runtime surfaces.
+Remove the remaining hard-coded provider lists from server, dashboard, CLI,
+and embedded runtime surfaces.
 
 Required behavior:
 
 1. Add a small registry-backed helper for "AgentDesk-supported CLI providers"
-   instead of duplicating `["claude", "codex", "gemini", "qwen"]` lists.
+   instead of duplicating hard-coded provider lists.
    The helper should include OpenCode and derive from
    `src/services/provider.rs` where possible.
 2. Update `/api/provider-cli` to include OpenCode in status, migration state,
@@ -647,14 +599,34 @@ Implemented in this PR:
   update follows streamed deltas.
 - Final Discord formatting now runs a provider-neutral hidden-context sanitizer
   before provider-specific output filtering.
+- OpenCode MCP sync/detection writes managed AgentDesk MCP servers to
+  `~/.config/opencode/opencode.json`, preserves manual config, removes stale
+  managed entries through runtime sync state, and refuses to overwrite malformed
+  JSON.
+- `provider_has_memento_mcp(...)` and the memory backend detector now inspect
+  all supported providers, including OpenCode.
+- Doctor/provider diagnostics now include OpenCode binary, non-managed-backend,
+  MCP config, and `opencode serve` health checks; startup failures include
+  bounded stdout/stderr context.
+- `/api/provider-cli`, provider CLI commands, API docs, embedded inflight
+  listing, restart/report copy, meeting provider validation, and review verdict
+  provider help all include OpenCode where the provider registry supports it.
+- Dashboard onboarding, meeting provider selectors, and rate-limit/token
+  dashboard copy include OpenCode.
+- Rate-limit analytics includes OpenCode in the unsupported-provider telemetry
+  path until a real OpenCode rate-limit source exists.
 
 Not implemented in this PR:
 
-- OpenCode MCP sync/detection and `provider_has_memento_mcp(...)` integration.
-- Provider CLI/API/dashboard provider-surface completeness.
 - Exact OpenCode permission-key serialization for AgentDesk allowed tools.
 - Runtime fallback when an older or drifted OpenCode build rejects top-level
   `system`; this remains a follow-up unless observed API drift requires it.
+- Real OpenCode HTTP session resume/reuse; capability metadata remains false
+  instead of over-promising.
+- OpenCode model catalog discovery; the supported override path is explicit
+  `providerID/modelID` input.
+- Dedicated OpenCode DB channel columns; OpenCode keeps the provider-primary
+  channel-binding model used by Gemini/Qwen.
 
 ### Rust unit tests
 
@@ -680,6 +652,8 @@ Not implemented in this PR:
 - `src/server/routes/analytics.rs`
   - OpenCode appears as unsupported for rate-limit telemetry when recently
     used, or has real telemetry if implemented.
+- `src/services/provider.rs`, `src/cli/init.rs`, and dispatch/config suffix
+  tests cover OpenCode in registry-derived provider lists.
 
 ### Integration or smoke checks
 
@@ -699,7 +673,10 @@ Not implemented in this PR:
 - `cargo test opencode --lib`
 - `cargo test response_sanitizer --lib`
 - `cargo test mcp_config --lib`
+- `cargo test provider_cli_api --lib`
+- `cargo test test_supported_provider_ids_follow_registry_order --lib`
 - `cargo check --all-targets`
+- `npm --prefix dashboard run build`
 
 ## Rollout Plan
 
@@ -712,12 +689,11 @@ Not implemented in this PR:
    - no duplicated streamed text;
    - clear final status.
 3. Land OpenCode prompt shaping after the sanitizer is already in place.
-4. Add provider-surface completeness fixes for API docs, provider-cli API,
-   dashboard selectors, inflight listing, and analytics. These changes are
-   mostly low-risk and prevent operators from thinking OpenCode is unsupported
-   when the runtime can handle it.
-5. Add MCP sync/detection after prompt/output safety is stable.
-6. Add doctor/health polish once MCP behavior is deterministic.
+4. Deploy to a single OpenCode-bound monitoring channel and verify
+   `/model`, `/meeting`, MCP visibility, and concise final answers in a real
+   Discord turn.
+5. Keep exact OpenCode tool permission mapping, model catalog discovery, and
+   real HTTP session reuse as separate follow-ups with provider-version tests.
 
 ## Risks and Guardrails
 
@@ -741,16 +717,16 @@ Not implemented in this PR:
 - [x] Correct OpenCode provider capability metadata for non-resume behavior.
 - [x] Add OpenCode `providerID/modelID` override validation and prompt
       serialization.
-- [ ] Add OpenCode MCP sync/detection, preserving manual config.
-- [ ] Update memory/health surfaces that currently only check Claude/Codex MCP.
-- [ ] Include OpenCode in provider-cli server API status/action validation.
-- [ ] Update API docs for OpenCode-capable provider params.
-- [ ] Include OpenCode in `agentdesk.inflight.list()`.
-- [ ] Include OpenCode in dashboard onboarding and meeting provider selectors.
-- [ ] Include OpenCode in rate-limit unsupported-provider analytics or add real
+- [x] Add OpenCode MCP sync/detection, preserving manual config.
+- [x] Update memory/health surfaces that currently only check Claude/Codex MCP.
+- [x] Include OpenCode in provider-cli server API status/action validation.
+- [x] Update API docs for OpenCode-capable provider params.
+- [x] Include OpenCode in `agentdesk.inflight.list()`.
+- [x] Include OpenCode in dashboard onboarding and meeting provider selectors.
+- [x] Include OpenCode in rate-limit unsupported-provider analytics or add real
       telemetry.
-- [ ] Preserve and document the provider-primary DB channel-binding model for
+- [x] Preserve and document the provider-primary DB channel-binding model for
       OpenCode.
-- [ ] Update CLI/Discord help text that lists supported providers.
-- [ ] Update OpenCode role/response contract docs or prompts.
+- [x] Update CLI/Discord help text that lists supported providers.
+- [x] Update OpenCode role/response contract docs or prompts.
 - [x] Run formatting, targeted tests, and `cargo check --all-targets`.

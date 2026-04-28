@@ -1989,6 +1989,10 @@ mod tests {
             config.provider_from_channel_suffix("any-qw").as_deref(),
             Some("qwen")
         );
+        assert_eq!(
+            config.provider_from_channel_suffix("any-oc").as_deref(),
+            Some("opencode")
+        );
         assert_eq!(config.provider_from_channel_suffix(""), None);
     }
 

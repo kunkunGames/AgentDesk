@@ -27,7 +27,7 @@ pub(crate) enum Commands {
         /// Discord channel ID for restart completion report
         #[arg(long)]
         report_channel_id: Option<u64>,
-        /// Provider for restart report (claude, codex, gemini, or qwen)
+        /// Provider for restart report (claude, codex, gemini, opencode, or qwen)
         #[arg(long, value_enum)]
         report_provider: Option<ReportProvider>,
         /// Existing message ID to edit for restart report
@@ -592,6 +592,7 @@ pub(crate) enum ReportProvider {
     Claude,
     Codex,
     Gemini,
+    OpenCode,
     Qwen,
 }
 

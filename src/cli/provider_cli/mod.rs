@@ -19,8 +19,6 @@ use crate::services::provider_cli::upgrade::{
 };
 use crate::services::provider_cli::{build_retention_set, cleanup_dry_run};
 
-const SUPPORTED_PROVIDERS: &[&str] = &["codex", "claude", "gemini", "opencode", "qwen"];
-
 #[derive(Args)]
 pub struct ProviderCliArgs {
     #[command(subcommand)]
@@ -31,7 +29,7 @@ pub struct ProviderCliArgs {
 pub enum ProviderCliAction {
     /// Show current registry channels and migration states
     Status {
-        /// Restrict output to a single provider (codex, claude, gemini, qwen)
+        /// Restrict output to a single provider (claude, codex, gemini, opencode, qwen)
         provider: Option<String>,
         /// Output raw JSON instead of the default table
         #[arg(long)]
@@ -39,7 +37,7 @@ pub enum ProviderCliAction {
     },
     /// Show what a migration would do without running it
     Plan {
-        /// Provider to plan (codex, claude, gemini, qwen)
+        /// Provider to plan (claude, codex, gemini, opencode, qwen)
         provider: String,
     },
     /// [step] Snapshot current binary and run upgrade
@@ -136,7 +134,7 @@ fn print_json(value: &serde_json::Value) {
 
 fn normalize_provider_arg(provider: &str) -> Result<String, String> {
     let provider = provider.trim().to_ascii_lowercase();
-    if SUPPORTED_PROVIDERS.contains(&provider.as_str()) {
+    if crate::services::provider::supported_provider_ids().contains(&provider.as_str()) {
         Ok(provider)
     } else {
         Err(format!("unsupported provider: {provider}"))
@@ -228,7 +226,7 @@ fn cmd_status(provider: Option<&str>, json_output: bool) -> Result<(), String> {
     let filter: Vec<&str> = if let Some(p) = provider {
         vec![p]
     } else {
-        SUPPORTED_PROVIDERS.to_vec()
+        crate::services::provider::supported_provider_ids()
     };
 
     if json_output {
@@ -658,8 +656,8 @@ fn cmd_cleanup(provider: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
 
-    let migration_states: Vec<_> = ["codex", "claude", "gemini", "opencode", "qwen"]
-        .iter()
+    let migration_states: Vec<_> = crate::services::provider::supported_provider_ids()
+        .into_iter()
         .filter_map(|p| load_migration_state(&root, p).ok().flatten())
         .collect();
 
