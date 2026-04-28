@@ -297,7 +297,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let artifact_dir = crate::services::provider_cli::paths::launch_artifacts_dir(root.path());
         std::fs::create_dir_all(&artifact_dir).unwrap();
-        std::fs::write(artifact_dir.join("corrupt.json"), "{not valid json").unwrap();
+        std::fs::write(
+            artifact_dir.join("corrupt.json"),
+            r#"{"provider":"codex","agent_id":123}"#,
+        )
+        .unwrap();
 
         let evaluation = evaluate_session_migration_guards(
             root.path(),
