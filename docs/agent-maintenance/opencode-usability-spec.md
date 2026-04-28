@@ -304,6 +304,71 @@ Non-goals:
 - Do not require exact model catalog parity with Claude/Codex.
 - Do not broaden Discord outbound migration or v3 delivery work.
 
+## Implementation Decisions
+
+These decisions are locked for PR #95 so implementation does not need another
+round of provider-shape interpretation.
+
+### OpenCode model override format
+
+Use a Qwen-like "configured default plus custom model id" experience, but keep
+OpenCode's required provider/model split explicit.
+
+Required behavior:
+
+- `default` means AgentDesk omits the model override from the OpenCode prompt
+  payload.
+- non-default overrides MUST use canonical `providerID/modelID` syntax, for
+  example `anthropic/claude-sonnet-4-5` or `openai/gpt-5.1`.
+- AgentDesk converts that value to OpenCode `PromptInput.model` as
+  `{"providerID":"...","modelID":"..."}` on `/prompt_async`.
+- bare model ids are rejected with a concise validation error instead of
+  guessing a provider.
+
+Rationale: Qwen can resolve model settings from `.qwen/settings.json`, while
+OpenCode prompt execution needs the provider id and model id as separate API
+fields.
+
+### OpenCode allowed tools contract
+
+Do not map AgentDesk `_allowed_tools` to OpenCode's top-level `tools` field in
+P0 unless exact OpenCode permission keys are verified.
+
+Required behavior:
+
+- keep OpenCode outbound safety enforced by AgentDesk-side sanitization and
+  command/tool execution guards;
+- include a concise advisory tool policy in the OpenCode `system` prompt when
+  exact tool permission mapping is unavailable;
+- add `OPENCODE_SUPPORTED_ALLOWED_TOOLS` only after tests prove the mapping
+  against the current OpenCode permission key names;
+- do not reuse Qwen's `QWEN_SUPPORTED_ALLOWED_TOOLS` table for OpenCode.
+
+Rationale: Qwen has an explicit AgentDesk tool compatibility table in
+`src/services/qwen.rs`, but OpenCode's `tools`/permission semantics are not the
+same contract.
+
+### OpenCode channel binding model
+
+Keep the current Qwen/Gemini-style provider-primary DB channel model for PR
+#95. Do not add a dedicated OpenCode DB channel column in this implementation
+wave.
+
+Required behavior:
+
+- YAML/config may continue to expose `AgentChannels.opencode`.
+- DB sync keeps OpenCode as the provider-primary `discord_channel_id` when
+  `agent.provider == "opencode"`.
+- Dashboard/API UI must not imply that one DB agent can simultaneously hold an
+  independent Claude channel, Codex channel, and OpenCode channel through
+  dedicated columns.
+- a dedicated `discord_channel_oc`-style migration is deferred until there is a
+  concrete requirement for simultaneous per-provider DB bindings.
+
+Rationale: existing DB sync already treats Gemini/OpenCode/Qwen as
+provider-primary providers, while only Claude/Codex have dedicated channel
+columns.
+
 ## Proposed Implementation Contract
 
 ### P0. OpenCode runtime contract correctness
@@ -320,7 +385,8 @@ Required behavior:
 3. Pass the caller's `CancelToken` through OpenCode simple execution and
    register the spawned `opencode serve` PID on that same token.
 4. Move model override handling out of session creation and into
-   `/prompt_async` as OpenCode `PromptInput.model`.
+   `/prompt_async` as OpenCode `PromptInput.model`, using the locked
+   `providerID/modelID` AgentDesk syntax described above.
 5. Preserve current remote-profile rejection until an explicit remote OpenCode
    execution path exists.
 
@@ -328,7 +394,8 @@ Acceptance:
 
 - tests prove OpenCode simple timeout/cancel registers the child PID on the
   caller token;
-- tests prove non-default OpenCode model selection serializes as
+- tests prove non-default OpenCode model selection accepts
+  `providerID/modelID`, rejects bare model ids, and serializes as
   `{"model":{"providerID": "...", "modelID": "..."}}` in the prompt payload;
 - restart/control copy no longer promises resumability when OpenCode cannot
   resume;
@@ -383,10 +450,11 @@ Required behavior:
    OpenCode's top-level `system` field, not prepended to the first text part.
 2. Keep `parts` focused on the visible user request and supported file/agent
    parts.
-3. Map `_allowed_tools` into OpenCode's top-level `tools` permission map only
-   when the AgentDesk tool names can be translated to OpenCode permission keys.
-   If that mapping is not exact yet, include a concise advisory tool policy in
-   `system` and surface the limitation in diagnostics.
+3. For PR #95, do not send `_allowed_tools` as OpenCode's top-level `tools`
+   permission map unless exact OpenCode permission keys have been verified by
+   tests. Until then, include a concise advisory tool policy in `system`,
+   surface the limitation in diagnostics, and keep AgentDesk-side sanitization
+   and execution guards as the enforcing layer.
 4. Keep a compatibility fallback for older or drifted OpenCode runtimes: if the
    runtime rejects top-level `system`, use a structured text wrapper equivalent
    to `compose_structured_turn_prompt(...)` and log the API drift.
@@ -400,8 +468,9 @@ Acceptance:
 - tests assert that the user request remains in `parts` and hidden
   instructions do not get prepended to the user text;
 - tests cover empty system prompt and empty tool policy;
-- tests cover successful tool permission mapping and the documented advisory
-  fallback for unmapped tools;
+- tests cover the documented advisory fallback for `_allowed_tools`; if exact
+  permission mapping is added later, tests must also cover the successful
+  OpenCode permission-map serialization path;
 - the final Discord sanitizer remains required as defense-in-depth.
 
 ### P0. OpenCode SSE text-state parity
@@ -517,13 +586,10 @@ Required behavior:
 6. Add OpenCode to the rate-limit unsupported-provider path unless a real
    OpenCode telemetry source is implemented first
    (`src/server/routes/analytics.rs`).
-7. Decide the channel-binding model before adding UI affordances:
-   - preferred: add a dedicated OpenCode channel column/migration and API
-     response field if simultaneous Claude/Codex/OpenCode bindings per agent
-     are required;
-   - acceptable short-term: keep the current provider-primary storage model
-     but document that OpenCode cannot have an independent DB channel column
-     yet.
+7. Keep the current Qwen/Gemini-style provider-primary channel-binding model:
+   OpenCode uses `discord_channel_id` when `agent.provider == "opencode"`.
+   Do not add a dedicated OpenCode DB channel column in PR #95, and make UI/API
+   copy explicit that independent OpenCode DB channel parity is deferred.
 8. Update CLI and Discord help/error text so OpenCode is listed anywhere
    `ProviderKind::from_str(...)` would accept it.
 
@@ -553,6 +619,8 @@ These are useful but not required for first parity:
   sees the same `.opencode/skills` content that Discord runtime scanning sees.
 - registry-driven provider list tests that fail when a server/dashboard/CLI
   surface omits a provider that `ProviderKind` supports.
+- dedicated OpenCode DB channel column/API fields if AgentDesk later needs
+  simultaneous Claude/Codex/OpenCode channel bindings for one DB agent.
 
 ## Regression Test Plan
 
@@ -646,7 +714,8 @@ These are useful but not required for first parity:
 - [ ] Include OpenCode in dashboard onboarding and meeting provider selectors.
 - [ ] Include OpenCode in rate-limit unsupported-provider analytics or add real
       telemetry.
-- [ ] Decide and document the DB channel-binding model for OpenCode.
+- [ ] Preserve and document the provider-primary DB channel-binding model for
+      OpenCode.
 - [ ] Update CLI/Discord help text that lists supported providers.
 - [ ] Update OpenCode role/response contract docs or prompts.
 - [ ] Run formatting, targeted tests, and `cargo check --all-targets`.
