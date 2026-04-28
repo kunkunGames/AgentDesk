@@ -252,6 +252,13 @@ async fn transition_card_to_backlog_with_cleanup(
     Ok(result)
 }
 
+fn pg_pool_required_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "postgres backend required for kanban transition (#1384)"})),
+    )
+}
+
 fn load_retry_dispatch_spec(
     conn: &libsql_rusqlite::Connection,
     card_id: &str,
@@ -548,9 +555,12 @@ pub async fn update_card(
                 );
             }
 
+            let Some(pool) = state.pg_pool_ref() else {
+                return pg_pool_required_error();
+            };
             let transition_result = if new_s == "backlog" {
                 transition_card_to_backlog_with_cleanup(&state, &id, "api:manual-backlog").await
-            } else if let Some(pool) = state.pg_pool_ref() {
+            } else {
                 crate::kanban::transition_status_with_opts_pg_only(
                     pool,
                     &state.engine,
@@ -560,15 +570,6 @@ pub async fn update_card(
                     crate::engine::transition::ForceIntent::None,
                 )
                 .await
-            } else {
-                crate::kanban::transition_status_with_opts(
-                    legacy_db(&state),
-                    &state.engine,
-                    &id,
-                    new_s,
-                    "api",
-                    crate::engine::transition::ForceIntent::None,
-                )
             };
 
             match transition_result {
@@ -803,121 +804,7 @@ pub async fn assign_card(
         };
     }
 
-    let old_status: Option<String> = {
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        conn.query_row(
-            "SELECT status FROM kanban_cards WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .ok()
-    };
-
-    if old_status.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "card not found"})),
-        );
-    }
-    let old_status = old_status.unwrap();
-
-    let conn = match legacy_db(&state).lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    // Pipeline-driven: assign to the first dispatchable state (or second state)
-    crate::pipeline::ensure_loaded();
-    let pipeline = crate::pipeline::get();
-    let ready_state = pipeline
-        .dispatchable_states()
-        .into_iter()
-        .next()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            tracing::warn!("Pipeline has no dispatchable states, using initial state");
-            pipeline.initial_state().to_string()
-        });
-    // #155: Split into assignee update (metadata) + status transition via reducer
-    match conn.execute(
-        "UPDATE kanban_cards SET assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-        libsql_rusqlite::params![body.agent_id, id],
-    ) {
-        Ok(0) => {
-            return (StatusCode::NOT_FOUND, Json(json!({"error": "card not found"})));
-        }
-        Ok(_) => {}
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    }
-    drop(conn);
-
-    // #255: Walk through free transitions to reach the dispatchable state.
-    // e.g., backlog → ready → requested (each step fires hooks, clocks, audit).
-    if old_status != ready_state {
-        if let Some(path) = pipeline.free_path_to_dispatchable(&old_status) {
-            for step in &path {
-                if let Err(e) = crate::kanban::transition_status_with_opts(
-                    legacy_db(&state),
-                    &state.engine,
-                    &id,
-                    step,
-                    "assign",
-                    crate::engine::transition::ForceIntent::None,
-                ) {
-                    tracing::warn!("[assign_card] walk step to '{step}' failed: {e}");
-                    break;
-                }
-            }
-        } else {
-            // Direct transition (already dispatchable or single hop)
-            if let Err(e) = crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
-                &state.engine,
-                &id,
-                &ready_state,
-                "assign",
-                crate::engine::transition::ForceIntent::None,
-            ) {
-                tracing::warn!("[assign_card] transition failed: {e}");
-            }
-        }
-    }
-
-    let card = legacy_db(&state).lock().ok().and_then(|conn| {
-        conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-            card_row_to_json(row)
-        })
-        .ok()
-    });
-
-    match card {
-        Some(c) => {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", c.clone());
-            (StatusCode::OK, Json(json!({"card": c})))
-        }
-        None => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "failed to read card after assign"})),
-        ),
-    }
+    pg_pool_required_error()
 }
 
 /// DELETE /api/kanban-cards/:id
@@ -1746,17 +1633,21 @@ pub async fn bulk_action(
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     for card_id in &body.card_ids {
+        let Some(pool) = state.pg_pool_ref() else {
+            return pg_pool_required_error();
+        };
         let transition_result = if target_status == "backlog" {
             transition_card_to_backlog_with_cleanup(&state, card_id, "bulk-action:backlog").await
         } else {
-            crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
+            crate::kanban::transition_status_with_opts_pg_only(
+                pool,
                 &state.engine,
                 card_id,
                 &target_status,
                 "bulk-action",
                 crate::engine::transition::ForceIntent::OperatorOverride,
             )
+            .await
         };
 
         match transition_result {
@@ -1920,129 +1811,7 @@ pub async fn assign_issue(
         };
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
-
-    let conn = match legacy_db(&state).lock() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            );
-        }
-    };
-
-    // Check for existing card with same github_issue_number + repo_id
-    if let Ok(existing_id) = conn.query_row(
-        "SELECT id FROM kanban_cards WHERE github_issue_number = ?1 AND repo_id = ?2",
-        libsql_rusqlite::params![body.github_issue_number, body.github_repo],
-        |row| row.get::<_, String>(0),
-    ) {
-        // Update existing card instead of creating duplicate
-        // COALESCE: preserve existing description when incoming value is NULL
-        let _ = conn.execute(
-            "UPDATE kanban_cards SET title = ?1, assigned_agent_id = ?2, github_issue_url = ?3, description = COALESCE(?4, description), updated_at = datetime('now') WHERE id = ?5",
-            libsql_rusqlite::params![body.title, body.assignee_agent_id, body.github_issue_url, body.description, existing_id],
-        );
-        drop(conn);
-
-        // Transition to dispatchable state if not already — fires OnCardTransition hook
-        crate::pipeline::ensure_loaded();
-        let pipeline = crate::pipeline::get();
-        let ready_state = pipeline
-            .dispatchable_states()
-            .into_iter()
-            .next()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                tracing::warn!("Pipeline has no dispatchable states, using initial state");
-                pipeline.initial_state().to_string()
-            });
-        let _ = crate::kanban::transition_status(
-            legacy_db(&state),
-            &state.engine,
-            &existing_id,
-            &ready_state,
-        );
-
-        let conn = match legacy_db(&state).lock() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{e}")})),
-                );
-            }
-        };
-        return match conn.query_row(
-            &format!("{CARD_SELECT} WHERE kc.id = ?1"),
-            [&existing_id],
-            |row| card_row_to_json(row),
-        ) {
-            Ok(card) => {
-                crate::server::ws::emit_event(
-                    &state.broadcast_tx,
-                    "kanban_card_updated",
-                    card.clone(),
-                );
-                (
-                    StatusCode::OK,
-                    Json(json!({"card": card, "deduplicated": true})),
-                )
-            }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{e}")})),
-            ),
-        };
-    }
-
-    // Pipeline-driven: new cards with assignee start in dispatchable state
-    crate::pipeline::ensure_loaded();
-    let pipeline = crate::pipeline::get();
-    let ready_state = pipeline
-        .dispatchable_states()
-        .into_iter()
-        .next()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            tracing::warn!("Pipeline has no dispatchable states, using initial state");
-            pipeline.initial_state().to_string()
-        });
-    let result = conn.execute(
-        "INSERT INTO kanban_cards (id, repo_id, title, status, priority, assigned_agent_id, github_issue_url, github_issue_number, description, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'medium', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
-        libsql_rusqlite::params![
-            id,
-            body.github_repo,
-            body.title,
-            ready_state,
-            body.assignee_agent_id,
-            body.github_issue_url,
-            body.github_issue_number,
-            body.description,
-        ],
-    );
-
-    if let Err(e) = result {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        );
-    }
-
-    match conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
-        card_row_to_json(row)
-    }) {
-        Ok(card) => {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_created", card.clone());
-            (StatusCode::CREATED, Json(json!({"card": card})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{e}")})),
-        ),
-    }
+    pg_pool_required_error()
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -2502,6 +2271,10 @@ pub async fn pm_decision(
         }
     }
 
+    let Some(transition_pool) = state.pg_pool_ref() else {
+        return pg_pool_required_error();
+    };
+
     let message = match body.decision.as_str() {
         "resume" => {
             // Guard: resume requires a live dispatch + working session.
@@ -2542,14 +2315,16 @@ pub async fn pm_decision(
                     tracing::warn!("Pipeline has no dispatchable states, using initial state");
                     pipeline.initial_state().to_string()
                 });
-            if let Err(e) = crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
+            if let Err(e) = crate::kanban::transition_status_with_opts_pg_only(
+                transition_pool,
                 &state.engine,
                 &body.card_id,
                 &resume_target,
                 "pm-decision",
                 crate::engine::transition::ForceIntent::OperatorOverride,
-            ) {
+            )
+            .await
+            {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("resume transition failed: {e}")})),
@@ -2633,14 +2408,16 @@ pub async fn pm_decision(
                             pipeline.dispatchable_states().first().map(|s| s.to_string())
                                 .unwrap_or_else(|| pipeline.initial_state().to_string())
                         });
-                    if let Err(e) = crate::kanban::transition_status_with_opts(
-                        legacy_db(&state),
+                    if let Err(e) = crate::kanban::transition_status_with_opts_pg_only(
+                        transition_pool,
                         &state.engine,
                         &body.card_id,
                         &rework_target,
                         "pm-decision",
                         crate::engine::transition::ForceIntent::OperatorOverride,
-                    ) {
+                    )
+                    .await
+                    {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(json!({"error": format!("rework transition failed: {e}")})),
@@ -2681,14 +2458,16 @@ pub async fn pm_decision(
                 .find(|s| s.terminal)
                 .map(|s| s.id.as_str())
                 .expect("Pipeline must have at least one terminal state");
-            if let Err(e) = crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
+            if let Err(e) = crate::kanban::transition_status_with_opts_pg_only(
+                transition_pool,
                 &state.engine,
                 &body.card_id,
                 terminal,
                 "pm-decision",
                 crate::engine::transition::ForceIntent::OperatorOverride,
-            ) {
+            )
+            .await
+            {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("dismiss transition failed: {e}")})),
@@ -2707,14 +2486,16 @@ pub async fn pm_decision(
                     tracing::warn!("Pipeline has no dispatchable states, using initial state");
                     pipeline.initial_state()
                 });
-            if let Err(e) = crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
+            if let Err(e) = crate::kanban::transition_status_with_opts_pg_only(
+                transition_pool,
                 &state.engine,
                 &body.card_id,
                 requeue_target,
                 "pm-decision",
                 crate::engine::transition::ForceIntent::OperatorOverride,
-            ) {
+            )
+            .await
+            {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({"error": format!("requeue transition failed: {e}")})),
@@ -3068,14 +2849,19 @@ pub async fn rereview_card(
     let transitioned_into_review = current_status != "review";
 
     if transitioned_into_review {
-        if let Err(e) = crate::kanban::transition_status_with_opts(
-            legacy_db(&state),
+        let Some(pool) = state.pg_pool_ref() else {
+            return pg_pool_required_error();
+        };
+        if let Err(e) = crate::kanban::transition_status_with_opts_pg_only(
+            pool,
             &state.engine,
             &id,
             "review",
             &format!("{caller_source}:rereview({reason})"),
             crate::engine::transition::ForceIntent::OperatorOverride,
-        ) {
+        )
+        .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("{e}")})),
@@ -3682,14 +3468,18 @@ pub async fn reopen_card(
 
     // ── Transition terminal → work state (force=true bypasses terminal guard) ──
     match {
-        let result = crate::kanban::transition_status_with_opts(
-            legacy_db(&state),
+        let Some(pool) = state.pg_pool_ref() else {
+            return pg_pool_required_error();
+        };
+        let result = crate::kanban::transition_status_with_opts_pg_only(
+            pool,
             &state.engine,
             &id,
             &reopen_target,
             &format!("{caller_source}:reopen({reason})"),
             crate::engine::transition::ForceIntent::OperatorOverride,
-        );
+        )
+        .await;
         result.map(|result| (result.from, result.to))
     } {
         Ok((from_status, to_status)) => {
@@ -4003,27 +3793,9 @@ pub async fn batch_transition(
                 .map(|result| (result, (0, 0)))
             }
         } else {
-            crate::kanban::transition_status_with_opts(
-                legacy_db(&state),
-                &state.engine,
-                &card_id,
-                &body.status,
-                &batch_transition_source,
-                crate::engine::transition::ForceIntent::OperatorOverride,
-            )
-            .map(|result| {
-                let counts = if force_transition_needs_cleanup(&body.status, body.cancel_dispatches)
-                {
-                    let conn = legacy_db(&state)
-                        .lock()
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    cleanup_force_transition_revert_on_conn(&conn, &card_id, &body.status)
-                } else {
-                    Ok((0, 0))
-                }?;
-                Ok::<_, anyhow::Error>((result, counts))
-            })
-            .and_then(|result| result)
+            Err(anyhow::anyhow!(
+                "postgres backend required for kanban transition (#1384)"
+            ))
         };
 
         match transition_result {

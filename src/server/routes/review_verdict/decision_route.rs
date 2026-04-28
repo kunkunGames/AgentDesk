@@ -24,12 +24,7 @@ fn legacy_db(state: &AppState) -> &crate::db::Db {
         })
 }
 
-/// PG-first wrapper around `crate::kanban::transition_status_with_opts`.
-///
-/// SQLite-only callers fail with `card not found` after the PG cutover when
-/// the card lives only in Postgres. Prefer `transition_status_with_opts_pg`
-/// when a PG pool is configured and fall through to the legacy SQLite path
-/// only when running without PG.
+/// PG-only wrapper for kanban transitions after #1384.
 async fn transition_status_pg_first(
     state: &AppState,
     card_id: &str,
@@ -37,26 +32,18 @@ async fn transition_status_pg_first(
     source: &str,
     force_intent: crate::engine::transition::ForceIntent,
 ) -> anyhow::Result<crate::kanban::TransitionResult> {
-    if let Some(pool) = state.pg_pool_ref() {
-        crate::kanban::transition_status_with_opts_pg_only(
-            pool,
-            &state.engine,
-            card_id,
-            new_status,
-            source,
-            force_intent,
-        )
-        .await
-    } else {
-        crate::kanban::transition_status_with_opts(
-            legacy_db(state),
-            &state.engine,
-            card_id,
-            new_status,
-            source,
-            force_intent,
-        )
-    }
+    let pool = state.pg_pool_ref().ok_or_else(|| {
+        anyhow::anyhow!("postgres backend required for kanban transition (#1384)")
+    })?;
+    crate::kanban::transition_status_with_opts_pg_only(
+        pool,
+        &state.engine,
+        card_id,
+        new_status,
+        source,
+        force_intent,
+    )
+    .await
 }
 
 fn spawn_review_tuning_aggregate_pg_first(state: &AppState) {

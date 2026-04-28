@@ -32,6 +32,7 @@ use sqlx::Row as SqlxRow;
 ///
 /// `source`: who initiated the transition (e.g., "api", "policy", "agentdesk")
 /// `force`: administrative override to bypass dispatch validation
+#[cfg(test)]
 pub fn transition_status(
     db: &Db,
     engine: &PolicyEngine,
@@ -601,6 +602,7 @@ impl AllowedOnConnMutation {
     }
 }
 
+#[cfg(test)]
 fn transition_status_with_opts_inner<F>(
     db: &Db,
     engine: &PolicyEngine,
@@ -841,6 +843,7 @@ where
 /// 3. Execute decision intents via Executor
 /// 4. Fire post-transition hooks (GitHub sync, policy hooks)
 #[track_caller]
+#[cfg(test)]
 pub fn transition_status_with_opts(
     db: &Db,
     engine: &PolicyEngine,
@@ -867,6 +870,7 @@ pub fn transition_status_with_opts(
 /// Full transition with an extra DB mutation executed inside the same
 /// transaction as the canonical transition intents.
 #[track_caller]
+#[cfg(test)]
 pub fn transition_status_with_opts_and_on_conn<F>(
     db: &Db,
     engine: &PolicyEngine,

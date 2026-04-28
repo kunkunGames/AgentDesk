@@ -10,6 +10,37 @@ const PRIMARY_FETCH_LIMIT: u32 = 100;
 const RECENTLY_CLOSED_FETCH_LIMIT: u32 = 50;
 const RECENTLY_CLOSED_LOOKBACK_DAYS: i64 = 30;
 
+fn transition_status_sync_pg(
+    engine: &crate::engine::PolicyEngine,
+    card_id: &str,
+    terminal: &str,
+    source: &'static str,
+) -> Result<(), String> {
+    let pool = engine.pg_pool().ok_or_else(|| {
+        "postgres backend required for GitHub sync transition (#1384)".to_string()
+    })?;
+    let engine = engine.clone();
+    let card_id = card_id.to_string();
+    let terminal = terminal.to_string();
+    crate::utils::async_bridge::block_on_pg_result(
+        pool,
+        move |bridge_pool| async move {
+            crate::kanban::transition_status_with_opts_pg_only(
+                &bridge_pool,
+                &engine,
+                &card_id,
+                &terminal,
+                source,
+                crate::engine::transition::ForceIntent::SystemRecovery,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        },
+        |error| error,
+    )
+}
+
 /// Represents a GitHub issue as returned by `gh issue list --json`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct GhIssue {
@@ -203,14 +234,7 @@ pub fn sync_github_issues_for_repo(
         })
         .unwrap_or("done");
     for (card_id, issue_number) in &cards_to_close {
-        let _ = crate::kanban::transition_status_with_opts(
-            db,
-            engine,
-            card_id,
-            terminal,
-            "github-sync",
-            crate::engine::transition::ForceIntent::SystemRecovery,
-        );
+        let _ = transition_status_sync_pg(engine, card_id, terminal, "github-sync");
         result.closed_count += 1;
         tracing::info!(
             "[github-sync] {repo}#{}: card {} → {} (issue closed)",
@@ -249,14 +273,7 @@ pub fn sync_github_issues_for_repo(
         }
 
         for (card_id, issue_number) in &mainline_cards_to_close {
-            let _ = crate::kanban::transition_status_with_opts(
-                db,
-                engine,
-                card_id,
-                terminal,
-                "github-sync-mainline",
-                crate::engine::transition::ForceIntent::SystemRecovery,
-            );
+            let _ = transition_status_sync_pg(engine, card_id, terminal, "github-sync-mainline");
             tracing::info!(
                 "[github-sync] {repo}#{}: card {} → {} (mainline commit matched issue)",
                 issue_number,
