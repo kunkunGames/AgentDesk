@@ -673,6 +673,12 @@ fn append_text_delta(sender: &Sender<StreamMessage>, state: &mut SseMessageState
     });
 }
 
+fn text_part_snapshot_key(part_id: &str, message_id: Option<&str>) -> String {
+    message_id
+        .map(|message_id| format!("{message_id}:{part_id}"))
+        .unwrap_or_else(|| part_id.to_string())
+}
+
 fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
     let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
     if text.is_empty() {
@@ -687,16 +693,22 @@ fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseM
         append_text_delta(sender, state, text);
         return;
     };
+    let message_id = part
+        .get("messageID")
+        .or_else(|| part.get("messageId"))
+        .or_else(|| part.get("message_id"))
+        .and_then(|v| v.as_str());
+    let snapshot_key = text_part_snapshot_key(part_id, message_id);
 
     let previous = state
         .text_part_snapshots
-        .get(part_id)
+        .get(&snapshot_key)
         .map(String::as_str)
         .unwrap_or("");
     let delta = text.strip_prefix(previous).unwrap_or(text);
     state
         .text_part_snapshots
-        .insert(part_id.to_string(), text.to_string());
+        .insert(snapshot_key, text.to_string());
     append_text_delta(sender, state, delta);
 }
 
@@ -812,7 +824,13 @@ fn process_sse_event(
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
                 if let Some(part_id) = part_id {
-                    let entry = state.text_part_snapshots.entry(part_id).or_default();
+                    let message_id = props
+                        .and_then(|p| p.get("messageID"))
+                        .or_else(|| props.and_then(|p| p.get("messageId")))
+                        .or_else(|| props.and_then(|p| p.get("message_id")))
+                        .and_then(|v| v.as_str());
+                    let snapshot_key = text_part_snapshot_key(&part_id, message_id);
+                    let entry = state.text_part_snapshots.entry(snapshot_key).or_default();
                     entry.push_str(delta);
                 }
                 append_text_delta(sender, state, delta);
@@ -1048,6 +1066,24 @@ mod tests {
                 .unwrap()
                 .contains("hidden system")
         );
+    }
+
+    #[test]
+    fn test_text_snapshot_key_includes_message_id() {
+        let events = [
+            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-1","messageID":"m1","type":"text","text":"first"}}}"#,
+            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-1","messageID":"m2","type":"text","text":"second"}}}"#,
+        ];
+        let (msgs, stops) = parse_events(&events, "s1");
+        assert_eq!(stops, vec![Some(false), Some(false)]);
+        let text = msgs
+            .iter()
+            .filter_map(|msg| match msg {
+                StreamMessage::Text { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "firstsecond");
     }
 
     #[test]

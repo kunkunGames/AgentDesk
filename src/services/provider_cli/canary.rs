@@ -72,6 +72,7 @@ pub fn verified_candidate_launch_artifact(
     not_before: DateTime<Utc>,
 ) -> Result<Option<LaunchArtifact>, String> {
     let mut candidates: Vec<_> = load_launch_artifacts(root, provider)
+        .map_err(|error| format!("failed to load launch artifacts for {provider}: {error}"))?
         .into_iter()
         .filter(|artifact| {
             artifact.agent_id.as_deref() == Some(agent_id)
@@ -207,5 +208,29 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_artifact_fails_when_launch_artifact_is_corrupt() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact_dir = crate::services::provider_cli::paths::launch_artifacts_dir(root.path());
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("corrupt.json"), "{not valid json").unwrap();
+
+        let candidate = candidate_channel("/tmp/codex", "1.0.0");
+        let result = verified_candidate_launch_artifact(
+            root.path(),
+            "codex",
+            "codex-agent",
+            &candidate,
+            Utc::now() - chrono::Duration::seconds(60),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to load launch artifacts")
+        );
     }
 }

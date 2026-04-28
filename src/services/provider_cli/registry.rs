@@ -225,11 +225,11 @@ pub const PROVIDER_UPDATE_STRATEGIES: &[ProviderCliUpdateStrategy] = &[
     },
     ProviderCliUpdateStrategy {
         provider: "opencode",
-        install_source: "homebrew",
-        command_argv: &["brew", "upgrade", "opencode"],
+        install_source: "npm-global",
+        command_argv: &["npm", "install", "-g", "opencode-ai"],
         expected_binary_name: "opencode",
         mutates_in_place: true,
-        allow_candidate_path_change: true,
+        allow_candidate_path_change: false,
     },
     ProviderCliUpdateStrategy {
         provider: "qwen",

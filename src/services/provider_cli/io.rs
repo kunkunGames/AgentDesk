@@ -88,18 +88,28 @@ pub fn load_launch_artifact(
     read_json(&paths::launch_artifact_path(root, session_key))
 }
 
-pub fn load_launch_artifacts(root: &Path, provider: &str) -> Vec<LaunchArtifact> {
+pub fn load_launch_artifacts(root: &Path, provider: &str) -> Result<Vec<LaunchArtifact>, IoError> {
     let dir = paths::launch_artifacts_dir(root);
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
 
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .filter_map(|content| serde_json::from_str::<LaunchArtifact>(&content).ok())
-        .filter(|artifact| artifact.provider == provider)
-        .collect()
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)?;
+        let artifact: LaunchArtifact = serde_json::from_str(&content)?;
+        if artifact.provider == provider {
+            artifacts.push(artifact);
+        }
+    }
+    Ok(artifacts)
 }
 
 // ── Smoke result ──────────────────────────────────────────────────────────────
