@@ -14021,7 +14021,7 @@ async fn force_transition_to_done_tracks_pr_from_live_work_dispatch_and_cleans_i
         .fetch_one(&pool)
         .await
         .unwrap();
-        let pr_row: (Option<String>, Option<i32>, Option<String>) = sqlx::query_as(
+        let pr_row: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
             "SELECT state, pr_number, last_error FROM pr_tracking WHERE card_id = 'card-ft-terminal'",
         )
         .fetch_optional(&pool)
@@ -14034,7 +14034,7 @@ async fn force_transition_to_done_tracks_pr_from_live_work_dispatch_and_cleans_i
         blocked_reason = card_row.2;
         dispatch_status = observed_dispatch_status;
         pr_tracking_state = pr_row.0;
-        pr_tracking_pr_number = pr_row.1.map(|v| v as i64);
+        pr_tracking_pr_number = pr_row.1;
         pr_tracking_last_error = pr_row.2;
 
         if pr_tracking_state.as_deref() == Some("wait-ci")
