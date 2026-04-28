@@ -1428,6 +1428,65 @@ pub async fn list_card_reviews(
 
 /// GET /api/kanban-cards/stalled
 pub async fn stalled_cards(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(pool) = state.pg_pool_ref() {
+        let rows = match sqlx::query(
+            "SELECT kc.id
+             FROM kanban_cards kc
+             LEFT JOIN task_dispatches td ON td.id = kc.latest_dispatch_id
+             WHERE kc.status = 'in_progress'
+               AND GREATEST(
+                   COALESCE(td.created_at, '-infinity'::timestamptz),
+                   COALESCE(kc.updated_at, '-infinity'::timestamptz),
+                   COALESCE(kc.started_at, '-infinity'::timestamptz)
+               ) < NOW() - INTERVAL '2 hours'
+               AND (
+                   NOT EXISTS (SELECT 1 FROM github_repos)
+                   OR kc.repo_id IN (SELECT id FROM github_repos)
+               )
+             ORDER BY GREATEST(
+                   COALESCE(td.created_at, '-infinity'::timestamptz),
+                   COALESCE(kc.updated_at, '-infinity'::timestamptz),
+                   COALESCE(kc.started_at, '-infinity'::timestamptz)
+               ) ASC",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("query postgres stalled cards: {error}")})),
+                );
+            }
+        };
+
+        let mut cards = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = match row.try_get::<String, _>("id") {
+                Ok(id) => id,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("decode postgres stalled card id: {error}")})),
+                    );
+                }
+            };
+            match load_card_json_pg(pool, &id).await {
+                Ok(Some(card)) => cards.push(card),
+                Ok(None) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": error})),
+                    );
+                }
+            }
+        }
+
+        return (StatusCode::OK, Json(json!(cards)));
+    }
+
     let conn = match legacy_db(&state).lock() {
         Ok(c) => c,
         Err(e) => {
@@ -1903,6 +1962,45 @@ pub async fn card_audit_log(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(pool) = state.pg_pool_ref() {
+        let rows = match sqlx::query(
+            "SELECT id::BIGINT AS id, card_id, from_status, to_status, source, result, created_at::text AS created_at
+             FROM kanban_audit_logs
+             WHERE card_id = $1
+             ORDER BY created_at DESC
+             LIMIT 50",
+        )
+        .bind(&id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("query postgres card audit log: {error}")})),
+                );
+            }
+        };
+
+        let logs: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "id": row.try_get::<i64, _>("id").unwrap_or_default(),
+                    "card_id": row.try_get::<String, _>("card_id").unwrap_or_default(),
+                    "from_status": row.try_get::<Option<String>, _>("from_status").ok().flatten(),
+                    "to_status": row.try_get::<Option<String>, _>("to_status").ok().flatten(),
+                    "source": row.try_get::<Option<String>, _>("source").ok().flatten(),
+                    "result": row.try_get::<Option<String>, _>("result").ok().flatten(),
+                    "created_at": row.try_get::<Option<String>, _>("created_at").ok().flatten(),
+                })
+            })
+            .collect();
+
+        return (StatusCode::OK, Json(json!({"logs": logs})));
+    }
+
     let conn = match legacy_db(&state).lock() {
         Ok(c) => c,
         Err(e) => {
@@ -1949,6 +2047,109 @@ pub async fn card_github_comments(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(pool) = state.pg_pool_ref() {
+        let (repo_id, issue_number) = match sqlx::query(
+            "SELECT repo_id, github_issue_number::BIGINT AS github_issue_number
+             FROM kanban_cards
+             WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some(row)) => {
+                let repo_id = match row.try_get::<Option<String>, _>("repo_id") {
+                    Ok(repo_id) => repo_id,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(
+                                json!({"error": format!("decode postgres card repo_id: {error}")}),
+                            ),
+                        );
+                    }
+                };
+                let issue_number = match row.try_get::<Option<i64>, _>("github_issue_number") {
+                    Ok(issue_number) => issue_number,
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(
+                                json!({"error": format!("decode postgres card github_issue_number: {error}")}),
+                            ),
+                        );
+                    }
+                };
+                (repo_id, issue_number)
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "card not found"})),
+                );
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("query postgres card github issue: {error}")})),
+                );
+            }
+        };
+
+        let repo = match repo_id {
+            Some(r) => r,
+            None => return (StatusCode::OK, Json(json!({"comments": []}))),
+        };
+        let number = match issue_number {
+            Some(n) => n,
+            None => return (StatusCode::OK, Json(json!({"comments": []}))),
+        };
+
+        let result =
+            tokio::task::spawn_blocking(move || crate::github::fetch_issue_comments(&repo, number))
+                .await;
+
+        return match result {
+            Ok(Ok(issue)) => {
+                let comments = serde_json::to_value(issue.comments).unwrap_or_else(|_| json!([]));
+                let body = issue.body.unwrap_or_default();
+
+                if let Err(error) = sqlx::query(
+                    "UPDATE kanban_cards
+                     SET description = $1,
+                         updated_at = NOW()
+                     WHERE id = $2
+                       AND (description IS DISTINCT FROM $1 OR description IS NULL)",
+                )
+                .bind(&body)
+                .bind(&id)
+                .execute(pool)
+                .await
+                {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            json!({"error": format!("update postgres card description: {error}")}),
+                        ),
+                    );
+                }
+
+                (
+                    StatusCode::OK,
+                    Json(json!({"comments": comments, "body": body})),
+                )
+            }
+            Ok(Err(e)) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("gh issue view failed: {e}")})),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("join: {e}")})),
+            ),
+        };
+    }
+
     let (repo_id, issue_number) = {
         let conn = match legacy_db(&state).lock() {
             Ok(c) => c,
