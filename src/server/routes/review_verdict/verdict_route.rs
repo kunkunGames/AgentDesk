@@ -52,10 +52,20 @@ fn normalize_review_notes(text: &str) -> String {
 
 fn review_state_sync_pg_first(state: &AppState, payload: &serde_json::Value) -> String {
     crate::engine::ops::review_state_sync_with_backends(
-        None,
+        review_verdict_db(state),
         state.pg_pool_ref(),
         &payload.to_string(),
     )
+}
+
+#[cfg(test)]
+fn review_verdict_db(state: &AppState) -> Option<&crate::db::Db> {
+    state.legacy_db()
+}
+
+#[cfg(not(test))]
+fn review_verdict_db(_state: &AppState) -> Option<&crate::db::Db> {
+    None
 }
 
 async fn enforce_session_reset_dilemma_fallback(
@@ -215,7 +225,7 @@ pub async fn submit_verdict(
     }
 
     let dispatch = match crate::dispatch::load_dispatch_row_with_backends(
-        None,
+        review_verdict_db(&state),
         state.pg_pool_ref(),
         &body.dispatch_id,
     ) {
@@ -381,7 +391,7 @@ pub async fn submit_verdict(
     // Review verdict fires OnReviewVerdict — specialized hook, not the generic completion hook.
     // Cancelled dispatches must NOT be promoted to completed (review loop guard #80).
     let updated = match crate::dispatch::set_dispatch_status_with_backends(
-        None,
+        review_verdict_db(&state),
         state.pg_pool_ref(),
         &body.dispatch_id,
         "completed",
@@ -401,7 +411,7 @@ pub async fn submit_verdict(
 
     if updated == 0 {
         let current_status = crate::dispatch::load_dispatch_row_with_backends(
-            None,
+            review_verdict_db(&state),
             state.pg_pool_ref(),
             &body.dispatch_id,
         )
@@ -423,7 +433,7 @@ pub async fn submit_verdict(
 
     // Find associated card
     let card_id = crate::dispatch::load_dispatch_row_with_backends(
-        None,
+        review_verdict_db(&state),
         state.pg_pool_ref(),
         &body.dispatch_id,
     )
@@ -443,7 +453,7 @@ pub async fn submit_verdict(
         if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
             // Roll back the dispatch status since we can't complete the pass flow
             let _ = crate::dispatch::set_dispatch_status_with_backends(
-                None,
+                review_verdict_db(&state),
                 state.pg_pool_ref(),
                 &body.dispatch_id,
                 "dispatched",

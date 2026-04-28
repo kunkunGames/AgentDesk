@@ -848,13 +848,69 @@ async fn cancel_dispatch_pg_first(
         .await;
     }
 
+    #[cfg(test)]
+    if let Some(db) = state.legacy_db() {
+        let conn = db
+            .separate_conn()
+            .map_err(|error| format!("open sqlite cancel dispatch connection: {error}"))?;
+        return crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+            &conn,
+            dispatch_id,
+            reason,
+        )
+        .map_err(|error| format!("sqlite cancel dispatch {dispatch_id}: {error}"));
+    }
+
     Err("postgres pool unavailable for cancel dispatch".to_string())
 }
 
 async fn dismiss_review_cleanup_pg_first(state: &AppState, card_id: &str) -> Result<(), String> {
-    let pool = state
-        .pg_pool_ref()
-        .ok_or_else(|| "postgres pool unavailable for dismiss cleanup".to_string())?;
+    let Some(pool) = state.pg_pool_ref() else {
+        #[cfg(test)]
+        if let Some(db) = state.legacy_db() {
+            let conn = db
+                .separate_conn()
+                .map_err(|error| format!("open sqlite dismiss cleanup connection: {error}"))?;
+            let dispatch_ids = conn
+                .prepare(
+                    "SELECT id FROM task_dispatches
+                     WHERE kanban_card_id = ?1
+                       AND status IN ('pending', 'dispatched')
+                       AND dispatch_type IN ('review', 'review-decision')",
+                )
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([card_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map_err(|error| {
+                    format!("load sqlite dismiss cleanup dispatches for {card_id}: {error}")
+                })?;
+
+            for dispatch_id in &dispatch_ids {
+                crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+                    &conn,
+                    dispatch_id,
+                    None,
+                )
+                .map_err(|error| {
+                    format!("sqlite dismiss cleanup cancel dispatch {dispatch_id}: {error}")
+                })?;
+            }
+            conn.execute(
+                "UPDATE kanban_cards
+                 SET review_status = NULL,
+                     channel_thread_map = NULL,
+                     active_thread_id = NULL,
+                     updated_at = datetime('now')
+                 WHERE id = ?1",
+                [card_id],
+            )
+            .map_err(|error| format!("clear sqlite dismiss review state for {card_id}: {error}"))?;
+            return Ok(());
+        }
+
+        return Err("postgres pool unavailable for dismiss cleanup".to_string());
+    };
     let mut tx = pool
         .begin()
         .await

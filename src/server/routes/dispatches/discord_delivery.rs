@@ -11,6 +11,8 @@ use crate::db::agents::{
     resolve_agent_channel_for_provider_pg, resolve_agent_dispatch_channel_pg,
     resolve_agent_primary_channel_pg,
 };
+#[cfg(test)]
+use rusqlite::OptionalExtension;
 use sqlx::{PgPool, Row as SqlxRow};
 use std::sync::OnceLock;
 
@@ -1744,6 +1746,7 @@ async fn resolve_agent_channel_with_provider_override_pg(
         .map_err(|error| format!("resolve postgres dispatch channel for {agent_id}: {error}"))
 }
 
+#[cfg(not(test))]
 pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     _conn: &T,
     _agent_id: &str,
@@ -1752,6 +1755,67 @@ pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     _dispatch_context: Option<&str>,
 ) -> Result<Option<String>, String> {
     Ok(None)
+}
+
+#[cfg(test)]
+pub(super) fn resolve_dispatch_delivery_channel_on_conn(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    card_id: &str,
+    dispatch_type: Option<&str>,
+    dispatch_context: Option<&str>,
+) -> Result<Option<String>, String> {
+    let provider_override = if dispatch_type == Some("review-decision") {
+        match review_source_provider_from_context(dispatch_context) {
+            Some(provider) => Some(provider),
+            None => latest_completed_review_provider_on_conn(conn, card_id)?,
+        }
+    } else {
+        None
+    };
+
+    if let Some(provider) = provider_override.filter(|provider| !provider.trim().is_empty()) {
+        if let Some(channel) = crate::db::agents::resolve_agent_channel_for_provider_on_conn(
+            conn,
+            agent_id,
+            Some(&provider),
+        )
+        .map_err(|error| {
+            format!("resolve sqlite provider channel for {agent_id} ({provider}): {error}")
+        })? {
+            return Ok(Some(channel));
+        }
+    }
+
+    crate::db::agents::resolve_agent_dispatch_channel_on_conn(conn, agent_id, dispatch_type)
+        .map_err(|error| format!("resolve sqlite dispatch channel for {agent_id}: {error}"))
+}
+
+#[cfg(test)]
+fn latest_completed_review_provider_on_conn(
+    conn: &rusqlite::Connection,
+    card_id: &str,
+) -> Result<Option<String>, String> {
+    let context: Option<String> = conn
+        .query_row(
+            "SELECT context
+             FROM task_dispatches
+             WHERE kanban_card_id = ?1
+               AND dispatch_type = 'review'
+               AND status = 'completed'
+             ORDER BY COALESCE(completed_at, updated_at) DESC, updated_at DESC
+             LIMIT 1",
+            [card_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("load sqlite review provider for {card_id}: {error}"))?;
+
+    Ok(dispatch_context_value(context.as_deref()).and_then(|ctx| {
+        ctx.get("from_provider")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }))
 }
 
 async fn resolve_dispatch_delivery_channel_pg(

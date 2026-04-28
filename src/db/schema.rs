@@ -999,7 +999,8 @@ pub(crate) fn ensure_auto_queue_schema(conn: &Connection) -> Result<()> {
             batch_phase     INTEGER DEFAULT 0,
             created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
             dispatched_at   DATETIME,
-            completed_at    DATETIME
+            completed_at    DATETIME,
+            updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS auto_queue_slots (
             agent_id             TEXT NOT NULL,
