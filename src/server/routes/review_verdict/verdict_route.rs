@@ -261,8 +261,8 @@ pub async fn submit_verdict(
         );
     }
 
-    let dispatch = match crate::dispatch::load_dispatch_row_pg_first(
-        legacy_db(&state),
+    let dispatch = match crate::dispatch::load_dispatch_row_with_backends(
+        None,
         state.pg_pool_ref(),
         &body.dispatch_id,
     ) {
@@ -427,11 +427,15 @@ pub async fn submit_verdict(
     // #143: Mark dispatch completed via shared helper (DB-only, no OnDispatchCompleted).
     // Review verdict fires OnReviewVerdict — specialized hook, not the generic completion hook.
     // Cancelled dispatches must NOT be promoted to completed (review loop guard #80).
-    let updated = match crate::dispatch::mark_dispatch_completed_pg_first(
-        legacy_db(&state),
+    let updated = match crate::dispatch::set_dispatch_status_with_backends(
+        None,
         state.pg_pool_ref(),
         &body.dispatch_id,
-        &result_json,
+        "completed",
+        Some(&result_json),
+        "mark_dispatch_completed",
+        Some(&["pending", "dispatched"]),
+        true,
     ) {
         Ok(n) => n,
         Err(e) => {
@@ -443,8 +447,8 @@ pub async fn submit_verdict(
     };
 
     if updated == 0 {
-        let current_status = crate::dispatch::load_dispatch_row_pg_first(
-            legacy_db(&state),
+        let current_status = crate::dispatch::load_dispatch_row_with_backends(
+            None,
             state.pg_pool_ref(),
             &body.dispatch_id,
         )
@@ -465,8 +469,8 @@ pub async fn submit_verdict(
     }
 
     // Find associated card
-    let card_id = crate::dispatch::load_dispatch_row_pg_first(
-        legacy_db(&state),
+    let card_id = crate::dispatch::load_dispatch_row_with_backends(
+        None,
         state.pg_pool_ref(),
         &body.dispatch_id,
     )
@@ -485,8 +489,8 @@ pub async fn submit_verdict(
     if body.overall == "pass" || body.overall == "approved" {
         if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
             // Roll back the dispatch status since we can't complete the pass flow
-            let _ = crate::dispatch::set_dispatch_status_pg_first(
-                legacy_db(&state),
+            let _ = crate::dispatch::set_dispatch_status_with_backends(
+                None,
                 state.pg_pool_ref(),
                 &body.dispatch_id,
                 "dispatched",
@@ -507,8 +511,8 @@ pub async fn submit_verdict(
 
     // Fire event hooks for review verdict (#134 — pipeline-defined events)
     if let Some(ref cid) = card_id {
-        crate::kanban::fire_event_hooks(
-            legacy_db(&state),
+        crate::kanban::fire_event_hooks_with_backends(
+            None,
             &state.engine,
             "on_review_verdict",
             "OnReviewVerdict",
@@ -530,8 +534,9 @@ pub async fn submit_verdict(
                 break;
             }
             for (t_card_id, old_s, new_s) in &transitions {
-                crate::kanban::fire_transition_hooks(
-                    legacy_db(&state),
+                crate::kanban::fire_transition_hooks_with_backends(
+                    None,
+                    state.pg_pool_ref(),
                     &state.engine,
                     t_card_id,
                     old_s,

@@ -1226,7 +1226,7 @@ pub async fn defer_dod(
 
     // Fire on_enter hooks for the review state to trigger review dispatch creation (#134)
     if let Some(ref review_state) = restart_review_state {
-        crate::kanban::fire_enter_hooks(legacy_db(&state), &state.engine, &id, review_state);
+        crate::kanban::fire_enter_hooks_with_backends(None, &state.engine, &id, review_state);
         tracing::info!(
             "[dod] Card {} DoD all-complete — restarting review from awaiting_dod",
             id
@@ -1542,18 +1542,8 @@ pub async fn bulk_action(
         match transition_result {
             Ok(_) => {
                 // Emit updated card for each successful transition
-                if let Ok(conn) = legacy_db(&state).lock() {
-                    if let Ok(card) = conn.query_row(
-                        &format!("{CARD_SELECT} WHERE kc.id = ?1"),
-                        [card_id],
-                        |row| card_row_to_json(row),
-                    ) {
-                        crate::server::ws::emit_event(
-                            &state.broadcast_tx,
-                            "kanban_card_updated",
-                            card,
-                        );
-                    }
+                if let Ok(Some(card)) = load_card_json_pg(pool, card_id).await {
+                    crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
                 }
                 results.push(json!({"id": card_id, "ok": true}));
             }
@@ -2122,11 +2112,15 @@ pub async fn pm_decision(
             })
             .unwrap_or_default();
         for dispatch_id in pending_dispatch_ids {
-            crate::dispatch::mark_dispatch_completed_pg_first(
-                legacy_db(&state),
+            crate::dispatch::set_dispatch_status_with_backends(
+                None,
                 state.pg_pool_ref(),
                 &dispatch_id,
-                &completion_result,
+                "completed",
+                Some(&completion_result),
+                "mark_dispatch_completed",
+                Some(&["pending", "dispatched"]),
+                true,
             )
             .ok();
         }
@@ -2258,11 +2252,15 @@ pub async fn pm_decision(
                         })
                         .unwrap_or_default();
                     for dispatch_id in pending_dispatch_ids {
-                        crate::dispatch::mark_dispatch_completed_pg_first(
-                            legacy_db(&state),
+                        crate::dispatch::set_dispatch_status_with_backends(
+                            None,
                             state.pg_pool_ref(),
                             &dispatch_id,
-                            &completion_result,
+                            "completed",
+                            Some(&completion_result),
+                            "mark_dispatch_completed",
+                            Some(&["pending", "dispatched"]),
+                            true,
                         )
                         .ok();
                     }
@@ -2393,14 +2391,8 @@ pub async fn pm_decision(
     };
 
     // Emit kanban_card_updated for the affected card
-    if let Ok(conn) = legacy_db(&state).lock() {
-        if let Ok(card) = conn.query_row(
-            &format!("{CARD_SELECT} WHERE kc.id = ?1"),
-            [&body.card_id],
-            |row| card_row_to_json(row),
-        ) {
-            crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
-        }
+    if let Ok(Some(card)) = load_card_json_pg(transition_pool, &body.card_id).await {
+        crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card);
     }
 
     (
@@ -2752,7 +2744,7 @@ pub async fn rereview_card(
             );
         }
     } else {
-        crate::kanban::fire_enter_hooks(legacy_db(&state), &state.engine, &id, "review");
+        crate::kanban::fire_enter_hooks_with_backends(None, &state.engine, &id, "review");
     }
 
     let mut review_dispatch_id = legacy_db(&state)
@@ -2764,7 +2756,7 @@ pub async fn rereview_card(
         let _ = state
             .engine
             .fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": id }));
-        crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+        crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
         review_dispatch_id = legacy_db(&state)
             .lock()
             .ok()

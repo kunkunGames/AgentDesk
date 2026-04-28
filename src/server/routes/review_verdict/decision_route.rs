@@ -1183,8 +1183,8 @@ pub async fn submit_review_decision(
                                     // OnReviewEnter (for example, single-provider
                                     // auto-approval to terminal) before checking
                                     // whether a live review dispatch exists.
-                                    crate::kanban::drain_hook_side_effects(
-                                        legacy_db(&state),
+                                    crate::kanban::drain_hook_side_effects_with_backends(
+                                        None,
                                         &state.engine,
                                     );
                                     let followups =
@@ -1394,11 +1394,17 @@ pub async fn submit_review_decision(
             }
 
             if let Some(ref rd_id) = pending_rd_id {
-                match crate::dispatch::mark_dispatch_completed_pg_first(
-                    legacy_db(&state),
+                match crate::dispatch::set_dispatch_status_with_backends(
+                    None,
                     state.pg_pool_ref(),
                     rd_id,
-                    &json!({"decision": "accept", "completion_source": "review_decision_api"}),
+                    "completed",
+                    Some(
+                        &json!({"decision": "accept", "completion_source": "review_decision_api"}),
+                    ),
+                    "mark_dispatch_completed",
+                    Some(&["pending", "dispatched"]),
+                    true,
                 ) {
                     Ok(1) => {}
                     Ok(_) => {
@@ -1589,8 +1595,8 @@ pub async fn submit_review_decision(
             let dispute_status = current_card_status_pg_first(&state, &body.card_id)
                 .await
                 .unwrap_or_else(|| "review".to_string());
-            crate::kanban::fire_enter_hooks(
-                legacy_db(&state),
+            crate::kanban::fire_enter_hooks_with_backends(
+                None,
                 &state.engine,
                 &body.card_id,
                 &dispute_status,
@@ -1601,7 +1607,7 @@ pub async fn submit_review_decision(
             // for review/manual-intervention follow-up on max rounds) and Discord notifications for any
             // dispatches created by the hooks, eliminating the previous manual drain loop
             // that only handled transitions and missed dispatch notifications.
-            crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+            crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
 
             // #229: Safety net — if card is still in a review-like state but no
             // pending review dispatch exists (OnReviewEnter hook may have failed
@@ -1660,7 +1666,7 @@ pub async fn submit_review_decision(
                         "OnReviewEnter",
                         json!({ "card_id": body.card_id }),
                     );
-                    crate::kanban::drain_hook_side_effects(legacy_db(&state), &state.engine);
+                    crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
                 }
             }
 
@@ -1721,11 +1727,17 @@ pub async fn submit_review_decision(
             }
 
             if let Some(ref rd_id) = pending_rd_id {
-                match crate::dispatch::mark_dispatch_completed_pg_first(
-                    legacy_db(&state),
+                match crate::dispatch::set_dispatch_status_with_backends(
+                    None,
                     state.pg_pool_ref(),
                     rd_id,
-                    &json!({"decision": "dispute", "completion_source": "review_decision_api"}),
+                    "completed",
+                    Some(
+                        &json!({"decision": "dispute", "completion_source": "review_decision_api"}),
+                    ),
+                    "mark_dispatch_completed",
+                    Some(&["pending", "dispatched"]),
+                    true,
                 ) {
                     Ok(1) => {}
                     Ok(_) => {
