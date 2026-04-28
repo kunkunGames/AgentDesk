@@ -358,17 +358,20 @@ fn cmd_upgrade(
 
     if let Some(path) = candidate_path {
         // Manual candidate override — skip running the upgrade command.
+        let canonical = std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string());
         let candidate = crate::services::provider_cli::snapshot::snapshot_current_channel(provider)
             .map(|mut ch| {
                 ch.path = path.to_string();
-                ch.canonical_path = path.to_string();
+                ch.canonical_path = canonical.clone();
                 ch.source = "manual_override".to_string();
                 ch
             })
             .unwrap_or_else(
                 || crate::services::provider_cli::registry::ProviderCliChannel {
                     path: path.to_string(),
-                    canonical_path: path.to_string(),
+                    canonical_path: canonical.clone(),
                     version: "unknown".to_string(),
                     version_output: None,
                     source: "manual_override".to_string(),
@@ -383,11 +386,12 @@ fn cmd_upgrade(
         state.candidate_channel = Some(candidate.clone());
         save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
+        let candidate_path = candidate.canonical_path.clone();
         persist_upgrade_candidate(&root, provider, &current, candidate)?;
 
         print_json(&json!({
             "provider": provider,
-            "candidate_path": path,
+            "candidate_path": candidate_path,
             "note": "manual candidate override — upgrade command was skipped",
         }));
         return Ok(());
@@ -618,11 +622,9 @@ fn cmd_promote(provider: &str, evidence: Option<&str>) -> Result<(), String> {
         Some(guard.evidence_json()),
     )
     .map_err(|e| format!("transition error: {e}"))?;
+    promote_registry_candidate(&root, provider)?;
     advance_to(&mut state, MigrationState::ProviderAgentsMigrated, None)
         .map_err(|e| format!("transition error: {e}"))?;
-    save_migration_state(&root, &state).map_err(|e| e.to_string())?;
-    promote_registry_candidate(&root, provider)?;
-
     save_migration_state(&root, &state).map_err(|e| e.to_string())?;
 
     print_json(&json!({
@@ -1063,6 +1065,28 @@ mod tests {
         }
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(name: &'static str, path: &std::path::Path) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, path.as_os_str()) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
     fn test_channel(path: &str) -> crate::services::provider_cli::ProviderCliChannel {
         crate::services::provider_cli::ProviderCliChannel {
             path: path.to_string(),
@@ -1073,6 +1097,16 @@ mod tests {
             checked_at: chrono::Utc::now(),
             evidence: Default::default(),
         }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -1151,6 +1185,47 @@ mod tests {
         let channels = registry.providers.get("codex").unwrap();
         assert_eq!(channels.current.as_ref(), Some(&current));
         assert_eq!(channels.candidate.as_ref(), Some(&candidate));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_manual_candidate_path_records_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let _root = RootEnvGuard::set(dir.path());
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let current = bin_dir.join("codex-current");
+        let candidate_real = bin_dir.join("codex-candidate-real");
+        let candidate_link = bin_dir.join("codex-candidate-link");
+        write_executable(&current, "#!/bin/sh\necho current-version\n");
+        write_executable(&candidate_real, "#!/bin/sh\necho candidate-version\n");
+        std::os::unix::fs::symlink(&candidate_real, &candidate_link).unwrap();
+        let _codex_path = EnvVarGuard::set_path("AGENTDESK_CODEX_PATH", &current);
+
+        let result = cmd_upgrade("codex", false, Some(candidate_link.to_str().unwrap()));
+        let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+        let expected = std::fs::canonicalize(&candidate_link)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        assert!(result.is_ok());
+        assert_eq!(
+            state.candidate_channel.as_ref().unwrap().canonical_path,
+            expected
+        );
+        assert_eq!(
+            registry
+                .providers
+                .get("codex")
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .canonical_path,
+            expected
+        );
     }
 
     #[test]
@@ -1496,11 +1571,83 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn promote_does_not_update_registry_when_state_save_fails() {
+    fn promote_retry_after_terminal_state_save_failure_preserves_previous() {
         let dir = tempfile::tempdir().unwrap();
         let _root = RootEnvGuard::set(dir.path());
 
         use crate::services::provider_cli::paths::migration_state_path;
+        use crate::services::provider_cli::registry::{
+            MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
+        };
+        use chrono::Utc;
+        use std::os::unix::fs::PermissionsExt;
+
+        let current = test_channel("/tmp/current-codex");
+        let candidate = test_channel("/tmp/candidate-codex");
+        let ms = ProviderCliMigrationState {
+            schema_version: 1,
+            provider: "codex".to_string(),
+            state: MigrationState::AwaitingOperatorPromote,
+            selected_agent_id: None,
+            current_channel: Some(current.clone()),
+            candidate_channel: Some(candidate.clone()),
+            rollback_target: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            history: vec![],
+        };
+        save_migration_state(dir.path(), &ms).unwrap();
+        let mut registry = ProviderCliRegistry::default();
+        registry.providers.insert(
+            "codex".to_string(),
+            ProviderChannels {
+                current: Some(current.clone()),
+                candidate: Some(candidate.clone()),
+                ..Default::default()
+            },
+        );
+        save_registry(dir.path(), &registry).unwrap();
+
+        let state_path = migration_state_path(dir.path(), "codex");
+        let mut read_only = std::fs::metadata(&state_path).unwrap().permissions();
+        read_only.set_mode(0o444);
+        std::fs::set_permissions(&state_path, read_only).unwrap();
+
+        let result = cmd_promote("codex", Some("operator approval"));
+
+        let mut writable = std::fs::metadata(&state_path).unwrap().permissions();
+        writable.set_mode(0o644);
+        std::fs::set_permissions(&state_path, writable).unwrap();
+        let state_after_failure = load_migration_state(dir.path(), "codex").unwrap().unwrap();
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+
+        assert!(result.is_err());
+        let channels = registry.providers.get("codex").unwrap();
+        assert_eq!(
+            state_after_failure.state,
+            MigrationState::AwaitingOperatorPromote
+        );
+        assert_eq!(channels.previous.as_ref(), Some(&current));
+        assert_eq!(channels.current.as_ref(), Some(&candidate));
+
+        let retry = cmd_promote("codex", Some("retry after state save failure"));
+        let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
+        let registry = load_registry(dir.path()).unwrap().unwrap();
+        let channels = registry.providers.get("codex").unwrap();
+
+        assert!(retry.is_ok());
+        assert_eq!(state.state, MigrationState::ProviderAgentsMigrated);
+        assert_eq!(channels.previous.as_ref(), Some(&current));
+        assert_eq!(channels.current.as_ref(), Some(&candidate));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promote_registry_failure_does_not_persist_terminal_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let _root = RootEnvGuard::set(dir.path());
+
+        use crate::services::provider_cli::paths::registry_path;
         use crate::services::provider_cli::registry::{
             MigrationState, ProviderChannels, ProviderCliMigrationState, ProviderCliRegistry,
         };
@@ -1533,19 +1680,21 @@ mod tests {
         );
         save_registry(dir.path(), &registry).unwrap();
 
-        let state_path = migration_state_path(dir.path(), "codex");
-        let mut read_only = std::fs::metadata(&state_path).unwrap().permissions();
+        let registry_path = registry_path(dir.path());
+        let mut read_only = std::fs::metadata(&registry_path).unwrap().permissions();
         read_only.set_mode(0o444);
-        std::fs::set_permissions(&state_path, read_only).unwrap();
+        std::fs::set_permissions(&registry_path, read_only).unwrap();
 
         let result = cmd_promote("codex", Some("operator approval"));
 
-        let mut writable = std::fs::metadata(&state_path).unwrap().permissions();
+        let mut writable = std::fs::metadata(&registry_path).unwrap().permissions();
         writable.set_mode(0o644);
-        std::fs::set_permissions(&state_path, writable).unwrap();
+        std::fs::set_permissions(&registry_path, writable).unwrap();
+        let state = load_migration_state(dir.path(), "codex").unwrap().unwrap();
         let registry = load_registry(dir.path()).unwrap().unwrap();
 
         assert!(result.is_err());
+        assert_eq!(state.state, MigrationState::AwaitingOperatorPromote);
         let channels = registry.providers.get("codex").unwrap();
         assert_eq!(channels.current.as_ref(), Some(&current));
     }
