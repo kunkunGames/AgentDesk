@@ -1858,6 +1858,7 @@ fn parse_agent_target(target: &str) -> Result<Option<&str>, SendTargetResolution
     Ok(Some(agent_id))
 }
 
+#[cfg(test)]
 fn resolve_agent_target_channel_id_sqlite(
     sqlite: &Db,
     agent_id: &str,
@@ -1917,6 +1918,7 @@ fn resolve_channel_target(target: &str) -> Result<u64, SendTargetResolutionError
     ))
 }
 
+#[cfg(test)]
 fn resolve_send_target_channel_id(
     sqlite: &Db,
     target: &str,
@@ -1937,12 +1939,24 @@ async fn resolve_send_target_channel_id_with_backends(
             if let Some(pg_pool) = pg_pool {
                 return resolve_agent_target_channel_id_pg(pg_pool, agent_id).await;
             }
-            let db = db.ok_or_else(|| {
-                SendTargetResolutionError::Internal(
-                    "sqlite db unavailable during agent lookup".to_string(),
-                )
-            })?;
-            resolve_agent_target_channel_id_sqlite(db, agent_id)
+
+            #[cfg(test)]
+            {
+                let db = db.ok_or_else(|| {
+                    SendTargetResolutionError::Internal(
+                        "sqlite db unavailable during test agent lookup".to_string(),
+                    )
+                })?;
+                return resolve_agent_target_channel_id_sqlite(db, agent_id);
+            }
+
+            #[cfg(not(test))]
+            {
+                let _ = db;
+                Err(SendTargetResolutionError::Internal(
+                    "postgres pool unavailable during agent lookup".to_string(),
+                ))
+            }
         }
         None => resolve_channel_target(target),
     }
@@ -2440,11 +2454,6 @@ pub async fn handle_send<'a>(
         _ => None,
     };
 
-    // Codex P1 on #1306 (843f): pass the runtime PG pool through so
-    // `target: "agent:<role>"` can resolve the agent's channel binding from
-    // Postgres. Before this fix the placeholder `sqlite` Db was the only
-    // backend handed in, leaving PG-only deployments unable to resolve any
-    // agent target through `/api/discord/send`.
     send_message_with_backends_and_delivery_id(
         registry,
         sqlite,
@@ -2664,8 +2673,6 @@ pub async fn handle_send_to_agent(
     };
 
     let target = format!("agent:{}", request.role_id);
-    // Codex P1 on #1306 (843f): hand the runtime PG pool to the backend
-    // resolver so the role lookup can hit Postgres on PG-only deployments.
     send_message_with_backends(
         registry,
         sqlite,
