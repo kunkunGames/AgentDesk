@@ -118,7 +118,7 @@
 | `error` | `src/error.rs` | 188 |  |
 | `github` | `src/github/mod.rs` | 844 |  |
 | `github::dod` | `src/github/dod.rs` | 395 |  |
-| `github::sync` | `src/github/sync.rs` | 994 |  |
+| `github::sync` | `src/github/sync.rs` | 997 |  |
 | `github::triage` | `src/github/triage.rs` | 159 |  |
 | `integration_tests::agents_setup_e2e` | `src/integration_tests/agents_setup_e2e.rs` | 651 |  |
 | `integration_tests::discord_flow` | `src/integration_tests/discord_flow/mod.rs` | 46 |  |

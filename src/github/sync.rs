@@ -88,7 +88,7 @@ fn fetch_issue_batch(
 
 fn recent_closed_search_query(today: NaiveDate) -> String {
     let cutoff = today - Duration::days(RECENTLY_CLOSED_LOOKBACK_DAYS);
-    format!("closed:>{}", cutoff.format("%Y-%m-%d"))
+    format!("closed:>{} sort:updated-desc", cutoff.format("%Y-%m-%d"))
 }
 
 fn merge_unique_issues(target: &mut Vec<GhIssue>, extras: Vec<GhIssue>) {
@@ -855,7 +855,7 @@ mod tests {
                     "--state".to_string(),
                     "closed".to_string(),
                     "--search".to_string(),
-                    "closed:>2026-03-13".to_string(),
+                    "closed:>2026-03-13 sort:updated-desc".to_string(),
                 ],
             ]
         );
