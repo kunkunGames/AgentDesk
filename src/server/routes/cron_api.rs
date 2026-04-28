@@ -33,12 +33,8 @@ async fn read_kv_str(state: &AppState, key: &str) -> String {
         }
     }
 
-    // TODO(#1238 / 843g): the runtime is PG-only and the kv_meta SQLite
-    // fallback is never reached. Tests still hit this branch through
-    // `AppState::test_state` which sets `db: Some(test_db)`.
     state
-        .db
-        .as_ref()
+        .legacy_db()
         .and_then(|db| db.lock().ok())
         .and_then(|conn| {
             conn.query_row::<String, _, _>(

@@ -1883,7 +1883,7 @@ mod tests {
         seed_dispatch(&db, "d-s1", "card-s1", "implementation", "pending");
 
         let state = AppState {
-            db: Some(db.clone()),
+            legacy_db_override: Some(db.clone()),
             pg_pool: None,
             engine: test_engine(&db),
             config: std::sync::Arc::new(crate::config::Config::default()),
@@ -2578,7 +2578,7 @@ mod tests {
         // onTick1min is now a thin localhost API trigger. In the unit harness there is
         // no Axum server, so exercise the authoritative activate route directly.
         let state = AppState {
-            db: Some(db.clone()),
+            legacy_db_override: Some(db.clone()),
             pg_pool: None,
             engine: engine.clone(),
             config: std::sync::Arc::new(crate::config::Config::default()),
@@ -5916,7 +5916,7 @@ mod tests {
         }
 
         let state = AppState {
-            db: Some(db.clone()),
+            legacy_db_override: Some(db.clone()),
             pg_pool: None,
             engine,
             config: std::sync::Arc::new(crate::config::Config::default()),
@@ -6041,7 +6041,7 @@ mod tests {
         }
 
         let state = AppState {
-            db: Some(db.clone()),
+            legacy_db_override: Some(db.clone()),
             pg_pool: None,
             engine,
             config: std::sync::Arc::new(crate::config::Config::default()),
@@ -6119,7 +6119,7 @@ mod tests {
         }
 
         let state = AppState {
-            db: Some(db.clone()),
+            legacy_db_override: Some(db.clone()),
             pg_pool: None,
             engine,
             config: std::sync::Arc::new(crate::config::Config::default()),

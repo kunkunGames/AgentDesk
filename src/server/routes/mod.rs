@@ -58,15 +58,10 @@ use crate::services::discord::health::HealthRegistry;
 
 /// Shared application state passed to all route handlers.
 ///
-/// #1237 (843f): the legacy SQLite handle (`db`) is no longer constructed at
-/// server startup. Production runtimes carry `db: None` and rely on
-/// `pg_pool` for persistence. Test fixtures continue to set
-/// `db: Some(test_db)` and that path is the only place `legacy_db()` returns
-/// a handle. Production call sites that still need a `&Db` are tracked under
-/// #1238 (843g) and should migrate to PG-only APIs there.
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Option<Db>,
+    #[cfg(test)]
+    pub(crate) legacy_db_override: Option<Db>,
     pub pg_pool: Option<sqlx::PgPool>,
     pub engine: PolicyEngine,
     pub config: Arc<crate::config::Config>,
@@ -76,11 +71,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Returns the optional legacy SQLite handle. Production runtimes get
-    /// `None`; #1238 (843g) will migrate the remaining call sites that
-    /// currently expect a `&Db` to PG-only APIs and remove this accessor.
+    /// Returns the optional legacy SQLite handle for test fixtures and
+    /// legacy policy-engine compatibility.
     pub fn legacy_db(&self) -> Option<&crate::db::Db> {
-        self.db.as_ref()
+        #[cfg(test)]
+        {
+            self.legacy_db_override
+                .as_ref()
+                .or_else(|| self.engine.legacy_db())
+        }
+        #[cfg(not(test))]
+        {
+            self.engine.legacy_db()
+        }
     }
 
     pub fn pg_pool_ref(&self) -> Option<&sqlx::PgPool> {
@@ -109,7 +112,7 @@ impl AppState {
     pub fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
         // AutoQueueService already accepts Option<Db>; pass it through
         // directly without forcing a placeholder shim.
-        let db = self.db.clone().or_else(|| self.engine.legacy_db().cloned());
+        let db = self.legacy_db().cloned();
         crate::services::auto_queue::AutoQueueService::new(db, self.engine.clone())
     }
 
@@ -139,9 +142,8 @@ impl AppState {
     /// #1238 migrates the constructors to `Option<Db>` (or PG-only), this
     /// helper goes away.
     fn legacy_db_for_pending_migration(&self) -> crate::db::Db {
-        self.db
-            .clone()
-            .or_else(|| self.engine.legacy_db().cloned())
+        self.legacy_db()
+            .cloned()
             .unwrap_or_else(legacy_pending_migration_shim)
     }
 }
@@ -190,7 +192,7 @@ impl AppState {
         let tx = crate::server::ws::new_broadcast();
         let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
         Self {
-            db: Some(db),
+            legacy_db_override: Some(db),
             pg_pool: None,
             engine,
             config: Arc::new(config),
@@ -207,7 +209,7 @@ impl AppState {
         let tx = crate::server::ws::new_broadcast();
         let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
         Self {
-            db: Some(db),
+            legacy_db_override: Some(db),
             pg_pool: Some(pg_pool),
             engine,
             config: Arc::new(crate::config::Config::default()),
@@ -247,8 +249,11 @@ pub fn api_router_with_pg(
     health_registry: Option<Arc<HealthRegistry>>,
     pg_pool: Option<sqlx::PgPool>,
 ) -> Router {
+    #[cfg(not(test))]
+    let _ = db;
     let state = AppState {
-        db,
+        #[cfg(test)]
+        legacy_db_override: db,
         pg_pool,
         engine,
         config: Arc::new(config),
