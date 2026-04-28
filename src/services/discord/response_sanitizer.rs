@@ -50,8 +50,8 @@ pub(crate) fn sanitize_hidden_context(input: &str) -> String {
         }
 
         let trimmed = line.trim();
-        if is_hidden_header(trimmed) || is_hidden_line(trimmed) {
-            dropping_block = is_hidden_header(trimmed);
+        if is_hidden_header(trimmed) {
+            dropping_block = true;
             saw_blank_in_block = false;
             continue;
         }
@@ -61,7 +61,10 @@ pub(crate) fn sanitize_hidden_context(input: &str) -> String {
                 saw_blank_in_block = true;
                 continue;
             }
-            if saw_blank_in_block && !looks_like_hidden_continuation(trimmed) {
+            if saw_blank_in_block
+                && !is_hidden_line(trimmed)
+                && !looks_like_hidden_continuation(trimmed)
+            {
                 dropping_block = false;
                 saw_blank_in_block = false;
             } else {
@@ -163,5 +166,27 @@ visible";
     fn preserves_near_miss_user_text() {
         let input = "I found a bug in an Authoritative Instructions parser.";
         assert_eq!(sanitize_hidden_context(input), input);
+    }
+
+    #[test]
+    fn preserves_hidden_line_prefix_outside_hidden_block() {
+        let input = "\
+Current working directory: /repo
+
+계속 진행하겠습니다.";
+        assert_eq!(sanitize_hidden_context(input), input);
+    }
+
+    #[test]
+    fn removes_hidden_line_prefix_after_blank_inside_hidden_block() {
+        let input = "\
+[Authoritative Instructions]
+
+Current working directory: /tmp/project
+Discord formatting rules:
+- Use inline code for short references.
+
+Visible answer.";
+        assert_eq!(sanitize_hidden_context(input), "Visible answer.");
     }
 }

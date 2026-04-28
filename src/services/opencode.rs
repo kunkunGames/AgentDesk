@@ -130,11 +130,14 @@ pub fn execute_command_simple_cancellable(
     if let Some(result) = done_result {
         return Ok(result);
     }
+    if let Some(error) = error {
+        return Err(error);
+    }
     let text = text.trim().to_string();
     if !text.is_empty() {
         return Ok(text);
     }
-    Err(error.unwrap_or_else(|| "Empty response from OpenCode".to_string()))
+    Err("Empty response from OpenCode".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -643,11 +646,12 @@ fn consume_sse(
             if let Some(should_stop) = process_sse_event(&data, session_id, sender, &mut state) {
                 if should_stop {
                     idle_seen = true;
-                    // Send Done
-                    let _ = sender.send(StreamMessage::Done {
-                        result: state.accumulated_text.trim().to_string(),
-                        session_id: Some(session_id.to_string()),
-                    });
+                    if !state.terminal_error {
+                        let _ = sender.send(StreamMessage::Done {
+                            result: state.accumulated_text.trim().to_string(),
+                            session_id: Some(session_id.to_string()),
+                        });
+                    }
                     break;
                 }
             }
@@ -665,6 +669,7 @@ fn consume_sse(
 struct SseMessageState {
     accumulated_text: String,
     text_part_snapshots: HashMap<String, String>,
+    terminal_error: bool,
 }
 
 fn append_text_delta(sender: &Sender<StreamMessage>, state: &mut SseMessageState, text: &str) {
@@ -941,6 +946,7 @@ fn process_sse_event(
                 stderr: String::new(),
                 exit_code: None,
             });
+            state.terminal_error = true;
             Some(true) // Stop on error events
         }
 
@@ -1197,13 +1203,39 @@ mod tests {
     }
 
     #[test]
-    fn test_error_event_signals_done() {
+    fn test_error_event_signals_stop() {
         let data = r#"{"type":"error","properties":{"message":"boom","sessionID":"s1"}}"#;
         let (msgs, stop) = parse_event(data, "s1");
         assert_eq!(stop, Some(true));
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, StreamMessage::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn test_error_event_does_not_emit_done() {
+        let data =
+            br#"data: {"type":"session.error","properties":{"message":"boom","sessionID":"s1"}}
+
+"#
+            .to_vec();
+        let reader: BufReader<Box<dyn std::io::Read + Send>> =
+            BufReader::new(Box::new(std::io::Cursor::new(data)));
+        let (tx, rx) = mpsc::channel::<StreamMessage>();
+
+        let result = consume_sse(reader, "s1", &tx, None, "http://127.0.0.1:9", "");
+        drop(tx);
+        let msgs = rx.try_iter().collect::<Vec<_>>();
+
+        assert!(result.is_ok());
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Error { message, .. } if message == "boom"))
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, StreamMessage::Done { .. })),
+            "OpenCode error terminal events must not be converted into Done"
         );
     }
 
