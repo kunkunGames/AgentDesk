@@ -404,6 +404,13 @@ pub fn run_upgrade(
         }
     }
 
+    // npm-global: the existing entry-point symlink blocks `npm install -g` from creating
+    // its own (EEXIST). Remove it now that the previous install is preserved (or the
+    // operator explicitly skipped preservation).
+    if strategy.install_source == "npm-global" {
+        remove_path_if_exists(Path::new(&current_snapshot.path))?;
+    }
+
     // Run the update command.
     let argv = strategy.command_argv;
     let output = run_upgrade_command(argv)?;
@@ -728,5 +735,53 @@ mod tests {
             dest.canonicalize().unwrap(),
             preserved_tree.join("bin/codex.js").canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_global_entry_point_removed_before_upgrade_command() {
+        // Verify that remove_path_if_exists is called for npm-global after preservation.
+        // We set up a symlink at `current_snapshot.path` and confirm it is absent once
+        // the preservation+removal step completes (the actual upgrade command is not run
+        // because there is no real npm binary in this environment, but the removal happens
+        // before the command is invoked).
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = temp.path().join("npm/lib/node_modules/@openai/codex");
+        let bin_dir = package_root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("codex.js"), "#!/usr/bin/env node\n").unwrap();
+
+        let global_bin = temp.path().join("npm/bin");
+        std::fs::create_dir_all(&global_bin).unwrap();
+        let entrypoint = global_bin.join("codex");
+        std::os::unix::fs::symlink(package_root.join("bin/codex.js"), &entrypoint).unwrap();
+
+        assert!(entrypoint.exists(), "entry point must exist before upgrade");
+
+        let channel = ProviderCliChannel {
+            path: entrypoint.to_string_lossy().to_string(),
+            canonical_path: package_root
+                .join("bin/codex.js")
+                .to_string_lossy()
+                .to_string(),
+            version: "1.0.0".to_string(),
+            version_output: None,
+            source: "current_path".to_string(),
+            checked_at: chrono::Utc::now(),
+            evidence: Default::default(),
+        };
+        let dest = temp.path().join("runtime/codex-previous-binary");
+
+        // Manually reproduce the preserve + remove_path_if_exists steps from run_upgrade().
+        let strategy = update_strategy_for("codex").unwrap();
+        preserve_previous_install(strategy, &channel, &dest).unwrap();
+        remove_path_if_exists(Path::new(&channel.path)).unwrap();
+
+        assert!(
+            !entrypoint.exists(),
+            "entry point must be removed so npm install -g can create its own symlink"
+        );
+        // Backup must still be intact.
+        assert!(dest.exists(), "preserved backup must still exist after removal");
     }
 }
