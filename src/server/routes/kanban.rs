@@ -175,6 +175,39 @@ async fn load_active_turn_targets_for_card_pg(
         .collect()
 }
 
+fn load_active_turn_targets_for_card_on_conn(
+    conn: &libsql_rusqlite::Connection,
+    card_id: &str,
+) -> anyhow::Result<Vec<ActiveTurnTarget>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_key, provider, thread_channel_id
+             FROM sessions
+             WHERE active_dispatch_id IN (
+                 SELECT id
+                 FROM task_dispatches
+                 WHERE kanban_card_id = ?1
+                   AND status IN ('pending', 'dispatched')
+             )",
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("prepare active turn target query for {card_id}: {error}")
+        })?;
+
+    let rows = stmt
+        .query_map([card_id], |row| {
+            Ok(ActiveTurnTarget {
+                session_key: row.get(0)?,
+                provider: row.get(1)?,
+                thread_channel_id: row.get(2)?,
+            })
+        })
+        .map_err(|error| anyhow::anyhow!("query active turn targets for {card_id}: {error}"))?;
+
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| anyhow::anyhow!("decode active turn targets for {card_id}: {error}"))
+}
+
 async fn cancel_turn_targets(state: &AppState, targets: &[ActiveTurnTarget], reason: &str) {
     for target in targets {
         let tmux_name = target
@@ -220,10 +253,25 @@ async fn cancel_turn_targets(state: &AppState, targets: &[ActiveTurnTarget], rea
             .await
             .ok();
         } else {
-            tracing::warn!(
-                target = %target.session_key,
-                "[kanban] cancel_turn_targets skipped session-clear: postgres pool unavailable (#1239)"
-            );
+            match legacy_db(state).lock() {
+                Ok(conn) => {
+                    conn.execute(
+                        "UPDATE sessions
+                         SET status = 'disconnected',
+                             active_dispatch_id = NULL,
+                             claude_session_id = NULL
+                         WHERE session_key = ?1",
+                        [&target.session_key],
+                    )
+                    .ok();
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target = %target.session_key,
+                        "[kanban] cancel_turn_targets skipped legacy session-clear: {error}"
+                    );
+                }
+            }
         }
     }
 }
@@ -233,21 +281,42 @@ async fn transition_card_to_backlog_with_cleanup(
     card_id: &str,
     source: &str,
 ) -> anyhow::Result<crate::kanban::TransitionResult> {
-    let pool = state.pg_pool_ref().ok_or_else(|| {
-        anyhow::anyhow!("transition_card_to_backlog_with_cleanup requires postgres pool (#1239)")
-    })?;
-    let turn_targets = load_active_turn_targets_for_card_pg(pool, card_id).await?;
-    let result = crate::kanban::transition_status_with_opts_and_allowed_cleanup_pg_only(
-        pool,
-        &state.engine,
-        card_id,
-        "backlog",
-        source,
-        crate::engine::transition::ForceIntent::SystemRecovery,
-        crate::kanban::AllowedOnConnMutation::ForceTransitionRevertCleanup,
-    )
-    .await
-    .map(|(result, _)| result)?;
+    let (turn_targets, result) = if let Some(pool) = state.pg_pool_ref() {
+        let turn_targets = load_active_turn_targets_for_card_pg(pool, card_id).await?;
+        let result = crate::kanban::transition_status_with_opts_and_allowed_cleanup_pg_only(
+            pool,
+            &state.engine,
+            card_id,
+            "backlog",
+            source,
+            crate::engine::transition::ForceIntent::SystemRecovery,
+            crate::kanban::AllowedOnConnMutation::ForceTransitionRevertCleanup,
+        )
+        .await
+        .map(|(result, _)| result)?;
+        (turn_targets, result)
+    } else {
+        let turn_targets = {
+            let conn = legacy_db(state)
+                .lock()
+                .map_err(|error| anyhow::anyhow!("lock legacy db for {card_id}: {error}"))?;
+            load_active_turn_targets_for_card_on_conn(&conn, card_id)?
+        };
+        let result = crate::kanban::transition_status_with_opts_and_on_conn(
+            legacy_db(state),
+            &state.engine,
+            card_id,
+            "backlog",
+            source,
+            crate::engine::transition::ForceIntent::SystemRecovery,
+            crate::kanban::AllowedOnConnMutation::ForceTransitionRevertCleanup,
+            |conn| {
+                cleanup_force_transition_revert_on_conn(conn, card_id, "backlog")?;
+                Ok(())
+            },
+        )?;
+        (turn_targets, result)
+    };
     cancel_turn_targets(state, &turn_targets, "kanban backlog revert").await;
     Ok(result)
 }
@@ -4465,14 +4534,82 @@ pub async fn force_transition(
     let needs_cleanup = force_transition_needs_cleanup(&body.status, body.cancel_dispatches);
     let target_status = body.status;
     let mut cleanup_counts = (0, 0);
-    let pool = match state.pg_pool_ref() {
-        Some(pool) => pool,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "force-transition requires postgres pool (#1239)"})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        let caller_source = {
+            let conn = match legacy_db(&state).lock() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{error}")})),
+                    );
+                }
+            };
+            resolve_requesting_agent_id_on_conn(&conn, &headers)
+                .unwrap_or_else(|| "api".to_string())
+        };
+        let transition_result = crate::kanban::transition_status_with_opts(
+            legacy_db(&state),
+            &state.engine,
+            &id,
+            &target_status,
+            &caller_source,
+            crate::engine::transition::ForceIntent::OperatorOverride,
+        )
+        .and_then(|result| {
+            let counts = if needs_cleanup {
+                let conn = legacy_db(&state)
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                cleanup_force_transition_revert_on_conn(&conn, &id, &target_status)
+            } else {
+                Ok((0, 0))
+            }?;
+            Ok::<_, anyhow::Error>((result, counts))
+        });
+
+        return match transition_result {
+            Ok((result, (cancelled_dispatches, skipped_auto_queue_entries))) => {
+                crate::kanban::drain_hook_side_effects_with_backends(
+                    Some(legacy_db(&state)),
+                    &state.engine,
+                );
+                let card = legacy_db(&state).lock().ok().and_then(|conn| {
+                    conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+                        card_row_to_json(row)
+                    })
+                    .ok()
+                });
+                match card {
+                    Some(card) => {
+                        crate::server::ws::emit_event(
+                            &state.broadcast_tx,
+                            "kanban_card_updated",
+                            card.clone(),
+                        );
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "card": card,
+                                "forced": true,
+                                "from": result.from,
+                                "to": result.to,
+                                "cancelled_dispatches": cancelled_dispatches,
+                                "skipped_auto_queue_entries": skipped_auto_queue_entries
+                            })),
+                        )
+                    }
+                    None => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "failed to read card after force-transition"})),
+                    ),
+                }
+            }
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{error}")})),
+            ),
+        };
     };
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await

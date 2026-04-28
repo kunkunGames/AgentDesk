@@ -27,7 +27,7 @@ use std::time::Duration;
 use crate::services::agent_protocol::StreamMessage;
 use crate::services::process::kill_pid_tree;
 use crate::services::provider::{CancelToken, ProviderKind};
-use crate::services::{claude, codex, gemini, qwen};
+use crate::services::{claude, codex, gemini, opencode, qwen};
 
 pub async fn execute_simple(provider: ProviderKind, prompt: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || execute_simple_blocking(provider, prompt, None))
@@ -82,6 +82,9 @@ fn execute_simple_blocking(
         }
         ProviderKind::Gemini => {
             gemini::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
+        }
+        ProviderKind::OpenCode => {
+            opencode::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
         }
         ProviderKind::Qwen => {
             qwen::execute_command_simple_cancellable(&prompt, cancel_token.as_deref())
@@ -143,6 +146,21 @@ pub async fn execute_structured(
                 None,
             ),
             ProviderKind::Gemini => gemini::execute_command_streaming(
+                &prompt,
+                None,
+                &working_dir,
+                sender.clone(),
+                system_prompt_ref,
+                allowed_tools_ref,
+                Some(Arc::clone(&cancel_token)),
+                None,
+                None,
+                None,
+                None,
+                model_ref,
+                None,
+            ),
+            ProviderKind::OpenCode => opencode::execute_command_streaming(
                 &prompt,
                 None,
                 &working_dir,
@@ -221,6 +239,9 @@ fn collect_stream_result(
         }
     }
 
+    if let Some(error) = error {
+        return Err(error);
+    }
     if let Some(result) = done {
         return Ok(result.trim().to_string());
     }
@@ -239,6 +260,34 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn collect_stream_result_prioritizes_stream_error_over_text_and_done() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(StreamMessage::Text {
+                content: "partial output".to_string(),
+            })
+            .unwrap();
+        sender
+            .send(StreamMessage::Done {
+                result: "successful looking output".to_string(),
+                session_id: Some("opencode-session".to_string()),
+            })
+            .unwrap();
+        sender
+            .send(StreamMessage::Error {
+                message: "opencode session failed".to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            })
+            .unwrap();
+        drop(sender);
+
+        let error = collect_stream_result(Ok(()), receiver).expect_err("stream error must win");
+        assert_eq!(error, "opencode session failed");
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {

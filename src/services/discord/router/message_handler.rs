@@ -1019,6 +1019,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",
         ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCode => "opencode",
         ProviderKind::Qwen => "qwen",
         ProviderKind::Unsupported(_) => "unsupported",
     };
@@ -1432,6 +1433,21 @@ pub(in crate::services::discord) async fn start_headless_turn(
                         None,
                     ),
                     ProviderKind::Qwen => qwen::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
+                    ),
+                    ProviderKind::OpenCode => opencode::execute_command_streaming(
                         &context_prompt,
                         session_id_clone.as_deref(),
                         &current_path_clone,
@@ -3358,6 +3374,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",
         ProviderKind::Gemini => "gemini",
+        ProviderKind::OpenCode => "opencode",
         ProviderKind::Qwen => "qwen",
         ProviderKind::Unsupported(_) => "unsupported",
     };
@@ -3882,6 +3899,21 @@ pub(in crate::services::discord) async fn handle_text_message(
                         Some(provider_for_blocking.clone()),
                         model_for_turn.as_deref(),
                         None, // Qwen: compact not supported
+                    ),
+                    ProviderKind::OpenCode => opencode::execute_command_streaming(
+                        &context_prompt,
+                        session_id_clone.as_deref(),
+                        &current_path_clone,
+                        tx.clone(),
+                        Some(&system_prompt_owned),
+                        Some(&allowed_tools),
+                        Some(cancel_token_clone),
+                        remote_profile.as_ref(),
+                        tmux_session_name.as_deref(),
+                        Some(channel_id.get()),
+                        Some(provider_for_blocking.clone()),
+                        model_for_turn.as_deref(),
+                        None,
                     ),
                     ProviderKind::Unsupported(name) => {
                         let _ = tx.send(StreamMessage::Error {
