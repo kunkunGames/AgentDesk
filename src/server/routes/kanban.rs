@@ -383,8 +383,7 @@ pub async fn list_cards(
     State(state): State<AppState>,
     Query(params): Query<ListCardsQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let service =
-        crate::services::kanban::KanbanService::new(legacy_db(&state).clone(), state.pg_pool);
+    let service = crate::services::kanban::KanbanService::new(state.pg_pool);
     match service
         .list_cards(crate::services::kanban::ListCardsInput {
             status: params.status,

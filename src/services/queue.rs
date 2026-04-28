@@ -14,7 +14,7 @@ use poise::serenity_prelude::ChannelId;
 
 #[derive(Clone)]
 pub struct QueueService {
-    db: Db,
+    db: Option<Db>,
     pg_pool: Option<PgPool>,
 }
 
@@ -35,7 +35,7 @@ struct CancelTurnChannelTarget {
 }
 
 impl QueueService {
-    pub fn new(db: Db, pg_pool: Option<PgPool>) -> Self {
+    pub fn new(db: Option<Db>, pg_pool: Option<PgPool>) -> Self {
         Self { db, pg_pool }
     }
 
@@ -280,16 +280,28 @@ impl QueueService {
                         "failed to cancel postgres dispatch while cancelling turn: {error}"
                     );
                 }
-            } else if let Ok(conn) = self.db.lock() {
-                if let Err(error) = crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
-                    &conn,
-                    dispatch_id,
-                    None,
-                ) {
-                    tracing::warn!(
-                        dispatch_id,
-                        "failed to cancel sqlite dispatch while cancelling turn: {error}"
-                    );
+            } else if let Some(db) = self.db.as_ref() {
+                match db.lock() {
+                    Ok(conn) => {
+                        if let Err(error) =
+                            crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
+                                &conn,
+                                dispatch_id,
+                                None,
+                            )
+                        {
+                            tracing::warn!(
+                                dispatch_id,
+                                "failed to cancel sqlite dispatch while cancelling turn: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            dispatch_id,
+                            "failed to lock sqlite dispatch while cancelling turn: {error}"
+                        );
+                    }
                 }
             }
         }
@@ -312,17 +324,27 @@ impl QueueService {
                         "failed to mark postgres session disconnected during cancel_turn: {error}"
                     );
                 }
-            } else if let Ok(conn) = self.db.lock() {
-                if let Err(error) = conn.execute(
-                    "UPDATE sessions
-                     SET status = 'disconnected', active_dispatch_id = NULL, claude_session_id = NULL
-                     WHERE session_key = ?1",
-                    [session_key],
-                ) {
-                    tracing::warn!(
-                        session_key,
-                        "failed to mark sqlite session disconnected during cancel_turn: {error}"
-                    );
+            } else if let Some(db) = self.db.as_ref() {
+                match db.lock() {
+                    Ok(conn) => {
+                        if let Err(error) = conn.execute(
+                            "UPDATE sessions
+                             SET status = 'disconnected', active_dispatch_id = NULL, claude_session_id = NULL
+                             WHERE session_key = ?1",
+                            [session_key],
+                        ) {
+                            tracing::warn!(
+                                session_key,
+                                "failed to mark sqlite session disconnected during cancel_turn: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_key,
+                            "failed to lock sqlite session while cancelling turn: {error}"
+                        );
+                    }
                 }
             }
         }

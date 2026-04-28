@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
-use crate::db::Db;
 use crate::services::service_error::{ErrorCode, ServiceError, ServiceResult};
 
 const RUNTIME_CONFIG_KEYS: &[&str] = &[
@@ -28,18 +27,13 @@ const RUNTIME_CONFIG_KEYS: &[&str] = &[
 
 #[derive(Clone)]
 pub struct SettingsService {
-    _db: Db,
     pg_pool: Option<sqlx::PgPool>,
     config: Arc<crate::config::Config>,
 }
 
 impl SettingsService {
-    pub fn new(db: Db, pg_pool: Option<sqlx::PgPool>, config: Arc<crate::config::Config>) -> Self {
-        Self {
-            _db: db,
-            pg_pool,
-            config,
-        }
+    pub fn new(pg_pool: Option<sqlx::PgPool>, config: Arc<crate::config::Config>) -> Self {
+        Self { pg_pool, config }
     }
 
     pub fn get_runtime_config(&self) -> ServiceResult<Value> {

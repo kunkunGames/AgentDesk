@@ -91,22 +91,11 @@ impl AppState {
     }
 
     pub fn kanban_service(&self) -> crate::services::kanban::KanbanService {
-        // TODO(#1238 / 843g): KanbanService still takes a `Db` for its
-        // SQLite fallback path. Production runtimes always have a `pg_pool`
-        // and never hit the SQLite branch, so the field is filled with the
-        // engine's optional handle (None at runtime, Some in tests).
-        crate::services::kanban::KanbanService::new(
-            self.legacy_db_for_pending_migration(),
-            self.pg_pool.clone(),
-        )
+        crate::services::kanban::KanbanService::new(self.pg_pool.clone())
     }
 
     pub fn dispatch_service(&self) -> crate::services::dispatches::DispatchService {
-        // TODO(#1238 / 843g): see kanban_service.
-        crate::services::dispatches::DispatchService::new(
-            self.legacy_db_for_pending_migration(),
-            self.engine.clone(),
-        )
+        crate::services::dispatches::DispatchService::new(self.engine.clone())
     }
 
     pub fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
@@ -117,20 +106,11 @@ impl AppState {
     }
 
     pub fn queue_service(&self) -> crate::services::queue::QueueService {
-        // TODO(#1238 / 843g): QueueService::new still takes a `Db`.
-        crate::services::queue::QueueService::new(
-            self.legacy_db_for_pending_migration(),
-            self.pg_pool.clone(),
-        )
+        crate::services::queue::QueueService::new(self.legacy_db().cloned(), self.pg_pool.clone())
     }
 
     pub fn settings_service(&self) -> crate::services::settings::SettingsService {
-        // TODO(#1238 / 843g): SettingsService::new still takes a `Db`.
-        crate::services::settings::SettingsService::new(
-            self.legacy_db_for_pending_migration(),
-            self.pg_pool.clone(),
-            self.config.clone(),
-        )
+        crate::services::settings::SettingsService::new(self.pg_pool.clone(), self.config.clone())
     }
 
     /// TODO(#1238 / 843g): used by service factories that still expect a
