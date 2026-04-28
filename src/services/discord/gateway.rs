@@ -275,6 +275,61 @@ fn dispatch_post_error(
     crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError::new(kind, detail)
 }
 
+/// codex review P2 (#1332 follow-up): drain the `queued_placeholders` /
+/// `placeholder_controller` bookkeeping for every non-head source message id
+/// of a merged intervention. The dispatch path uses `intervention.message_id`
+/// (the merged tail) as the Active card, so the head id's mapping must be
+/// preserved here — only the *other* source ids leak. Returns the placeholder
+/// Discord message ids whose visible cards the caller should delete (kept as
+/// a return value to keep the helper independent of `serenity::Http` so the
+/// test harness can invoke it without a real Discord client).
+pub(super) async fn drain_merged_queued_placeholders(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    head_message_id: MessageId,
+    source_message_ids: &[MessageId],
+) -> Vec<MessageId> {
+    // codex review round-4 P2 + round-5 P2: serialize the merged-source
+    // drain with every other `queued_placeholders` mutation on the same
+    // channel via the per-channel async persistence mutex. Otherwise an
+    // `insert_queued_placeholder` for the head id could race this drain and
+    // let the older snapshot overwrite the newer disk file, resurrecting
+    // non-head source mappings on restart. The lock is async so this helper
+    // can be safely awaited from both the live dispatch path and the
+    // restart-induced kickoff path (round-5 P2 finding 3) without blocking
+    // the runtime worker.
+    let persist_lock = shared.queued_placeholders_persist_lock(channel_id);
+    let _persist_guard = persist_lock.lock().await;
+    let mut to_delete = Vec::new();
+    let mut mutated = false;
+    for message_id in source_message_ids {
+        if *message_id == head_message_id {
+            continue;
+        }
+        if let Some((_, placeholder_msg_id)) = shared
+            .queued_placeholders
+            .remove(&(channel_id, *message_id))
+        {
+            shared
+                .placeholder_controller
+                .detach_by_message(channel_id, placeholder_msg_id);
+            to_delete.push(placeholder_msg_id);
+            mutated = true;
+        }
+    }
+    // codex review round-3 P2: persist the write-through after the batch
+    // drain so a restart sees the same state as memory.
+    if mutated {
+        super::queued_placeholders_store::persist_channel_from_map(
+            &shared.queued_placeholders,
+            &shared.provider,
+            &shared.token_hash,
+            channel_id,
+        );
+    }
+    to_delete
+}
+
 pub(super) async fn send_intake_placeholder(
     http: Arc<serenity::Http>,
     shared: Arc<SharedData>,
@@ -439,6 +494,30 @@ impl TurnGateway for DiscordGateway {
                 formatting::remove_reaction_raw(&self.http, channel_id, *message_id, '📬').await;
                 formatting::remove_reaction_raw(&self.http, channel_id, *message_id, '➕').await;
             }
+
+            // codex review P2 (#1332 follow-up): merged interventions can carry
+            // several `source_message_ids`, each of which had registered its own
+            // `📬 메시지 대기 중` placeholder when it lost the start-turn race.
+            // `handle_text_message` only consumes `queued_placeholders` for the
+            // intervention's HEAD message id (the last merged id, used as the
+            // Active card). The remaining source ids would otherwise leak both
+            // a `queued_placeholders` mapping and a stale `📬` Discord card for
+            // a turn that is now actively running. Drain them here, before
+            // dispatch enters `handle_text_message`. The head id is excluded
+            // because the dispatch hand-off path will own its transition.
+            let drained = drain_merged_queued_placeholders(
+                &self.shared,
+                channel_id,
+                intervention.message_id,
+                &intervention.source_message_ids,
+            )
+            .await;
+            for placeholder_msg_id in drained {
+                let _ = channel_id
+                    .delete_message(&self.http, placeholder_msg_id)
+                    .await;
+            }
+
             handle_text_message(
                 &live_turn.ctx,
                 channel_id,
@@ -596,10 +675,11 @@ impl TurnGateway for HeadlessGateway {
 
 #[cfg(test)]
 mod tests {
-    use super::{live_bot_owner_provider, outbound_policy};
+    use super::{drain_merged_queued_placeholders, live_bot_owner_provider, outbound_policy};
     use crate::services::discord::outbound::{
         DISCORD_HARD_LIMIT_CHARS, SplitStrategy, ThreadFallback,
     };
+    use poise::serenity_prelude::{ChannelId, MessageId};
 
     #[test]
     fn live_bot_owner_provider_requires_live_turn_context() {
@@ -614,5 +694,133 @@ mod tests {
         assert_eq!(policy.split_strategy, SplitStrategy::RejectOverLimit);
         assert_eq!(policy.thread_fallback, ThreadFallback::None);
         assert!(policy.minimal_fallback.is_none());
+    }
+
+    // codex review round-6 P2 (#1332): the two `drain_merged_queued_placeholders`
+    // tests below now write to disk via `persist_channel_from_map` whenever
+    // the drain mutates the map. Without isolation they could pollute the
+    // developer's real `~/.adk/release` runtime directory or race a
+    // parallel test that mutates `AGENTDESK_ROOT_DIR`. Wrap each test in
+    // `lock_test_env` + a `tempfile::tempdir` `AGENTDESK_ROOT_DIR` so the
+    // write-through lands in a per-test temp directory.
+    fn with_isolated_runtime_root<F: FnOnce(&std::path::Path)>(f: F) {
+        let _lock = crate::services::discord::runtime_store::lock_test_env();
+        let tmp = tempfile::tempdir().expect("create temp runtime dir for queued placeholder test");
+        unsafe {
+            std::env::set_var(
+                "AGENTDESK_ROOT_DIR",
+                tmp.path().to_str().expect("temp path must be valid utf-8"),
+            );
+        }
+        f(tmp.path());
+        unsafe {
+            std::env::remove_var("AGENTDESK_ROOT_DIR");
+        }
+    }
+
+    // codex review P2 (#1332 follow-up): when a merged intervention is
+    // dispatched, the queued placeholders for every NON-head source id must
+    // be drained and returned for visible-card cleanup. The head id is left
+    // in place because the dispatch hand-off path consumes it directly.
+    //
+    // codex review round-6 P2 (#1332): isolated under temp `AGENTDESK_ROOT_DIR`
+    // so the persistence write-through cannot pollute the dev runtime dir
+    // or race other parallel tests that mutate the env var. Run the async
+    // body on a freshly-built runtime inside the env-locked block — using
+    // `#[tokio::test]` would acquire the lock AFTER the runtime started,
+    // and other tests on the runtime's worker threads could observe a
+    // half-set `AGENTDESK_ROOT_DIR`.
+    #[test]
+    fn drain_merged_queued_placeholders_drops_non_head_source_ids() {
+        with_isolated_runtime_root(|_root| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build single-thread tokio runtime");
+            rt.block_on(async {
+                let shared = crate::services::discord::make_shared_data_for_tests();
+                let channel_id = ChannelId::new(940_000_000_000_001);
+                let head_msg = MessageId::new(840_000_000_000_001);
+                let head_card = MessageId::new(740_000_000_000_001);
+                let merged_a_msg = MessageId::new(840_000_000_000_002);
+                let merged_a_card = MessageId::new(740_000_000_000_002);
+                let merged_b_msg = MessageId::new(840_000_000_000_003);
+                let merged_b_card = MessageId::new(740_000_000_000_003);
+
+                shared
+                    .queued_placeholders
+                    .insert((channel_id, head_msg), head_card);
+                shared
+                    .queued_placeholders
+                    .insert((channel_id, merged_a_msg), merged_a_card);
+                shared
+                    .queued_placeholders
+                    .insert((channel_id, merged_b_msg), merged_b_card);
+
+                let drained = drain_merged_queued_placeholders(
+                    &shared,
+                    channel_id,
+                    head_msg,
+                    &[merged_a_msg, merged_b_msg, head_msg],
+                )
+                .await;
+
+                // Head id must remain in queued_placeholders so the dispatch hand-off
+                // path can consume it; the two merged ids must be drained AND
+                // returned so the caller can delete their stale Discord cards.
+                assert_eq!(drained.len(), 2);
+                let drained_set: std::collections::HashSet<MessageId> =
+                    drained.into_iter().collect();
+                assert!(drained_set.contains(&merged_a_card));
+                assert!(drained_set.contains(&merged_b_card));
+                assert!(!drained_set.contains(&head_card));
+                assert_eq!(shared.queued_placeholders.len(), 1);
+                assert_eq!(
+                    shared
+                        .queued_placeholders
+                        .get(&(channel_id, head_msg))
+                        .map(|entry| *entry.value()),
+                    Some(head_card),
+                    "head id mapping must survive the drain"
+                );
+            });
+        });
+    }
+
+    // codex review P2: a non-merged intervention (single source id == head)
+    // should produce an empty drain — there is nothing to clean up.
+    //
+    // codex review round-6 P2 (#1332): even though this drain takes the
+    // `mutated == false` branch and does NOT write to disk, the helper
+    // still acquires the per-channel persistence mutex which DashMap-stores
+    // the lock entry inside `SharedData::queued_placeholders_persist_locks`.
+    // Wrap the test for symmetry with the mutating sibling and to defend
+    // against future drain-helper changes that would start persisting on
+    // the no-op path.
+    #[test]
+    fn drain_merged_queued_placeholders_noop_for_non_merged_intervention() {
+        with_isolated_runtime_root(|_root| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build single-thread tokio runtime");
+            rt.block_on(async {
+                let shared = crate::services::discord::make_shared_data_for_tests();
+                let channel_id = ChannelId::new(950_000_000_000_001);
+                let head_msg = MessageId::new(850_000_000_000_001);
+                let head_card = MessageId::new(750_000_000_000_001);
+
+                shared
+                    .queued_placeholders
+                    .insert((channel_id, head_msg), head_card);
+
+                let drained =
+                    drain_merged_queued_placeholders(&shared, channel_id, head_msg, &[head_msg])
+                        .await;
+
+                assert!(drained.is_empty());
+                assert_eq!(shared.queued_placeholders.len(), 1);
+            });
+        });
     }
 }

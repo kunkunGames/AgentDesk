@@ -1187,6 +1187,8 @@ impl TestHealthHarness {
             placeholder_controller: Arc::new(
                 super::placeholder_controller::PlaceholderController::default(),
             ),
+            queued_placeholders: dashmap::DashMap::new(),
+            queued_placeholders_persist_locks: dashmap::DashMap::new(),
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1217,6 +1219,7 @@ impl TestHealthHarness {
             cached_serenity_ctx: tokio::sync::OnceCell::new(),
             cached_bot_token: tokio::sync::OnceCell::new(),
             token_hash: super::settings::discord_token_hash("test-token"),
+            provider: provider.clone(),
             api_port: 8791,
             sqlite: None,
             pg_pool: None,
