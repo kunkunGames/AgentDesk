@@ -807,12 +807,12 @@ fn process_sse_event(
                 let delta = props
                     .and_then(|p| p.get("delta"))
                     .and_then(|v| v.as_str())?;
-                if let Some(part_id) = props.and_then(|p| p.get("partID")).and_then(|v| v.as_str())
-                {
-                    let entry = state
-                        .text_part_snapshots
-                        .entry(part_id.to_string())
-                        .or_default();
+                let part_id = props
+                    .and_then(|p| p.get("partID"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if let Some(part_id) = part_id {
+                    let entry = state.text_part_snapshots.entry(part_id).or_default();
                     entry.push_str(delta);
                 }
                 append_text_delta(sender, state, delta);

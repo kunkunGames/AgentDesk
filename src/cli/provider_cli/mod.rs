@@ -233,10 +233,14 @@ fn cmd_status(provider: Option<&str>, json_output: bool) -> Result<(), String> {
         let mut output = Vec::new();
         for p in filter {
             let channels = registry.providers.get(p);
+            let live_current = channels
+                .and_then(|c| c.current.as_ref())
+                .cloned()
+                .or_else(|| snapshot_current_channel(p));
             let migration = load_migration_state(&root, p).ok().flatten();
             output.push(json!({
                 "provider": p,
-                "current": channels.and_then(|c| c.current.as_ref()).map(|ch| &ch.version),
+                "current": live_current.as_ref().map(|ch| ch.version.clone()),
                 "candidate": channels.and_then(|c| c.candidate.as_ref()).map(|ch| &ch.version),
                 "previous": channels.and_then(|c| c.previous.as_ref()).map(|ch| &ch.version),
                 "migration_state": migration.as_ref().map(|m| format!("{:?}", m.state)),
@@ -252,13 +256,15 @@ fn cmd_status(provider: Option<&str>, json_output: bool) -> Result<(), String> {
     let mut rows: Vec<[String; 5]> = Vec::new();
     for p in filter {
         let channels = registry.providers.get(p);
+        let live_current = channels
+            .and_then(|c| c.current.as_ref())
+            .cloned()
+            .or_else(|| snapshot_current_channel(p));
         let migration = load_migration_state(&root, p).ok().flatten();
         let state_str = migration.as_ref().map(|m| format!("{:?}", m.state));
         rows.push([
             p.to_string(),
-            d(channels
-                .and_then(|c| c.current.as_ref())
-                .map(|ch| ch.version.as_str())),
+            d(live_current.as_ref().map(|ch| ch.version.as_str())),
             d(channels
                 .and_then(|c| c.candidate.as_ref())
                 .map(|ch| ch.version.as_str())),
@@ -317,6 +323,7 @@ fn cmd_plan(provider: &str) -> Result<(), String> {
             "install_source": strategy.install_source,
             "command": strategy.command_argv,
             "mutates_in_place": strategy.mutates_in_place,
+            "allow_candidate_path_change": strategy.allow_candidate_path_change,
         },
         "current_version": snapshot.as_ref().map(|ch| &ch.version),
         "current_path": snapshot.as_ref().map(|ch| &ch.canonical_path),
