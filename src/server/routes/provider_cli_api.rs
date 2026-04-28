@@ -22,8 +22,6 @@ use crate::services::provider_cli::{
 
 use super::AppState;
 
-const ALL_PROVIDERS: &[&str] = &["codex", "claude", "gemini", "qwen"];
-
 /// GET /api/provider-cli — current registry channels + migration states.
 pub async fn get_provider_cli_status(State(_state): State<AppState>) -> (StatusCode, Json<Value>) {
     let Some(root) = crate::config::runtime_root() else {
@@ -43,7 +41,8 @@ pub async fn get_provider_cli_status(State(_state): State<AppState>) -> (StatusC
         }
     };
 
-    let providers: Vec<ProviderDiagnostics> = ALL_PROVIDERS
+    let supported_providers = crate::services::provider::supported_provider_ids();
+    let providers: Vec<ProviderDiagnostics> = supported_providers
         .iter()
         .map(|provider| {
             let channels = registry.providers.get(*provider);
@@ -62,7 +61,7 @@ pub async fn get_provider_cli_status(State(_state): State<AppState>) -> (StatusC
         .collect();
 
     let mut migrations = Vec::new();
-    for provider in ALL_PROVIDERS {
+    for provider in &supported_providers {
         if let Ok(Some(ms)) = load_migration_state(&root, provider) {
             migrations.push(MigrationDiagnostics {
                 provider: provider.to_string(),
@@ -357,7 +356,7 @@ pub async fn patch_provider_cli(
 }
 
 fn is_supported_provider(provider: &str) -> bool {
-    ALL_PROVIDERS.contains(&provider)
+    crate::services::provider::ProviderKind::from_str(provider).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,7 +409,7 @@ mod tests {
     }
 
     fn make_state() -> AppState {
-        let db = crate::db::init(&crate::config::Config::default()).unwrap();
+        let db = crate::db::test_db();
         AppState::test_state(
             db,
             PolicyEngine::new(&crate::config::Config::default()).unwrap(),
@@ -427,6 +426,23 @@ mod tests {
         assert!(
             status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
             "unexpected status: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_status_includes_opencode_from_provider_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let _runtime_root = RuntimeRootOverrideGuard::set(dir.path());
+
+        let state = make_state();
+        let (status, Json(value)) = get_provider_cli_status(State(state)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let providers = value["providers"].as_array().unwrap();
+        assert!(
+            providers
+                .iter()
+                .any(|entry| entry["provider"].as_str() == Some("opencode"))
         );
     }
 

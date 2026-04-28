@@ -42,7 +42,7 @@ pub struct ProviderChannels {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCliRegistry {
     pub schema_version: u32,
-    /// Key is provider id: "codex", "claude", "gemini", "qwen".
+    /// Key is provider id: "codex", "claude", "gemini", "opencode", "qwen".
     #[serde(default)]
     pub providers: HashMap<String, ProviderChannels>,
     pub updated_at: DateTime<Utc>,

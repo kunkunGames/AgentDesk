@@ -422,6 +422,7 @@ fn build_restart_report_context(
                 ReportProvider::Claude => ProviderKind::Claude,
                 ReportProvider::Codex => ProviderKind::Codex,
                 ReportProvider::Gemini => ProviderKind::Gemini,
+                ReportProvider::OpenCode => ProviderKind::OpenCode,
                 ReportProvider::Qwen => ProviderKind::Qwen,
             };
             Ok(Some(RestartReportContext {

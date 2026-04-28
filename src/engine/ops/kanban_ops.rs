@@ -261,7 +261,7 @@ fn set_status_raw_pg(pool: &PgPool, card_id: &str, new_status: &str, force: bool
             None
         };
         let effective =
-            resolve_pipeline_with_pg(&pool, repo_id.as_deref(), assigned_agent_id.as_deref())
+            resolve_pipeline_with_pg_tx(&mut tx, repo_id.as_deref(), assigned_agent_id.as_deref())
                 .await?;
         let transition_rule = effective.find_transition(&old_status, &new_status);
 
@@ -453,7 +453,7 @@ fn reopen_raw_pg(pool: &PgPool, card_id: &str, new_status: &str) -> String {
             .map_err(|error| format!("decode assigned_agent_id for {card_id}: {error}"))?;
 
         let effective =
-            resolve_pipeline_with_pg(&pool, repo_id.as_deref(), assigned_agent_id.as_deref())
+            resolve_pipeline_with_pg_tx(&mut tx, repo_id.as_deref(), assigned_agent_id.as_deref())
                 .await?;
 
         if !effective.is_terminal(&old_status) {
@@ -715,8 +715,8 @@ fn set_review_status_raw_pg(pool: &PgPool, card_id: &str, opts_json: &str) -> St
     }
 }
 
-async fn resolve_pipeline_with_pg(
-    pool: &PgPool,
+async fn resolve_pipeline_with_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
     repo_id: Option<&str>,
     agent_id: Option<&str>,
 ) -> Result<crate::pipeline::PipelineConfig, String> {
@@ -727,7 +727,7 @@ async fn resolve_pipeline_with_pg(
             "SELECT pipeline_config FROM github_repos WHERE id = $1",
         )
         .bind(repo_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|error| format!("load repo pipeline override for {repo_id}: {error}"))?
         .flatten()
@@ -741,7 +741,7 @@ async fn resolve_pipeline_with_pg(
     let agent_override = if let Some(agent_id) = agent_id {
         sqlx::query_scalar::<_, Option<String>>("SELECT pipeline_config FROM agents WHERE id = $1")
             .bind(agent_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(|error| format!("load agent pipeline override for {agent_id}: {error}"))?
             .flatten()
