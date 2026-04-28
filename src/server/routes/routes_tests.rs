@@ -9768,7 +9768,7 @@ async fn dispatch_pg_get_not_found() {
 
 // ── Policy hook firing tests ───────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kanban_terminal_status_fires_hook() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -9794,7 +9794,8 @@ async fn kanban_terminal_status_fires_hook() {
             "#,
         ).unwrap();
 
-    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
     let config = crate::config::Config {
         policies: crate::config::PoliciesConfig {
             dir: dir.path().to_path_buf(),
@@ -9802,49 +9803,48 @@ async fn kanban_terminal_status_fires_hook() {
         },
         ..crate::config::Config::default()
     };
-    let engine = PolicyEngine::new_with_legacy_db(&config, db.clone()).unwrap();
+    let engine = PolicyEngine::new_with_pg(&config, Some(pg_pool.clone())).unwrap();
 
-    {
-        let conn = db.lock().unwrap();
-        conn.execute(
-                "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at) VALUES ('c1', 'Card1', 'requested', 'medium', datetime('now'), datetime('now'))",
-                [],
-            ).unwrap();
-    }
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at)
+         VALUES ('c1', 'Card1', 'requested', 'medium', NOW(), NOW())",
+    )
+    .execute(&pg_pool)
+    .await
+    .unwrap();
 
     // Use force transition: requested → done (no rule, force bypasses)
-    let result = crate::kanban::transition_status_with_opts(
-        &db,
+    let result = crate::kanban::transition_status_with_opts_pg_only(
+        &pg_pool,
         &engine,
         "c1",
         "done",
         "pmd",
         crate::engine::transition::ForceIntent::OperatorOverride,
-    );
+    )
+    .await;
     assert!(
         result.is_ok(),
         "force transition should succeed: {:?}",
         result
     );
 
-    let conn = db.lock().unwrap();
-    let transition: String = conn
-        .query_row(
-            "SELECT value FROM kv_meta WHERE key = 'transition'",
-            [],
-            |r| r.get(0),
-        )
+    let transition: String = sqlx::query_scalar("SELECT value FROM kv_meta WHERE key = $1")
+        .bind("transition")
+        .fetch_one(&pg_pool)
+        .await
         .unwrap();
     assert_eq!(transition, "requested->done");
 
-    let terminal: String = conn
-        .query_row(
-            "SELECT value FROM kv_meta WHERE key = 'terminal'",
-            [],
-            |r| r.get(0),
-        )
+    let terminal: String = sqlx::query_scalar("SELECT value FROM kv_meta WHERE key = $1")
+        .bind("terminal")
+        .fetch_one(&pg_pool)
+        .await
         .unwrap();
     assert_eq!(terminal, "c1:done");
+
+    pg_pool.close().await;
+    pg_db.drop().await;
 }
 
 #[tokio::test]
@@ -14996,10 +14996,6 @@ async fn reopen_reactivates_done_card_without_deadlocking_review_tuning_fixup() 
 #[tokio::test]
 async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
     crate::pipeline::ensure_loaded();
-    let db = test_db();
-    ensure_auto_queue_tables(&db);
-    seed_agent(&db, "agent-pg-tn");
-    seed_repo(&db, "test-repo");
     let pg_db = TestPostgresDb::create().await;
     let pg_pool = pg_db.connect_and_migrate().await;
     let engine = crate::engine::PolicyEngine::new_with_pg(
@@ -15008,15 +15004,8 @@ async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
     )
     .unwrap();
 
-    sqlx::query(
-        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
-         VALUES ($1, $1, '111', '222')
-         ON CONFLICT (id) DO NOTHING",
-    )
-    .bind("agent-pg-tn")
-    .execute(&pg_pool)
-    .await
-    .unwrap();
+    seed_agent_pg(&pg_pool, "agent-pg-tn").await;
+    seed_repo_pg(&pg_pool, "test-repo").await;
 
     sqlx::query(
         "INSERT INTO kanban_cards (
@@ -15035,21 +15024,6 @@ async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
     .execute(&pg_pool)
     .await
     .unwrap();
-
-    {
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "INSERT INTO kanban_cards (
-                id, title, status, priority, assigned_agent_id, repo_id,
-                review_status, created_at, updated_at
-            ) VALUES (
-                'card-pg-tn', 'PG TN', 'review', 'medium', 'agent-pg-tn', 'test-repo',
-                'pass', datetime('now'), datetime('now')
-            )",
-            [],
-        )
-        .unwrap();
-    }
 
     sqlx::query(
         "INSERT INTO card_review_state (card_id, review_round, last_verdict, updated_at)
@@ -15082,14 +15056,15 @@ async fn transition_to_done_records_true_negative_in_postgres_review_tuning() {
     .await
     .unwrap();
 
-    let result = crate::kanban::transition_status_with_opts(
-        &db,
+    let result = crate::kanban::transition_status_with_opts_pg_only(
+        &pg_pool,
         &engine,
         "card-pg-tn",
         "done",
         "review",
         crate::engine::transition::ForceIntent::OperatorOverride,
-    );
+    )
+    .await;
     assert!(result.is_ok(), "transition to done should succeed");
 
     let row = sqlx::query(
