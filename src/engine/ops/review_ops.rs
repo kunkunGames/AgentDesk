@@ -1,15 +1,10 @@
-use crate::db::Db;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use serde_json::json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row as SqlxRow};
 
 pub(crate) const ADVANCE_REVIEW_ROUND_HINT_KEY: &str = "advance_review_round_on_next_review";
 
-pub(super) fn register_review_ops<'js>(
-    ctx: &Ctx<'js>,
-    _db: Option<Db>,
-    pg_pool: Option<PgPool>,
-) -> JsResult<()> {
+pub(super) fn register_review_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let review_obj = Object::new(ctx.clone())?;
 

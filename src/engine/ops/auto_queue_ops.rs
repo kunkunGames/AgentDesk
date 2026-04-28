@@ -1,4 +1,3 @@
-use crate::db::Db;
 use crate::supervisor::BridgeHandle;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use serde::Deserialize;
@@ -6,7 +5,6 @@ use sqlx::PgPool;
 
 pub(super) fn register_auto_queue_ops<'js>(
     ctx: &Ctx<'js>,
-    _db: Option<Db>,
     pg_pool: Option<PgPool>,
     bridge: BridgeHandle,
 ) -> JsResult<()> {

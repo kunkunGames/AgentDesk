@@ -14,11 +14,7 @@ use std::time::Duration;
 
 const POLICY_DB_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 
-pub(super) fn register_db_ops<'js>(
-    ctx: &Ctx<'js>,
-    _db: Option<Db>,
-    pg_pool: Option<PgPool>,
-) -> JsResult<()> {
+pub(super) fn register_db_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let db_obj = Object::new(ctx.clone())?;
 

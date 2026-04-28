@@ -1,4 +1,3 @@
-use crate::db::Db;
 use anyhow::anyhow;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use serde::Deserialize;
@@ -25,16 +24,7 @@ struct CardListFilter {
     limit: Option<usize>,
 }
 
-pub(super) fn register_card_ops<'js>(
-    ctx: &Ctx<'js>,
-    db: Option<Db>,
-    pg_pool: Option<PgPool>,
-) -> JsResult<()> {
-    // Signature retains `db: Option<Db>` so callers in `src/engine/ops.rs` stay
-    // unchanged. The SQLite backend has been removed (#1238); the parameter is
-    // intentionally unused now that the JS bridge is PG-only.
-    let _ = db;
-
+pub(super) fn register_card_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let cards_obj = Object::new(ctx.clone())?;
 

@@ -1,4 +1,3 @@
-use crate::db::Db;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 use sqlx::PgPool;
 
@@ -8,11 +7,7 @@ use sqlx::PgPool;
 // agentdesk.kv.get(key) → value or null (filters expired)
 // agentdesk.kv.delete(key) — delete a key
 
-pub(super) fn register_kv_ops<'js>(
-    ctx: &Ctx<'js>,
-    _db: Option<Db>,
-    pg_pool: Option<PgPool>,
-) -> JsResult<()> {
+pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let kv_obj = Object::new(ctx.clone())?;
 

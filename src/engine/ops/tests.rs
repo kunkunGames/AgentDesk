@@ -1111,11 +1111,9 @@ async fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads() {
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     let pool_for_js = pool.clone();
-    let db_for_js = db.clone();
     ctx.with(|ctx| {
         register_globals_with_supervisor_and_pg(
             &ctx,
-            Some(db_for_js),
             Some(pool_for_js),
             crate::supervisor::BridgeHandle::new(),
         )
@@ -1457,15 +1455,8 @@ async fn js_auto_queue_run_status_bridge_updates_run_and_releases_slots() {
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     let pool_for_js = pool.clone();
-    let db_for_js = db.clone();
     ctx.with(|ctx| {
-        register_globals_with_supervisor_and_pg(
-            &ctx,
-            Some(db_for_js),
-            Some(pool_for_js),
-            bridge.clone(),
-        )
-        .unwrap();
+        register_globals_with_supervisor_and_pg(&ctx, Some(pool_for_js), bridge.clone()).unwrap();
         let raw: String = ctx
             .eval(
                 r#"
@@ -1603,15 +1594,8 @@ async fn js_auto_queue_consultation_bridge_updates_card_metadata_and_entry_statu
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     let pool_for_js = pool.clone();
-    let db_for_js = db.clone();
     ctx.with(|ctx| {
-        register_globals_with_supervisor_and_pg(
-            &ctx,
-            Some(db_for_js),
-            Some(pool_for_js),
-            bridge.clone(),
-        )
-        .unwrap();
+        register_globals_with_supervisor_and_pg(&ctx, Some(pool_for_js), bridge.clone()).unwrap();
         let wrapper_type: String = ctx
             .eval(r#"typeof agentdesk.autoQueue.recordConsultationDispatch"#)
             .unwrap();
@@ -1743,15 +1727,8 @@ async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows() {
     let rt = rquickjs::Runtime::new().unwrap();
     let ctx = rquickjs::Context::full(&rt).unwrap();
     let pool_for_js = pool.clone();
-    let db_for_js = db.clone();
     ctx.with(|ctx| {
-        register_globals_with_supervisor_and_pg(
-            &ctx,
-            Some(db_for_js),
-            Some(pool_for_js),
-            bridge.clone(),
-        )
-        .unwrap();
+        register_globals_with_supervisor_and_pg(&ctx, Some(pool_for_js), bridge.clone()).unwrap();
         let raw: String = ctx
             .eval(
                 r#"

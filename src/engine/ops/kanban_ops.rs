@@ -45,11 +45,7 @@ async fn auto_queue_review_disabled_for_card_on_pg(
     .map_err(|error| format!("load auto-queue review_mode for {card_id}: {error}"))
 }
 
-pub(super) fn register_kanban_ops<'js>(
-    ctx: &Ctx<'js>,
-    _db: Option<Db>,
-    pg_pool: Option<PgPool>,
-) -> JsResult<()> {
+pub(super) fn register_kanban_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let kanban_obj = Object::new(ctx.clone())?;
 

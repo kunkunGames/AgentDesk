@@ -11,9 +11,12 @@ use sqlx::{PgPool, Row as SqlxRow};
 
 pub(super) fn register_dispatch_ops<'js>(
     ctx: &Ctx<'js>,
-    db: Option<Db>,
+    #[cfg(test)] db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
+    #[cfg(not(test))]
+    let db: Option<Db> = None;
+
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let dispatch_obj = Object::new(ctx.clone())?;
 
