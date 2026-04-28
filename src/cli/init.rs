@@ -1176,10 +1176,12 @@ mod tests {
                 "claude (Anthropic)",
                 "codex (OpenAI)",
                 "gemini (Google)",
+                "opencode (OpenCode)",
                 "qwen (Alibaba)"
             ]
         );
-        assert_eq!(cli_init_provider_from_index(3), "qwen");
+        assert_eq!(cli_init_provider_from_index(3), "opencode");
+        assert_eq!(cli_init_provider_from_index(4), "qwen");
     }
 
     #[cfg(target_os = "macos")]

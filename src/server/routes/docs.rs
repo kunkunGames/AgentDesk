@@ -834,7 +834,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             (
                 "provider",
                 body_param("string", true, "Provider for the agent channel")
-                    .with_enum(&["claude", "codex", "gemini", "qwen"]),
+                    .with_enum(&["claude", "codex", "gemini", "opencode", "qwen"]),
             ),
             (
                 "prompt_template_path",
@@ -876,7 +876,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_error_example(
             400,
             json!({"body": {"agent_id": "x", "channel_id": "1473922824350601297", "provider": "unknown", "prompt_template_path": "config/agents/_shared.prompt.md"}}),
-            json!({"error": "provider must be one of claude|codex|gemini|qwen"}),
+            json!({"error": "provider must be one of claude|codex|gemini|opencode|qwen"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/agents/setup -H 'Content-Type: application/json' -d '{\"agent_id\":\"project-agentdesk\",\"channel_id\":\"1473922824350601297\",\"provider\":\"codex\",\"prompt_template_path\":\"config/agents/_shared.prompt.md\",\"dry_run\":true}'"),
         ep(
@@ -3071,7 +3071,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             .with_params([
                 (
                     "provider",
-                    query_param("string", false, "Filter by provider id (claude/codex/gemini/qwen)"),
+                    query_param("string", false, "Filter by provider id (claude/codex/gemini/opencode/qwen)"),
                 ),
                 (
                     "channelId",
@@ -3095,7 +3095,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_params([
             (
                 "provider",
-                query_param("string", false, "Filter by provider id (claude/codex/gemini/qwen)"),
+                query_param("string", false, "Filter by provider id (claude/codex/gemini/opencode/qwen)"),
             ),
             (
                 "channelId",

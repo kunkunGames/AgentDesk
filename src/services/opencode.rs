@@ -4,10 +4,11 @@
 //! HTTP REST + SSE API, and normalizes events to AgentDesk `StreamMessage`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -22,6 +23,28 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTH_POLL_MS: u64 = 250;
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const DISPOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_OUTPUT_LIMIT: usize = 8 * 1024;
+
+#[derive(Debug, Default)]
+struct OpenCodeStartupOutput {
+    stdout: String,
+    stderr: String,
+}
+
+struct OpenCodeServerProcess {
+    child: Child,
+    startup_output: Arc<Mutex<OpenCodeStartupOutput>>,
+}
+
+impl OpenCodeServerProcess {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -36,6 +59,22 @@ pub fn resolve_opencode_path() -> Option<String> {
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
         })
+}
+
+pub fn probe_serve_health(working_dir: &str) -> Result<String, String> {
+    let bin = resolve_opencode_path().ok_or_else(|| {
+        "OpenCode CLI not found — install with: npm install -g opencode-ai".to_string()
+    })?;
+    let port = allocate_port()?;
+    let password = generate_password();
+    let auth = build_auth_header(&password);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let mut server = spawn_server(&bin, port, &password, working_dir)?;
+    let result = wait_for_health(&base_url, &auth, Some(&server.startup_output))
+        .map(|_| format!("serve health ok at {base_url}"));
+    dispose_server(&base_url, &auth);
+    let _ = server.kill();
+    result
 }
 
 pub fn execute_command_simple_cancellable(
@@ -165,8 +204,8 @@ fn execute_command_streaming_inner(
     let auth = build_auth_header(&password);
     let base_url = format!("http://127.0.0.1:{port}");
 
-    let mut child = spawn_server(&bin, port, &password, working_dir)?;
-    register_child_pid(cancel_token, child.id());
+    let mut server = spawn_server(&bin, port, &password, working_dir)?;
+    register_child_pid(cancel_token, server.id());
 
     let result = run_session(
         prompt,
@@ -177,10 +216,11 @@ fn execute_command_streaming_inner(
         &auth,
         &sender,
         cancel_token,
+        Some(server.startup_output.clone()),
     );
 
     dispose_server(&base_url, &auth);
-    let _ = child.kill();
+    let _ = server.kill();
 
     match result {
         Ok(()) => Ok(()),
@@ -192,7 +232,12 @@ fn execute_command_streaming_inner(
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
-fn spawn_server(bin: &str, port: u16, password: &str, working_dir: &str) -> Result<Child, String> {
+fn spawn_server(
+    bin: &str,
+    port: u16,
+    password: &str,
+    working_dir: &str,
+) -> Result<OpenCodeServerProcess, String> {
     let mut cmd = Command::new(bin);
     configure_child_process_group(&mut cmd);
     cmd.arg("serve")
@@ -203,11 +248,84 @@ fn spawn_server(bin: &str, port: u16, password: &str, working_dir: &str) -> Resu
         .env("OPENCODE_SERVER_PASSWORD", password)
         .current_dir(working_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
-    cmd.spawn()
-        .map_err(|e| format!("Failed to spawn opencode serve: {e}"))
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn opencode serve: {e}"))?;
+    let startup_output = Arc::new(Mutex::new(OpenCodeStartupOutput::default()));
+    if let Some(stdout) = child.stdout.take() {
+        drain_startup_output(stdout, startup_output.clone(), StartupStream::Stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain_startup_output(stderr, startup_output.clone(), StartupStream::Stderr);
+    }
+    Ok(OpenCodeServerProcess {
+        child,
+        startup_output,
+    })
+}
+
+enum StartupStream {
+    Stdout,
+    Stderr,
+}
+
+fn drain_startup_output<R>(
+    mut reader: R,
+    output: Arc<Mutex<OpenCodeStartupOutput>>,
+    stream: StartupStream,
+) where
+    R: Read + Send + 'static,
+{
+    let _ = thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            let chunk = String::from_utf8_lossy(&buffer[..read]);
+            if let Ok(mut output) = output.lock() {
+                match stream {
+                    StartupStream::Stdout => append_bounded(&mut output.stdout, &chunk),
+                    StartupStream::Stderr => append_bounded(&mut output.stderr, &chunk),
+                }
+            }
+        }
+    });
+}
+
+fn append_bounded(target: &mut String, chunk: &str) {
+    target.push_str(chunk);
+    if target.len() <= STARTUP_OUTPUT_LIMIT {
+        return;
+    }
+    let mut split_at = target.len().saturating_sub(STARTUP_OUTPUT_LIMIT);
+    while !target.is_char_boundary(split_at) && split_at < target.len() {
+        split_at += 1;
+    }
+    target.drain(..split_at);
+}
+
+fn summarize_startup_output(output: &Arc<Mutex<OpenCodeStartupOutput>>) -> String {
+    let Ok(output) = output.lock() else {
+        return String::new();
+    };
+    let stdout = compact_log_fragment(&output.stdout);
+    let stderr = compact_log_fragment(&output.stderr);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("stdout={stdout}"),
+        (true, false) => format!("stderr={stderr}"),
+        (false, false) => format!("stdout={stdout}; stderr={stderr}"),
+    }
+}
+
+fn compact_log_fragment(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn dispose_server(base_url: &str, auth: &str) {
@@ -231,9 +349,10 @@ fn run_session(
     auth: &str,
     sender: &Sender<StreamMessage>,
     cancel_token: Option<&CancelToken>,
+    startup_output: Option<Arc<Mutex<OpenCodeStartupOutput>>>,
 ) -> Result<(), String> {
     // 1. Wait for server to be ready
-    wait_for_health(base_url, auth)?;
+    wait_for_health(base_url, auth, startup_output.as_ref())?;
 
     if is_cancelled(cancel_token) {
         return Err("OpenCode request cancelled before session start".to_string());
@@ -277,7 +396,11 @@ fn run_session(
     consume_sse(reader, &session_id, sender, cancel_token, base_url, auth)
 }
 
-fn wait_for_health(base_url: &str, auth: &str) -> Result<(), String> {
+fn wait_for_health(
+    base_url: &str,
+    auth: &str,
+    startup_output: Option<&Arc<Mutex<OpenCodeStartupOutput>>>,
+) -> Result<(), String> {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(2))
@@ -285,10 +408,15 @@ fn wait_for_health(base_url: &str, auth: &str) -> Result<(), String> {
 
     loop {
         if Instant::now() >= deadline {
+            let output = startup_output
+                .map(|output| summarize_startup_output(output))
+                .filter(|summary| !summary.is_empty())
+                .map(|summary| format!("; startup output: {summary}"))
+                .unwrap_or_default();
             return Err(format!(
                 "OpenCode server health check timed out after {}s",
                 HEALTH_TIMEOUT.as_secs()
-            ));
+            ) + &output);
         }
         match agent
             .get(&format!("{base_url}/global/health"))
