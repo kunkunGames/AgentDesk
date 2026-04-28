@@ -3858,6 +3858,22 @@ pub(crate) async fn maybe_finalize_run_if_ready_pg(
         return Ok(false);
     }
 
+    let user_cancelled = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM auto_queue_entries
+         WHERE run_id = $1
+           AND status = 'user_cancelled'",
+    )
+    .bind(run_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("count user-cancelled auto-queue entries for run {run_id}: {error}")
+    })?;
+    if user_cancelled > 0 {
+        return Ok(false);
+    }
+
     sqlx::query(
         "UPDATE auto_queue_slots
          SET assigned_run_id = NULL,

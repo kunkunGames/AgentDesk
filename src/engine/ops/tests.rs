@@ -1870,6 +1870,7 @@ async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows() {
             .eval(
                 r#"
                 JSON.stringify((function() {
+                  try {
                     var saved = agentdesk.autoQueue.savePhaseGateState("aq-phase-run", 2, {
                         status: "failed",
                         verdict: "phase_gate_failed",
@@ -1902,11 +1903,21 @@ async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows() {
                         cleared: cleared.changed,
                         remaining: remaining
                     };
+                  } catch (e) {
+                    return {
+                        error: String(e),
+                        stack: e && e.stack ? String(e.stack) : null
+                    };
+                  }
                 })())
                 "#,
             )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed.get("error").is_none(),
+            "phase gate bridge error: {parsed}"
+        );
         assert_eq!(
             parsed["saved"]["dispatch_ids"],
             serde_json::json!(["aq-phase-valid-1", "aq-phase-valid-2"])
