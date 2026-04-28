@@ -4465,14 +4465,82 @@ pub async fn force_transition(
     let needs_cleanup = force_transition_needs_cleanup(&body.status, body.cancel_dispatches);
     let target_status = body.status;
     let mut cleanup_counts = (0, 0);
-    let pool = match state.pg_pool_ref() {
-        Some(pool) => pool,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "force-transition requires postgres pool (#1239)"})),
-            );
-        }
+    let Some(pool) = state.pg_pool_ref() else {
+        let caller_source = {
+            let conn = match legacy_db(&state).lock() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": format!("{error}")})),
+                    );
+                }
+            };
+            resolve_requesting_agent_id_on_conn(&conn, &headers)
+                .unwrap_or_else(|| "api".to_string())
+        };
+        let transition_result = crate::kanban::transition_status_with_opts(
+            legacy_db(&state),
+            &state.engine,
+            &id,
+            &target_status,
+            &caller_source,
+            crate::engine::transition::ForceIntent::OperatorOverride,
+        )
+        .and_then(|result| {
+            let counts = if needs_cleanup {
+                let conn = legacy_db(&state)
+                    .lock()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                cleanup_force_transition_revert_on_conn(&conn, &id, &target_status)
+            } else {
+                Ok((0, 0))
+            }?;
+            Ok::<_, anyhow::Error>((result, counts))
+        });
+
+        return match transition_result {
+            Ok((result, (cancelled_dispatches, skipped_auto_queue_entries))) => {
+                crate::kanban::drain_hook_side_effects_with_backends(
+                    Some(legacy_db(&state)),
+                    &state.engine,
+                );
+                let card = legacy_db(&state).lock().ok().and_then(|conn| {
+                    conn.query_row(&format!("{CARD_SELECT} WHERE kc.id = ?1"), [&id], |row| {
+                        card_row_to_json(row)
+                    })
+                    .ok()
+                });
+                match card {
+                    Some(card) => {
+                        crate::server::ws::emit_event(
+                            &state.broadcast_tx,
+                            "kanban_card_updated",
+                            card.clone(),
+                        );
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "card": card,
+                                "forced": true,
+                                "from": result.from,
+                                "to": result.to,
+                                "cancelled_dispatches": cancelled_dispatches,
+                                "skipped_auto_queue_entries": skipped_auto_queue_entries
+                            })),
+                        )
+                    }
+                    None => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "failed to read card after force-transition"})),
+                    ),
+                }
+            }
+            Err(error) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{error}")})),
+            ),
+        };
     };
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await

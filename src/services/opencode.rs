@@ -41,8 +41,9 @@ impl OpenCodeServerProcess {
         self.child.id()
     }
 
-    fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill()
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -72,8 +73,7 @@ pub fn probe_serve_health(working_dir: &str) -> Result<String, String> {
     let mut server = spawn_server(&bin, port, &password, working_dir)?;
     let result = wait_for_health(&base_url, &auth, Some(&server.startup_output))
         .map(|_| format!("serve health ok at {base_url}"));
-    dispose_server(&base_url, &auth);
-    let _ = server.kill();
+    shutdown_server(&mut server, &base_url, &auth);
     result
 }
 
@@ -219,8 +219,7 @@ fn execute_command_streaming_inner(
         Some(server.startup_output.clone()),
     );
 
-    dispose_server(&base_url, &auth);
-    let _ = server.kill();
+    shutdown_server(&mut server, &base_url, &auth);
 
     match result {
         Ok(()) => Ok(()),
@@ -334,6 +333,11 @@ fn dispose_server(base_url: &str, auth: &str) {
         .post(&format!("{base_url}/instance/dispose"))
         .set("Authorization", auth)
         .call();
+}
+
+fn shutdown_server(server: &mut OpenCodeServerProcess, base_url: &str, auth: &str) {
+    dispose_server(base_url, auth);
+    server.terminate();
 }
 
 // ---------------------------------------------------------------------------
@@ -700,19 +704,72 @@ fn emit_text_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseM
     append_text_delta(sender, state, delta);
 }
 
+fn stream_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn emit_tool_part(part: &Value, sender: &Sender<StreamMessage>) {
+    let name = part
+        .get("tool")
+        .or_else(|| part.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let state = part.get("state").unwrap_or(&Value::Null);
+    let status = state
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let input = state
+        .get("input")
+        .or_else(|| part.get("input"))
+        .map(stream_value)
+        .unwrap_or_default();
+
+    if !input.is_empty() || matches!(status, "pending" | "running" | "completed" | "error") {
+        let _ = sender.send(StreamMessage::ToolUse { name, input });
+    }
+
+    let output = state
+        .get("output")
+        .or_else(|| state.get("error"))
+        .or_else(|| state.get("title"))
+        .or_else(|| part.get("output"))
+        .or_else(|| part.get("content"));
+    if let Some(output) = output {
+        let is_error = status == "error"
+            || state
+                .get("isError")
+                .or_else(|| state.get("is_error"))
+                .or_else(|| part.get("isError"))
+                .or_else(|| part.get("is_error"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        let _ = sender.send(StreamMessage::ToolResult {
+            content: stream_value(output),
+            is_error,
+        });
+    }
+}
+
 fn emit_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessageState) {
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match part_type {
         "text" => emit_text_part(part, sender, state),
-        "thinking" | "redactedThinking" => {
+        "thinking" | "redactedThinking" | "reasoning" => {
             let summary = part
                 .get("thinking")
                 .or_else(|| part.get("summary"))
+                .or_else(|| part.get("text"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let _ = sender.send(StreamMessage::Thinking { summary });
         }
+        "tool" => emit_tool_part(part, sender),
         "tool-use" => {
             let name = part
                 .get("name")
@@ -728,9 +785,8 @@ fn emit_part(part: &Value, sender: &Sender<StreamMessage>, state: &mut SseMessag
             let content = part
                 .get("output")
                 .or_else(|| part.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(stream_value)
+                .unwrap_or_default();
             let is_error = part
                 .get("isError")
                 .or_else(|| part.get("is_error"))
@@ -756,11 +812,27 @@ fn process_sse_event(
     // Filter events by sessionID where applicable
     let event_session = props
         .and_then(|p| p.get("sessionID").and_then(|v| v.as_str()))
+        .or_else(|| props.and_then(|p| p.get("sessionId").and_then(|v| v.as_str())))
         .or_else(|| {
             props
                 .and_then(|p| p.get("info"))
                 .and_then(|i| i.get("id"))
                 .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            props.and_then(|p| p.get("part")).and_then(|part| {
+                part.get("sessionID")
+                    .or_else(|| part.get("sessionId"))
+                    .and_then(|v| v.as_str())
+            })
+        })
+        .or_else(|| {
+            props.and_then(|p| p.get("message")).and_then(|message| {
+                message
+                    .get("sessionID")
+                    .or_else(|| message.get("sessionId"))
+                    .and_then(|v| v.as_str())
+            })
         });
 
     if let Some(sid) = event_session {
@@ -774,10 +846,16 @@ fn process_sse_event(
 
         "session.status" => {
             if let Some(status) = props
-                .and_then(|p| p.get("info"))
-                .and_then(|i| i.get("status"))
+                .and_then(|p| p.get("status"))
                 .and_then(|v| v.as_str())
+                .or_else(|| {
+                    props
+                        .and_then(|p| p.get("info"))
+                        .and_then(|i| i.get("status"))
+                        .and_then(|v| v.as_str())
+                })
             {
+                let info = props.and_then(|p| p.get("info"));
                 let _ = sender.send(StreamMessage::StatusUpdate {
                     model: None,
                     cost_usd: None,
@@ -789,6 +867,7 @@ fn process_sse_event(
                     cache_read_tokens: None,
                     output_tokens: props
                         .and_then(|p| p.get("outputTokens"))
+                        .or_else(|| info.and_then(|i| i.get("outputTokens")))
                         .and_then(|v| v.as_u64()),
                 });
                 let _ = status;
@@ -985,6 +1064,14 @@ mod tests {
     }
 
     #[test]
+    fn test_message_part_updated_filters_nested_part_session() {
+        let data = r#"{"type":"message.part.updated","properties":{"part":{"id":"part-1","sessionID":"other-session","type":"text","text":"OK"}}}"#;
+        let (msgs, stop) = parse_event(data, "s1");
+        assert!(msgs.is_empty(), "wrong nested part session must be ignored");
+        assert_eq!(stop, None);
+    }
+
+    #[test]
     fn test_message_part_delta_then_updated_does_not_duplicate_text() {
         let events = [
             r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-1","field":"text","delta":"O"}}"#,
@@ -1070,6 +1157,21 @@ mod tests {
     }
 
     #[test]
+    fn test_opencode_tool_part_emits_use_and_result() {
+        let data = r#"{"type":"message.part.updated","properties":{"part":{"id":"tool-1","sessionID":"s1","type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"ls"},"output":"file.txt"}}}}"#;
+        let (msgs, stop) = parse_event(data, "s1");
+        assert_eq!(stop, Some(false));
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, StreamMessage::ToolUse { name, input } if name == "bash" && input.contains("ls"))
+            )
+        );
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, StreamMessage::ToolResult { content, is_error } if content == "file.txt" && !is_error)));
+    }
+
+    #[test]
     fn test_session_idle_signals_done() {
         let data = r#"{"type":"session.idle","properties":{"sessionID":"s1"}}"#;
         let (_, stop) = parse_event(data, "s1");
@@ -1079,6 +1181,15 @@ mod tests {
     #[test]
     fn test_thinking_part_emitted() {
         let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"thinking","thinking":"step 1"}}}"#;
+        let (msgs, _) = parse_event(data, "s1");
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.as_deref() == Some("step 1"))));
+    }
+
+    #[test]
+    fn test_reasoning_part_emitted() {
+        let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"reasoning","text":"step 1"}}}"#;
         let (msgs, _) = parse_event(data, "s1");
         assert!(msgs
             .iter()

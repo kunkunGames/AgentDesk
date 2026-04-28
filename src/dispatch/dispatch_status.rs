@@ -308,6 +308,16 @@ async fn dispatch_exists_pg(pool: &PgPool, dispatch_id: &str) -> Result<bool> {
         })
 }
 
+#[cfg(test)]
+fn dispatch_exists_on_conn(conn: &libsql_rusqlite::Connection, dispatch_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_dispatches WHERE id = ?1)",
+        [dispatch_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| anyhow::anyhow!("sqlite dispatch existence lookup {dispatch_id}: {error}"))
+}
+
 async fn validate_dispatch_completion_evidence_on_pg(
     pool: &PgPool,
     db: Option<&Db>,
@@ -718,6 +728,64 @@ async fn card_needs_review_dispatch_pg(pool: &PgPool, card_id: &str) -> Result<b
     Ok(is_review_state && !has_review_dispatch && !has_active_work)
 }
 
+#[cfg(test)]
+fn card_needs_review_dispatch_on_conn(
+    conn: &libsql_rusqlite::Connection,
+    card_id: &str,
+) -> Result<bool> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, repo_id, assigned_agent_id
+             FROM kanban_cards
+             WHERE id = ?1",
+            [card_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            anyhow::anyhow!("load sqlite card {card_id} for review redispatch: {error}")
+        })?;
+    let Some((card_status, repo_id, agent_id)) = row else {
+        return Ok(false);
+    };
+
+    let has_review_dispatch: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0
+             FROM task_dispatches
+             WHERE kanban_card_id = ?1
+               AND dispatch_type IN ('review', 'review-decision')
+               AND status IN ('pending', 'dispatched')",
+            [card_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("load sqlite review dispatch gate for {card_id}: {error}")
+        })?;
+    let has_active_work: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0
+             FROM task_dispatches
+             WHERE kanban_card_id = ?1
+               AND dispatch_type IN ('implementation', 'rework')
+               AND status IN ('pending', 'dispatched')",
+            [card_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| anyhow::anyhow!("load sqlite active work gate for {card_id}: {error}"))?;
+
+    let Some(card_status) = card_status else {
+        return Ok(false);
+    };
+    let effective =
+        crate::pipeline::resolve_for_card(conn, repo_id.as_deref(), agent_id.as_deref());
+    let is_review_state = effective
+        .hooks_for_state(&card_status)
+        .is_some_and(|hooks| hooks.on_enter.iter().any(|name| name == "OnReviewEnter"));
+
+    Ok(is_review_state && !has_review_dispatch && !has_active_work)
+}
+
 async fn maybe_inject_phase_gate_verdict_pg(
     pool: &PgPool,
     dispatch_id: &str,
@@ -732,6 +800,27 @@ async fn maybe_inject_phase_gate_verdict_pg(
     .ok()
     .flatten()
     .flatten()?;
+    let ctx = serde_json::from_str::<serde_json::Value>(&context_raw).ok()?;
+    let phase_gate_ctx = ctx.get("phase_gate").and_then(|v| v.as_object())?;
+    infer_phase_gate_verdict(dispatch_id, phase_gate_ctx, result)
+}
+
+#[cfg(test)]
+fn maybe_inject_phase_gate_verdict_on_conn(
+    conn: &libsql_rusqlite::Connection,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let context_raw: String = conn
+        .query_row(
+            "SELECT context FROM task_dispatches WHERE id = ?1",
+            [dispatch_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()?;
     let ctx = serde_json::from_str::<serde_json::Value>(&context_raw).ok()?;
     let phase_gate_ctx = ctx.get("phase_gate").and_then(|v| v.as_object())?;
     infer_phase_gate_verdict(dispatch_id, phase_gate_ctx, result)
@@ -1383,10 +1472,7 @@ fn complete_dispatch_inner_with_backends(
         crate::logging::dispatch_span("complete_dispatch", Some(dispatch_id), None, None);
     let _guard = dispatch_span.enter();
     let Some(pool) = engine.pg_pool() else {
-        let _ = db;
-        return Err(anyhow::anyhow!(
-            "Postgres pool required to complete dispatch {dispatch_id}"
-        ));
+        return complete_dispatch_inner_on_conn(db, engine, dispatch_id, result);
     };
     let db_owned = db.cloned();
     let dispatch_id_owned = dispatch_id.to_string();
@@ -1498,6 +1584,120 @@ fn complete_dispatch_inner_with_backends(
     }
 
     Ok(dispatch)
+}
+
+#[cfg(test)]
+fn complete_dispatch_inner_on_conn(
+    db: Option<&Db>,
+    engine: &PolicyEngine,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let db =
+        db.ok_or_else(|| anyhow::anyhow!("SQLite DB required to complete dispatch {dispatch_id}"))?;
+    let conn = db.lock().map_err(|_| {
+        anyhow::anyhow!("SQLite DB mutex poisoned while completing dispatch {dispatch_id}")
+    })?;
+
+    validate_dispatch_completion_evidence_on_conn(
+        &conn,
+        db,
+        engine.pg_pool(),
+        dispatch_id,
+        result,
+    )?;
+    let effective_result = maybe_inject_phase_gate_verdict_on_conn(&conn, dispatch_id, result)
+        .unwrap_or_else(|| result.clone());
+    let changed = set_dispatch_status_on_conn_with_sync(
+        &conn,
+        dispatch_id,
+        "completed",
+        Some(&effective_result),
+        effective_result
+            .get("completion_source")
+            .and_then(|value| value.as_str())
+            .unwrap_or("complete_dispatch"),
+        Some(&["pending", "dispatched"]),
+        true,
+        true,
+    )?;
+
+    if changed == 0 {
+        if dispatch_exists_on_conn(&conn, dispatch_id)? {
+            tracing::info!("skipping completion hooks because dispatch is already finalized");
+            return query_dispatch_row(&conn, dispatch_id);
+        }
+        return Err(anyhow::anyhow!("Dispatch not found: {dispatch_id}"));
+    }
+
+    let dispatch = query_dispatch_row(&conn, dispatch_id)?;
+    let kanban_card_id = dispatch
+        .get("kanban_card_id")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let dispatch_type = dispatch
+        .get("dispatch_type")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let skip_dispatch_completed_hooks =
+        matches!(dispatch_type.as_deref(), Some("implementation" | "rework"))
+            && auto_queue_review_disabled_for_dispatch_on_conn(&conn, dispatch_id);
+    let needs_review_dispatch = if skip_dispatch_completed_hooks {
+        false
+    } else if let Some(card_id) = kanban_card_id.as_deref() {
+        card_needs_review_dispatch_on_conn(&conn, card_id)?
+    } else {
+        false
+    };
+
+    if skip_dispatch_completed_hooks && let Some(card_id) = kanban_card_id.as_deref() {
+        restore_auto_queue_mainline_after_review_skip_on_conn(&conn, card_id, dispatch_id)?;
+    }
+
+    drop(conn);
+
+    if skip_dispatch_completed_hooks {
+        return Ok(dispatch);
+    }
+
+    crate::kanban::fire_event_hooks_with_backends(
+        Some(db),
+        engine,
+        "on_dispatch_completed",
+        "OnDispatchCompleted",
+        json!({
+            "dispatch_id": dispatch_id,
+            "kanban_card_id": kanban_card_id,
+            "result": effective_result,
+        }),
+    );
+
+    crate::kanban::drain_hook_side_effects_with_backends(Some(db), engine);
+
+    if needs_review_dispatch {
+        let cid = kanban_card_id.as_deref().unwrap_or("unknown");
+        tracing::warn!(
+            "[dispatch] Card {} in review-like state but no review dispatch — re-firing OnReviewEnter with blocking lock (#220)",
+            cid
+        );
+        let _ = engine.fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": cid }));
+        crate::kanban::drain_hook_side_effects_with_backends(Some(db), engine);
+    }
+
+    Ok(dispatch)
+}
+
+#[cfg(not(test))]
+fn complete_dispatch_inner_on_conn(
+    db: Option<&Db>,
+    engine: &PolicyEngine,
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let _ = (db, engine, result);
+    Err(anyhow::anyhow!(
+        "Postgres pool required to complete dispatch {dispatch_id}"
+    ))
 }
 
 /// #699: inject `verdict = context.phase_gate.pass_verdict` into a phase-gate

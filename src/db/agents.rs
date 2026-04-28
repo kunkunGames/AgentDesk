@@ -338,7 +338,7 @@ fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Resul
         "qwen" => agent.channels.qwen.as_ref().and_then(AgentChannel::target),
         _ => None,
     };
-    let discord_channel_id = discord_channel_cc.clone().or(provider_primary);
+    let discord_channel_id = provider_primary.or_else(|| discord_channel_cc.clone());
     let discord_channel_alt = discord_channel_cdx.clone();
 
     conn.execute(
@@ -567,6 +567,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cdx, Some("222".into()));
+    }
+
+    #[test]
+    fn sync_prefers_provider_primary_channel_over_claude_fallback() {
+        let db = test_db();
+        let agents = vec![AgentDef {
+            id: "opencode-01".into(),
+            name: "OpenCode".into(),
+            name_ko: None,
+            provider: "opencode".into(),
+            channels: AgentChannels {
+                claude: Some("claude-review".into()),
+                opencode: Some("opencode-primary".into()),
+                ..Default::default()
+            },
+            keywords: Vec::new(),
+            department: Some("eng".into()),
+            avatar_emoji: None,
+        }];
+
+        sync_agents_from_config(&db, &agents).unwrap();
+
+        let conn = db.lock().unwrap();
+        let (primary, claude): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT discord_channel_id, discord_channel_cc FROM agents WHERE id = 'opencode-01'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(primary.as_deref(), Some("opencode-primary"));
+        assert_eq!(claude.as_deref(), Some("claude-review"));
     }
 
     #[test]

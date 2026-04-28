@@ -448,7 +448,7 @@ async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<
         "qwen" => agent.channels.qwen.as_ref().and_then(AgentChannel::target),
         _ => None,
     };
-    let discord_channel_id = discord_channel_cc.clone().or(provider_primary);
+    let discord_channel_id = provider_primary.or_else(|| discord_channel_cc.clone());
     let discord_channel_alt = discord_channel_cdx.clone();
 
     sqlx::query(

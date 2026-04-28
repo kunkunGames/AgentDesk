@@ -590,6 +590,7 @@ pub(crate) enum ReportProvider {
     Claude,
     Codex,
     Gemini,
+    #[value(name = "opencode", alias = "open-code")]
     OpenCode,
     Qwen,
 }
