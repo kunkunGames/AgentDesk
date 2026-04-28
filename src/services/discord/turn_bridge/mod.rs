@@ -102,6 +102,17 @@ fn thinking_status_line() -> String {
     "💭 Thinking...".to_string()
 }
 
+fn redacted_thinking_transcript_event(_summary: Option<String>) -> SessionTranscriptEvent {
+    SessionTranscriptEvent {
+        kind: SessionTranscriptEventKind::Thinking,
+        tool_name: None,
+        summary: None,
+        content: String::new(),
+        status: Some("info".to_string()),
+        is_error: false,
+    }
+}
+
 fn emit_turn_quality_event(
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -1101,14 +1112,7 @@ pub(super) fn spawn_turn_bridge(
                             state_dirty = true;
                             push_transcript_event(
                                 &mut transcript_events,
-                                SessionTranscriptEvent {
-                                    kind: SessionTranscriptEventKind::Thinking,
-                                    tool_name: None,
-                                    summary: summary.clone(),
-                                    content: summary.unwrap_or_default(),
-                                    status: Some("info".to_string()),
-                                    is_error: false,
-                                },
+                                redacted_thinking_transcript_event(summary),
                             );
                         }
                         StreamMessage::ToolUse { name, input } => {

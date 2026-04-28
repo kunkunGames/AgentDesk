@@ -7084,18 +7084,11 @@ pub(super) fn process_watcher_lines(
                                             },
                                         );
                                     } else if block_type == Some("thinking") {
-                                        let has_plaintext_thinking = block
-                                            .get("thinking")
-                                            .and_then(|t| t.as_str())
-                                            .map(|t| t.trim())
-                                            .is_some_and(|text| !text.is_empty());
-                                        if has_plaintext_thinking {
-                                            tool_state.mark_thinking();
-                                            push_transcript_event(
-                                                &mut tool_state.transcript_events,
-                                                redacted_thinking_transcript_event(),
-                                            );
-                                        }
+                                        tool_state.mark_thinking();
+                                        push_transcript_event(
+                                            &mut tool_state.transcript_events,
+                                            redacted_thinking_transcript_event(),
+                                        );
                                     }
                                 }
                             }
@@ -10215,6 +10208,32 @@ mod tests {
             event.summary.as_deref() != Some("internal reasoning")
                 && !event.content.contains("internal reasoning")
         }));
+    }
+
+    #[test]
+    fn watcher_records_redacted_assistant_thinking_block_without_plaintext() {
+        let mut buffer = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\"},{\"type\":\"text\",\"text\":\"final answer\"}]}}\n",
+        )
+        .to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        let outcome =
+            process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
+
+        assert!(!outcome.found_result);
+        assert_eq!(full_response, "final answer");
+        assert_eq!(
+            tool_state.prev_tool_status.as_deref(),
+            Some(super::REDACTED_THINKING_STATUS_LINE)
+        );
+        assert!(tool_state.transcript_events.iter().any(|event| matches!(
+            event.kind,
+            SessionTranscriptEventKind::Thinking
+        ) && event.summary.is_none()
+            && event.content.is_empty()));
     }
 
     #[test]
