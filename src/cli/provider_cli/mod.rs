@@ -779,15 +779,25 @@ fn cmd_run(
         )?;
         advance_to(&mut state, MigrationState::UpgradePlanned, None)?;
         advance_to(&mut state, MigrationState::UpgradeSucceeded, None)?;
-        crate::services::provider_cli::registry::ProviderCliChannel {
-            path: path.to_string(),
-            canonical_path: path.to_string(),
-            version: "manual".to_string(),
-            version_output: None,
-            source: "manual_override".to_string(),
-            checked_at: chrono::Utc::now(),
-            evidence: Default::default(),
-        }
+        let canonical = std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string());
+        snapshot_current_channel(provider)
+            .map(|mut ch| {
+                ch.path = path.to_string();
+                ch.canonical_path = canonical.clone();
+                ch.source = "manual_override".to_string();
+                ch
+            })
+            .unwrap_or_else(|| crate::services::provider_cli::registry::ProviderCliChannel {
+                path: path.to_string(),
+                canonical_path: canonical,
+                version: "unknown".to_string(),
+                version_output: None,
+                source: "manual_override".to_string(),
+                checked_at: chrono::Utc::now(),
+                evidence: Default::default(),
+            })
     } else if skip_upgrade {
         advance_to(
             &mut state,
