@@ -107,31 +107,6 @@ impl ActiveAcceptFollowups {
     }
 }
 
-fn active_accept_followups(db: &crate::db::Db, card_id: &str) -> ActiveAcceptFollowups {
-    db.lock()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT \
-                     COALESCE(SUM(CASE WHEN dispatch_type = 'review' AND status IN ('pending', 'dispatched') THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN dispatch_type = 'rework' AND status IN ('pending', 'dispatched') THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN dispatch_type = 'review-decision' AND status IN ('pending', 'dispatched') THEN 1 ELSE 0 END), 0) \
-                 FROM task_dispatches \
-                 WHERE kanban_card_id = ?1",
-                [card_id],
-                |row| {
-                    Ok(ActiveAcceptFollowups {
-                        review: row.get(0)?,
-                        rework: row.get(1)?,
-                        review_decision: row.get(2)?,
-                    })
-                },
-            )
-            .ok()
-        })
-        .unwrap_or_default()
-}
-
 async fn active_accept_followups_pg_first(
     state: &AppState,
     card_id: &str,
@@ -1311,7 +1286,6 @@ pub async fn submit_review_decision(
             // rework_pending override that would conflict with the live review dispatch.
             if !direct_review_created && !terminal_auto_approved {
                 update_card_review_state(
-                    None,
                     state.pg_pool_ref(),
                     &body.card_id,
                     "accept",
@@ -1560,7 +1534,6 @@ pub async fn submit_review_decision(
 
             // #117: Update canonical review state before returning
             update_card_review_state(
-                None,
                 state.pg_pool_ref(),
                 &body.card_id,
                 "dispute",
@@ -1620,7 +1593,6 @@ pub async fn submit_review_decision(
 
     // #117: Update canonical review state for all decision paths
     update_card_review_state(
-        None,
         state.pg_pool_ref(),
         &body.card_id,
         &body.decision,
