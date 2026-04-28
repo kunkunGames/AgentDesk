@@ -112,40 +112,6 @@ impl AppState {
     pub fn settings_service(&self) -> crate::services::settings::SettingsService {
         crate::services::settings::SettingsService::new(self.pg_pool.clone(), self.config.clone())
     }
-
-    /// TODO(#1238 / 843g): used by service factories that still expect a
-    /// `Db` parameter. Production runtimes never reach the SQLite branch
-    /// inside those services because `pg_pool` is required, but the
-    /// constructors still accept a handle. This helper materializes one
-    /// lazily — tests pass an explicit `Db`, runtime gets a placeholder
-    /// in-memory shim that none of the live PG branches consult. Once
-    /// #1238 migrates the constructors to `Option<Db>` (or PG-only), this
-    /// helper goes away.
-    fn legacy_db_for_pending_migration(&self) -> crate::db::Db {
-        self.legacy_db()
-            .cloned()
-            .unwrap_or_else(legacy_pending_migration_shim)
-    }
-}
-
-/// TODO(#1238 / 843g): replaced the previous startup-time SQLite shim. This
-/// helper is created lazily from
-/// `AppState::legacy_db_for_pending_migration` and only used as a
-/// placeholder for service constructors that have not been ported to
-/// PG-only APIs yet. It is never read at runtime — production deployments
-/// always go through the `pg_pool` branch inside each service.
-fn legacy_pending_migration_shim() -> crate::db::Db {
-    let conn =
-        rusqlite::Connection::open_in_memory().expect("open legacy compatibility placeholder");
-    crate::db::wrap_conn(conn)
-}
-
-/// TODO(#1238 / 843g): exposed for the few route helpers (auto_queue's
-/// activation deps, etc.) that still build their own `Db` clone from
-/// `AppState`. They will switch to `state.legacy_db()` (Option<&Db>) once
-/// the receiving signatures are ported.
-pub(super) fn pending_migration_shim_for_callers() -> crate::db::Db {
-    legacy_pending_migration_shim()
 }
 
 pub(crate) type ApiRouter = Router<AppState>;
