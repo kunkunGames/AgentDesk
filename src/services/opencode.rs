@@ -670,6 +670,8 @@ fn consume_sse(
 struct SseMessageState {
     accumulated_text: String,
     text_part_snapshots: HashMap<String, String>,
+    part_types: HashMap<String, String>,
+    pending_text_deltas: HashMap<String, String>,
     terminal_error: bool,
 }
 
@@ -687,6 +689,77 @@ fn text_part_snapshot_key(part_id: &str, message_id: Option<&str>) -> String {
     message_id
         .map(|message_id| format!("{message_id}:{part_id}"))
         .unwrap_or_else(|| part_id.to_string())
+}
+
+fn part_id_from_value(value: &Value) -> Option<&str> {
+    value
+        .get("id")
+        .or_else(|| value.get("partID"))
+        .or_else(|| value.get("partId"))
+        .or_else(|| value.get("part_id"))
+        .and_then(|v| v.as_str())
+}
+
+fn part_type_from_value(value: &Value) -> Option<&str> {
+    value.get("type").and_then(|v| v.as_str())
+}
+
+fn is_reasoning_part_type(part_type: &str) -> bool {
+    matches!(part_type, "thinking" | "redactedThinking" | "reasoning")
+}
+
+fn part_type_from_delta_props<'a>(
+    props: &'a Value,
+    state: &'a SseMessageState,
+    snapshot_key: Option<&str>,
+) -> Option<&'a str> {
+    props
+        .get("part")
+        .and_then(part_type_from_value)
+        .or_else(|| props.get("partType").and_then(|v| v.as_str()))
+        .or_else(|| props.get("part_type").and_then(|v| v.as_str()))
+        .or_else(|| snapshot_key.and_then(|key| state.part_types.get(key).map(String::as_str)))
+}
+
+fn snapshot_key_from_part(part: &Value, event_message_id: Option<&str>) -> Option<String> {
+    let part_id = part_id_from_value(part)?;
+    Some(text_part_snapshot_key(
+        part_id,
+        message_id_from_value(part).or(event_message_id),
+    ))
+}
+
+fn register_part_type(
+    part: &Value,
+    state: &mut SseMessageState,
+    event_message_id: Option<&str>,
+) -> Option<String> {
+    let part_type = part_type_from_value(part)?;
+    let snapshot_key = snapshot_key_from_part(part, event_message_id)?;
+    state
+        .part_types
+        .insert(snapshot_key.clone(), part_type.to_string());
+    if is_reasoning_part_type(part_type) || part_type != "text" {
+        state.pending_text_deltas.remove(&snapshot_key);
+    }
+    Some(snapshot_key)
+}
+
+fn flush_pending_text_delta(
+    sender: &Sender<StreamMessage>,
+    state: &mut SseMessageState,
+    snapshot_key: &str,
+) {
+    let Some(pending) = state.pending_text_deltas.remove(snapshot_key) else {
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    state
+        .text_part_snapshots
+        .insert(snapshot_key.to_string(), pending.clone());
+    append_text_delta(sender, state, &pending);
 }
 
 fn message_id_from_value(value: &Value) -> Option<&str> {
@@ -708,16 +781,16 @@ fn emit_text_part(
         return;
     }
 
-    let Some(part_id) = part
-        .get("id")
-        .or_else(|| part.get("partID"))
-        .and_then(|v| v.as_str())
-    else {
+    let Some(part_id) = part_id_from_value(part) else {
         append_text_delta(sender, state, text);
         return;
     };
     let message_id = message_id_from_value(part).or(event_message_id);
     let snapshot_key = text_part_snapshot_key(part_id, message_id);
+    state
+        .part_types
+        .insert(snapshot_key.clone(), "text".to_string());
+    flush_pending_text_delta(sender, state, &snapshot_key);
 
     let previous = state
         .text_part_snapshots
@@ -789,17 +862,12 @@ fn emit_part(
     event_message_id: Option<&str>,
 ) {
     let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    register_part_type(part, state, event_message_id);
 
     match part_type {
         "text" => emit_text_part(part, sender, state, event_message_id),
         "thinking" | "redactedThinking" | "reasoning" => {
-            let summary = part
-                .get("thinking")
-                .or_else(|| part.get("summary"))
-                .or_else(|| part.get("text"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let _ = sender.send(StreamMessage::Thinking { summary });
+            let _ = sender.send(StreamMessage::redacted_thinking());
         }
         "tool" => emit_tool_part(part, sender),
         "tool-use" => {
@@ -916,20 +984,43 @@ fn process_sse_event(
 
         "message.part.delta" => {
             if props.and_then(|p| p.get("field")).and_then(|v| v.as_str()) == Some("text") {
-                let delta = props
-                    .and_then(|p| p.get("delta"))
-                    .and_then(|v| v.as_str())?;
+                let props = props?;
+                let delta = props.get("delta").and_then(|v| v.as_str())?;
                 let part_id = props
-                    .and_then(|p| p.get("partID"))
+                    .get("partID")
+                    .or_else(|| props.get("partId"))
+                    .or_else(|| props.get("part_id"))
                     .and_then(|v| v.as_str())
+                    .or_else(|| props.get("part").and_then(part_id_from_value));
+                let message_id = message_id_from_value(props)
+                    .or_else(|| props.get("part").and_then(message_id_from_value));
+                let snapshot_key =
+                    part_id.map(|part_id| text_part_snapshot_key(part_id, message_id));
+                let part_type = part_type_from_delta_props(props, state, snapshot_key.as_deref())
                     .map(str::to_string);
-                if let Some(part_id) = part_id {
-                    let message_id = props.and_then(message_id_from_value);
-                    let snapshot_key = text_part_snapshot_key(&part_id, message_id);
-                    let entry = state.text_part_snapshots.entry(snapshot_key).or_default();
-                    entry.push_str(delta);
+
+                match (snapshot_key, part_type.as_deref()) {
+                    (Some(snapshot_key), Some("text")) => {
+                        let entry = state.text_part_snapshots.entry(snapshot_key).or_default();
+                        entry.push_str(delta);
+                        append_text_delta(sender, state, delta);
+                    }
+                    (Some(snapshot_key), Some(part_type)) if is_reasoning_part_type(part_type) => {
+                        state.pending_text_deltas.remove(&snapshot_key);
+                    }
+                    (Some(snapshot_key), Some(_)) => {
+                        state.pending_text_deltas.remove(&snapshot_key);
+                    }
+                    (Some(snapshot_key), None) => {
+                        state
+                            .pending_text_deltas
+                            .entry(snapshot_key)
+                            .or_default()
+                            .push_str(delta);
+                    }
+                    (None, Some("text")) => append_text_delta(sender, state, delta),
+                    (None, _) => {}
                 }
-                append_text_delta(sender, state, delta);
             }
             Some(false)
         }
@@ -1128,6 +1219,25 @@ mod tests {
     }
 
     #[test]
+    fn test_reasoning_delta_then_updated_does_not_emit_text() {
+        let events = [
+            r#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"reason-1","field":"text","delta":"internal reasoning"}}"#,
+            r#"{"type":"message.part.updated","properties":{"sessionID":"s1","messageID":"m1","part":{"id":"reason-1","sessionID":"s1","type":"reasoning","text":"internal reasoning"}}}"#,
+        ];
+        let (msgs, stops) = parse_events(&events, "s1");
+        assert_eq!(stops, vec![Some(false), Some(false)]);
+        assert!(
+            msgs.iter()
+                .all(|m| !matches!(m, StreamMessage::Text { .. })),
+            "reasoning delta must not be emitted as user-visible text"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.is_none()))
+        );
+    }
+
+    #[test]
     fn test_parse_model_override_accepts_provider_model_pair() {
         assert_eq!(
             parse_model_override(Some("anthropic/claude-sonnet-4-5")).unwrap(),
@@ -1237,18 +1347,20 @@ mod tests {
     fn test_thinking_part_emitted() {
         let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"thinking","thinking":"step 1"}}}"#;
         let (msgs, _) = parse_event(data, "s1");
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.as_deref() == Some("step 1"))));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.is_none()))
+        );
     }
 
     #[test]
     fn test_reasoning_part_emitted() {
         let data = r#"{"type":"part","properties":{"sessionID":"s1","part":{"type":"reasoning","text":"step 1"}}}"#;
         let (msgs, _) = parse_event(data, "s1");
-        assert!(msgs
-            .iter()
-            .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.as_deref() == Some("step 1"))));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, StreamMessage::Thinking { summary } if summary.is_none()))
+        );
     }
 
     #[test]
