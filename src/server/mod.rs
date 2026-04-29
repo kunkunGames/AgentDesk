@@ -3272,6 +3272,14 @@ async fn routine_runtime_loop(
         tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs.get()));
     loop {
         interval.tick().await;
+        match store.recover_stale_running_runs().await {
+            Ok(n) if n > 0 => tracing::info!(
+                recovered = n,
+                "routine periodic recovery: expired-lease runs marked interrupted"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
+        }
         // ORDER-P0-002: due-claim tick loop and JS executor land here
     }
 }
