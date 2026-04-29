@@ -213,6 +213,7 @@ pub(crate) fn dequeue_next_soft_intervention(queue: &mut Vec<Intervention>) -> T
     TakeNextSoftResult {
         intervention,
         has_more,
+        queue_len_after: queue.len(),
         queue_exit_events,
     }
 }
@@ -630,6 +631,7 @@ pub(crate) struct CancelQueuedMessageResult {
 pub(crate) struct TakeNextSoftResult {
     pub(crate) intervention: Option<Intervention>,
     pub(crate) has_more: bool,
+    pub(crate) queue_len_after: usize,
     pub(crate) queue_exit_events: Vec<QueueExitEvent>,
 }
 
@@ -793,6 +795,7 @@ impl ChannelMailboxHandle {
             TakeNextSoftResult {
                 intervention: None,
                 has_more: false,
+                queue_len_after: 0,
                 queue_exit_events: Vec::new(),
             },
         )
@@ -1263,8 +1266,14 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                 ChannelMailboxMsg::TakeNextSoft { persistence, reply } => {
                     state.last_persistence = Some(persistence.clone());
                     let next_result = dequeue_next_soft_intervention(&mut state.intervention_queue);
+                    let queue_len_after = state.intervention_queue.len();
                     persist_queue(channel_id, &state.intervention_queue, &persistence);
-                    let _ = reply.send(next_result);
+                    let _ = reply.send(TakeNextSoftResult {
+                        intervention: next_result.intervention,
+                        has_more: next_result.has_more,
+                        queue_len_after,
+                        queue_exit_events: next_result.queue_exit_events,
+                    });
                 }
                 ChannelMailboxMsg::RequeueFront {
                     intervention,

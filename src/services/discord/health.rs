@@ -1215,6 +1215,7 @@ impl TestHealthHarness {
             model_picker_pending: dashmap::DashMap::new(),
             dispatch_role_overrides: dashmap::DashMap::new(),
             last_message_ids: dashmap::DashMap::new(),
+            catch_up_retry_pending: dashmap::DashMap::new(),
             turn_start_times: dashmap::DashMap::new(),
             channel_rosters: dashmap::DashMap::new(),
             cached_serenity_ctx: tokio::sync::OnceCell::new(),
