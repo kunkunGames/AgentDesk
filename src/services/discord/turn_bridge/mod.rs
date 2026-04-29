@@ -51,7 +51,8 @@ use memory_lifecycle::{
     spawn_memory_reflect_task, take_memento_reflect_request,
 };
 use recall_feedback::{
-    analyze_recall_feedback_turn, submit_pending_feedbacks,
+    analyze_recall_feedback_turn, build_voluntary_feedback_reminder, reminder_transcript_event,
+    should_submit_automatic_feedback_fallback, submit_pending_feedbacks,
     transcript_contains_explicit_memento_tool_call,
 };
 use retry_state::{
@@ -2828,13 +2829,21 @@ pub(super) fn spawn_turn_bridge(
         }
 
         let memory_role_id = resolve_memory_role_id(role_binding.as_ref());
-        let recall_feedback_analysis = if should_analyze_recall_feedback
+        let mut recall_feedback_analysis = if should_analyze_recall_feedback
             || transcript_contains_explicit_memento_tool_call(&transcript_events)
         {
             Some(analyze_recall_feedback_turn(&transcript_events))
         } else {
             None
         };
+        let mut voluntary_feedback_reminder_injected = false;
+        if let Some(analysis) = recall_feedback_analysis.as_ref()
+            && let Some(reminder) = build_voluntary_feedback_reminder(analysis)
+        {
+            push_transcript_event(&mut transcript_events, reminder_transcript_event(reminder));
+            voluntary_feedback_reminder_injected = true;
+            recall_feedback_analysis = Some(analyze_recall_feedback_turn(&transcript_events));
+        }
         let model_token_usage = TurnTokenUsage {
             input_tokens: accumulated_input_tokens,
             cache_create_tokens: accumulated_cache_create_tokens,
@@ -2973,7 +2982,10 @@ pub(super) fn spawn_turn_bridge(
 
         let mut auto_feedback_count = 0usize;
         if let Some(analysis) = recall_feedback_analysis.as_ref()
-            && !analysis.pending_feedbacks.is_empty()
+            && should_submit_automatic_feedback_fallback(
+                analysis,
+                voluntary_feedback_reminder_injected,
+            )
         {
             let submit_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(20),
