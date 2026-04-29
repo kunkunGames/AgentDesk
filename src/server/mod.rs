@@ -3240,8 +3240,8 @@ async fn routine_runtime_loop(
     tick_interval_secs: u64,
 ) {
     use crate::services::routines::{
-        RoutineAction, RoutineAgentExecutor, RoutineScriptLoader, RoutineStore, poll_agent_turns,
-        run_due_tick,
+        RoutineAction, RoutineAgentExecutor, RoutineDiscordLogger, RoutineScriptLoader,
+        RoutineStore, poll_agent_turns, run_due_tick,
     };
     let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
@@ -3264,6 +3264,7 @@ async fn routine_runtime_loop(
     }
 
     let store = RoutineStore::new(pg_pool.clone());
+    let discord_logger = RoutineDiscordLogger::new(pg_pool.clone());
     let agent_executor = RoutineAgentExecutor::new(pg_pool, health_registry);
     match store.recover_stale_running_runs().await {
         Ok(n) if n > 0 => tracing::info!(
@@ -3296,6 +3297,9 @@ async fn routine_runtime_loop(
         }
         match poll_agent_turns(&store, &agent_executor, routines_config.max_due_per_tick).await {
             Ok(outcomes) if !outcomes.is_empty() => {
+                for outcome in &outcomes {
+                    discord_logger.log_run_outcome(&store, outcome).await;
+                }
                 tracing::info!(count = outcomes.len(), "routine agent turns completed")
             }
             Ok(_) => {}
@@ -3305,6 +3309,7 @@ async fn routine_runtime_loop(
             &store,
             &script_loader,
             Some(&agent_executor),
+            Some(&discord_logger),
             routines_config.max_due_per_tick,
         )
         .await

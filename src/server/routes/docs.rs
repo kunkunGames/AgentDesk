@@ -2522,7 +2522,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ])
         .with_example(
             json!({"body": {"script_ref": "daily-summary.js", "name": "Daily Summary", "execution_strategy": "fresh"}}),
-            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}}),
+            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}, "discord_log": {"status": "skipped"}}),
         ),
         ep(
             "GET",
@@ -2565,7 +2565,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/routines/{id}/runs",
             "routines",
-            "List recent run history for one routine.",
+            "List recent run history for one routine, including best-effort Discord log status.",
         )
         .with_params([
             ("id", path_param("Routine id")),
@@ -2575,14 +2575,14 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/pause",
             "routines",
-            "Pause an enabled routine and clear its next due time.",
+            "Pause an enabled routine, clear its next due time, and enqueue a best-effort Discord log when an attached agent has a channel.",
         )
         .with_params([("id", path_param("Routine id"))]),
         ep(
             "POST",
             "/api/routines/{id}/resume",
             "routines",
-            "Resume a paused routine with an optional next due time.",
+            "Resume a paused routine with an optional next due time and best-effort Discord log.",
         )
         .with_params([
             ("id", path_param("Routine id")),
@@ -2592,7 +2592,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/detach",
             "routines",
-            "Detach a non-running routine without deleting its run history.",
+            "Detach a non-running routine without deleting its run history; Discord log failure is returned only as discord_log.warning.",
         )
         .with_params([("id", path_param("Routine id"))]),
         ep(
@@ -2604,7 +2604,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_params([("id", path_param("Routine id"))])
         .with_example(
             json!({"path": {"id": "routine-1"}}),
-            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "agent", "status": "running", "result_json": {"turn_id": "discord:1473922824350601297:9100000000000000000", "fresh_context_guaranteed": false}}}),
+            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "agent", "status": "running", "result_json": {"turn_id": "discord:1473922824350601297:9100000000000000000", "fresh_context_guaranteed": false}}, "discord_log": {"status": "ok"}}),
         ),
         ep(
             "POST",

@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
-    NewRoutine, RoutineAgentExecutor, RoutinePatch, RoutineScriptLoader, RoutineStore,
-    execute_claimed_script_run,
+    NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
+    RoutineScriptLoader, RoutineStore, execute_claimed_script_run,
 };
 
 use super::AppState;
@@ -124,7 +124,13 @@ pub async fn attach_routine(
         })
         .await
         .map_err(store_error)?;
-    Ok((StatusCode::CREATED, Json(json!({ "routine": routine }))))
+    let discord_log = routine_discord_logger(&state)?
+        .log_routine_event(&routine, RoutineLifecycleEvent::Attached)
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "routine": routine, "discord_log": discord_log })),
+    ))
 }
 
 pub async fn patch_routine(
@@ -169,7 +175,12 @@ pub async fn pause_routine(
             "enabled routine {routine_id} not found"
         )));
     }
-    Ok(Json(json!({ "ok": true, "routine_id": routine_id })))
+    let discord_log = routine_discord_logger(&state)?
+        .log_routine_event_by_id(&store, &routine_id, RoutineLifecycleEvent::Paused)
+        .await;
+    Ok(Json(
+        json!({ "ok": true, "routine_id": routine_id, "discord_log": discord_log }),
+    ))
 }
 
 pub async fn resume_routine(
@@ -187,7 +198,12 @@ pub async fn resume_routine(
             "paused routine {routine_id} not found"
         )));
     }
-    Ok(Json(json!({ "ok": true, "routine_id": routine_id })))
+    let discord_log = routine_discord_logger(&state)?
+        .log_routine_event_by_id(&store, &routine_id, RoutineLifecycleEvent::Resumed)
+        .await;
+    Ok(Json(
+        json!({ "ok": true, "routine_id": routine_id, "discord_log": discord_log }),
+    ))
 }
 
 pub async fn detach_routine(
@@ -204,7 +220,12 @@ pub async fn detach_routine(
             "routine {routine_id} is missing, already detached, or currently running"
         )));
     }
-    Ok(Json(json!({ "ok": true, "routine_id": routine_id })))
+    let discord_log = routine_discord_logger(&state)?
+        .log_routine_event_by_id(&store, &routine_id, RoutineLifecycleEvent::Detached)
+        .await;
+    Ok(Json(
+        json!({ "ok": true, "routine_id": routine_id, "discord_log": discord_log }),
+    ))
 }
 
 pub async fn run_routine_now(
@@ -253,10 +274,15 @@ pub async fn run_routine_now(
     };
 
     let agent_executor = routine_agent_executor(&state)?;
+    let discord_logger = routine_discord_logger(&state)?;
+    discord_logger.log_run_started(&store, &claimed).await;
     let outcome = execute_claimed_script_run(&store, &loader, Some(&agent_executor), claimed)
         .await
         .map_err(store_error)?;
-    Ok(Json(json!({ "outcome": outcome })))
+    let discord_log = discord_logger.log_run_outcome(&store, &outcome).await;
+    Ok(Json(
+        json!({ "outcome": outcome, "discord_log": discord_log }),
+    ))
 }
 
 fn routine_store(state: &AppState) -> AppResult<RoutineStore> {
@@ -282,6 +308,17 @@ fn routine_agent_executor(state: &AppState) -> AppResult<RoutineAgentExecutor> {
         std::sync::Arc::new(pool),
         state.health_registry.clone(),
     ))
+}
+
+fn routine_discord_logger(state: &AppState) -> AppResult<RoutineDiscordLogger> {
+    let Some(pool) = state.pg_pool.clone() else {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Database,
+            "postgres pool unavailable; routines require postgresql",
+        ));
+    };
+    Ok(RoutineDiscordLogger::new(std::sync::Arc::new(pool)))
 }
 
 fn fallback_name(script_ref: &str) -> String {

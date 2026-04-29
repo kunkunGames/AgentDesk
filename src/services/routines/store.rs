@@ -59,6 +59,7 @@ pub struct RoutineRunRecord {
     pub result_json: Option<Value>,
     pub error: Option<String>,
     pub discord_log_status: Option<String>,
+    pub discord_log_error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -192,7 +193,7 @@ impl RoutineStore {
         sqlx::query_as(
             r#"
             SELECT id, routine_id, status, action, turn_id, lease_expires_at,
-                   result_json, error, discord_log_status, started_at,
+                   result_json, error, discord_log_status, discord_log_error, started_at,
                    finished_at, created_at, updated_at
             FROM routine_runs
             WHERE routine_id = $1
@@ -582,6 +583,31 @@ impl RoutineStore {
         .execute(&*self.pool)
         .await
         .map_err(|e| anyhow!("heartbeat routine run {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_discord_log_result(
+        &self,
+        run_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET discord_log_status = $2,
+                discord_log_error = $3,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(error)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("record routine discord log result {run_id}: {e}"))?;
 
         Ok(result.rows_affected() == 1)
     }

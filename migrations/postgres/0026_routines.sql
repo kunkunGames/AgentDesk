@@ -46,13 +46,20 @@ CREATE TABLE IF NOT EXISTS routine_runs (
     lease_expires_at    TIMESTAMPTZ,
     result_json         JSONB,
     error               TEXT,
-    -- 'ok' | 'failed' | NULL (not attempted yet)
+    -- 'ok' | 'failed' | 'skipped' | NULL (not attempted yet)
     discord_log_status  TEXT,
+    discord_log_error   TEXT,
     started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at         TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE IF EXISTS routine_runs
+    ADD COLUMN IF NOT EXISTS discord_log_status TEXT;
+
+ALTER TABLE IF EXISTS routine_runs
+    ADD COLUMN IF NOT EXISTS discord_log_error TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_routines_agent_status
     ON routines(agent_id, status);

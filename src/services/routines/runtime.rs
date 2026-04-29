@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use super::action::RoutineAction;
 use super::agent_executor::RoutineAgentExecutor;
+use super::discord_log::RoutineDiscordLogger;
 use super::loader::{RoutineScriptLoader, RoutineTickContext, RoutineTickRoutine, RoutineTickRun};
 use super::store::{ClaimedRoutineRun, RoutineStore};
 
@@ -23,13 +24,22 @@ pub async fn run_due_tick(
     store: &RoutineStore,
     loader: &RoutineScriptLoader,
     agent_executor: Option<&RoutineAgentExecutor>,
+    discord_logger: Option<&RoutineDiscordLogger>,
     max_due_per_tick: u32,
 ) -> Result<Vec<RoutineRunOutcome>> {
     let claimed = store.claim_due_runs(max_due_per_tick).await?;
     let mut outcomes = Vec::with_capacity(claimed.len());
     for run in claimed {
+        if let Some(logger) = discord_logger {
+            logger.log_run_started(store, &run).await;
+        }
         match execute_claimed_script_run(store, loader, agent_executor, run).await {
-            Ok(outcome) => outcomes.push(outcome),
+            Ok(outcome) => {
+                if let Some(logger) = discord_logger {
+                    logger.log_run_outcome(store, &outcome).await;
+                }
+                outcomes.push(outcome);
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "routine due run failed before outcome capture");
             }
