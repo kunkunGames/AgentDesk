@@ -66,6 +66,23 @@ pub struct RoutineRunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRunSearchRecord {
+    pub id: String,
+    pub routine_id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub status: String,
+    pub action: Option<String>,
+    pub result_json: Option<Value>,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RoutineMetrics {
     pub routines_total: i64,
@@ -318,6 +335,53 @@ impl RoutineStore {
                 .try_get("avg_latency_ms")
                 .map_err(|e| anyhow!("decode routine metric avg_latency_ms: {e}"))?,
         })
+    }
+
+    pub async fn search_run_results(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<RoutineRunSearchRecord>> {
+        let limit = limit.clamp(1, 100);
+        let pattern = format!("%{}%", escape_like_pattern(query));
+        sqlx::query_as(
+            r#"
+            SELECT
+                rr.id,
+                rr.routine_id,
+                r.agent_id,
+                r.script_ref,
+                r.name,
+                rr.status,
+                rr.action,
+                rr.result_json,
+                rr.error,
+                rr.started_at,
+                rr.finished_at,
+                rr.created_at,
+                rr.updated_at
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.result_json IS NOT NULL
+              AND rr.result_json::text ILIKE $1 ESCAPE '\'
+              AND ($2::text IS NULL OR r.agent_id = $2)
+              AND ($3::text IS NULL OR rr.status = $3)
+              AND ($4::timestamptz IS NULL OR rr.created_at >= $4)
+            ORDER BY rr.created_at DESC
+            LIMIT $5
+            "#,
+        )
+        .bind(pattern)
+        .bind(agent_id)
+        .bind(status)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("search routine run results: {e}"))
     }
 
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
@@ -1005,6 +1069,13 @@ fn validate_execution_strategy(strategy: &str) -> Result<()> {
 fn get_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64> {
     row.try_get(column)
         .map_err(|e| anyhow!("decode routine metric {column}: {e}"))
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[derive(Debug, Clone, Copy)]

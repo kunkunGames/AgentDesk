@@ -2528,6 +2528,35 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"metrics": {"routines_total": 3, "routines_enabled": 2, "routines_paused": 1, "routines_detached": 0, "runs_total": 12, "runs_running": 1, "runs_succeeded": 9, "runs_failed": 1, "runs_skipped": 0, "runs_paused": 0, "runs_interrupted": 1, "runs_error": 2, "avg_latency_ms": 1532.4}, "filters": {"agent_id": "codex", "since": "2026-04-29T00:00:00Z"}}),
         ),
         ep(
+            "GET",
+            "/api/routines/runs/search",
+            "routines",
+            "Search recent routine runs by `routine_runs.result_json` text with optional agent, status, time-window, and limit filters.",
+        )
+        .with_params([
+            ("q", query_param("string", true, "Search text matched against routine_runs.result_json")),
+            (
+                "agent_id",
+                query_param("string", false, "Filter matches to one attached agent"),
+            ),
+            (
+                "status",
+                query_param("string", false, "Filter by running, succeeded, failed, skipped, paused, or interrupted"),
+            ),
+            (
+                "since",
+                query_param("string", false, "Optional RFC3339 lower bound for routine_runs.created_at"),
+            ),
+            (
+                "limit",
+                query_param("integer", false, "Maximum rows to return, clamped to 1..100"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"q": "checkpoint", "agent_id": "codex", "status": "succeeded", "limit": 20}}),
+            json!({"runs": [{"id": "run-1", "routine_id": "routine-1", "script_ref": "agent-checkpoint-review.js", "status": "succeeded", "result_json": {"summary": "checkpoint ok"}}], "filters": {"q": "checkpoint", "agent_id": "codex", "status": "succeeded", "since": null, "limit": 20}}),
+        ),
+        ep(
             "POST",
             "/api/routines",
             "routines",

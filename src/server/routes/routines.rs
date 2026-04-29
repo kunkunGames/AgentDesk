@@ -34,6 +34,15 @@ pub struct RoutineMetricsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SearchRoutineRunResultsQuery {
+    pub q: String,
+    pub agent_id: Option<String>,
+    pub status: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AttachRoutineBody {
     pub agent_id: Option<String>,
     pub script_ref: String,
@@ -84,6 +93,40 @@ pub async fn routine_metrics(
         "filters": {
             "agent_id": query.agent_id,
             "since": query.since,
+        },
+    })))
+}
+
+pub async fn search_routine_run_results(
+    State(state): State<AppState>,
+    Query(query): Query<SearchRoutineRunResultsQuery>,
+) -> AppResult<Json<Value>> {
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Err(AppError::bad_request("q is required"));
+    }
+    if let Some(status) = query.status.as_deref() {
+        validate_run_status_filter(status)?;
+    }
+    let store = routine_store(&state)?;
+    let runs = store
+        .search_run_results(
+            q,
+            query.agent_id.as_deref(),
+            query.status.as_deref(),
+            query.since,
+            query.limit.unwrap_or(20),
+        )
+        .await
+        .map_err(store_error)?;
+    Ok(Json(json!({
+        "runs": runs,
+        "filters": {
+            "q": q,
+            "agent_id": query.agent_id,
+            "status": query.status,
+            "since": query.since,
+            "limit": query.limit.unwrap_or(20).clamp(1, 100),
         },
     })))
 }
@@ -464,6 +507,15 @@ fn validate_execution_strategy_request(strategy: &str) -> AppResult<()> {
         "fresh" | "persistent" => Ok(()),
         other => Err(AppError::bad_request(format!(
             "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
+        ))),
+    }
+}
+
+fn validate_run_status_filter(status: &str) -> AppResult<()> {
+    match status {
+        "running" | "succeeded" | "failed" | "skipped" | "paused" | "interrupted" => Ok(()),
+        other => Err(AppError::bad_request(format!(
+            "unsupported routine run status '{other}'"
         ))),
     }
 }
