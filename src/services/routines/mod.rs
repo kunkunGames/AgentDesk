@@ -13,6 +13,7 @@ pub mod agent_executor;
 pub mod discord_log;
 pub mod loader;
 pub mod runtime;
+pub mod runtime_config;
 pub mod session_control;
 pub mod store;
 
@@ -21,7 +22,6 @@ pub use agent_executor::RoutineAgentExecutor;
 pub use discord_log::{RoutineDiscordLogger, RoutineLifecycleEvent};
 pub use loader::RoutineScriptLoader;
 pub use runtime::{execute_claimed_script_run, poll_agent_turns, run_due_tick};
+pub use runtime_config::validate_routine_runtime_config;
 pub use session_control::{RoutineSessionCommand, RoutineSessionController};
-pub use store::{
-    NewRoutine, ROUTINE_RUN_LEASE_SECS, RoutinePatch, RoutineStore, validate_routine_schedule,
-};
+pub use store::{NewRoutine, RoutinePatch, RoutineStore, validate_routine_schedule};

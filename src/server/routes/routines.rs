@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
     RoutineScriptLoader, RoutineSessionCommand, RoutineSessionController, RoutineStore,
-    execute_claimed_script_run, validate_routine_schedule,
+    execute_claimed_script_run, validate_routine_runtime_config, validate_routine_schedule,
 };
 
 use super::AppState;
@@ -304,13 +304,7 @@ pub async fn run_routine_now(
     State(state): State<AppState>,
     Path(routine_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    if !state.config.routines.enabled {
-        return Err(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Config,
-            "routines are disabled by config",
-        ));
-    }
+    ensure_routine_runtime_runnable(&state.config.routines)?;
 
     let store = routine_store(&state)?;
     if store
@@ -361,6 +355,24 @@ pub async fn run_routine_now(
     Ok(Json(
         json!({ "outcome": outcome, "discord_log": discord_log }),
     ))
+}
+
+fn ensure_routine_runtime_runnable(config: &crate::config::RoutinesConfig) -> AppResult<()> {
+    if !config.enabled {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Config,
+            "routines are disabled by config",
+        ));
+    }
+    if let Err(error) = validate_routine_runtime_config(config) {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Config,
+            format!("routine runtime is not runnable: {}", error.message()),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn reset_routine_session(
@@ -547,5 +559,44 @@ fn session_control_error(error: anyhow::Error) -> AppError {
         AppError::conflict(message)
     } else {
         AppError::internal(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::ensure_routine_runtime_runnable;
+    use crate::config::RoutinesConfig;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn run_now_guard_rejects_disabled_routines() {
+        let config = RoutinesConfig::default();
+
+        let err = ensure_routine_runtime_runnable(&config)
+            .expect_err("disabled routines must reject run-now before DB access");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), ErrorCode::Config);
+        assert_eq!(err.message(), "routines are disabled by config");
+    }
+
+    #[test]
+    fn run_now_guard_rejects_invalid_runtime_worker_config() {
+        let mut config = RoutinesConfig {
+            enabled: true,
+            ..RoutinesConfig::default()
+        };
+        config.max_agent_polls_per_tick = 0;
+
+        let err = ensure_routine_runtime_runnable(&config)
+            .expect_err("worker-invalid routines config must reject run-now");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), ErrorCode::Config);
+        assert!(
+            err.message().contains("max_agent_polls_per_tick"),
+            "unexpected message: {}",
+            err.message()
+        );
     }
 }

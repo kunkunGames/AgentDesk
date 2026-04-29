@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::engine::PolicyEngine;
 use crate::services::discord::health::HealthRegistry;
-use crate::services::routines::ROUTINE_RUN_LEASE_SECS;
+use crate::services::routines::validate_routine_runtime_config;
 use sqlx::PgPool;
 
 use super::ws::{BatchBuffer, BroadcastTx};
@@ -483,24 +483,13 @@ impl SupervisedWorkerRegistry {
                     self.log_skip(spec, "routines.enabled=false");
                     return Ok(None);
                 }
-                let Some(tick_secs) =
-                    valid_routine_tick_interval_secs(self.config.routines.tick_interval_secs)
-                else {
-                    self.log_skip(
-                        spec,
-                        "routines.tick_interval_secs must be greater than zero and no more than half the routine run lease window",
-                    );
-                    return Ok(None);
+                let tick_secs = match validate_routine_runtime_config(&self.config.routines) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.log_skip(spec, error.message());
+                        return Ok(None);
+                    }
                 };
-                if valid_routine_agent_poll_limit(self.config.routines.max_agent_polls_per_tick)
-                    .is_none()
-                {
-                    self.log_skip(
-                        spec,
-                        "routines.max_agent_polls_per_tick must be greater than zero",
-                    );
-                    return Ok(None);
-                }
                 let Some(routine_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(
                         spec,
@@ -581,21 +570,9 @@ impl SupervisedWorkerRegistry {
     }
 }
 
-fn valid_routine_tick_interval_secs(value: u64) -> Option<u64> {
-    let max_safe_tick_secs = ROUTINE_RUN_LEASE_SECS / 2;
-    (value > 0 && value <= max_safe_tick_secs).then_some(value)
-}
-
-fn valid_routine_agent_poll_limit(value: u32) -> Option<u32> {
-    (value > 0).then_some(value)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage,
-        valid_routine_agent_poll_limit, valid_routine_tick_interval_secs,
-    };
+    use super::{BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage};
 
     #[test]
     fn boot_steps_are_explicit_and_ordered() {
@@ -650,22 +627,5 @@ mod tests {
                 .all(|spec| !spec.health_owner.is_empty())
         );
         assert!(WORKER_SPECS.iter().all(|spec| !spec.notes.is_empty()));
-    }
-
-    #[test]
-    fn routine_tick_interval_rejects_zero() {
-        assert_eq!(valid_routine_tick_interval_secs(0), None);
-        assert_eq!(valid_routine_tick_interval_secs(1), Some(1));
-        assert_eq!(valid_routine_tick_interval_secs(30), Some(30));
-        assert_eq!(valid_routine_tick_interval_secs(900), Some(900));
-        assert_eq!(valid_routine_tick_interval_secs(901), None);
-        assert_eq!(valid_routine_tick_interval_secs(1800), None);
-    }
-
-    #[test]
-    fn routine_agent_poll_limit_rejects_zero() {
-        assert_eq!(valid_routine_agent_poll_limit(0), None);
-        assert_eq!(valid_routine_agent_poll_limit(1), Some(1));
-        assert_eq!(valid_routine_agent_poll_limit(10), Some(10));
     }
 }
