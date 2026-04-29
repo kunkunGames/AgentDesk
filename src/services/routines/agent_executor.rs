@@ -103,6 +103,39 @@ impl RoutineAgentExecutor {
         let pending = store.list_running_agent_runs(limit).await?;
         let mut outcomes = Vec::new();
         for run in pending {
+            if let Some(completion) = self.find_turn_completion(&run.turn_id).await? {
+                let checkpoint = pending_checkpoint(run.result_json.as_ref());
+                let next_due_at = pending_next_due_at(run.result_json.as_ref());
+                let last_result = assistant_preview(&completion.assistant_message);
+                let result_json = Some(completed_result(&run, &completion, last_result.as_str()));
+                let closed = store
+                    .complete_agent_run(
+                        &run.run_id,
+                        result_json.clone(),
+                        checkpoint,
+                        Some(last_result.as_str()),
+                        match next_due_at {
+                            Some(value) => NextDueAtUpdate::Set(value),
+                            None => NextDueAtUpdate::Preserve,
+                        },
+                    )
+                    .await?;
+                if !closed {
+                    continue;
+                }
+                outcomes.push(RoutineRunOutcome {
+                    run_id: run.run_id,
+                    routine_id: run.routine_id,
+                    script_ref: run.script_ref,
+                    action: "agent".to_string(),
+                    status: "succeeded".to_string(),
+                    result_json,
+                    error: None,
+                    fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
+                });
+                continue;
+            }
+
             if self.has_timed_out(&run).await? {
                 let message = format!(
                     "routine agent turn timed out after {} seconds",
@@ -126,42 +159,6 @@ impl RoutineAgentExecutor {
                     fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
                 });
                 continue;
-            }
-
-            match self.find_turn_completion(&run.turn_id).await? {
-                Some(completion) => {
-                    let checkpoint = pending_checkpoint(run.result_json.as_ref());
-                    let next_due_at = pending_next_due_at(run.result_json.as_ref());
-                    let last_result = assistant_preview(&completion.assistant_message);
-                    let result_json =
-                        Some(completed_result(&run, &completion, last_result.as_str()));
-                    let closed = store
-                        .complete_agent_run(
-                            &run.run_id,
-                            result_json.clone(),
-                            checkpoint,
-                            Some(last_result.as_str()),
-                            match next_due_at {
-                                Some(value) => NextDueAtUpdate::Set(value),
-                                None => NextDueAtUpdate::Preserve,
-                            },
-                        )
-                        .await?;
-                    if !closed {
-                        continue;
-                    }
-                    outcomes.push(RoutineRunOutcome {
-                        run_id: run.run_id,
-                        routine_id: run.routine_id,
-                        script_ref: run.script_ref,
-                        action: "agent".to_string(),
-                        status: "succeeded".to_string(),
-                        result_json,
-                        error: None,
-                        fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
-                    });
-                }
-                None => {}
             }
         }
         Ok(outcomes)
