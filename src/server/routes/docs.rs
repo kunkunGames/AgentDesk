@@ -267,7 +267,7 @@ fn canonical_category(category: &str) -> &'static str {
         "agents" => "agents",
         "kanban" | "kanban-repos" | "pipeline" | "pm" | "reviews" => "kanban",
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
-        "auto-queue" | "cron" | "queue" => "queue",
+        "auto-queue" | "cron" | "queue" | "routines" => "queue",
         "analytics" | "auth" | "docs" | "health" | "monitoring" | "stats" | "provider-cli" => "ops",
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
@@ -318,7 +318,7 @@ fn category_to_group(category: &str) -> &'static str {
         // integrations — discord, github, meetings, provider, mcp
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         // automation — auto-queue, policies, scheduler, cron, maintenance
-        "auto-queue" | "queue" | "cron" | "policies" => "automation",
+        "auto-queue" | "queue" | "cron" | "policies" | "routines" => "automation",
         // config — settings, onboarding, knowledge, source-of-truth, skills,
         // offices, departments, memory (#1066 /api/memory dual-mode)
         "settings" | "onboarding" | "skills" | "offices" | "departments" | "memory" => "config",
@@ -423,6 +423,7 @@ fn category_description(category: &str) -> &'static str {
             "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback."
         }
         "reviews" => "Review verdict submission, decisions, and tuning aggregation.",
+        "routines" => "Durable script-backed routines, run history, and manual routine controls.",
         "sessions" => "Sessions, force-kill, and termination events.",
         "settings" => "Settings surfaces, live overrides, precedence, and onboarding contracts.",
         "skills" => "Skill catalog and usage ranking.",
@@ -2486,6 +2487,111 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 ),
             )]),
         ep("GET", "/api/cron-jobs", "cron", "List cron jobs // TODO: example"),
+        ep(
+            "GET",
+            "/api/routines",
+            "routines",
+            "List durable routines with optional agent/status filters.",
+        )
+        .with_params([
+            (
+                "agent_id",
+                query_param("string", false, "Filter routines attached to one agent"),
+            ),
+            (
+                "status",
+                query_param("string", false, "Filter by enabled, paused, or detached"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"status": "enabled"}}),
+            json!({"routines": [{"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}]}),
+        ),
+        ep(
+            "POST",
+            "/api/routines",
+            "routines",
+            "Attach a file-backed routine row without starting an agent action.",
+        )
+        .with_params([
+            ("script_ref", body_param("string", true, "Routine script path relative to routines.dir")),
+            ("name", body_param("string", false, "Human-readable routine name")),
+            ("agent_id", body_param("string", false, "Optional attached agent id")),
+            ("execution_strategy", body_param("string", false, "fresh or persistent")),
+            ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
+        ])
+        .with_example(
+            json!({"body": {"script_ref": "daily-summary.js", "name": "Daily Summary", "execution_strategy": "fresh"}}),
+            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}}),
+        ),
+        ep(
+            "GET",
+            "/api/routines/{id}",
+            "routines",
+            "Get one durable routine row.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js"}}),
+        ),
+        ep(
+            "PATCH",
+            "/api/routines/{id}",
+            "routines",
+            "Patch routine metadata, scheduling fields, or checkpoint.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("name", body_param("string", false, "New routine name")),
+            ("next_due_at", body_param("string", false, "RFC3339 due time")),
+            ("checkpoint", body_param("object", false, "Replacement checkpoint JSON")),
+        ]),
+        ep(
+            "GET",
+            "/api/routines/{id}/runs",
+            "routines",
+            "List recent run history for one routine.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("limit", query_param("integer", false, "Maximum runs to return, capped at 100")),
+        ]),
+        ep(
+            "POST",
+            "/api/routines/{id}/pause",
+            "routines",
+            "Pause an enabled routine and clear its next due time.",
+        )
+        .with_params([("id", path_param("Routine id"))]),
+        ep(
+            "POST",
+            "/api/routines/{id}/resume",
+            "routines",
+            "Resume a paused routine with an optional next due time.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
+        ]),
+        ep(
+            "POST",
+            "/api/routines/{id}/detach",
+            "routines",
+            "Detach a non-running routine without deleting its run history.",
+        )
+        .with_params([("id", path_param("Routine id"))]),
+        ep(
+            "POST",
+            "/api/routines/{id}/run-now",
+            "routines",
+            "Claim and execute one routine through the script-only runtime.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "complete", "status": "succeeded", "fresh_context_guaranteed": false}}),
+        ),
         ep(
             "POST",
             "/api/auto-queue/generate",

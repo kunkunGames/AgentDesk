@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::super::{
     ApiRouter, AppState, auto_queue, cron_api, dispatched_sessions, dispatches, docs, health_api,
     hooks, log_deprecated_alias, maintenance, messages, pipeline, protected_api_domain,
-    provider_cli_api, queue_api, skills_api, termination_events,
+    provider_cli_api, queue_api, routines, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -139,6 +139,19 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/skills/prune", post(skills_api::prune))
             .route("/cron-jobs", get(cron_api::list_cron_jobs))
             .route("/maintenance/jobs", get(maintenance::list_jobs))
+            .route(
+                "/routines",
+                get(routines::list_routines).post(routines::attach_routine),
+            )
+            .route(
+                "/routines/{id}",
+                get(routines::get_routine).patch(routines::patch_routine),
+            )
+            .route("/routines/{id}/runs", get(routines::list_routine_runs))
+            .route("/routines/{id}/pause", post(routines::pause_routine))
+            .route("/routines/{id}/resume", post(routines::resume_routine))
+            .route("/routines/{id}/detach", post(routines::detach_routine))
+            .route("/routines/{id}/run-now", post(routines::run_routine_now))
             // Canonical queue routes (#1065): /api/queue/*
             // Legacy /api/auto-queue/* still mounted (same handlers) for backward compat.
             .route("/queue/generate", post(auto_queue::generate))

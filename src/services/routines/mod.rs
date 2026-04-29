@@ -3,15 +3,17 @@
 /// This module is intentionally small at this stage. It exposes only
 /// `RoutineStore` exposes PG-backed claim/finish/recovery transactions.
 /// `RoutineScriptLoader` and `RoutineAction` are the ORDER-P0-002 foundation;
-/// the worker tick loop and `/api/routines` route integration land after this
-/// isolated loader/validator is verified.
+/// the worker tick loop and `/api/routines` route integration use the typed
+/// runtime/store boundary exposed here.
 ///
 /// SQLite users: this module is never instantiated when `pg_pool` is `None`,
 /// so there are zero side effects for non-PG deployments.
 pub mod action;
 pub mod loader;
+pub mod runtime;
 pub mod store;
 
 pub use action::{RoutineAction, validate_routine_action};
 pub use loader::RoutineScriptLoader;
-pub use store::RoutineStore;
+pub use runtime::{execute_claimed_script_run, run_due_tick};
+pub use store::{NewRoutine, RoutinePatch, RoutineStore};

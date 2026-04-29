@@ -3238,7 +3238,9 @@ async fn routine_runtime_loop(
     routines_config: crate::config::RoutinesConfig,
     tick_interval_secs: u64,
 ) {
-    use crate::services::routines::{RoutineAction, RoutineScriptLoader, RoutineStore};
+    use crate::services::routines::{
+        RoutineAction, RoutineScriptLoader, RoutineStore, run_due_tick,
+    };
     let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
         return;
@@ -3280,6 +3282,21 @@ async fn routine_runtime_loop(
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
         }
-        // ORDER-P0-002: due-claim tick loop and JS executor land here
+        if routines_config.hot_reload {
+            match script_loader.load_dir(&routines_config.dir) {
+                Ok(count) if count > 0 => {
+                    tracing::debug!(count, "routine script registry hot-reload pass complete")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
+            }
+        }
+        match run_due_tick(&store, &script_loader, routines_config.max_due_per_tick).await {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                tracing::info!(count = outcomes.len(), "routine due tick executed")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine due tick failed"),
+        }
     }
 }

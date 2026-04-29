@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
@@ -27,6 +28,61 @@ pub struct ClaimedRoutineRun {
     pub execution_strategy: String,
     pub checkpoint: Option<Value>,
     pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRecord {
+    pub id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub status: String,
+    pub execution_strategy: String,
+    pub schedule: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_result: Option<String>,
+    pub checkpoint: Option<Value>,
+    pub in_flight_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRunRecord {
+    pub id: String,
+    pub routine_id: String,
+    pub status: String,
+    pub action: Option<String>,
+    pub turn_id: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub result_json: Option<Value>,
+    pub error: Option<String>,
+    pub discord_log_status: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRoutine {
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub execution_strategy: String,
+    pub schedule: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub checkpoint: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RoutinePatch {
+    pub name: Option<String>,
+    pub execution_strategy: Option<String>,
+    pub schedule: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub checkpoint: Option<Value>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -80,6 +136,128 @@ impl RoutineStore {
 
         tx.commit().await?;
         Ok(claimed)
+    }
+
+    pub async fn list_routines(
+        &self,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<RoutineRecord>> {
+        sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, status, execution_strategy,
+                   schedule, next_due_at, last_run_at, last_result, checkpoint,
+                   in_flight_run_id, created_at, updated_at
+            FROM routines
+            WHERE ($1::text IS NULL OR agent_id = $1)
+              AND ($2::text IS NULL OR status = $2)
+            ORDER BY created_at DESC, id ASC
+            "#,
+        )
+        .bind(agent_id)
+        .bind(status)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list routines: {e}"))
+    }
+
+    pub async fn get_routine(&self, routine_id: &str) -> Result<Option<RoutineRecord>> {
+        sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, status, execution_strategy,
+                   schedule, next_due_at, last_run_at, last_result, checkpoint,
+                   in_flight_run_id, created_at, updated_at
+            FROM routines
+            WHERE id = $1
+            "#,
+        )
+        .bind(routine_id)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("get routine {routine_id}: {e}"))
+    }
+
+    pub async fn list_runs(&self, routine_id: &str, limit: i64) -> Result<Vec<RoutineRunRecord>> {
+        let limit = limit.clamp(1, 100);
+        sqlx::query_as(
+            r#"
+            SELECT id, routine_id, status, action, turn_id, lease_expires_at,
+                   result_json, error, discord_log_status, started_at,
+                   finished_at, created_at, updated_at
+            FROM routine_runs
+            WHERE routine_id = $1
+            ORDER BY started_at DESC, created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(routine_id)
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list routine runs {routine_id}: {e}"))
+    }
+
+    pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
+        validate_execution_strategy(&new_routine.execution_strategy)?;
+        let id = Uuid::new_v4().to_string();
+        sqlx::query_as(
+            r#"
+            INSERT INTO routines (
+                id, agent_id, script_ref, name, status, execution_strategy,
+                schedule, next_due_at, checkpoint
+            )
+            VALUES ($1, $2, $3, $4, 'enabled', $5, $6, $7, $8)
+            RETURNING id, agent_id, script_ref, name, status, execution_strategy,
+                      schedule, next_due_at, last_run_at, last_result, checkpoint,
+                      in_flight_run_id, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(new_routine.agent_id)
+        .bind(new_routine.script_ref)
+        .bind(new_routine.name)
+        .bind(new_routine.execution_strategy)
+        .bind(new_routine.schedule)
+        .bind(new_routine.next_due_at)
+        .bind(new_routine.checkpoint)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("attach routine: {e}"))
+    }
+
+    pub async fn patch_routine(
+        &self,
+        routine_id: &str,
+        patch: RoutinePatch,
+    ) -> Result<Option<RoutineRecord>> {
+        if let Some(strategy) = patch.execution_strategy.as_deref() {
+            validate_execution_strategy(strategy)?;
+        }
+        sqlx::query_as(
+            r#"
+            UPDATE routines
+            SET name = COALESCE($2, name),
+                execution_strategy = COALESCE($3, execution_strategy),
+                schedule = COALESCE($4, schedule),
+                next_due_at = COALESCE($5, next_due_at),
+                checkpoint = COALESCE($6, checkpoint),
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+            RETURNING id, agent_id, script_ref, name, status, execution_strategy,
+                      schedule, next_due_at, last_run_at, last_result, checkpoint,
+                      in_flight_run_id, created_at, updated_at
+            "#,
+        )
+        .bind(routine_id)
+        .bind(patch.name)
+        .bind(patch.execution_strategy)
+        .bind(patch.schedule)
+        .bind(patch.next_due_at)
+        .bind(patch.checkpoint)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("patch routine {routine_id}: {e}"))
     }
 
     /// Claim one enabled routine immediately, independent of its schedule.
@@ -248,23 +426,42 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn detach_routine(&self, routine_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET status = 'detached',
+                next_due_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+              AND in_flight_run_id IS NULL
+            "#,
+        )
+        .bind(routine_id)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("detach routine {routine_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Extend the lease for a running routine run.
     ///
     /// Executors must call this periodically while JS execution is active.
     /// Boot recovery only interrupts rows whose lease has expired.
     pub async fn heartbeat_run(&self, run_id: &str) -> Result<bool> {
-        let lease_expires_at = Self::new_lease_expires_at();
         let result = sqlx::query(
             r#"
             UPDATE routine_runs
-            SET lease_expires_at = $2,
+            SET lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
                 updated_at = NOW()
             WHERE id = $1
               AND status = 'running'
             "#,
         )
         .bind(run_id)
-        .bind(lease_expires_at)
+        .bind(RUN_LEASE_SECS)
         .execute(&*self.pool)
         .await
         .map_err(|e| anyhow!("heartbeat routine run {run_id}: {e}"))?;
@@ -281,7 +478,6 @@ impl RoutineStore {
     /// Returns the number of expired-lease runs that were recovered.
     pub async fn recover_stale_running_runs(&self) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
-        let now = Utc::now();
 
         // Close expired leases. The UPDATE re-checks status and lease expiry
         // under the row lock so a concurrently finished run is not clobbered.
@@ -292,7 +488,7 @@ impl RoutineStore {
                 FROM routine_runs
                 WHERE status = 'running'
                   AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < $1
+                  AND lease_expires_at < NOW()
                 FOR UPDATE SKIP LOCKED
             ),
             closed AS (
@@ -306,13 +502,12 @@ impl RoutineStore {
                 WHERE rr.id = expired.id
                   AND rr.status = 'running'
                   AND rr.lease_expires_at IS NOT NULL
-                  AND rr.lease_expires_at < $1
+                  AND rr.lease_expires_at < NOW()
                 RETURNING rr.id, rr.routine_id
             )
             SELECT id, routine_id FROM closed
             "#,
         )
-        .bind(now)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| anyhow!("recover: close expired routine leases: {e}"))?;
@@ -353,18 +548,18 @@ impl RoutineStore {
         candidate: RoutineClaimCandidate,
     ) -> Result<ClaimedRoutineRun> {
         let run_id = Uuid::new_v4().to_string();
-        let lease_expires_at = Self::new_lease_expires_at();
 
-        sqlx::query(
+        let lease_expires_at: DateTime<Utc> = sqlx::query_scalar(
             r#"
             INSERT INTO routine_runs (id, routine_id, status, lease_expires_at)
-            VALUES ($1, $2, 'running', $3)
+            VALUES ($1, $2, 'running', NOW() + ($3::bigint * INTERVAL '1 second'))
+            RETURNING lease_expires_at
             "#,
         )
         .bind(&run_id)
         .bind(&candidate.id)
-        .bind(lease_expires_at)
-        .execute(&mut **tx)
+        .bind(RUN_LEASE_SECS)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| anyhow!("claim routine {}: insert running run: {e}", candidate.id))?;
 
@@ -401,10 +596,6 @@ impl RoutineStore {
             checkpoint: candidate.checkpoint,
             lease_expires_at,
         })
-    }
-
-    fn new_lease_expires_at() -> DateTime<Utc> {
-        Utc::now() + chrono::Duration::seconds(RUN_LEASE_SECS)
     }
 
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
@@ -486,6 +677,15 @@ impl RoutineStore {
 
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+fn validate_execution_strategy(strategy: &str) -> Result<()> {
+    match strategy {
+        "fresh" | "persistent" => Ok(()),
+        other => Err(anyhow!(
+            "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
+        )),
     }
 }
 
