@@ -62,6 +62,7 @@ struct RoutineSessionTarget {
 #[derive(Debug, Clone)]
 struct RoutineSessionRow {
     session_key: Option<String>,
+    thread_channel_id: Option<String>,
 }
 
 impl RoutineSessionController {
@@ -179,17 +180,32 @@ impl RoutineSessionController {
                 .ok_or_else(|| {
                     anyhow!("agent {agent_id} primary channel is invalid: {primary_channel}")
                 })?;
-        let channel = ChannelId::new(channel_id);
+        let routine_thread_channel_id = routine
+            .discord_thread_id
+            .as_deref()
+            .and_then(parse_discord_channel_id);
 
         let session = self
-            .load_latest_session(&agent_id, &provider, channel_id)
+            .load_latest_session(&agent_id, &provider, channel_id, routine_thread_channel_id)
             .await?;
+        let session_thread_channel_id = session
+            .as_ref()
+            .and_then(|row| row.thread_channel_id.as_deref())
+            .and_then(parse_discord_channel_id);
+        let target_channel_id = target_channel_id(
+            channel_id,
+            routine_thread_channel_id,
+            session_thread_channel_id,
+        );
+        let channel = ChannelId::new(target_channel_id);
+        let fallback_channel_name =
+            fallback_tmux_channel_name(&primary_channel, channel_id, target_channel_id);
         let session_key = session.and_then(|row| row.session_key);
         let tmux_session = session_key
             .as_deref()
             .and_then(tmux_name_from_session_key)
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| provider.build_tmux_session_name(&primary_channel));
+            .unwrap_or_else(|| provider.build_tmux_session_name(&fallback_channel_name));
 
         Ok(RoutineSessionTarget {
             agent_id,
@@ -204,18 +220,29 @@ impl RoutineSessionController {
         &self,
         agent_id: &str,
         provider: &ProviderKind,
-        channel_id: u64,
+        primary_channel_id: u64,
+        routine_thread_channel_id: Option<u64>,
     ) -> Result<Option<RoutineSessionRow>> {
+        let primary_channel_id = primary_channel_id.to_string();
+        let routine_thread_channel_id = routine_thread_channel_id.map(|value| value.to_string());
         let row = sqlx::query(
             r#"
-            SELECT session_key
+            SELECT session_key, thread_channel_id
             FROM sessions
             WHERE agent_id = $1
               AND LOWER(COALESCE(provider, '')) = LOWER($2)
               AND status IN ('working', 'idle', 'connected')
-              AND (thread_channel_id = $3 OR thread_channel_id IS NULL)
+              AND (
+                thread_channel_id = $3
+                OR ($4::text IS NOT NULL AND thread_channel_id = $4)
+                OR thread_channel_id IS NULL
+              )
             ORDER BY
-              CASE WHEN thread_channel_id = $3 THEN 0 ELSE 1 END,
+              CASE
+                WHEN $4::text IS NOT NULL AND thread_channel_id = $4 THEN 0
+                WHEN thread_channel_id = $3 THEN 1
+                ELSE 2
+              END,
               CASE status WHEN 'working' THEN 0 WHEN 'idle' THEN 1 WHEN 'connected' THEN 2 ELSE 3 END,
               last_heartbeat DESC NULLS LAST,
               created_at DESC
@@ -224,7 +251,8 @@ impl RoutineSessionController {
         )
         .bind(agent_id)
         .bind(provider.as_str())
-        .bind(channel_id.to_string())
+        .bind(primary_channel_id)
+        .bind(routine_thread_channel_id)
         .fetch_optional(&*self.pool)
         .await
         .map_err(|error| anyhow!("load routine session for {agent_id}: {error}"))?;
@@ -234,6 +262,9 @@ impl RoutineSessionController {
                 session_key: row
                     .try_get("session_key")
                     .map_err(|error| anyhow!("decode routine session_key: {error}"))?,
+                thread_channel_id: row
+                    .try_get("thread_channel_id")
+                    .map_err(|error| anyhow!("decode routine thread_channel_id: {error}"))?,
             })
         })
         .transpose()
@@ -292,6 +323,32 @@ fn tmux_name_from_session_key(session_key: &str) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn parse_discord_channel_id(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+fn target_channel_id(
+    primary_channel_id: u64,
+    routine_thread_channel_id: Option<u64>,
+    session_thread_channel_id: Option<u64>,
+) -> u64 {
+    session_thread_channel_id
+        .or(routine_thread_channel_id)
+        .unwrap_or(primary_channel_id)
+}
+
+fn fallback_tmux_channel_name(
+    primary_channel: &str,
+    primary_channel_id: u64,
+    target_channel_id: u64,
+) -> String {
+    if target_channel_id == primary_channel_id {
+        primary_channel.to_string()
+    } else {
+        format!("{primary_channel}-t{target_channel_id}")
+    }
+}
+
 pub fn provider_clear_behavior(provider: &ProviderKind) -> &'static str {
     if *provider == ProviderKind::Claude {
         "runtime clear plus /clear in the existing Claude tmux session"
@@ -321,5 +378,24 @@ mod tests {
         assert!(provider_clear_behavior(&ProviderKind::Claude).contains("/clear"));
         assert!(provider_clear_behavior(&ProviderKind::Codex).contains("managed process"));
         assert!(provider_clear_behavior(&ProviderKind::Gemini).contains("mailbox clear only"));
+    }
+
+    #[test]
+    fn target_channel_prefers_session_thread_then_routine_thread_then_primary() {
+        assert_eq!(target_channel_id(100, Some(200), Some(300)), 300);
+        assert_eq!(target_channel_id(100, Some(200), None), 200);
+        assert_eq!(target_channel_id(100, None, None), 100);
+    }
+
+    #[test]
+    fn fallback_tmux_channel_name_preserves_thread_suffix() {
+        assert_eq!(
+            fallback_tmux_channel_name("agent-cdx", 100, 100),
+            "agent-cdx"
+        );
+        assert_eq!(
+            fallback_tmux_channel_name("agent-cdx", 100, 200),
+            "agent-cdx-t200"
+        );
     }
 }
