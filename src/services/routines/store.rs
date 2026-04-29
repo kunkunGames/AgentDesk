@@ -202,7 +202,7 @@ impl RoutineStore {
         .map_err(|e| anyhow!("seed routine schedules: select routines: {e}"))?;
 
         for (routine_id, schedule) in scheduled {
-            let next_due_at = match next_due_from_schedule(&schedule) {
+            let next_due_at = match Self::next_due_from_schedule_tx(tx, &schedule).await {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(
@@ -458,10 +458,12 @@ impl RoutineStore {
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
         validate_execution_strategy(&new_routine.execution_strategy)?;
         let schedule = normalize_schedule(new_routine.schedule)?;
-        let next_due_at = match (new_routine.next_due_at, schedule.as_deref()) {
-            (Some(value), _) => Some(value),
-            (None, Some(schedule)) => Some(next_due_from_schedule(schedule)?),
-            (None, None) => None,
+        let next_due_at = if let Some(value) = new_routine.next_due_at {
+            Some(value)
+        } else if let Some(schedule) = schedule.as_deref() {
+            Some(self.next_due_from_schedule(schedule).await?)
+        } else {
+            None
         };
         let id = Uuid::new_v4().to_string();
         sqlx::query_as(
@@ -506,11 +508,14 @@ impl RoutineStore {
         let mut next_due_at = patch.next_due_at.flatten();
         let mut update_next_due_at = next_due_was_set;
         if schedule_was_set && schedule.is_some() && !next_due_was_set {
-            next_due_at = Some(next_due_from_schedule(
-                schedule
-                    .as_deref()
-                    .expect("checked schedule is present after is_some"),
-            )?);
+            next_due_at = Some(
+                self.next_due_from_schedule(
+                    schedule
+                        .as_deref()
+                        .expect("checked schedule is present after is_some"),
+                )
+                .await?,
+            );
             update_next_due_at = true;
         }
         if schedule_was_set && schedule.is_none() && !next_due_was_set {
@@ -1015,6 +1020,35 @@ impl RoutineStore {
         Ok(count)
     }
 
+    async fn next_due_from_schedule(&self, schedule: &str) -> Result<DateTime<Utc>> {
+        let seconds = parse_schedule_interval(schedule)?.num_seconds();
+        sqlx::query_scalar(
+            r#"
+            SELECT NOW() + ($1::bigint * INTERVAL '1 second')
+            "#,
+        )
+        .bind(seconds)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("compute routine next due from schedule: {e}"))
+    }
+
+    async fn next_due_from_schedule_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        schedule: &str,
+    ) -> Result<DateTime<Utc>> {
+        let seconds = parse_schedule_interval(schedule)?.num_seconds();
+        sqlx::query_scalar(
+            r#"
+            SELECT NOW() + ($1::bigint * INTERVAL '1 second')
+            "#,
+        )
+        .bind(seconds)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| anyhow!("compute routine next due from schedule in tx: {e}"))
+    }
+
     async fn insert_running_run(
         tx: &mut Transaction<'_, Postgres>,
         candidate: RoutineClaimCandidate,
@@ -1080,7 +1114,7 @@ impl RoutineStore {
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.id = $1
               AND rr.status = 'running'
-            FOR UPDATE OF rr
+            FOR UPDATE OF rr, r
             "#,
         )
         .bind(run_id)
@@ -1094,11 +1128,10 @@ impl RoutineStore {
         };
         let scheduled_next_due_at = if close.next_due_at.should_update() {
             close.next_due_at.value()
+        } else if let Some(schedule) = schedule.as_deref() {
+            Some(Self::next_due_from_schedule_tx(&mut tx, schedule).await?)
         } else {
-            schedule
-                .as_deref()
-                .map(next_due_from_schedule)
-                .transpose()?
+            None
         };
         let should_update_next_due_at =
             close.next_due_at.should_update() || scheduled_next_due_at.is_some();
@@ -1185,10 +1218,6 @@ fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
             Ok(schedule)
         })
         .transpose()
-}
-
-fn next_due_from_schedule(schedule: &str) -> Result<DateTime<Utc>> {
-    Ok(Utc::now() + parse_schedule_interval(schedule)?)
 }
 
 fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
