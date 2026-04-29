@@ -256,14 +256,12 @@ else
     echo "▸ [gate] Zero create-pr dispatches inflight on release — proceeding."
 fi
 
-if ! DASHBOARD_SOURCE=$(_resolve_dashboard_source); then
-    echo "✗ Dashboard dist not found in workspace — aborting deploy"
-    echo "  looked for:"
-    echo "    - $REPO/dashboard/dist/index.html"
-    echo "  Run 'cd $REPO/dashboard && npm run build' to generate it"
-    exit 1
+if DASHBOARD_SOURCE=$(_resolve_dashboard_source); then
+    echo "▸ Dashboard source: $DASHBOARD_SOURCE"
+else
+    echo "▸ Dashboard source missing — will build before staging"
+    echo "  looked for: $REPO/dashboard/dist/index.html"
 fi
-echo "▸ Dashboard source: $DASHBOARD_SOURCE"
 if [ ! -d "$REPO/skills" ]; then
     echo "✗ Managed skills not found in workspace — aborting deploy"
     echo "  expected: $REPO/skills"
@@ -310,6 +308,9 @@ SOURCE_BINARY="${AGENTDESK_DEPLOY_BINARY:-$REPO/target/release/agentdesk}"
 if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     echo "▸ Building release binary..."
     (cd "$REPO" && cargo build --release --bin agentdesk)
+    # The freshness gate below is mtime-based. A successful current-HEAD cargo
+    # build can still reuse an existing artifact, so align the mtime after build.
+    [ -e "$SOURCE_BINARY" ] && touch "$SOURCE_BINARY"
 fi
 
 # Rebuild dashboard so deploy never ships a stale dist.
