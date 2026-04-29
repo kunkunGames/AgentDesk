@@ -3235,6 +3235,11 @@ async fn dm_reply_retry_loop(pg_pool: Arc<PgPool>) {
 
 async fn routine_runtime_loop(pg_pool: Arc<PgPool>, tick_interval_secs: u64) {
     use crate::services::routines::RoutineStore;
+    if tick_interval_secs == 0 {
+        tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
+        return;
+    }
+
     let store = RoutineStore::new(pg_pool);
     match store.recover_stale_running_runs().await {
         Ok(n) if n > 0 => tracing::info!(

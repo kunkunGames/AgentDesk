@@ -482,6 +482,15 @@ impl SupervisedWorkerRegistry {
                     self.log_skip(spec, "routines.enabled=false");
                     return Ok(None);
                 }
+                let Some(tick_secs) =
+                    valid_routine_tick_interval_secs(self.config.routines.tick_interval_secs)
+                else {
+                    self.log_skip(
+                        spec,
+                        "routines.tick_interval_secs must be greater than zero",
+                    );
+                    return Ok(None);
+                };
                 let Some(routine_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(
                         spec,
@@ -489,7 +498,6 @@ impl SupervisedWorkerRegistry {
                     );
                     return Ok(None);
                 };
-                let tick_secs = self.config.routines.tick_interval_secs;
                 self.register_tokio(spec, async move {
                     super::routine_runtime_loop(routine_pg_pool, tick_secs).await;
                 });
@@ -555,9 +563,16 @@ impl SupervisedWorkerRegistry {
     }
 }
 
+fn valid_routine_tick_interval_secs(value: u64) -> Option<u64> {
+    (value > 0).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage};
+    use super::{
+        BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage,
+        valid_routine_tick_interval_secs,
+    };
 
     #[test]
     fn boot_steps_are_explicit_and_ordered() {
@@ -612,5 +627,12 @@ mod tests {
                 .all(|spec| !spec.health_owner.is_empty())
         );
         assert!(WORKER_SPECS.iter().all(|spec| !spec.notes.is_empty()));
+    }
+
+    #[test]
+    fn routine_tick_interval_rejects_zero() {
+        assert_eq!(valid_routine_tick_interval_secs(0), None);
+        assert_eq!(valid_routine_tick_interval_secs(1), Some(1));
+        assert_eq!(valid_routine_tick_interval_secs(30), Some(30));
     }
 }
