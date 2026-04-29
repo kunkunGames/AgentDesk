@@ -386,6 +386,115 @@ health_turn_snapshot() {
   echo "${active:-0} ${finalizing:-0} ${queue_depth:-0}"
 }
 
+assert_restart_helpers_loaded() {
+  # Preflight contract for scripts that source _defaults.sh expecting the
+  # restart-drain helpers. Returns non-zero (so callers can `if !` and exit 1)
+  # instead of letting a missing function silently `command not found`. See
+  # #1447: silent fail of agentdesk-restart when these helpers were absent.
+  local missing=()
+  local fn
+  for fn in \
+    request_restart_drain_mode_or_fail \
+    wait_for_live_turns_to_drain_or_fail \
+    clear_restart_drain_mode; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      missing+=("$fn")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "✗ [gate] required restart helper(s) missing from _defaults.sh: ${missing[*]}" >&2
+    echo "  Refusing restart to avoid bypassing live-turn drain protection (#1447)." >&2
+    return 1
+  fi
+  return 0
+}
+
+clear_restart_drain_mode() {
+  local runtime_root="$1"
+  if [ -z "$runtime_root" ]; then
+    echo "✗ [gate] runtime root is required to clear restart drain mode" >&2
+    return 1
+  fi
+  rm -f "$runtime_root/restart_pending"
+}
+
+_restart_pending_acknowledged() {
+  local port="$1"
+  local detail_json
+  detail_json=$(curl -sf --max-time 3 "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null) || return 1
+
+  if _health_json_has_jq; then
+    printf '%s\n' "$detail_json" | jq -e '
+      (.providers // [])
+      | map(select(.restart_pending == true))
+      | length > 0
+    ' >/dev/null 2>&1
+    return $?
+  fi
+
+  printf '%s' "$detail_json" | grep -q '"restart_pending":true'
+}
+
+request_restart_drain_mode_or_fail() {
+  local scope="$1"
+  local label="$2"
+  local port="$3"
+  local runtime_root="$4"
+  local source="${5:-agentdesk-restart}"
+  local ack_wait="${AGENTDESK_RESTART_DRAIN_ACK_WAIT:-20}"
+  local waited=0
+  local marker
+  local tmp_marker
+  local job_state
+
+  if [ -z "$runtime_root" ]; then
+    echo "✗ [gate] ${scope} runtime root is required for restart drain mode" >&2
+    return 1
+  fi
+
+  mkdir -p "$runtime_root" || {
+    echo "✗ [gate] failed to create ${scope} runtime root: $runtime_root" >&2
+    return 1
+  }
+
+  marker="$runtime_root/restart_pending"
+  tmp_marker="${marker}.$$"
+  {
+    printf 'source=%s\n' "$source"
+    printf 'scope=%s\n' "$scope"
+    printf 'label=%s\n' "$label"
+    date -u '+requested_at=%Y-%m-%dT%H:%M:%SZ'
+  } >"$tmp_marker" || {
+    echo "✗ [gate] failed to write restart drain marker: $tmp_marker" >&2
+    return 1
+  }
+  mv "$tmp_marker" "$marker" || {
+    rm -f "$tmp_marker"
+    echo "✗ [gate] failed to publish restart drain marker: $marker" >&2
+    return 1
+  }
+
+  while [ "$waited" -lt "$ack_wait" ]; do
+    if _restart_pending_acknowledged "$port"; then
+      echo "✓ [gate] ${scope} restart drain mode acknowledged by runtime"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  job_state=$(_launchd_job_state "$label")
+  if [ "$job_state" = "not running" ]; then
+    echo "▸ [gate] ${scope} launchd job is not running; restart drain marker staged for next boot"
+    return 0
+  fi
+
+  echo "✗ [gate] ${scope} restart drain mode was not acknowledged within ${ack_wait}s" >&2
+  echo "  Refusing restart to avoid bypassing live-turn drain protection." >&2
+  clear_restart_drain_mode "$runtime_root" || true
+  return 1
+}
+
 wait_for_live_turns_to_drain_or_fail() {
   local scope="$1"
   local label="$2"
