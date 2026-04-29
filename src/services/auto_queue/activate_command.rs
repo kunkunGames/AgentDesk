@@ -1,3 +1,5 @@
+use super::*;
+
 pub(crate) async fn activate_with_deps_pg(
     deps: &AutoQueueActivateDeps,
     body: ActivateBody,
@@ -992,4 +994,3 @@ pub(crate) async fn activate_with_deps_pg(
         })),
     )
 }
-

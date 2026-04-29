@@ -1,3 +1,5 @@
+use super::*;
+
 /// GET /api/auto-queue/status
 pub async fn status(
     State(state): State<AppState>,
@@ -111,7 +113,7 @@ pub async fn history(
 }
 
 /// PATCH /api/auto-queue/entries/{id}
-async fn update_entry_with_pg(
+pub(super) async fn update_entry_with_pg(
     state: &AppState,
     id: &str,
     body: &UpdateEntryBody,
@@ -343,7 +345,7 @@ pub async fn update_entry(
 }
 
 /// POST /api/auto-queue/runs/{id}/entries
-async fn add_run_entry_with_pg(
+pub(super) async fn add_run_entry_with_pg(
     state: &AppState,
     run_id: &str,
     body: &AddRunEntryBody,
@@ -559,7 +561,7 @@ pub async fn add_run_entry(
 }
 
 /// POST /api/auto-queue/runs/{id}/restore
-async fn restore_run_with_pg(
+pub(super) async fn restore_run_with_pg(
     state: &AppState,
     run_id: &str,
     pool: &sqlx::PgPool,
@@ -698,4 +700,3 @@ pub async fn restore_run(
     };
     restore_run_with_pg(&state, &run_id, &pg_pool).await
 }
-

@@ -208,6 +208,7 @@ src/
 │   │   ├── cancel_run.rs
 │   │   ├── command.rs
 │   │   ├── control_routes.rs
+│   │   ├── dispatch_assignment_command.rs
 │   │   ├── dispatch_command.rs
 │   │   ├── dispatch_query.rs
 │   │   ├── fsm.rs
@@ -222,7 +223,7 @@ src/
 │   │   ├── runtime.rs
 │   │   ├── slot_routes.rs
 │   │   ├── view.rs
-│   │   └── view_routes.rs
+│   │   └── view_admin_routes.rs
 │   ├── discord/
 │   │   ├── commands/
 │   │   │   ├── command_policy.rs

@@ -1,4 +1,6 @@
-fn attempt_restore_dispatch(
+use super::*;
+
+pub(super) fn attempt_restore_dispatch(
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     candidate: &RestoreDispatchCandidate,
@@ -214,7 +216,7 @@ fn attempt_restore_dispatch(
     }
 }
 
-async fn load_restore_entries_pg(
+pub(super) async fn load_restore_entries_pg(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: &str,
 ) -> Result<Vec<RestoreEntryRecord>, String> {
@@ -250,7 +252,7 @@ async fn load_restore_entries_pg(
         .collect()
 }
 
-async fn decide_restore_transition_pg(
+pub(super) async fn decide_restore_transition_pg(
     pool: &sqlx::PgPool,
     entry: &RestoreEntryRecord,
 ) -> Result<RestoreEntryDecision, String> {
@@ -293,7 +295,7 @@ async fn decide_restore_transition_pg(
     })
 }
 
-async fn apply_restore_state_changes_pg(
+pub(super) async fn apply_restore_state_changes_pg(
     pool: &sqlx::PgPool,
     run_id: &str,
     run_status: Option<&str>,
@@ -408,7 +410,10 @@ async fn apply_restore_state_changes_pg(
     Ok((counts, dispatch_candidates))
 }
 
-async fn finalize_restore_run_pg(pool: &sqlx::PgPool, run_id: &str) -> Result<(), String> {
+pub(super) async fn finalize_restore_run_pg(
+    pool: &sqlx::PgPool,
+    run_id: &str,
+) -> Result<(), String> {
     let finalized = sqlx::query(
         "UPDATE auto_queue_runs
          SET status = 'active',
@@ -448,15 +453,15 @@ async fn finalize_restore_run_pg(pool: &sqlx::PgPool, run_id: &str) -> Result<()
 
 #[derive(Clone)]
 pub(crate) struct AutoQueueActivateDeps {
-    pg_pool: Option<sqlx::PgPool>,
-    engine: crate::engine::PolicyEngine,
-    config: Arc<crate::config::Config>,
-    health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
-    guild_id: Option<String>,
+    pub(super) pg_pool: Option<sqlx::PgPool>,
+    pub(super) engine: crate::engine::PolicyEngine,
+    pub(super) config: Arc<crate::config::Config>,
+    pub(super) health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
+    pub(super) guild_id: Option<String>,
 }
 
 impl AutoQueueActivateDeps {
-    fn from_state(state: &AppState) -> Self {
+    pub(super) fn from_state(state: &AppState) -> Self {
         Self {
             pg_pool: state.pg_pool.clone(),
             engine: state.engine.clone(),
@@ -476,24 +481,28 @@ impl AutoQueueActivateDeps {
         }
     }
 
-    fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
+    pub(super) fn auto_queue_service(&self) -> crate::services::auto_queue::AutoQueueService {
         crate::services::auto_queue::AutoQueueService::new(self.engine.clone())
     }
 
-    fn entry_json(&self, entry_id: &str) -> serde_json::Value {
+    pub(super) fn entry_json(&self, entry_id: &str) -> serde_json::Value {
         self.auto_queue_service()
             .entry_json(entry_id, self.guild_id.as_deref())
             .unwrap_or(serde_json::Value::Null)
     }
 
-    async fn entry_json_pg(&self, pool: &sqlx::PgPool, entry_id: &str) -> serde_json::Value {
+    pub(super) async fn entry_json_pg(
+        &self,
+        pool: &sqlx::PgPool,
+        entry_id: &str,
+    ) -> serde_json::Value {
         self.auto_queue_service()
             .entry_json_with_pg(pool, entry_id, self.guild_id.as_deref())
             .await
             .unwrap_or(serde_json::Value::Null)
     }
 
-    fn entry_json_prefer_pg(&self, entry_id: &str) -> serde_json::Value {
+    pub(super) fn entry_json_prefer_pg(&self, entry_id: &str) -> serde_json::Value {
         if let Some(pool) = self.pg_pool.as_ref() {
             let entry_id = entry_id.to_string();
             let guild_id = self.guild_id.clone();
@@ -516,7 +525,7 @@ impl AutoQueueActivateDeps {
     }
 }
 
-fn load_activate_card_state_prefer_pg(
+pub(super) fn load_activate_card_state_prefer_pg(
     deps: &AutoQueueActivateDeps,
     card_id: &str,
     entry_id: &str,
@@ -537,7 +546,7 @@ fn load_activate_card_state_prefer_pg(
     Err("postgres backend required for auto-queue activation".to_string())
 }
 
-fn update_entry_status_prefer_pg(
+pub(super) fn update_entry_status_prefer_pg(
     deps: &AutoQueueActivateDeps,
     entry_id: &str,
     new_status: &str,
@@ -569,7 +578,7 @@ fn update_entry_status_prefer_pg(
     )
 }
 
-fn allocate_slot_for_group_agent_prefer_pg(
+pub(super) fn allocate_slot_for_group_agent_prefer_pg(
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     thread_group: i64,
@@ -597,7 +606,7 @@ fn allocate_slot_for_group_agent_prefer_pg(
     )
 }
 
-fn slot_requires_thread_reset_before_reuse_prefer_pg(
+pub(super) fn slot_requires_thread_reset_before_reuse_prefer_pg(
     deps: &AutoQueueActivateDeps,
     agent_id: &str,
     slot_index: i64,
@@ -631,7 +640,7 @@ fn slot_requires_thread_reset_before_reuse_prefer_pg(
     Err("postgres backend required for auto-queue slot reset".to_string())
 }
 
-async fn select_consultation_counterpart_pg(
+pub(super) async fn select_consultation_counterpart_pg(
     pool: &sqlx::PgPool,
     agent_id: &str,
 ) -> Result<String, String> {
@@ -688,7 +697,7 @@ async fn select_consultation_counterpart_pg(
         .unwrap_or_else(|| agent_id.to_string()))
 }
 
-fn select_consultation_counterpart_prefer_pg(
+pub(super) fn select_consultation_counterpart_prefer_pg(
     deps: &AutoQueueActivateDeps,
     agent_id: &str,
 ) -> Result<String, String> {
@@ -707,7 +716,7 @@ fn select_consultation_counterpart_prefer_pg(
     )
 }
 
-fn record_consultation_dispatch_prefer_pg(
+pub(super) fn record_consultation_dispatch_prefer_pg(
     deps: &AutoQueueActivateDeps,
     entry_id: &str,
     card_id: &str,
@@ -742,7 +751,7 @@ fn record_consultation_dispatch_prefer_pg(
     )
 }
 
-fn create_activate_dispatch_prefer_pg(
+pub(super) fn create_activate_dispatch_prefer_pg(
     deps: &AutoQueueActivateDeps,
     card_id: &str,
     to_agent_id: &str,
@@ -798,14 +807,14 @@ pub(crate) async fn activate_with_bridge_pg(
     activate_with_deps_pg(&deps, body).await
 }
 
-enum ActivatePreflightOutcome {
+pub(super) enum ActivatePreflightOutcome {
     Continue,
     Dispatched(serde_json::Value),
     Skipped,
     Deferred,
 }
 
-fn run_activate_blocking<T, F>(operation: F) -> T
+pub(super) fn run_activate_blocking<T, F>(operation: F) -> T
 where
     F: FnOnce() -> T,
 {
@@ -816,11 +825,14 @@ where
     }
 }
 
-fn clamp_retry_limit(value: u64) -> i64 {
+pub(super) fn clamp_retry_limit(value: u64) -> i64 {
     value.max(1).min(i64::MAX as u64) as i64
 }
 
-fn load_kv_meta_value_pg(pool: &sqlx::PgPool, key: &str) -> Result<Option<String>, String> {
+pub(super) fn load_kv_meta_value_pg(
+    pool: &sqlx::PgPool,
+    key: &str,
+) -> Result<Option<String>, String> {
     let key_text = key.to_string();
     crate::utils::async_bridge::block_on_pg_result(
         pool,

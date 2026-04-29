@@ -1,3 +1,5 @@
+use super::*;
+
 /// POST /api/auto-queue/generate
 /// Creates a queue run from ready cards, ordered by priority.
 pub async fn generate(
@@ -426,4 +428,3 @@ pub async fn generate(
         Json(json!({ "run": run, "entries": entries })),
     )
 }
-

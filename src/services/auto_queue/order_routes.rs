@@ -1,3 +1,5 @@
+use super::*;
+
 // ── Authenticated order submission callback ─────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -11,7 +13,7 @@ pub struct OrderBody {
 
 /// POST /api/auto-queue/runs/:id/order
 /// Authenticated callback: provides the ordered card list for a pending run.
-async fn resolve_submit_order_card_with_pg(
+pub(super) async fn resolve_submit_order_card_with_pg(
     pool: &sqlx::PgPool,
     run_repo: Option<&str>,
     item: &serde_json::Value,
@@ -76,7 +78,7 @@ async fn resolve_submit_order_card_with_pg(
     }))
 }
 
-async fn submit_order_with_pg(
+pub(super) async fn submit_order_with_pg(
     state: &AppState,
     run_id: &str,
     headers: &HeaderMap,

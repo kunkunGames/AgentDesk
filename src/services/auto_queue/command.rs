@@ -1,11 +1,13 @@
+use super::*;
+
 #[derive(Debug, Default)]
-struct SlotCleanupResult {
+pub(super) struct SlotCleanupResult {
     released_slots: usize,
     cleared_slot_sessions: usize,
     warnings: Vec<String>,
 }
 
-async fn load_run_ids_with_status_pg(
+pub(super) async fn load_run_ids_with_status_pg(
     pool: &sqlx::PgPool,
     statuses: &[&str],
 ) -> Result<Vec<String>, String> {
@@ -27,7 +29,7 @@ async fn load_run_ids_with_status_pg(
         .map_err(|error| format!("load postgres auto_queue_runs by status: {error}"))
 }
 
-async fn load_slot_bindings_for_runs_pg(
+pub(super) async fn load_slot_bindings_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
 ) -> Result<Vec<(String, String, i64)>, String> {
@@ -66,7 +68,7 @@ async fn load_slot_bindings_for_runs_pg(
         .collect()
 }
 
-async fn load_live_dispatch_ids_for_runs_pg(
+pub(super) async fn load_live_dispatch_ids_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
 ) -> Result<Vec<String>, String> {
@@ -111,7 +113,7 @@ async fn load_live_dispatch_ids_for_runs_pg(
     })
 }
 
-async fn load_dispatched_card_ids_for_runs_pg(
+pub(super) async fn load_dispatched_card_ids_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
 ) -> Result<Vec<String>, String> {
@@ -139,7 +141,7 @@ async fn load_dispatched_card_ids_for_runs_pg(
     })
 }
 
-async fn delete_phase_gate_rows_for_runs_pg(
+pub(super) async fn delete_phase_gate_rows_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
 ) -> Result<usize, String> {
@@ -163,7 +165,7 @@ async fn delete_phase_gate_rows_for_runs_pg(
         .map_err(|error| format!("delete postgres auto_queue_phase_gates: {error}"))
 }
 
-async fn count_live_dispatches_for_runs_pg(
+pub(super) async fn count_live_dispatches_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
 ) -> Result<i64, String> {
@@ -172,7 +174,7 @@ async fn count_live_dispatches_for_runs_pg(
         .map(|rows| rows.len() as i64)
 }
 
-async fn cancel_live_dispatches_for_runs_pg(
+pub(super) async fn cancel_live_dispatches_for_runs_pg(
     pool: &sqlx::PgPool,
     run_ids: &[String],
     reason: &str,
@@ -190,7 +192,7 @@ async fn cancel_live_dispatches_for_runs_pg(
     Ok(cancelled)
 }
 
-async fn clear_sessions_for_dispatches_pg(
+pub(super) async fn clear_sessions_for_dispatches_pg(
     pool: &sqlx::PgPool,
     dispatch_ids: &[String],
 ) -> Result<usize, String> {
@@ -219,7 +221,7 @@ async fn clear_sessions_for_dispatches_pg(
     Ok(cleared_sessions)
 }
 
-async fn transition_entry_to_skipped_pg(
+pub(super) async fn transition_entry_to_skipped_pg(
     pool: &sqlx::PgPool,
     entry_id: &str,
     trigger_source: &str,
@@ -294,7 +296,7 @@ async fn transition_entry_to_skipped_pg(
     Ok(true)
 }
 
-async fn clear_and_release_slots_for_runs_pg(
+pub(super) async fn clear_and_release_slots_for_runs_pg(
     health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
     pool: &sqlx::PgPool,
     run_ids: &[String],
@@ -386,7 +388,7 @@ async fn clear_and_release_slots_for_runs_pg(
     }
 }
 
-async fn cancel_selected_runs_with_pg(
+pub(super) async fn cancel_selected_runs_with_pg(
     health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
     pool: &sqlx::PgPool,
     target_run_ids: &[String],
@@ -401,7 +403,7 @@ async fn cancel_selected_runs_with_pg(
     .await
 }
 
-async fn reset_scoped_with_pg(
+pub(super) async fn reset_scoped_with_pg(
     agent_id: &str,
     pool: &sqlx::PgPool,
 ) -> Result<serde_json::Value, String> {
@@ -431,7 +433,7 @@ async fn reset_scoped_with_pg(
     }))
 }
 
-async fn reset_global_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, String> {
+pub(super) async fn reset_global_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, String> {
     let protected_active_runs = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT FROM auto_queue_runs WHERE status = 'active'",
     )
@@ -514,7 +516,7 @@ async fn reset_global_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, 
     Ok(response)
 }
 
-fn parse_json_body<T: DeserializeOwned>(body: Bytes, label: &str) -> Result<T, String> {
+pub(super) fn parse_json_body<T: DeserializeOwned>(body: Bytes, label: &str) -> Result<T, String> {
     if body.is_empty() {
         serde_json::from_slice(b"{}").map_err(|error| format!("invalid {label} body: {error}"))
     } else {
@@ -522,7 +524,7 @@ fn parse_json_body<T: DeserializeOwned>(body: Bytes, label: &str) -> Result<T, S
     }
 }
 
-async fn update_run_with_pg(
+pub(super) async fn update_run_with_pg(
     run_id: &str,
     body: &UpdateRunBody,
     pool: &sqlx::PgPool,
@@ -599,7 +601,7 @@ async fn update_run_with_pg(
     Ok(changed)
 }
 
-async fn reorder_with_pg(body: &ReorderBody, pool: &sqlx::PgPool) -> Result<(), String> {
+pub(super) async fn reorder_with_pg(body: &ReorderBody, pool: &sqlx::PgPool) -> Result<(), String> {
     let mut run_id = None;
     for id in &body.ordered_ids {
         let found = sqlx::query_scalar::<_, String>(
@@ -676,7 +678,7 @@ async fn reorder_with_pg(body: &ReorderBody, pool: &sqlx::PgPool) -> Result<(), 
     Ok(())
 }
 
-async fn soft_pause_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, String> {
+pub(super) async fn soft_pause_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, String> {
     let paused = sqlx::query(
         "UPDATE auto_queue_runs
          SET status = 'paused',
@@ -697,7 +699,7 @@ async fn soft_pause_with_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, St
     }))
 }
 
-async fn force_pause_with_pg(
+pub(super) async fn force_pause_with_pg(
     health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
     pool: &sqlx::PgPool,
 ) -> Result<serde_json::Value, String> {
@@ -751,10 +753,9 @@ async fn force_pause_with_pg(
     Ok(response)
 }
 
-async fn cancel_with_pg(
+pub(super) async fn cancel_with_pg(
     health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
     pool: &sqlx::PgPool,
 ) -> Result<serde_json::Value, String> {
     crate::services::auto_queue::cancel_run::cancel_with_pg(health_registry, pool).await
 }
-

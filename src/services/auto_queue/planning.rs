@@ -1,4 +1,6 @@
-fn effective_max_entry_retries(deps: &AutoQueueActivateDeps) -> i64 {
+use super::*;
+
+pub(super) fn effective_max_entry_retries(deps: &AutoQueueActivateDeps) -> i64 {
     let from_pg = deps.pg_pool.as_ref().and_then(|pool| {
         match load_kv_meta_value_pg(pool, "runtime-config") {
             Ok(raw) => raw
@@ -20,7 +22,7 @@ fn effective_max_entry_retries(deps: &AutoQueueActivateDeps) -> i64 {
     clamp_retry_limit(from_pg.unwrap_or(fallback))
 }
 
-fn normalize_human_alert_target(channel: String) -> Option<String> {
+pub(super) fn normalize_human_alert_target(channel: String) -> Option<String> {
     let channel = channel.trim();
     if channel.is_empty() {
         return None;
@@ -32,7 +34,7 @@ fn normalize_human_alert_target(channel: String) -> Option<String> {
     })
 }
 
-fn human_alert_target(deps: &AutoQueueActivateDeps) -> Option<String> {
+pub(super) fn human_alert_target(deps: &AutoQueueActivateDeps) -> Option<String> {
     let pool = deps.pg_pool.as_ref()?;
     let from_pg = match load_kv_meta_value_pg(pool, "kanban_human_alert_channel_id") {
         Ok(value) => value,
@@ -49,7 +51,7 @@ fn human_alert_target(deps: &AutoQueueActivateDeps) -> Option<String> {
         .and_then(normalize_human_alert_target)
 }
 
-fn compact_failure_summary(message: &str) -> String {
+pub(super) fn compact_failure_summary(message: &str) -> String {
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = normalized.chars();
     let truncated: String = chars.by_ref().take(180).collect();
@@ -60,7 +62,7 @@ fn compact_failure_summary(message: &str) -> String {
     }
 }
 
-fn queue_failed_entry_escalation(
+pub(super) fn queue_failed_entry_escalation(
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     entry_id: &str,
@@ -113,7 +115,7 @@ fn queue_failed_entry_escalation(
     )
 }
 
-fn record_entry_dispatch_failure(
+pub(super) fn record_entry_dispatch_failure(
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     entry_id: &str,
@@ -213,7 +215,7 @@ fn record_entry_dispatch_failure(
     Ok(result)
 }
 
-fn handle_activate_preflight_metadata(
+pub(super) fn handle_activate_preflight_metadata(
     deps: &AutoQueueActivateDeps,
     run_id: &str,
     entry_id: &str,
@@ -388,7 +390,7 @@ fn handle_activate_preflight_metadata(
     }
 }
 
-fn normalize_generate_entries(
+pub(super) fn normalize_generate_entries(
     body: &GenerateBody,
 ) -> Result<Option<Vec<RequestedGenerateEntry>>, String> {
     if body
@@ -430,7 +432,9 @@ fn normalize_generate_entries(
     Ok(Some(normalized))
 }
 
-fn normalize_auto_queue_review_mode(review_mode: Option<&str>) -> Result<&'static str, String> {
+pub(super) fn normalize_auto_queue_review_mode(
+    review_mode: Option<&str>,
+) -> Result<&'static str, String> {
     match review_mode.map(str::trim).filter(|value| !value.is_empty()) {
         None | Some(AUTO_QUEUE_REVIEW_MODE_ENABLED) => Ok(AUTO_QUEUE_REVIEW_MODE_ENABLED),
         Some(AUTO_QUEUE_REVIEW_MODE_DISABLED) => Ok(AUTO_QUEUE_REVIEW_MODE_DISABLED),
@@ -440,7 +444,9 @@ fn normalize_auto_queue_review_mode(review_mode: Option<&str>) -> Result<&'stati
     }
 }
 
-fn normalize_dispatch_entries(body: &DispatchBody) -> Result<Vec<GenerateEntryBody>, String> {
+pub(super) fn normalize_dispatch_entries(
+    body: &DispatchBody,
+) -> Result<Vec<GenerateEntryBody>, String> {
     if body.groups.is_empty() {
         return Err("groups must contain at least one issue group".to_string());
     }
@@ -491,4 +497,3 @@ fn normalize_dispatch_entries(body: &DispatchBody) -> Result<Vec<GenerateEntryBo
 
     Ok(entries)
 }
-

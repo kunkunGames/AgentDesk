@@ -1,41 +1,43 @@
+use super::*;
+
 #[derive(Debug, Serialize)]
-struct AutoQueueHistoryRun {
-    id: String,
-    repo: Option<String>,
-    agent_id: Option<String>,
-    status: String,
-    created_at: i64,
-    completed_at: Option<i64>,
-    duration_ms: i64,
-    entry_count: i64,
-    done_count: i64,
-    skipped_count: i64,
-    pending_count: i64,
-    dispatched_count: i64,
-    success_rate: f64,
-    failure_rate: f64,
+pub(super) struct AutoQueueHistoryRun {
+    pub(super) id: String,
+    pub(super) repo: Option<String>,
+    pub(super) agent_id: Option<String>,
+    pub(super) status: String,
+    pub(super) created_at: i64,
+    pub(super) completed_at: Option<i64>,
+    pub(super) duration_ms: i64,
+    pub(super) entry_count: i64,
+    pub(super) done_count: i64,
+    pub(super) skipped_count: i64,
+    pub(super) pending_count: i64,
+    pub(super) dispatched_count: i64,
+    pub(super) success_rate: f64,
+    pub(super) failure_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct AutoQueueHistorySummary {
-    total_runs: usize,
-    completed_runs: usize,
-    success_rate: f64,
-    failure_rate: f64,
+pub(super) struct AutoQueueHistorySummary {
+    pub(super) total_runs: usize,
+    pub(super) completed_runs: usize,
+    pub(super) success_rate: f64,
+    pub(super) failure_rate: f64,
 }
 
 #[derive(Debug, Clone)]
-struct GroupPlan {
-    entries: Vec<PlannedEntry>,
-    thread_group_count: i64,
-    recommended_parallel_threads: i64,
-    dependency_edges: usize,
-    similarity_edges: usize,
-    path_backed_card_count: usize,
+pub(super) struct GroupPlan {
+    pub(super) entries: Vec<PlannedEntry>,
+    pub(super) thread_group_count: i64,
+    pub(super) recommended_parallel_threads: i64,
+    pub(super) dependency_edges: usize,
+    pub(super) similarity_edges: usize,
+    pub(super) path_backed_card_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GroupKind {
+pub(super) enum GroupKind {
     Independent,
     Similarity,
     Dependency,
@@ -43,35 +45,35 @@ enum GroupKind {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RequestedGenerateEntry {
-    issue_number: i64,
-    batch_phase: i64,
-    thread_group: Option<i64>,
+pub(super) struct RequestedGenerateEntry {
+    pub(super) issue_number: i64,
+    pub(super) batch_phase: i64,
+    pub(super) thread_group: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedDispatchCard {
-    issue_number: i64,
-    card_id: String,
-    repo_id: Option<String>,
-    status: String,
-    assigned_agent_id: Option<String>,
+pub(super) struct ResolvedDispatchCard {
+    pub(super) issue_number: i64,
+    pub(super) card_id: String,
+    pub(super) repo_id: Option<String>,
+    pub(super) status: String,
+    pub(super) assigned_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-struct ActivateCardState {
-    status: String,
-    title: String,
-    metadata: Option<String>,
-    latest_dispatch_id: Option<String>,
-    latest_dispatch_status: Option<String>,
-    entry_status: String,
-    repo_id: Option<String>,
-    assigned_agent_id: Option<String>,
+pub(super) struct ActivateCardState {
+    pub(super) status: String,
+    pub(super) title: String,
+    pub(super) metadata: Option<String>,
+    pub(super) latest_dispatch_id: Option<String>,
+    pub(super) latest_dispatch_status: Option<String>,
+    pub(super) entry_status: String,
+    pub(super) repo_id: Option<String>,
+    pub(super) assigned_agent_id: Option<String>,
 }
 
 impl ActivateCardState {
-    fn has_active_dispatch(&self) -> bool {
+    pub(super) fn has_active_dispatch(&self) -> bool {
         self.latest_dispatch_id.is_some()
             && matches!(
                 self.latest_dispatch_status.as_deref(),
@@ -80,7 +82,7 @@ impl ActivateCardState {
     }
 
     #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    fn is_terminal(&self, conn: &sqlite_test::Connection) -> bool {
+    pub(super) fn is_terminal(&self, conn: &sqlite_test::Connection) -> bool {
         crate::pipeline::ensure_loaded();
         crate::pipeline::resolve_for_card(
             conn,
@@ -92,27 +94,27 @@ impl ActivateCardState {
 }
 
 #[derive(Debug, Clone)]
-struct RestoreEntryRecord {
-    entry_id: String,
-    card_id: String,
-    agent_id: String,
-    thread_group: i64,
+pub(super) struct RestoreEntryRecord {
+    pub(super) entry_id: String,
+    pub(super) card_id: String,
+    pub(super) agent_id: String,
+    pub(super) thread_group: i64,
 }
 
 #[derive(Debug, Default)]
-struct RestoreRunCounts {
-    restored_pending: usize,
-    restored_done: usize,
-    restored_dispatched: usize,
-    rebound_slots: usize,
-    created_dispatches: usize,
-    unbound_dispatches: usize,
+pub(super) struct RestoreRunCounts {
+    pub(super) restored_pending: usize,
+    pub(super) restored_done: usize,
+    pub(super) restored_dispatched: usize,
+    pub(super) rebound_slots: usize,
+    pub(super) created_dispatches: usize,
+    pub(super) unbound_dispatches: usize,
 }
 
-const RUN_STATUS_RESTORING: &str = "restoring";
+pub(super) const RUN_STATUS_RESTORING: &str = "restoring";
 
 #[derive(Debug, Clone)]
-enum RestoreEntryDecision {
+pub(super) enum RestoreEntryDecision {
     Pending,
     Done,
     ExistingDispatch { dispatch_id: String, title: String },
@@ -120,21 +122,21 @@ enum RestoreEntryDecision {
 }
 
 #[derive(Debug, Clone)]
-struct RestoreDispatchCandidate {
-    entry: RestoreEntryRecord,
-    title: String,
+pub(super) struct RestoreDispatchCandidate {
+    pub(super) entry: RestoreEntryRecord,
+    pub(super) title: String,
 }
 
 #[derive(Debug, Default)]
-struct RestoreDispatchAttemptResult {
-    dispatched: bool,
-    created_dispatch: bool,
-    rebound_slot: bool,
-    unbound_dispatch: bool,
+pub(super) struct RestoreDispatchAttemptResult {
+    pub(super) dispatched: bool,
+    pub(super) created_dispatch: bool,
+    pub(super) rebound_slot: bool,
+    pub(super) unbound_dispatch: bool,
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn load_activate_card_state(
+pub(super) fn load_activate_card_state(
     conn: &sqlite_test::Connection,
     card_id: &str,
     entry_id: &str,
@@ -190,7 +192,7 @@ fn load_activate_card_state(
     })
 }
 
-async fn load_activate_card_state_pg(
+pub(super) async fn load_activate_card_state_pg(
     pool: &sqlx::PgPool,
     card_id: &str,
     entry_id: &str,
@@ -250,7 +252,7 @@ async fn load_activate_card_state_pg(
     })
 }
 
-async fn resolve_activate_pipeline_pg(
+pub(super) async fn resolve_activate_pipeline_pg(
     pool: &sqlx::PgPool,
     repo_id: Option<&str>,
     agent_id: Option<&str>,
@@ -296,4 +298,3 @@ async fn resolve_activate_pipeline_pg(
         agent_override.as_ref(),
     ))
 }
-

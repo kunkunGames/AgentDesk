@@ -1,4 +1,6 @@
-const RESET_GLOBAL_CONFIRMATION_TOKEN: &str = "confirm-global-reset";
+use super::*;
+
+pub(super) const RESET_GLOBAL_CONFIRMATION_TOKEN: &str = "confirm-global-reset";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -138,29 +140,29 @@ pub struct CancelQuery {
 }
 
 #[derive(Debug, Clone)]
-struct GenerateCandidate {
-    card_id: String,
-    agent_id: String,
-    priority: String,
-    description: Option<String>,
-    metadata: Option<String>,
-    github_issue_number: Option<i64>,
+pub(super) struct GenerateCandidate {
+    pub(super) card_id: String,
+    pub(super) agent_id: String,
+    pub(super) priority: String,
+    pub(super) description: Option<String>,
+    pub(super) metadata: Option<String>,
+    pub(super) github_issue_number: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
-struct PlannedEntry {
-    card_idx: usize,
-    thread_group: i64,
-    priority_rank: i64,
-    batch_phase: i64,
-    reason: String,
+pub(super) struct PlannedEntry {
+    pub(super) card_idx: usize,
+    pub(super) thread_group: i64,
+    pub(super) priority_rank: i64,
+    pub(super) batch_phase: i64,
+    pub(super) reason: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DependencyParseResult {
-    numbers: Vec<i64>,
-    signals: Vec<String>,
+pub(super) struct DependencyParseResult {
+    pub(super) numbers: Vec<i64>,
+    pub(super) signals: Vec<String>,
 }
 
-const AUTO_QUEUE_REVIEW_MODE_ENABLED: &str = "enabled";
-const AUTO_QUEUE_REVIEW_MODE_DISABLED: &str = "disabled";
+pub(super) const AUTO_QUEUE_REVIEW_MODE_ENABLED: &str = "enabled";
+pub(super) const AUTO_QUEUE_REVIEW_MODE_DISABLED: &str = "disabled";

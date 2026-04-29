@@ -1,4 +1,13 @@
-async fn sync_run_group_metadata_with_pg_tx(
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct AddedRunEntry {
+    pub(super) entry_id: String,
+    pub(super) thread_group: i64,
+    pub(super) priority_rank: i64,
+}
+
+pub(super) async fn sync_run_group_metadata_with_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: &str,
 ) -> Result<(), String> {
@@ -29,7 +38,7 @@ async fn sync_run_group_metadata_with_pg_tx(
     Ok(())
 }
 
-async fn enqueue_entries_into_existing_run_with_pg(
+pub(super) async fn enqueue_entries_into_existing_run_with_pg(
     pool: &sqlx::PgPool,
     run_id: &str,
     requested_entries: &[GenerateEntryBody],
@@ -165,7 +174,7 @@ async fn enqueue_entries_into_existing_run_with_pg(
     Ok(inserted)
 }
 
-fn existing_live_run_conflict_response(
+pub(super) fn existing_live_run_conflict_response(
     run_id: &str,
     status: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -181,7 +190,7 @@ fn existing_live_run_conflict_response(
     )
 }
 
-fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<String> {
+pub(super) fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<String> {
     let mut states: Vec<String> = pipeline
         .dispatchable_states()
         .iter()
@@ -200,7 +209,7 @@ fn enqueueable_states_for(pipeline: &crate::pipeline::PipelineConfig) -> Vec<Str
     states
 }
 
-fn priority_sort_key(priority: &str) -> i32 {
+pub(super) fn priority_sort_key(priority: &str) -> i32 {
     match priority {
         "urgent" => 0,
         "high" => 1,
@@ -210,16 +219,16 @@ fn priority_sort_key(priority: &str) -> i32 {
     }
 }
 
-fn planning_sort_key(card: &GenerateCandidate, idx: usize) -> (i32, usize) {
+pub(super) fn planning_sort_key(card: &GenerateCandidate, idx: usize) -> (i32, usize) {
     (priority_sort_key(&card.priority), idx)
 }
 
-fn dependency_issue_regex() -> &'static regex::Regex {
+pub(super) fn dependency_issue_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"#(\d+)").expect("dependency regex must compile"))
 }
 
-fn dependency_section_header_regex() -> &'static regex::Regex {
+pub(super) fn dependency_section_header_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
@@ -229,7 +238,7 @@ fn dependency_section_header_regex() -> &'static regex::Regex {
     })
 }
 
-fn dependency_inline_regex() -> &'static regex::Regex {
+pub(super) fn dependency_inline_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
@@ -239,12 +248,12 @@ fn dependency_inline_regex() -> &'static regex::Regex {
     })
 }
 
-fn markdown_header_regex() -> &'static regex::Regex {
+pub(super) fn markdown_header_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^#{1,6}\s").expect("markdown header regex must compile"))
 }
 
-fn bare_dependency_list_regex() -> &'static regex::Regex {
+pub(super) fn bare_dependency_list_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(r"^\s*#\d+(?:[\s,]+#\d+)*\s*$")
@@ -252,13 +261,17 @@ fn bare_dependency_list_regex() -> &'static regex::Regex {
     })
 }
 
-fn insert_dependency_number(deps: &mut HashSet<i64>, self_issue_number: Option<i64>, num: i64) {
+pub(super) fn insert_dependency_number(
+    deps: &mut HashSet<i64>,
+    self_issue_number: Option<i64>,
+    num: i64,
+) {
     if Some(num) != self_issue_number {
         deps.insert(num);
     }
 }
 
-fn collect_dependency_numbers_from_issue_refs(
+pub(super) fn collect_dependency_numbers_from_issue_refs(
     text: &str,
     deps: &mut HashSet<i64>,
     self_issue_number: Option<i64>,
@@ -273,7 +286,7 @@ fn collect_dependency_numbers_from_issue_refs(
     matched
 }
 
-fn collect_dependency_numbers_from_json_value(
+pub(super) fn collect_dependency_numbers_from_json_value(
     value: &Value,
     deps: &mut HashSet<i64>,
     self_issue_number: Option<i64>,
@@ -308,7 +321,7 @@ fn collect_dependency_numbers_from_json_value(
     }
 }
 
-fn extract_dependency_numbers_from_text(
+pub(super) fn extract_dependency_numbers_from_text(
     text: &str,
     source_label: &str,
     allow_bare_ref_list: bool,
@@ -362,7 +375,7 @@ fn extract_dependency_numbers_from_text(
     }
 }
 
-fn extract_dependency_parse_result(card: &GenerateCandidate) -> DependencyParseResult {
+pub(super) fn extract_dependency_parse_result(card: &GenerateCandidate) -> DependencyParseResult {
     let mut deps = HashSet::new();
     let mut signals = HashSet::new();
 
@@ -414,11 +427,11 @@ fn extract_dependency_parse_result(card: &GenerateCandidate) -> DependencyParseR
     DependencyParseResult { numbers, signals }
 }
 
-fn extract_dependency_numbers(card: &GenerateCandidate) -> Vec<i64> {
+pub(super) fn extract_dependency_numbers(card: &GenerateCandidate) -> Vec<i64> {
     extract_dependency_parse_result(card).numbers
 }
 
-fn normalize_similarity_path(raw: &str) -> Option<String> {
+pub(super) fn normalize_similarity_path(raw: &str) -> Option<String> {
     let trimmed = raw
         .trim_matches(|ch: char| matches!(ch, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'))
         .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ':' | ';'));
@@ -428,7 +441,7 @@ fn normalize_similarity_path(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
+pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
     let re = regex::Regex::new(
         r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
     )
@@ -438,7 +451,7 @@ fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
         .collect()
 }
 
-fn similarity_paths(card: &GenerateCandidate) -> HashSet<String> {
+pub(super) fn similarity_paths(card: &GenerateCandidate) -> HashSet<String> {
     let description_paths = card
         .description
         .as_deref()
@@ -453,7 +466,7 @@ fn similarity_paths(card: &GenerateCandidate) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn similarity_edge_allowed(left: &GenerateCandidate, right: &GenerateCandidate) -> bool {
+pub(super) fn similarity_edge_allowed(left: &GenerateCandidate, right: &GenerateCandidate) -> bool {
     // Allow cross-agent similarity edges — file overlap determines conflict,
     // not agent assignment. Cards touching the same files should be grouped
     // regardless of which agent they're assigned to.
@@ -473,7 +486,7 @@ fn similarity_edge_allowed(left: &GenerateCandidate, right: &GenerateCandidate) 
 ///
 /// Using max() ensures that two issues sharing a file are grouped even when their
 /// total file counts differ significantly.
-fn path_similarity(left: &HashSet<String>, right: &HashSet<String>) -> (usize, f64) {
+pub(super) fn path_similarity(left: &HashSet<String>, right: &HashSet<String>) -> (usize, f64) {
     if left.is_empty() || right.is_empty() {
         return (0, 0.0);
     }
@@ -487,7 +500,7 @@ fn path_similarity(left: &HashSet<String>, right: &HashSet<String>) -> (usize, f
     (shared, overlap.max(jaccard))
 }
 
-fn compact_path_label(path: &str) -> String {
+pub(super) fn compact_path_label(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() <= 2 {
         path.to_string()
@@ -496,7 +509,7 @@ fn compact_path_label(path: &str) -> String {
     }
 }
 
-fn group_path_labels(members: &[usize], paths: &[HashSet<String>]) -> Vec<String> {
+pub(super) fn group_path_labels(members: &[usize], paths: &[HashSet<String>]) -> Vec<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for &member in members {
         for path in &paths[member] {
@@ -516,7 +529,7 @@ fn group_path_labels(members: &[usize], paths: &[HashSet<String>]) -> Vec<String
         .collect()
 }
 
-fn build_group_reason(
+pub(super) fn build_group_reason(
     kind: GroupKind,
     path_labels: &[String],
     dependency_issue_nums: &[i64],
@@ -555,7 +568,7 @@ fn build_group_reason(
     }
 }
 
-fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
+pub(super) fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
     const SIMILARITY_THRESHOLD: f64 = 0.5;
     if cards.is_empty() {
         return GroupPlan {
@@ -839,13 +852,13 @@ fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QueueEntryOrder {
-    id: String,
-    status: String,
-    agent_id: String,
+pub(super) struct QueueEntryOrder {
+    pub(super) id: String,
+    pub(super) status: String,
+    pub(super) agent_id: String,
 }
 
-fn reorder_entry_ids(
+pub(super) fn reorder_entry_ids(
     entries: &[QueueEntryOrder],
     ordered_ids: &[String],
     agent_id: Option<&str>,
@@ -912,4 +925,3 @@ fn reorder_entry_ids(
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
-

@@ -1,4 +1,6 @@
-async fn create_activate_dispatch_pg(
+use super::*;
+
+pub(super) async fn create_activate_dispatch_pg(
     pool: &sqlx::PgPool,
     card_id: &str,
     to_agent_id: &str,
@@ -299,4 +301,3 @@ async fn create_activate_dispatch_pg(
 
     Ok(dispatch_id)
 }
-

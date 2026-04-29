@@ -1,3 +1,5 @@
+use super::*;
+
 /// PATCH /api/auto-queue/runs/{id}
 pub async fn update_run(
     State(state): State<AppState>,
@@ -197,7 +199,7 @@ pub async fn pause(
     }
 }
 
-fn cancel_route_error_response(
+pub(super) fn cancel_route_error_response(
     error: crate::error::AppError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut body = json!({ "error": error.message() });
@@ -349,4 +351,3 @@ pub async fn reorder(
         ),
     }
 }
-

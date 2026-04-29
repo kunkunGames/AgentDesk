@@ -1,9 +1,11 @@
-enum ActivatePgPreflight {
+use super::*;
+
+pub(super) enum ActivatePgPreflight {
     Return((StatusCode, Json<serde_json::Value>)),
     Continue(ActivateBody),
 }
 
-async fn activate_preflight_with_pg(
+pub(super) async fn activate_preflight_with_pg(
     pool: &sqlx::PgPool,
     mut body: ActivateBody,
 ) -> ActivatePgPreflight {
@@ -195,4 +197,3 @@ async fn activate_preflight_with_pg(
 
     ActivatePgPreflight::Continue(body)
 }
-

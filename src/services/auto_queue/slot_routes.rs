@@ -1,5 +1,7 @@
+use super::*;
+
 /// POST /api/auto-queue/slots/{agent_id}/{slot_index}/rebind
-async fn rebind_slot_with_pg(
+pub(super) async fn rebind_slot_with_pg(
     agent_id: &str,
     slot_index: i64,
     body: &RebindSlotBody,
@@ -212,7 +214,7 @@ pub async fn rebind_slot(
 }
 
 /// PATCH /api/auto-queue/entries/{id}/skip
-async fn skip_entry_with_pg(
+pub(super) async fn skip_entry_with_pg(
     id: &str,
     pool: &sqlx::PgPool,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -264,4 +266,3 @@ pub async fn skip_entry(
     };
     skip_entry_with_pg(&id, &pg_pool).await
 }
-

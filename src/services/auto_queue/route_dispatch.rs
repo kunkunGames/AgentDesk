@@ -1,3 +1,5 @@
+use super::*;
+
 /// POST /api/auto-queue/dispatch
 /// Declaratively generate and optionally activate an auto-queue run.
 pub async fn dispatch(
@@ -272,4 +274,3 @@ pub async fn dispatch(
 
     (StatusCode::OK, Json(snapshot))
 }
-

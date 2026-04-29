@@ -1,4 +1,6 @@
-fn deploy_phase_api_enabled(state: &AppState) -> bool {
+use super::*;
+
+pub(super) fn deploy_phase_api_enabled(state: &AppState) -> bool {
     state
         .config
         .server
@@ -8,7 +10,7 @@ fn deploy_phase_api_enabled(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
+pub(super) fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({"error": "postgres pool is not configured"})),
@@ -16,7 +18,7 @@ fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn slot_thread_map_has_bindings(
+pub(super) fn slot_thread_map_has_bindings(
     conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
@@ -48,7 +50,7 @@ fn slot_thread_map_has_bindings(
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn slot_has_dispatch_thread_history(
+pub(super) fn slot_has_dispatch_thread_history(
     conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
@@ -71,7 +73,7 @@ fn slot_has_dispatch_thread_history(
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn slot_requires_thread_reset_before_reuse(
+pub(super) fn slot_requires_thread_reset_before_reuse(
     conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
@@ -83,7 +85,7 @@ fn slot_requires_thread_reset_before_reuse(
             || slot_has_dispatch_thread_history(conn, agent_id, slot_index))
 }
 
-fn json_value_kind(value: &serde_json::Value) -> &'static str {
+pub(super) fn json_value_kind(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",
@@ -94,7 +96,7 @@ fn json_value_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-async fn slot_thread_map_has_bindings_pg(
+pub(super) async fn slot_thread_map_has_bindings_pg(
     pool: &sqlx::PgPool,
     agent_id: &str,
     slot_index: i64,
@@ -145,7 +147,7 @@ async fn slot_thread_map_has_bindings_pg(
     }))
 }
 
-async fn slot_has_dispatch_thread_history_pg(
+pub(super) async fn slot_has_dispatch_thread_history_pg(
     pool: &sqlx::PgPool,
     agent_id: &str,
     slot_index: i64,
@@ -223,7 +225,7 @@ async fn slot_has_dispatch_thread_history_pg(
     Ok(false)
 }
 
-async fn slot_requires_thread_reset_before_reuse_pg(
+pub(super) async fn slot_requires_thread_reset_before_reuse_pg(
     pool: &sqlx::PgPool,
     agent_id: &str,
     slot_index: i64,
@@ -240,7 +242,7 @@ async fn slot_requires_thread_reset_before_reuse_pg(
     )
 }
 
-fn build_auto_queue_dispatch_context(
+pub(super) fn build_auto_queue_dispatch_context(
     entry_id: &str,
     thread_group: i64,
     slot_index: Option<i64>,
@@ -264,14 +266,14 @@ fn build_auto_queue_dispatch_context(
     serde_json::Value::Object(context)
 }
 
-fn resolve_activate_dispatch_channel_id(channel: &str) -> Option<u64> {
+pub(super) fn resolve_activate_dispatch_channel_id(channel: &str) -> Option<u64> {
     channel
         .parse::<u64>()
         .ok()
         .or_else(|| crate::server::routes::dispatches::resolve_channel_alias_pub(channel))
 }
 
-async fn group_has_dispatched_entries_pg(
+pub(super) async fn group_has_dispatched_entries_pg(
     pool: &sqlx::PgPool,
     run_id: &str,
     thread_group: i64,
@@ -292,4 +294,3 @@ async fn group_has_dispatched_entries_pg(
     })?;
     Ok(count > 0)
 }
-

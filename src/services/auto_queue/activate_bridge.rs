@@ -1,3 +1,5 @@
+use super::*;
+
 pub(crate) fn activate_with_deps(
     deps: &AutoQueueActivateDeps,
     body: ActivateBody,
@@ -20,4 +22,3 @@ pub(crate) fn activate_with_deps(
         ),
     }
 }
-
