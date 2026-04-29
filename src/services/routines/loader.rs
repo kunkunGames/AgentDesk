@@ -596,4 +596,54 @@ mod tests {
             other => panic!("unexpected action: {other:?}"),
         }
     }
+
+    #[test]
+    fn bundled_sample_routines_load_and_validate() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("routines");
+        let loader = RoutineScriptLoader::new().unwrap();
+        assert_eq!(loader.load_dir(&root).unwrap(), 2);
+        assert_eq!(
+            loader.script_refs().unwrap(),
+            vec![
+                "agent-checkpoint-review.js".to_string(),
+                "script-summary.js".to_string(),
+            ]
+        );
+
+        let context_for = |script_ref: &str, name: &str| RoutineTickContext {
+            routine: RoutineTickRoutine {
+                id: "routine-1".to_string(),
+                agent_id: Some("maker".to_string()),
+                script_ref: script_ref.to_string(),
+                name: name.to_string(),
+                execution_strategy: "fresh".to_string(),
+                fresh_context_guaranteed: false,
+            },
+            run: RoutineTickRun {
+                id: "run-1".to_string(),
+                lease_expires_at: chrono::Utc::now(),
+            },
+            checkpoint: None,
+            now: chrono::Utc::now(),
+        };
+
+        assert!(matches!(
+            loader
+                .execute_tick(
+                    "script-summary.js",
+                    context_for("script-summary.js", "script-only-summary")
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Complete { .. }
+        ));
+        assert!(matches!(
+            loader
+                .execute_tick(
+                    "agent-checkpoint-review.js",
+                    context_for("agent-checkpoint-review.js", "agent-checkpoint-review")
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Agent { .. }
+        ));
+    }
 }
