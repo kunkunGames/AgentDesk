@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -57,14 +57,65 @@ pub struct AttachRoutineBody {
 pub struct PatchRoutineBody {
     pub name: Option<String>,
     pub execution_strategy: Option<String>,
-    pub schedule: Option<Option<String>>,
-    pub next_due_at: Option<Option<DateTime<Utc>>>,
-    pub checkpoint: Option<Option<Value>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    schedule: PatchField<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    next_due_at: PatchField<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    checkpoint: PatchField<Option<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ResumeRoutineBody {
     pub next_due_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatchField<T> {
+    Missing,
+    Present(T),
+}
+
+impl<T> Default for PatchField<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<T> PatchField<T> {
+    fn as_present(&self) -> Option<&T> {
+        match self {
+            Self::Missing => None,
+            Self::Present(value) => Some(value),
+        }
+    }
+
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Missing => None,
+            Self::Present(value) => Some(value),
+        }
+    }
+}
+
+fn deserialize_patch_field<'de, D, T>(deserializer: D) -> Result<PatchField<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(PatchField::Present)
+}
+
+impl PatchRoutineBody {
+    fn into_patch(self) -> RoutinePatch {
+        RoutinePatch {
+            name: self.name,
+            execution_strategy: self.execution_strategy,
+            schedule: self.schedule.into_option(),
+            next_due_at: self.next_due_at.into_option(),
+            checkpoint: self.checkpoint.into_option(),
+        }
+    }
 }
 
 pub async fn list_routines(
@@ -211,16 +262,10 @@ pub async fn patch_routine(
     if let Some(strategy) = body.execution_strategy.as_deref() {
         validate_execution_strategy_request(strategy)?;
     }
-    if let Some(Some(schedule)) = body.schedule.as_ref() {
+    if let Some(Some(schedule)) = body.schedule.as_present() {
         validate_schedule_request(Some(schedule))?;
     }
-    let patch = RoutinePatch {
-        name: body.name,
-        execution_strategy: body.execution_strategy,
-        schedule: body.schedule,
-        next_due_at: body.next_due_at,
-        checkpoint: body.checkpoint,
-    };
+    let patch = body.into_patch();
     let Some(routine) = store
         .patch_routine(&routine_id, patch)
         .await
@@ -565,8 +610,9 @@ fn session_control_error(error: anyhow::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
+    use serde_json::json;
 
-    use super::ensure_routine_runtime_runnable;
+    use super::{PatchRoutineBody, ensure_routine_runtime_runnable};
     use crate::config::RoutinesConfig;
     use crate::error::ErrorCode;
 
@@ -598,5 +644,45 @@ mod tests {
             "unexpected message: {}",
             err.message()
         );
+    }
+
+    #[test]
+    fn patch_body_preserves_omitted_nullable_fields() {
+        let body: PatchRoutineBody = serde_json::from_value(json!({})).unwrap();
+        let patch = body.into_patch();
+
+        assert_eq!(patch.schedule, None);
+        assert_eq!(patch.next_due_at, None);
+        assert_eq!(patch.checkpoint, None);
+    }
+
+    #[test]
+    fn patch_body_preserves_explicit_null_nullable_fields() {
+        let body: PatchRoutineBody = serde_json::from_value(json!({
+            "schedule": null,
+            "next_due_at": null,
+            "checkpoint": null
+        }))
+        .unwrap();
+        let patch = body.into_patch();
+
+        assert_eq!(patch.schedule, Some(None));
+        assert_eq!(patch.next_due_at, Some(None));
+        assert_eq!(patch.checkpoint, Some(None));
+    }
+
+    #[test]
+    fn patch_body_preserves_present_nullable_values() {
+        let body: PatchRoutineBody = serde_json::from_value(json!({
+            "schedule": "@every 1h",
+            "next_due_at": "2026-04-29T00:00:00Z",
+            "checkpoint": {"cursor": "abc"}
+        }))
+        .unwrap();
+        let patch = body.into_patch();
+
+        assert_eq!(patch.schedule, Some(Some("@every 1h".to_string())));
+        assert!(patch.next_due_at.flatten().is_some());
+        assert_eq!(patch.checkpoint, Some(Some(json!({"cursor": "abc"}))));
     }
 }
