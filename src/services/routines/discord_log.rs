@@ -14,6 +14,8 @@ pub struct RoutineDiscordLogger {
 pub struct RoutineDiscordLogStatus {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
 
@@ -180,6 +182,7 @@ impl RoutineDiscordLogStatus {
     fn ok() -> Self {
         Self {
             status: "ok".to_string(),
+            warning_code: None,
             warning: None,
         }
     }
@@ -187,17 +190,48 @@ impl RoutineDiscordLogStatus {
     fn skipped() -> Self {
         Self {
             status: "skipped".to_string(),
+            warning_code: None,
             warning: None,
         }
     }
 
     fn failed(error: impl ToString) -> Self {
         let warning = error.to_string();
-        tracing::warn!(warning, "routine discord log failed");
+        let warning_code = classify_warning(&warning);
+        tracing::warn!(warning, warning_code, "routine discord log failed");
         Self {
             status: "failed".to_string(),
+            warning_code: Some(warning_code.to_string()),
             warning: Some(warning),
         }
+    }
+}
+
+fn classify_warning(warning: &str) -> &'static str {
+    let lower = warning.to_ascii_lowercase();
+    if lower.contains("missing permissions")
+        || lower.contains("missing access")
+        || lower.contains("permission")
+        || lower.contains("forbidden")
+        || lower.contains("403")
+    {
+        "discord_permission_denied"
+    } else if lower.contains("archived") {
+        "discord_thread_archived"
+    } else if (lower.contains("thread") && lower.contains("creat"))
+        || lower.contains("create thread")
+    {
+        "discord_thread_creation_failed"
+    } else if lower.contains("primary channel is invalid") {
+        "discord_channel_invalid"
+    } else if lower.contains("no primary channel") {
+        "discord_channel_missing"
+    } else if lower.contains("agent ") && lower.contains("not found") {
+        "agent_not_found"
+    } else if lower.contains("enqueue") || lower.contains("message_outbox") {
+        "message_outbox_enqueue_failed"
+    } else {
+        "discord_log_failed"
     }
 }
 
@@ -356,6 +390,27 @@ mod tests {
     fn missing_agent_is_skipped_without_warning() {
         let status = RoutineDiscordLogStatus::skipped();
         assert_eq!(status.status, "skipped");
+        assert_eq!(status.warning_code, None);
         assert_eq!(status.warning, None);
+    }
+
+    #[test]
+    fn discord_log_warning_codes_are_operator_specific() {
+        assert_eq!(
+            classify_warning("Discord API returned 403 Missing Permissions"),
+            "discord_permission_denied"
+        );
+        assert_eq!(
+            classify_warning("cannot reuse archived thread 123"),
+            "discord_thread_archived"
+        );
+        assert_eq!(
+            classify_warning("thread creation failed for routine log"),
+            "discord_thread_creation_failed"
+        );
+        assert_eq!(
+            classify_warning("failed to enqueue routine discord log: db down"),
+            "message_outbox_enqueue_failed"
+        );
     }
 }

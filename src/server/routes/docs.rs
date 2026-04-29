@@ -2565,7 +2565,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/routines/{id}/runs",
             "routines",
-            "List recent run history for one routine, including best-effort Discord log status.",
+            "List recent run history for one routine, including best-effort Discord log status and warning detail.",
         )
         .with_params([
             ("id", path_param("Routine id")),
@@ -2592,7 +2592,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/detach",
             "routines",
-            "Detach a non-running routine without deleting its run history; Discord log failure is returned only as discord_log.warning.",
+            "Detach a non-running routine without deleting its run history; Discord log failure is returned only as discord_log.warning_code/warning.",
         )
         .with_params([("id", path_param("Routine id"))]),
         ep(
