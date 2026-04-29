@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use rquickjs::{Context, Function, Runtime};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,6 +92,10 @@ impl RoutineScriptLoader {
     pub fn load_dir(&self, root: &Path) -> Result<usize> {
         if !root.exists() {
             tracing::warn!("Routines directory does not exist: {}", root.display());
+            let pruned = self.prune_missing_scripts(&HashSet::new())?;
+            if pruned > 0 {
+                tracing::info!(count = pruned, "pruned missing routine scripts");
+            }
             return Ok(0);
         }
 
@@ -103,11 +107,17 @@ impl RoutineScriptLoader {
         entries.sort();
 
         let mut loaded = 0;
+        let mut seen_refs = HashSet::new();
+        let mut loaded_scripts = Vec::new();
         for path in entries {
-            match self.load_script(root, &path) {
-                Ok(script_ref) => {
+            let seen_ref = script_ref(root, &path);
+            seen_refs.insert(seen_ref);
+            match load_single_routine_script(root, &path) {
+                Ok(script) => {
+                    let script_ref = script.script_ref.clone();
                     loaded += 1;
                     tracing::info!(routine_script = %script_ref, "loaded routine script");
+                    loaded_scripts.push(script);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -117,6 +127,11 @@ impl RoutineScriptLoader {
                     );
                 }
             }
+        }
+
+        let pruned = self.apply_dir_reload(loaded_scripts, &seen_refs)?;
+        if pruned > 0 {
+            tracing::info!(count = pruned, "pruned missing routine scripts");
         }
 
         Ok(loaded)
@@ -163,6 +178,33 @@ impl RoutineScriptLoader {
             .collect();
         refs.sort();
         Ok(refs)
+    }
+
+    fn apply_dir_reload(
+        &self,
+        loaded_scripts: Vec<LoadedRoutineScript>,
+        seen_refs: &HashSet<String>,
+    ) -> Result<usize> {
+        let mut scripts = self
+            .scripts
+            .lock()
+            .map_err(|_| anyhow!("routine script store lock poisoned"))?;
+        for script in loaded_scripts {
+            scripts.insert(script.script_ref.clone(), script);
+        }
+        let before = scripts.len();
+        scripts.retain(|script_ref, _| seen_refs.contains(script_ref));
+        Ok(before.saturating_sub(scripts.len()))
+    }
+
+    fn prune_missing_scripts(&self, seen_refs: &HashSet<String>) -> Result<usize> {
+        let mut scripts = self
+            .scripts
+            .lock()
+            .map_err(|_| anyhow!("routine script store lock poisoned"))?;
+        let before = scripts.len();
+        scripts.retain(|script_ref, _| seen_refs.contains(script_ref));
+        Ok(before.saturating_sub(scripts.len()))
     }
 }
 
@@ -461,6 +503,36 @@ mod tests {
             loader.script_refs().unwrap(),
             vec!["first.js".to_string(), "second.js".to_string()]
         );
+    }
+
+    #[test]
+    fn load_dir_prunes_removed_scripts_and_keeps_failed_seen_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed = dir.path().join("removed.js");
+        let retained = dir.path().join("retained.js");
+        std::fs::write(
+            &removed,
+            "agentdesk.routines.register({ name: 'Removed', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+        std::fs::write(
+            &retained,
+            "agentdesk.routines.register({ name: 'Retained', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        assert_eq!(loader.load_dir(dir.path()).unwrap(), 2);
+
+        std::fs::remove_file(&removed).unwrap();
+        std::fs::write(
+            &retained,
+            "agentdesk.routines.register({ name: 'Broken' });",
+        )
+        .unwrap();
+
+        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
+        assert_eq!(loader.script_refs().unwrap(), vec!["retained.js"]);
     }
 
     #[test]
