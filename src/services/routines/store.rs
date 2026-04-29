@@ -625,7 +625,7 @@ impl RoutineStore {
             UPDATE routines
             SET in_flight_run_id = NULL,
                 status = CASE WHEN $5 THEN 'paused' ELSE status END,
-                next_due_at = $2,
+                next_due_at = COALESCE($2, next_due_at),
                 checkpoint = COALESCE($3, checkpoint),
                 last_result = $4,
                 updated_at = NOW()

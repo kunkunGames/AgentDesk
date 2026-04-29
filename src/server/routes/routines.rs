@@ -205,6 +205,14 @@ pub async fn run_routine_now(
     State(state): State<AppState>,
     Path(routine_id): Path<String>,
 ) -> AppResult<Json<Value>> {
+    if !state.config.routines.enabled {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Config,
+            "routines are disabled by config",
+        ));
+    }
+
     let store = routine_store(&state)?;
     if store
         .get_routine(&routine_id)
