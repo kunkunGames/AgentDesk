@@ -110,15 +110,18 @@ impl RoutineAgentExecutor {
         let pending = store.list_running_agent_runs(limit).await?;
         let mut outcomes = Vec::new();
         for run in pending {
-            if self.has_timed_out(&run) {
+            if self.has_timed_out(&run).await? {
                 let message = format!(
                     "routine agent turn timed out after {} seconds",
                     self.completion_timeout.as_secs()
                 );
                 let result_json = Some(merge_pending_result(&run, "timeout", Some(&message), None));
-                store
+                let closed = store
                     .fail_agent_run(&run.run_id, &message, result_json.clone(), None)
                     .await?;
+                if !closed {
+                    continue;
+                }
                 outcomes.push(RoutineRunOutcome {
                     run_id: run.run_id,
                     routine_id: run.routine_id,
@@ -139,7 +142,7 @@ impl RoutineAgentExecutor {
                     let last_result = assistant_preview(&completion.assistant_message);
                     let result_json =
                         Some(completed_result(&run, &completion, last_result.as_str()));
-                    store
+                    let closed = store
                         .complete_agent_run(
                             &run.run_id,
                             result_json.clone(),
@@ -151,6 +154,9 @@ impl RoutineAgentExecutor {
                             },
                         )
                         .await?;
+                    if !closed {
+                        continue;
+                    }
                     outcomes.push(RoutineRunOutcome {
                         run_id: run.run_id,
                         routine_id: run.routine_id,
@@ -268,11 +274,19 @@ impl RoutineAgentExecutor {
         .map_err(|error| anyhow!("lookup routine agent transcript {turn_id}: {error}"))
     }
 
-    fn has_timed_out(&self, run: &RunningAgentRoutineRun) -> bool {
-        let Ok(age) = (Utc::now() - run.started_at).to_std() else {
-            return false;
-        };
-        age >= self.completion_timeout
+    async fn has_timed_out(&self, run: &RunningAgentRoutineRun) -> Result<bool> {
+        let timeout_secs = i64::try_from(self.completion_timeout.as_secs())
+            .map_err(|_| anyhow!("routine agent completion timeout exceeds i64 seconds"))?;
+        sqlx::query_scalar(
+            r#"
+            SELECT $1::timestamptz + ($2::bigint * INTERVAL '1 second') <= NOW()
+            "#,
+        )
+        .bind(run.started_at)
+        .bind(timeout_secs)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|error| anyhow!("check routine agent timeout {}: {error}", run.run_id))
     }
 }
 
