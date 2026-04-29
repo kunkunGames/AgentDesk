@@ -26,6 +26,7 @@ pub enum RoutineAction {
     Agent {
         prompt: String,
         checkpoint: Option<Value>,
+        next_due_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -120,7 +121,17 @@ pub fn validate_routine_action(value: Value) -> Result<RoutineAction> {
             })
         }
         "agent" => {
-            reject_unknown_keys(obj, &["action", "kind", "prompt", "checkpoint"])?;
+            reject_unknown_keys(
+                obj,
+                &[
+                    "action",
+                    "kind",
+                    "prompt",
+                    "checkpoint",
+                    "nextDueAt",
+                    "next_due_at",
+                ],
+            )?;
             let prompt = required_string(obj, "prompt")?;
             if prompt.trim().is_empty() {
                 bail!("RoutineAction.agent.prompt must not be empty");
@@ -128,6 +139,7 @@ pub fn validate_routine_action(value: Value) -> Result<RoutineAction> {
             Ok(RoutineAction::Agent {
                 prompt,
                 checkpoint: optional_value(obj, "checkpoint"),
+                next_due_at: optional_datetime_alias(obj, "nextDueAt", "next_due_at")?,
             })
         }
         other => bail!(
@@ -248,10 +260,23 @@ mod tests {
         let action = RoutineAction::validate(json!({
             "action": "agent",
             "prompt": "summarize current queue",
-            "checkpoint": {"cursor": 3}
+            "checkpoint": {"cursor": 3},
+            "nextDueAt": "2026-04-29T02:00:00Z"
         }))
         .unwrap();
         assert_eq!(action.action_name(), "agent");
+        match action {
+            RoutineAction::Agent {
+                prompt,
+                checkpoint,
+                next_due_at,
+            } => {
+                assert_eq!(prompt, "summarize current queue");
+                assert_eq!(checkpoint, Some(json!({"cursor": 3})));
+                assert!(next_due_at.is_some());
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
 
         let err = RoutineAction::validate(json!({"action": "agent", "prompt": "   "})).unwrap_err();
         assert!(err.to_string().contains("must not be empty"));

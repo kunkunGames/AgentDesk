@@ -499,8 +499,15 @@ impl SupervisedWorkerRegistry {
                     return Ok(None);
                 };
                 let routines_config = self.config.routines.clone();
+                let routine_health_registry = self.health_registry.clone();
                 self.register_tokio(spec, async move {
-                    super::routine_runtime_loop(routine_pg_pool, routines_config, tick_secs).await;
+                    super::routine_runtime_loop(
+                        routine_pg_pool,
+                        routine_health_registry,
+                        routines_config,
+                        tick_secs,
+                    )
+                    .await;
                 });
                 Ok(None)
             }

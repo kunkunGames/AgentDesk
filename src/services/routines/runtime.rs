@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::action::RoutineAction;
+use super::agent_executor::RoutineAgentExecutor;
 use super::loader::{RoutineScriptLoader, RoutineTickContext, RoutineTickRoutine, RoutineTickRun};
 use super::store::{ClaimedRoutineRun, RoutineStore};
 
@@ -21,12 +22,13 @@ pub struct RoutineRunOutcome {
 pub async fn run_due_tick(
     store: &RoutineStore,
     loader: &RoutineScriptLoader,
+    agent_executor: Option<&RoutineAgentExecutor>,
     max_due_per_tick: u32,
 ) -> Result<Vec<RoutineRunOutcome>> {
     let claimed = store.claim_due_runs(max_due_per_tick).await?;
     let mut outcomes = Vec::with_capacity(claimed.len());
     for run in claimed {
-        match execute_claimed_script_run(store, loader, run).await {
+        match execute_claimed_script_run(store, loader, agent_executor, run).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(error) => {
                 tracing::warn!(error = %error, "routine due run failed before outcome capture");
@@ -36,9 +38,18 @@ pub async fn run_due_tick(
     Ok(outcomes)
 }
 
+pub async fn poll_agent_turns(
+    store: &RoutineStore,
+    agent_executor: &RoutineAgentExecutor,
+    max_per_tick: u32,
+) -> Result<Vec<RoutineRunOutcome>> {
+    agent_executor.poll_agent_runs(store, max_per_tick).await
+}
+
 pub async fn execute_claimed_script_run(
     store: &RoutineStore,
     loader: &RoutineScriptLoader,
+    agent_executor: Option<&RoutineAgentExecutor>,
     claimed: ClaimedRoutineRun,
 ) -> Result<RoutineRunOutcome> {
     let fresh_context_guaranteed = false;
@@ -84,11 +95,19 @@ pub async fn execute_claimed_script_run(
         }
     };
 
-    close_action(store, claimed, action, fresh_context_guaranteed).await
+    close_action(
+        store,
+        agent_executor,
+        claimed,
+        action,
+        fresh_context_guaranteed,
+    )
+    .await
 }
 
 async fn close_action(
     store: &RoutineStore,
+    agent_executor: Option<&RoutineAgentExecutor>,
     claimed: ClaimedRoutineRun,
     action: RoutineAction,
     fresh_context_guaranteed: bool,
@@ -177,25 +196,34 @@ async fn close_action(
                 fresh_context_guaranteed,
             })
         }
-        RoutineAction::Agent { .. } => {
-            let message = "RoutineAction.agent is not active in ORDER-P0-002 script-only runtime";
-            let result_json = Some(json!({
-                "error": message,
-                "fresh_context_guaranteed": fresh_context_guaranteed,
-            }));
-            store
-                .fail_run(&claimed.run_id, message, result_json.clone(), None)
-                .await?;
-            Ok(RoutineRunOutcome {
-                run_id: claimed.run_id,
-                routine_id: claimed.routine_id,
-                script_ref: claimed.script_ref,
-                action: action_name,
-                status: "failed".to_string(),
-                result_json,
-                error: Some(message.to_string()),
-                fresh_context_guaranteed,
-            })
+        RoutineAction::Agent {
+            prompt,
+            checkpoint,
+            next_due_at,
+        } => {
+            let Some(agent_executor) = agent_executor else {
+                let message = "RoutineAction.agent requires RoutineAgentExecutor";
+                let result_json = Some(json!({
+                    "error": message,
+                    "fresh_context_guaranteed": fresh_context_guaranteed,
+                }));
+                store
+                    .fail_agent_run(&claimed.run_id, message, result_json.clone(), None)
+                    .await?;
+                return Ok(RoutineRunOutcome {
+                    run_id: claimed.run_id,
+                    routine_id: claimed.routine_id,
+                    script_ref: claimed.script_ref,
+                    action: action_name,
+                    status: "failed".to_string(),
+                    result_json,
+                    error: Some(message.to_string()),
+                    fresh_context_guaranteed,
+                });
+            };
+            agent_executor
+                .start_agent_run(store, claimed, prompt, checkpoint, next_due_at)
+                .await
         }
     }
 }

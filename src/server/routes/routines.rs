@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
-    NewRoutine, RoutinePatch, RoutineScriptLoader, RoutineStore, execute_claimed_script_run,
+    NewRoutine, RoutineAgentExecutor, RoutinePatch, RoutineScriptLoader, RoutineStore,
+    execute_claimed_script_run,
 };
 
 use super::AppState;
@@ -246,7 +247,8 @@ pub async fn run_routine_now(
         )));
     };
 
-    let outcome = execute_claimed_script_run(&store, &loader, claimed)
+    let agent_executor = routine_agent_executor(&state)?;
+    let outcome = execute_claimed_script_run(&store, &loader, Some(&agent_executor), claimed)
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "outcome": outcome })))
@@ -261,6 +263,20 @@ fn routine_store(state: &AppState) -> AppResult<RoutineStore> {
         ));
     };
     Ok(RoutineStore::new(std::sync::Arc::new(pool)))
+}
+
+fn routine_agent_executor(state: &AppState) -> AppResult<RoutineAgentExecutor> {
+    let Some(pool) = state.pg_pool.clone() else {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Database,
+            "postgres pool unavailable; routines require postgresql",
+        ));
+    };
+    Ok(RoutineAgentExecutor::new(
+        std::sync::Arc::new(pool),
+        state.health_registry.clone(),
+    ))
 }
 
 fn fallback_name(script_ref: &str) -> String {

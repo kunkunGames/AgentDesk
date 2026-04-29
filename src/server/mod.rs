@@ -3235,11 +3235,13 @@ async fn dm_reply_retry_loop(pg_pool: Arc<PgPool>) {
 
 async fn routine_runtime_loop(
     pg_pool: Arc<PgPool>,
+    health_registry: Option<Arc<HealthRegistry>>,
     routines_config: crate::config::RoutinesConfig,
     tick_interval_secs: u64,
 ) {
     use crate::services::routines::{
-        RoutineAction, RoutineScriptLoader, RoutineStore, run_due_tick,
+        RoutineAction, RoutineAgentExecutor, RoutineScriptLoader, RoutineStore, poll_agent_turns,
+        run_due_tick,
     };
     let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
@@ -3261,7 +3263,8 @@ async fn routine_runtime_loop(
         Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
     }
 
-    let store = RoutineStore::new(pg_pool);
+    let store = RoutineStore::new(pg_pool.clone());
+    let agent_executor = RoutineAgentExecutor::new(pg_pool, health_registry);
     match store.recover_stale_running_runs().await {
         Ok(n) if n > 0 => tracing::info!(
             recovered = n,
@@ -3291,7 +3294,21 @@ async fn routine_runtime_loop(
                 Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
             }
         }
-        match run_due_tick(&store, &script_loader, routines_config.max_due_per_tick).await {
+        match poll_agent_turns(&store, &agent_executor, routines_config.max_due_per_tick).await {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                tracing::info!(count = outcomes.len(), "routine agent turns completed")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine agent turn polling failed"),
+        }
+        match run_due_tick(
+            &store,
+            &script_loader,
+            Some(&agent_executor),
+            routines_config.max_due_per_tick,
+        )
+        .await
+        {
             Ok(outcomes) if !outcomes.is_empty() => {
                 tracing::info!(count = outcomes.len(), "routine due tick executed")
             }

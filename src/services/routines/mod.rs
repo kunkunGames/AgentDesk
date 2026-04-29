@@ -1,3 +1,4 @@
+pub mod action;
 /// Routines core runtime — durable store plus script-only runtime pieces.
 ///
 /// This module is intentionally small at this stage. It exposes only
@@ -8,12 +9,13 @@
 ///
 /// SQLite users: this module is never instantiated when `pg_pool` is `None`,
 /// so there are zero side effects for non-PG deployments.
-pub mod action;
+pub mod agent_executor;
 pub mod loader;
 pub mod runtime;
 pub mod store;
 
 pub use action::{RoutineAction, validate_routine_action};
+pub use agent_executor::RoutineAgentExecutor;
 pub use loader::RoutineScriptLoader;
-pub use runtime::{execute_claimed_script_run, run_due_tick};
+pub use runtime::{execute_claimed_script_run, poll_agent_turns, run_due_tick};
 pub use store::{NewRoutine, RoutinePatch, RoutineStore};

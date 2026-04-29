@@ -72,6 +72,7 @@ impl RoutineScriptLoader {
         })
     }
 
+    #[cfg(test)]
     pub fn load_script(&self, root: &Path, path: &Path) -> Result<String> {
         let script = load_single_routine_script(root, path)?;
         tracing::debug!(

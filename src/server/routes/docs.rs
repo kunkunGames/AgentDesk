@@ -2585,12 +2585,12 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/run-now",
             "routines",
-            "Claim and execute one routine through the script-only runtime.",
+            "Claim and execute one routine. Script actions close immediately; agent actions store turn_id and remain running until session_transcripts completion evidence is found.",
         )
         .with_params([("id", path_param("Routine id"))])
         .with_example(
             json!({"path": {"id": "routine-1"}}),
-            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "complete", "status": "succeeded", "fresh_context_guaranteed": false}}),
+            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "agent", "status": "running", "result_json": {"turn_id": "discord:1473922824350601297:9100000000000000000", "fresh_context_guaranteed": false}}}),
         ),
         ep(
             "POST",

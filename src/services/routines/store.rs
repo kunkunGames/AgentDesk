@@ -65,6 +65,16 @@ pub struct RoutineRunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RunningAgentRoutineRun {
+    pub run_id: String,
+    pub routine_id: String,
+    pub script_ref: String,
+    pub turn_id: String,
+    pub result_json: Option<Value>,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewRoutine {
     pub agent_id: Option<String>,
@@ -197,6 +207,34 @@ impl RoutineStore {
         .map_err(|e| anyhow!("list routine runs {routine_id}: {e}"))
     }
 
+    pub async fn list_running_agent_runs(&self, limit: u32) -> Result<Vec<RunningAgentRoutineRun>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as(
+            r#"
+            SELECT rr.id AS run_id,
+                   rr.routine_id,
+                   r.script_ref,
+                   rr.turn_id,
+                   rr.result_json,
+                   rr.started_at
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.status = 'running'
+              AND rr.action = 'agent'
+              AND rr.turn_id IS NOT NULL
+            ORDER BY rr.started_at ASC, rr.created_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list running agent routine runs: {e}"))
+    }
+
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
         validate_execution_strategy(&new_routine.execution_strategy)?;
         let id = Uuid::new_v4().to_string();
@@ -304,7 +342,7 @@ impl RoutineStore {
                 error: None,
                 checkpoint,
                 last_result,
-                next_due_at,
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
                 pause_routine: false,
             },
         )
@@ -328,7 +366,7 @@ impl RoutineStore {
                 error: None,
                 checkpoint,
                 last_result,
-                next_due_at,
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
                 pause_routine: false,
             },
         )
@@ -351,7 +389,7 @@ impl RoutineStore {
                 error: None,
                 checkpoint,
                 last_result,
-                next_due_at: None,
+                next_due_at: NextDueAtUpdate::Clear,
                 pause_routine: true,
             },
         )
@@ -374,7 +412,83 @@ impl RoutineStore {
                 error: Some(error),
                 checkpoint: None,
                 last_result: Some(error),
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_agent_turn_started(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        result_json: Option<Value>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET action = 'agent',
+                turn_id = $2,
+                result_json = $3,
+                lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(turn_id)
+        .bind(result_json)
+        .bind(RUN_LEASE_SECS)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("mark routine agent turn started {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn complete_agent_run(
+        &self,
+        run_id: &str,
+        result_json: Option<Value>,
+        checkpoint: Option<Value>,
+        last_result: Option<&str>,
+        next_due_at: NextDueAtUpdate,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "succeeded",
+                action: Some("agent"),
+                result_json,
+                error: None,
+                checkpoint,
+                last_result,
                 next_due_at,
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn fail_agent_run(
+        &self,
+        run_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "failed",
+                action: Some("agent"),
+                result_json,
+                error: Some(error),
+                checkpoint: None,
+                last_result: Some(error),
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
                 pause_routine: false,
             },
         )
@@ -625,7 +739,7 @@ impl RoutineStore {
             UPDATE routines
             SET in_flight_run_id = NULL,
                 status = CASE WHEN $5 THEN 'paused' ELSE status END,
-                next_due_at = COALESCE($2, next_due_at),
+                next_due_at = CASE WHEN $7 THEN $2 ELSE next_due_at END,
                 checkpoint = COALESCE($3, checkpoint),
                 last_result = $4,
                 updated_at = NOW()
@@ -634,11 +748,12 @@ impl RoutineStore {
             "#,
         )
         .bind(&routine_id)
-        .bind(close.next_due_at)
+        .bind(close.next_due_at.value())
         .bind(&close.checkpoint)
         .bind(close.last_result)
         .bind(close.pause_routine)
         .bind(run_id)
+        .bind(close.next_due_at.should_update())
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("close run {run_id}: update routine {routine_id}: {e}"))?;
@@ -689,6 +804,30 @@ fn validate_execution_strategy(strategy: &str) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum NextDueAtUpdate {
+    Preserve,
+    Set(DateTime<Utc>),
+    Clear,
+}
+
+impl NextDueAtUpdate {
+    fn from_optional_preserve(next_due_at: Option<DateTime<Utc>>) -> Self {
+        next_due_at.map(Self::Set).unwrap_or(Self::Preserve)
+    }
+
+    fn should_update(&self) -> bool {
+        !matches!(self, Self::Preserve)
+    }
+
+    fn value(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Preserve | Self::Clear => None,
+            Self::Set(value) => Some(*value),
+        }
+    }
+}
+
 struct CloseRun<'a> {
     run_status: &'a str,
     action: Option<&'a str>,
@@ -696,7 +835,7 @@ struct CloseRun<'a> {
     error: Option<&'a str>,
     checkpoint: Option<Value>,
     last_result: Option<&'a str>,
-    next_due_at: Option<DateTime<Utc>>,
+    next_due_at: NextDueAtUpdate,
     pause_routine: bool,
 }
 

@@ -73,3 +73,11 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_running
 CREATE INDEX IF NOT EXISTS idx_routine_runs_running_lease
     ON routine_runs(lease_expires_at)
     WHERE status = 'running' AND lease_expires_at IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_running_agent
+    ON routine_runs(started_at)
+    WHERE status = 'running' AND action = 'agent' AND turn_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_turn_id
+    ON routine_runs(turn_id)
+    WHERE turn_id IS NOT NULL;
