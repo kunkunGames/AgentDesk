@@ -1492,9 +1492,9 @@ mod tests {
         DEFAULT_MEMENTO_MCP_URL, DiscordBotAuthConfig, DiscordConfig, EscalationConfig,
         EscalationMode, EscalationScheduleConfig, FileMemoryConfig, KanbanConfig, McpMemoryConfig,
         McpServerAuthConfig, McpServerAuthType, McpServerConfig, MemoryConfig, OnboardingConfig,
-        ReviewConfig, RuntimeSettingsConfig, is_valid_dispatch_profile, load_from_path,
-        normalize_cache_ttl_minutes, normalize_dispatch_profile, resolve_graceful_config_path,
-        runtime_root, save_to_path,
+        ReviewConfig, RoutinesConfig, RuntimeSettingsConfig, is_valid_dispatch_profile,
+        load_from_path, normalize_cache_ttl_minutes, normalize_dispatch_profile,
+        resolve_graceful_config_path, runtime_root, save_to_path,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
@@ -1634,6 +1634,74 @@ mod tests {
         assert_eq!(resolved, root.join("agentdesk.yaml"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routines_config_defaults_are_disabled_safe() {
+        let config = Config::default();
+
+        assert_eq!(config.routines, RoutinesConfig::default());
+        assert!(!config.routines.enabled);
+        assert_eq!(config.routines.dir, PathBuf::from("./routines"));
+        assert_eq!(config.routines.tick_interval_secs, 30);
+        assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.default_timezone, "UTC");
+        assert!(config.routines.hot_reload);
+        assert!(config.routines.is_default());
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("routines:"),
+            "default routines config must be omitted, got: {yaml}"
+        );
+    }
+
+    #[test]
+    fn routines_config_partial_yaml_uses_defaults() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  port: 9010
+routines:
+  enabled: true
+  dir: ./ops-routines
+"#,
+        )
+        .unwrap();
+
+        assert!(config.routines.enabled);
+        assert_eq!(config.routines.dir, PathBuf::from("./ops-routines"));
+        assert_eq!(config.routines.tick_interval_secs, 30);
+        assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.default_timezone, "UTC");
+        assert!(config.routines.hot_reload);
+        assert!(!config.routines.is_default());
+    }
+
+    #[test]
+    fn routines_config_round_trips_through_yaml() {
+        let mut config = Config::default();
+        config.routines = RoutinesConfig {
+            enabled: true,
+            dir: PathBuf::from("./routines-prod"),
+            tick_interval_secs: 15,
+            max_due_per_tick: 25,
+            default_timezone: "Asia/Seoul".to_string(),
+            hot_reload: false,
+        };
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            yaml.contains("routines:"),
+            "non-default routines config must be serialized, got: {yaml}"
+        );
+        assert!(
+            yaml.contains("enabled: true"),
+            "enabled flag must be serialized, got: {yaml}"
+        );
+
+        let reloaded: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.routines, config.routines);
     }
 
     #[test]

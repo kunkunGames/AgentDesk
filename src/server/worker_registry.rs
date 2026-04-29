@@ -483,7 +483,10 @@ impl SupervisedWorkerRegistry {
                     return Ok(None);
                 }
                 let Some(routine_pg_pool) = self.pg_pool.clone() else {
-                    self.log_skip(spec, "postgres pool unavailable; routines require postgresql");
+                    self.log_skip(
+                        spec,
+                        "postgres pool unavailable; routines require postgresql",
+                    );
                     return Ok(None);
                 };
                 let tick_secs = self.config.routines.tick_interval_secs;

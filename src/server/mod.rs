@@ -3237,7 +3237,10 @@ async fn routine_runtime_loop(pg_pool: Arc<PgPool>, tick_interval_secs: u64) {
     use crate::services::routines::RoutineStore;
     let store = RoutineStore::new(pg_pool);
     match store.recover_stale_running_runs().await {
-        Ok(n) if n > 0 => tracing::info!(recovered = n, "routine boot recovery: stale runs marked interrupted"),
+        Ok(n) if n > 0 => tracing::info!(
+            recovered = n,
+            "routine boot recovery: stale runs marked interrupted"
+        ),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "routine boot recovery failed"),
     }
