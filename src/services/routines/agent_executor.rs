@@ -106,7 +106,7 @@ impl RoutineAgentExecutor {
         let pending = store.list_running_agent_runs(limit).await?;
         let mut outcomes = Vec::new();
         for run in pending {
-            if let Some(completion) = self.find_turn_completion(&run.turn_id).await? {
+            if let Some(completion) = self.find_turn_completion(&run).await? {
                 let checkpoint = pending_checkpoint(run.result_json.as_ref());
                 let next_due_at = pending_next_due_at(run.result_json.as_ref());
                 let last_result = assistant_preview(&completion.assistant_message);
@@ -298,20 +298,32 @@ impl RoutineAgentExecutor {
         Ok(StartedAgentTurn { result_json })
     }
 
-    async fn find_turn_completion(&self, turn_id: &str) -> Result<Option<AgentTurnCompletion>> {
+    async fn find_turn_completion(
+        &self,
+        run: &RunningAgentRoutineRun,
+    ) -> Result<Option<AgentTurnCompletion>> {
         sqlx::query_as(
             r#"
             SELECT assistant_message, duration_ms, created_at
             FROM session_transcripts
             WHERE turn_id = $1
+              AND created_at >= $2
               AND BTRIM(assistant_message) <> ''
+            ORDER BY created_at ASC
             LIMIT 1
             "#,
         )
-        .bind(turn_id)
+        .bind(&run.turn_id)
+        .bind(run.started_at)
         .fetch_optional(&*self.pool)
         .await
-        .map_err(|error| anyhow!("lookup routine agent transcript {turn_id}: {error}"))
+        .map_err(|error| {
+            anyhow!(
+                "lookup routine agent transcript {} for run {}: {error}",
+                run.turn_id,
+                run.run_id
+            )
+        })
     }
 
     fn timeout_secs_for_run(&self, run: &RunningAgentRoutineRun) -> u64 {

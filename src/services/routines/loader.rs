@@ -100,11 +100,8 @@ impl RoutineScriptLoader {
             return Ok(0);
         }
 
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(root)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
-            .collect();
+        let mut entries = Vec::new();
+        collect_routine_script_paths(root, &mut entries)?;
         entries.sort();
 
         let mut loaded = 0;
@@ -476,6 +473,20 @@ fn script_ref(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn collect_routine_script_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_routine_script_paths(&path, out)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "js") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +554,24 @@ mod tests {
             loader.script_refs().unwrap(),
             vec!["first.js".to_string(), "second.js".to_string()]
         );
+    }
+
+    #[test]
+    fn load_dir_recurses_into_nested_script_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("ops").join("daily");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("summary.js");
+        std::fs::write(
+            &path,
+            "agentdesk.routines.register({ name: 'Nested', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        assert_eq!(loader.load_dir(dir.path()).unwrap(), 1);
+        assert_eq!(loader.script_refs().unwrap(), vec!["ops/daily/summary.js"]);
+        assert!(loader.has_script("ops/daily/summary.js").unwrap());
     }
 
     #[test]
