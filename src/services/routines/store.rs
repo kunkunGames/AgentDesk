@@ -494,6 +494,9 @@ impl RoutineStore {
             )?);
             update_next_due_at = true;
         }
+        if schedule_was_set && schedule.is_none() && !next_due_was_set {
+            update_next_due_at = true;
+        }
         sqlx::query_as(
             r#"
             UPDATE routines
