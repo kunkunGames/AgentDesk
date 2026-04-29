@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::engine::PolicyEngine;
 use crate::services::discord::health::HealthRegistry;
+use crate::services::routines::validate_routine_runtime_config;
 use sqlx::PgPool;
 
 use super::ws::{BatchBuffer, BroadcastTx};
@@ -49,6 +50,7 @@ enum ServerWorkerId {
     DispatchOutbox,
     DmReplyRetry,
     WsBatchFlusher,
+    RoutineRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +133,7 @@ pub(crate) struct WorkerSpec {
     pub(crate) notes: &'static str,
 }
 
-pub(crate) const WORKER_SPECS: [WorkerSpec; 8] = [
+pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
     WorkerSpec {
         id: ServerWorkerId::GithubSync,
         name: "github_sync_loop",
@@ -215,6 +217,21 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 8] = [
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
         health_owner: "dispatch outbox tables and delivery tracing",
         notes: "Shares the boot-reconcile boundary with other DB-backed recovery workers",
+    },
+    WorkerSpec {
+        id: ServerWorkerId::RoutineRuntime,
+        name: "routine-runtime",
+        kind: WorkerKind::TokioTask,
+        target: "routine_runtime_loop",
+        responsibility: "Run scheduled JS routines independent of the policy-tick engine",
+        owner: "server::worker_registry",
+        start_stage: WorkerStartStage::AfterBootReconcile,
+        start_order: 55,
+        restart_policy: WorkerRestartPolicy::SkipWhenDisabled,
+        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        health_owner: "routine_runs row state and tracing logs",
+        notes: "Skipped when routines.enabled=false or postgres pool unavailable; \
+                performs boot recovery of stale running runs before the tick loop starts",
     },
     WorkerSpec {
         id: ServerWorkerId::DmReplyRetry,
@@ -461,6 +478,47 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(Some(buffer))
             }
+            ServerWorkerId::RoutineRuntime => {
+                if !self.config.routines.enabled {
+                    self.log_skip(spec, "routines.enabled=false");
+                    return Ok(None);
+                }
+                let tick_secs = match validate_routine_runtime_config(&self.config.routines) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.log_skip(spec, error.message());
+                        return Ok(None);
+                    }
+                };
+                let Some(routine_pg_pool) = self.pg_pool.clone() else {
+                    self.log_skip(
+                        spec,
+                        "postgres pool unavailable; routines require postgresql",
+                    );
+                    return Ok(None);
+                };
+                let routines_config = self.config.routines.clone();
+                let routine_health_target = self
+                    .config
+                    .kanban
+                    .human_alert_channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("channel:{value}"));
+                let routine_health_registry = self.health_registry.clone();
+                self.register_tokio(spec, async move {
+                    super::routine_runtime_loop(
+                        routine_pg_pool,
+                        routine_health_registry,
+                        routines_config,
+                        routine_health_target,
+                        tick_secs,
+                    )
+                    .await;
+                });
+                Ok(None)
+            }
         }
     }
 
@@ -539,7 +597,7 @@ mod tests {
 
     #[test]
     fn long_lived_workers_have_explicit_supervision_metadata() {
-        assert_eq!(WORKER_SPECS.len(), 8);
+        assert_eq!(WORKER_SPECS.len(), 9);
         assert!(
             WORKER_SPECS
                 .windows(2)
@@ -550,7 +608,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.start_stage == WorkerStartStage::AfterBootReconcile)
                 .count(),
-            7
+            8
         );
         assert_eq!(
             WORKER_SPECS

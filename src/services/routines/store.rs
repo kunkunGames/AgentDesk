@@ -1,0 +1,1537 @@
+use anyhow::{Result, anyhow};
+use chrono::{DateTime, Duration, Utc};
+use chrono_tz::Tz;
+use croner::Cron;
+use croner::parser::{CronParser, Seconds, Year};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::str::FromStr;
+use std::sync::Arc;
+use uuid::Uuid;
+
+pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
+const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
+
+/// Durable PG-backed store for routines and routine_runs.
+///
+/// All mutating operations are transaction-scoped. Callers never hold a
+/// connection across JS execution — claim and finish are always separate
+/// transactions (see M-1 in PRD review notes).
+#[derive(Clone)]
+pub struct RoutineStore {
+    pool: Arc<PgPool>,
+    default_timezone: String,
+}
+
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct ClaimedRoutineRun {
+    pub run_id: String,
+    pub routine_id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub execution_strategy: String,
+    pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRecord {
+    pub id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub status: String,
+    pub execution_strategy: String,
+    pub schedule: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_result: Option<String>,
+    pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
+    pub in_flight_run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRunRecord {
+    pub id: String,
+    pub routine_id: String,
+    pub status: String,
+    pub action: Option<String>,
+    pub turn_id: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub result_json: Option<Value>,
+    pub error: Option<String>,
+    pub discord_log_status: Option<String>,
+    pub discord_log_error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct RoutineRunSearchRecord {
+    pub id: String,
+    pub routine_id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub status: String,
+    pub action: Option<String>,
+    pub result_json: Option<Value>,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoutineMetrics {
+    pub routines_total: i64,
+    pub routines_enabled: i64,
+    pub routines_paused: i64,
+    pub routines_detached: i64,
+    pub runs_total: i64,
+    pub runs_running: i64,
+    pub runs_succeeded: i64,
+    pub runs_failed: i64,
+    pub runs_skipped: i64,
+    pub runs_paused: i64,
+    pub runs_interrupted: i64,
+    pub runs_error: i64,
+    pub avg_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RunningAgentRoutineRun {
+    pub run_id: String,
+    pub routine_id: String,
+    pub script_ref: String,
+    pub turn_id: String,
+    pub result_json: Option<Value>,
+    pub started_at: DateTime<Utc>,
+    pub timeout_secs: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RecoveredRoutineRun {
+    pub run_id: String,
+    pub routine_id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub discord_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewRoutine {
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub execution_strategy: String,
+    pub schedule: Option<String>,
+    pub next_due_at: Option<DateTime<Utc>>,
+    pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RoutinePatch {
+    pub name: Option<String>,
+    pub execution_strategy: Option<String>,
+    pub schedule: Option<Option<String>>,
+    pub next_due_at: Option<Option<DateTime<Utc>>>,
+    pub checkpoint: Option<Option<Value>>,
+    pub discord_thread_id: Option<Option<String>>,
+    pub timeout_secs: Option<Option<i32>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RoutineClaimCandidate {
+    id: String,
+    agent_id: Option<String>,
+    script_ref: String,
+    name: String,
+    execution_strategy: String,
+    checkpoint: Option<Value>,
+    discord_thread_id: Option<String>,
+    timeout_secs: Option<i32>,
+}
+
+impl RoutineStore {
+    pub fn new_with_timezone(pool: Arc<PgPool>, default_timezone: impl Into<String>) -> Self {
+        Self {
+            pool,
+            default_timezone: default_timezone.into(),
+        }
+    }
+
+    /// Claim due routines in a short transaction.
+    ///
+    /// This only creates `routine_runs` rows and marks parent routines
+    /// in-flight. JS execution and finish/fail handling must happen after this
+    /// transaction commits.
+    pub async fn claim_due_runs(&self, limit: u32) -> Result<Vec<ClaimedRoutineRun>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        Self::seed_scheduled_due_times(&mut tx, &self.default_timezone).await?;
+        let candidates: Vec<RoutineClaimCandidate> = sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint,
+                   discord_thread_id, timeout_secs
+            FROM routines
+            WHERE status = 'enabled'
+              AND next_due_at IS NOT NULL
+              AND next_due_at <= NOW()
+              AND in_flight_run_id IS NULL
+            ORDER BY next_due_at ASC, created_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("claim due routines: select candidates: {e}"))?;
+
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            claimed.push(Self::insert_running_run(&mut tx, candidate).await?);
+        }
+
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn seed_scheduled_due_times(
+        tx: &mut Transaction<'_, Postgres>,
+        default_timezone: &str,
+    ) -> Result<()> {
+        let scheduled: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, schedule
+            FROM routines
+            WHERE status = 'enabled'
+              AND schedule IS NOT NULL
+              AND next_due_at IS NULL
+              AND in_flight_run_id IS NULL
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| anyhow!("seed routine schedules: select routines: {e}"))?;
+
+        for (routine_id, schedule) in scheduled {
+            let next_due_at =
+                match Self::next_due_from_schedule_tx(tx, &schedule, default_timezone).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            routine_id,
+                            schedule,
+                            error = %error,
+                            "routine has invalid schedule; next_due_at not seeded"
+                        );
+                        continue;
+                    }
+                };
+            sqlx::query(
+                r#"
+                UPDATE routines
+                SET next_due_at = $2,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND status = 'enabled'
+                  AND next_due_at IS NULL
+                  AND in_flight_run_id IS NULL
+                "#,
+            )
+            .bind(&routine_id)
+            .bind(next_due_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("seed routine {routine_id} next_due_at: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_routines(
+        &self,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<RoutineRecord>> {
+        sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, status, execution_strategy,
+                   schedule, next_due_at, last_run_at, last_result, checkpoint,
+                   discord_thread_id, timeout_secs, in_flight_run_id,
+                   created_at, updated_at
+            FROM routines
+            WHERE ($1::text IS NULL OR agent_id = $1)
+              AND ($2::text IS NULL OR status = $2)
+            ORDER BY created_at DESC, id ASC
+            "#,
+        )
+        .bind(agent_id)
+        .bind(status)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list routines: {e}"))
+    }
+
+    pub async fn get_routine(&self, routine_id: &str) -> Result<Option<RoutineRecord>> {
+        sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, status, execution_strategy,
+                   schedule, next_due_at, last_run_at, last_result, checkpoint,
+                   discord_thread_id, timeout_secs, in_flight_run_id,
+                   created_at, updated_at
+            FROM routines
+            WHERE id = $1
+            "#,
+        )
+        .bind(routine_id)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("get routine {routine_id}: {e}"))
+    }
+
+    pub async fn list_runs(&self, routine_id: &str, limit: i64) -> Result<Vec<RoutineRunRecord>> {
+        let limit = limit.clamp(1, 100);
+        sqlx::query_as(
+            r#"
+            SELECT id, routine_id, status, action, turn_id, lease_expires_at,
+                   result_json, error, discord_log_status, discord_log_error, started_at,
+                   finished_at, created_at, updated_at
+            FROM routine_runs
+            WHERE routine_id = $1
+            ORDER BY started_at DESC, created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(routine_id)
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list routine runs {routine_id}: {e}"))
+    }
+
+    pub async fn list_running_agent_runs(&self, limit: u32) -> Result<Vec<RunningAgentRoutineRun>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as(
+            r#"
+            SELECT rr.id AS run_id,
+                   rr.routine_id,
+                   r.script_ref,
+                   rr.turn_id,
+                   rr.result_json,
+                   rr.started_at,
+                   r.timeout_secs
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.status = 'running'
+              AND rr.action = 'agent'
+              AND rr.turn_id IS NOT NULL
+            ORDER BY rr.started_at ASC, rr.created_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("list running agent routine runs: {e}"))
+    }
+
+    pub async fn heartbeat_running_agent_runs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET lease_expires_at = NOW() + ($1::bigint * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE status = 'running'
+              AND action = 'agent'
+              AND turn_id IS NOT NULL
+            "#,
+        )
+        .bind(RUN_LEASE_SECS)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("heartbeat running agent routine runs: {e}"))?;
+
+        Ok(result.rows_affected())
+    }
+
+    pub async fn metrics(
+        &self,
+        agent_id: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<RoutineMetrics> {
+        let routine_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS routines_total,
+                COUNT(*) FILTER (WHERE status = 'enabled')::BIGINT AS routines_enabled,
+                COUNT(*) FILTER (WHERE status = 'paused')::BIGINT AS routines_paused,
+                COUNT(*) FILTER (WHERE status = 'detached')::BIGINT AS routines_detached
+            FROM routines
+            WHERE ($1::text IS NULL OR agent_id = $1)
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("load routine metrics: routines: {e}"))?;
+
+        let run_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(rr.id)::BIGINT AS runs_total,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'running')::BIGINT AS runs_running,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'succeeded')::BIGINT AS runs_succeeded,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'failed')::BIGINT AS runs_failed,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'skipped')::BIGINT AS runs_skipped,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'paused')::BIGINT AS runs_paused,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'interrupted')::BIGINT AS runs_interrupted,
+                COUNT(rr.id) FILTER (
+                    WHERE rr.status IN ('failed', 'interrupted') OR rr.error IS NOT NULL
+                )::BIGINT AS runs_error,
+                AVG(EXTRACT(EPOCH FROM (rr.finished_at - rr.started_at)) * 1000.0)
+                    FILTER (WHERE rr.finished_at IS NOT NULL)::DOUBLE PRECISION AS avg_latency_ms
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE ($1::text IS NULL OR r.agent_id = $1)
+              AND ($2::timestamptz IS NULL OR rr.created_at >= $2)
+            "#,
+        )
+        .bind(agent_id)
+        .bind(since)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("load routine metrics: runs: {e}"))?;
+
+        Ok(RoutineMetrics {
+            routines_total: get_i64(&routine_row, "routines_total")?,
+            routines_enabled: get_i64(&routine_row, "routines_enabled")?,
+            routines_paused: get_i64(&routine_row, "routines_paused")?,
+            routines_detached: get_i64(&routine_row, "routines_detached")?,
+            runs_total: get_i64(&run_row, "runs_total")?,
+            runs_running: get_i64(&run_row, "runs_running")?,
+            runs_succeeded: get_i64(&run_row, "runs_succeeded")?,
+            runs_failed: get_i64(&run_row, "runs_failed")?,
+            runs_skipped: get_i64(&run_row, "runs_skipped")?,
+            runs_paused: get_i64(&run_row, "runs_paused")?,
+            runs_interrupted: get_i64(&run_row, "runs_interrupted")?,
+            runs_error: get_i64(&run_row, "runs_error")?,
+            avg_latency_ms: run_row
+                .try_get("avg_latency_ms")
+                .map_err(|e| anyhow!("decode routine metric avg_latency_ms: {e}"))?,
+        })
+    }
+
+    pub async fn search_run_results(
+        &self,
+        query: &str,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<RoutineRunSearchRecord>> {
+        let limit = limit.clamp(1, 100);
+        let pattern = format!("%{}%", escape_like_pattern(query));
+        sqlx::query_as(
+            r#"
+            SELECT
+                rr.id,
+                rr.routine_id,
+                r.agent_id,
+                r.script_ref,
+                r.name,
+                rr.status,
+                rr.action,
+                rr.result_json,
+                rr.error,
+                rr.started_at,
+                rr.finished_at,
+                rr.created_at,
+                rr.updated_at
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.result_json IS NOT NULL
+              AND rr.result_json::text ILIKE $1 ESCAPE '\'
+              AND ($2::text IS NULL OR r.agent_id = $2)
+              AND ($3::text IS NULL OR rr.status = $3)
+              AND ($4::timestamptz IS NULL OR rr.created_at >= $4)
+            ORDER BY rr.created_at DESC
+            LIMIT $5
+            "#,
+        )
+        .bind(pattern)
+        .bind(agent_id)
+        .bind(status)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("search routine run results: {e}"))
+    }
+
+    pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
+        validate_execution_strategy(&new_routine.execution_strategy)?;
+        let schedule = normalize_schedule(new_routine.schedule)?;
+        validate_timeout_secs(new_routine.timeout_secs)?;
+        let discord_thread_id = normalize_optional_text(new_routine.discord_thread_id);
+        let next_due_at = if let Some(value) = new_routine.next_due_at {
+            Some(value)
+        } else if let Some(schedule) = schedule.as_deref() {
+            Some(self.next_due_from_schedule(schedule).await?)
+        } else {
+            None
+        };
+        let id = Uuid::new_v4().to_string();
+        sqlx::query_as(
+            r#"
+            INSERT INTO routines (
+                id, agent_id, script_ref, name, status, execution_strategy,
+                schedule, next_due_at, checkpoint, discord_thread_id, timeout_secs
+            )
+            VALUES ($1, $2, $3, $4, 'enabled', $5, $6, $7, $8, $9, $10)
+            RETURNING id, agent_id, script_ref, name, status, execution_strategy,
+                      schedule, next_due_at, last_run_at, last_result, checkpoint,
+                      discord_thread_id, timeout_secs, in_flight_run_id,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(new_routine.agent_id)
+        .bind(new_routine.script_ref)
+        .bind(new_routine.name)
+        .bind(new_routine.execution_strategy)
+        .bind(schedule)
+        .bind(next_due_at)
+        .bind(new_routine.checkpoint)
+        .bind(discord_thread_id)
+        .bind(new_routine.timeout_secs)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("attach routine: {e}"))
+    }
+
+    pub async fn patch_routine(
+        &self,
+        routine_id: &str,
+        patch: RoutinePatch,
+    ) -> Result<Option<RoutineRecord>> {
+        if let Some(strategy) = patch.execution_strategy.as_deref() {
+            validate_execution_strategy(strategy)?;
+        }
+        validate_timeout_secs(patch.timeout_secs.flatten())?;
+        let schedule_was_set = patch.schedule.is_some();
+        let schedule = match patch.schedule {
+            Some(value) => normalize_schedule(value)?,
+            None => None,
+        };
+        let discord_thread_id_was_set = patch.discord_thread_id.is_some();
+        let discord_thread_id = patch
+            .discord_thread_id
+            .map(|value| normalize_optional_text(value));
+        let timeout_secs_was_set = patch.timeout_secs.is_some();
+        let timeout_secs = patch.timeout_secs.flatten();
+        let next_due_was_set = patch.next_due_at.is_some();
+        let mut next_due_at = patch.next_due_at.flatten();
+        let mut update_next_due_at = next_due_was_set;
+        if schedule_was_set && schedule.is_some() && !next_due_was_set {
+            next_due_at = Some(
+                self.next_due_from_schedule(
+                    schedule
+                        .as_deref()
+                        .expect("checked schedule is present after is_some"),
+                )
+                .await?,
+            );
+            update_next_due_at = true;
+        }
+        if schedule_was_set && schedule.is_none() && !next_due_was_set {
+            update_next_due_at = true;
+        }
+        sqlx::query_as(
+            r#"
+            UPDATE routines
+            SET name = COALESCE($2, name),
+                execution_strategy = COALESCE($3, execution_strategy),
+                schedule = CASE WHEN $4 THEN $5 ELSE schedule END,
+                next_due_at = CASE WHEN $6 THEN $7 ELSE next_due_at END,
+                checkpoint = CASE WHEN $8 THEN $9 ELSE checkpoint END,
+                discord_thread_id = CASE WHEN $10 THEN $11 ELSE discord_thread_id END,
+                timeout_secs = CASE WHEN $12 THEN $13 ELSE timeout_secs END,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+            RETURNING id, agent_id, script_ref, name, status, execution_strategy,
+                      schedule, next_due_at, last_run_at, last_result, checkpoint,
+                      discord_thread_id, timeout_secs, in_flight_run_id,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(routine_id)
+        .bind(patch.name)
+        .bind(patch.execution_strategy)
+        .bind(schedule_was_set)
+        .bind(schedule)
+        .bind(update_next_due_at)
+        .bind(next_due_at)
+        .bind(patch.checkpoint.is_some())
+        .bind(patch.checkpoint.flatten())
+        .bind(discord_thread_id_was_set)
+        .bind(discord_thread_id.flatten())
+        .bind(timeout_secs_was_set)
+        .bind(timeout_secs)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("patch routine {routine_id}: {e}"))
+    }
+
+    /// Claim one enabled routine immediately, independent of its schedule.
+    pub async fn claim_run_now(&self, routine_id: &str) -> Result<Option<ClaimedRoutineRun>> {
+        let mut tx = self.pool.begin().await?;
+        let candidate: Option<RoutineClaimCandidate> = sqlx::query_as(
+            r#"
+            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint,
+                   discord_thread_id, timeout_secs
+            FROM routines
+            WHERE id = $1
+              AND status = 'enabled'
+              AND in_flight_run_id IS NULL
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(routine_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("claim run-now routine {routine_id}: select candidate: {e}"))?;
+
+        let claimed = match candidate {
+            Some(candidate) => Some(Self::insert_running_run(&mut tx, candidate).await?),
+            None => None,
+        };
+
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    pub async fn finish_run(
+        &self,
+        run_id: &str,
+        result_json: Option<Value>,
+        checkpoint: Option<Value>,
+        last_result: Option<&str>,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "succeeded",
+                action: Some("complete"),
+                result_json,
+                error: None,
+                checkpoint,
+                last_result,
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn skip_run(
+        &self,
+        run_id: &str,
+        result_json: Option<Value>,
+        checkpoint: Option<Value>,
+        last_result: Option<&str>,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "skipped",
+                action: Some("skip"),
+                result_json,
+                error: None,
+                checkpoint,
+                last_result,
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn pause_after_run(
+        &self,
+        run_id: &str,
+        result_json: Option<Value>,
+        checkpoint: Option<Value>,
+        last_result: Option<&str>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "paused",
+                action: Some("pause"),
+                result_json,
+                error: None,
+                checkpoint,
+                last_result,
+                next_due_at: NextDueAtUpdate::Clear,
+                pause_routine: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn fail_run(
+        &self,
+        run_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "failed",
+                action: None,
+                result_json,
+                error: Some(error),
+                checkpoint: None,
+                last_result: Some(error),
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn mark_agent_turn_started(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        result_json: Option<Value>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET action = 'agent',
+                turn_id = $2,
+                result_json = $3,
+                lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(turn_id)
+        .bind(result_json)
+        .bind(RUN_LEASE_SECS)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("mark routine agent turn started {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn complete_agent_run(
+        &self,
+        run_id: &str,
+        result_json: Option<Value>,
+        checkpoint: Option<Value>,
+        last_result: Option<&str>,
+        next_due_at: NextDueAtUpdate,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "succeeded",
+                action: Some("agent"),
+                result_json,
+                error: None,
+                checkpoint,
+                last_result,
+                next_due_at,
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn fail_agent_run(
+        &self,
+        run_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "failed",
+                action: Some("agent"),
+                result_json,
+                error: Some(error),
+                checkpoint: None,
+                last_result: Some(error),
+                next_due_at: NextDueAtUpdate::from_optional_preserve(next_due_at),
+                pause_routine: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn pause_routine(&self, routine_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET status = 'paused',
+                next_due_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'enabled'
+            "#,
+        )
+        .bind(routine_id)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("pause routine {routine_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Resume a paused routine. `next_due_at` is authoritative; pass `None`
+    /// for manual-only routines.
+    pub async fn resume_routine(
+        &self,
+        routine_id: &str,
+        next_due_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET status = 'enabled',
+                next_due_at = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'paused'
+            "#,
+        )
+        .bind(routine_id)
+        .bind(next_due_at)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("resume routine {routine_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn detach_routine(&self, routine_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET status = 'detached',
+                next_due_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+              AND in_flight_run_id IS NULL
+            "#,
+        )
+        .bind(routine_id)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("detach routine {routine_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Extend the lease for a running routine run.
+    ///
+    /// Executors must call this periodically while JS execution is active.
+    /// Boot recovery only interrupts rows whose lease has expired.
+    pub async fn heartbeat_run(&self, run_id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET lease_expires_at = NOW() + ($2::bigint * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(RUN_LEASE_SECS)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("heartbeat routine run {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn record_discord_log_result(
+        &self,
+        run_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET discord_log_status = CASE
+                    WHEN discord_log_status = 'failed' AND $2 <> 'failed'
+                    THEN discord_log_status
+                    ELSE $2
+                END,
+                discord_log_error = CASE
+                    WHEN discord_log_status = 'failed' AND $2 <> 'failed'
+                    THEN discord_log_error
+                    ELSE $3
+                END,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(error)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("record routine discord log result {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_discord_thread_id(
+        &self,
+        routine_id: &str,
+        discord_thread_id: &str,
+    ) -> Result<bool> {
+        let normalized = normalize_optional_text(Some(discord_thread_id.to_string()))
+            .ok_or_else(|| anyhow!("discord_thread_id must not be empty"))?;
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET discord_thread_id = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+            "#,
+        )
+        .bind(routine_id)
+        .bind(normalized)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("update routine {routine_id} discord_thread_id: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Interrupt the current in-flight run for a routine after an explicit
+    /// session reset/kill invalidates the provider context.
+    pub async fn interrupt_in_flight_run(
+        &self,
+        routine_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+    ) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+
+        let run_id: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT rr.id
+            FROM routine_runs rr
+            JOIN routines r ON r.in_flight_run_id = rr.id
+            WHERE r.id = $1
+              AND rr.routine_id = $1
+              AND rr.status = 'running'
+            FOR UPDATE OF rr
+            "#,
+        )
+        .bind(routine_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: lock running run: {e}"))?;
+
+        let Some(run_id) = run_id else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let routine_updated = sqlx::query(
+            r#"
+            UPDATE routines
+            SET in_flight_run_id = NULL,
+                last_result = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND in_flight_run_id = $3
+            "#,
+        )
+        .bind(routine_id)
+        .bind(error)
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: clear in-flight: {e}"))?;
+
+        if routine_updated.rows_affected() != 1 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let run_updated = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET status = 'interrupted',
+                result_json = COALESCE($3, result_json),
+                error = $2,
+                finished_at = NOW(),
+                lease_expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND routine_id = $4
+              AND status = 'running'
+            "#,
+        )
+        .bind(&run_id)
+        .bind(error)
+        .bind(result_json)
+        .bind(routine_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine run {run_id}: {e}"))?;
+
+        if run_updated.rows_affected() != 1 {
+            return Err(anyhow!(
+                "interrupt routine run {run_id}: running run guard lost row"
+            ));
+        }
+
+        tx.commit().await?;
+        Ok(Some(run_id))
+    }
+
+    /// Boot recovery: mark expired-lease `running` runs as `interrupted`, clear
+    /// `in_flight_run_id` on their parent routines. Called once at worker
+    /// startup before the tick loop begins. Running rows without an expired
+    /// lease are left alone so a second server instance cannot interrupt work
+    /// that another instance is actively executing.
+    ///
+    /// Returns the expired-lease runs that were recovered.
+    pub async fn recover_stale_running_runs(&self) -> Result<Vec<RecoveredRoutineRun>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Close expired leases. The UPDATE re-checks status and lease expiry
+        // under the row lock so a concurrently finished run is not clobbered.
+        let recovered: Vec<RecoveredRoutineRun> = sqlx::query_as(
+            r#"
+            WITH expired AS (
+                SELECT id
+                FROM routine_runs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < NOW()
+                FOR UPDATE SKIP LOCKED
+            ),
+            closed AS (
+                UPDATE routine_runs AS rr
+                SET status = 'interrupted',
+                    finished_at = NOW(),
+                    updated_at = NOW(),
+                    lease_expires_at = NULL,
+                    error = 'interrupted by expired routine lease'
+                FROM expired
+                WHERE rr.id = expired.id
+                  AND rr.status = 'running'
+                  AND rr.lease_expires_at IS NOT NULL
+                  AND rr.lease_expires_at < NOW()
+                RETURNING rr.id, rr.routine_id
+            )
+            SELECT closed.id AS run_id,
+                   r.id AS routine_id,
+                   r.agent_id,
+                   r.script_ref,
+                   r.name,
+                   r.discord_thread_id
+            FROM closed
+            JOIN routines r ON r.id = closed.routine_id
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("recover: close expired routine leases: {e}"))?;
+
+        if recovered.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        let recovered_routine_ids: Vec<&str> = recovered
+            .iter()
+            .map(|run| run.routine_id.as_str())
+            .collect();
+        let recovered_run_ids: Vec<&str> =
+            recovered.iter().map(|run| run.run_id.as_str()).collect();
+
+        // Release only locks that still point at the interrupted run.
+        sqlx::query(
+            r#"
+            UPDATE routines AS r
+            SET in_flight_run_id = NULL,
+                updated_at = NOW()
+            FROM UNNEST($1::text[], $2::text[]) AS recovered(routine_id, run_id)
+            WHERE r.id = recovered.routine_id
+              AND r.in_flight_run_id = recovered.run_id
+            "#,
+        )
+        .bind(&recovered_routine_ids)
+        .bind(&recovered_run_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("recover: clear in_flight_run_id: {e}"))?;
+
+        tx.commit().await?;
+        Ok(recovered)
+    }
+
+    async fn next_due_from_schedule(&self, schedule: &str) -> Result<DateTime<Utc>> {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&*self.pool)
+            .await
+            .map_err(|e| anyhow!("load database time for routine schedule: {e}"))?;
+        next_due_after(schedule, &self.default_timezone, now)
+    }
+
+    async fn next_due_from_schedule_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        schedule: &str,
+        default_timezone: &str,
+    ) -> Result<DateTime<Utc>> {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("load database time for routine schedule in tx: {e}"))?;
+        next_due_after(schedule, default_timezone, now)
+    }
+
+    async fn insert_running_run(
+        tx: &mut Transaction<'_, Postgres>,
+        candidate: RoutineClaimCandidate,
+    ) -> Result<ClaimedRoutineRun> {
+        let run_id = Uuid::new_v4().to_string();
+
+        let lease_expires_at: DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO routine_runs (id, routine_id, status, lease_expires_at)
+            VALUES ($1, $2, 'running', NOW() + ($3::bigint * INTERVAL '1 second'))
+            RETURNING lease_expires_at
+            "#,
+        )
+        .bind(&run_id)
+        .bind(&candidate.id)
+        .bind(RUN_LEASE_SECS)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| anyhow!("claim routine {}: insert running run: {e}", candidate.id))?;
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE routines
+            SET in_flight_run_id = $1,
+                last_run_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $2
+              AND in_flight_run_id IS NULL
+            "#,
+        )
+        .bind(&run_id)
+        .bind(&candidate.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow!("claim routine {}: mark in-flight: {e}", candidate.id))?;
+
+        if updated.rows_affected() != 1 {
+            return Err(anyhow!(
+                "claim routine {}: in-flight guard rejected locked candidate",
+                candidate.id
+            ));
+        }
+
+        Ok(ClaimedRoutineRun {
+            run_id,
+            routine_id: candidate.id,
+            agent_id: candidate.agent_id,
+            script_ref: candidate.script_ref,
+            name: candidate.name,
+            execution_strategy: candidate.execution_strategy,
+            checkpoint: candidate.checkpoint,
+            discord_thread_id: candidate.discord_thread_id,
+            timeout_secs: candidate.timeout_secs,
+            lease_expires_at,
+        })
+    }
+
+    async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+
+        let target: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.schedule
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.id = $1
+              AND rr.status = 'running'
+            FOR UPDATE OF rr, r
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
+
+        let Some((routine_id, schedule)) = target else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let scheduled_next_due_at = if close.next_due_at.should_update() {
+            close.next_due_at.value()
+        } else if let Some(schedule) = schedule.as_deref() {
+            Some(Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone).await?)
+        } else {
+            None
+        };
+        let should_update_next_due_at =
+            close.next_due_at.should_update() || scheduled_next_due_at.is_some();
+
+        let routine_updated = sqlx::query(
+            r#"
+            UPDATE routines
+            SET in_flight_run_id = NULL,
+                status = CASE WHEN $5 THEN 'paused' ELSE status END,
+                next_due_at = CASE WHEN $7 THEN $2 ELSE next_due_at END,
+                checkpoint = COALESCE($3, checkpoint),
+                last_result = $4,
+                updated_at = NOW()
+            WHERE id = $1
+              AND in_flight_run_id = $6
+            "#,
+        )
+        .bind(&routine_id)
+        .bind(scheduled_next_due_at)
+        .bind(&close.checkpoint)
+        .bind(close.last_result)
+        .bind(close.pause_routine)
+        .bind(run_id)
+        .bind(should_update_next_due_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("close run {run_id}: update routine {routine_id}: {e}"))?;
+
+        if routine_updated.rows_affected() != 1 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let run_updated = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET status = $2,
+                action = $3,
+                result_json = $4,
+                error = $5,
+                finished_at = NOW(),
+                lease_expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'running'
+            "#,
+        )
+        .bind(run_id)
+        .bind(close.run_status)
+        .bind(close.action)
+        .bind(&close.result_json)
+        .bind(close.error)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("close run {run_id}: update run: {e}"))?;
+
+        if run_updated.rows_affected() != 1 {
+            return Err(anyhow!("close run {run_id}: running run guard lost row"));
+        }
+
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+fn validate_execution_strategy(strategy: &str) -> Result<()> {
+    match strategy {
+        "fresh" | "persistent" => Ok(()),
+        other => Err(anyhow!(
+            "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
+        )),
+    }
+}
+
+pub fn validate_routine_schedule(schedule: &str) -> Result<()> {
+    parse_routine_schedule(schedule).map(|_| ())
+}
+
+fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
+    schedule
+        .map(|schedule| {
+            let schedule = schedule.trim().to_string();
+            validate_routine_schedule(&schedule)?;
+            Ok(schedule)
+        })
+        .transpose()
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_timeout_secs(timeout_secs: Option<i32>) -> Result<()> {
+    if let Some(value) = timeout_secs
+        && value <= 0
+    {
+        return Err(anyhow!("routine timeout_secs must be greater than zero"));
+    }
+    Ok(())
+}
+
+enum ParsedRoutineSchedule {
+    Every(Duration),
+    Cron(Cron),
+}
+
+fn parse_routine_schedule(schedule: &str) -> Result<ParsedRoutineSchedule> {
+    let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+        ));
+    }
+    if trimmed.starts_with("@every ") || trimmed.starts_with("every ") {
+        return parse_schedule_interval(trimmed).map(ParsedRoutineSchedule::Every);
+    }
+    if trimmed.starts_with('@') {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+        ));
+    }
+
+    let field_count = trimmed.split_whitespace().count();
+    if field_count != 5 {
+        return Err(anyhow!(
+            "unsupported routine cron schedule '{schedule}'; expected exactly 5 fields"
+        ));
+    }
+    let cron = CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .build()
+        .parse(trimmed)
+        .map_err(|e| anyhow!("invalid routine cron schedule '{schedule}': {e}"))?;
+    Ok(ParsedRoutineSchedule::Cron(cron))
+}
+
+fn next_due_after(
+    schedule: &str,
+    default_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    match parse_routine_schedule(schedule)? {
+        ParsedRoutineSchedule::Every(duration) => Ok(now + duration),
+        ParsedRoutineSchedule::Cron(cron) => {
+            let timezone = Tz::from_str(default_timezone)
+                .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
+            let zoned_now = now.with_timezone(&timezone);
+            cron.find_next_occurrence(&zoned_now, false)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
+        }
+    }
+}
+
+fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
+    let trimmed = schedule.trim();
+    let duration = trimmed
+        .strip_prefix("@every ")
+        .or_else(|| trimmed.strip_prefix("every "))
+        .unwrap_or(trimmed)
+        .trim();
+    if duration.is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+        ));
+    }
+
+    let split_at = duration
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(duration.len());
+    let (amount, unit) = duration.split_at(split_at);
+    if amount.is_empty() || unit.trim().is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+        ));
+    }
+    let amount: i64 = amount
+        .parse()
+        .map_err(|e| anyhow!("invalid routine schedule amount '{amount}': {e}"))?;
+    if amount <= 0 {
+        return Err(anyhow!(
+            "routine schedule duration must be greater than zero"
+        ));
+    }
+
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        "d" | "day" | "days" => 60 * 60 * 24,
+        other => {
+            return Err(anyhow!(
+                "unsupported routine schedule unit '{other}'; expected s, m, h, or d"
+            ));
+        }
+    };
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("routine schedule duration is too large"))?;
+    Ok(Duration::seconds(seconds))
+}
+
+fn get_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64> {
+    row.try_get(column)
+        .map_err(|e| anyhow!("decode routine metric {column}: {e}"))
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NextDueAtUpdate {
+    Preserve,
+    Set(DateTime<Utc>),
+    Clear,
+}
+
+impl NextDueAtUpdate {
+    fn from_optional_preserve(next_due_at: Option<DateTime<Utc>>) -> Self {
+        next_due_at.map(Self::Set).unwrap_or(Self::Preserve)
+    }
+
+    fn should_update(&self) -> bool {
+        !matches!(self, Self::Preserve)
+    }
+
+    fn value(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Preserve | Self::Clear => None,
+            Self::Set(value) => Some(*value),
+        }
+    }
+}
+
+struct CloseRun<'a> {
+    run_status: &'a str,
+    action: Option<&'a str>,
+    result_json: Option<Value>,
+    error: Option<&'a str>,
+    checkpoint: Option<Value>,
+    last_result: Option<&'a str>,
+    next_due_at: NextDueAtUpdate,
+    pause_routine: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_due_after, parse_schedule_interval, validate_routine_schedule};
+    use chrono::{TimeZone, Timelike, Utc};
+
+    // Integration tests that require a live PG connection live in
+    // src/integration_tests.rs and are gated on the `integration` feature.
+    // The store SQL is compiled by `cargo check`; concurrent claim/recovery
+    // behavior should be covered by PG integration tests once the runtime
+    // harness starts executing routines.
+
+    #[test]
+    fn parses_supported_interval_schedules() {
+        assert_eq!(
+            parse_schedule_interval("@every 30s").unwrap().num_seconds(),
+            30
+        );
+        assert_eq!(
+            parse_schedule_interval("every 5m").unwrap().num_seconds(),
+            300
+        );
+        assert_eq!(parse_schedule_interval("2h").unwrap().num_seconds(), 7200);
+        assert_eq!(parse_schedule_interval("1d").unwrap().num_seconds(), 86_400);
+    }
+
+    #[test]
+    fn rejects_invalid_interval_schedules() {
+        assert!(validate_routine_schedule("").is_err());
+        assert!(validate_routine_schedule("@every 0s").is_err());
+        assert!(validate_routine_schedule("@daily").is_err());
+        assert!(validate_routine_schedule("* * * * * *").is_err());
+        assert!(validate_routine_schedule("60 9 * * *").is_err());
+    }
+
+    #[test]
+    fn accepts_standard_cron_schedules() {
+        assert!(validate_routine_schedule("*/5 * * * *").is_ok());
+        assert!(validate_routine_schedule("30 9 * * 1-5").is_ok());
+    }
+
+    #[test]
+    fn cron_next_due_uses_default_timezone() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 29, 0, 0, 0).unwrap();
+        let next_due = next_due_after("30 9 * * 1-5", "Asia/Seoul", now).unwrap();
+        let next_due_kst = next_due.with_timezone(&chrono_tz::Asia::Seoul);
+        assert_eq!(next_due_kst.hour(), 9);
+        assert_eq!(next_due_kst.minute(), 30);
+    }
+
+    #[test]
+    fn every_next_due_uses_utc_interval() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 29, 0, 0, 0).unwrap();
+        let next_due = next_due_after("@every 1h", "Asia/Seoul", now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 29, 1, 0, 0).unwrap()
+        );
+    }
+}
