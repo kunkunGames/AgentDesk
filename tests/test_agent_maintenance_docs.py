@@ -149,6 +149,24 @@ class DocTouchRulesTest(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].path, "docs/agent-maintenance/change-surfaces.md")
 
+    def test_multinode_source_change_requires_multinode_doc_touch(self) -> None:
+        findings = CHECKER.check_doc_touch_rules({"src/server/worker_registry.rs"})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "error")
+        self.assertEqual(
+            findings[0].path,
+            "docs/agent-maintenance/multinode-transition.md",
+        )
+
+    def test_multinode_doc_touch_satisfies_rule(self) -> None:
+        findings = CHECKER.check_doc_touch_rules(
+            {
+                "src/server/routes/dispatches/outbox.rs",
+                "docs/agent-maintenance/multinode-transition.md",
+            }
+        )
+        self.assertEqual(findings, [])
+
 
 class ChangeSurfaceLineCountTest(unittest.TestCase):
     def test_warns_when_copied_line_count_drifts_from_inventory(self) -> None:

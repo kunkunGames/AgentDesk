@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-04-30 (against `main` @ `7aac66365e441ab74ed72ef056bb02d6a08546f0`).
+> Last refreshed: 2026-04-30 (against `main` @ `6392ce0832e7360725ebc03849b8f04bee018d7b`).
 
 ## Read This First
 
@@ -49,7 +49,7 @@
 - feature: `multinode / supervised_workers_singleton`
 - canonical_modules: `src/server/worker_registry.rs:134` defines the supervised
   worker inventory, with `dispatch_outbox_loop` at
-  `src/server/worker_registry.rs:205`. `src/server/mod.rs:201` creates the
+  `src/server/worker_registry.rs:206`. `src/server/mod.rs:201` creates the
   registry, `src/server/mod.rs:207` runs boot-only steps, and
   `src/server/mod.rs:208` starts workers after boot reconcile.
 - legacy_modules: none. Workers are centrally registered, but most entries still
@@ -145,7 +145,7 @@
 ### `multinode / dispatch_outbox`
 
 - feature: `multinode / dispatch_outbox`
-- canonical_modules: `src/server/worker_registry.rs:205` registers the worker,
+- canonical_modules: `src/server/worker_registry.rs:206` registers the worker,
   `src/server/routes/dispatches/outbox.rs:248` claims PostgreSQL rows with
   `FOR UPDATE SKIP LOCKED`, `src/server/routes/dispatches/outbox.rs:596`
   processes a batch, `src/server/routes/dispatches/outbox.rs:654` relies on the
@@ -201,7 +201,7 @@
 | GitHub issue/body mutation local | `src/github/mod.rs:166`, `src/github/mod.rs:218`, `src/github/dod.rs:122`, `src/server/routes/github.rs:275` | Multiple nodes can create, close, comment, or edit issue bodies unless calls are leader-only or idempotent. |
 | Tmux/provider sessions local | `src/services/discord/mod.rs:538`, `src/services/discord/router/message_handler.rs:1420`, `src/services/claude.rs:1166`, `src/services/claude.rs:1300` | Live provider state depends on local tmux panes, FIFOs, output files, watcher handles, and wrapper processes. |
 | MCP routing local | `src/services/mcp_config.rs:34`, `src/services/mcp_config.rs:71`, `src/services/memory/memento.rs:262`, `src/services/discord/mcp_credential_watcher.rs:349` | MCP availability, config mutation, cached MCP session IDs, and credential watcher notifications are node/provider local. |
-| `dispatch_outbox` local retry loop | `src/server/worker_registry.rs:205`, `src/server/routes/dispatches/outbox.rs:248`, `src/server/routes/dispatches/outbox.rs:596`, `src/server/routes/dispatches/outbox.rs:719` | Current PG claim narrows duplicate row processing, but multinode delivery still needs explicit lease/idempotency tests before multiple nodes drain it. |
+| `dispatch_outbox` local retry loop | `src/server/worker_registry.rs:206`, `src/server/routes/dispatches/outbox.rs:248`, `src/server/routes/dispatches/outbox.rs:596`, `src/server/routes/dispatches/outbox.rs:719` | Current PG claim narrows duplicate row processing, but multinode delivery still needs explicit lease/idempotency tests before multiple nodes drain it. |
 | Memory/cache local | `src/services/memory/local.rs:10`, `src/services/memory/memento_throttle.rs:128`, `src/services/memory/memento_throttle.rs:175`, `src/services/observability/metrics.rs:238` | Process-local recall, dedupe, and telemetry caches must not be treated as cluster truth. |
 
 ## Leader-Only Side Effects
@@ -215,7 +215,7 @@
   `src/server/mod.rs:297`, `src/server/mod.rs:367`,
   `src/server/mod.rs:379`.
 - Global cleanup and maintenance jobs registered as supervised workers:
-  `src/server/worker_registry.rs:177`, `src/server/worker_registry.rs:205`,
+  `src/server/worker_registry.rs:177`, `src/server/worker_registry.rs:206`,
   `src/server/worker_registry.rs:219`.
 - `dispatch_outbox` delivery if the action is not proven lease-backed and
   idempotent: `src/server/routes/dispatches/outbox.rs:248`,

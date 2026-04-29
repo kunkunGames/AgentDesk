@@ -81,6 +81,7 @@ MIGRATION_SENSITIVE_DOCS: tuple[str, ...] = (
     "docs/agent-maintenance/known-legacy.md",
     "docs/agent-maintenance/discord-outbound-migration.md",
     "docs/agent-maintenance/opencode-usability-spec.md",
+    "docs/agent-maintenance/multinode-transition.md",
 )
 
 DOC_TOUCH_RULES: tuple[TouchRule, ...] = (
@@ -103,6 +104,16 @@ DOC_TOUCH_RULES: tuple[TouchRule, ...] = (
         ),
         required_doc="docs/agent-maintenance/change-surfaces.md",
         reason="central git-helper changes must keep the maintenance map in sync.",
+    ),
+    TouchRule(
+        patterns=(
+            "src/server/worker_registry.rs",
+            "src/services/discord/runtime_bootstrap.rs",
+            "policies/merge-automation.js",
+            "src/server/routes/dispatches/outbox.rs",
+        ),
+        required_doc="docs/agent-maintenance/multinode-transition.md",
+        reason="multinode-sensitive ownership, singleton, and lease assumptions must stay audited.",
     ),
 )
 
