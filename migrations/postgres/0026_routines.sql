@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS routines (
     status              TEXT NOT NULL DEFAULT 'enabled',
     -- 'fresh' | 'persistent'
     execution_strategy  TEXT NOT NULL DEFAULT 'fresh',
-    -- cron expression or NULL for manual-only
+    -- @every/every duration expression or NULL for manual-only
     schedule            TEXT,
     next_due_at         TIMESTAMPTZ,
     last_run_at         TIMESTAMPTZ,

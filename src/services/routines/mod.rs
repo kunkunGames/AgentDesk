@@ -22,4 +22,6 @@ pub use discord_log::{RoutineDiscordLogger, RoutineLifecycleEvent};
 pub use loader::RoutineScriptLoader;
 pub use runtime::{execute_claimed_script_run, poll_agent_turns, run_due_tick};
 pub use session_control::{RoutineSessionCommand, RoutineSessionController};
-pub use store::{NewRoutine, RoutinePatch, RoutineStore};
+pub use store::{
+    NewRoutine, ROUTINE_RUN_LEASE_SECS, RoutinePatch, RoutineStore, validate_routine_schedule,
+};

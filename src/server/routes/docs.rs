@@ -2567,6 +2567,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             ("name", body_param("string", false, "Human-readable routine name")),
             ("agent_id", body_param("string", false, "Optional attached agent id")),
             ("execution_strategy", body_param("string", false, "fresh or persistent")),
+            (
+                "schedule",
+                body_param("string", false, "Optional @every/every duration such as @every 5m"),
+            ),
             ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
         ])
         .with_example(
@@ -2599,7 +2603,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             ),
             (
                 "schedule",
-                body_param("string|null", false, "Set schedule or pass null to clear it"),
+                body_param("string|null", false, "Set @every/every duration schedule or pass null to clear it"),
             ),
             (
                 "next_due_at",

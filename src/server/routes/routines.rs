@@ -11,7 +11,7 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
     RoutineScriptLoader, RoutineSessionCommand, RoutineSessionController, RoutineStore,
-    execute_claimed_script_run,
+    execute_claimed_script_run, validate_routine_schedule,
 };
 
 use super::AppState;
@@ -180,6 +180,7 @@ pub async fn attach_routine(
         .execution_strategy
         .unwrap_or_else(|| "fresh".to_string());
     validate_execution_strategy_request(&execution_strategy)?;
+    validate_schedule_request(body.schedule.as_deref())?;
     let routine = store
         .attach_routine(NewRoutine {
             agent_id: body.agent_id,
@@ -209,6 +210,9 @@ pub async fn patch_routine(
     let store = routine_store(&state)?;
     if let Some(strategy) = body.execution_strategy.as_deref() {
         validate_execution_strategy_request(strategy)?;
+    }
+    if let Some(Some(schedule)) = body.schedule.as_ref() {
+        validate_schedule_request(Some(schedule))?;
     }
     let patch = RoutinePatch {
         name: body.name,
@@ -518,6 +522,13 @@ fn validate_run_status_filter(status: &str) -> AppResult<()> {
             "unsupported routine run status '{other}'"
         ))),
     }
+}
+
+fn validate_schedule_request(schedule: Option<&str>) -> AppResult<()> {
+    let Some(schedule) = schedule else {
+        return Ok(());
+    };
+    validate_routine_schedule(schedule).map_err(|error| AppError::bad_request(error.to_string()))
 }
 
 fn store_error(error: anyhow::Error) -> AppError {

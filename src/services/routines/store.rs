@@ -1,12 +1,13 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const RUN_LEASE_SECS: i64 = 30 * 60;
+pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
+const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
 
 /// Durable PG-backed store for routines and routine_runs.
 ///
@@ -156,6 +157,7 @@ impl RoutineStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        Self::seed_scheduled_due_times(&mut tx).await?;
         let candidates: Vec<RoutineClaimCandidate> = sqlx::query_as(
             r#"
             SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint
@@ -181,6 +183,56 @@ impl RoutineStore {
 
         tx.commit().await?;
         Ok(claimed)
+    }
+
+    async fn seed_scheduled_due_times(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+        let scheduled: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, schedule
+            FROM routines
+            WHERE status = 'enabled'
+              AND schedule IS NOT NULL
+              AND next_due_at IS NULL
+              AND in_flight_run_id IS NULL
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| anyhow!("seed routine schedules: select routines: {e}"))?;
+
+        for (routine_id, schedule) in scheduled {
+            let next_due_at = match next_due_from_schedule(&schedule) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        routine_id,
+                        schedule,
+                        error = %error,
+                        "routine has invalid schedule; next_due_at not seeded"
+                    );
+                    continue;
+                }
+            };
+            sqlx::query(
+                r#"
+                UPDATE routines
+                SET next_due_at = $2,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND status = 'enabled'
+                  AND next_due_at IS NULL
+                  AND in_flight_run_id IS NULL
+                "#,
+            )
+            .bind(&routine_id)
+            .bind(next_due_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("seed routine {routine_id} next_due_at: {e}"))?;
+        }
+
+        Ok(())
     }
 
     pub async fn list_routines(
@@ -386,6 +438,12 @@ impl RoutineStore {
 
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
         validate_execution_strategy(&new_routine.execution_strategy)?;
+        let schedule = normalize_schedule(new_routine.schedule)?;
+        let next_due_at = match (new_routine.next_due_at, schedule.as_deref()) {
+            (Some(value), _) => Some(value),
+            (None, Some(schedule)) => Some(next_due_from_schedule(schedule)?),
+            (None, None) => None,
+        };
         let id = Uuid::new_v4().to_string();
         sqlx::query_as(
             r#"
@@ -404,8 +462,8 @@ impl RoutineStore {
         .bind(new_routine.script_ref)
         .bind(new_routine.name)
         .bind(new_routine.execution_strategy)
-        .bind(new_routine.schedule)
-        .bind(new_routine.next_due_at)
+        .bind(schedule)
+        .bind(next_due_at)
         .bind(new_routine.checkpoint)
         .fetch_one(&*self.pool)
         .await
@@ -419,6 +477,22 @@ impl RoutineStore {
     ) -> Result<Option<RoutineRecord>> {
         if let Some(strategy) = patch.execution_strategy.as_deref() {
             validate_execution_strategy(strategy)?;
+        }
+        let schedule_was_set = patch.schedule.is_some();
+        let schedule = match patch.schedule {
+            Some(value) => normalize_schedule(value)?,
+            None => None,
+        };
+        let next_due_was_set = patch.next_due_at.is_some();
+        let mut next_due_at = patch.next_due_at.flatten();
+        let mut update_next_due_at = next_due_was_set;
+        if schedule_was_set && schedule.is_some() && !next_due_was_set {
+            next_due_at = Some(next_due_from_schedule(
+                schedule
+                    .as_deref()
+                    .expect("checked schedule is present after is_some"),
+            )?);
+            update_next_due_at = true;
         }
         sqlx::query_as(
             r#"
@@ -439,10 +513,10 @@ impl RoutineStore {
         .bind(routine_id)
         .bind(patch.name)
         .bind(patch.execution_strategy)
-        .bind(patch.schedule.is_some())
-        .bind(patch.schedule.flatten())
-        .bind(patch.next_due_at.is_some())
-        .bind(patch.next_due_at.flatten())
+        .bind(schedule_was_set)
+        .bind(schedule)
+        .bind(update_next_due_at)
+        .bind(next_due_at)
         .bind(patch.checkpoint.is_some())
         .bind(patch.checkpoint.flatten())
         .fetch_optional(&*self.pool)
@@ -977,13 +1051,14 @@ impl RoutineStore {
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
 
-        let routine_id: Option<String> = sqlx::query_scalar(
+        let target: Option<(String, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT routine_id
-            FROM routine_runs
-            WHERE id = $1
-              AND status = 'running'
-            FOR UPDATE
+            SELECT r.id, r.schedule
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.id = $1
+              AND rr.status = 'running'
+            FOR UPDATE OF rr
             "#,
         )
         .bind(run_id)
@@ -991,10 +1066,20 @@ impl RoutineStore {
         .await
         .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
 
-        let Some(routine_id) = routine_id else {
+        let Some((routine_id, schedule)) = target else {
             tx.commit().await?;
             return Ok(false);
         };
+        let scheduled_next_due_at = if close.next_due_at.should_update() {
+            close.next_due_at.value()
+        } else {
+            schedule
+                .as_deref()
+                .map(next_due_from_schedule)
+                .transpose()?
+        };
+        let should_update_next_due_at =
+            close.next_due_at.should_update() || scheduled_next_due_at.is_some();
 
         let routine_updated = sqlx::query(
             r#"
@@ -1010,12 +1095,12 @@ impl RoutineStore {
             "#,
         )
         .bind(&routine_id)
-        .bind(close.next_due_at.value())
+        .bind(scheduled_next_due_at)
         .bind(&close.checkpoint)
         .bind(close.last_result)
         .bind(close.pause_routine)
         .bind(run_id)
-        .bind(close.next_due_at.should_update())
+        .bind(should_update_next_due_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("close run {run_id}: update routine {routine_id}: {e}"))?;
@@ -1064,6 +1149,72 @@ fn validate_execution_strategy(strategy: &str) -> Result<()> {
             "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
         )),
     }
+}
+
+pub fn validate_routine_schedule(schedule: &str) -> Result<()> {
+    parse_schedule_interval(schedule).map(|_| ())
+}
+
+fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
+    schedule
+        .map(|schedule| {
+            let schedule = schedule.trim().to_string();
+            validate_routine_schedule(&schedule)?;
+            Ok(schedule)
+        })
+        .transpose()
+}
+
+fn next_due_from_schedule(schedule: &str) -> Result<DateTime<Utc>> {
+    Ok(Utc::now() + parse_schedule_interval(schedule)?)
+}
+
+fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
+    let trimmed = schedule.trim();
+    let duration = trimmed
+        .strip_prefix("@every ")
+        .or_else(|| trimmed.strip_prefix("every "))
+        .unwrap_or(trimmed)
+        .trim();
+    if duration.is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+        ));
+    }
+
+    let split_at = duration
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(duration.len());
+    let (amount, unit) = duration.split_at(split_at);
+    if amount.is_empty() || unit.trim().is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+        ));
+    }
+    let amount: i64 = amount
+        .parse()
+        .map_err(|e| anyhow!("invalid routine schedule amount '{amount}': {e}"))?;
+    if amount <= 0 {
+        return Err(anyhow!(
+            "routine schedule duration must be greater than zero"
+        ));
+    }
+
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 60 * 60,
+        "d" | "day" | "days" => 60 * 60 * 24,
+        other => {
+            return Err(anyhow!(
+                "unsupported routine schedule unit '{other}'; expected s, m, h, or d"
+            ));
+        }
+    };
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("routine schedule duration is too large"))?;
+    Ok(Duration::seconds(seconds))
 }
 
 fn get_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64> {
@@ -1115,9 +1266,33 @@ struct CloseRun<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_schedule_interval, validate_routine_schedule};
+
     // Integration tests that require a live PG connection live in
     // src/integration_tests.rs and are gated on the `integration` feature.
     // The store SQL is compiled by `cargo check`; concurrent claim/recovery
     // behavior should be covered by PG integration tests once the runtime
     // harness starts executing routines.
+
+    #[test]
+    fn parses_supported_interval_schedules() {
+        assert_eq!(
+            parse_schedule_interval("@every 30s").unwrap().num_seconds(),
+            30
+        );
+        assert_eq!(
+            parse_schedule_interval("every 5m").unwrap().num_seconds(),
+            300
+        );
+        assert_eq!(parse_schedule_interval("2h").unwrap().num_seconds(), 7200);
+        assert_eq!(parse_schedule_interval("1d").unwrap().num_seconds(), 86_400);
+    }
+
+    #[test]
+    fn rejects_invalid_interval_schedules() {
+        assert!(validate_routine_schedule("").is_err());
+        assert!(validate_routine_schedule("@every 0s").is_err());
+        assert!(validate_routine_schedule("@daily").is_err());
+        assert!(validate_routine_schedule("*/5 * * * *").is_err());
+    }
 }

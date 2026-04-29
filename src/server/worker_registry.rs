@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::engine::PolicyEngine;
 use crate::services::discord::health::HealthRegistry;
+use crate::services::routines::ROUTINE_RUN_LEASE_SECS;
 use sqlx::PgPool;
 
 use super::ws::{BatchBuffer, BroadcastTx};
@@ -487,7 +488,7 @@ impl SupervisedWorkerRegistry {
                 else {
                     self.log_skip(
                         spec,
-                        "routines.tick_interval_secs must be greater than zero",
+                        "routines.tick_interval_secs must be greater than zero and no more than half the routine run lease window",
                     );
                     return Ok(None);
                 };
@@ -572,7 +573,8 @@ impl SupervisedWorkerRegistry {
 }
 
 fn valid_routine_tick_interval_secs(value: u64) -> Option<u64> {
-    (value > 0).then_some(value)
+    let max_safe_tick_secs = ROUTINE_RUN_LEASE_SECS / 2;
+    (value > 0 && value <= max_safe_tick_secs).then_some(value)
 }
 
 #[cfg(test)]
@@ -642,5 +644,8 @@ mod tests {
         assert_eq!(valid_routine_tick_interval_secs(0), None);
         assert_eq!(valid_routine_tick_interval_secs(1), Some(1));
         assert_eq!(valid_routine_tick_interval_secs(30), Some(30));
+        assert_eq!(valid_routine_tick_interval_secs(900), Some(900));
+        assert_eq!(valid_routine_tick_interval_secs(901), None);
+        assert_eq!(valid_routine_tick_interval_secs(1800), None);
     }
 }
