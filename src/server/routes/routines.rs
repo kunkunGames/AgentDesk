@@ -223,10 +223,8 @@ pub async fn attach_routine(
     Json(body): Json<AttachRoutineBody>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let store = routine_store(&state)?;
-    if body.script_ref.trim().is_empty() {
-        return Err(AppError::bad_request("script_ref is required"));
-    }
-    let name = body.name.unwrap_or_else(|| fallback_name(&body.script_ref));
+    let script_ref = normalize_script_ref(&body.script_ref)?;
+    let name = body.name.unwrap_or_else(|| fallback_name(&script_ref));
     let execution_strategy = body
         .execution_strategy
         .unwrap_or_else(|| "fresh".to_string());
@@ -235,7 +233,7 @@ pub async fn attach_routine(
     let routine = store
         .attach_routine(NewRoutine {
             agent_id: body.agent_id,
-            script_ref: body.script_ref,
+            script_ref,
             name,
             execution_strategy,
             schedule: body.schedule,
@@ -563,6 +561,14 @@ fn fallback_name(script_ref: &str) -> String {
         .to_string()
 }
 
+fn normalize_script_ref(script_ref: &str) -> AppResult<String> {
+    let normalized = script_ref.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return Err(AppError::bad_request("script_ref is required"));
+    }
+    Ok(normalized)
+}
+
 fn validate_execution_strategy_request(strategy: &str) -> AppResult<()> {
     match strategy {
         "fresh" | "persistent" => Ok(()),
@@ -612,7 +618,7 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::{PatchRoutineBody, ensure_routine_runtime_runnable};
+    use super::{PatchRoutineBody, ensure_routine_runtime_runnable, normalize_script_ref};
     use crate::config::RoutinesConfig;
     use crate::error::ErrorCode;
 
@@ -684,5 +690,17 @@ mod tests {
         assert_eq!(patch.schedule, Some(Some("@every 1h".to_string())));
         assert!(patch.next_due_at.flatten().is_some());
         assert_eq!(patch.checkpoint, Some(Some(json!({"cursor": "abc"}))));
+    }
+
+    #[test]
+    fn normalize_script_ref_trims_and_matches_loader_separator() {
+        assert_eq!(
+            normalize_script_ref(" nested\\summary.js \n").unwrap(),
+            "nested/summary.js"
+        );
+
+        let err = normalize_script_ref(" \t ").expect_err("empty refs must be rejected");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "script_ref is required");
     }
 }
