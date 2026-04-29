@@ -3359,7 +3359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entry_dispatch_history_preserves_previous_dispatch_ids() {
+    async fn entry_dispatch_history_preserves_previous_dispatch_ids_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         // The dispatch-history FK requires task_dispatches rows.
@@ -3726,7 +3726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reactivate_done_entry_allows_admin_restore_to_dispatched() {
+    async fn reactivate_done_entry_allows_admin_restore_to_dispatched_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         sqlx::query(
@@ -4142,7 +4142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slot_has_active_dispatch_ignores_sidecar_dispatches() {
+    async fn slot_has_active_dispatch_ignores_sidecar_dispatches_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         sqlx::query(
@@ -4195,7 +4195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_consultation_dispatch_preserves_metadata_and_marks_entry_dispatched() {
+    async fn record_consultation_dispatch_preserves_metadata_and_marks_entry_dispatched_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         sqlx::query(
@@ -4268,7 +4268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_consultation_dispatch_requires_dispatch_id() {
+    async fn record_consultation_dispatch_requires_dispatch_id_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         let error = record_consultation_dispatch_on_pg(
@@ -4291,7 +4291,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_phase_gate_state_filters_invalid_dispatches_and_removes_stale_rows() {
+    async fn save_phase_gate_state_filters_invalid_dispatches_and_removes_stale_rows_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         for dispatch_id in &["dispatch-valid-1", "dispatch-valid-2", "dispatch-stale"] {
@@ -4379,7 +4379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_phase_gate_state_removes_phase_rows() {
+    async fn clear_phase_gate_state_removes_phase_rows_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         sqlx::query(
@@ -4442,7 +4442,7 @@ mod tests {
     /// route in `src/server/routes/kanban.rs` (the `pmd_reopen` /
     /// `rereview_dispatch` call sites).
     #[tokio::test]
-    async fn done_entry_cannot_reactivate_without_explicit_operator_rerun() {
+    async fn done_entry_cannot_reactivate_without_explicit_operator_rerun_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         sqlx::query(

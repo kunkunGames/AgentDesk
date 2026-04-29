@@ -2640,7 +2640,7 @@ mod tests {
     // #1239: migrated to PG fixtures because `activate_with_deps` is now
     // PG-only — the SQLite fallback was removed in favor of `activate_with_deps_pg`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn auto_queue_activate_concurrent_calls_dispatch_once() {
+    async fn auto_queue_activate_concurrent_calls_dispatch_once_pg() {
         // `create_dispatch()` may resolve the default repo/worktree from
         // AGENTDESK_REPO_DIR. Hold the shared env lock with a real git repo so
         // this concurrency test does not race unrelated env-mutating tests.
@@ -2806,7 +2806,7 @@ mod tests {
     // #1239: migrated to PG fixtures because `activate_with_deps` is now
     // PG-only — the SQLite fallback was removed in favor of `activate_with_deps_pg`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_queue_activate_agent_scope_uses_free_slot_for_additional_group() {
+    async fn auto_queue_activate_agent_scope_uses_free_slot_for_additional_group_pg() {
         let pg_db = IntegrationPgDatabase::create().await;
         let pool = pg_db.migrate().await;
         let engine = test_engine_with_pg(pool.clone());
@@ -3375,7 +3375,7 @@ mod tests {
     // #1342: migrated to PG fixtures because the dispatch/auto_queue/github
     // sync paths now route through PG when the engine has a pg_pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn implementation_completion_for_auto_queue_review_mode_disabled_skips_review_and_mainline_sync_completes_entry()
+    async fn implementation_completion_for_auto_queue_review_mode_disabled_skips_review_and_mainline_sync_completes_entry_pg()
      {
         let (repo, _remote, _repo_guard) = setup_test_repo_with_origin();
         let repo_id = repo.path().to_string_lossy().to_string();
@@ -5676,7 +5676,7 @@ mod tests {
     // #1342: migrated to PG fixtures because the dispatch/auto_queue JS bridge
     // routes through PG when the engine has a pg_pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn auto_queue_phase_gate_completes_for_batch_phase_zero() {
+    async fn auto_queue_phase_gate_completes_for_batch_phase_zero_pg() {
         let pg_db = IntegrationPgDatabase::create().await;
         let pool = pg_db.migrate().await;
         let db = test_db();
@@ -6513,7 +6513,7 @@ mod tests {
     // #1342: migrated to PG fixtures because the dispatch + auto_queue JS
     // bridge ops now route through PG when the engine has a pg_pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scenario_547_implementation_noop_completion_waits_for_review_before_auto_queue_activate()
+    async fn scenario_547_implementation_noop_completion_waits_for_review_before_auto_queue_activate_pg()
      {
         let policies_dir = setup_auto_queue_activate_spy_policy_dir();
         let pg_db = IntegrationPgDatabase::create().await;
@@ -11023,7 +11023,7 @@ mod tests {
     // #1342: migrated to PG fixtures because the dispatch + auto_queue JS
     // bridge ops now route through PG when the engine has a pg_pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn consultation_clear_redispatches_linked_auto_queue_entry() {
+    async fn consultation_clear_redispatches_linked_auto_queue_entry_pg() {
         let pg_db = IntegrationPgDatabase::create().await;
         let pool = pg_db.migrate().await;
         let db = test_db();
