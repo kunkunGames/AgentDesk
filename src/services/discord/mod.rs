@@ -258,6 +258,38 @@ pub(in crate::services::discord) fn should_phase2_recover_message(
     true
 }
 
+const CATCH_UP_RETRY_QUEUE_THRESHOLD: usize = MAX_INTERVENTIONS_PER_CHANNEL / 2;
+
+fn should_trigger_catch_up_retry(queue_len: usize) -> bool {
+    queue_len <= CATCH_UP_RETRY_QUEUE_THRESHOLD
+}
+
+fn take_catch_up_retry_checkpoint_after_queue_drain(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    queue_len_after: usize,
+) -> Option<u64> {
+    if !should_trigger_catch_up_retry(queue_len_after) {
+        return None;
+    }
+    shared
+        .catch_up_retry_pending
+        .remove(&channel_id)
+        .map(|(_, checkpoint)| checkpoint)
+}
+
+fn catch_up_checkpoint_for_scan(
+    disk_checkpoint: u64,
+    live_checkpoint: Option<u64>,
+    retry_checkpoint: Option<u64>,
+) -> u64 {
+    retry_checkpoint.unwrap_or_else(|| {
+        live_checkpoint
+            .map(|checkpoint| disk_checkpoint.max(checkpoint))
+            .unwrap_or(disk_checkpoint)
+    })
+}
+
 pub(in crate::services::discord) fn queued_message_ids(
     snapshot: &ChannelMailboxSnapshot,
 ) -> std::collections::HashSet<u64> {
@@ -964,6 +996,11 @@ pub(super) struct SharedData {
     pub(super) dispatch_role_overrides: dashmap::DashMap<ChannelId, ChannelId>,
     /// Per-channel last processed message ID — used for startup catch-up polling.
     pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
+    /// Channels where catch-up stopped because the intervention queue was at
+    /// capacity. The value is the pinned `after` checkpoint for the next
+    /// in-process catch-up pass, independent of live message checkpoints that
+    /// may advance while the queued backlog drains.
+    pub(super) catch_up_retry_pending: dashmap::DashMap<ChannelId, u64>,
     /// Per-channel turn start time — used for metrics duration calculation.
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Per-channel known speakers collected lazily from incoming messages.
@@ -1625,6 +1662,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         model_picker_pending: dashmap::DashMap::new(),
         dispatch_role_overrides: dashmap::DashMap::new(),
         last_message_ids: dashmap::DashMap::new(),
+        catch_up_retry_pending: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
         channel_rosters: dashmap::DashMap::new(),
         cached_serenity_ctx: tokio::sync::OnceCell::new(),
@@ -2138,8 +2176,50 @@ async fn mailbox_has_pending_soft_queue(
     result
 }
 
+fn maybe_schedule_catch_up_retry_after_queue_drain(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    queue_len_after: usize,
+) -> bool {
+    if !should_trigger_catch_up_retry(queue_len_after) {
+        return false;
+    }
+
+    let Some(ctx) = shared.cached_serenity_ctx.get() else {
+        return false;
+    };
+
+    let Some(retry_checkpoint) =
+        take_catch_up_retry_checkpoint_after_queue_drain(shared, channel_id, queue_len_after)
+    else {
+        return false;
+    };
+
+    let http = ctx.http.clone();
+    let shared = Arc::clone(shared);
+    let provider = provider.clone();
+    tokio::spawn(async move {
+        let retry_checkpoints = HashMap::from([(channel_id, retry_checkpoint)]);
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] 🔁 catch-up: retrying channel {} after queue drained to {} item(s)",
+            channel_id,
+            queue_len_after
+        );
+        catch_up_missed_messages_inner(&http, &shared, &provider, &retry_checkpoints).await;
+        schedule_deferred_idle_queue_kickoff(
+            shared,
+            provider,
+            channel_id,
+            "catch-up retry after queue drain",
+        );
+    });
+    true
+}
+
 async fn mailbox_take_next_soft_intervention(
-    shared: &SharedData,
+    shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<(Intervention, bool)> {
@@ -2147,14 +2227,16 @@ async fn mailbox_take_next_soft_intervention(
         .mailbox(channel_id)
         .take_next_soft(queue_persistence_context(shared, provider, channel_id))
         .await;
+    let queue_len_after = result.queue_len_after;
     apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    maybe_schedule_catch_up_retry_after_queue_drain(shared, provider, channel_id, queue_len_after);
     result
         .intervention
         .map(|intervention| (intervention, result.has_more))
 }
 
 async fn idle_queue_take_next_soft_if_ready(
-    shared: &SharedData,
+    shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<(Intervention, bool)> {
@@ -2408,6 +2490,16 @@ async fn catch_up_missed_messages(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) {
+    let retry_checkpoints = HashMap::new();
+    catch_up_missed_messages_inner(http, shared, provider, &retry_checkpoints).await;
+}
+
+async fn catch_up_missed_messages_inner(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    retry_checkpoints: &HashMap<ChannelId, u64>,
+) {
     let Some(root) = runtime_store::last_message_root() else {
         return;
     };
@@ -2458,11 +2550,14 @@ async fn catch_up_missed_messages(
         let Ok(last_id_str) = fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(last_id) = last_id_str.trim().parse::<u64>() else {
+        let Ok(disk_last_id) = last_id_str.trim().parse::<u64>() else {
             continue;
         };
 
         let channel_id = ChannelId::new(channel_id_raw);
+        let retry_checkpoint = retry_checkpoints.get(&channel_id).copied();
+        let live_checkpoint = shared.last_message_ids.get(&channel_id).map(|entry| *entry);
+        let last_id = catch_up_checkpoint_for_scan(disk_last_id, live_checkpoint, retry_checkpoint);
         let after_msg = MessageId::new(last_id);
 
         // #429: skip channels this bot cannot access.  Utility bots
@@ -2590,6 +2685,16 @@ async fn catch_up_missed_messages(
             // the last actually-queued message — newer entries that we
             // declined are still > `after_msg` for the next pass.
             if outcome == CatchUpClassification::Recover && stats.recovered >= remaining_capacity {
+                let retry_after = max_recovered_id.unwrap_or(last_id);
+                shared
+                    .catch_up_retry_pending
+                    .insert(channel_id, retry_after);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🔁 catch-up: queue cap reached for channel {}; retry armed after checkpoint {}",
+                    channel_id,
+                    retry_after
+                );
                 break;
             }
             stats.record(outcome);
@@ -2661,6 +2766,16 @@ async fn catch_up_missed_messages(
         // Only advance checkpoint if we actually recovered messages
         if let Some(newest) = max_recovered_id {
             shared.last_message_ids.insert(channel_id, newest);
+            if retry_checkpoint.is_some()
+                && !shared.catch_up_retry_pending.contains_key(&channel_id)
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🔁 catch-up: retry completed for channel {} at checkpoint {}",
+                    channel_id,
+                    newest
+                );
+            }
         }
     }
 
@@ -3629,6 +3744,136 @@ mod tests {
         assert!(!should_phase2_recover_message(200, None, &existing));
     }
 
+    #[test]
+    fn catch_up_retry_uses_pinned_checkpoint_after_queue_drain() {
+        let shared = super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(1486333430516947304);
+        let disk_checkpoint = 100;
+        let pinned_retry_checkpoint = 130;
+        let live_checkpoint_after_newer_messages = 500;
+
+        shared
+            .last_message_ids
+            .insert(channel_id, live_checkpoint_after_newer_messages);
+        shared
+            .catch_up_retry_pending
+            .insert(channel_id, pinned_retry_checkpoint);
+
+        assert_eq!(
+            super::catch_up_checkpoint_for_scan(
+                disk_checkpoint,
+                shared.last_message_ids.get(&channel_id).map(|entry| *entry),
+                shared
+                    .catch_up_retry_pending
+                    .get(&channel_id)
+                    .map(|entry| *entry),
+            ),
+            pinned_retry_checkpoint,
+            "retry must resume from the cap-pinned checkpoint, not the newer live checkpoint"
+        );
+
+        assert_eq!(
+            super::take_catch_up_retry_checkpoint_after_queue_drain(
+                shared.as_ref(),
+                channel_id,
+                super::CATCH_UP_RETRY_QUEUE_THRESHOLD + 1,
+            ),
+            None,
+            "retry must stay armed while the queue is still above the drain threshold"
+        );
+        assert!(shared.catch_up_retry_pending.contains_key(&channel_id));
+
+        assert_eq!(
+            super::take_catch_up_retry_checkpoint_after_queue_drain(
+                shared.as_ref(),
+                channel_id,
+                super::CATCH_UP_RETRY_QUEUE_THRESHOLD,
+            ),
+            Some(pinned_retry_checkpoint),
+            "dropping to the threshold should consume the pinned retry checkpoint"
+        );
+        assert!(!shared.catch_up_retry_pending.contains_key(&channel_id));
+    }
+
+    #[tokio::test]
+    async fn catch_up_retry_becomes_ready_when_mailbox_drains_to_threshold() {
+        let shared = super::make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(1486333430516947305);
+        let author_id = UserId::new(1486333430516947306);
+        let pinned_retry_checkpoint = 200;
+        let initial_len = super::CATCH_UP_RETRY_QUEUE_THRESHOLD + 2;
+
+        for offset in 0..initial_len {
+            let message_id = MessageId::new(1486333430516947400 + offset as u64);
+            let outcome = super::mailbox_enqueue_intervention(
+                shared.as_ref(),
+                &provider,
+                channel_id,
+                Intervention {
+                    author_id,
+                    message_id,
+                    source_message_ids: vec![message_id],
+                    text: format!("queued {offset}"),
+                    mode: InterventionMode::Soft,
+                    created_at: Instant::now(),
+                    reply_context: None,
+                    has_reply_boundary: false,
+                    merge_consecutive: false,
+                },
+            )
+            .await;
+            assert!(outcome.enqueued);
+        }
+
+        shared
+            .catch_up_retry_pending
+            .insert(channel_id, pinned_retry_checkpoint);
+
+        let first = shared
+            .mailbox(channel_id)
+            .take_next_soft(super::queue_persistence_context(
+                shared.as_ref(),
+                &provider,
+                channel_id,
+            ))
+            .await;
+        assert_eq!(
+            first.queue_len_after,
+            super::CATCH_UP_RETRY_QUEUE_THRESHOLD + 1
+        );
+        assert_eq!(
+            super::take_catch_up_retry_checkpoint_after_queue_drain(
+                shared.as_ref(),
+                channel_id,
+                first.queue_len_after,
+            ),
+            None
+        );
+        assert!(shared.catch_up_retry_pending.contains_key(&channel_id));
+
+        let second = shared
+            .mailbox(channel_id)
+            .take_next_soft(super::queue_persistence_context(
+                shared.as_ref(),
+                &provider,
+                channel_id,
+            ))
+            .await;
+        assert_eq!(
+            second.queue_len_after,
+            super::CATCH_UP_RETRY_QUEUE_THRESHOLD
+        );
+        assert_eq!(
+            super::take_catch_up_retry_checkpoint_after_queue_drain(
+                shared.as_ref(),
+                channel_id,
+                second.queue_len_after,
+            ),
+            Some(pinned_retry_checkpoint)
+        );
+    }
+
     /// #1227 regression: in a channel where the last_id checkpoint is followed
     /// by 10 bot messages and then 1 user message, the OLD `limit=10` window
     /// would return only the 10 bots and silently drop the user message. With
@@ -3864,7 +4109,7 @@ mod tests {
             channel_id
         ));
         assert!(
-            super::idle_queue_take_next_soft_if_ready(shared.as_ref(), &provider, channel_id)
+            super::idle_queue_take_next_soft_if_ready(&shared, &provider, channel_id)
                 .await
                 .is_none()
         );
@@ -3892,7 +4137,7 @@ mod tests {
             &snapshot
         ));
         let (started, has_more) =
-            super::idle_queue_take_next_soft_if_ready(shared.as_ref(), &provider, channel_id)
+            super::idle_queue_take_next_soft_if_ready(&shared, &provider, channel_id)
                 .await
                 .expect("resolved cleanup should allow queued turn kickoff");
         assert_eq!(started.message_id, queued_msg_id);
