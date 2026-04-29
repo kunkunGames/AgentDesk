@@ -35,6 +35,7 @@ pub mod receipt;
 pub mod resume;
 pub mod review_verdict;
 pub mod reviews;
+pub mod routines;
 mod session_activity;
 pub mod settings;
 mod skill_usage_analytics;

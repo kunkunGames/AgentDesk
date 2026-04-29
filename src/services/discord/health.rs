@@ -2291,6 +2291,61 @@ pub async fn start_headless_agent_turn(
     metadata: Option<serde_json::Value>,
     channel_name_hint: Option<String>,
 ) -> Result<super::router::HeadlessTurnStartOutcome, super::router::HeadlessTurnStartError> {
+    let reservation = reserve_headless_agent_turn(channel_id);
+    start_reserved_headless_agent_turn(
+        registry,
+        channel_id,
+        owner_provider,
+        prompt,
+        source,
+        metadata,
+        channel_name_hint,
+        reservation,
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+pub struct HeadlessAgentTurnReservation {
+    channel_id: ChannelId,
+    turn_id: String,
+    inner: super::router::HeadlessTurnReservation,
+}
+
+impl HeadlessAgentTurnReservation {
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+}
+
+pub fn reserve_headless_agent_turn(channel_id: ChannelId) -> HeadlessAgentTurnReservation {
+    let inner = super::router::reserve_headless_turn();
+    HeadlessAgentTurnReservation {
+        channel_id,
+        turn_id: inner.turn_id(channel_id),
+        inner,
+    }
+}
+
+pub async fn start_reserved_headless_agent_turn(
+    registry: &HealthRegistry,
+    channel_id: ChannelId,
+    owner_provider: ProviderKind,
+    prompt: String,
+    source: Option<String>,
+    metadata: Option<serde_json::Value>,
+    channel_name_hint: Option<String>,
+    reservation: HeadlessAgentTurnReservation,
+) -> Result<super::router::HeadlessTurnStartOutcome, super::router::HeadlessTurnStartError> {
+    if reservation.channel_id != channel_id {
+        return Err(super::router::HeadlessTurnStartError::Internal(format!(
+            "headless turn reservation channel mismatch: reserved {} but starting {}",
+            reservation.channel_id.get(),
+            channel_id.get()
+        )));
+    }
+
+    let expected_turn_id = reservation.turn_id.clone();
     let shared = resolve_direct_meeting_shared(registry, channel_id, &owner_provider)
         .await
         .map_err(super::router::HeadlessTurnStartError::Internal)?;
@@ -2320,7 +2375,7 @@ pub async fn start_headless_agent_turn(
             ))
         })?;
 
-    super::router::start_headless_turn(
+    let outcome = super::router::start_reserved_headless_turn(
         &ctx,
         channel_id,
         &prompt,
@@ -2330,8 +2385,18 @@ pub async fn start_headless_agent_turn(
         source.as_deref(),
         metadata,
         channel_name_hint,
+        reservation.inner,
     )
-    .await
+    .await?;
+
+    if outcome.turn_id != expected_turn_id {
+        return Err(super::router::HeadlessTurnStartError::Internal(format!(
+            "reserved headless turn id mismatch: expected {} but started {}",
+            expected_turn_id, outcome.turn_id
+        )));
+    }
+
+    Ok(outcome)
 }
 
 pub async fn start_direct_meeting(
@@ -2565,6 +2630,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
         "timeouts",
         "merge-automation",
         "dashboard",
+        "routine-runtime",
     ];
     if !INTERNAL_SOURCES.contains(&source) && !super::settings::is_known_agent(source) {
         return (

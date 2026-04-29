@@ -39,6 +39,8 @@ pub struct Config {
     pub runtime: RuntimeSettingsConfig,
     #[serde(default, skip_serializing_if = "AutomationConfig::is_empty")]
     pub automation: AutomationConfig,
+    #[serde(default, skip_serializing_if = "RoutinesConfig::is_default")]
+    pub routines: RoutinesConfig,
     #[serde(default, skip_serializing_if = "EscalationConfig::is_empty")]
     pub escalation: EscalationConfig,
     #[serde(default, skip_serializing_if = "OnboardingConfig::is_empty")]
@@ -1234,6 +1236,80 @@ impl Default for PoliciesConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct RoutinesConfig {
+    /// Master on/off switch. Defaults to false; requires PostgreSQL.
+    /// SQLite-only deployments are unaffected when this is false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory containing *.js routine scripts. Defaults to `./routines`.
+    #[serde(default = "default_routines_dir")]
+    pub dir: PathBuf,
+    /// How often the due-scan tick runs, in seconds. Defaults to 30.
+    #[serde(default = "default_routines_tick_interval_secs")]
+    pub tick_interval_secs: u64,
+    /// Maximum routines to claim per tick. Defaults to 10.
+    #[serde(default = "default_routines_max_due_per_tick")]
+    pub max_due_per_tick: u32,
+    /// Maximum running agent-backed routine runs to poll per tick. Defaults to 10.
+    #[serde(default = "default_routines_max_agent_polls_per_tick")]
+    pub max_agent_polls_per_tick: u32,
+    /// IANA timezone name used when no per-routine timezone is set.
+    #[serde(default = "default_routines_timezone")]
+    pub default_timezone: String,
+    /// Default maximum wait for agent-backed routine completion, in seconds.
+    #[serde(default = "default_routines_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+    /// Watch `dir` for script changes and reload without restart.
+    #[serde(default = "default_true")]
+    pub hot_reload: bool,
+}
+
+impl Default for RoutinesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_routines_dir(),
+            tick_interval_secs: default_routines_tick_interval_secs(),
+            max_due_per_tick: default_routines_max_due_per_tick(),
+            max_agent_polls_per_tick: default_routines_max_agent_polls_per_tick(),
+            default_timezone: default_routines_timezone(),
+            agent_timeout_secs: default_routines_agent_timeout_secs(),
+            hot_reload: true,
+        }
+    }
+}
+
+impl RoutinesConfig {
+    pub fn is_default(&self) -> bool {
+        *self == RoutinesConfig::default()
+    }
+}
+
+fn default_routines_dir() -> PathBuf {
+    PathBuf::from("./routines")
+}
+
+fn default_routines_tick_interval_secs() -> u64 {
+    30
+}
+
+fn default_routines_max_due_per_tick() -> u32 {
+    10
+}
+
+fn default_routines_max_agent_polls_per_tick() -> u32 {
+    10
+}
+
+fn default_routines_timezone() -> String {
+    "Asia/Seoul".to_string()
+}
+
+fn default_routines_agent_timeout_secs() -> u64 {
+    30 * 60
+}
+
 impl Default for DataConfig {
     fn default() -> Self {
         Self {
@@ -1295,6 +1371,7 @@ impl Default for Config {
             placeholder: PlaceholderConfig::default(),
             runtime: RuntimeSettingsConfig::default(),
             automation: AutomationConfig::default(),
+            routines: RoutinesConfig::default(),
             escalation: EscalationConfig::default(),
             onboarding: OnboardingConfig::default(),
             memory: None,
@@ -1508,9 +1585,9 @@ mod tests {
         DEFAULT_MEMENTO_MCP_URL, DiscordBotAuthConfig, DiscordConfig, EscalationConfig,
         EscalationMode, EscalationScheduleConfig, FileMemoryConfig, KanbanConfig, McpMemoryConfig,
         McpServerAuthConfig, McpServerAuthType, McpServerConfig, MemoryConfig, OnboardingConfig,
-        ReviewConfig, RuntimeSettingsConfig, is_valid_dispatch_profile, load_from_path,
-        normalize_cache_ttl_minutes, normalize_dispatch_profile, resolve_graceful_config_path,
-        runtime_root, save_to_path,
+        ReviewConfig, RoutinesConfig, RuntimeSettingsConfig, is_valid_dispatch_profile,
+        load_from_path, normalize_cache_ttl_minutes, normalize_dispatch_profile,
+        resolve_graceful_config_path, runtime_root, save_to_path,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
@@ -1650,6 +1727,97 @@ mod tests {
         assert_eq!(resolved, root.join("agentdesk.yaml"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routines_config_defaults_are_disabled_safe() {
+        let config = Config::default();
+
+        assert_eq!(config.routines, RoutinesConfig::default());
+        assert!(!config.routines.enabled);
+        assert_eq!(config.routines.dir, PathBuf::from("./routines"));
+        assert_eq!(config.routines.tick_interval_secs, 30);
+        assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
+        assert_eq!(config.routines.default_timezone, "Asia/Seoul");
+        assert_eq!(config.routines.agent_timeout_secs, 1800);
+        assert!(config.routines.hot_reload);
+        assert!(config.routines.is_default());
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("routines:"),
+            "default routines config must be omitted, got: {yaml}"
+        );
+    }
+
+    #[test]
+    fn routines_config_partial_yaml_uses_defaults() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  port: 9010
+routines:
+  enabled: true
+  dir: ./ops-routines
+"#,
+        )
+        .unwrap();
+
+        assert!(config.routines.enabled);
+        assert_eq!(config.routines.dir, PathBuf::from("./ops-routines"));
+        assert_eq!(config.routines.tick_interval_secs, 30);
+        assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
+        assert_eq!(config.routines.default_timezone, "Asia/Seoul");
+        assert_eq!(config.routines.agent_timeout_secs, 1800);
+        assert!(config.routines.hot_reload);
+        assert!(!config.routines.is_default());
+    }
+
+    #[test]
+    fn routines_config_due_claim_limit_does_not_disable_agent_polling() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  port: 9010
+routines:
+  enabled: true
+  max_due_per_tick: 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.routines.max_due_per_tick, 0);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
+    }
+
+    #[test]
+    fn routines_config_round_trips_through_yaml() {
+        let mut config = Config::default();
+        config.routines = RoutinesConfig {
+            enabled: true,
+            dir: PathBuf::from("./routines-prod"),
+            tick_interval_secs: 15,
+            max_due_per_tick: 25,
+            max_agent_polls_per_tick: 50,
+            default_timezone: "Asia/Seoul".to_string(),
+            agent_timeout_secs: 900,
+            hot_reload: false,
+        };
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            yaml.contains("routines:"),
+            "non-default routines config must be serialized, got: {yaml}"
+        );
+        assert!(
+            yaml.contains("enabled: true"),
+            "enabled flag must be serialized, got: {yaml}"
+        );
+
+        let reloaded: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.routines, config.routines);
     }
 
     #[test]

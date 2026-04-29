@@ -69,6 +69,7 @@ hex = "0.4"
 # From RCC — misc
 rand = "0.8"
 libc = "0.2"
+croner = "3.0.1"
 
 sqlite_test = { package = "rusqlite", version = "0.32", features = ["bundled"], optional = true }
 

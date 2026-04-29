@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default, Deserialize)]
 pub struct ApiDocsQuery {
     pub format: Option<String>,
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,11 +247,12 @@ pub(crate) const TOP_40_PAIRED_PATHS: &[(&str, &str)] = &[
     ("GET", "/api/docs"),
 ];
 
-const CANONICAL_CATEGORIES: [&str; 7] = [
+const CANONICAL_CATEGORIES: [&str; 8] = [
     "agents",
     "kanban",
     "dispatches",
     "queue",
+    "routines",
     "ops",
     "integrations",
     "admin",
@@ -262,6 +264,7 @@ fn canonical_category(category: &str) -> &'static str {
         "kanban" | "kanban-repos" | "pipeline" | "pm" | "reviews" => "kanban",
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
         "auto-queue" | "cron" | "queue" => "queue",
+        "routines" => "routines",
         "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats"
         | "provider-cli" => "ops",
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
@@ -313,7 +316,7 @@ fn category_to_group(category: &str) -> &'static str {
         // integrations — discord, github, meetings, provider, mcp
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         // automation — auto-queue, policies, scheduler, cron, maintenance
-        "auto-queue" | "queue" | "cron" | "policies" => "automation",
+        "auto-queue" | "queue" | "cron" | "policies" | "routines" => "automation",
         // config — settings, onboarding, knowledge, source-of-truth, skills,
         // offices, departments, memory (#1066 /api/memory dual-mode)
         "settings" | "onboarding" | "skills" | "offices" | "departments" | "memory" => "config",
@@ -419,6 +422,7 @@ fn category_description(category: &str) -> &'static str {
             "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback."
         }
         "reviews" => "Review verdict submission, decisions, and tuning aggregation.",
+        "routines" => "Durable script-backed routines, run history, and manual routine controls.",
         "sessions" => "Sessions, force-kill, and termination events.",
         "settings" => "Settings surfaces, live overrides, precedence, and onboarding contracts.",
         "skills" => "Skill catalog and usage ranking.",
@@ -2956,6 +2960,210 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             )]),
         ep("GET", "/api/cron-jobs", "cron", "List cron jobs // TODO: example"),
         ep(
+            "GET",
+            "/api/routines",
+            "routines",
+            "List durable routines with optional agent/status filters.",
+        )
+        .with_params([
+            (
+                "agent_id",
+                query_param("string", false, "Filter routines attached to one agent"),
+            ),
+            (
+                "status",
+                query_param("string", false, "Filter by enabled, paused, or detached"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"status": "enabled"}}),
+            json!({"routines": [{"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}]}),
+        ),
+        ep(
+            "GET",
+            "/api/routines/metrics",
+            "routines",
+            "Aggregate routine status counts, run outcome/error counts, and average finished-run latency with optional agent and time-window filters.",
+        )
+        .with_params([
+            (
+                "agent_id",
+                query_param("string", false, "Filter metrics to one attached agent"),
+            ),
+            (
+                "since",
+                query_param("string", false, "Optional RFC3339 lower bound for routine_runs.created_at"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"agent_id": "codex", "since": "2026-04-29T00:00:00Z"}}),
+            json!({"metrics": {"routines_total": 3, "routines_enabled": 2, "routines_paused": 1, "routines_detached": 0, "runs_total": 12, "runs_running": 1, "runs_succeeded": 9, "runs_failed": 1, "runs_skipped": 0, "runs_paused": 0, "runs_interrupted": 1, "runs_error": 2, "avg_latency_ms": 1532.4}, "filters": {"agent_id": "codex", "since": "2026-04-29T00:00:00Z"}}),
+        ),
+        ep(
+            "GET",
+            "/api/routines/runs/search",
+            "routines",
+            "Search recent routine runs by `routine_runs.result_json` text with optional agent, status, time-window, and limit filters.",
+        )
+        .with_params([
+            ("q", query_param("string", true, "Search text matched against routine_runs.result_json")),
+            (
+                "agent_id",
+                query_param("string", false, "Filter matches to one attached agent"),
+            ),
+            (
+                "status",
+                query_param("string", false, "Filter by running, succeeded, failed, skipped, paused, or interrupted"),
+            ),
+            (
+                "since",
+                query_param("string", false, "Optional RFC3339 lower bound for routine_runs.created_at"),
+            ),
+            (
+                "limit",
+                query_param("integer", false, "Maximum rows to return, clamped to 1..100"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"q": "checkpoint", "agent_id": "codex", "status": "succeeded", "limit": 20}}),
+            json!({"runs": [{"id": "run-1", "routine_id": "routine-1", "script_ref": "agent-checkpoint-review.js", "status": "succeeded", "result_json": {"summary": "checkpoint ok"}}], "filters": {"q": "checkpoint", "agent_id": "codex", "status": "succeeded", "since": null, "limit": 20}}),
+        ),
+        ep(
+            "POST",
+            "/api/routines",
+            "routines",
+            "Attach a file-backed routine row without starting an agent action.",
+        )
+        .with_params([
+            ("script_ref", body_param("string", true, "Routine script path relative to routines.dir")),
+            ("name", body_param("string", false, "Human-readable routine name")),
+            ("agent_id", body_param("string", false, "Optional attached agent id")),
+            ("execution_strategy", body_param("string", false, "fresh or persistent")),
+            (
+                "schedule",
+                body_param("string", false, "Optional @every duration or 5-field cron such as 30 9 * * 1-5"),
+            ),
+            ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
+            ("discord_thread_id", body_param("string", false, "Optional existing Discord thread id")),
+            ("timeout_secs", body_param("integer", false, "Optional per-routine agent timeout in seconds")),
+        ])
+        .with_example(
+            json!({"body": {"script_ref": "daily-summary.js", "name": "Daily Summary", "execution_strategy": "fresh"}}),
+            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}, "discord_log": {"status": "skipped"}}),
+        ),
+        ep(
+            "GET",
+            "/api/routines/{id}",
+            "routines",
+            "Get one durable routine row.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"routine": {"id": "routine-1", "script_ref": "daily-summary.js"}}),
+        ),
+        ep(
+            "PATCH",
+            "/api/routines/{id}",
+            "routines",
+            "Patch routine metadata, scheduling fields, or checkpoint.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("name", body_param("string", false, "New routine name")),
+            (
+                "execution_strategy",
+                body_param("string", false, "fresh or persistent"),
+            ),
+            (
+                "schedule",
+                body_param("string|null", false, "Set @every duration or 5-field cron, or pass null to clear it"),
+            ),
+            (
+                "next_due_at",
+                body_param("string|null", false, "RFC3339 due time or null to clear it"),
+            ),
+            (
+                "checkpoint",
+                body_param("object|null", false, "Replacement checkpoint JSON or null to clear it"),
+            ),
+            (
+                "discord_thread_id",
+                body_param("string|null", false, "Saved Discord thread id or null to clear it"),
+            ),
+            (
+                "timeout_secs",
+                body_param("integer|null", false, "Per-routine agent timeout in seconds or null for config default"),
+            ),
+        ]),
+        ep(
+            "GET",
+            "/api/routines/{id}/runs",
+            "routines",
+            "List recent run history for one routine, including best-effort Discord log status and warning detail.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("limit", query_param("integer", false, "Maximum runs to return, capped at 100")),
+        ]),
+        ep(
+            "POST",
+            "/api/routines/{id}/pause",
+            "routines",
+            "Pause an enabled routine, clear its next due time, and enqueue a best-effort Discord log when an attached agent has a channel.",
+        )
+        .with_params([("id", path_param("Routine id"))]),
+        ep(
+            "POST",
+            "/api/routines/{id}/resume",
+            "routines",
+            "Resume a paused routine with an optional next due time and best-effort Discord log.",
+        )
+        .with_params([
+            ("id", path_param("Routine id")),
+            ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
+        ]),
+        ep(
+            "POST",
+            "/api/routines/{id}/detach",
+            "routines",
+            "Detach a non-running routine without deleting its run history; Discord log failure is returned only as discord_log.warning_code/warning.",
+        )
+        .with_params([("id", path_param("Routine id"))]),
+        ep(
+            "POST",
+            "/api/routines/{id}/run-now",
+            "routines",
+            "Claim and execute one routine. Script actions close immediately; agent actions store turn_id and remain running until session_transcripts completion evidence is found.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"outcome": {"run_id": "run-1", "routine_id": "routine-1", "action": "agent", "status": "running", "result_json": {"turn_id": "discord:1473922824350601297:9100000000000000000", "fresh_context_guaranteed": false}}, "discord_log": {"status": "ok"}}),
+        ),
+        ep(
+            "POST",
+            "/api/routines/{id}/session/reset",
+            "routines",
+            "Reset the provider session for a persistent agent-backed routine. Claude sends /clear; managed tmux providers reset the process session; providers without managed tmux clear runtime mailbox state only.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"ok": true, "session": {"action": "reset", "provider": "codex", "provider_clear_behavior": "runtime clear plus managed process session reset for the provider tmux session", "runtime_cleared": true}, "interrupted_run_id": null}),
+        ),
+        ep(
+            "POST",
+            "/api/routines/{id}/session/kill",
+            "routines",
+            "Force-kill the provider session for a persistent agent-backed routine, disconnect matching session rows, and interrupt the routine's in-flight run when the session actually changes.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"ok": true, "session": {"action": "kill", "provider": "codex", "tmux_killed": true, "lifecycle_path": "mailbox_canonical"}, "interrupted_run_id": "run-1"}),
+        ),
+        ep(
             "POST",
             "/api/queue/generate",
             "auto-queue",
@@ -3946,6 +4154,35 @@ pub async fn api_docs(Query(query): Query<ApiDocsQuery>) -> (StatusCode, Json<Va
         .is_some_and(|format| format.eq_ignore_ascii_case("flat"))
     {
         return (StatusCode::OK, Json(json!({ "endpoints": endpoints })));
+    }
+
+    if let Some(category) = query
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let category = canonical_category(category);
+        let matching: Vec<EndpointDoc> = endpoints
+            .into_iter()
+            .filter(|endpoint| effective_category(endpoint) == category)
+            .collect();
+        if matching.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown docs category: {category}") })),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "group": category_to_group(category),
+                "category": category,
+                "description": category_description(category),
+                "count": matching.len(),
+                "endpoints": matching,
+            })),
+        );
     }
 
     let groups: Vec<Value> = GROUP_NAMES
