@@ -3233,12 +3233,31 @@ async fn dm_reply_retry_loop(pg_pool: Arc<PgPool>) {
     }
 }
 
-async fn routine_runtime_loop(pg_pool: Arc<PgPool>, tick_interval_secs: u64) {
-    use crate::services::routines::RoutineStore;
+async fn routine_runtime_loop(
+    pg_pool: Arc<PgPool>,
+    routines_config: crate::config::RoutinesConfig,
+    tick_interval_secs: u64,
+) {
+    use crate::services::routines::{RoutineAction, RoutineScriptLoader, RoutineStore};
     let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
         return;
     };
+
+    let _routine_action_validator: fn(serde_json::Value) -> anyhow::Result<RoutineAction> =
+        crate::services::routines::validate_routine_action;
+
+    let script_loader = match RoutineScriptLoader::new() {
+        Ok(loader) => loader,
+        Err(e) => {
+            tracing::warn!(error = %e, "routine runtime not started: script loader init failed");
+            return;
+        }
+    };
+    match script_loader.load_dir(&routines_config.dir) {
+        Ok(count) => tracing::info!(count, "routine script registry initialized"),
+        Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
+    }
 
     let store = RoutineStore::new(pg_pool);
     match store.recover_stale_running_runs().await {
