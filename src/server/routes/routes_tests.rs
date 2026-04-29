@@ -7302,6 +7302,12 @@ async fn api_docs_group_category_automation_routines_returns_session_controls() 
     assert!(
         endpoints
             .iter()
+            .any(|ep| ep["path"] == "/api/routines/metrics"),
+        "automation/routines must include routine metrics"
+    );
+    assert!(
+        endpoints
+            .iter()
             .any(|ep| ep["path"] == "/api/routines/{id}/session/reset"),
         "automation/routines must include routine session reset"
     );

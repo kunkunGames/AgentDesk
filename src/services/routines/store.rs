@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -64,6 +64,23 @@ pub struct RoutineRunRecord {
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoutineMetrics {
+    pub routines_total: i64,
+    pub routines_enabled: i64,
+    pub routines_paused: i64,
+    pub routines_detached: i64,
+    pub runs_total: i64,
+    pub runs_running: i64,
+    pub runs_succeeded: i64,
+    pub runs_failed: i64,
+    pub runs_skipped: i64,
+    pub runs_paused: i64,
+    pub runs_interrupted: i64,
+    pub runs_error: i64,
+    pub avg_latency_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -234,6 +251,73 @@ impl RoutineStore {
         .fetch_all(&*self.pool)
         .await
         .map_err(|e| anyhow!("list running agent routine runs: {e}"))
+    }
+
+    pub async fn metrics(
+        &self,
+        agent_id: Option<&str>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<RoutineMetrics> {
+        let routine_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS routines_total,
+                COUNT(*) FILTER (WHERE status = 'enabled')::BIGINT AS routines_enabled,
+                COUNT(*) FILTER (WHERE status = 'paused')::BIGINT AS routines_paused,
+                COUNT(*) FILTER (WHERE status = 'detached')::BIGINT AS routines_detached
+            FROM routines
+            WHERE ($1::text IS NULL OR agent_id = $1)
+            "#,
+        )
+        .bind(agent_id)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("load routine metrics: routines: {e}"))?;
+
+        let run_row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(rr.id)::BIGINT AS runs_total,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'running')::BIGINT AS runs_running,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'succeeded')::BIGINT AS runs_succeeded,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'failed')::BIGINT AS runs_failed,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'skipped')::BIGINT AS runs_skipped,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'paused')::BIGINT AS runs_paused,
+                COUNT(rr.id) FILTER (WHERE rr.status = 'interrupted')::BIGINT AS runs_interrupted,
+                COUNT(rr.id) FILTER (
+                    WHERE rr.status IN ('failed', 'interrupted') OR rr.error IS NOT NULL
+                )::BIGINT AS runs_error,
+                AVG(EXTRACT(EPOCH FROM (rr.finished_at - rr.started_at)) * 1000.0)
+                    FILTER (WHERE rr.finished_at IS NOT NULL)::DOUBLE PRECISION AS avg_latency_ms
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE ($1::text IS NULL OR r.agent_id = $1)
+              AND ($2::timestamptz IS NULL OR rr.created_at >= $2)
+            "#,
+        )
+        .bind(agent_id)
+        .bind(since)
+        .fetch_one(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("load routine metrics: runs: {e}"))?;
+
+        Ok(RoutineMetrics {
+            routines_total: get_i64(&routine_row, "routines_total")?,
+            routines_enabled: get_i64(&routine_row, "routines_enabled")?,
+            routines_paused: get_i64(&routine_row, "routines_paused")?,
+            routines_detached: get_i64(&routine_row, "routines_detached")?,
+            runs_total: get_i64(&run_row, "runs_total")?,
+            runs_running: get_i64(&run_row, "runs_running")?,
+            runs_succeeded: get_i64(&run_row, "runs_succeeded")?,
+            runs_failed: get_i64(&run_row, "runs_failed")?,
+            runs_skipped: get_i64(&run_row, "runs_skipped")?,
+            runs_paused: get_i64(&run_row, "runs_paused")?,
+            runs_interrupted: get_i64(&run_row, "runs_interrupted")?,
+            runs_error: get_i64(&run_row, "runs_error")?,
+            avg_latency_ms: run_row
+                .try_get("avg_latency_ms")
+                .map_err(|e| anyhow!("decode routine metric avg_latency_ms: {e}"))?,
+        })
     }
 
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
@@ -904,6 +988,11 @@ fn validate_execution_strategy(strategy: &str) -> Result<()> {
             "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
         )),
     }
+}
+
+fn get_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64> {
+    row.try_get(column)
+        .map_err(|e| anyhow!("decode routine metric {column}: {e}"))
 }
 
 #[derive(Debug, Clone, Copy)]

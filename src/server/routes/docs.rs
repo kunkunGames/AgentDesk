@@ -2508,6 +2508,26 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"routines": [{"id": "routine-1", "script_ref": "daily-summary.js", "status": "enabled"}]}),
         ),
         ep(
+            "GET",
+            "/api/routines/metrics",
+            "routines",
+            "Aggregate routine status counts, run outcome/error counts, and average finished-run latency with optional agent and time-window filters.",
+        )
+        .with_params([
+            (
+                "agent_id",
+                query_param("string", false, "Filter metrics to one attached agent"),
+            ),
+            (
+                "since",
+                query_param("string", false, "Optional RFC3339 lower bound for routine_runs.created_at"),
+            ),
+        ])
+        .with_example(
+            json!({"query": {"agent_id": "codex", "since": "2026-04-29T00:00:00Z"}}),
+            json!({"metrics": {"routines_total": 3, "routines_enabled": 2, "routines_paused": 1, "routines_detached": 0, "runs_total": 12, "runs_running": 1, "runs_succeeded": 9, "runs_failed": 1, "runs_skipped": 0, "runs_paused": 0, "runs_interrupted": 1, "runs_error": 2, "avg_latency_ms": 1532.4}, "filters": {"agent_id": "codex", "since": "2026-04-29T00:00:00Z"}}),
+        ),
+        ep(
             "POST",
             "/api/routines",
             "routines",

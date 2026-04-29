@@ -143,6 +143,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/routines",
                 get(routines::list_routines).post(routines::attach_routine),
             )
+            .route("/routines/metrics", get(routines::routine_metrics))
             .route(
                 "/routines/{id}",
                 get(routines::get_routine).patch(routines::patch_routine),

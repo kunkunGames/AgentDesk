@@ -28,6 +28,12 @@ pub struct ListRunsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RoutineMetricsQuery {
+    pub agent_id: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AttachRoutineBody {
     pub agent_id: Option<String>,
     pub script_ref: String,
@@ -62,6 +68,24 @@ pub async fn list_routines(
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "routines": routines })))
+}
+
+pub async fn routine_metrics(
+    State(state): State<AppState>,
+    Query(query): Query<RoutineMetricsQuery>,
+) -> AppResult<Json<Value>> {
+    let store = routine_store(&state)?;
+    let metrics = store
+        .metrics(query.agent_id.as_deref(), query.since)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(json!({
+        "metrics": metrics,
+        "filters": {
+            "agent_id": query.agent_id,
+            "since": query.since,
+        },
+    })))
 }
 
 pub async fn get_routine(
