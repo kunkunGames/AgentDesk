@@ -24,6 +24,10 @@
 - [`known-legacy.md`](known-legacy.md) — code paths that intentionally remain
   legacy, with the cleanup-owner issue number. Touch them only inside the
   scope of the listed issue or for narrow bugfix.
+- [`multinode-transition.md`](multinode-transition.md) — transition map for
+  moving AgentDesk from one dcserver node to leader/worker execution, including
+  single-node assumptions, side-effect ownership, invariants, and #876-#884
+  test gates.
 - [`opencode-usability-spec.md`](opencode-usability-spec.md) — implementation
   contract for raising OpenCode's Discord-facing usability toward Claude/Codex
   parity, including prompt/output safety, SSE text handling, and MCP sync.
