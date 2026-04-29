@@ -1,4 +1,4 @@
-//! New outbound delivery policy (#1006 v3, slice 1.0 — types only).
+//! New outbound delivery policy (#1006 v3).
 //!
 //! Replaces the legacy [`super::legacy::DiscordOutboundPolicy`] (which mixed
 //! `max_len`, three independent fallback enums, and a `minimal_fallback`
@@ -14,8 +14,8 @@
 //!   `(correlation_id, semantic_event_id)` pair. Stored as
 //!   [`std::time::Duration`] so wire formats can serialise it as seconds.
 //!
-//! The new types are not yet consumed by any callsite; the deliver
-//! implementation that interprets them lands in slice 1.1.
+//! These policies are consumed by [`super::delivery`] for direct v3 callsites
+//! and by [`super::legacy`] through its compatibility adapter.
 
 use std::time::Duration;
 
@@ -34,6 +34,10 @@ pub(crate) enum LengthStrategy {
     /// Escalate the payload to an attached text file when it exceeds the
     /// inline limit.
     FileAttachment,
+    /// Reject payloads beyond the inline limit without sending. Used by
+    /// stream/edit callsites that already manage chunking and must not
+    /// silently alter content.
+    RejectOverLimit,
 }
 
 /// Behaviour when the primary [`super::message::OutboundTarget`] is
@@ -71,6 +75,37 @@ impl Default for DiscordOutboundPolicy {
             fallback: FallbackPolicy::None,
             idempotency_window: Duration::from_secs(24 * 60 * 60),
         }
+    }
+}
+
+impl DiscordOutboundPolicy {
+    pub(crate) fn dispatch_outbox() -> Self {
+        Self {
+            length_strategy: LengthStrategy::Compact,
+            fallback: FallbackPolicy::None,
+            idempotency_window: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    pub(crate) fn review_notification() -> Self {
+        Self {
+            length_strategy: LengthStrategy::Compact,
+            fallback: FallbackPolicy::None,
+            idempotency_window: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    pub(crate) fn preserve_inline_content() -> Self {
+        Self {
+            length_strategy: LengthStrategy::RejectOverLimit,
+            fallback: FallbackPolicy::None,
+            idempotency_window: Duration::from_secs(24 * 60 * 60),
+        }
+    }
+
+    pub(crate) fn without_idempotency(mut self) -> Self {
+        self.idempotency_window = Duration::ZERO;
+        self
     }
 }
 
@@ -124,6 +159,7 @@ mod tests {
             LengthStrategy::Split,
             LengthStrategy::Compact,
             LengthStrategy::FileAttachment,
+            LengthStrategy::RejectOverLimit,
         ] {
             let json = serde_json::to_string(&variant).expect("serialize");
             let back: LengthStrategy = serde_json::from_str(&json).expect("deserialize");

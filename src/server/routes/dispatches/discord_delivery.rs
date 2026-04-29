@@ -728,48 +728,78 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
     minimal_message: &str,
     dispatch_id: Option<&str>,
 ) -> Result<DispatchMessagePostOutcome, DispatchMessagePostError> {
-    // #1006: route through the unified outbound API. The API owns length
-    // truncation + minimal-fallback retry. Dispatch notify callsites pass a
-    // semantic delivery id so outbox operators can distinguish normal sends,
-    // degraded fallback sends, and duplicate guard skips.
-    use crate::services::discord::outbound::{
-        DeliveryResult, DiscordOutboundMessage, DiscordOutboundPolicy, HttpOutboundClient,
-        OutboundDeduper, deliver_outbound,
-    };
+    // #1436: dispatch_outbox is the first production callsite using the v3
+    // outbound envelope directly. The compatibility re-export remains for
+    // older producers while this path exercises message/policy/decision/result.
+    use crate::services::discord::outbound::delivery::{deliver_outbound, first_raw_message_id};
+    use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+    use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+    use crate::services::discord::outbound::result::{DeliveryResult, FallbackUsed};
+    use crate::services::discord::outbound::{HttpOutboundClient, OutboundDeduper};
+    use poise::serenity_prelude::ChannelId;
 
     let outbound_client =
         HttpOutboundClient::new(client.clone(), token.to_string(), base_url.to_string());
     let dedup = OutboundDeduper::new();
-    let mut outbound_msg = DiscordOutboundMessage::new(channel_id, message);
     let correlation_id = dispatch_id.map(dispatch_delivery_correlation_id);
     let semantic_event_id = dispatch_id.map(dispatch_delivery_semantic_event_id);
-    if let (Some(correlation_id), Some(semantic_event_id)) =
-        (correlation_id.as_deref(), semantic_event_id.as_deref())
-    {
-        outbound_msg = outbound_msg.with_correlation(correlation_id, semantic_event_id);
-    }
-    let policy = DiscordOutboundPolicy::dispatch_outbox(minimal_message.to_string());
+    let mut policy = DiscordOutboundPolicy::dispatch_outbox();
+    let (delivery_correlation_id, delivery_semantic_event_id) =
+        match (correlation_id.as_ref(), semantic_event_id.as_ref()) {
+            (Some(correlation_id), Some(semantic_event_id)) => {
+                (correlation_id.clone(), semantic_event_id.clone())
+            }
+            _ => {
+                policy = policy.without_idempotency();
+                (
+                    "dispatch:adhoc".to_string(),
+                    "dispatch:adhoc:notify".to_string(),
+                )
+            }
+        };
+    let target_channel_id = channel_id
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| {
+            DispatchMessagePostError::new(
+                DispatchMessagePostErrorKind::Other,
+                format!("invalid dispatch outbound channel id {channel_id}: {error}"),
+            )
+        })?;
+    let outbound_msg = DiscordOutboundMessage::new(
+        delivery_correlation_id,
+        delivery_semantic_event_id,
+        message,
+        OutboundTarget::Channel(target_channel_id),
+        policy,
+    )
+    .with_summary(minimal_message.to_string());
 
-    match deliver_outbound(&outbound_client, &dedup, outbound_msg, policy).await {
-        DeliveryResult::Success { message_id } => Ok(DispatchMessagePostOutcome {
-            message_id: message_id.clone(),
-            delivery: DispatchNotifyDeliveryResult {
-                status: "success".to_string(),
-                dispatch_id: dispatch_id.unwrap_or("").to_string(),
-                action: "notify".to_string(),
-                correlation_id,
-                semantic_event_id,
-                target_channel_id: Some(channel_id.to_string()),
-                message_id: Some(message_id),
-                fallback_kind: None,
-                detail: None,
-            },
-        }),
-        DeliveryResult::Fallback { message_id, kind } => {
-            if matches!(
-                kind,
-                crate::services::discord::outbound::FallbackKind::MinimalFallback
-            ) {
+    match deliver_outbound(&outbound_client, &dedup, outbound_msg).await {
+        DeliveryResult::Sent { messages, .. } => {
+            let message_id = first_raw_message_id(&messages).unwrap_or_default();
+            Ok(DispatchMessagePostOutcome {
+                message_id: message_id.clone(),
+                delivery: DispatchNotifyDeliveryResult {
+                    status: "success".to_string(),
+                    dispatch_id: dispatch_id.unwrap_or("").to_string(),
+                    action: "notify".to_string(),
+                    correlation_id,
+                    semantic_event_id,
+                    target_channel_id: Some(channel_id.to_string()),
+                    message_id: Some(message_id),
+                    fallback_kind: None,
+                    detail: None,
+                },
+            })
+        }
+        DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => {
+            let message_id = first_raw_message_id(&messages).unwrap_or_default();
+            if matches!(fallback_used, FallbackUsed::MinimalFallback) {
                 tracing::warn!(
                     "[dispatch] Message too long for channel {channel_id}; retried with minimal fallback"
                 );
@@ -784,7 +814,11 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
                     semantic_event_id,
                     target_channel_id: Some(channel_id.to_string()),
                     message_id: Some(message_id),
-                    fallback_kind: Some(format!("{kind:?}")),
+                    fallback_kind: Some(match fallback_used {
+                        FallbackUsed::MinimalFallback => "MinimalFallback".to_string(),
+                        FallbackUsed::LengthCompacted => "Truncated".to_string(),
+                        other => format!("{other:?}"),
+                    }),
                     detail: Some("shared outbound API used degraded delivery".to_string()),
                 },
             })
@@ -803,19 +837,19 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
                 detail: Some("shared outbound API deduplicated delivery".to_string()),
             },
         }),
-        DeliveryResult::Skipped { .. } => Err(DispatchMessagePostError::new(
+        DeliveryResult::Skip { .. } => Err(DispatchMessagePostError::new(
             DispatchMessagePostErrorKind::Other,
             format!("unexpected skip for channel {channel_id}"),
         )),
-        DeliveryResult::PermanentFailure { detail } => {
-            let kind = if detail.to_ascii_lowercase().contains("base_type_max_length")
-                || detail.contains("length")
+        DeliveryResult::PermanentFailure { reason } => {
+            let kind = if reason.to_ascii_lowercase().contains("base_type_max_length")
+                || reason.contains("length")
             {
                 DispatchMessagePostErrorKind::MessageTooLong
             } else {
                 DispatchMessagePostErrorKind::Other
             };
-            Err(DispatchMessagePostError::new(kind, detail))
+            Err(DispatchMessagePostError::new(kind, reason))
         }
     }
 }
@@ -3626,6 +3660,46 @@ mod tests {
                 "PATCH /channels/thread-1",
                 "PUT /channels/thread-1/thread-members/42",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_outbox_direct_v3_envelope_posts_success_metadata() {
+        let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
+        let client = reqwest::Client::new();
+
+        let outcome = post_dispatch_message_to_channel_with_delivery(
+            &client,
+            "announce-token",
+            &base_url,
+            "123",
+            "direct v3 dispatch message",
+            "minimal fallback message",
+            Some("dispatch-v3-outbox"),
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+        assert_eq!(outcome.message_id, "message-123");
+        assert_eq!(outcome.delivery.status, "success");
+        assert_eq!(
+            outcome.delivery.correlation_id.as_deref(),
+            Some("dispatch:dispatch-v3-outbox")
+        );
+        assert_eq!(
+            outcome.delivery.semantic_event_id.as_deref(),
+            Some("dispatch:dispatch-v3-outbox:notify")
+        );
+        assert_eq!(outcome.delivery.target_channel_id.as_deref(), Some("123"));
+        assert_eq!(outcome.delivery.message_id.as_deref(), Some("message-123"));
+        assert_eq!(outcome.delivery.fallback_kind, None);
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.calls, vec!["POST /channels/123/messages"]);
+        assert_eq!(
+            state.posted_messages,
+            vec![("123".to_string(), "direct v3 dispatch message".to_string())]
         );
     }
 

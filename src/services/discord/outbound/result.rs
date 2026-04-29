@@ -1,4 +1,4 @@
-//! New delivery outcome enum (#1006 v3, slice 1.0 — types only).
+//! New delivery outcome enum (#1006 v3).
 //!
 //! Replaces the legacy [`super::legacy::DeliveryResult`] with a cleaner
 //! variant set:
@@ -18,9 +18,9 @@
 //! - `PermanentFailure` — delivery failed and must not be retried. The
 //!   `reason` string is intended for logs / dead-letter queues.
 //!
-//! Slice 1.0 is types only — no production code constructs these variants
-//! yet. The deliver impl in slice 1.1 will be responsible for choosing the
-//! correct variant per outcome.
+//! [`super::delivery`] constructs these variants for direct v3 callsites; the
+//! legacy facade maps them back to the older result shape while producers
+//! migrate.
 
 use poise::serenity_prelude::{ChannelId, MessageId};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,9 @@ use super::message::OutboundDedupKey;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FallbackUsed {
+    /// Primary send returned a length error and a caller-provided minimal
+    /// fallback body was posted instead.
+    MinimalFallback,
     /// Payload was truncated / compacted to fit the per-message limit.
     LengthCompacted,
     /// Payload was split across multiple messages.
@@ -47,6 +50,9 @@ pub(crate) enum FallbackUsed {
 pub(crate) struct DeliveredMessage {
     pub(crate) channel_id: ChannelId,
     pub(crate) message_id: MessageId,
+    /// Raw id returned by the transport. Production Discord ids are numeric
+    /// snowflakes; legacy test doubles also use stable string ids.
+    pub(crate) raw_message_id: String,
     /// Present for split delivery. `None` means the message is not a split
     /// chunk, such as compact or file fallback delivery.
     pub(crate) chunk_index: Option<usize>,
@@ -58,6 +64,18 @@ impl DeliveredMessage {
         Self {
             channel_id,
             message_id,
+            raw_message_id: message_id.get().to_string(),
+            chunk_index: None,
+            chunk_count: None,
+        }
+    }
+
+    pub(crate) fn single_raw(channel_id: ChannelId, raw_message_id: impl Into<String>) -> Self {
+        let raw_message_id = raw_message_id.into();
+        Self {
+            channel_id,
+            message_id: parse_message_id_lossy(&raw_message_id),
+            raw_message_id,
             chunk_index: None,
             chunk_count: None,
         }
@@ -72,10 +90,34 @@ impl DeliveredMessage {
         Self {
             channel_id,
             message_id,
+            raw_message_id: message_id.get().to_string(),
             chunk_index: Some(chunk_index),
             chunk_count: Some(chunk_count),
         }
     }
+
+    pub(crate) fn chunk_raw(
+        channel_id: ChannelId,
+        raw_message_id: impl Into<String>,
+        chunk_index: usize,
+        chunk_count: usize,
+    ) -> Self {
+        let raw_message_id = raw_message_id.into();
+        Self {
+            channel_id,
+            message_id: parse_message_id_lossy(&raw_message_id),
+            raw_message_id,
+            chunk_index: Some(chunk_index),
+            chunk_count: Some(chunk_count),
+        }
+    }
+}
+
+fn parse_message_id_lossy(raw_message_id: &str) -> MessageId {
+    raw_message_id
+        .parse::<u64>()
+        .map(MessageId::new)
+        .unwrap_or_else(|_| MessageId::new(1))
 }
 
 /// Outcome of a single outbound delivery attempt (#1006 v3).
@@ -253,6 +295,7 @@ mod tests {
     #[test]
     fn fallback_used_serde_roundtrip_all_variants() {
         for variant in [
+            FallbackUsed::MinimalFallback,
             FallbackUsed::LengthCompacted,
             FallbackUsed::LengthSplit,
             FallbackUsed::FileAttachment,

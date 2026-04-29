@@ -1,9 +1,9 @@
 //! Unified length-safe idempotent Discord outbound delivery API (#1006).
 //!
 //! This module introduces a common outbound domain API that all Discord
-//! message-sending code paths can migrate to. The first slice wires the
-//! dispatch outbox path through it; subsequent slices will migrate review
-//! notifications, DMs, and intake placeholder sends.
+//! message-sending code paths can migrate to. New production callsites should
+//! use the v3 envelope modules directly; this module is the compatibility
+//! facade for producers that have not migrated yet.
 //!
 //! Design:
 //! - [`DiscordOutboundMessage`] carries content + channel/thread routing +
@@ -22,11 +22,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use poise::serenity_prelude::{ChannelId, MessageId};
 use sha2::{Digest, Sha256};
 
 use crate::server::routes::dispatches::discord_delivery::{
     DispatchMessagePostError, DispatchMessagePostErrorKind,
 };
+
+use super::delivery::{DeliveryReferenceOverride, DeliveryTransportOverrides};
+use super::message as v3_message;
+use super::policy as v3_policy;
+use super::result as v3_result;
 
 /// Discord's hard per-message character limit.
 pub(crate) const DISCORD_HARD_LIMIT_CHARS: usize = 2000;
@@ -217,15 +223,126 @@ impl DiscordOutboundMessage {
             .as_deref()
             .unwrap_or(self.channel_id.as_str())
     }
+}
 
-    /// Dedup key derived from correlation/semantic ids.
-    fn dedup_key(&self) -> Option<String> {
-        match (&self.correlation_id, &self.semantic_event_id) {
-            (Some(c), Some(s)) => Some(format!("{c}::{s}")),
-            (Some(c), None) => Some(format!("{c}::_")),
-            (None, Some(s)) => Some(format!("_::{s}")),
-            (None, None) => None,
+fn legacy_delivery_ids(message: &DiscordOutboundMessage) -> (String, String, bool) {
+    match (&message.correlation_id, &message.semantic_event_id) {
+        (Some(correlation_id), Some(semantic_event_id)) => {
+            (correlation_id.clone(), semantic_event_id.clone(), true)
         }
+        (Some(correlation_id), None) => (correlation_id.clone(), "_".to_string(), true),
+        (None, Some(semantic_event_id)) => ("_".to_string(), semantic_event_id.clone(), true),
+        (None, None) => (
+            "legacy:no-dedup".to_string(),
+            "legacy:no-dedup".to_string(),
+            false,
+        ),
+    }
+}
+
+fn legacy_dedup_key(message: &DiscordOutboundMessage) -> Option<String> {
+    let (correlation_id, semantic_event_id, dedup_enabled) = legacy_delivery_ids(message);
+    dedup_enabled.then(|| format!("{correlation_id}::{semantic_event_id}"))
+}
+
+fn parse_channel_id_lossy(raw: &str) -> ChannelId {
+    raw.parse::<u64>()
+        .map(ChannelId::new)
+        .unwrap_or_else(|_| ChannelId::new(1))
+}
+
+fn parse_message_id_lossy(raw: &str) -> MessageId {
+    raw.parse::<u64>()
+        .map(MessageId::new)
+        .unwrap_or_else(|_| MessageId::new(1))
+}
+
+fn legacy_policy_to_v3(
+    policy: &DiscordOutboundPolicy,
+    dedup_enabled: bool,
+) -> v3_policy::DiscordOutboundPolicy {
+    let length_strategy = match (policy.split_strategy, policy.file_fallback) {
+        (_, FileFallback::AttachAsTextFile) => v3_policy::LengthStrategy::FileAttachment,
+        (SplitStrategy::RejectOverLimit, _) => v3_policy::LengthStrategy::RejectOverLimit,
+        (SplitStrategy::TruncateWithMarker | SplitStrategy::TruncateWithMinimalFallback, _) => {
+            v3_policy::LengthStrategy::Compact
+        }
+    };
+    let mut v3 = v3_policy::DiscordOutboundPolicy {
+        length_strategy,
+        fallback: v3_policy::FallbackPolicy::None,
+        idempotency_window: std::time::Duration::from_secs(24 * 60 * 60),
+    };
+    if !dedup_enabled {
+        v3 = v3.without_idempotency();
+    }
+    v3
+}
+
+fn legacy_message_to_v3(
+    message: &DiscordOutboundMessage,
+    policy: &DiscordOutboundPolicy,
+) -> v3_message::DiscordOutboundMessage {
+    let (correlation_id, semantic_event_id, dedup_enabled) = legacy_delivery_ids(message);
+    let target = match message.thread_id.as_deref() {
+        Some(thread_id) => v3_message::OutboundTarget::Thread {
+            parent: parse_channel_id_lossy(&message.channel_id),
+            thread: parse_channel_id_lossy(thread_id),
+        },
+        None => v3_message::OutboundTarget::Channel(parse_channel_id_lossy(&message.channel_id)),
+    };
+    let operation = message
+        .edit_message_id
+        .as_deref()
+        .map(|message_id| v3_message::OutboundOperation::Edit {
+            message_id: parse_message_id_lossy(message_id),
+        })
+        .unwrap_or(v3_message::OutboundOperation::Send);
+    let mut v3 = v3_message::DiscordOutboundMessage::new(
+        correlation_id,
+        semantic_event_id,
+        message.content.clone(),
+        target,
+        legacy_policy_to_v3(policy, dedup_enabled),
+    )
+    .with_operation(operation);
+
+    if let Some(reference) = message.reference.as_ref() {
+        v3 = v3.with_reference(v3_message::OutboundReferenceContext::reply_to(
+            parse_channel_id_lossy(&reference.channel_id),
+            parse_message_id_lossy(&reference.message_id),
+        ));
+    }
+    if let Some(minimal) = policy
+        .minimal_fallback
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        v3 = v3.with_summary(minimal.to_string());
+    }
+    v3
+}
+
+fn legacy_delivery_overrides(
+    message: &DiscordOutboundMessage,
+    policy: &DiscordOutboundPolicy,
+) -> DeliveryTransportOverrides {
+    DeliveryTransportOverrides {
+        target_channel: Some(message.target_channel().to_string()),
+        edit_message_id: message.edit_message_id.clone(),
+        reference: message
+            .reference
+            .as_ref()
+            .map(|reference| DeliveryReferenceOverride {
+                channel_id: reference.channel_id.clone(),
+                message_id: reference.message_id.clone(),
+            }),
+        limits: Some(super::decision::OutboundPolicyLimits {
+            inline_char_limit: policy.max_len.max(1),
+            split_chunk_char_limit: policy.max_len.max(1),
+            compact_char_limit: policy.max_len.max(1),
+        }),
     }
 }
 
@@ -335,20 +452,11 @@ impl OutboundDeduper {
 /// Truncate `content` to at most `max_chars` characters, appending a truncation
 /// marker on a new paragraph when truncation occurred. Returns `(content, was_truncated)`.
 fn truncate_with_marker(content: &str, max_chars: usize) -> (String, bool) {
-    if content.chars().count() <= max_chars {
-        return (content.to_string(), false);
-    }
-    let boundary: usize = content
-        .char_indices()
-        .nth(max_chars)
-        .map(|(i, _)| i)
-        .unwrap_or(content.len());
-    let cut = content[..boundary].rfind('\n').unwrap_or(boundary);
-    (format!("{}\n\n[… truncated]", &content[..cut]), true)
+    super::delivery::truncate_with_marker(content, max_chars)
 }
 
-/// Core delivery function. Applies the length policy, performs dedup lookup,
-/// sends via `client`, and records the dedup key on success.
+/// Compatibility adapter for legacy callers. The v3 delivery module owns
+/// policy planning, length safety, fallback retry, and dedup recording.
 pub(crate) async fn deliver_outbound<C>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -358,9 +466,8 @@ pub(crate) async fn deliver_outbound<C>(
 where
     C: DiscordOutboundClient,
 {
-    // 1. Idempotency check.
-    let dedup_key = message.dedup_key();
-    if let Some(key) = dedup_key.as_deref() {
+    let legacy_dedup_key = legacy_dedup_key(&message);
+    if let Some(key) = legacy_dedup_key.as_deref() {
         if let Some(message_id) = dedup.lookup(key) {
             return DeliveryResult::Duplicate {
                 message_id: Some(message_id),
@@ -368,169 +475,56 @@ where
         }
     }
 
-    let target = message.target_channel().to_string();
-
-    // 2. Apply length policy.
-    let (primary, truncated) = match policy.split_strategy {
-        SplitStrategy::RejectOverLimit => {
-            if message.content.chars().count() > policy.max_len {
-                return DeliveryResult::PermanentFailure {
-                    detail: format!(
-                        "content length {} exceeds max_len {} (RejectOverLimit)",
-                        message.content.chars().count(),
-                        policy.max_len
-                    ),
-                };
-            }
-            (message.content.clone(), false)
+    let v3_message = legacy_message_to_v3(&message, &policy);
+    let overrides = legacy_delivery_overrides(&message, &policy);
+    match super::delivery::deliver_outbound_with_overrides(client, dedup, v3_message, overrides)
+        .await
+    {
+        v3_result::DeliveryResult::Sent { messages, .. } => {
+            let message_id = super::delivery::first_raw_message_id(&messages).unwrap_or_default();
+            record_legacy_dedup_success(dedup, legacy_dedup_key.as_deref(), &message_id);
+            DeliveryResult::Success { message_id }
         }
-        SplitStrategy::TruncateWithMarker | SplitStrategy::TruncateWithMinimalFallback => {
-            truncate_with_marker(&message.content, policy.max_len)
-        }
-    };
-
-    // 3. Primary send attempt.
-    let primary_result = if let Some(message_id) = message.edit_message_id.as_deref() {
-        client.edit_message(&target, message_id, &primary).await
-    } else if let Some(reference) = message.reference.as_ref() {
-        client
-            .post_message_with_reference(
-                &target,
-                &primary,
-                &reference.channel_id,
-                &reference.message_id,
-            )
-            .await
-    } else {
-        client.post_message(&target, &primary).await
-    };
-
-    match primary_result {
-        Ok(message_id) => {
-            if let Some(key) = dedup_key.as_deref() {
-                dedup.record(key, &message_id);
-            }
-            if truncated {
-                DeliveryResult::Fallback {
-                    message_id,
-                    kind: FallbackKind::Truncated,
-                }
-            } else {
-                DeliveryResult::Success { message_id }
+        v3_result::DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => {
+            let message_id = super::delivery::first_raw_message_id(&messages).unwrap_or_default();
+            record_legacy_dedup_success(dedup, legacy_dedup_key.as_deref(), &message_id);
+            DeliveryResult::Fallback {
+                message_id,
+                kind: match fallback_used {
+                    v3_result::FallbackUsed::MinimalFallback => FallbackKind::MinimalFallback,
+                    _ => FallbackKind::Truncated,
+                },
             }
         }
-        Err(error) => {
-            let is_length = error.kind() == DispatchMessagePostErrorKind::MessageTooLong;
-
-            // 4. Thread fallback gate — for reused threads, we preserve the
-            //    error (matches #750 invariant: reused-thread length errors
-            //    do not spawn a new thread).
-            if is_length
-                && policy.thread_fallback == ThreadFallback::PreserveOnLengthError
-                && message.thread_id.is_some()
-                && matches!(
-                    policy.split_strategy,
-                    SplitStrategy::TruncateWithMinimalFallback
-                )
-                && policy
-                    .minimal_fallback
-                    .as_deref()
-                    .map(|v| !v.trim().is_empty())
-                    .unwrap_or(false)
-            {
-                // Even with thread preservation, we DO retry inside the same
-                // thread with the minimal content — matches existing
-                // `post_dispatch_message_to_channel` behaviour.
-                let minimal = policy.minimal_fallback.clone().unwrap();
-                if minimal == primary {
-                    return DeliveryResult::PermanentFailure {
-                        detail: format!(
-                            "length error and minimal fallback matches primary: {error}"
-                        ),
-                    };
-                }
-                let fallback_result = if let Some(message_id) = message.edit_message_id.as_deref() {
-                    client.edit_message(&target, message_id, &minimal).await
-                } else if let Some(reference) = message.reference.as_ref() {
-                    client
-                        .post_message_with_reference(
-                            &target,
-                            &minimal,
-                            &reference.channel_id,
-                            &reference.message_id,
-                        )
-                        .await
-                } else {
-                    client.post_message(&target, &minimal).await
-                };
-                match fallback_result {
-                    Ok(message_id) => {
-                        if let Some(key) = dedup_key.as_deref() {
-                            dedup.record(key, &message_id);
-                        }
-                        return DeliveryResult::Fallback {
-                            message_id,
-                            kind: FallbackKind::MinimalFallback,
-                        };
-                    }
-                    Err(err) => {
-                        return DeliveryResult::PermanentFailure {
-                            detail: err.to_string(),
-                        };
-                    }
-                }
+        v3_result::DeliveryResult::Duplicate {
+            existing_messages, ..
+        } => {
+            let message_id = super::delivery::first_raw_message_id(&existing_messages);
+            if let Some(message_id) = message_id.as_deref() {
+                record_legacy_dedup_success(dedup, legacy_dedup_key.as_deref(), message_id);
             }
-
-            // 5. Minimal fallback for non-thread or plain minimal policy.
-            if is_length
-                && matches!(
-                    policy.split_strategy,
-                    SplitStrategy::TruncateWithMinimalFallback
-                )
-            {
-                if let Some(minimal) = policy
-                    .minimal_fallback
-                    .as_deref()
-                    .filter(|v| !v.trim().is_empty() && *v != primary.as_str())
-                {
-                    let fallback_result =
-                        if let Some(message_id) = message.edit_message_id.as_deref() {
-                            client.edit_message(&target, message_id, minimal).await
-                        } else if let Some(reference) = message.reference.as_ref() {
-                            client
-                                .post_message_with_reference(
-                                    &target,
-                                    minimal,
-                                    &reference.channel_id,
-                                    &reference.message_id,
-                                )
-                                .await
-                        } else {
-                            client.post_message(&target, minimal).await
-                        };
-                    match fallback_result {
-                        Ok(message_id) => {
-                            if let Some(key) = dedup_key.as_deref() {
-                                dedup.record(key, &message_id);
-                            }
-                            return DeliveryResult::Fallback {
-                                message_id,
-                                kind: FallbackKind::MinimalFallback,
-                            };
-                        }
-                        Err(err) => {
-                            return DeliveryResult::PermanentFailure {
-                                detail: err.to_string(),
-                            };
-                        }
-                    }
-                }
-            }
-
-            DeliveryResult::PermanentFailure {
-                detail: error.to_string(),
-            }
+            DeliveryResult::Duplicate { message_id }
         }
+        v3_result::DeliveryResult::Skip { .. } => DeliveryResult::Skipped {
+            reason: SkipReason::Duplicate,
+        },
+        v3_result::DeliveryResult::PermanentFailure { reason } => {
+            DeliveryResult::PermanentFailure { detail: reason }
+        }
+    }
+}
+
+fn record_legacy_dedup_success(
+    dedup: &OutboundDeduper,
+    legacy_dedup_key: Option<&str>,
+    message_id: &str,
+) {
+    if let Some(key) = legacy_dedup_key.filter(|_| !message_id.is_empty()) {
+        dedup.record(key, message_id);
     }
 }
 
@@ -783,6 +777,41 @@ mod tests {
         ));
         // Only one POST landed on the wire.
         assert_eq!(client.posts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn compatibility_adapter_honors_existing_legacy_dedup_key() {
+        let client = MockScript::new();
+        let dedup = OutboundDeduper::new();
+        dedup.record("dispatch-42::dispatch:42:sent", "msg-existing");
+        let msg = DiscordOutboundMessage::new("chan-1", "hello")
+            .with_correlation("dispatch-42", "dispatch:42:sent");
+
+        let result = deliver_outbound(&client, &dedup, msg, DiscordOutboundPolicy::default()).await;
+
+        assert_eq!(
+            result,
+            DeliveryResult::Duplicate {
+                message_id: Some("msg-existing".to_string())
+            }
+        );
+        assert!(client.posts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compatibility_adapter_records_legacy_dedup_key_after_v3_success() {
+        let client = MockScript::new();
+        let dedup = OutboundDeduper::new();
+        let msg = DiscordOutboundMessage::new("chan-1", "hello")
+            .with_correlation("dispatch-42", "dispatch:42:sent");
+
+        let result = deliver_outbound(&client, &dedup, msg, DiscordOutboundPolicy::default()).await;
+
+        assert!(matches!(result, DeliveryResult::Success { .. }));
+        assert_eq!(
+            dedup.lookup("dispatch-42::dispatch:42:sent").as_deref(),
+            Some("msg-chan-1-5")
+        );
     }
 
     #[tokio::test]
