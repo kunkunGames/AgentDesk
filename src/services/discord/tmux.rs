@@ -3488,6 +3488,7 @@ fn trigger_missing_inflight_reattach(
     );
     if claim.should_spawn() {
         record_recent_watcher_reattach_offset(channel_id, tmux_session_name, initial_offset);
+        shared.record_tmux_watcher_reconnect(channel_id);
         tokio::spawn(tmux_output_watcher(
             channel_id,
             http.clone(),
@@ -7625,6 +7626,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
             pw.initial_offset
         );
 
+        shared.record_tmux_watcher_reconnect(pw.channel_id);
         tokio::spawn(tmux_output_watcher_with_restore(
             pw.channel_id,
             http.clone(),
@@ -9057,6 +9059,75 @@ mod tests {
             "no inflight state should leak when reattach is skipped"
         );
 
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    }
+
+    #[tokio::test]
+    async fn missing_inflight_reattach_spawn_increments_reconnect_count() {
+        if !crate::services::claude::is_tmux_available() {
+            eprintln!("skipping live reattach counter test: tmux is unavailable");
+            return;
+        }
+
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        clear_recent_watcher_reattach_offsets_for_tests();
+
+        let tmux_name = format!(
+            "AgentDesk-codex-test-964-count-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmux_created = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &tmux_name, "sleep 600"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !tmux_created {
+            unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+            panic!("failed to create tmux session for reconnect counter test");
+        }
+
+        let shared = super::super::make_shared_data_for_tests();
+        let http = Arc::new(poise::serenity_prelude::Http::new("Bot test-token"));
+        let provider = ProviderKind::Codex;
+        let channel = ChannelId::new(987_0964_001);
+        let (output_path, _) = super::super::turn_bridge::tmux_runtime_paths(&tmux_name);
+        if let Some(parent) = std::path::Path::new(&output_path).parent() {
+            std::fs::create_dir_all(parent).expect("runtime dir");
+        }
+        std::fs::write(&output_path, b"reattach bytes").expect("seed output file");
+
+        let outcome =
+            trigger_missing_inflight_reattach(&http, &shared, &provider, channel, &tmux_name);
+
+        assert_eq!(
+            outcome,
+            MissingInflightReattachOutcome::Spawned {
+                replaced_existing: false
+            }
+        );
+        assert_eq!(
+            shared
+                .tmux_relay_coord(channel)
+                .reconnect_count
+                .load(Ordering::Acquire),
+            1,
+            "fresh missing-inflight reattach spawn must increment reconnect_count"
+        );
+
+        if let Some(watcher) = shared.tmux_watchers.get(&channel) {
+            watcher.cancel.store(true, Ordering::Relaxed);
+        }
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &tmux_name])
+            .status();
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 

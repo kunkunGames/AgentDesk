@@ -288,6 +288,9 @@ fn attach_paused_turn_watcher(
                 channel_id,
                 claim.as_str()
             );
+            if claim.replaced_existing() {
+                shared.record_tmux_watcher_reconnect(channel_id);
+            }
             tokio::spawn(super::super::tmux::tmux_output_watcher(
                 channel_id,
                 http,
