@@ -492,6 +492,15 @@ impl SupervisedWorkerRegistry {
                     );
                     return Ok(None);
                 };
+                if valid_routine_agent_poll_limit(self.config.routines.max_agent_polls_per_tick)
+                    .is_none()
+                {
+                    self.log_skip(
+                        spec,
+                        "routines.max_agent_polls_per_tick must be greater than zero",
+                    );
+                    return Ok(None);
+                }
                 let Some(routine_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(
                         spec,
@@ -577,11 +586,15 @@ fn valid_routine_tick_interval_secs(value: u64) -> Option<u64> {
     (value > 0 && value <= max_safe_tick_secs).then_some(value)
 }
 
+fn valid_routine_agent_poll_limit(value: u32) -> Option<u32> {
+    (value > 0).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage,
-        valid_routine_tick_interval_secs,
+        valid_routine_agent_poll_limit, valid_routine_tick_interval_secs,
     };
 
     #[test]
@@ -647,5 +660,12 @@ mod tests {
         assert_eq!(valid_routine_tick_interval_secs(900), Some(900));
         assert_eq!(valid_routine_tick_interval_secs(901), None);
         assert_eq!(valid_routine_tick_interval_secs(1800), None);
+    }
+
+    #[test]
+    fn routine_agent_poll_limit_rejects_zero() {
+        assert_eq!(valid_routine_agent_poll_limit(0), None);
+        assert_eq!(valid_routine_agent_poll_limit(1), Some(1));
+        assert_eq!(valid_routine_agent_poll_limit(10), Some(10));
     }
 }

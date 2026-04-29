@@ -322,6 +322,25 @@ impl RoutineStore {
         .map_err(|e| anyhow!("list running agent routine runs: {e}"))
     }
 
+    pub async fn heartbeat_running_agent_runs(&self) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET lease_expires_at = NOW() + ($1::bigint * INTERVAL '1 second'),
+                updated_at = NOW()
+            WHERE status = 'running'
+              AND action = 'agent'
+              AND turn_id IS NOT NULL
+            "#,
+        )
+        .bind(RUN_LEASE_SECS)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("heartbeat running agent routine runs: {e}"))?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn metrics(
         &self,
         agent_id: Option<&str>,

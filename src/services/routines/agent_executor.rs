@@ -113,6 +113,7 @@ impl RoutineAgentExecutor {
         store: &RoutineStore,
         limit: u32,
     ) -> Result<Vec<RoutineRunOutcome>> {
+        store.heartbeat_running_agent_runs().await?;
         let pending = store.list_running_agent_runs(limit).await?;
         let mut outcomes = Vec::new();
         for run in pending {
@@ -174,9 +175,7 @@ impl RoutineAgentExecutor {
                         fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
                     });
                 }
-                None => {
-                    store.heartbeat_run(&run.run_id).await?;
-                }
+                None => {}
             }
         }
         Ok(outcomes)
