@@ -5,7 +5,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const STALE_RUNNING_RUN_RECOVERY_AGE_SECS: i64 = 30 * 60;
+const RUN_LEASE_SECS: i64 = 30 * 60;
 
 /// Durable PG-backed store for routines and routine_runs.
 ///
@@ -26,6 +26,7 @@ pub struct ClaimedRoutineRun {
     pub name: String,
     pub execution_strategy: String,
     pub checkpoint: Option<Value>,
+    pub lease_expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -247,66 +248,98 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Boot recovery: mark stale `running` runs as `interrupted`, clear
-    /// `in_flight_run_id` on their parent routines. Called once at worker
-    /// startup before the tick loop begins. Fresh running rows are left alone
-    /// so a second server instance cannot interrupt work that another instance
-    /// is actively executing.
+    /// Extend the lease for a running routine run.
     ///
-    /// Returns the number of stale runs that were recovered.
-    pub async fn recover_stale_running_runs(&self) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-        let stale_before =
-            Utc::now() - chrono::Duration::seconds(STALE_RUNNING_RUN_RECOVERY_AGE_SECS);
-
-        // Collect stale running run IDs and their routine IDs.
-        let stale: Vec<(String, String)> = sqlx::query_as(
+    /// Executors must call this periodically while JS execution is active.
+    /// Boot recovery only interrupts rows whose lease has expired.
+    pub async fn heartbeat_run(&self, run_id: &str) -> Result<bool> {
+        let lease_expires_at = Self::new_lease_expires_at();
+        let result = sqlx::query(
             r#"
-            SELECT id, routine_id
-            FROM routine_runs
-            WHERE status = 'running'
-              AND updated_at < $1
+            UPDATE routine_runs
+            SET lease_expires_at = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'running'
             "#,
         )
-        .bind(stale_before)
-        .fetch_all(&mut *tx)
-        .await?;
+        .bind(run_id)
+        .bind(lease_expires_at)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("heartbeat routine run {run_id}: {e}"))?;
 
-        if stale.is_empty() {
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Boot recovery: mark expired-lease `running` runs as `interrupted`, clear
+    /// `in_flight_run_id` on their parent routines. Called once at worker
+    /// startup before the tick loop begins. Running rows without an expired
+    /// lease are left alone so a second server instance cannot interrupt work
+    /// that another instance is actively executing.
+    ///
+    /// Returns the number of expired-lease runs that were recovered.
+    pub async fn recover_stale_running_runs(&self) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        // Close expired leases. The UPDATE re-checks status and lease expiry
+        // under the row lock so a concurrently finished run is not clobbered.
+        let recovered: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            WITH expired AS (
+                SELECT id
+                FROM routine_runs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < $1
+                FOR UPDATE SKIP LOCKED
+            ),
+            closed AS (
+                UPDATE routine_runs AS rr
+                SET status = 'interrupted',
+                    finished_at = NOW(),
+                    updated_at = NOW(),
+                    lease_expires_at = NULL,
+                    error = 'interrupted by expired routine lease'
+                FROM expired
+                WHERE rr.id = expired.id
+                  AND rr.status = 'running'
+                  AND rr.lease_expires_at IS NOT NULL
+                  AND rr.lease_expires_at < $1
+                RETURNING rr.id, rr.routine_id
+            )
+            SELECT id, routine_id FROM closed
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("recover: close expired routine leases: {e}"))?;
+
+        if recovered.is_empty() {
             tx.commit().await?;
             return Ok(0);
         }
 
-        let count = stale.len() as u64;
-        let stale_run_ids: Vec<&str> = stale.iter().map(|(id, _)| id.as_str()).collect();
-        let stale_routine_ids: Vec<&str> = stale.iter().map(|(_, rid)| rid.as_str()).collect();
+        let count = recovered.len() as u64;
+        let recovered_routine_ids: Vec<&str> =
+            recovered.iter().map(|(_, rid)| rid.as_str()).collect();
+        let recovered_run_ids: Vec<&str> = recovered.iter().map(|(id, _)| id.as_str()).collect();
 
-        // Close stale runs.
+        // Release only locks that still point at the interrupted run.
         sqlx::query(
             r#"
-            UPDATE routine_runs
-            SET status = 'interrupted',
-                finished_at = NOW(),
-                updated_at = NOW(),
-                error = 'interrupted by server restart'
-            WHERE id = ANY($1)
-            "#,
-        )
-        .bind(&stale_run_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("recover: close stale runs: {e}"))?;
-
-        // Release in_flight_run_id locks on affected routines.
-        sqlx::query(
-            r#"
-            UPDATE routines
+            UPDATE routines AS r
             SET in_flight_run_id = NULL,
                 updated_at = NOW()
-            WHERE id = ANY($1)
+            FROM UNNEST($1::text[], $2::text[]) AS recovered(routine_id, run_id)
+            WHERE r.id = recovered.routine_id
+              AND r.in_flight_run_id = recovered.run_id
             "#,
         )
-        .bind(&stale_routine_ids)
+        .bind(&recovered_routine_ids)
+        .bind(&recovered_run_ids)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("recover: clear in_flight_run_id: {e}"))?;
@@ -320,15 +353,17 @@ impl RoutineStore {
         candidate: RoutineClaimCandidate,
     ) -> Result<ClaimedRoutineRun> {
         let run_id = Uuid::new_v4().to_string();
+        let lease_expires_at = Self::new_lease_expires_at();
 
         sqlx::query(
             r#"
-            INSERT INTO routine_runs (id, routine_id, status)
-            VALUES ($1, $2, 'running')
+            INSERT INTO routine_runs (id, routine_id, status, lease_expires_at)
+            VALUES ($1, $2, 'running', $3)
             "#,
         )
         .bind(&run_id)
         .bind(&candidate.id)
+        .bind(lease_expires_at)
         .execute(&mut **tx)
         .await
         .map_err(|e| anyhow!("claim routine {}: insert running run: {e}", candidate.id))?;
@@ -364,7 +399,12 @@ impl RoutineStore {
             name: candidate.name,
             execution_strategy: candidate.execution_strategy,
             checkpoint: candidate.checkpoint,
+            lease_expires_at,
         })
+    }
+
+    fn new_lease_expires_at() -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::seconds(RUN_LEASE_SECS)
     }
 
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
@@ -425,6 +465,7 @@ impl RoutineStore {
                 result_json = $4,
                 error = $5,
                 finished_at = NOW(),
+                lease_expires_at = NULL,
                 updated_at = NOW()
             WHERE id = $1
               AND status = 'running'
