@@ -33,6 +33,7 @@ pub mod qwen;
 pub mod qwen_tmux_wrapper;
 pub mod remote_stub;
 pub mod retrospectives;
+pub mod routines;
 pub mod service_error;
 pub mod session_backend;
 pub mod settings;
