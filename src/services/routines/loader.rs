@@ -292,6 +292,7 @@ fn evaluate_tick_action(
         let action_value: rquickjs::Value = tick
             .call((js_context,))
             .map_err(|e| anyhow!("routine script {} tick(ctx) failed: {e}", script.script_ref))?;
+        ensure_acyclic_js_value(ctx, action_value.clone())?;
         js_value_to_json(action_value)
     })
 }
@@ -428,6 +429,44 @@ fn js_value_to_json(value: rquickjs::Value<'_>) -> Result<Value> {
     Err(anyhow!(
         "routine action returned unsupported JavaScript value"
     ))
+}
+
+fn ensure_acyclic_js_value<'js>(
+    ctx: rquickjs::Ctx<'js>,
+    value: rquickjs::Value<'js>,
+) -> Result<()> {
+    let checker: rquickjs::Function = ctx
+        .eval(
+            r#"
+            (value) => {
+              const seen = new WeakSet();
+              const visit = (item) => {
+                if (item === null || typeof item !== "object") {
+                  return;
+                }
+                if (seen.has(item)) {
+                  throw new Error("routine action contains cyclic object graph");
+                }
+                seen.add(item);
+                if (Array.isArray(item)) {
+                  for (const child of item) {
+                    visit(child);
+                  }
+                } else {
+                  for (const key of Object.keys(item)) {
+                    visit(item[key]);
+                  }
+                }
+                seen.delete(item);
+              };
+              visit(value);
+            }
+            "#,
+        )
+        .map_err(|e| anyhow!("routine action cycle checker init failed: {e}"))?;
+    checker
+        .call::<_, ()>((value,))
+        .map_err(|e| anyhow!("routine action cycle check failed: {e}"))
 }
 
 fn script_ref(root: &Path, path: &Path) -> String {
@@ -595,6 +634,56 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_cyclic_action_result_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cycle.js");
+        std::fs::write(
+            &path,
+            r#"
+            agentdesk.routines.register({
+              name: "Cycle",
+              tick() {
+                const result = { ok: true };
+                result.self = result;
+                return { action: "complete", result };
+              }
+            });
+            "#,
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        loader.load_script(dir.path(), &path).unwrap();
+        let error = loader
+            .execute_tick(
+                "cycle.js",
+                RoutineTickContext {
+                    routine: RoutineTickRoutine {
+                        id: "routine-1".to_string(),
+                        agent_id: None,
+                        script_ref: "cycle.js".to_string(),
+                        name: "Cycle".to_string(),
+                        execution_strategy: "fresh".to_string(),
+                        fresh_context_guaranteed: false,
+                    },
+                    run: RoutineTickRun {
+                        id: "run-1".to_string(),
+                        lease_expires_at: chrono::Utc::now(),
+                    },
+                    checkpoint: None,
+                    now: chrono::Utc::now(),
+                },
+            )
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("cycle check failed") || message.contains("cyclic object graph"),
+            "{message}"
+        );
     }
 
     #[test]

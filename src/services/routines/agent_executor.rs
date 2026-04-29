@@ -156,7 +156,7 @@ impl RoutineAgentExecutor {
                             Some(last_result.as_str()),
                             match next_due_at {
                                 Some(value) => NextDueAtUpdate::Set(value),
-                                None => NextDueAtUpdate::Clear,
+                                None => NextDueAtUpdate::Preserve,
                             },
                         )
                         .await?;
