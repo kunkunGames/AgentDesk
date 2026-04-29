@@ -25537,7 +25537,7 @@ async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
 }
 
 #[tokio::test]
-async fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries() {
+async fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries_pg() {
     crate::pipeline::ensure_loaded();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -25690,7 +25690,7 @@ async fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries() {
 }
 
 #[tokio::test]
-async fn auto_queue_recovery_honors_stale_dispatch_runtime_config() {
+async fn auto_queue_recovery_honors_stale_dispatch_runtime_config_pg() {
     crate::pipeline::ensure_loaded();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -25807,7 +25807,7 @@ async fn auto_queue_recovery_honors_stale_dispatch_runtime_config() {
 /// Regression test for #295: onTick1min must backstop terminal cards that still
 /// have pending auto-queue entries in active/paused runs.
 #[tokio::test]
-async fn auto_queue_recovery_skips_terminal_pending_entries() {
+async fn auto_queue_recovery_skips_terminal_pending_entries_pg() {
     crate::pipeline::ensure_loaded();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -25937,7 +25937,7 @@ async fn auto_queue_recovery_skips_terminal_pending_entries() {
 }
 
 #[tokio::test]
-async fn auto_queue_recovery_completes_finished_non_phase_gate_runs_and_releases_slots() {
+async fn auto_queue_recovery_completes_finished_non_phase_gate_runs_and_releases_slots_pg() {
     crate::pipeline::ensure_loaded();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;

@@ -1051,7 +1051,7 @@ fn policies_js_files_under_10kb_budget() {
 }
 
 #[tokio::test]
-async fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads() {
+async fn auto_queue_log_context_hydrates_agent_id_without_redundant_reloads_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let db = test_db();
@@ -1394,7 +1394,7 @@ async fn test_auto_queue_activate_bridge_dispatches_without_server_port() {
 }
 
 #[tokio::test]
-async fn js_auto_queue_run_status_bridge_updates_run_and_releases_slots() {
+async fn js_auto_queue_run_status_bridge_updates_run_and_releases_slots_pg() {
     crate::pipeline::ensure_loaded();
 
     let pg_db = TestPostgresDb::create().await;
@@ -1529,7 +1529,7 @@ async fn js_auto_queue_run_status_bridge_updates_run_and_releases_slots() {
 }
 
 #[tokio::test]
-async fn js_auto_queue_consultation_bridge_updates_card_metadata_and_entry_status() {
+async fn js_auto_queue_consultation_bridge_updates_card_metadata_and_entry_status_pg() {
     crate::pipeline::ensure_loaded();
 
     let pg_db = TestPostgresDb::create().await;
@@ -1745,7 +1745,7 @@ async fn pg_consultation_dispatch_rolls_back_when_entry_status_is_stale() {
 }
 
 #[tokio::test]
-async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows() {
+async fn js_auto_queue_phase_gate_bridge_saves_and_clears_rows_pg() {
     crate::pipeline::ensure_loaded();
 
     let pg_db = TestPostgresDb::create().await;
