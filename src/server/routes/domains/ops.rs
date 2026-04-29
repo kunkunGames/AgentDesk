@@ -152,6 +152,14 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/routines/{id}/resume", post(routines::resume_routine))
             .route("/routines/{id}/detach", post(routines::detach_routine))
             .route("/routines/{id}/run-now", post(routines::run_routine_now))
+            .route(
+                "/routines/{id}/session/reset",
+                post(routines::reset_routine_session),
+            )
+            .route(
+                "/routines/{id}/session/kill",
+                post(routines::kill_routine_session),
+            )
             // Canonical queue routes (#1065): /api/queue/*
             // Legacy /api/auto-queue/* still mounted (same handlers) for backward compat.
             .route("/queue/generate", post(auto_queue::generate))

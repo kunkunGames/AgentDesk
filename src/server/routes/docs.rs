@@ -2608,6 +2608,28 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
+            "/api/routines/{id}/session/reset",
+            "routines",
+            "Reset the provider session for a persistent agent-backed routine. Claude sends /clear; managed tmux providers reset the process session; providers without managed tmux clear runtime mailbox state only.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"ok": true, "session": {"action": "reset", "provider": "codex", "provider_clear_behavior": "runtime clear plus managed process session reset for the provider tmux session", "runtime_cleared": true}, "interrupted_run_id": null}),
+        ),
+        ep(
+            "POST",
+            "/api/routines/{id}/session/kill",
+            "routines",
+            "Force-kill the provider session for a persistent agent-backed routine, disconnect matching session rows, and interrupt the routine's in-flight run when the session actually changes.",
+        )
+        .with_params([("id", path_param("Routine id"))])
+        .with_example(
+            json!({"path": {"id": "routine-1"}}),
+            json!({"ok": true, "session": {"action": "kill", "provider": "codex", "tmux_killed": true, "lifecycle_path": "mailbox_canonical"}, "interrupted_run_id": "run-1"}),
+        ),
+        ep(
+            "POST",
             "/api/auto-queue/generate",
             "auto-queue",
             "Generate auto-queue entries",

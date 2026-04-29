@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
-    RoutineScriptLoader, RoutineStore, execute_claimed_script_run,
+    RoutineScriptLoader, RoutineSessionCommand, RoutineSessionController, RoutineStore,
+    execute_claimed_script_run,
 };
 
 use super::AppState;
@@ -285,6 +286,91 @@ pub async fn run_routine_now(
     ))
 }
 
+pub async fn reset_routine_session(
+    State(state): State<AppState>,
+    Path(routine_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    control_routine_session(&state, routine_id, RoutineSessionCommand::Reset).await
+}
+
+pub async fn kill_routine_session(
+    State(state): State<AppState>,
+    Path(routine_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    control_routine_session(&state, routine_id, RoutineSessionCommand::Kill).await
+}
+
+async fn control_routine_session(
+    state: &AppState,
+    routine_id: String,
+    command: RoutineSessionCommand,
+) -> AppResult<Json<Value>> {
+    let store = routine_store(state)?;
+    let Some(routine) = store.get_routine(&routine_id).await.map_err(store_error)? else {
+        return Err(AppError::not_found(format!(
+            "routine {routine_id} not found"
+        )));
+    };
+    if routine.execution_strategy != "persistent" {
+        return Err(AppError::conflict(format!(
+            "routine {routine_id} uses execution_strategy={}; session control requires persistent",
+            routine.execution_strategy
+        )));
+    }
+    if routine
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(AppError::conflict(format!(
+            "routine {routine_id} is not attached to an agent"
+        )));
+    }
+
+    let reason = format!(
+        "routine persistent session {} via POST /api/routines/{}/session/{}",
+        command.as_str(),
+        routine_id,
+        command.as_str()
+    );
+    let session = routine_session_controller(state)?
+        .control_persistent_session(&routine, command, &reason)
+        .await
+        .map_err(session_control_error)?;
+    let session_changed = session.runtime_cleared
+        || session.tmux_killed
+        || session.inflight_cleared
+        || session.disconnected_sessions > 0;
+    let interrupted_run_id = if session_changed {
+        store
+            .interrupt_in_flight_run(
+                &routine_id,
+                &reason,
+                Some(json!({
+                    "status": "interrupted_by_session_control",
+                    "routine_id": routine_id,
+                    "action": command.as_str(),
+                    "provider": session.provider.clone(),
+                    "channel_id": session.channel_id.clone(),
+                    "session_key": session.session_key.clone(),
+                    "tmux_session": session.tmux_session.clone(),
+                })),
+            )
+            .await
+            .map_err(store_error)?
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "session": session,
+        "interrupted_run_id": interrupted_run_id,
+    })))
+}
+
 fn routine_store(state: &AppState) -> AppResult<RoutineStore> {
     let Some(pool) = state.pg_pool.clone() else {
         return Err(AppError::new(
@@ -321,6 +407,20 @@ fn routine_discord_logger(state: &AppState) -> AppResult<RoutineDiscordLogger> {
     Ok(RoutineDiscordLogger::new(std::sync::Arc::new(pool)))
 }
 
+fn routine_session_controller(state: &AppState) -> AppResult<RoutineSessionController> {
+    let Some(pool) = state.pg_pool.clone() else {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Database,
+            "postgres pool unavailable; routines require postgresql",
+        ));
+    };
+    Ok(RoutineSessionController::new(
+        std::sync::Arc::new(pool),
+        state.health_registry.clone(),
+    ))
+}
+
 fn fallback_name(script_ref: &str) -> String {
     std::path::Path::new(script_ref)
         .file_stem()
@@ -340,4 +440,19 @@ fn validate_execution_strategy_request(strategy: &str) -> AppResult<()> {
 
 fn store_error(error: anyhow::Error) -> AppError {
     AppError::internal(error.to_string()).with_code(ErrorCode::Database)
+}
+
+fn session_control_error(error: anyhow::Error) -> AppError {
+    let message = error.to_string();
+    if message.contains("not found") {
+        AppError::not_found(message)
+    } else if message.contains("not configured")
+        || message.contains("not attached")
+        || message.contains("invalid")
+        || message.contains("requires execution_strategy")
+    {
+        AppError::conflict(message)
+    } else {
+        AppError::internal(message)
+    }
 }

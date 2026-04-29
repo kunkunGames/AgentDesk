@@ -612,6 +612,79 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Interrupt the current in-flight run for a routine after an explicit
+    /// session reset/kill invalidates the provider context.
+    pub async fn interrupt_in_flight_run(
+        &self,
+        routine_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+    ) -> Result<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+
+        let run_id: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT in_flight_run_id
+            FROM routines
+            WHERE id = $1
+              AND in_flight_run_id IS NOT NULL
+            FOR UPDATE
+            "#,
+        )
+        .bind(routine_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: lock routine: {e}"))?
+        .flatten();
+
+        let Some(run_id) = run_id else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET status = 'interrupted',
+                result_json = COALESCE($3, result_json),
+                error = $2,
+                finished_at = NOW(),
+                lease_expires_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND routine_id = $4
+              AND status = 'running'
+            "#,
+        )
+        .bind(&run_id)
+        .bind(error)
+        .bind(result_json)
+        .bind(routine_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine run {run_id}: {e}"))?;
+
+        sqlx::query(
+            r#"
+            UPDATE routines
+            SET in_flight_run_id = NULL,
+                last_result = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND in_flight_run_id = $3
+            "#,
+        )
+        .bind(routine_id)
+        .bind(error)
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: clear in-flight: {e}"))?;
+
+        tx.commit().await?;
+        Ok(Some(run_id))
+    }
+
     /// Boot recovery: mark expired-lease `running` runs as `interrupted`, clear
     /// `in_flight_run_id` on their parent routines. Called once at worker
     /// startup before the tick loop begins. Running rows without an expired
