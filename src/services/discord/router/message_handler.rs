@@ -570,6 +570,18 @@ pub(crate) struct HeadlessTurnStartOutcome {
     pub turn_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeadlessTurnReservation {
+    user_msg_id: MessageId,
+    placeholder_msg_id: MessageId,
+}
+
+impl HeadlessTurnReservation {
+    pub(in crate::services::discord) fn turn_id(&self, channel_id: ChannelId) -> String {
+        format!("discord:{}:{}", channel_id.get(), self.user_msg_id.get())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeadlessTurnStartError {
     Conflict(String),
@@ -589,6 +601,13 @@ impl std::error::Error for HeadlessTurnStartError {}
 fn next_headless_turn_message_id() -> MessageId {
     static HEADLESS_TURN_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(9_100_000_000_000_000_000);
     MessageId::new(HEADLESS_TURN_MESSAGE_ID_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+pub(in crate::services::discord) fn reserve_headless_turn() -> HeadlessTurnReservation {
+    HeadlessTurnReservation {
+        user_msg_id: next_headless_turn_message_id(),
+        placeholder_msg_id: next_headless_turn_message_id(),
+    }
 }
 
 fn build_headless_trigger_context(
@@ -683,6 +702,33 @@ pub(in crate::services::discord) async fn start_headless_turn(
     metadata: Option<serde_json::Value>,
     channel_name_hint: Option<String>,
 ) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
+    start_reserved_headless_turn(
+        ctx,
+        channel_id,
+        prompt,
+        request_owner_name,
+        shared,
+        token,
+        source,
+        metadata,
+        channel_name_hint,
+        reserve_headless_turn(),
+    )
+    .await
+}
+
+pub(in crate::services::discord) async fn start_reserved_headless_turn(
+    ctx: &serenity::Context,
+    channel_id: ChannelId,
+    prompt: &str,
+    request_owner_name: &str,
+    shared: &Arc<SharedData>,
+    token: &str,
+    source: Option<&str>,
+    metadata: Option<serde_json::Value>,
+    channel_name_hint: Option<String>,
+    reservation: HeadlessTurnReservation,
+) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err(HeadlessTurnStartError::Internal(
@@ -692,8 +738,8 @@ pub(in crate::services::discord) async fn start_headless_turn(
 
     let request_owner = UserId::new(1);
     shared.record_channel_speaker(channel_id, request_owner, request_owner_name, false);
-    let user_msg_id = next_headless_turn_message_id();
-    let placeholder_msg_id = next_headless_turn_message_id();
+    let user_msg_id = reservation.user_msg_id;
+    let placeholder_msg_id = reservation.placeholder_msg_id;
     let mut session_reset_reason = None;
     let mut reset_session_id_to_clear = None;
 
@@ -1578,7 +1624,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
     );
 
     Ok(HeadlessTurnStartOutcome {
-        turn_id: format!("discord:{}:{}", channel_id.get(), user_msg_id.get()),
+        turn_id: reservation.turn_id(channel_id),
     })
 }
 

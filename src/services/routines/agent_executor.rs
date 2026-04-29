@@ -5,7 +5,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::services::discord::health::HealthRegistry;
+use crate::services::discord::health::{
+    HealthRegistry, reserve_headless_agent_turn, start_reserved_headless_agent_turn,
+};
 
 use super::runtime::RoutineRunOutcome;
 use super::store::{ClaimedRoutineRun, NextDueAtUpdate, RoutineStore, RunningAgentRoutineRun};
@@ -46,35 +48,19 @@ impl RoutineAgentExecutor {
     ) -> Result<RoutineRunOutcome> {
         let action = "agent".to_string();
         let result = self
-            .start_turn(&claimed, &prompt, &checkpoint, next_due_at)
+            .start_turn(store, &claimed, &prompt, &checkpoint, next_due_at)
             .await;
         match result {
-            Ok(started) => {
-                let updated = store
-                    .mark_agent_turn_started(
-                        &claimed.run_id,
-                        &started.turn_id,
-                        Some(started.result_json.clone()),
-                    )
-                    .await?;
-                if !updated {
-                    return Err(anyhow!(
-                        "routine agent run {} vanished before turn_id could be stored",
-                        claimed.run_id
-                    ));
-                }
-
-                Ok(RoutineRunOutcome {
-                    run_id: claimed.run_id,
-                    routine_id: claimed.routine_id,
-                    script_ref: claimed.script_ref,
-                    action,
-                    status: "running".to_string(),
-                    result_json: Some(started.result_json),
-                    error: None,
-                    fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
-                })
-            }
+            Ok(started) => Ok(RoutineRunOutcome {
+                run_id: claimed.run_id,
+                routine_id: claimed.routine_id,
+                script_ref: claimed.script_ref,
+                action,
+                status: "running".to_string(),
+                result_json: Some(started.result_json),
+                error: None,
+                fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
+            }),
             Err(error) => {
                 let message = error.to_string();
                 let result_json = Some(json!({
@@ -183,6 +169,7 @@ impl RoutineAgentExecutor {
 
     async fn start_turn(
         &self,
+        store: &RoutineStore,
         claimed: &ClaimedRoutineRun,
         prompt: &str,
         checkpoint: &Option<Value>,
@@ -217,34 +204,13 @@ impl RoutineAgentExecutor {
                 "agent {agent_id} primary channel is invalid: {primary_channel}"
             ));
         };
-
-        let metadata = Some(json!({
-            "routine_id": claimed.routine_id,
-            "routine_run_id": claimed.run_id,
-            "script_ref": claimed.script_ref,
-            "execution_strategy": claimed.execution_strategy,
-            "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
-        }));
-        let channel_name_hint = primary_channel
-            .chars()
-            .all(|ch| ch.is_ascii_digit())
-            .then_some(None)
-            .unwrap_or_else(|| Some(primary_channel.clone()));
-        let outcome = crate::services::discord::health::start_headless_agent_turn(
-            registry,
-            poise::serenity_prelude::ChannelId::new(channel_id_num),
-            provider.clone(),
-            prompt.to_string(),
-            Some("routine".to_string()),
-            metadata,
-            channel_name_hint,
-        )
-        .await
-        .map_err(|error| anyhow!("start routine agent turn for {agent_id}: {error}"))?;
+        let channel_id = poise::serenity_prelude::ChannelId::new(channel_id_num);
+        let reservation = reserve_headless_agent_turn(channel_id);
+        let turn_id = reservation.turn_id().to_string();
 
         let result_json = json!({
             "status": "started",
-            "turn_id": outcome.turn_id,
+            "turn_id": turn_id.clone(),
             "agent_id": agent_id,
             "provider": provider.as_str(),
             "channel_id": channel_id_num.to_string(),
@@ -256,11 +222,51 @@ impl RoutineAgentExecutor {
             "checkpoint": checkpoint,
             "next_due_at": next_due_at.map(|value| value.to_rfc3339()),
         });
+        let updated = store
+            .mark_agent_turn_started(&claimed.run_id, &turn_id, Some(result_json.clone()))
+            .await?;
+        if !updated {
+            return Err(anyhow!(
+                "routine agent run {} vanished before turn_id could be stored",
+                claimed.run_id
+            ));
+        }
 
-        Ok(StartedAgentTurn {
-            turn_id: outcome.turn_id,
-            result_json,
-        })
+        let metadata = Some(json!({
+            "routine_id": claimed.routine_id,
+            "routine_run_id": claimed.run_id,
+            "script_ref": claimed.script_ref,
+            "execution_strategy": claimed.execution_strategy,
+            "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
+            "turn_id": turn_id.clone(),
+        }));
+        let channel_name_hint = primary_channel
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+            .then_some(None)
+            .unwrap_or_else(|| Some(primary_channel.clone()));
+        let outcome = start_reserved_headless_agent_turn(
+            registry,
+            channel_id,
+            provider.clone(),
+            prompt.to_string(),
+            Some("routine".to_string()),
+            metadata,
+            channel_name_hint,
+            reservation,
+        )
+        .await
+        .map_err(|error| anyhow!("start routine agent turn for {agent_id}: {error}"))?;
+
+        if outcome.turn_id != turn_id {
+            return Err(anyhow!(
+                "reserved routine agent turn id mismatch: expected {} but started {}",
+                turn_id,
+                outcome.turn_id
+            ));
+        }
+
+        Ok(StartedAgentTurn { result_json })
     }
 
     async fn find_turn_completion(&self, turn_id: &str) -> Result<Option<AgentTurnCompletion>> {
@@ -296,7 +302,6 @@ impl RoutineAgentExecutor {
 }
 
 struct StartedAgentTurn {
-    turn_id: String,
     result_json: Value,
 }
 
