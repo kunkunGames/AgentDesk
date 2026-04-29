@@ -260,6 +260,22 @@ fn attach_paused_turn_watcher(
 
     #[cfg(unix)]
     if let (Some(tmux_session_name), Some(output_path)) = (tmux_session_name, output_path) {
+        let existing_owner_for_tmux = shared.tmux_watchers.iter().any(|entry| {
+            entry.tmux_session_name == tmux_session_name
+                && !entry.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let tmux_live =
+            crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name);
+        if !tmux_live && !existing_owner_for_tmux {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ↻ Skipping paused tmux watcher attach for channel {} ({source}) — tmux {} is not live yet",
+                channel_id,
+                tmux_session_name
+            );
+            return watcher_owner_channel_id;
+        }
+
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
@@ -6573,6 +6589,28 @@ mod tests {
         assert!(
             !shared.tmux_watchers.contains_key(&thread_channel),
             "reusing an owner watcher must not install a duplicate thread watcher"
+        );
+    }
+
+    #[test]
+    fn attach_paused_turn_watcher_skips_prelaunch_dead_tmux() {
+        let shared = super::super::super::make_shared_data_for_tests();
+        let channel = ChannelId::new(1485506232256168138);
+        let owner = attach_paused_turn_watcher(
+            &shared,
+            Arc::new(poise::serenity_prelude::Http::new("Bot test-token")),
+            &ProviderKind::Codex,
+            channel,
+            Some("AgentDesk-codex-not-yet-spawned".to_string()),
+            Some("/tmp/agentdesk-test-output.jsonl".to_string()),
+            0,
+            "unit-test-prelaunch",
+        );
+
+        assert_eq!(owner, channel);
+        assert!(
+            !shared.tmux_watchers.contains_key(&channel),
+            "prelaunch turn start must wait for TmuxReady instead of spawning a watcher that immediately observes a dead pane"
         );
     }
 
