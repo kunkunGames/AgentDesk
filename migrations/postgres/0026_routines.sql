@@ -5,8 +5,9 @@
 --
 -- Design notes:
 --   * in_flight_run_id guards against duplicate concurrent runs (SET on claim,
---     cleared on finish/fail/interrupt). Boot recovery sets interrupted runs to
---     'interrupted' and clears this column.
+--     cleared on finish/fail/interrupt). Boot recovery only interrupts stale
+--     running rows so a second server instance does not clear active work from
+--     another instance.
 --   * checkpoint/last_result are the only durable state payload columns;
 --     no separate checkpoint or observation table is created in this migration.
 --   * execution_strategy 'fresh'/'persistent' — 'fresh' does NOT guarantee
@@ -65,4 +66,8 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_routine_id
 -- Partial index for boot recovery and in-flight deduplication.
 CREATE INDEX IF NOT EXISTS idx_routine_runs_running
     ON routine_runs(routine_id)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_routine_runs_running_updated_at
+    ON routine_runs(updated_at)
     WHERE status = 'running';

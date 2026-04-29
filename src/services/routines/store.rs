@@ -5,6 +5,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
+const STALE_RUNNING_RUN_RECOVERY_AGE_SECS: i64 = 30 * 60;
+
 /// Durable PG-backed store for routines and routine_runs.
 ///
 /// All mutating operations are transaction-scoped. Callers never hold a
@@ -245,13 +247,17 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Boot recovery: mark all `running` runs as `interrupted`, clear
+    /// Boot recovery: mark stale `running` runs as `interrupted`, clear
     /// `in_flight_run_id` on their parent routines. Called once at worker
-    /// startup before the tick loop begins.
+    /// startup before the tick loop begins. Fresh running rows are left alone
+    /// so a second server instance cannot interrupt work that another instance
+    /// is actively executing.
     ///
     /// Returns the number of stale runs that were recovered.
     pub async fn recover_stale_running_runs(&self) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
+        let stale_before =
+            Utc::now() - chrono::Duration::seconds(STALE_RUNNING_RUN_RECOVERY_AGE_SECS);
 
         // Collect stale running run IDs and their routine IDs.
         let stale: Vec<(String, String)> = sqlx::query_as(
@@ -259,8 +265,10 @@ impl RoutineStore {
             SELECT id, routine_id
             FROM routine_runs
             WHERE status = 'running'
+              AND updated_at < $1
             "#,
         )
+        .bind(stale_before)
         .fetch_all(&mut *tx)
         .await?;
 

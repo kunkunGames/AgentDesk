@@ -3235,10 +3235,10 @@ async fn dm_reply_retry_loop(pg_pool: Arc<PgPool>) {
 
 async fn routine_runtime_loop(pg_pool: Arc<PgPool>, tick_interval_secs: u64) {
     use crate::services::routines::RoutineStore;
-    if tick_interval_secs == 0 {
+    let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
         return;
-    }
+    };
 
     let store = RoutineStore::new(pg_pool);
     match store.recover_stale_running_runs().await {
@@ -3249,7 +3249,8 @@ async fn routine_runtime_loop(pg_pool: Arc<PgPool>, tick_interval_secs: u64) {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "routine boot recovery failed"),
     }
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs.get()));
     loop {
         interval.tick().await;
         // ORDER-P0-002: due-claim tick loop and JS executor land here
