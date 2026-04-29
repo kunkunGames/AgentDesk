@@ -3295,7 +3295,13 @@ async fn routine_runtime_loop(
                 Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
             }
         }
-        match poll_agent_turns(&store, &agent_executor, routines_config.max_due_per_tick).await {
+        match poll_agent_turns(
+            &store,
+            &agent_executor,
+            routines_config.max_agent_polls_per_tick,
+        )
+        .await
+        {
             Ok(outcomes) if !outcomes.is_empty() => {
                 for outcome in &outcomes {
                     discord_logger.log_run_outcome(&store, outcome).await;

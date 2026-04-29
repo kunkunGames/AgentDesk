@@ -1177,6 +1177,9 @@ pub struct RoutinesConfig {
     /// Maximum routines to claim per tick. Defaults to 10.
     #[serde(default = "default_routines_max_due_per_tick")]
     pub max_due_per_tick: u32,
+    /// Maximum running agent-backed routine runs to poll per tick. Defaults to 10.
+    #[serde(default = "default_routines_max_agent_polls_per_tick")]
+    pub max_agent_polls_per_tick: u32,
     /// IANA timezone name used when no per-routine timezone is set.
     #[serde(default = "default_routines_timezone")]
     pub default_timezone: String,
@@ -1192,6 +1195,7 @@ impl Default for RoutinesConfig {
             dir: default_routines_dir(),
             tick_interval_secs: default_routines_tick_interval_secs(),
             max_due_per_tick: default_routines_max_due_per_tick(),
+            max_agent_polls_per_tick: default_routines_max_agent_polls_per_tick(),
             default_timezone: default_routines_timezone(),
             hot_reload: true,
         }
@@ -1213,6 +1217,10 @@ fn default_routines_tick_interval_secs() -> u64 {
 }
 
 fn default_routines_max_due_per_tick() -> u32 {
+    10
+}
+
+fn default_routines_max_agent_polls_per_tick() -> u32 {
     10
 }
 
@@ -1645,6 +1653,7 @@ mod tests {
         assert_eq!(config.routines.dir, PathBuf::from("./routines"));
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
         assert_eq!(config.routines.default_timezone, "UTC");
         assert!(config.routines.hot_reload);
         assert!(config.routines.is_default());
@@ -1673,9 +1682,27 @@ routines:
         assert_eq!(config.routines.dir, PathBuf::from("./ops-routines"));
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
         assert_eq!(config.routines.default_timezone, "UTC");
         assert!(config.routines.hot_reload);
         assert!(!config.routines.is_default());
+    }
+
+    #[test]
+    fn routines_config_due_claim_limit_does_not_disable_agent_polling() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+server:
+  port: 9010
+routines:
+  enabled: true
+  max_due_per_tick: 0
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.routines.max_due_per_tick, 0);
+        assert_eq!(config.routines.max_agent_polls_per_tick, 10);
     }
 
     #[test]
@@ -1686,6 +1713,7 @@ routines:
             dir: PathBuf::from("./routines-prod"),
             tick_interval_secs: 15,
             max_due_per_tick: 25,
+            max_agent_polls_per_tick: 50,
             default_timezone: "Asia/Seoul".to_string(),
             hot_reload: false,
         };
