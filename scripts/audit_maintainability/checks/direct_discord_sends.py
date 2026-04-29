@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from ..common import Finding, line_of, read_text, rel_posix, strip_rust_comments
+from ..common import Finding, is_allowlisted, line_of, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 ALLOWED_PARENTS = (
@@ -40,17 +40,18 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         rel = rel_posix(path)
         if any(rel.startswith(parent) for parent in ALLOWED_PARENTS):
             continue
-        if rel in allowlist:
-            continue
         text = read_text(path)
         stripped = strip_rust_comments(text)
         for match in PATTERN.finditer(stripped):
+            line = line_of(stripped, match.start())
+            if is_allowlisted(allowlist, rel, line):
+                continue
             findings.append(
                 Finding(
                     rule="direct_discord_sends",
                     severity="warn",
                     file=rel,
-                    line=line_of(stripped, match.start()),
+                    line=line,
                     message=f"direct Discord send/edit call: `{match.group(0).strip()}`",
                 )
             )
@@ -65,6 +66,6 @@ CHECK = CheckSpec(
         "Direct serenity send_message/edit_message/reply calls outside the "
         "outbound queue (src/services/discord/outbound/, message_outbox.rs)."
     ),
-    hard_gate=False,
+    hard_gate=True,
     runner=_run,
 )

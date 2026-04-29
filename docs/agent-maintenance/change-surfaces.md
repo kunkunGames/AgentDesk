@@ -6,7 +6,7 @@
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-04-30 (against `main` @ `58c26894784f12235ae33ee3b0963a248e0b23f5`).
+> Last refreshed: 2026-04-30 (against `main` @ `3a9f0d9327d9aaf24dbc71a459926f8e4b6f074b`).
 
 ## Read This First
 
@@ -173,11 +173,33 @@
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1600), client.rs (1583), direct.rs (1535),
     dcserver.rs (1496)}`.
+  - `src/cli/provider_cli/mod.rs` (1701 lines).
 - active_callsite_coverage: n/a.
 - invariants: LaunchAgent plist and runtime layout are generated only — see
   the matrix in `docs/source-of-truth.md`.
 - allowed_changes: `bugfix` only; PG-cutover retention plan is owned by
   #1239.
+
+### `runtime_core`
+
+- canonical_modules: `src/config.rs`, `src/runtime_layout/mod.rs`,
+  `src/server/mod.rs`, `src/kanban.rs`, `src/receipt.rs`, and
+  `src/github/sync.rs`.
+- legacy_modules: none — these are shared runtime coordination surfaces.
+- do_not_edit_without_migration_plan (giant-file):
+  - `src/config.rs` (2236 lines).
+  - `src/runtime_layout/mod.rs` (1425 lines).
+  - `src/server/mod.rs` (3234 lines).
+  - `src/kanban.rs` (3875 lines).
+  - `src/receipt.rs` (2133 lines).
+  - `src/github/sync.rs` (1059 lines).
+- active_callsite_coverage: n/a.
+- invariants: config precedence, runtime path generation, kanban state, receipt
+  persistence, and GitHub sync must keep their existing owner-specific
+  contracts; split work needs a dedicated extraction issue before new feature
+  logic lands here.
+- allowed_changes: `bugfix` only; new feature logic must land in smaller
+  owner-specific modules or a scoped extraction branch.
 
 ### `db_layer`
 
@@ -204,12 +226,18 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/api_friction.rs` (1808).
 - `src/services/auto_queue.rs` (1047); auto-queue route behavior is split
   across `src/services/auto_queue/*` slices, each currently below 1000 lines.
-- `src/services/claude.rs` (2477), `gemini.rs` (2546), `qwen.rs` (2446),
-  `codex.rs` (1679), `provider.rs` (2100) — provider adapters.
+- `src/services/claude.rs` (2477), `src/services/gemini.rs` (2565),
+  `src/services/qwen.rs` (2466), `src/services/codex.rs` (1665),
+  `src/services/opencode.rs` (2133), `src/services/provider.rs` (2177) —
+  provider adapters.
 - `src/services/memory/memento.rs` (2479).
 - `src/services/observability/mod.rs` (3647).
 - `src/services/platform/shell.rs` (1507) — split owned by #1281
   (GitClient extraction).
+- `src/services/platform/binary_resolver.rs` (1377).
+- `src/services/discord/mod.rs` (5519),
+  `src/services/discord_config_audit.rs` (1310), and
+  `src/services/qwen_tmux_wrapper.rs` (1194).
 - `src/services/turn_orchestrator.rs` (2070).
 - `src/services/session_backend.rs` (1053).
 

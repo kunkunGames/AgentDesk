@@ -68,6 +68,32 @@ presence check only; reviewers still confirm the content was refreshed. CI runs
 this gate in `--warning-only` mode during the initial rollout for #1432; remove
 that flag when the quiet-week promotion is approved.
 
+## Maintainability Hard Gates
+
+CI runs `python3 scripts/audit_maintainability.py --check` and blocks on these
+four checks:
+
+- `new_direct_discord_send_outside_allowed_exclusion`
+  (`direct_discord_sends`) — no direct Discord send/edit call outside the
+  outbound dispatcher baseline.
+- `new_runtime_sqlite_or_legacy_db_reference` (`legacy_sqlite_refs`) — no new
+  runtime SQLite or legacy DB reference outside the compat/migration paths.
+- `new_source_of_truth_alias_write` (`source_of_truth_alias_writes`) — no new
+  write to an alias path from `docs/source-of-truth.md`.
+- `new_giant_file_without_change_surface_doc` (`giant_files`) — no production
+  Rust file at or above 1000 lines unless `change-surfaces.md` names it.
+
+`route_srp_violations`, `manual_json_row_mapping`, and
+`limit_clamp_duplication` intentionally remain warning-only.
+
+Allowlist format lives in `scripts/audit_allowlist.toml`. Entries are
+repo-relative POSIX paths or `path:line` findings under the matching check key.
+New exclusions for hard-gated checks must include a nearby comment that
+references an open extraction or cleanup issue; do not add a blanket path
+unless the check cannot produce stable line-level findings. For giant files,
+prefer updating `change-surfaces.md` because that page is the source of truth
+for allowed migration-sensitive surfaces.
+
 ## Schema (Common to All Pages)
 
 Each row in `change-surfaces.md` and `known-legacy.md`, and each entry in

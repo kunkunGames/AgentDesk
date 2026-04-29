@@ -1,27 +1,71 @@
 # Allowlist for scripts/audit_maintainability.py (#1282).
 #
-# Each entry is a repo-relative POSIX path. Keep this list narrow:
-# additions must reference an issue or rationale in a comment on the
-# preceding line so future reviewers can decide whether to retire them.
+# Each entry is either a repo-relative POSIX path or a path:line finding.
+# Keep this list narrow: additions to hard-gated checks must reference an
+# open extraction or cleanup issue in a nearby comment so future reviewers
+# can decide whether to retire them.
 #
-# The audit is non-blocking, so allowlisting is mostly about keeping the
-# generated report short — not about silencing genuine regressions.
+# Hard-gated checks use this file as the current-HEAD baseline only. New
+# regressions should remove code, update change-surfaces.md when appropriate,
+# or link an open extraction issue before adding another exclusion.
 
-# Giant files: legacy modules pending split (see follow-up issues).
+# Giant files: change-surfaces.md is the source of truth. This list should
+# normally stay empty; add entries only for temporary parser gaps with an
+# open extraction issue.
 giant_files = [
-  # Discord recovery decision tree — split tracked by #1283 follow-up.
-  "src/services/discord/recovery_engine.rs",
-  # Tracing span helpers grew large; refactor candidate.
-  "src/integration_tests.rs",
 ]
 
 # Route SRP: temporary tolerated mixed-concerns route handlers.
 route_srp_violations = [
 ]
 
-# Direct Discord sends: only the outbound dispatcher is allowed; nothing
-# here yet.
+# Direct Discord sends: current baseline captured for #1436 outbound v3
+# extraction. Entries are path:line so new callsites in the same file still
+# fail the hard gate.
 direct_discord_sends = [
+  "src/services/discord/commands/model_picker.rs:60",
+  "src/services/discord/commands/skill.rs:286",
+  "src/services/discord/commands/skill.rs:352",
+  "src/services/discord/commands/text_commands.rs:975",
+  "src/services/discord/commands/text_commands.rs:1239",
+  "src/services/discord/discord_io.rs:364",
+  "src/services/discord/formatting.rs:2171",
+  "src/services/discord/formatting.rs:2226",
+  "src/services/discord/formatting.rs:2333",
+  "src/services/discord/formatting.rs:2390",
+  "src/services/discord/gateway.rs:186",
+  "src/services/discord/gateway.rs:210",
+  "src/services/discord/gateway.rs:237",
+  "src/services/discord/health.rs:2312",
+  "src/services/discord/health.rs:2358",
+  "src/services/discord/meeting_orchestrator.rs:654",
+  "src/services/discord/meeting_orchestrator.rs:678",
+  "src/services/discord/mod.rs:2031",
+  "src/services/discord/monitoring_status.rs:50",
+  "src/services/discord/monitoring_status.rs:74",
+  "src/services/discord/placeholder_controller.rs:202",
+  "src/services/discord/placeholder_controller.rs:270",
+  "src/services/discord/placeholder_controller.rs:348",
+  "src/services/discord/router/intake_gate.rs:258",
+  "src/services/discord/tmux.rs:1255",
+  "src/services/discord/tmux.rs:4851",
+  "src/services/discord/tmux.rs:4861",
+  "src/services/discord/tmux.rs:4892",
+  "src/services/discord/tmux.rs:4933",
+  "src/services/discord/tmux.rs:4987",
+  "src/services/discord/tmux.rs:5070",
+  "src/services/discord/tmux.rs:5148",
+  "src/services/discord/tmux.rs:5268",
+  "src/services/discord/tmux.rs:5542",
+  "src/services/discord/turn_bridge/mod.rs:1073",
+  "src/services/discord/turn_bridge/mod.rs:1456",
+  "src/services/discord/turn_bridge/mod.rs:2009",
+  "src/services/discord/turn_bridge/mod.rs:2012",
+  "src/services/discord/turn_bridge/mod.rs:2094",
+  "src/services/discord/turn_bridge/mod.rs:2133",
+  "src/services/discord/turn_bridge/mod.rs:2455",
+  "src/services/discord/turn_bridge/mod.rs:2673",
+  "src/services/discord/turn_bridge/mod.rs:2954",
 ]
 
 # Manual JSON row mapping: legacy mapping callsites pending typed migration.
@@ -37,8 +81,10 @@ git_subprocess_callsites = [
 ]
 
 # Legacy SQLite references: cli/migrate and compat are exempt by path rule
-# already; this list is for anything else that is unavoidable.
+# already. Current baseline is tracked by #1440.
 legacy_sqlite_refs = [
+  "src/config.rs:1069",
+  "src/integration_tests/tests/high_risk_recovery.rs:609",
 ]
 
 # Source-of-truth alias writes: runtime_layout is already exempt.

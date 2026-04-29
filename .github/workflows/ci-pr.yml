@@ -340,9 +340,8 @@ jobs:
       - name: Agent maintenance freshness tests
         run: python3 -m unittest tests.test_agent_maintenance_docs
 
-      - name: Maintainability audit (non-blocking, #1282)
+      - name: Maintainability audit
         id: maintainability_audit
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail

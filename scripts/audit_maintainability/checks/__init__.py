@@ -21,9 +21,8 @@ class CheckSpec:
         key: stable identifier used as YAML/JSON section key.
         title: human-readable title for the markdown report.
         description: 1-line description for the markdown report.
-        hard_gate: when ``True`` a finding fails ``--check`` mode. All current
-            checks default to ``False`` per the issue (#1282) — hard-gating
-            is split into follow-up issues.
+        hard_gate: when ``True`` a finding fails ``--check`` mode unless it is
+            covered by the current baseline allowlist.
         runner: callable ``(allowlist) -> Iterable[Finding]``.
     """
 

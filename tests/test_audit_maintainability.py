@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import sys
 import textwrap
 import unittest
@@ -104,6 +105,33 @@ class GiantFilesCheck(unittest.TestCase):
         big = "fn x() {}\n" * (giant_files.THRESHOLD + 5)
         with _FakeSrcTree({"src/legacy.rs": big}):
             hits = list(giant_files.CHECK.runner({"src/legacy.rs"}))
+        self.assertEqual(hits, [])
+
+    def test_change_surfaces_doc_suppresses_existing_giant_file(self) -> None:
+        big = "fn x() {}\n" * (giant_files.THRESHOLD + 5)
+        with _FakeSrcTree({"src/legacy.rs": big}) as root:
+            _write(
+                root,
+                "docs/agent-maintenance/change-surfaces.md",
+                "- `src/legacy.rs` (1005 lines).\n",
+            )
+            hits = list(giant_files.CHECK.runner(set()))
+        self.assertEqual(hits, [])
+
+    def test_change_surfaces_doc_expands_brace_groups(self) -> None:
+        big = "fn x() {}\n" * (giant_files.THRESHOLD + 5)
+        with _FakeSrcTree(
+            {
+                "src/dispatch/mod.rs": big,
+                "src/dispatch/dispatch_status.rs": big,
+            }
+        ) as root:
+            _write(
+                root,
+                "docs/agent-maintenance/change-surfaces.md",
+                "- `src/dispatch/{mod,dispatch_status}.rs` (giant files).\n",
+            )
+            hits = list(giant_files.CHECK.runner(set()))
         self.assertEqual(hits, [])
 
 
@@ -281,11 +309,92 @@ class HarnessCli(unittest.TestCase):
             self.assertIn(f'"{key}"', json_text, f"missing json section for {key}")
             self.assertIn(f"`{key}`", md_text, f"missing markdown section for {key}")
 
-    def test_check_mode_returns_zero_with_no_hard_gates(self) -> None:
+    def test_only_selected_four_checks_are_hard_gated(self) -> None:
+        specs = HARNESS.load_check_specs()
+        hard_gated = {spec.key for spec in specs if spec.hard_gate}
+        self.assertEqual(
+            hard_gated,
+            {
+                "giant_files",
+                "direct_discord_sends",
+                "legacy_sqlite_refs",
+                "source_of_truth_alias_writes",
+            },
+        )
+        warning_only = {
+            "route_srp_violations",
+            "manual_json_row_mapping",
+            "limit_clamp_duplication",
+        }
+        self.assertTrue(all(not spec.hard_gate for spec in specs if spec.key in warning_only))
+
+    def test_renderers_report_hard_gate_enabled(self) -> None:
+        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}):
+            specs = HARNESS.load_check_specs()
+            findings = HARNESS.run_all(specs, {})
+            yaml_text = HARNESS.render_yaml(specs, findings)
+            json_payload = json.loads(HARNESS.render_json(specs, findings))
+        self.assertIn("hard_gate_enabled: true", yaml_text)
+        self.assertIn("hard_gate_count: 4", yaml_text)
+        self.assertIs(json_payload["hard_gate_enabled"], True)
+        self.assertEqual(json_payload["hard_gate_count"], 4)
+
+    def test_check_mode_returns_zero_with_no_findings(self) -> None:
         with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}):
             with mock.patch.object(sys, "stdout", new=mock.MagicMock()):
                 rc = HARNESS.main(["--check", "--format", "json"])
         self.assertEqual(rc, 0)
+
+    def test_check_mode_fails_on_direct_discord_send_regression(self) -> None:
+        body = """
+        async fn notify(http: Arc<Http>, ch: ChannelId) {
+            ch.send_message(&http, |m| m.content("x")).await.ok();
+        }
+        """
+        with _FakeSrcTree({"src/services/agents.rs": body}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text("", encoding="utf-8")
+            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
+                sys, "stderr", new=mock.MagicMock()
+            ):
+                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+        self.assertEqual(rc, 1)
+
+    def test_check_mode_fails_on_legacy_sqlite_regression(self) -> None:
+        body = "use rusqlite::Connection;\n"
+        with _FakeSrcTree({"src/services/foo.rs": body}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text("", encoding="utf-8")
+            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
+                sys, "stderr", new=mock.MagicMock()
+            ):
+                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+        self.assertEqual(rc, 1)
+
+    def test_check_mode_fails_on_source_of_truth_alias_write_regression(self) -> None:
+        body = """
+        let path = repo_root.join("ARCHITECTURE.md");
+        std::fs::write(&path, contents)?;
+        """
+        with _FakeSrcTree({"src/services/agents.rs": body}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text("", encoding="utf-8")
+            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
+                sys, "stderr", new=mock.MagicMock()
+            ):
+                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+        self.assertEqual(rc, 1)
+
+    def test_check_mode_fails_on_undocumented_giant_file_regression(self) -> None:
+        big = "fn x() {}\n" * (giant_files.THRESHOLD + 5)
+        with _FakeSrcTree({"src/new_giant.rs": big}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text("", encoding="utf-8")
+            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
+                sys, "stderr", new=mock.MagicMock()
+            ):
+                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+        self.assertEqual(rc, 1)
 
     def test_allowlist_loader_scopes_per_rule(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -298,6 +407,7 @@ class HarnessCli(unittest.TestCase):
                     ]
                     direct_discord_sends = [
                       "src/services/notify.rs",
+                      "src/services/notify.rs:42",
                     ]
                     """
                 ),
@@ -305,7 +415,10 @@ class HarnessCli(unittest.TestCase):
             )
             data = HARNESS.load_allowlist(p)
         self.assertEqual(data.get("giant_files"), {"src/big.rs"})
-        self.assertEqual(data.get("direct_discord_sends"), {"src/services/notify.rs"})
+        self.assertEqual(
+            data.get("direct_discord_sends"),
+            {"src/services/notify.rs", "src/services/notify.rs:42"},
+        )
         self.assertNotIn("src/services/notify.rs", data.get("giant_files", set()))
 
 

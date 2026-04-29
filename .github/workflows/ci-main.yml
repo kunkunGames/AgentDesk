@@ -242,6 +242,25 @@ jobs:
       - name: PG audit guard
         run: ./scripts/pg-audit.sh
 
+      - name: Maintainability audit
+        id: maintainability_audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          python3 scripts/audit_maintainability.py --format yaml > target/maintainability-audit.yaml
+          python3 scripts/audit_maintainability.py --check
+          echo "Wrote target/maintainability-audit.yaml"
+
+      - name: Upload maintainability audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintainability-audit-main
+          path: target/maintainability-audit.yaml
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Check hardcoded port/path drift
         shell: bash
         run: |

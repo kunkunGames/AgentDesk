@@ -19,9 +19,9 @@ TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
 class Finding:
     """A single audit hit.
 
-    ``severity`` is one of: ``info``, ``warn``, ``error``. The current audit
-    is non-blocking so severity is informational only — see #1282 for the
-    follow-up hard-gate plan.
+    ``severity`` is one of: ``info``, ``warn``, ``error``. Hard-gated checks
+    fail ``scripts/audit_maintainability.py --check`` when a finding is not
+    covered by the current baseline.
     """
 
     rule: str
@@ -67,6 +67,14 @@ def read_text(path: Path) -> str:
 
 def line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
+
+
+def is_allowlisted(allowlist: set[str], file: str, line: int | None = None) -> bool:
+    """Return true when a finding is covered by a path or path:line baseline."""
+
+    if file in allowlist:
+        return True
+    return line is not None and f"{file}:{line}" in allowlist
 
 
 # Strip ``// ...`` line comments and ``/* ... */`` block comments. Cheap

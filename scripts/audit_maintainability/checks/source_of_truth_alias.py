@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from ..common import Finding, line_of, read_text, rel_posix, strip_rust_comments
+from ..common import Finding, is_allowlisted, line_of, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 ALIAS_FRAGMENTS = (
@@ -43,8 +43,6 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     findings: list[Finding] = []
     for path in production_rust_files():
         rel = rel_posix(path)
-        if rel in allowlist:
-            continue
         if any(rel.startswith(parent) for parent in ALLOWED_PARENTS):
             continue
         text = strip_rust_comments(read_text(path))
@@ -54,12 +52,15 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
             continue
         for fragment in ALIAS_FRAGMENTS:
             for match in re.finditer(re.escape(fragment), text):
+                line = line_of(text, match.start())
+                if is_allowlisted(allowlist, rel, line):
+                    continue
                 findings.append(
                     Finding(
                         rule="source_of_truth_alias_writes",
                         severity="info",
                         file=rel,
-                        line=line_of(text, match.start()),
+                        line=line,
                         message=f"file writes near alias path `{fragment}`",
                         extra={"alias": fragment},
                     )
@@ -75,6 +76,6 @@ CHECK = CheckSpec(
         "File-write callsites that touch alias paths listed in "
         "docs/source-of-truth.md. Writes should target the canonical path."
     ),
-    hard_gate=False,
+    hard_gate=True,
     runner=_run,
 )
