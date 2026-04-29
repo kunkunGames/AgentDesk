@@ -41,9 +41,9 @@ pub struct AttachRoutineBody {
 pub struct PatchRoutineBody {
     pub name: Option<String>,
     pub execution_strategy: Option<String>,
-    pub schedule: Option<String>,
-    pub next_due_at: Option<DateTime<Utc>>,
-    pub checkpoint: Option<Value>,
+    pub schedule: Option<Option<String>>,
+    pub next_due_at: Option<Option<DateTime<Utc>>>,
+    pub checkpoint: Option<Option<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,14 +108,16 @@ pub async fn attach_routine(
         return Err(AppError::bad_request("script_ref is required"));
     }
     let name = body.name.unwrap_or_else(|| fallback_name(&body.script_ref));
+    let execution_strategy = body
+        .execution_strategy
+        .unwrap_or_else(|| "fresh".to_string());
+    validate_execution_strategy_request(&execution_strategy)?;
     let routine = store
         .attach_routine(NewRoutine {
             agent_id: body.agent_id,
             script_ref: body.script_ref,
             name,
-            execution_strategy: body
-                .execution_strategy
-                .unwrap_or_else(|| "fresh".to_string()),
+            execution_strategy,
             schedule: body.schedule,
             next_due_at: body.next_due_at,
             checkpoint: body.checkpoint,
@@ -131,6 +133,9 @@ pub async fn patch_routine(
     Json(body): Json<PatchRoutineBody>,
 ) -> AppResult<Json<Value>> {
     let store = routine_store(&state)?;
+    if let Some(strategy) = body.execution_strategy.as_deref() {
+        validate_execution_strategy_request(strategy)?;
+    }
     let patch = RoutinePatch {
         name: body.name,
         execution_strategy: body.execution_strategy,
@@ -285,6 +290,15 @@ fn fallback_name(script_ref: &str) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string()
+}
+
+fn validate_execution_strategy_request(strategy: &str) -> AppResult<()> {
+    match strategy {
+        "fresh" | "persistent" => Ok(()),
+        other => Err(AppError::bad_request(format!(
+            "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
+        ))),
+    }
 }
 
 fn store_error(error: anyhow::Error) -> AppError {

@@ -2544,8 +2544,22 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_params([
             ("id", path_param("Routine id")),
             ("name", body_param("string", false, "New routine name")),
-            ("next_due_at", body_param("string", false, "RFC3339 due time")),
-            ("checkpoint", body_param("object", false, "Replacement checkpoint JSON")),
+            (
+                "execution_strategy",
+                body_param("string", false, "fresh or persistent"),
+            ),
+            (
+                "schedule",
+                body_param("string|null", false, "Set schedule or pass null to clear it"),
+            ),
+            (
+                "next_due_at",
+                body_param("string|null", false, "RFC3339 due time or null to clear it"),
+            ),
+            (
+                "checkpoint",
+                body_param("object|null", false, "Replacement checkpoint JSON or null to clear it"),
+            ),
         ]),
         ep(
             "GET",

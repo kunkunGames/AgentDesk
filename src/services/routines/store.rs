@@ -90,9 +90,9 @@ pub struct NewRoutine {
 pub struct RoutinePatch {
     pub name: Option<String>,
     pub execution_strategy: Option<String>,
-    pub schedule: Option<String>,
-    pub next_due_at: Option<DateTime<Utc>>,
-    pub checkpoint: Option<Value>,
+    pub schedule: Option<Option<String>>,
+    pub next_due_at: Option<Option<DateTime<Utc>>>,
+    pub checkpoint: Option<Option<Value>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -276,9 +276,9 @@ impl RoutineStore {
             UPDATE routines
             SET name = COALESCE($2, name),
                 execution_strategy = COALESCE($3, execution_strategy),
-                schedule = COALESCE($4, schedule),
-                next_due_at = COALESCE($5, next_due_at),
-                checkpoint = COALESCE($6, checkpoint),
+                schedule = CASE WHEN $4 THEN $5 ELSE schedule END,
+                next_due_at = CASE WHEN $6 THEN $7 ELSE next_due_at END,
+                checkpoint = CASE WHEN $8 THEN $9 ELSE checkpoint END,
                 updated_at = NOW()
             WHERE id = $1
               AND status <> 'detached'
@@ -290,9 +290,12 @@ impl RoutineStore {
         .bind(routine_id)
         .bind(patch.name)
         .bind(patch.execution_strategy)
-        .bind(patch.schedule)
-        .bind(patch.next_due_at)
-        .bind(patch.checkpoint)
+        .bind(patch.schedule.is_some())
+        .bind(patch.schedule.flatten())
+        .bind(patch.next_due_at.is_some())
+        .bind(patch.next_due_at.flatten())
+        .bind(patch.checkpoint.is_some())
+        .bind(patch.checkpoint.flatten())
         .fetch_optional(&*self.pool)
         .await
         .map_err(|e| anyhow!("patch routine {routine_id}: {e}"))
