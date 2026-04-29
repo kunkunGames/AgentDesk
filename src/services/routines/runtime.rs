@@ -34,11 +34,14 @@ pub async fn run_due_tick(
             logger.log_run_started(store, &run).await;
         }
         match execute_claimed_script_run(store, loader, agent_executor, run).await {
-            Ok(outcome) => {
+            Ok(Some(outcome)) => {
                 if let Some(logger) = discord_logger {
                     logger.log_run_outcome(store, &outcome).await;
                 }
                 outcomes.push(outcome);
+            }
+            Ok(None) => {
+                tracing::info!("routine due run was closed before outcome capture");
             }
             Err(error) => {
                 tracing::warn!(error = %error, "routine due run failed before outcome capture");
@@ -61,7 +64,7 @@ pub async fn execute_claimed_script_run(
     loader: &RoutineScriptLoader,
     agent_executor: Option<&RoutineAgentExecutor>,
     claimed: ClaimedRoutineRun,
-) -> Result<RoutineRunOutcome> {
+) -> Result<Option<RoutineRunOutcome>> {
     let fresh_context_guaranteed = false;
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
@@ -89,10 +92,13 @@ pub async fn execute_claimed_script_run(
                 "error": message,
                 "script_ref": claimed.script_ref,
             }));
-            store
+            let closed = store
                 .fail_run(&claimed.run_id, &message, result_json.clone(), None)
                 .await?;
-            return Ok(RoutineRunOutcome {
+            if !closed {
+                return Ok(None);
+            }
+            return Ok(Some(RoutineRunOutcome {
                 run_id: claimed.run_id,
                 routine_id: claimed.routine_id,
                 script_ref: claimed.script_ref,
@@ -101,7 +107,7 @@ pub async fn execute_claimed_script_run(
                 result_json,
                 error: Some(message),
                 fresh_context_guaranteed,
-            });
+            }));
         }
     };
 
@@ -121,7 +127,7 @@ async fn close_action(
     claimed: ClaimedRoutineRun,
     action: RoutineAction,
     fresh_context_guaranteed: bool,
-) -> Result<RoutineRunOutcome> {
+) -> Result<Option<RoutineRunOutcome>> {
     let action_name = action.action_name().to_string();
     match action {
         RoutineAction::Complete {
@@ -130,7 +136,7 @@ async fn close_action(
             last_result,
             next_due_at,
         } => {
-            store
+            let closed = store
                 .finish_run(
                     &claimed.run_id,
                     result_json.clone(),
@@ -139,7 +145,10 @@ async fn close_action(
                     next_due_at,
                 )
                 .await?;
-            Ok(RoutineRunOutcome {
+            if !closed {
+                return Ok(None);
+            }
+            Ok(Some(RoutineRunOutcome {
                 run_id: claimed.run_id,
                 routine_id: claimed.routine_id,
                 script_ref: claimed.script_ref,
@@ -148,7 +157,7 @@ async fn close_action(
                 result_json,
                 error: None,
                 fresh_context_guaranteed,
-            })
+            }))
         }
         RoutineAction::Skip {
             reason,
@@ -159,7 +168,7 @@ async fn close_action(
         } => {
             let result_json =
                 result_json.or_else(|| reason.as_ref().map(|reason| json!({ "reason": reason })));
-            store
+            let closed = store
                 .skip_run(
                     &claimed.run_id,
                     result_json.clone(),
@@ -168,7 +177,10 @@ async fn close_action(
                     next_due_at,
                 )
                 .await?;
-            Ok(RoutineRunOutcome {
+            if !closed {
+                return Ok(None);
+            }
+            Ok(Some(RoutineRunOutcome {
                 run_id: claimed.run_id,
                 routine_id: claimed.routine_id,
                 script_ref: claimed.script_ref,
@@ -177,7 +189,7 @@ async fn close_action(
                 result_json,
                 error: None,
                 fresh_context_guaranteed,
-            })
+            }))
         }
         RoutineAction::Pause {
             reason,
@@ -187,7 +199,7 @@ async fn close_action(
         } => {
             let result_json =
                 result_json.or_else(|| reason.as_ref().map(|reason| json!({ "reason": reason })));
-            store
+            let closed = store
                 .pause_after_run(
                     &claimed.run_id,
                     result_json.clone(),
@@ -195,7 +207,10 @@ async fn close_action(
                     last_result.as_deref().or(reason.as_deref()),
                 )
                 .await?;
-            Ok(RoutineRunOutcome {
+            if !closed {
+                return Ok(None);
+            }
+            Ok(Some(RoutineRunOutcome {
                 run_id: claimed.run_id,
                 routine_id: claimed.routine_id,
                 script_ref: claimed.script_ref,
@@ -204,7 +219,7 @@ async fn close_action(
                 result_json,
                 error: None,
                 fresh_context_guaranteed,
-            })
+            }))
         }
         RoutineAction::Agent {
             prompt,
@@ -217,10 +232,13 @@ async fn close_action(
                     "error": message,
                     "fresh_context_guaranteed": fresh_context_guaranteed,
                 }));
-                store
+                let closed = store
                     .fail_agent_run(&claimed.run_id, message, result_json.clone(), None)
                     .await?;
-                return Ok(RoutineRunOutcome {
+                if !closed {
+                    return Ok(None);
+                }
+                return Ok(Some(RoutineRunOutcome {
                     run_id: claimed.run_id,
                     routine_id: claimed.routine_id,
                     script_ref: claimed.script_ref,
@@ -229,11 +247,12 @@ async fn close_action(
                     result_json,
                     error: Some(message.to_string()),
                     fresh_context_guaranteed,
-                });
+                }));
             };
             agent_executor
                 .start_agent_run(store, claimed, prompt, checkpoint, next_due_at)
                 .await
+                .map(Some)
         }
     }
 }

@@ -708,25 +708,48 @@ impl RoutineStore {
 
         let run_id: Option<String> = sqlx::query_scalar(
             r#"
-            SELECT in_flight_run_id
-            FROM routines
-            WHERE id = $1
-              AND in_flight_run_id IS NOT NULL
-            FOR UPDATE
+            SELECT rr.id
+            FROM routine_runs rr
+            JOIN routines r ON r.in_flight_run_id = rr.id
+            WHERE r.id = $1
+              AND rr.routine_id = $1
+              AND rr.status = 'running'
+            FOR UPDATE OF rr
             "#,
         )
         .bind(routine_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| anyhow!("interrupt routine {routine_id}: lock routine: {e}"))?
-        .flatten();
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: lock running run: {e}"))?;
 
         let Some(run_id) = run_id else {
             tx.commit().await?;
             return Ok(None);
         };
 
-        sqlx::query(
+        let routine_updated = sqlx::query(
+            r#"
+            UPDATE routines
+            SET in_flight_run_id = NULL,
+                last_result = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND in_flight_run_id = $3
+            "#,
+        )
+        .bind(routine_id)
+        .bind(error)
+        .bind(&run_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("interrupt routine {routine_id}: clear in-flight: {e}"))?;
+
+        if routine_updated.rows_affected() != 1 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let run_updated = sqlx::query(
             r#"
             UPDATE routine_runs
             SET status = 'interrupted',
@@ -748,22 +771,11 @@ impl RoutineStore {
         .await
         .map_err(|e| anyhow!("interrupt routine run {run_id}: {e}"))?;
 
-        sqlx::query(
-            r#"
-            UPDATE routines
-            SET in_flight_run_id = NULL,
-                last_result = $2,
-                updated_at = NOW()
-            WHERE id = $1
-              AND in_flight_run_id = $3
-            "#,
-        )
-        .bind(routine_id)
-        .bind(error)
-        .bind(&run_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("interrupt routine {routine_id}: clear in-flight: {e}"))?;
+        if run_updated.rows_affected() != 1 {
+            return Err(anyhow!(
+                "interrupt routine run {run_id}: running run guard lost row"
+            ));
+        }
 
         tx.commit().await?;
         Ok(Some(run_id))

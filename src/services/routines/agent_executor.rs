@@ -85,9 +85,15 @@ impl RoutineAgentExecutor {
                     "script_ref": claimed.script_ref,
                     "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
                 }));
-                store
+                let closed = store
                     .fail_agent_run(&claimed.run_id, &message, result_json.clone(), None)
                     .await?;
+                if !closed {
+                    return Err(anyhow!(
+                        "routine agent run {} was already closed before failed outcome",
+                        claimed.run_id
+                    ));
+                }
                 Ok(RoutineRunOutcome {
                     run_id: claimed.run_id,
                     routine_id: claimed.routine_id,
