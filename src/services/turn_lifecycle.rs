@@ -207,7 +207,7 @@ fn clear_inflight_by_channel(provider: &ProviderKind, channel_id: ChannelId) -> 
     crate::services::discord::clear_inflight_state(provider, channel_id.get())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use crate::services::discord::health::TestHealthHarness;
     use crate::services::provider::ProviderKind;

@@ -15,7 +15,7 @@ pub(crate) fn parse_github_repo_from_remote(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

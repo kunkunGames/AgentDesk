@@ -788,7 +788,7 @@ pub async fn senddm_handler(
     (status, Json(json)).into_response()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         discord_control_endpoints_allowed, public_health_json, stale_mailbox_repair_applied,

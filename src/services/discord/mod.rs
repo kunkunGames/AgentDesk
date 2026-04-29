@@ -63,7 +63,7 @@ pub(in crate::services::discord) use recovery_engine as recovery;
 pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use turn_bridge::build_work_dispatch_completion_result;
 
 use std::borrow::Cow;
@@ -674,7 +674,7 @@ impl TmuxWatcherRegistry {
             .map(|entry| entry.cancel.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn assert_invariants_for_tests(&self) {
         let _guard = lock_tmux_watcher_registry();
         assert_eq!(
@@ -733,7 +733,7 @@ impl TmuxWatcherRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn remove_after_channel_index_drop_for_tests(
         &self,
         channel_id: &ChannelId,
@@ -1035,7 +1035,7 @@ pub(super) struct SharedData {
     /// HTTP API port for self-referencing requests (from config server.port).
     pub(super) api_port: u16,
     /// Test-only legacy DB handle for SQLite compatibility tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) sqlite: Option<crate::db::Db>,
     /// Shared PostgreSQL pool for PG-backed route and runtime helpers.
     pub(super) pg_pool: Option<sqlx::PgPool>,
@@ -1051,18 +1051,8 @@ pub(super) struct SharedData {
 }
 
 impl SharedData {
-    #[cfg(test)]
-    pub(super) fn legacy_sqlite(&self) -> Option<&crate::db::Db> {
-        self.sqlite.as_ref()
-    }
-
-    #[cfg(not(test))]
-    pub(super) fn legacy_sqlite(&self) -> Option<&crate::db::Db> {
-        None
-    }
-
     pub(super) fn has_runtime_storage(&self) -> bool {
-        self.pg_pool.is_some() || self.legacy_sqlite().is_some()
+        self.pg_pool.is_some()
     }
 
     fn mailbox(&self, channel_id: ChannelId) -> ChannelMailboxHandle {
@@ -1345,7 +1335,7 @@ impl SharedData {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
     make_shared_data_for_tests_with_storage(None, None)
 }
@@ -1357,7 +1347,7 @@ pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
 /// primitives without widening visibility on production paths. Private
 /// types (`TmuxWatcherHandle`, `InflightTurnState`) never leak out of this
 /// module; consumers only see opaque newtype wrappers.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod test_harness_exports {
     use super::{TmuxWatcherHandle, TmuxWatcherRegistry};
     use crate::services::provider::ProviderKind;
@@ -1640,7 +1630,7 @@ pub(crate) mod test_harness_exports {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn make_shared_data_for_tests_with_storage(
     sqlite: Option<crate::db::Db>,
     pg_pool: Option<sqlx::PgPool>,
@@ -3452,7 +3442,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             // Clean up worktree if session had one
             if let Some(session) = data.sessions.get(&ch) {
                 if let Some(ref wt) = session.worktree {
-                    cleanup_git_worktree(shared.legacy_sqlite(), shared.pg_pool.as_ref(), wt);
+                    cleanup_git_worktree(None::<&crate::db::Db>, shared.pg_pool.as_ref(), wt);
                 }
             }
             data.sessions.remove(&ch);
@@ -3485,7 +3475,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     for expired_session in &expired {
         if let Some(session_key) = expired_session.session_key.as_deref() {
             let should_record = mark_session_disconnected_for_idle_cleanup(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 session_key,
             )
@@ -3495,7 +3485,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             }
 
             crate::services::termination_audit::record_termination_with_handles(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 session_key,
                 None,
@@ -3661,7 +3651,7 @@ fn enrich_role_map_with_channel_ids() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::runtime_bootstrap::discord_gateway_intents;
     use super::{

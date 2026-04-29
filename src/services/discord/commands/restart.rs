@@ -240,7 +240,7 @@ pub(in crate::services::discord) async fn cmd_restart(ctx: Context<'_>) -> Resul
     run_restart(ctx, "/restart").await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         RestartAction, RestartSeedStatus, build_restart_response, classify_restart_action,

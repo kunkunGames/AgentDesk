@@ -4,7 +4,7 @@ pub mod cancel_tombstones;
 pub mod kanban;
 pub mod memento_feedback_stats;
 pub mod postgres;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod schema;
 pub(crate) mod session_agent_resolution;
 pub mod session_observability;
@@ -13,53 +13,53 @@ pub mod session_transcripts;
 pub mod table_metadata;
 pub mod turns;
 
-#[cfg(test)]
-use rusqlite::Connection;
-#[cfg(not(test))]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::Connection;
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Thread-safe SQLite handle keyed by DB path.
 /// A lightweight mutex serializes write openings while readers and separate
 /// writers reopen their own connections against the same WAL-backed store.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub struct TestSqliteDb {
     path: std::path::PathBuf,
     write_gate: Mutex<()>,
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 #[derive(Debug)]
 pub enum LegacySqliteDisabled {}
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 #[derive(Debug, Clone, Copy)]
 pub struct LegacySqliteError;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl std::fmt::Display for LegacySqliteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "legacy sqlite backend is unavailable in production")
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl std::error::Error for LegacySqliteError {}
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub struct LegacySqliteConnection;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub struct LegacySqliteStatement;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub struct LegacySqliteRows;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub struct LegacySqliteRow;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl LegacySqliteDisabled {
     pub fn lock(&self) -> Result<LegacySqliteConnection, LegacySqliteError> {
         Err(LegacySqliteError)
@@ -74,7 +74,7 @@ impl LegacySqliteDisabled {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl LegacySqliteConnection {
     pub fn execute<P>(&self, _sql: &str, _params: P) -> Result<usize, LegacySqliteError> {
         Err(LegacySqliteError)
@@ -96,7 +96,7 @@ impl LegacySqliteConnection {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl LegacySqliteStatement {
     pub fn query<P>(&mut self, _params: P) -> Result<LegacySqliteRows, LegacySqliteError> {
         Err(LegacySqliteError)
@@ -114,28 +114,28 @@ impl LegacySqliteStatement {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl LegacySqliteRows {
     pub fn next(&mut self) -> Result<Option<LegacySqliteRow>, LegacySqliteError> {
         Err(LegacySqliteError)
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 impl LegacySqliteRow {
     pub fn get<I, T: Default>(&self, _idx: I) -> Result<T, LegacySqliteError> {
         Err(LegacySqliteError)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Debug)]
 pub enum DbLockError {
     Poisoned,
-    Open(rusqlite::Error),
+    Open(sqlite_test::Error),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl std::fmt::Display for DbLockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -145,19 +145,19 @@ impl std::fmt::Display for DbLockError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl std::error::Error for DbLockError {}
 
 /// Fresh SQLite write connection guarded by the per-DB write gate.
 /// The connection field is declared before the gate so the connection is
 /// dropped before the mutex unlocks, keeping write serialization intact.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub struct DbWriteGuard<'a> {
     conn: Connection,
     _write_gate: MutexGuard<'a, ()>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl std::ops::Deref for DbWriteGuard<'_> {
     type Target = Connection;
 
@@ -166,14 +166,14 @@ impl std::ops::Deref for DbWriteGuard<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl std::ops::DerefMut for DbWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl TestSqliteDb {
     /// Acquire the write connection (exclusive).
     /// Backward compatible with existing `db.lock()` calls.
@@ -188,40 +188,40 @@ impl TestSqliteDb {
 
     /// Open a new read-only connection for non-blocking reads.
     /// SQLite WAL mode allows concurrent readers without blocking writers.
-    pub fn read_conn(&self) -> std::result::Result<Connection, rusqlite::Error> {
+    pub fn read_conn(&self) -> std::result::Result<Connection, sqlite_test::Error> {
         open_read_only_connection(&self.path)
     }
 
     /// Open a new read-write connection that bypasses the Mutex.
     /// Used by the policy engine (QuickJS) to avoid blocking request handlers.
     /// SQLite WAL serializes concurrent writers via busy_timeout.
-    pub fn separate_conn(&self) -> std::result::Result<Connection, rusqlite::Error> {
+    pub fn separate_conn(&self) -> std::result::Result<Connection, sqlite_test::Error> {
         open_write_connection(&self.path)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn open_read_only_connection(
     path: &std::path::Path,
-) -> std::result::Result<Connection, rusqlite::Error> {
+) -> std::result::Result<Connection, sqlite_test::Error> {
     let conn = Connection::open_with_flags(
         path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        sqlite_test::OpenFlags::SQLITE_OPEN_READ_ONLY | sqlite_test::OpenFlags::SQLITE_OPEN_URI,
     )?;
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")?;
     Ok(conn)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn open_write_connection(
     path: &std::path::Path,
-) -> std::result::Result<Connection, rusqlite::Error> {
+) -> std::result::Result<Connection, sqlite_test::Error> {
     let conn = Connection::open_with_flags(
         path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        sqlite_test::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | sqlite_test::OpenFlags::SQLITE_OPEN_CREATE
+            | sqlite_test::OpenFlags::SQLITE_OPEN_URI
+            | sqlite_test::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
@@ -229,16 +229,16 @@ pub(crate) fn open_write_connection(
     Ok(conn)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub type Db = Arc<TestSqliteDb>;
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub type Db = Arc<LegacySqliteDisabled>;
 
 /// Create an in-memory Db for tests.
 /// The wrapped Db uses a unique file-backed SQLite path so `read_conn()` and
 /// `separate_conn()` can reopen it without keeping a shared-memory anchor alive.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn test_db() -> Db {
     let conn = Connection::open_in_memory().unwrap();
     wrap_conn(conn)
@@ -247,7 +247,7 @@ pub fn test_db() -> Db {
 /// Wrap a raw Connection into a Db (for tests and migration).
 /// The source connection is checkpointed into a unique temp SQLite file so
 /// subsequent connections can reopen the same store without a resident anchor.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn wrap_conn(conn: Connection) -> Db {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -269,7 +269,7 @@ pub fn wrap_conn(conn: Connection) -> Db {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

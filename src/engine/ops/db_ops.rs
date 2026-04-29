@@ -113,7 +113,7 @@ fn db_query_raw(
         };
 
     let Some(pg_pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = legacy_db {
             return db_query_raw_sqlite(db, sql, &params, started);
         }
@@ -184,7 +184,7 @@ fn db_query_raw_pg(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn db_query_raw_sqlite(
     db: &Db,
     sql: &str,
@@ -217,7 +217,7 @@ fn db_query_raw_sqlite(
         .iter()
         .map(|name| name.to_string())
         .collect();
-    let mut rows = match stmt.query(rusqlite::params_from_iter(values.iter())) {
+    let mut rows = match stmt.query(sqlite_test::params_from_iter(values.iter())) {
         Ok(rows) => rows,
         Err(error) => {
             return policy_db_error_json(
@@ -290,7 +290,7 @@ fn db_execute_raw(
         };
 
     let Some(pg_pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = legacy_db {
             return db_execute_raw_sqlite(db, sql, &params, started);
         }
@@ -304,7 +304,7 @@ fn db_execute_raw(
     db_execute_raw_pg(&pg_pool, sql, &params, started)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn db_execute_raw_sqlite(
     db: &Db,
     sql: &str,
@@ -322,7 +322,7 @@ fn db_execute_raw_sqlite(
         }
     };
     let values = sqlite_params(params);
-    match conn.execute(sql, rusqlite::params_from_iter(values.iter())) {
+    match conn.execute(sql, sqlite_test::params_from_iter(values.iter())) {
         Ok(rows_affected) => {
             let elapsed = started.elapsed();
             if elapsed >= POLICY_DB_WARN_THRESHOLD {
@@ -426,42 +426,44 @@ fn parse_params_json(
     })
 }
 
-#[cfg(test)]
-fn sqlite_params(params: &[serde_json::Value]) -> Vec<rusqlite::types::Value> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn sqlite_params(params: &[serde_json::Value]) -> Vec<sqlite_test::types::Value> {
     params.iter().map(sqlite_param).collect()
 }
 
-#[cfg(test)]
-fn sqlite_param(value: &serde_json::Value) -> rusqlite::types::Value {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn sqlite_param(value: &serde_json::Value) -> sqlite_test::types::Value {
     match value {
-        serde_json::Value::Null => rusqlite::types::Value::Null,
-        serde_json::Value::Bool(value) => rusqlite::types::Value::Integer(i64::from(*value)),
+        serde_json::Value::Null => sqlite_test::types::Value::Null,
+        serde_json::Value::Bool(value) => sqlite_test::types::Value::Integer(i64::from(*value)),
         serde_json::Value::Number(value) => {
             if let Some(int_value) = value.as_i64() {
-                rusqlite::types::Value::Integer(int_value)
+                sqlite_test::types::Value::Integer(int_value)
             } else if let Some(float_value) = value.as_f64() {
-                rusqlite::types::Value::Real(float_value)
+                sqlite_test::types::Value::Real(float_value)
             } else {
-                rusqlite::types::Value::Text(value.to_string())
+                sqlite_test::types::Value::Text(value.to_string())
             }
         }
-        serde_json::Value::String(value) => rusqlite::types::Value::Text(value.clone()),
+        serde_json::Value::String(value) => sqlite_test::types::Value::Text(value.clone()),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            rusqlite::types::Value::Text(value.to_string())
+            sqlite_test::types::Value::Text(value.to_string())
         }
     }
 }
 
-#[cfg(test)]
-fn sqlite_value_ref_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn sqlite_value_ref_to_json(value: sqlite_test::types::ValueRef<'_>) -> serde_json::Value {
     match value {
-        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
-        rusqlite::types::ValueRef::Integer(value) => serde_json::json!(value),
-        rusqlite::types::ValueRef::Real(value) => serde_json::json!(value),
-        rusqlite::types::ValueRef::Text(value) => {
+        sqlite_test::types::ValueRef::Null => serde_json::Value::Null,
+        sqlite_test::types::ValueRef::Integer(value) => serde_json::json!(value),
+        sqlite_test::types::ValueRef::Real(value) => serde_json::json!(value),
+        sqlite_test::types::ValueRef::Text(value) => {
             serde_json::Value::String(String::from_utf8_lossy(value).to_string())
         }
-        rusqlite::types::ValueRef::Blob(value) => serde_json::Value::String(format!("{value:?}")),
+        sqlite_test::types::ValueRef::Blob(value) => {
+            serde_json::Value::String(format!("{value:?}"))
+        }
     }
 }
 
@@ -999,7 +1001,7 @@ where
     crate::utils::async_bridge::block_on_pg_result(pool, future_factory, |error| error)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;

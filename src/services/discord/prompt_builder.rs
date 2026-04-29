@@ -643,7 +643,7 @@ fn store_agent_performance_section(cache_key: String, hour_bucket: i64, section:
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn reset_agent_performance_cache_for_tests() {
     let cache = AGENT_PERFORMANCE_PROMPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
@@ -934,7 +934,7 @@ pub(super) fn build_system_prompt(
     system_prompt_owned
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

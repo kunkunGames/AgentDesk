@@ -319,7 +319,7 @@ fn attach_paused_turn_watcher(
     watcher_owner_channel_id
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod test_harness_exports {
     use super::*;
 
@@ -579,7 +579,7 @@ fn merge_reply_contexts(primary: Option<String>, secondary: Option<String>) -> O
 }
 
 fn take_session_retry_context(shared: &Arc<SharedData>, channel_id: ChannelId) -> Option<String> {
-    super::super::turn_bridge::take_session_retry_context(shared.legacy_sqlite(), channel_id.get())
+    super::super::turn_bridge::take_session_retry_context(None::<&crate::db::Db>, channel_id.get())
         .and_then(|raw| format_session_retry_context(&raw))
 }
 
@@ -725,7 +725,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
                 session.recent_history_context(super::super::SESSION_RECOVERY_CONTEXT_MESSAGES)
             {
                 let _ = super::super::turn_bridge::store_session_retry_context(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     channel_id.get(),
                     &retry_context,
@@ -1781,14 +1781,14 @@ fn dispatch_session_path_should_update(
     dispatch_effective_path != current_path
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchCwdPolicyDecision {
     log_main_workspace_error: bool,
     reject_for_missing_fresh_worktree: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn evaluate_dispatch_cwd_policy(
     dispatch_type: Option<&str>,
     current_path: &str,
@@ -1945,7 +1945,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 session.recent_history_context(super::super::SESSION_RECOVERY_CONTEXT_MESSAGES)
             {
                 let _ = super::super::turn_bridge::store_session_retry_context(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     channel_id.get(),
                     &retry_context,
@@ -5435,7 +5435,7 @@ fn resolve_session_id_for_current_turn(
     if reset_applied { None } else { session_id }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::super::super::DiscordSession;
     use super::super::control_intent::{

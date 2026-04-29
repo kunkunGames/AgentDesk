@@ -231,7 +231,7 @@ pub fn resolve_repo_dir_for_target(target_repo: Option<&str>) -> Result<Option<S
     resolve_repo_dir_for_id(Some(requested))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

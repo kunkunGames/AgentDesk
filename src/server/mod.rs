@@ -40,12 +40,12 @@ static POLICY_TICK_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// deadline, which is the failure mode this counter was added to track.
 static POLICY_TICK_POST_TIMEOUT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn policy_tick_timeout_count() -> u64 {
     POLICY_TICK_TIMEOUT_COUNT.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn policy_tick_post_timeout_completions() -> u64 {
     POLICY_TICK_POST_TIMEOUT_COMPLETIONS.load(Ordering::Acquire)
 }
@@ -351,7 +351,7 @@ async fn policy_tick_loop(engine: PolicyEngine, pg_pool: Option<Arc<PgPool>>) {
 
 /// Fire a single tick hook by name, log timing, record telemetry, and notify any dispatches created by JS.
 /// Uses try_fire_hook_by_name for dynamic hook binding (#134).
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn fire_tick_hook_by_name(
     engine: &PolicyEngine,
     legacy_db: &crate::db::Db,
@@ -459,7 +459,7 @@ async fn fire_tick_hook_by_name_with_timeout(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn record_tick_hook_execution(
     legacy_db: &crate::db::Db,
     label: &str,
@@ -675,7 +675,7 @@ async fn record_tick_hook_execution_pg(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) async fn fire_tick_hook_by_name_for_test(
     engine: &PolicyEngine,
     legacy_db: &crate::db::Db,
@@ -818,7 +818,7 @@ async fn rate_limit_sync_loop(pg_pool: Arc<PgPool>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -2946,7 +2946,7 @@ impl PendingMessageOutboxRow {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_pending_message_outbox_batch_sqlite(
     legacy_db: &crate::db::Db,
 ) -> Vec<PendingMessageOutboxRow> {
@@ -3100,7 +3100,7 @@ where
     pending.len()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn drain_message_outbox_batch_once_sqlite<F, Fut>(
     sqlite_db: &crate::db::Db,
     mut deliver: F,

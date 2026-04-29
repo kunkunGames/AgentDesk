@@ -1,6 +1,6 @@
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
-#[cfg(test)]
-use rusqlite::OptionalExtension;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::PgPool;
 
 // ── Config ops ───────────────────────────────────────────────────
@@ -24,7 +24,7 @@ pub(super) fn register_config_ops<'js>(
                 if let Some(pool) = pg_c.as_ref() {
                     return config_get_raw_pg(pool, &key);
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 if let Some(db) = db_c.as_ref() {
                     return config_get_raw_sqlite(db, &key);
                 }
@@ -51,14 +51,14 @@ pub(super) fn register_config_ops<'js>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn config_get_raw_sqlite(db: &crate::db::Db, key: &str) -> String {
     let value = db
         .read_conn()
         .and_then(|conn| {
             conn.query_row(
                 "SELECT value FROM kv_meta WHERE key = ?1",
-                rusqlite::params![key],
+                sqlite_test::params![key],
                 |row| row.get::<_, String>(0),
             )
             .optional()

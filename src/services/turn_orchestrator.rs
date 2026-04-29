@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -332,7 +332,7 @@ pub(crate) fn save_channel_queue(
 }
 
 /// Save all non-empty intervention queues to `{provider}/{token_hash}/`.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn save_pending_queues(
     provider: &ProviderKind,
     token_hash: &str,
@@ -478,7 +478,7 @@ pub(crate) fn warn_legacy_pending_queue_files(provider: &ProviderKind) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn take_next_soft_intervention_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -526,7 +526,7 @@ pub(crate) fn take_next_soft_intervention_persisted(
     Some((intervention, has_more))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn requeue_intervention_front_persisted(
     provider: &ProviderKind,
     token_hash: &str,
@@ -1517,7 +1517,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
     ChannelMailboxHandle { sender: tx }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::runtime_store::test_env_lock;

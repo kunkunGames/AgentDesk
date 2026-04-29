@@ -492,7 +492,7 @@ async fn broadcast_credential_change(
         let sqlite_runtime_db = if shared.pg_pool.is_some() {
             None
         } else {
-            shared.legacy_sqlite()
+            None::<&crate::db::Db>
         };
         crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
             sqlite_runtime_db,
@@ -509,7 +509,7 @@ async fn broadcast_credential_change(
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use notify::event::ModifyKind;

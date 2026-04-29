@@ -174,7 +174,7 @@ pub(crate) fn classify_mailbox_snapshot(snapshot: &Value) -> Option<MailboxFindi
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

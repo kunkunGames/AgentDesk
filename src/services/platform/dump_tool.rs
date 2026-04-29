@@ -96,7 +96,7 @@ pub fn capture_process_dump(pid: u32, output_path: &str) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

@@ -167,7 +167,7 @@ pub fn transition_idempotent_terminal(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::MeetingEvent::*;
     use super::MeetingState::*;

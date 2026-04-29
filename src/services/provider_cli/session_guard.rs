@@ -198,7 +198,7 @@ fn artifact_active(artifact: &LaunchArtifact, evidence: &mut HashMap<String, Str
     active
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

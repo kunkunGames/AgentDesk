@@ -236,7 +236,7 @@ pub(super) fn resolve_dispatch_tmux_protection(
     .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{DispatchTmuxProtection, resolve_dispatch_tmux_protection};
     use crate::services::provider::ProviderKind;

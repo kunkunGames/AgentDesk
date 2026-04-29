@@ -734,7 +734,7 @@ pub(super) async fn auto_restore_session_force(
         let sqlite_settings_db = if shared.pg_pool.is_some() {
             None
         } else {
-            shared.legacy_sqlite()
+            None::<&crate::db::Db>
         };
         let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref())
             .or_else(|| {
@@ -787,9 +787,9 @@ pub(super) async fn auto_restore_session_force(
                 .flatten();
             }
 
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             {
-                shared.legacy_sqlite().and_then(|db| {
+                None::<&crate::db::Db>.and_then(|db| {
                     db.lock().ok().and_then(|conn| {
                         session_keys.iter().find_map(|session_key| {
                             conn.query_row(
@@ -805,7 +805,7 @@ pub(super) async fn auto_restore_session_force(
                     })
                 })
             }
-            #[cfg(not(test))]
+            #[cfg(not(feature = "legacy-sqlite-tests"))]
             {
                 None
             }
@@ -1185,7 +1185,7 @@ pub(super) async fn resolve_thread_parent(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::path::Path;

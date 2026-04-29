@@ -384,7 +384,7 @@ pub(crate) fn recall_size_snapshot() -> Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn reset_memento_throttle_for_tests() {
     with_state(|state| {
         *state = MementoThrottleState::default();

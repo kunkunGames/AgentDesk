@@ -5,18 +5,18 @@ use sqlx::PgPool;
 
 pub(super) fn register_queue_ops<'js>(
     ctx: &Ctx<'js>,
-    #[cfg(test)] db: Option<Db>,
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))] db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let db: Option<Db> = None;
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let _ = &db;
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let queue_obj = Object::new(ctx.clone())?;
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     let db_status = db;
     let pg_status = pg_pool;
     queue_obj.set(
@@ -25,7 +25,7 @@ pub(super) fn register_queue_ops<'js>(
             if let Some(pool) = pg_status.as_ref() {
                 return queue_status_raw_pg(pool);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db_status) = db_status.as_ref() {
                 return queue_status_raw_sqlite_test(db_status);
             }
@@ -113,7 +113,7 @@ fn queue_status_raw_pg(pool: &PgPool) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn queue_status_raw_sqlite_test(db: &Db) -> String {
     let result = (|| -> anyhow::Result<serde_json::Value> {
         let conn = db.read_conn()?;

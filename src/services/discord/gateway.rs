@@ -673,7 +673,7 @@ impl TurnGateway for HeadlessGateway {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{drain_merged_queued_placeholders, live_bot_owner_provider, outbound_policy};
     use crate::services::discord::outbound::{

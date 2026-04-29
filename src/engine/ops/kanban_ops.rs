@@ -122,7 +122,7 @@ pub(super) fn register_kanban_ops<'js>(
                 if let Some(pool) = pg_review.as_ref() {
                     return set_review_status_raw_pg(pool, &card_id, &opts_json);
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 if let Some(db) = db_review.as_ref() {
                     return set_review_status_raw_sqlite(db, &card_id, &opts_json);
                 }
@@ -633,7 +633,7 @@ fn clear_latest_dispatch_raw_pg(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn set_review_status_raw_sqlite(db: &Db, card_id: &str, opts_json: &str) -> String {
     let opts: serde_json::Value = match serde_json::from_str(opts_json) {
         Ok(value) => value,
@@ -669,7 +669,7 @@ fn set_review_status_raw_sqlite(db: &Db, card_id: &str, opts_json: &str) -> Stri
             } else if let Some(status) = review_status.as_str() {
                 conn.execute(
                     "UPDATE kanban_cards SET review_status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![status, card_id],
+                    sqlite_test::params![status, card_id],
                 )
                 .map_err(|error| format!("set sqlite review_status for {card_id}: {error}"))?;
             }
@@ -709,7 +709,7 @@ fn set_review_status_raw_sqlite(db: &Db, card_id: &str, opts_json: &str) -> Stri
             } else if let Some(reason) = value.as_str() {
                 conn.execute(
                     "UPDATE kanban_cards SET blocked_reason = ?1, updated_at = datetime('now') WHERE id = ?2",
-                    rusqlite::params![reason, card_id],
+                    sqlite_test::params![reason, card_id],
                 )
                 .map_err(|error| format!("set sqlite blocked_reason for {card_id}: {error}"))?;
             }
@@ -885,16 +885,16 @@ pub(super) fn review_state_sync_with_backends(
     if let Some(pool) = pg_pool {
         return review_state_sync_pg(pool, json_str);
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = db {
         return review_state_sync_sqlite(db, json_str);
     }
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let _ = db;
     r#"{"error":"postgres backend is required for review_state_sync"}"#.to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_state_sync_sqlite(db: &Db, json_str: &str) -> String {
     let params: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -918,7 +918,7 @@ fn review_state_sync_sqlite(db: &Db, json_str: &str) -> String {
              SET last_verdict = NULL,
                  updated_at = datetime('now')
              WHERE card_id = ?1",
-            rusqlite::params![card_id],
+            sqlite_test::params![card_id],
         );
         return match result {
             Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
@@ -968,7 +968,7 @@ fn review_state_sync_sqlite(db: &Db, json_str: &str) -> String {
             session_reset_round = COALESCE(?8, session_reset_round),
             review_entered_at = COALESCE(CASE WHEN ?9 = 'now' THEN datetime('now') ELSE ?9 END, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END),
             updated_at = datetime('now')",
-        rusqlite::params![
+        sqlite_test::params![
             card_id,
             state,
             review_round,

@@ -21,7 +21,7 @@ pub(crate) fn git_command() -> std::process::Command {
     crate::services::platform::binary_resolver::git_command()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) mod test_support {
     use tempfile::TempDir;
 

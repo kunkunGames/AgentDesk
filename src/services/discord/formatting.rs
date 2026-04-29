@@ -208,7 +208,7 @@ pub(super) fn extract_skill_description(content: &str) -> String {
     "Custom skill".to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         LongRunningCloseTrigger, MonitorHandoffReason, MonitorHandoffStatus,

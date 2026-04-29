@@ -300,7 +300,7 @@ fn extract_count(payload: &Value, keys: &[&str]) -> Option<u64> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

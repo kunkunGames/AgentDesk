@@ -165,7 +165,7 @@ fn matching_recent_watcher_reattach_offset(
         .cloned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_recent_watcher_reattach_offsets_for_tests() {
     recent_watcher_reattach_offsets().clear();
 }
@@ -484,12 +484,12 @@ fn recent_turn_stop_matches_watcher_range(
             <= RECENT_TURN_STOP_METADATA_FALLBACK_TTL
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_recent_turn_stops_for_tests() {
     recent_turn_stops().clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn record_recent_turn_stop_with_offset_for_tests(
     channel_id: ChannelId,
     tmux_session_name: &str,
@@ -515,7 +515,7 @@ fn record_recent_turn_stop_with_offset_for_tests(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn record_recent_turn_stop_for_tests(
     channel_id: ChannelId,
     tmux_session_name: Option<&str>,
@@ -2748,7 +2748,7 @@ fn sqlite_runtime_db(shared: &SharedData) -> Option<&crate::db::Db> {
     if shared.pg_pool.is_some() {
         None
     } else {
-        shared.legacy_sqlite()
+        None::<&crate::db::Db>
     }
 }
 
@@ -3201,7 +3201,7 @@ async fn resolve_watcher_dispatch_id(
         .await)
         .or_else(|| {
             resolve_dispatched_thread_dispatch_from_db(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 channel_id.get(),
             )
@@ -3551,7 +3551,7 @@ impl WatcherClaimOutcome {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(crate) fn action(self) -> WatcherClaimAction {
         self.action
     }
@@ -4354,7 +4354,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             );
         }
         maybe_refresh_watcher_activity_heartbeat(
-            shared.legacy_sqlite(),
+            None::<&crate::db::Db>,
             shared.pg_pool.as_ref(),
             &shared.token_hash,
             &watcher_provider,
@@ -4511,7 +4511,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     Ok(Ok(Ok((chunk, off)))) if !chunk.is_empty() => {
                         current_offset = off;
                         maybe_refresh_watcher_activity_heartbeat(
-                            shared.legacy_sqlite(),
+                            None::<&crate::db::Db>,
                             shared.pg_pool.as_ref(),
                             &shared.token_hash,
                             &watcher_provider,
@@ -4671,7 +4671,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                 crate::services::provider::ReadyForInputIdleState::PostWorkIdleTimeout => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     let dispatch_id = resolve_dispatched_thread_dispatch_from_db(
-                                        shared.legacy_sqlite(),
+                                        None::<&crate::db::Db>,
                                         shared.pg_pool.as_ref(),
                                         watcher_thread_channel_id.unwrap_or_else(|| channel_id.get()),
                                     )
@@ -6050,7 +6050,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             super::formatting::add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
 
             if has_assistant_response
-                && (shared.legacy_sqlite().is_some() || shared.pg_pool.is_some())
+                && (None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some())
             {
                 let turn_id = format!("discord:{}:{}", channel_id.get(), state.user_msg_id);
                 let channel_id_text = channel_id.get().to_string();
@@ -6065,13 +6065,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     .await)
                     .or_else(|| {
                         resolve_dispatched_thread_dispatch_from_db(
-                            shared.legacy_sqlite(),
+                            None::<&crate::db::Db>,
                             shared.pg_pool.as_ref(),
                             channel_id.get(),
                         )
                     });
                 if let Err(e) = crate::db::session_transcripts::persist_turn_db(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     crate::db::session_transcripts::PersistSessionTranscript {
                         turn_id: &turn_id,
@@ -6095,7 +6095,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 }
 
                 super::turn_bridge::persist_turn_analytics_row_with_handles(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     &provider_kind,
                     channel_id,
@@ -6128,7 +6128,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             .await)
             .or_else(|| {
                 resolve_dispatched_thread_dispatch_from_db(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     channel_id.get(),
                 )
@@ -6163,11 +6163,11 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         );
                         false
                     } else if let (Some(db), Some(engine)) =
-                        (shared.legacy_sqlite(), &shared.engine)
+                        (None::<&crate::db::Db>, &shared.engine)
                     {
                         let mut work_completion_context =
                             super::turn_bridge::build_work_dispatch_completion_result(
-                                shared.legacy_sqlite(),
+                                None::<&crate::db::Db>,
                                 shared.pg_pool.as_ref(),
                                 did,
                                 "watcher_completed",
@@ -6209,7 +6209,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                 );
                                 let mut fallback_result =
                                     super::turn_bridge::build_work_dispatch_completion_result(
-                                        shared.legacy_sqlite(),
+                                        None::<&crate::db::Db>,
                                         shared.pg_pool.as_ref(),
                                         did,
                                         "watcher_db_fallback",
@@ -6231,7 +6231,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                 if completed {
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            shared.legacy_sqlite(),
+                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "watcher_completed_fallback",
@@ -6244,7 +6244,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     } else {
                         let mut fallback_result =
                             super::turn_bridge::build_work_dispatch_completion_result(
-                                shared.legacy_sqlite(),
+                                None::<&crate::db::Db>,
                                 shared.pg_pool.as_ref(),
                                 did,
                                 "watcher_db_fallback",
@@ -6265,7 +6265,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             );
                         if completed {
                             let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                shared.legacy_sqlite(),
+                                None::<&crate::db::Db>,
                                 shared.pg_pool.as_ref(),
                                 did,
                                 "watcher_completed_runtime_fallback",
@@ -6599,7 +6599,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             .and_then(|s| s.channel_name.clone())
     };
     let dispatch_protection = super::tmux_lifecycle::resolve_dispatch_tmux_protection(
-        shared.legacy_sqlite(),
+        None::<&crate::db::Db>,
         shared.pg_pool.as_ref(),
         &shared.token_hash,
         &provider,
@@ -7470,7 +7470,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let sqlite_settings_db = if shared.pg_pool.is_some() {
             None
         } else {
-            shared.legacy_sqlite()
+            None::<&crate::db::Db>
         };
         for (channel_id, channel_name) in &owned_sessions {
             let persisted_path = load_last_session_path(
@@ -7501,7 +7501,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
                 &tmux_name,
             );
             let db_cwd = load_restored_session_cwd(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 &session_keys,
             );
@@ -7651,7 +7651,7 @@ pub(super) async fn restore_tmux_watchers(http: &Arc<serenity::Http>, shared: &A
         let mut cleaned_dead_sessions = 0usize;
         for dc in &dead_cleanups {
             let dispatch_protection = super::tmux_lifecycle::resolve_dispatch_tmux_protection(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 &provider,
@@ -7855,7 +7855,7 @@ async fn sweep_orphan_session_files() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::FallbackPlaceholderCleanupDecision;
     use super::{

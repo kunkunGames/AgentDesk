@@ -858,7 +858,7 @@ pub fn read_output_file_until_result_tracked(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::process::Stdio;

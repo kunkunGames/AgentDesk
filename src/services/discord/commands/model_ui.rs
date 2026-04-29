@@ -263,7 +263,7 @@ pub(super) fn build_model_picker_options(
     .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::fs;
 

@@ -319,7 +319,7 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

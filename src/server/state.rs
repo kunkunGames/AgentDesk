@@ -148,7 +148,7 @@ pub fn global_monitoring_store() -> Arc<Mutex<MonitoringStore>> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

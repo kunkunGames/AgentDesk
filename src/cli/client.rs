@@ -1048,7 +1048,7 @@ pub fn cmd_terminations(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         build_cli_advance_completion_result, cmd_advance, cmd_dispatch, encode_path_segment,

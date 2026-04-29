@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 pub(super) fn current_home_dir() -> Option<PathBuf> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         if let Ok(slot) = test_home_dir_override_slot().lock() {
             if let Some(override_path) = slot.clone() {
@@ -12,21 +12,21 @@ pub(super) fn current_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn test_home_dir_override_slot() -> &'static std::sync::Mutex<Option<Option<PathBuf>>> {
     static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Option<PathBuf>>>> =
         std::sync::OnceLock::new();
     OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn set_test_home_dir_override(path: Option<PathBuf>) {
     if let Ok(mut slot) = test_home_dir_override_slot().lock() {
         *slot = Some(path);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn clear_test_home_dir_override() {
     if let Ok(mut slot) = test_home_dir_override_slot().lock() {
         *slot = None;

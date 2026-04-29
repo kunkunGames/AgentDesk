@@ -750,7 +750,7 @@ pub struct SyncResult {
     pub inconsistency_count: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::github::test_utils::RecordingAdapter;

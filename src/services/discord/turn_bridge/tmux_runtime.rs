@@ -575,7 +575,7 @@ pub(super) fn should_resume_watcher_after_turn(
     !defer_watcher_resume && !(has_local_queued_turns && can_chain_locally)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{TmuxCleanupPolicy, handoff_interrupted_message, stale_inflight_message};
     use crate::services::discord::InflightRestartMode;

@@ -566,7 +566,7 @@ async fn load_memento_feedback_counts(state: &AppState) -> Option<(i64, i64)> {
     load_memento_feedback_counts_legacy(state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_memento_feedback_counts_legacy(state: &AppState) -> Option<(i64, i64)> {
     let db = state.legacy_db()?;
     let conn = db.lock().ok()?;
@@ -581,7 +581,7 @@ fn load_memento_feedback_counts_legacy(state: &AppState) -> Option<(i64, i64)> {
     ))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn load_memento_feedback_counts_legacy(_state: &AppState) -> Option<(i64, i64)> {
     None
 }

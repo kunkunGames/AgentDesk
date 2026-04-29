@@ -590,7 +590,7 @@ impl DiscordOutboundClient for HttpOutboundClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

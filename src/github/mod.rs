@@ -552,7 +552,7 @@ fn parse_issue_number_from_url(url: &str) -> Option<i64> {
 }
 
 /// List all registered repos from the database.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn list_repos(db: &Db) -> Result<Vec<RepoRow>, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
     let mut stmt = conn
@@ -575,7 +575,7 @@ pub fn list_repos(db: &Db) -> Result<Vec<RepoRow>, String> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub fn list_repos(_db: &Db) -> Result<Vec<RepoRow>, String> {
     Err("sqlite github repo registry is unavailable in production".to_string())
 }
@@ -612,7 +612,7 @@ pub async fn list_repos_pg(pool: &PgPool) -> Result<Vec<RepoRow>, String> {
 }
 
 /// Register a new repo (or update display_name if already exists).
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn register_repo(db: &Db, repo_id: &str) -> Result<RepoRow, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
     conn.execute(
@@ -639,7 +639,7 @@ pub fn register_repo(db: &Db, repo_id: &str) -> Result<RepoRow, String> {
     Ok(row)
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub fn register_repo(_db: &Db, repo_id: &str) -> Result<RepoRow, String> {
     Err(format!(
         "sqlite github repo registry is unavailable in production for {repo_id}"
@@ -654,7 +654,7 @@ pub struct RepoRow {
     pub last_synced_at: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod test_utils {
     use super::{GitHubAdapter, GitHubFuture};
     use std::collections::VecDeque;
@@ -725,7 +725,7 @@ pub(crate) mod test_utils {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::test_utils::RecordingAdapter;
     use super::*;

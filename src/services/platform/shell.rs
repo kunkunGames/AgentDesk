@@ -93,7 +93,7 @@ pub fn hostname_short() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

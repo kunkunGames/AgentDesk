@@ -179,7 +179,7 @@ fn parse_cargo_sweep_output(stdout: &str) -> (u64, u64) {
     (removed_files, removed_bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

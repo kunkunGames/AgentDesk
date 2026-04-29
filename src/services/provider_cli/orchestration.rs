@@ -236,7 +236,7 @@ fn agent_supports_provider(agent: &crate::config::AgentDef, provider: &str) -> b
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider_cli::io::{load_registry, save_registry};

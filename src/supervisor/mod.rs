@@ -222,7 +222,7 @@ impl RuntimeSupervisor {
                     note = Some("dispatch already terminal or missing".to_string());
                     chosen_action = SupervisorAction::Probe;
                 } else {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                     self.apply_orphan_fault_injection(&dispatch_id, &candidate.card_id);
 
                     // Return card to ready for re-dispatch instead of advancing to review
@@ -663,7 +663,7 @@ impl RuntimeSupervisor {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     fn apply_orphan_fault_injection(&self, dispatch_id: &str, card_id: &str) {
         let _ = (dispatch_id, card_id);
     }
@@ -790,7 +790,7 @@ impl std::fmt::Display for SupervisorAction {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

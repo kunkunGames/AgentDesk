@@ -484,7 +484,7 @@ fn office_exists_or_response(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::office_exists_or_response;
     use axum::{Json, http::StatusCode};

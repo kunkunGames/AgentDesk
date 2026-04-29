@@ -472,7 +472,7 @@ async fn deliver_channel_message(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;

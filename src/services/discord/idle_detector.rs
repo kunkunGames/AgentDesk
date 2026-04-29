@@ -299,8 +299,8 @@ async fn fetch_last_heartbeat(
         }
     }
 
-    #[cfg(test)]
-    if let Some(db) = shared.legacy_sqlite() {
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+    if let Some(db) = None::<&crate::db::Db> {
         let db = db.clone();
         let provider_name_clone = provider_name.clone();
         let thread_channel_id_clone = thread_channel_id.clone();
@@ -330,7 +330,7 @@ async fn fetch_last_heartbeat(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;

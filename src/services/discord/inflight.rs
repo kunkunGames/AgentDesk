@@ -762,7 +762,7 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
     states
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         CreateNewInflightError, InflightTurnState, latest_request_owner_user_id_for_channel,

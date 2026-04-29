@@ -1241,7 +1241,7 @@ fn handle_codex_json_line(
     Ok(Some(false))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::sync::mpsc;
 

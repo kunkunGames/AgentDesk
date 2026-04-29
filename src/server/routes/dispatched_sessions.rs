@@ -10,7 +10,7 @@ use sqlx::{PgPool, Row};
 use super::AppState;
 use super::session_activity::SessionActivityResolver;
 use crate::db::agents::resolve_agent_channel_for_provider_pg;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::session_agent_resolution::resolve_agent_id_for_session;
 use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
@@ -36,9 +36,9 @@ async fn load_dispatch_thread_id_pg(pool: &PgPool, dispatch_id: &str) -> Option<
     normalize_thread_channel_id(thread_id.as_deref())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_dispatch_thread_id_sqlite(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     dispatch_id: &str,
 ) -> Option<String> {
     let thread_id: Option<String> = conn
@@ -962,7 +962,7 @@ pub async fn hook_session(
         return hook_session_pg(&state, pool, body).await;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db().cloned() {
         return hook_session_sqlite_for_tests(&state, db, body).await;
     }
@@ -973,7 +973,7 @@ pub async fn hook_session(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn hook_session_sqlite_for_tests(
     state: &AppState,
     db: crate::db::Db,
@@ -1052,7 +1052,7 @@ async fn hook_session_sqlite_for_tests(
             claude_session_id = COALESCE(excluded.claude_session_id, sessions.claude_session_id),
             raw_provider_session_id = COALESCE(excluded.raw_provider_session_id, sessions.raw_provider_session_id),
             last_heartbeat = datetime('now')",
-        rusqlite::params![
+        sqlite_test::params![
             body.session_key,
             agent_id,
             provider,
@@ -2076,7 +2076,7 @@ pub async fn force_kill_session_legacy(
     force_kill_session_impl(&state, &body.session_key, body.retry).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::db::Db;

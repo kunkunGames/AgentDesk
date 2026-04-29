@@ -663,7 +663,7 @@ pub(super) async fn gc_stale_thread_sessions() -> Result<usize, String> {
         .unwrap_or(0))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod self_feedback_tests {
     //! #1103 — Tests for the self-feedback prompt block and rework category
     //! tagging. These tests cover the pure formatter and classifier so they

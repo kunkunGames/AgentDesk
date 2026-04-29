@@ -538,11 +538,11 @@ async fn wait_for_turn_end(
 }
 
 fn runtime_stop_wait_timeout() -> std::time::Duration {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         std::time::Duration::from_millis(150)
     }
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     {
         std::time::Duration::from_secs(3)
     }
@@ -1230,14 +1230,14 @@ fn recovery_duration_secs(shared: &SharedData) -> f64 {
     duration_ms as f64 / 1000.0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) struct TestHealthHarness {
     provider: ProviderKind,
     registry: Arc<HealthRegistry>,
     shared: Arc<SharedData>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl TestHealthHarness {
     pub(crate) async fn new() -> Self {
         Self::new_with_provider(ProviderKind::Claude).await
@@ -1303,7 +1303,7 @@ impl TestHealthHarness {
             token_hash: super::settings::discord_token_hash("test-token"),
             provider: provider.clone(),
             api_port: 8791,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             sqlite: None,
             pg_pool: None,
             engine: None,
@@ -1960,7 +1960,7 @@ fn parse_agent_target(target: &str) -> Result<Option<&str>, SendTargetResolution
     Ok(Some(agent_id))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_target_channel_id_sqlite(
     sqlite: &Db,
     agent_id: &str,
@@ -2020,7 +2020,7 @@ fn resolve_channel_target(target: &str) -> Result<u64, SendTargetResolutionError
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_send_target_channel_id(
     sqlite: &Db,
     target: &str,
@@ -2042,7 +2042,7 @@ async fn resolve_send_target_channel_id_with_backends(
                 return resolve_agent_target_channel_id_pg(pg_pool, agent_id).await;
             }
 
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             {
                 let db = db.ok_or_else(|| {
                     SendTargetResolutionError::Internal(
@@ -2052,7 +2052,7 @@ async fn resolve_send_target_channel_id_with_backends(
                 return resolve_agent_target_channel_id_sqlite(db, agent_id);
             }
 
-            #[cfg(not(test))]
+            #[cfg(not(feature = "legacy-sqlite-tests"))]
             {
                 let _ = db;
                 Err(SendTargetResolutionError::Internal(
@@ -3090,7 +3090,7 @@ fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str>
     Ok((target, content, source))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::DISCORD_MSG_LIMIT;

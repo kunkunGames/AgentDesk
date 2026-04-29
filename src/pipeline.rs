@@ -578,9 +578,9 @@ pub fn resolve(
 }
 
 /// Resolve effective pipeline from DB, looking up repo and agent overrides.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn resolve_for_card(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     repo_id: Option<&str>,
     agent_id: Option<&str>,
 ) -> PipelineConfig {
@@ -1319,7 +1319,7 @@ impl PipelineConfig {
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use sqlx::PgPool;

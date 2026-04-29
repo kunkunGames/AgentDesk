@@ -473,7 +473,7 @@ pub fn review_tuning_guidance_path() -> std::path::PathBuf {
     root.join("runtime").join("review-tuning-guidance.txt")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{aggregate_review_tuning_core_pg, record_decision_tuning};
     use sqlx::Row;

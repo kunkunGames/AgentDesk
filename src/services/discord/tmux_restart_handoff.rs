@@ -376,7 +376,7 @@ pub(super) async fn resume_aborted_restart_turn(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         RestartHandoffScope, build_restart_handoff_session_key, resolve_restart_handoff_scope,

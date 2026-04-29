@@ -682,7 +682,7 @@ fn success_result_end_offset_after_offset(output_path: &str, start_offset: u64) 
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn output_has_result_after_offset(output_path: &str, start_offset: u64) -> bool {
     success_result_end_offset_after_offset(output_path, start_offset).is_some()
 }
@@ -1075,9 +1075,9 @@ pub(super) async fn restore_inflight_turns(
                 let duration_ms =
                     recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
                 let has_completion_evidence =
-                    if shared.legacy_sqlite().is_some() || shared.pg_pool.is_some() {
+                    if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
                         super::turn_bridge::persist_turn_analytics_row_with_handles(
-                            shared.legacy_sqlite(),
+                            None::<&crate::db::Db>,
                             shared.pg_pool.as_ref(),
                             provider,
                             channel_id,
@@ -1095,7 +1095,7 @@ pub(super) async fn restore_inflight_turns(
                             duration_ms,
                         );
                         persist_recovered_transcript(
-                            shared.legacy_sqlite(),
+                            None::<&crate::db::Db>,
                             shared.pg_pool.as_ref(),
                             provider,
                             &state,
@@ -1142,7 +1142,7 @@ pub(super) async fn restore_inflight_turns(
                         // #143: Use finalize_dispatch directly with retry.
                         for attempt in 1..=3u8 {
                             match crate::dispatch::finalize_dispatch_with_backends(
-                                shared.legacy_sqlite(),
+                                None::<&crate::db::Db>,
                                 engine,
                                 did,
                                 "recovery_completed_during_downtime",
@@ -1155,7 +1155,7 @@ pub(super) async fn restore_inflight_turns(
                                     );
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            shared.legacy_sqlite(),
+                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_completed_during_downtime",
@@ -1185,7 +1185,7 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    shared.legacy_sqlite(),
+                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_completed_during_downtime_fallback",
@@ -1614,9 +1614,9 @@ pub(super) async fn restore_inflight_turns(
             let duration_ms =
                 recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
             let has_completion_evidence =
-                if shared.legacy_sqlite().is_some() || shared.pg_pool.is_some() {
+                if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
                     super::turn_bridge::persist_turn_analytics_row_with_handles(
-                        shared.legacy_sqlite(),
+                        None::<&crate::db::Db>,
                         shared.pg_pool.as_ref(),
                         provider,
                         channel_id,
@@ -1632,7 +1632,7 @@ pub(super) async fn restore_inflight_turns(
                         duration_ms,
                     );
                     persist_recovered_transcript(
-                        shared.legacy_sqlite(),
+                        None::<&crate::db::Db>,
                         shared.pg_pool.as_ref(),
                         provider,
                         &state,
@@ -1684,7 +1684,7 @@ pub(super) async fn restore_inflight_turns(
                         } else if let Some(engine) = &shared.engine {
                             for attempt in 1..=3u8 {
                                 match crate::dispatch::finalize_dispatch_with_backends(
-                                    shared.legacy_sqlite(),
+                                    None::<&crate::db::Db>,
                                     engine,
                                     did,
                                     "recovery_captured_full_response",
@@ -1697,7 +1697,7 @@ pub(super) async fn restore_inflight_turns(
                                         );
                                         let _ =
                                             super::turn_bridge::queue_dispatch_followup_with_handles(
-                                                shared.legacy_sqlite(),
+                                                None::<&crate::db::Db>,
                                                 shared.pg_pool.as_ref(),
                                                 did,
                                                 "recovery_captured_full_response",
@@ -1727,7 +1727,7 @@ pub(super) async fn restore_inflight_turns(
                                 if dispatch_completed {
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            shared.legacy_sqlite(),
+                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_captured_full_response_fallback",
@@ -1743,7 +1743,7 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    shared.legacy_sqlite(),
+                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_captured_full_response_runtime_fallback",
@@ -1847,9 +1847,9 @@ pub(super) async fn restore_inflight_turns(
             let duration_ms =
                 recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
             let has_completion_evidence =
-                if shared.legacy_sqlite().is_some() || shared.pg_pool.is_some() {
+                if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
                     super::turn_bridge::persist_turn_analytics_row_with_handles(
-                        shared.legacy_sqlite(),
+                        None::<&crate::db::Db>,
                         shared.pg_pool.as_ref(),
                         provider,
                         channel_id,
@@ -1867,7 +1867,7 @@ pub(super) async fn restore_inflight_turns(
                         duration_ms,
                     );
                     persist_recovered_transcript(
-                        shared.legacy_sqlite(),
+                        None::<&crate::db::Db>,
                         shared.pg_pool.as_ref(),
                         provider,
                         &state,
@@ -1917,7 +1917,7 @@ pub(super) async fn restore_inflight_turns(
                         } else if let Some(engine) = &shared.engine {
                             for attempt in 1..=3u8 {
                                 match crate::dispatch::finalize_dispatch_with_backends(
-                                    shared.legacy_sqlite(),
+                                    None::<&crate::db::Db>,
                                     engine,
                                     did,
                                     "recovery_output_completed",
@@ -1930,7 +1930,7 @@ pub(super) async fn restore_inflight_turns(
                                         );
                                         let _ =
                                             super::turn_bridge::queue_dispatch_followup_with_handles(
-                                                shared.legacy_sqlite(),
+                                                None::<&crate::db::Db>,
                                                 shared.pg_pool.as_ref(),
                                                 did,
                                                 "recovery_output_completed",
@@ -1960,7 +1960,7 @@ pub(super) async fn restore_inflight_turns(
                                 if dispatch_completed {
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            shared.legacy_sqlite(),
+                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_output_completed_fallback",
@@ -1976,7 +1976,7 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    shared.legacy_sqlite(),
+                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_output_completed_runtime_fallback",
@@ -2100,7 +2100,7 @@ pub(super) async fn restore_inflight_turns(
             .await;
             if let Some(ref sk) = state.session_key {
                 crate::services::termination_audit::record_termination_with_handles(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     sk,
                     state.dispatch_id.as_deref(),
@@ -2171,7 +2171,7 @@ pub(super) async fn restore_inflight_turns(
                 let sqlite_settings_db = if shared.pg_pool.is_some() {
                     None
                 } else {
-                    shared.legacy_sqlite()
+                    None::<&crate::db::Db>
                 };
                 let persisted_session_path = load_last_session_path(
                     sqlite_settings_db,
@@ -2353,7 +2353,7 @@ pub(super) async fn restore_inflight_turns(
         let sqlite_settings_db = if shared.pg_pool.is_some() {
             None
         } else {
-            shared.legacy_sqlite()
+            None::<&crate::db::Db>
         };
         let persisted_session_path = load_last_session_path(
             sqlite_settings_db,
@@ -3019,7 +3019,7 @@ pub(crate) async fn rebind_inflight_for_channel(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider::ProviderKind;
@@ -3029,7 +3029,7 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::{Json, Router};
     use poise::serenity_prelude as serenity;
-    use rusqlite::OptionalExtension;
+    use sqlite_test::OptionalExtension;
     use std::ffi::OsString;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -3160,7 +3160,7 @@ mod tests {
             64,
         );
 
-        let conn = rusqlite::Connection::open_in_memory()
+        let conn = sqlite_test::Connection::open_in_memory()
             .expect("in-memory sqlite should open for recovery phase test");
         conn.execute_batch(
             "CREATE TABLE recovery_phase_roundtrip (
@@ -3174,7 +3174,7 @@ mod tests {
         assert_eq!(initial_phase, RecoveryPhase::InflightRestore);
         conn.execute(
             "INSERT INTO recovery_phase_roundtrip (id, state) VALUES (?1, ?2)",
-            rusqlite::params!["phase-1", initial_phase.as_str()],
+            sqlite_test::params!["phase-1", initial_phase.as_str()],
         )
         .expect("initial recovery phase should be inserted");
 
@@ -3198,7 +3198,7 @@ mod tests {
         assert_eq!(next_phase, RecoveryPhase::Pending);
         conn.execute(
             "UPDATE recovery_phase_roundtrip SET state = ?1 WHERE id = ?2",
-            rusqlite::params![next_phase.as_str(), "phase-1"],
+            sqlite_test::params![next_phase.as_str(), "phase-1"],
         )
         .expect("updated recovery phase should be written");
 

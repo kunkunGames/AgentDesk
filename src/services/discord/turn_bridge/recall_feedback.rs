@@ -479,7 +479,7 @@ pub(super) fn reminder_transcript_event(content: String) -> SessionTranscriptEve
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;

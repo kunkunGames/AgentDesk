@@ -30,7 +30,6 @@ src/
 │   ├── migrate/
 │   │   ├── apply.rs
 │   │   ├── plan.rs
-│   │   ├── postgres_cutover.rs
 │   │   ├── source.rs
 │   │   └── tests.rs
 │   ├── provider_cli/
@@ -403,6 +402,7 @@ src/
 ├── config.rs
 ├── credential.rs
 ├── error.rs
+├── high_risk_recovery.rs
 ├── integration_tests.rs
 ├── kanban.rs
 ├── launch.rs
@@ -444,6 +444,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |
 | `src/credential.rs` | Reads runtime credential files such as Discord bot tokens from the AgentDesk root. |
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
+| `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
 | `src/integration_tests.rs` | End-to-end pipeline, dispatch, review, and recovery integration test harness. |
 | `src/kanban.rs` | High-level kanban orchestration and transition entrypoints. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |

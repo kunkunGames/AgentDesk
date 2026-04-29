@@ -853,7 +853,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         token_hash: token_hash.clone(),
         provider: provider.clone(),
         api_port,
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         sqlite: None,
         pg_pool,
         engine,
@@ -1777,7 +1777,7 @@ async fn gc_stale_fixed_working_sessions(shared: &Arc<SharedData>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use poise::serenity_prelude::{MessageId, UserId};

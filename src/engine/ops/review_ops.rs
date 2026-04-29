@@ -1,7 +1,7 @@
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 use serde_json::json;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row as SqlxRow};
 
 pub(crate) const ADVANCE_REVIEW_ROUND_HINT_KEY: &str = "advance_review_round_on_next_review";
@@ -22,7 +22,7 @@ pub(super) fn register_review_ops<'js>(
             match pg_verdict.as_ref() {
                 Some(pool) => review_get_verdict_raw_pg(pool, &card_id),
                 None => {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                     if let Some(db) = db_verdict.as_ref() {
                         return review_get_verdict_raw_sqlite(db, &card_id);
                     }
@@ -43,7 +43,7 @@ pub(super) fn register_review_ops<'js>(
             match pg_entry.as_ref() {
                 Some(pool) => review_entry_context_raw_pg(pool, &card_id),
                 None => {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                     if let Some(db) = db_entry.as_ref() {
                         return review_entry_context_raw_sqlite(db, &card_id);
                     }
@@ -66,7 +66,7 @@ pub(super) fn register_review_ops<'js>(
                 match pg_record.as_ref() {
                     Some(pool) => review_record_entry_raw_pg(pool, &card_id, &opts_json),
                     None => {
-                        #[cfg(test)]
+                        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                         if let Some(db) = db_record.as_ref() {
                             return review_record_entry_raw_sqlite(db, &card_id, &opts_json);
                         }
@@ -88,7 +88,7 @@ pub(super) fn register_review_ops<'js>(
             match pg_active_work.as_ref() {
                 Some(pool) => review_has_active_work_raw_pg(pool, &card_id),
                 None => {
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                     if let Some(db) = db_active_work.as_ref() {
                         return review_has_active_work_raw_sqlite(db, &card_id);
                     }
@@ -158,7 +158,7 @@ fn metadata_requests_review_round_advance(metadata_raw: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_get_verdict_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     if card_id.trim().is_empty() {
         return json!({ "error": "review.getVerdict requires card_id" }).to_string();
@@ -225,7 +225,7 @@ fn review_get_verdict_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     result.unwrap_or_else(|error| json!({ "error": error }).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_entry_context_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     if card_id.trim().is_empty() {
         return json!({ "error": "review.entryContext requires card_id" }).to_string();
@@ -299,7 +299,7 @@ fn review_entry_context_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String 
     result.unwrap_or_else(|error| json!({ "error": error }).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_record_entry_raw_sqlite(db: &crate::db::Db, card_id: &str, opts_json: &str) -> String {
     if card_id.trim().is_empty() {
         return json!({ "error": "review.recordEntry requires card_id" }).to_string();
@@ -329,21 +329,21 @@ fn review_record_entry_raw_sqlite(db: &crate::db::Db, card_id: &str, opts_json: 
             (Some(round), Some(exclude)) => conn.execute(
                 "UPDATE kanban_cards SET review_round = ?1, updated_at = datetime('now')
                  WHERE id = ?2 AND status != ?3",
-                rusqlite::params![round, card_id, exclude],
+                sqlite_test::params![round, card_id, exclude],
             ),
             (Some(round), None) => conn.execute(
                 "UPDATE kanban_cards SET review_round = ?1, updated_at = datetime('now')
                  WHERE id = ?2",
-                rusqlite::params![round, card_id],
+                sqlite_test::params![round, card_id],
             ),
             (None, Some(exclude)) => conn.execute(
                 "UPDATE kanban_cards SET updated_at = datetime('now')
                  WHERE id = ?1 AND status != ?2",
-                rusqlite::params![card_id, exclude],
+                sqlite_test::params![card_id, exclude],
             ),
             (None, None) => conn.execute(
                 "UPDATE kanban_cards SET updated_at = datetime('now') WHERE id = ?1",
-                rusqlite::params![card_id],
+                sqlite_test::params![card_id],
             ),
         }
         .map_err(|error| format!("update sqlite review entry for {card_id}: {error}"))?;
@@ -361,7 +361,7 @@ fn review_record_entry_raw_sqlite(db: &crate::db::Db, card_id: &str, opts_json: 
     result.unwrap_or_else(|error| json!({ "error": error }).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_has_active_work_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     if card_id.trim().is_empty() {
         return json!({ "error": "review.hasActiveWork requires card_id" }).to_string();
@@ -386,9 +386,9 @@ fn review_has_active_work_raw_sqlite(db: &crate::db::Db, card_id: &str) -> Strin
     result.unwrap_or_else(|error| json!({ "error": error }).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_review_round_advance_hint_sqlite(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> Result<(), String> {
     let metadata_raw: Option<String> = conn
@@ -419,7 +419,7 @@ fn clear_review_round_advance_hint_sqlite(
     };
     conn.execute(
         "UPDATE kanban_cards SET metadata = ?1, updated_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![stored_metadata, card_id],
+        sqlite_test::params![stored_metadata, card_id],
     )
     .map_err(|error| format!("clear sqlite review hint metadata for {card_id}: {error}"))?;
     Ok(())

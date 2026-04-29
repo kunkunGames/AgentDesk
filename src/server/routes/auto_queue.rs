@@ -197,9 +197,9 @@ fn pg_unavailable_response() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn slot_thread_map_has_bindings(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
 ) -> bool {
@@ -208,7 +208,7 @@ fn slot_thread_map_has_bindings(
             "SELECT thread_id_map
              FROM auto_queue_slots
              WHERE agent_id = ?1 AND slot_index = ?2",
-            rusqlite::params![agent_id, slot_index],
+            sqlite_test::params![agent_id, slot_index],
             |row| row.get(0),
         )
         .ok()
@@ -229,9 +229,9 @@ fn slot_thread_map_has_bindings(
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn slot_has_dispatch_thread_history(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
 ) -> bool {
@@ -246,15 +246,15 @@ fn slot_has_dispatch_thread_history(
                      THEN NULL
                  ELSE CAST(json_extract(context, '$.slot_index') AS INTEGER)
                END = ?2",
-        rusqlite::params![agent_id, slot_index],
+        sqlite_test::params![agent_id, slot_index],
         |row| row.get(0),
     )
     .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn slot_requires_thread_reset_before_reuse(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     agent_id: &str,
     slot_index: i64,
     newly_assigned: bool,
@@ -1618,8 +1618,8 @@ impl ActivateCardState {
             )
     }
 
-    #[cfg(test)]
-    fn is_terminal(&self, conn: &rusqlite::Connection) -> bool {
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+    fn is_terminal(&self, conn: &sqlite_test::Connection) -> bool {
         crate::pipeline::ensure_loaded();
         crate::pipeline::resolve_for_card(
             conn,
@@ -1672,12 +1672,12 @@ struct RestoreDispatchAttemptResult {
     unbound_dispatch: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_activate_card_state(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     entry_id: &str,
-) -> rusqlite::Result<ActivateCardState> {
+) -> sqlite_test::Result<ActivateCardState> {
     let (status, title, metadata, latest_dispatch_id, repo_id, assigned_agent_id): (
         String,
         String,
@@ -7859,14 +7859,14 @@ pub async fn submit_order(
     submit_order_with_pg(&state, &run_id, &headers, &body, &pg_pool).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         GenerateCandidate, QueueEntryOrder, build_group_plan, extract_dependency_numbers,
         extract_dependency_parse_result, reorder_entry_ids,
         slot_requires_thread_reset_before_reuse,
     };
-    use rusqlite::Connection;
+    use sqlite_test::Connection;
     use std::collections::HashMap;
 
     fn entry(id: &str, status: &str, agent_id: &str) -> QueueEntryOrder {

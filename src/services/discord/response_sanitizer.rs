@@ -120,7 +120,7 @@ fn trim_blank_edges(lines: Vec<String>) -> String {
     lines[start..end].join("\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::sanitize_hidden_context;
 

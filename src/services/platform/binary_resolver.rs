@@ -887,7 +887,7 @@ fn record_context_launch_artifact(
     let _ = crate::services::provider_cli::io::save_launch_artifact(&root, &artifact);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::MutexGuard;

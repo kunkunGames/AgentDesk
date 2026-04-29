@@ -202,7 +202,7 @@ pub(crate) async fn cancel_live_dispatches_for_terminal_card_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::engine::transition::TransitionIntent;

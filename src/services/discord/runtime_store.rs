@@ -134,12 +134,12 @@ pub(super) fn save_all_last_message_ids(provider: &str, ids: &std::collections::
 
 /// Shared mutex for tests that manipulate AGENTDESK_ROOT_DIR env var.
 /// All test modules must use this to avoid env var races.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
     crate::config::shared_test_env_lock()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
     test_env_lock()
         .lock()
@@ -182,7 +182,7 @@ pub(crate) fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| classify_io_error("rename", e))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::fs;

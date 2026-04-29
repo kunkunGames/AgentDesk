@@ -355,7 +355,7 @@ fn pending_dispatch_row_to_json_pg(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider::CancelToken;

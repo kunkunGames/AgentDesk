@@ -375,7 +375,7 @@ where
     crate::utils::async_bridge::block_on_pg_result(pool, future_factory, |error| error)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

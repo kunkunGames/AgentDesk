@@ -310,7 +310,7 @@ pub fn git_mainline_issue_numbers(repo_dir: &str) -> Result<Vec<i64>, String> {
     Err(last_error.unwrap_or_else(|| "git log main failed".to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::git::test_support::setup_test_repo;

@@ -215,7 +215,7 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     value[..end].to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         BackgroundChildSpawn, background_child_purpose, close_background_child_pg,

@@ -52,7 +52,7 @@ use axum::{
 
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
 use crate::engine::PolicyEngine;
 use crate::error::{AppError, ErrorCode};
@@ -62,7 +62,7 @@ use crate::services::discord::health::HealthRegistry;
 ///
 #[derive(Clone)]
 pub struct AppState {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(crate) legacy_db_override: Option<Db>,
     pub pg_pool: Option<sqlx::PgPool>,
     pub engine: PolicyEngine,
@@ -74,7 +74,7 @@ pub struct AppState {
 
 impl AppState {
     /// Returns the optional legacy SQLite handle for test fixtures.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn legacy_db(&self) -> Option<&crate::db::Db> {
         self.legacy_db_override
             .as_ref()
@@ -116,7 +116,7 @@ pub(crate) fn log_deprecated_alias(old_path: &'static str, canonical_path: &'sta
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl AppState {
     pub fn test_state(db: Db, engine: PolicyEngine) -> Self {
         Self::test_state_with_config(db, engine, crate::config::Config::default())
@@ -158,7 +158,7 @@ impl AppState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn api_router(
     db: Db,
     engine: PolicyEngine,
@@ -187,7 +187,7 @@ pub fn api_router_with_pg(
     pg_pool: Option<sqlx::PgPool>,
 ) -> Router {
     let state = AppState {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         legacy_db_override: None,
         pg_pool,
         engine,
@@ -197,7 +197,7 @@ pub fn api_router_with_pg(
         health_registry,
     };
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     crate::services::discord::monitoring_status::spawn_expiry_sweeper(
         state::global_monitoring_store(),
         state.health_registry.clone(),
@@ -206,7 +206,7 @@ pub fn api_router_with_pg(
     compose_api_router(state.clone()).with_state(state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn api_router_with_pg_for_tests(
     db: Db,
     engine: PolicyEngine,
@@ -278,5 +278,5 @@ fn response_is_json(response: &Response) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod routes_tests;

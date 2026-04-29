@@ -85,7 +85,7 @@ pub fn queue_dispatch_followup_sync(
     queue_dispatch_followup(db, dispatch_id);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::db;

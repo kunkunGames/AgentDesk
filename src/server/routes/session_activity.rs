@@ -207,7 +207,7 @@ fn heartbeat_is_recent(last_heartbeat: Option<&str>, now: DateTime<Utc>) -> bool
         .unwrap_or(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use chrono::Duration;

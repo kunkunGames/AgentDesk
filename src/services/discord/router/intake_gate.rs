@@ -132,7 +132,7 @@ async fn enqueue_soft_intervention(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) async fn enqueue_soft_intervention_for_test(
     shared: &std::sync::Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -704,7 +704,7 @@ pub(in crate::services::discord) async fn handle_event(
             // message handling produces a bogus "No active session" error in DMs.
             if !text.is_empty() {
                 if try_handle_pending_dm_reply(
-                    data.shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     data.shared.pg_pool.as_ref(),
                     new_message,
                 )
@@ -1212,7 +1212,7 @@ pub(in crate::services::discord) async fn handle_event(
 
 use super::super::model_picker_interaction::handle_model_picker_interaction;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod direct_session_tests {
     use super::*;
 

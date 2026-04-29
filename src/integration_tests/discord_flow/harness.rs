@@ -17,7 +17,7 @@
 //!
 //! The harness owns its env-var overrides; dropping it clears them. The
 //! existing `crate::config::shared_test_env_lock()` mutex is held for the
-//! lifetime of the harness so we never race with other `#[cfg(test)]` code
+//! lifetime of the harness so we never race with other `#[cfg(all(test, feature = "legacy-sqlite-tests"))]` code
 //! that also mutates process-wide env vars.
 
 use std::ffi::OsString;

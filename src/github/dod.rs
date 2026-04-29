@@ -215,7 +215,7 @@ fn replace_dod_section(body: &str, items: &[DodItem]) -> String {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::github::test_utils::RecordingAdapter;

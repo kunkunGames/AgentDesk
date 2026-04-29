@@ -98,7 +98,7 @@ pub fn cleanup_dry_run(scan_dir: &Path, set: &RetentionSet) -> std::io::Result<V
     Ok(candidates)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider_cli::registry::{

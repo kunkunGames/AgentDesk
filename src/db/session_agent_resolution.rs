@@ -1,5 +1,5 @@
-#[cfg(test)]
-use rusqlite::Connection;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::Connection;
 use sqlx::{PgPool, Row as SqlxRow};
 
 use crate::db::agents::AgentChannelBindings;
@@ -44,7 +44,7 @@ fn normalize_nonempty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_known_agent_id(conn: &Connection, agent_id: Option<&str>) -> Option<String> {
     let agent_id = normalize_nonempty(agent_id)?;
     let exists = conn
@@ -69,7 +69,7 @@ async fn resolve_known_agent_id_pg(pool: &PgPool, agent_id: Option<&str>) -> Opt
     exists.then_some(agent_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_id_from_channel_name(conn: &Connection, channel_name: &str) -> Option<String> {
     if channel_name.is_empty() {
         return None;
@@ -164,7 +164,7 @@ async fn resolve_agent_id_from_channel_name_pg(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_id_from_dispatch_id(conn: &Connection, dispatch_id: &str) -> Option<String> {
     let agent_id: Option<String> = conn
         .query_row(
@@ -189,7 +189,7 @@ async fn resolve_agent_id_from_dispatch_id_pg(pool: &PgPool, dispatch_id: &str) 
     resolve_known_agent_id_pg(pool, agent_id.as_deref()).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_id_from_thread_channel_id(
     conn: &Connection,
     thread_channel_id: &str,
@@ -276,7 +276,7 @@ async fn resolve_agent_id_from_thread_channel_id_pg(
     resolve_known_agent_id_pg(pool, card_agent_id.as_deref()).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_session_context(
     conn: &Connection,
     session_key: &str,
@@ -314,7 +314,7 @@ async fn load_session_context_pg(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn resolve_agent_id_for_session(
     conn: &Connection,
     explicit_agent_id: Option<&str>,
@@ -462,7 +462,7 @@ pub(crate) async fn resolve_agent_id_for_session_pg(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::parse_channel_name_from_session_key;
     use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};

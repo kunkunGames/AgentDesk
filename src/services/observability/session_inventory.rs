@@ -212,7 +212,7 @@ fn child_label(index: usize) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

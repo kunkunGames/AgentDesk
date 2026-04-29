@@ -151,7 +151,7 @@ async fn list_termination_events_pg(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

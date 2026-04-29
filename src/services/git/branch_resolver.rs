@@ -122,7 +122,7 @@ pub fn git_merge_base(dir: &str, base_ref: &str, other_ref: &str) -> Option<Stri
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::git::commit_resolver::git_head_commit;

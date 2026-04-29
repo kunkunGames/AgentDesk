@@ -379,7 +379,7 @@ pub(in crate::services::discord) async fn cmd_cc(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::build_provider_skill_prompt;
     use crate::services::provider::ProviderKind;

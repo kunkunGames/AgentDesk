@@ -8,7 +8,7 @@ use crate::utils::format::expand_tilde_path;
 mod apply;
 mod plan;
 mod source;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests;
 
 use apply::apply_import_plan;

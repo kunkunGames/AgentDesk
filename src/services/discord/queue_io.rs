@@ -99,7 +99,7 @@ pub(super) fn schedule_deferred_idle_queue_kickoff(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::runtime_store::test_env_lock;

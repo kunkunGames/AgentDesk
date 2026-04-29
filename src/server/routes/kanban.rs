@@ -1599,8 +1599,8 @@ pub async fn assign_issue(
 
 // ── Helpers ────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(super) fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(super) fn card_row_to_json(row: &sqlite_test::Row) -> sqlite_test::Result<serde_json::Value> {
     let repo_id = row.get::<_, Option<String>>(1)?;
     let assigned_agent_id = row.get::<_, Option<String>>(5)?;
     let metadata_raw = row.get::<_, Option<String>>(10).unwrap_or(None);
@@ -2362,8 +2362,8 @@ pub struct RereviewBody {
     pub reason: Option<String>,
 }
 
-#[cfg(test)]
-fn find_active_review_dispatch_id(conn: &rusqlite::Connection, card_id: &str) -> Option<String> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn find_active_review_dispatch_id(conn: &sqlite_test::Connection, card_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT id FROM task_dispatches
          WHERE kanban_card_id = ?1
@@ -2439,9 +2439,9 @@ pub(super) fn require_explicit_bearer_token(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_id_from_channel_id_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     channel_id: &str,
 ) -> Option<String> {
     conn.query_row(
@@ -2477,9 +2477,9 @@ async fn resolve_agent_id_from_channel_id_with_pg(
     .and_then(|row| row.try_get::<String, _>("id").ok())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_requesting_agent_id_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     headers: &HeaderMap,
 ) -> Option<String> {
     if let Some(agent_id) = trimmed_header_value(headers, "x-agent-id") {
@@ -3428,9 +3428,9 @@ fn force_transition_needs_cleanup(target_status: &str, cancel_dispatches: Option
     matches!(target_status, "backlog" | "ready") && cancel_dispatches.unwrap_or(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn count_live_auto_queue_entries_for_card_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<usize> {
     let count: i64 = conn
@@ -3449,9 +3449,9 @@ fn count_live_auto_queue_entries_for_card_on_conn(
     Ok(count.max(0) as usize)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_force_transition_terminalized_links_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
@@ -3476,9 +3476,9 @@ fn clear_force_transition_terminalized_links_on_conn(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn cleanup_force_transition_revert_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     target_status: &str,
 ) -> anyhow::Result<(usize, usize)> {
@@ -3498,11 +3498,11 @@ fn cleanup_force_transition_revert_on_conn(
     Ok((cancelled_dispatches, skipped_auto_queue_entries))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn skip_live_auto_queue_entries_for_card_legacy(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
-) -> rusqlite::Result<usize> {
+) -> sqlite_test::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT id FROM auto_queue_entries
          WHERE kanban_card_id = ?1
@@ -3532,13 +3532,13 @@ fn skip_live_auto_queue_entries_for_card_legacy(
     Ok(changed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn move_auto_queue_entry_to_dispatched_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     entry_id: &str,
     trigger_source: &str,
     options: &crate::db::auto_queue::EntryStatusUpdateOptions,
-) -> rusqlite::Result<()> {
+) -> sqlite_test::Result<()> {
     conn.execute(
         "UPDATE auto_queue_entries
          SET status = 'dispatched',
@@ -3548,7 +3548,7 @@ fn move_auto_queue_entry_to_dispatched_on_conn(
              completed_at = NULL,
              updated_at = datetime('now')
          WHERE id = ?1 AND status IN ('pending', 'dispatched', 'done')",
-        rusqlite::params![entry_id, options.dispatch_id, options.slot_index],
+        sqlite_test::params![entry_id, options.dispatch_id, options.slot_index],
     )?;
     let _ = trigger_source;
     Ok(())
@@ -3596,9 +3596,9 @@ async fn reactivate_done_auto_queue_entries_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_card_metadata_map_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let metadata_raw: Option<String> = conn.query_row(
@@ -3638,9 +3638,9 @@ async fn load_card_metadata_map_pg(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn save_card_metadata_map_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     metadata: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -3652,7 +3652,7 @@ fn save_card_metadata_map_on_conn(
     } else {
         conn.execute(
             "UPDATE kanban_cards SET metadata = ?1 WHERE id = ?2",
-            rusqlite::params![serde_json::to_string(metadata)?, card_id],
+            sqlite_test::params![serde_json::to_string(metadata)?, card_id],
         )?;
     }
     Ok(())
@@ -3690,9 +3690,9 @@ async fn save_card_metadata_map_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn mark_api_reopen_skip_preflight_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3715,9 +3715,9 @@ async fn mark_api_reopen_skip_preflight_on_pg(
     save_card_metadata_map_pg(pool, card_id, &metadata).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_api_reopen_skip_preflight_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3734,9 +3734,9 @@ async fn clear_api_reopen_skip_preflight_on_pg(
     save_card_metadata_map_pg(pool, card_id, &metadata).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn consume_api_reopen_preflight_skip_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3793,9 +3793,9 @@ async fn consume_api_reopen_preflight_skip_on_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_reopen_preflight_cache_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -4006,7 +4006,7 @@ pub async fn force_transition(
 // ── #1065 param standardization tests ────────────────────────────────
 // UpdateCardBody canonical field is `assignee_agent_id` (snake_case).
 // Legacy `assigned_agent_id` still accepted via serde alias during migration.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod param_standardization_tests {
     use super::UpdateCardBody;
 

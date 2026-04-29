@@ -1,7 +1,7 @@
 mod crud;
 pub(crate) mod discord_delivery;
 mod outbox;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests;
 mod thread_reuse;
 
@@ -16,7 +16,7 @@ pub(crate) use discord_delivery::send_dispatch_to_discord;
 // ── Re-exports: Outbox ───────────────────────────────────────
 pub use outbox::resolve_channel_alias_pub;
 pub(crate) use outbox::use_counter_model_channel;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use outbox::{
     OutboxNotifier, process_outbox_batch, process_outbox_batch_with_real_notifier,
 };

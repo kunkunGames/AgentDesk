@@ -1497,7 +1497,7 @@ pub async fn emit_escalation(
     emit_escalation_with_base_url(&state, body, DISCORD_API_BASE).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use axum::{

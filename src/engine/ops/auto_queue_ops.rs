@@ -343,7 +343,7 @@ fn pause_run_raw(
     }
 
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = db {
             return update_run_status_raw_sqlite(db, run_id, "paused");
         }
@@ -379,7 +379,7 @@ fn resume_run_raw(
     }
 
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = db {
             return update_run_status_raw_sqlite(db, run_id, "active");
         }
@@ -430,7 +430,7 @@ fn complete_run_raw(
         .unwrap_or(false);
 
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = db {
             return update_run_status_raw_sqlite(db, run_id, "completed");
         }
@@ -460,7 +460,7 @@ fn complete_run_raw(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn update_run_status_raw_sqlite(db: &crate::db::Db, run_id: &str, status: &str) -> String {
     let result = db
         .separate_conn()
@@ -468,7 +468,7 @@ fn update_run_status_raw_sqlite(db: &crate::db::Db, run_id: &str, status: &str) 
         .and_then(|conn| {
             conn.execute(
                 "UPDATE auto_queue_runs SET status = ?1 WHERE id = ?2",
-                rusqlite::params![status, run_id],
+                sqlite_test::params![status, run_id],
             )
             .map_err(|error| format!("update sqlite auto-queue run {run_id}: {error}"))
         });
@@ -532,7 +532,7 @@ fn save_phase_gate_state_raw(
     };
 
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = db {
             return save_phase_gate_state_raw_sqlite(db, run_id, phase, &write);
         }
@@ -567,7 +567,7 @@ fn clear_phase_gate_state_raw(
     phase: i64,
 ) -> String {
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = db {
             return clear_phase_gate_state_raw_sqlite(db, run_id, phase);
         }
@@ -593,7 +593,7 @@ fn clear_phase_gate_state_raw(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn save_phase_gate_state_raw_sqlite(
     db: &crate::db::Db,
     run_id: &str,
@@ -619,7 +619,7 @@ fn save_phase_gate_state_raw_sqlite(
         let removed_stale_rows = conn
             .execute(
                 "DELETE FROM auto_queue_phase_gates WHERE run_id = ?1 AND phase = ?2",
-                rusqlite::params![run_id, phase],
+                sqlite_test::params![run_id, phase],
             )
             .map_err(|error| format!("delete sqlite phase gate rows for {run_id}: {error}"))?;
         let final_phase = if state.final_phase { 1 } else { 0 };
@@ -629,7 +629,7 @@ fn save_phase_gate_state_raw_sqlite(
                     run_id, phase, status, verdict, dispatch_id, pass_verdict,
                     next_phase, final_phase, anchor_card_id, failure_reason, created_at, updated_at
                  ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, datetime('now')), datetime('now'))",
-                rusqlite::params![
+                sqlite_test::params![
                     run_id,
                     phase,
                     state.status,
@@ -650,7 +650,7 @@ fn save_phase_gate_state_raw_sqlite(
                         run_id, phase, status, verdict, dispatch_id, pass_verdict,
                         next_phase, final_phase, anchor_card_id, failure_reason, created_at, updated_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE(?11, datetime('now')), datetime('now'))",
-                    rusqlite::params![
+                    sqlite_test::params![
                         run_id,
                         phase,
                         state.status,
@@ -681,7 +681,7 @@ fn save_phase_gate_state_raw_sqlite(
     result.unwrap_or_else(|error| serde_json::json!({ "error": error }).to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_phase_gate_state_raw_sqlite(db: &crate::db::Db, run_id: &str, phase: i64) -> String {
     let result = db
         .separate_conn()
@@ -689,7 +689,7 @@ fn clear_phase_gate_state_raw_sqlite(db: &crate::db::Db, run_id: &str, phase: i6
         .and_then(|conn| {
             conn.execute(
                 "DELETE FROM auto_queue_phase_gates WHERE run_id = ?1 AND phase = ?2",
-                rusqlite::params![run_id, phase],
+                sqlite_test::params![run_id, phase],
             )
             .map_err(|error| format!("clear sqlite phase gate rows for {run_id}: {error}"))
         });

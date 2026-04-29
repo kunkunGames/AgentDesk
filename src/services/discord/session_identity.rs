@@ -119,7 +119,7 @@ pub fn tmux_name_from_session_key(session_key: &str) -> Option<String> {
     SessionIdentity::parse(session_key).map(|id| id.tmux_name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

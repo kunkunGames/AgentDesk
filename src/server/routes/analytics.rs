@@ -106,7 +106,7 @@ fn prune_expired_analytics_cache_entries(cache: &mut HashMap<String, CachedJson>
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn reset_analytics_cache() {
     if let Ok(mut cache) = analytics_response_cache().lock() {
         cache.clear();
@@ -1467,7 +1467,7 @@ pub async fn skills_trend(
     build_analytics_response(&entry, "miss")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

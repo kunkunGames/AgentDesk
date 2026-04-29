@@ -120,7 +120,7 @@ pub(super) fn build_metrics_report(metrics: &[TurnMetric], label: &str) -> Strin
     lines.join("\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

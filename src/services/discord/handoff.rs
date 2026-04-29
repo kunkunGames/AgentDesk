@@ -197,7 +197,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

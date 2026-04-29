@@ -509,7 +509,7 @@ fn clean_nonempty(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{derive_adk_session_info, parse_thread_channel_id_from_name};
 

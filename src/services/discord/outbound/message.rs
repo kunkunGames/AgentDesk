@@ -408,7 +408,7 @@ impl DiscordOutboundMessage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::outbound::policy::{

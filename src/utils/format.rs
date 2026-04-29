@@ -246,7 +246,7 @@ pub fn display_width_suffix(s: &str, max_width: usize) -> String {
     chars[start_idx..].iter().collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

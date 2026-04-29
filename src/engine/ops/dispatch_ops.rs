@@ -11,10 +11,10 @@ use sqlx::{PgPool, Row as SqlxRow};
 
 pub(super) fn register_dispatch_ops<'js>(
     ctx: &Ctx<'js>,
-    #[cfg(test)] db: Option<Db>,
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))] db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let db: Option<Db> = None;
 
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
@@ -339,7 +339,7 @@ fn dispatch_create_raw(
     r#"{"error":"backend unavailable for dispatch.create in JS hook"}"#.to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn dispatch_create_raw_sqlite_test(
     db: &Db,
     card_id: &str,
@@ -399,7 +399,7 @@ fn dispatch_create_raw_sqlite_test(
                      SET state = 'suggestion_pending',
                          pending_dispatch_id = excluded.pending_dispatch_id,
                          updated_at = datetime('now')",
-                    rusqlite::params![card_id, dispatch_id],
+                    sqlite_test::params![card_id, dispatch_id],
                 ) {
                     return format!(r#"{{"error":"{}"}}"#, error.to_string().replace('"', "'"));
                 }
@@ -415,7 +415,7 @@ fn dispatch_create_raw_sqlite_test(
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn dispatch_create_raw_sqlite_test(
     _db: &Db,
     _card_id: &str,
@@ -451,7 +451,7 @@ fn dispatch_has_active_work_raw_pg(pool: &PgPool, card_id: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn dispatch_has_active_work_raw_sqlite_test(db: &Db, card_id: &str) -> String {
     let conn = match db.separate_conn() {
         Ok(conn) => conn,
@@ -473,7 +473,7 @@ fn dispatch_has_active_work_raw_sqlite_test(db: &Db, card_id: &str) -> String {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn dispatch_has_active_work_raw_sqlite_test(_db: &Db, _card_id: &str) -> String {
     r#"{"error":"sqlite backend is unavailable for dispatch.hasActiveWork in production"}"#
         .to_string()
@@ -501,7 +501,7 @@ fn dispatch_set_retry_count_raw_pg(pool: &PgPool, dispatch_id: &str, count: i32)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn dispatch_set_retry_count_raw_sqlite_test(db: &Db, dispatch_id: &str, count: i32) -> String {
     let conn = match db.separate_conn() {
         Ok(conn) => conn,
@@ -511,14 +511,14 @@ fn dispatch_set_retry_count_raw_sqlite_test(db: &Db, dispatch_id: &str, count: i
     };
     match conn.execute(
         "UPDATE task_dispatches SET retry_count = ?1 WHERE id = ?2",
-        rusqlite::params![count, dispatch_id],
+        sqlite_test::params![count, dispatch_id],
     ) {
         Ok(rows_affected) => format!(r#"{{"ok":true,"rows_affected":{rows_affected}}}"#),
         Err(error) => format!(r#"{{"error":"{}"}}"#, error.to_string().replace('"', "'")),
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn dispatch_set_retry_count_raw_sqlite_test(_db: &Db, _dispatch_id: &str, _count: i32) -> String {
     r#"{"error":"sqlite backend is unavailable for dispatch.setRetryCount in production"}"#
         .to_string()
@@ -716,7 +716,7 @@ fn dispatch_set_status_raw_pg(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn dispatch_set_status_raw_sqlite_test(
     db: &Db,
     dispatch_id: &str,
@@ -745,7 +745,7 @@ fn dispatch_set_status_raw_sqlite_test(
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn dispatch_set_status_raw_sqlite_test(
     _db: &Db,
     _dispatch_id: &str,

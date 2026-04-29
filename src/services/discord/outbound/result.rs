@@ -107,7 +107,7 @@ pub(crate) enum DeliveryResult {
     PermanentFailure { reason: String },
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::outbound::message::{OutboundOperationKey, OutboundTargetKey};

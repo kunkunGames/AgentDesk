@@ -1530,7 +1530,7 @@ fn send_error(sender: &Sender<StreamMessage>, message: String) -> Result<(), Str
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::mpsc;

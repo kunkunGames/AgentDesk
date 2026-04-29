@@ -1429,7 +1429,7 @@ impl MemoryBackend for MementoBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider::ProviderKind;

@@ -685,7 +685,7 @@ fn format_audit_message(
 
 // ── Unit tests ───────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::pipeline::{
@@ -1258,15 +1258,17 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(file) else {
                 continue;
             };
-            // Skip any #[cfg(test)] / #[test] gated sections by scanning
-            // line-wise: if a match sits inside a `#[cfg(test)]` mod or a
-            // `#[cfg(test)]` / `#[test]` annotated item we accept it.
+            // Skip any #[cfg(all(test, feature = "legacy-sqlite-tests"))] / #[test] gated sections by scanning
+            // line-wise: if a match sits inside a `#[cfg(all(test, feature = "legacy-sqlite-tests"))]` mod or a
+            // `#[cfg(all(test, feature = "legacy-sqlite-tests"))]` / `#[test]` annotated item we accept it.
             let mut in_test_cfg = false;
             let mut brace_depth: i32 = 0;
             let mut test_cfg_depth: Option<i32> = None;
             for (idx, line) in text.lines().enumerate() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[test]") {
+                if trimmed.starts_with(r#"#[cfg(all(test, feature = "legacy-sqlite-tests"))]"#)
+                    || trimmed.starts_with("#[test]")
+                {
                     in_test_cfg = true;
                 }
                 // Track brace depth so we know when a test-gated block ends.

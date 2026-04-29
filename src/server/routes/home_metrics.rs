@@ -350,7 +350,7 @@ fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

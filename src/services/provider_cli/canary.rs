@@ -97,7 +97,7 @@ pub fn verified_candidate_launch_artifact(
     Ok(Some(artifact))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

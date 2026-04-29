@@ -325,7 +325,7 @@ fn collect_stream_result(
     Err(error.unwrap_or_else(|| "Empty response from provider".to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::fs;

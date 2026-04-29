@@ -5,6 +5,9 @@ edition = "2024"
 description = "AI agent orchestration platform"
 license = "MIT"
 
+[features]
+legacy-sqlite-tests = ["dep:sqlite_test"]
+
 [dependencies]
 # HTTP server
 axum = { version = "0.8", features = ["ws", "macros"] }
@@ -67,8 +70,9 @@ hex = "0.4"
 rand = "0.8"
 libc = "0.2"
 
+sqlite_test = { package = "rusqlite", version = "0.32", features = ["bundled"], optional = true }
+
 [dev-dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 

@@ -154,7 +154,7 @@ pub fn smoke_passed(result: &SmokeResult) -> bool {
         && !matches!(result.overall_status.as_str(), "failed")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

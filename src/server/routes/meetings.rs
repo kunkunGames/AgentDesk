@@ -1683,7 +1683,7 @@ async fn upsert_kv_meta_pg(pool: &PgPool, key: &str, value: &str) -> Result<(), 
     .map(|_| ())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::db::Db;

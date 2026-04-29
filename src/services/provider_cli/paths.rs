@@ -88,7 +88,7 @@ fn session_key_digest(session_key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

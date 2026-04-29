@@ -749,7 +749,7 @@ pub(super) async fn try_reuse_thread(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::{

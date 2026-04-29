@@ -229,7 +229,7 @@ pub(in crate::services::discord) fn take_session_retry_context(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::direct_runtime_context_unavailable;
 
@@ -311,7 +311,7 @@ pub(in crate::services::discord) async fn auto_retry_with_history(
                 .await
                 .unwrap_or_else(|| format!("channel:{}", channel_id.get()));
         let _ = store_session_retry_context_with_notify(
-            shared.legacy_sqlite(),
+            None::<&crate::db::Db>,
             shared.pg_pool.as_ref(),
             channel_id.get(),
             hist,

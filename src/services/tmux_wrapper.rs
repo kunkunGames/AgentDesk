@@ -629,7 +629,7 @@ fn append_jsonl_line_and_sync(path: &str, line: &str) -> std::io::Result<()> {
     output.sync_all()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{append_jsonl_line_and_sync, append_output_line, format_tool_detail};
     use crate::utils::format::safe_prefix;

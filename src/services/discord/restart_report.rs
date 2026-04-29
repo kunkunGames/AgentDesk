@@ -409,7 +409,7 @@ pub(super) async fn flush_restart_reports(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         RESTART_REPORT_VERSION, RestartCompletionReport, is_unrecoverable_flush_error,

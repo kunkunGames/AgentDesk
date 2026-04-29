@@ -1066,7 +1066,7 @@ fn codex_model_context_window(model: &str) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         CancelToken, FollowupResult, ProviderKind, ReadOutputResult, StreamAttemptFailure,

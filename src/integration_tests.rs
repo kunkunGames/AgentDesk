@@ -2,7 +2,7 @@
 //!
 //! These tests verify pipeline correctness end-to-end before #106 data-driven transition.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::ffi::OsString;
     use std::fs;

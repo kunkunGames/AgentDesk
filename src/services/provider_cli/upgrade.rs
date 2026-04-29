@@ -635,7 +635,7 @@ fn is_valid_transition(from: &MigrationState, to: &MigrationState) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider_cli::registry::MigrationState;

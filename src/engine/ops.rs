@@ -28,21 +28,21 @@ mod runtime_ops;
 pub(crate) use db_ops::execute_policy_sql;
 pub(crate) use review_ops::{ADVANCE_REVIEW_ROUND_HINT_KEY, ensure_js_error_json};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
 use crate::supervisor::BridgeHandle;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
 
 /// Register all `agentdesk.*` globals in the given JS context.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn register_globals(ctx: &Ctx<'_>, db: Db) -> JsResult<()> {
     register_globals_with_test_backends(ctx, Some(db), None, BridgeHandle::new())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(dead_code)]
 pub fn register_globals_with_supervisor(
     ctx: &Ctx<'_>,
@@ -57,18 +57,18 @@ pub fn register_globals_with_supervisor_and_pg(
     pg_pool: Option<sqlx::PgPool>,
     supervisor_bridge: BridgeHandle,
 ) -> JsResult<()> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         register_globals_with_test_backends(ctx, None, pg_pool, supervisor_bridge)
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     {
         register_globals_pg_only(ctx, pg_pool, supervisor_bridge)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn register_globals_with_supervisor_and_test_backends(
     ctx: &Ctx<'_>,
     db: Option<Db>,
@@ -78,7 +78,7 @@ pub(crate) fn register_globals_with_supervisor_and_test_backends(
     register_globals_with_test_backends(ctx, db, pg_pool, supervisor_bridge)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn register_globals_with_test_backends(
     ctx: &Ctx<'_>,
     db: Option<Db>,
@@ -178,7 +178,7 @@ fn register_globals_with_test_backends(
     Ok(())
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn register_globals_pg_only(
     ctx: &Ctx<'_>,
     pg_pool: Option<sqlx::PgPool>,
@@ -228,7 +228,7 @@ fn register_globals_pg_only(
 
 /// Test-only wrapper for card_review_state sync (#158).
 /// PG-backed tests should pass a pool through `review_state_sync_with_backends`.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn review_state_sync(db: &Db, json_str: &str) -> String {
     review_state_sync_with_backends(Some(db), None, json_str)
 }

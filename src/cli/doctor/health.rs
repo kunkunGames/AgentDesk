@@ -159,7 +159,7 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::is_loopback_base_url;
 

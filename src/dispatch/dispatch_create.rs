@@ -3,7 +3,7 @@ use serde_json::json;
 use sqlx::{PgPool, Postgres, Row as SqlxRow};
 
 use crate::db::Db;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::agents::{
     resolve_agent_channel_for_provider_on_conn, resolve_agent_dispatch_channel_on_conn,
 };
@@ -19,20 +19,20 @@ use super::dispatch_context::{
     inject_review_dispatch_identifiers, json_string_field, resolve_card_target_repo_ref,
     resolve_card_worktree, resolve_parent_dispatch_context,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use super::dispatch_context::{
     build_review_context_sqlite_test, inject_review_dispatch_identifiers_sqlite_test,
     resolve_card_target_repo_ref_sqlite_test, resolve_card_worktree_sqlite_test,
     resolve_parent_dispatch_context_sqlite_test,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use super::dispatch_status::{
     ensure_dispatch_notify_outbox_on_conn, record_dispatch_status_event_on_conn,
 };
 use super::{
     DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx, summarize_dispatch_result,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use super::{cancel_dispatch_and_reset_auto_queue_on_conn, query_dispatch_row};
 
 fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
@@ -74,9 +74,9 @@ fn inject_work_dispatch_baseline_commit(dispatch_type: &str, context: &mut serde
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_existing_thread_for_channel(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     channel_id: u64,
 ) -> Result<Option<String>> {
@@ -183,9 +183,9 @@ async fn load_existing_thread_for_channel_pg(
     Ok(active_thread_id.filter(|value| !value.trim().is_empty()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn lookup_active_dispatch_id(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     dispatch_type: &str,
 ) -> Option<String> {
@@ -194,7 +194,7 @@ fn lookup_active_dispatch_id(
          WHERE kanban_card_id = ?1 AND dispatch_type = ?2 \
          AND status IN ('pending', 'dispatched') \
          ORDER BY rowid DESC LIMIT 1",
-        rusqlite::params![card_id, dispatch_type],
+        sqlite_test::params![card_id, dispatch_type],
         |row| row.get(0),
     )
     .ok()
@@ -222,11 +222,11 @@ async fn lookup_active_dispatch_id_pg(
     .flatten()
 }
 
-#[cfg(test)]
-fn is_single_active_dispatch_violation(error: &rusqlite::Error) -> bool {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn is_single_active_dispatch_violation(error: &sqlite_test::Error) -> bool {
     matches!(
         error,
-        rusqlite::Error::SqliteFailure(_, Some(message))
+        sqlite_test::Error::SqliteFailure(_, Some(message))
             if message.contains("UNIQUE constraint failed")
                 && message.contains("task_dispatches.kanban_card_id")
     )
@@ -249,9 +249,9 @@ fn is_single_active_dispatch_violation_pg(error: &sqlx::Error) -> bool {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn validate_dispatch_target_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_type: &str,
@@ -770,7 +770,7 @@ pub async fn create_dispatch_core_with_id_and_options(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_record_sqlite_test(
     db: &Db,
@@ -794,7 +794,7 @@ pub(crate) fn create_dispatch_record_sqlite_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_record_with_id_sqlite_test(
     db: &Db,
@@ -1163,7 +1163,7 @@ pub fn create_dispatch_with_options(
         );
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         return create_dispatch_with_options_sqlite_test(
             db,
@@ -1176,7 +1176,7 @@ pub fn create_dispatch_with_options(
             options,
         );
     }
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     {
         Err(anyhow::anyhow!(
             "Postgres pool required for create_dispatch_with_options"
@@ -1234,7 +1234,7 @@ pub fn create_dispatch_with_options_pg_only(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(clippy::too_many_arguments)]
 fn create_dispatch_with_options_sqlite_test(
     db: &Db,
@@ -1296,10 +1296,10 @@ fn create_dispatch_with_options_sqlite_test(
 /// Production callers use the PG helpers (`apply_dispatch_attached_intents_pg`
 /// / `apply_dispatch_attached_intents_on_pg_tx`). This wrapper remains only
 /// for sqlite-backed test fixtures.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(clippy::too_many_arguments)]
 fn apply_dispatch_attached_intents(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_id: &str,
@@ -1650,10 +1650,10 @@ pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
 /// Production transactional callers use `apply_dispatch_attached_intents_on_pg_tx`.
 /// This exists only for sqlite-backed test fixtures that still exercise the
 /// old connection-local transition plumbing.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(clippy::too_many_arguments)]
 fn apply_dispatch_attached_intents_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     to_agent_id: &str,
     dispatch_id: &str,
@@ -1719,7 +1719,7 @@ fn apply_dispatch_attached_intents_on_conn(
             parent_dispatch_id, chain_depth, created_at, updated_at
         )
          VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
-        rusqlite::params![
+        sqlite_test::params![
             dispatch_id,
             card_id,
             to_agent_id,
@@ -1762,9 +1762,9 @@ fn apply_dispatch_attached_intents_on_conn(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn apply_sqlite_transition_intent_for_tests(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     intent: &crate::engine::transition::TransitionIntent,
 ) -> Result<()> {
     use crate::engine::transition::TransitionIntent;
@@ -1773,7 +1773,7 @@ fn apply_sqlite_transition_intent_for_tests(
         TransitionIntent::UpdateStatus { card_id, to, .. } => {
             conn.execute(
                 "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![to, card_id],
+                sqlite_test::params![to, card_id],
             )?;
         }
         TransitionIntent::SetLatestDispatchId {
@@ -1782,7 +1782,7 @@ fn apply_sqlite_transition_intent_for_tests(
         } => {
             conn.execute(
                 "UPDATE kanban_cards SET latest_dispatch_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![dispatch_id, card_id],
+                sqlite_test::params![dispatch_id, card_id],
             )?;
         }
         TransitionIntent::SetReviewStatus {
@@ -1791,7 +1791,7 @@ fn apply_sqlite_transition_intent_for_tests(
         } => {
             conn.execute(
                 "UPDATE kanban_cards SET review_status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![review_status, card_id],
+                sqlite_test::params![review_status, card_id],
             )?;
         }
         TransitionIntent::ApplyClock { card_id, clock, .. } => {
@@ -1837,7 +1837,7 @@ fn apply_sqlite_transition_intent_for_tests(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::apply_dispatch_attached_intents_on_pg_tx;
     use super::create_dispatch_core_with_id_and_options as create_dispatch_core_with_id_and_options_async;
@@ -2102,13 +2102,13 @@ mod tests {
         conn.execute(
             "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
              VALUES (?1, ?2, '111', '222')",
-            rusqlite::params![agent_id, format!("Agent {agent_id}")],
+            sqlite_test::params![agent_id, format!("Agent {agent_id}")],
         )
         .expect("seed sqlite agent");
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
              VALUES (?1, 'Test Card', ?2, ?3)",
-            rusqlite::params![card_id, status, agent_id],
+            sqlite_test::params![card_id, status, agent_id],
         )
         .expect("seed sqlite card");
     }
@@ -2126,13 +2126,13 @@ mod tests {
                 id, name, provider, discord_channel_id, discord_channel_alt,
                 discord_channel_cc, discord_channel_cdx
              ) VALUES (?1, ?2, ?3, '111', '222', '111', '222')",
-            rusqlite::params![agent_id, format!("Agent {agent_id}"), provider],
+            sqlite_test::params![agent_id, format!("Agent {agent_id}"), provider],
         )
         .expect("seed sqlite provider agent");
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
              VALUES (?1, 'Test Card', ?2, ?3)",
-            rusqlite::params![card_id, status, agent_id],
+            sqlite_test::params![card_id, status, agent_id],
         )
         .expect("seed sqlite card");
     }

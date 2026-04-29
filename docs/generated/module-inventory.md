@@ -4,14 +4,14 @@
 
 - Production Rust modules: `345`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `85`
+- Giant files: `84`
 
 ## Namespace Summary
 
 | Namespace | Modules |
 | --- | ---: |
 | `bootstrap` | 1 |
-| `cli` | 22 |
+| `cli` | 21 |
 | `compat` | 3 |
 | `config` | 1 |
 | `crate` | 1 |
@@ -21,6 +21,7 @@
 | `engine` | 28 |
 | `error` | 1 |
 | `github` | 4 |
+| `high_risk_recovery` | 1 |
 | `integration_tests` | 6 |
 | `kanban` | 1 |
 | `launch` | 1 |
@@ -58,7 +59,6 @@
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
 | `cli::migrate::apply` | `src/cli/migrate/apply.rs` | 3142 | giant-file |
 | `cli::migrate::plan` | `src/cli/migrate/plan.rs` | 1513 | giant-file |
-| `cli::migrate::postgres_cutover` | `src/cli/migrate/postgres_cutover.rs` | 7675 | giant-file |
 | `cli::migrate::source` | `src/cli/migrate/source.rs` | 1612 | giant-file |
 | `cli::monitoring` | `src/cli/monitoring.rs` | 141 |  |
 | `cli::provider_cli` | `src/cli/provider_cli/mod.rs` | 1701 | giant-file |
@@ -68,7 +68,7 @@
 | `compat::deprecated_alias` | `src/compat/deprecated_alias.rs` | 28 |  |
 | `compat::legacy_tmp_paths` | `src/compat/legacy_tmp_paths.rs` | 23 |  |
 | `config` | `src/config.rs` | 2236 | giant-file |
-| `crate` | `src/main.rs` | 43 |  |
+| `crate` | `src/main.rs` | 45 |  |
 | `credential` | `src/credential.rs` | 24 |  |
 | `db` | `src/db/mod.rs` | 337 |  |
 | `db::agents` | `src/db/agents.rs` | 1125 | giant-file |
@@ -84,11 +84,11 @@
 | `db::session_transcripts` | `src/db/session_transcripts.rs` | 877 |  |
 | `db::table_metadata` | `src/db/table_metadata.rs` | 231 |  |
 | `db::turns` | `src/db/turns.rs` | 166 |  |
-| `dispatch` | `src/dispatch/mod.rs` | 4871 | giant-file |
+| `dispatch` | `src/dispatch/mod.rs` | 4875 | giant-file |
 | `dispatch::dispatch_channel` | `src/dispatch/dispatch_channel.rs` | 43 |  |
 | `dispatch::dispatch_context` | `src/dispatch/dispatch_context.rs` | 3913 | giant-file |
 | `dispatch::dispatch_create` | `src/dispatch/dispatch_create.rs` | 2737 | giant-file |
-| `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 1825 | giant-file |
+| `dispatch::dispatch_status` | `src/dispatch/dispatch_status.rs` | 1828 | giant-file |
 | `engine` | `src/engine/mod.rs` | 2590 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 |  |
 | `engine::intent` | `src/engine/intent.rs` | 873 |  |
@@ -99,7 +99,7 @@
 | `engine::ops::cards_ops` | `src/engine/ops/cards_ops.rs` | 718 |  |
 | `engine::ops::ci_recovery_ops` | `src/engine/ops/ci_recovery_ops.rs` | 270 |  |
 | `engine::ops::config_ops` | `src/engine/ops/config_ops.rs` | 90 |  |
-| `engine::ops::db_ops` | `src/engine/ops/db_ops.rs` | 1193 | giant-file |
+| `engine::ops::db_ops` | `src/engine/ops/db_ops.rs` | 1195 | giant-file |
 | `engine::ops::dispatch_ops` | `src/engine/ops/dispatch_ops.rs` | 759 |  |
 | `engine::ops::dm_reply_ops` | `src/engine/ops/dm_reply_ops.rs` | 534 |  |
 | `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 399 |  |
@@ -115,13 +115,14 @@
 | `engine::ops::review_ops` | `src/engine/ops/review_ops.rs` | 718 |  |
 | `engine::ops::runtime_ops` | `src/engine/ops/runtime_ops.rs` | 258 |  |
 | `engine::sql_guard` | `src/engine/sql_guard.rs` | 230 |  |
-| `engine::transition` | `src/engine/transition.rs` | 1307 | giant-file |
+| `engine::transition` | `src/engine/transition.rs` | 1309 | giant-file |
 | `engine::transition_executor_pg` | `src/engine/transition_executor_pg.rs` | 690 |  |
 | `error` | `src/error.rs` | 188 |  |
 | `github` | `src/github/mod.rs` | 869 |  |
 | `github::dod` | `src/github/dod.rs` | 395 |  |
 | `github::sync` | `src/github/sync.rs` | 1059 | giant-file |
 | `github::triage` | `src/github/triage.rs` | 159 |  |
+| `high_risk_recovery` | `src/high_risk_recovery.rs` | 368 |  |
 | `integration_tests::agents_setup_e2e` | `src/integration_tests/agents_setup_e2e.rs` | 651 |  |
 | `integration_tests::discord_flow` | `src/integration_tests/discord_flow/mod.rs` | 46 |  |
 | `integration_tests::discord_flow::harness` | `src/integration_tests/discord_flow/harness.rs` | 265 |  |
@@ -218,7 +219,7 @@
 | `services::claude` | `src/services/claude.rs` | 2477 | giant-file |
 | `services::codex` | `src/services/codex.rs` | 1665 | giant-file |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 667 |  |
-| `services::discord` | `src/services/discord/mod.rs` | 5529 | giant-file |
+| `services::discord` | `src/services/discord/mod.rs` | 5519 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 723 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1166 | giant-file |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 97 |  |

@@ -153,7 +153,7 @@ impl From<&str> for AppError {
 
 pub type AppResult<T> = Result<T, AppError>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

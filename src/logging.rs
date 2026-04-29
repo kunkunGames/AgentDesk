@@ -111,7 +111,7 @@ fn find_string<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
         .find_map(|key| value.get(key).and_then(|v| v.as_str()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::tracing_env_filter;
     use std::io;

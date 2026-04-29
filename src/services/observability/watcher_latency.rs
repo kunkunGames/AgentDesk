@@ -191,7 +191,7 @@ impl WatcherLatencyMetrics {
 
     /// Force a sweep at `now`. Test-only escape hatch used by unit tests to
     /// deterministically advance the timeout window without sleeping.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     fn sweep_at(&self, now: Instant) {
         // Bypass the throttle for tests.
         if let Ok(mut h) = self.histogram.lock() {
@@ -238,7 +238,7 @@ impl WatcherLatencyMetrics {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn reset(&self) {
         self.pending.clear();
         self.attach_total.store(0, Ordering::Relaxed);
@@ -300,12 +300,12 @@ pub fn snapshot() -> WatcherLatencySnapshot {
     global().snapshot()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn reset_for_tests() {
     global().reset();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

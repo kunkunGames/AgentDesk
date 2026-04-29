@@ -100,7 +100,7 @@ fn save_runtime_bot_settings_checked(
     token: &str,
     settings: &DiscordBotSettings,
 ) -> std::io::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if force_runtime_settings_write_failure_for_tests() {
         return Err(std::io::Error::other(
             "forced runtime bot settings write failure for tests",
@@ -341,16 +341,16 @@ pub(crate) fn save_bot_settings(token: &str, settings: &DiscordBotSettings) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 static FORCE_RUNTIME_SETTINGS_WRITE_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn force_runtime_settings_write_failure_for_tests() -> bool {
     FORCE_RUNTIME_SETTINGS_WRITE_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn set_force_runtime_settings_write_failure_for_tests(enabled: bool) {
     FORCE_RUNTIME_SETTINGS_WRITE_FAILURE.store(enabled, std::sync::atomic::Ordering::SeqCst);
 }

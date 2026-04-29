@@ -133,7 +133,7 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
     Some(matches[best_idx].clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::git::test_support::setup_test_repo;

@@ -12,8 +12,8 @@ use crate::db::agents::{
     resolve_agent_primary_channel_pg,
 };
 use crate::dispatch::dispatch_destination_provider_override;
-#[cfg(test)]
-use rusqlite::OptionalExtension;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::{PgPool, Row as SqlxRow};
 use std::sync::OnceLock;
 
@@ -1739,7 +1739,7 @@ async fn resolve_agent_channel_with_provider_override_pg(
         .map_err(|error| format!("resolve postgres dispatch channel for {agent_id}: {error}"))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     _conn: &T,
     _agent_id: &str,
@@ -1750,9 +1750,9 @@ pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_dispatch_delivery_channel_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     agent_id: &str,
     card_id: &str,
     dispatch_type: Option<&str>,
@@ -1786,9 +1786,9 @@ pub(super) fn resolve_dispatch_delivery_channel_on_conn(
         .map_err(|error| format!("resolve sqlite dispatch channel for {agent_id}: {error}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn latest_completed_review_provider_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> Result<Option<String>, String> {
     let context: Option<String> = conn
@@ -3123,7 +3123,7 @@ fn review_followup_deduper() -> &'static crate::services::discord::outbound::Out
     DEDUPER.get_or_init(crate::services::discord::outbound::OutboundDeduper::new)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use axum::{

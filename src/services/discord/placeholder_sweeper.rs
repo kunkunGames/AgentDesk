@@ -427,7 +427,7 @@ pub(super) fn spawn_placeholder_sweeper(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

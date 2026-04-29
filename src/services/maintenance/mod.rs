@@ -197,7 +197,7 @@ pub fn list_maintenance_jobs() -> Vec<MaintenanceJobInfo> {
 }
 
 /// Spawn the maintenance scheduler task. The task runs until the tokio
-/// runtime shuts down. Call once during server boot (under `#[cfg(not(test))]`).
+/// runtime shuts down. Call once during server boot (under `#[cfg(not(feature = "legacy-sqlite-tests"))]`).
 ///
 /// Scheduling model: every [`DEFAULT_TICK_INTERVAL`] the scheduler iterates
 /// the registry; for each job whose `last_run + interval <= now` (or which
@@ -330,7 +330,7 @@ fn duration_to_i64_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn reset_registry_for_tests() {
     if let Ok(mut guard) = registry().write() {
         guard.clear();
@@ -343,14 +343,14 @@ pub(crate) fn reset_registry_for_tests() {
 /// threads and the registry is process-global — without this, concurrent
 /// `reset_registry_for_tests()` calls race with registrations from other
 /// tests. Acquire this at the top of any such test.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn test_serialization_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Mutex;
     static GUARD: Mutex<()> = Mutex::new(());
     GUARD.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

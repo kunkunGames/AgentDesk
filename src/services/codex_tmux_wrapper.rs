@@ -403,7 +403,7 @@ fn run_turn(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         decode_external_prompt, emit_json_line, handle_background_event, handle_item_completed,

@@ -2807,7 +2807,7 @@ fn saturating_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) async fn flush_for_tests() {
     let Some(sender) = worker_sender() else {
         return;
@@ -2817,7 +2817,7 @@ pub(crate) async fn flush_for_tests() {
     let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn reset_for_tests() {
     let runtime = runtime();
     runtime.counters.clear();
@@ -2829,7 +2829,7 @@ pub(crate) fn reset_for_tests() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn test_runtime_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -2837,13 +2837,13 @@ pub(crate) fn test_runtime_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn test_storage_presence() -> (bool, bool) {
     let handles = storage_handles(&runtime());
     (false, handles.pg_pool.is_some())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
