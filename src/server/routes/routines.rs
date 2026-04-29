@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
@@ -51,6 +52,8 @@ pub struct AttachRoutineBody {
     pub schedule: Option<String>,
     pub next_due_at: Option<DateTime<Utc>>,
     pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +66,10 @@ pub struct PatchRoutineBody {
     next_due_at: PatchField<Option<DateTime<Utc>>>,
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     checkpoint: PatchField<Option<Value>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    discord_thread_id: PatchField<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    timeout_secs: PatchField<Option<i32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +121,8 @@ impl PatchRoutineBody {
             schedule: self.schedule.into_option(),
             next_due_at: self.next_due_at.into_option(),
             checkpoint: self.checkpoint.into_option(),
+            discord_thread_id: self.discord_thread_id.into_option(),
+            timeout_secs: self.timeout_secs.into_option(),
         }
     }
 }
@@ -230,6 +239,7 @@ pub async fn attach_routine(
         .unwrap_or_else(|| "fresh".to_string());
     validate_execution_strategy_request(&execution_strategy)?;
     validate_schedule_request(body.schedule.as_deref())?;
+    validate_timeout_request(body.timeout_secs)?;
     let routine = store
         .attach_routine(NewRoutine {
             agent_id: body.agent_id,
@@ -239,6 +249,8 @@ pub async fn attach_routine(
             schedule: body.schedule,
             next_due_at: body.next_due_at,
             checkpoint: body.checkpoint,
+            discord_thread_id: body.discord_thread_id,
+            timeout_secs: body.timeout_secs,
         })
         .await
         .map_err(store_error)?;
@@ -262,6 +274,9 @@ pub async fn patch_routine(
     }
     if let Some(Some(schedule)) = body.schedule.as_present() {
         validate_schedule_request(Some(schedule))?;
+    }
+    if let Some(timeout_secs) = body.timeout_secs.as_present().copied().flatten() {
+        validate_timeout_request(Some(timeout_secs))?;
     }
     let patch = body.into_patch();
     let Some(routine) = store
@@ -511,7 +526,10 @@ fn routine_store(state: &AppState) -> AppResult<RoutineStore> {
             "postgres pool unavailable; routines require postgresql",
         ));
     };
-    Ok(RoutineStore::new(std::sync::Arc::new(pool)))
+    Ok(RoutineStore::new_with_timezone(
+        std::sync::Arc::new(pool),
+        state.config.routines.default_timezone.clone(),
+    ))
 }
 
 fn routine_agent_executor(state: &AppState) -> AppResult<RoutineAgentExecutor> {
@@ -525,6 +543,7 @@ fn routine_agent_executor(state: &AppState) -> AppResult<RoutineAgentExecutor> {
     Ok(RoutineAgentExecutor::new(
         std::sync::Arc::new(pool),
         state.health_registry.clone(),
+        state.config.routines.agent_timeout_secs,
     ))
 }
 
@@ -536,7 +555,10 @@ fn routine_discord_logger(state: &AppState) -> AppResult<RoutineDiscordLogger> {
             "postgres pool unavailable; routines require postgresql",
         ));
     };
-    Ok(RoutineDiscordLogger::new(std::sync::Arc::new(pool)))
+    Ok(RoutineDiscordLogger::new_with_health_target(
+        std::sync::Arc::new(pool),
+        routine_health_target(&state.config),
+    ))
 }
 
 fn routine_session_controller(state: &AppState) -> AppResult<RoutineSessionController> {
@@ -592,6 +614,25 @@ fn validate_schedule_request(schedule: Option<&str>) -> AppResult<()> {
         return Ok(());
     };
     validate_routine_schedule(schedule).map_err(|error| AppError::bad_request(error.to_string()))
+}
+
+fn validate_timeout_request(timeout_secs: Option<i32>) -> AppResult<()> {
+    if matches!(timeout_secs, Some(value) if value <= 0) {
+        return Err(AppError::bad_request(
+            "routine timeout_secs must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn routine_health_target(config: &Config) -> Option<String> {
+    config
+        .kanban
+        .human_alert_channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("channel:{value}"))
 }
 
 fn store_error(error: anyhow::Error) -> AppError {
@@ -660,6 +701,8 @@ mod tests {
         assert_eq!(patch.schedule, None);
         assert_eq!(patch.next_due_at, None);
         assert_eq!(patch.checkpoint, None);
+        assert_eq!(patch.discord_thread_id, None);
+        assert_eq!(patch.timeout_secs, None);
     }
 
     #[test]
@@ -667,7 +710,9 @@ mod tests {
         let body: PatchRoutineBody = serde_json::from_value(json!({
             "schedule": null,
             "next_due_at": null,
-            "checkpoint": null
+            "checkpoint": null,
+            "discord_thread_id": null,
+            "timeout_secs": null
         }))
         .unwrap();
         let patch = body.into_patch();
@@ -675,6 +720,8 @@ mod tests {
         assert_eq!(patch.schedule, Some(None));
         assert_eq!(patch.next_due_at, Some(None));
         assert_eq!(patch.checkpoint, Some(None));
+        assert_eq!(patch.discord_thread_id, Some(None));
+        assert_eq!(patch.timeout_secs, Some(None));
     }
 
     #[test]
@@ -682,7 +729,9 @@ mod tests {
         let body: PatchRoutineBody = serde_json::from_value(json!({
             "schedule": "@every 1h",
             "next_due_at": "2026-04-29T00:00:00Z",
-            "checkpoint": {"cursor": "abc"}
+            "checkpoint": {"cursor": "abc"},
+            "discord_thread_id": "1234567890",
+            "timeout_secs": 60
         }))
         .unwrap();
         let patch = body.into_patch();
@@ -690,6 +739,11 @@ mod tests {
         assert_eq!(patch.schedule, Some(Some("@every 1h".to_string())));
         assert!(patch.next_due_at.flatten().is_some());
         assert_eq!(patch.checkpoint, Some(Some(json!({"cursor": "abc"}))));
+        assert_eq!(
+            patch.discord_thread_id,
+            Some(Some("1234567890".to_string()))
+        );
+        assert_eq!(patch.timeout_secs, Some(Some(60)));
     }
 
     #[test]

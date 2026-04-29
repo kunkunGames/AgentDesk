@@ -2104,6 +2104,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
         "timeouts",
         "merge-automation",
         "dashboard",
+        "routine-runtime",
     ];
     if !INTERNAL_SOURCES.contains(&source) && !super::settings::is_known_agent(source) {
         return (

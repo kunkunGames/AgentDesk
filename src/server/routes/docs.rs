@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default, Deserialize)]
 pub struct ApiDocsQuery {
     pub format: Option<String>,
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,11 +253,12 @@ pub(crate) const TOP_40_PAIRED_PATHS: &[(&str, &str)] = &[
     ("GET", "/api/docs"),
 ];
 
-const CANONICAL_CATEGORIES: [&str; 7] = [
+const CANONICAL_CATEGORIES: [&str; 8] = [
     "agents",
     "kanban",
     "dispatches",
     "queue",
+    "routines",
     "ops",
     "integrations",
     "admin",
@@ -267,7 +269,8 @@ fn canonical_category(category: &str) -> &'static str {
         "agents" => "agents",
         "kanban" | "kanban-repos" | "pipeline" | "pm" | "reviews" => "kanban",
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
-        "auto-queue" | "cron" | "queue" | "routines" => "queue",
+        "auto-queue" | "cron" | "queue" => "queue",
+        "routines" => "routines",
         "analytics" | "auth" | "docs" | "health" | "monitoring" | "stats" | "provider-cli" => "ops",
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
@@ -2569,9 +2572,11 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             ("execution_strategy", body_param("string", false, "fresh or persistent")),
             (
                 "schedule",
-                body_param("string", false, "Optional @every/every duration such as @every 5m"),
+                body_param("string", false, "Optional @every duration or 5-field cron such as 30 9 * * 1-5"),
             ),
             ("next_due_at", body_param("string", false, "Optional RFC3339 due time")),
+            ("discord_thread_id", body_param("string", false, "Optional existing Discord thread id")),
+            ("timeout_secs", body_param("integer", false, "Optional per-routine agent timeout in seconds")),
         ])
         .with_example(
             json!({"body": {"script_ref": "daily-summary.js", "name": "Daily Summary", "execution_strategy": "fresh"}}),
@@ -2603,7 +2608,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             ),
             (
                 "schedule",
-                body_param("string|null", false, "Set @every/every duration schedule or pass null to clear it"),
+                body_param("string|null", false, "Set @every duration or 5-field cron, or pass null to clear it"),
             ),
             (
                 "next_due_at",
@@ -2612,6 +2617,14 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             (
                 "checkpoint",
                 body_param("object|null", false, "Replacement checkpoint JSON or null to clear it"),
+            ),
+            (
+                "discord_thread_id",
+                body_param("string|null", false, "Saved Discord thread id or null to clear it"),
+            ),
+            (
+                "timeout_secs",
+                body_param("integer|null", false, "Per-routine agent timeout in seconds or null for config default"),
             ),
         ]),
         ep(
@@ -3736,6 +3749,35 @@ pub async fn api_docs(Query(query): Query<ApiDocsQuery>) -> (StatusCode, Json<Va
         .is_some_and(|format| format.eq_ignore_ascii_case("flat"))
     {
         return (StatusCode::OK, Json(json!({ "endpoints": endpoints })));
+    }
+
+    if let Some(category) = query
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let category = canonical_category(category);
+        let matching: Vec<EndpointDoc> = endpoints
+            .into_iter()
+            .filter(|endpoint| effective_category(endpoint) == category)
+            .collect();
+        if matching.is_empty() {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("unknown docs category: {category}") })),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "group": category_to_group(category),
+                "category": category,
+                "description": category_description(category),
+                "count": matching.len(),
+                "endpoints": matching,
+            })),
+        );
     }
 
     let groups: Vec<Value> = GROUP_NAMES

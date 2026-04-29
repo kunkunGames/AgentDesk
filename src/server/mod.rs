@@ -3237,6 +3237,7 @@ async fn routine_runtime_loop(
     pg_pool: Arc<PgPool>,
     health_registry: Option<Arc<HealthRegistry>>,
     routines_config: crate::config::RoutinesConfig,
+    routine_health_target: Option<String>,
     tick_interval_secs: u64,
 ) {
     use crate::services::routines::{
@@ -3263,14 +3264,22 @@ async fn routine_runtime_loop(
         Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
     }
 
-    let store = RoutineStore::new(pg_pool.clone());
-    let discord_logger = RoutineDiscordLogger::new(pg_pool.clone());
-    let agent_executor = RoutineAgentExecutor::new(pg_pool, health_registry);
+    let store =
+        RoutineStore::new_with_timezone(pg_pool.clone(), routines_config.default_timezone.clone());
+    let discord_logger =
+        RoutineDiscordLogger::new_with_health_target(pg_pool.clone(), routine_health_target);
+    let agent_executor =
+        RoutineAgentExecutor::new(pg_pool, health_registry, routines_config.agent_timeout_secs);
     match store.recover_stale_running_runs().await {
-        Ok(n) if n > 0 => tracing::info!(
-            recovered = n,
-            "routine boot recovery: stale runs marked interrupted"
-        ),
+        Ok(recovered) if !recovered.is_empty() => {
+            for run in &recovered {
+                discord_logger.log_recovery(&store, run).await;
+            }
+            tracing::info!(
+                recovered = recovered.len(),
+                "routine boot recovery: stale runs marked interrupted"
+            )
+        }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "routine boot recovery failed"),
     }
@@ -3279,10 +3288,15 @@ async fn routine_runtime_loop(
     loop {
         interval.tick().await;
         match store.recover_stale_running_runs().await {
-            Ok(n) if n > 0 => tracing::info!(
-                recovered = n,
-                "routine periodic recovery: expired-lease runs marked interrupted"
-            ),
+            Ok(recovered) if !recovered.is_empty() => {
+                for run in &recovered {
+                    discord_logger.log_recovery(&store, run).await;
+                }
+                tracing::info!(
+                    recovered = recovered.len(),
+                    "routine periodic recovery: expired-lease runs marked interrupted"
+                )
+            }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
         }

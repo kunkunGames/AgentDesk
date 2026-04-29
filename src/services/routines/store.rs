@@ -1,8 +1,12 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
+use chrono_tz::Tz;
+use croner::Cron;
+use croner::parser::{CronParser, Seconds, Year};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -17,6 +21,7 @@ const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
 #[derive(Clone)]
 pub struct RoutineStore {
     pool: Arc<PgPool>,
+    default_timezone: String,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -28,6 +33,8 @@ pub struct ClaimedRoutineRun {
     pub name: String,
     pub execution_strategy: String,
     pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
     pub lease_expires_at: DateTime<Utc>,
 }
 
@@ -44,6 +51,8 @@ pub struct RoutineRecord {
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_result: Option<String>,
     pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
     pub in_flight_run_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -109,6 +118,17 @@ pub struct RunningAgentRoutineRun {
     pub turn_id: String,
     pub result_json: Option<Value>,
     pub started_at: DateTime<Utc>,
+    pub timeout_secs: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct RecoveredRoutineRun {
+    pub run_id: String,
+    pub routine_id: String,
+    pub agent_id: Option<String>,
+    pub script_ref: String,
+    pub name: String,
+    pub discord_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +140,8 @@ pub struct NewRoutine {
     pub schedule: Option<String>,
     pub next_due_at: Option<DateTime<Utc>>,
     pub checkpoint: Option<Value>,
+    pub discord_thread_id: Option<String>,
+    pub timeout_secs: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -129,6 +151,8 @@ pub struct RoutinePatch {
     pub schedule: Option<Option<String>>,
     pub next_due_at: Option<Option<DateTime<Utc>>>,
     pub checkpoint: Option<Option<Value>>,
+    pub discord_thread_id: Option<Option<String>>,
+    pub timeout_secs: Option<Option<i32>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -139,11 +163,16 @@ struct RoutineClaimCandidate {
     name: String,
     execution_strategy: String,
     checkpoint: Option<Value>,
+    discord_thread_id: Option<String>,
+    timeout_secs: Option<i32>,
 }
 
 impl RoutineStore {
-    pub fn new(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+    pub fn new_with_timezone(pool: Arc<PgPool>, default_timezone: impl Into<String>) -> Self {
+        Self {
+            pool,
+            default_timezone: default_timezone.into(),
+        }
     }
 
     /// Claim due routines in a short transaction.
@@ -157,10 +186,11 @@ impl RoutineStore {
         }
 
         let mut tx = self.pool.begin().await?;
-        Self::seed_scheduled_due_times(&mut tx).await?;
+        Self::seed_scheduled_due_times(&mut tx, &self.default_timezone).await?;
         let candidates: Vec<RoutineClaimCandidate> = sqlx::query_as(
             r#"
-            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint
+            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint,
+                   discord_thread_id, timeout_secs
             FROM routines
             WHERE status = 'enabled'
               AND next_due_at IS NOT NULL
@@ -185,7 +215,10 @@ impl RoutineStore {
         Ok(claimed)
     }
 
-    async fn seed_scheduled_due_times(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    async fn seed_scheduled_due_times(
+        tx: &mut Transaction<'_, Postgres>,
+        default_timezone: &str,
+    ) -> Result<()> {
         let scheduled: Vec<(String, String)> = sqlx::query_as(
             r#"
             SELECT id, schedule
@@ -202,18 +235,19 @@ impl RoutineStore {
         .map_err(|e| anyhow!("seed routine schedules: select routines: {e}"))?;
 
         for (routine_id, schedule) in scheduled {
-            let next_due_at = match Self::next_due_from_schedule_tx(tx, &schedule).await {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(
-                        routine_id,
-                        schedule,
-                        error = %error,
-                        "routine has invalid schedule; next_due_at not seeded"
-                    );
-                    continue;
-                }
-            };
+            let next_due_at =
+                match Self::next_due_from_schedule_tx(tx, &schedule, default_timezone).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            routine_id,
+                            schedule,
+                            error = %error,
+                            "routine has invalid schedule; next_due_at not seeded"
+                        );
+                        continue;
+                    }
+                };
             sqlx::query(
                 r#"
                 UPDATE routines
@@ -244,7 +278,8 @@ impl RoutineStore {
             r#"
             SELECT id, agent_id, script_ref, name, status, execution_strategy,
                    schedule, next_due_at, last_run_at, last_result, checkpoint,
-                   in_flight_run_id, created_at, updated_at
+                   discord_thread_id, timeout_secs, in_flight_run_id,
+                   created_at, updated_at
             FROM routines
             WHERE ($1::text IS NULL OR agent_id = $1)
               AND ($2::text IS NULL OR status = $2)
@@ -263,7 +298,8 @@ impl RoutineStore {
             r#"
             SELECT id, agent_id, script_ref, name, status, execution_strategy,
                    schedule, next_due_at, last_run_at, last_result, checkpoint,
-                   in_flight_run_id, created_at, updated_at
+                   discord_thread_id, timeout_secs, in_flight_run_id,
+                   created_at, updated_at
             FROM routines
             WHERE id = $1
             "#,
@@ -306,7 +342,8 @@ impl RoutineStore {
                    r.script_ref,
                    rr.turn_id,
                    rr.result_json,
-                   rr.started_at
+                   rr.started_at,
+                   r.timeout_secs
             FROM routine_runs rr
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.status = 'running'
@@ -458,6 +495,8 @@ impl RoutineStore {
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
         validate_execution_strategy(&new_routine.execution_strategy)?;
         let schedule = normalize_schedule(new_routine.schedule)?;
+        validate_timeout_secs(new_routine.timeout_secs)?;
+        let discord_thread_id = normalize_optional_text(new_routine.discord_thread_id);
         let next_due_at = if let Some(value) = new_routine.next_due_at {
             Some(value)
         } else if let Some(schedule) = schedule.as_deref() {
@@ -470,12 +509,13 @@ impl RoutineStore {
             r#"
             INSERT INTO routines (
                 id, agent_id, script_ref, name, status, execution_strategy,
-                schedule, next_due_at, checkpoint
+                schedule, next_due_at, checkpoint, discord_thread_id, timeout_secs
             )
-            VALUES ($1, $2, $3, $4, 'enabled', $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, 'enabled', $5, $6, $7, $8, $9, $10)
             RETURNING id, agent_id, script_ref, name, status, execution_strategy,
                       schedule, next_due_at, last_run_at, last_result, checkpoint,
-                      in_flight_run_id, created_at, updated_at
+                      discord_thread_id, timeout_secs, in_flight_run_id,
+                      created_at, updated_at
             "#,
         )
         .bind(id)
@@ -486,6 +526,8 @@ impl RoutineStore {
         .bind(schedule)
         .bind(next_due_at)
         .bind(new_routine.checkpoint)
+        .bind(discord_thread_id)
+        .bind(new_routine.timeout_secs)
         .fetch_one(&*self.pool)
         .await
         .map_err(|e| anyhow!("attach routine: {e}"))
@@ -499,11 +541,18 @@ impl RoutineStore {
         if let Some(strategy) = patch.execution_strategy.as_deref() {
             validate_execution_strategy(strategy)?;
         }
+        validate_timeout_secs(patch.timeout_secs.flatten())?;
         let schedule_was_set = patch.schedule.is_some();
         let schedule = match patch.schedule {
             Some(value) => normalize_schedule(value)?,
             None => None,
         };
+        let discord_thread_id_was_set = patch.discord_thread_id.is_some();
+        let discord_thread_id = patch
+            .discord_thread_id
+            .map(|value| normalize_optional_text(value));
+        let timeout_secs_was_set = patch.timeout_secs.is_some();
+        let timeout_secs = patch.timeout_secs.flatten();
         let next_due_was_set = patch.next_due_at.is_some();
         let mut next_due_at = patch.next_due_at.flatten();
         let mut update_next_due_at = next_due_was_set;
@@ -529,12 +578,15 @@ impl RoutineStore {
                 schedule = CASE WHEN $4 THEN $5 ELSE schedule END,
                 next_due_at = CASE WHEN $6 THEN $7 ELSE next_due_at END,
                 checkpoint = CASE WHEN $8 THEN $9 ELSE checkpoint END,
+                discord_thread_id = CASE WHEN $10 THEN $11 ELSE discord_thread_id END,
+                timeout_secs = CASE WHEN $12 THEN $13 ELSE timeout_secs END,
                 updated_at = NOW()
             WHERE id = $1
               AND status <> 'detached'
             RETURNING id, agent_id, script_ref, name, status, execution_strategy,
                       schedule, next_due_at, last_run_at, last_result, checkpoint,
-                      in_flight_run_id, created_at, updated_at
+                      discord_thread_id, timeout_secs, in_flight_run_id,
+                      created_at, updated_at
             "#,
         )
         .bind(routine_id)
@@ -546,6 +598,10 @@ impl RoutineStore {
         .bind(next_due_at)
         .bind(patch.checkpoint.is_some())
         .bind(patch.checkpoint.flatten())
+        .bind(discord_thread_id_was_set)
+        .bind(discord_thread_id.flatten())
+        .bind(timeout_secs_was_set)
+        .bind(timeout_secs)
         .fetch_optional(&*self.pool)
         .await
         .map_err(|e| anyhow!("patch routine {routine_id}: {e}"))
@@ -556,7 +612,8 @@ impl RoutineStore {
         let mut tx = self.pool.begin().await?;
         let candidate: Option<RoutineClaimCandidate> = sqlx::query_as(
             r#"
-            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint
+            SELECT id, agent_id, script_ref, name, execution_strategy, checkpoint,
+                   discord_thread_id, timeout_secs
             FROM routines
             WHERE id = $1
               AND status = 'enabled'
@@ -845,8 +902,16 @@ impl RoutineStore {
         let result = sqlx::query(
             r#"
             UPDATE routine_runs
-            SET discord_log_status = $2,
-                discord_log_error = $3,
+            SET discord_log_status = CASE
+                    WHEN discord_log_status = 'failed' AND $2 <> 'failed'
+                    THEN discord_log_status
+                    ELSE $2
+                END,
+                discord_log_error = CASE
+                    WHEN discord_log_status = 'failed' AND $2 <> 'failed'
+                    THEN discord_log_error
+                    ELSE $3
+                END,
                 updated_at = NOW()
             WHERE id = $1
             "#,
@@ -857,6 +922,31 @@ impl RoutineStore {
         .execute(&*self.pool)
         .await
         .map_err(|e| anyhow!("record routine discord log result {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_discord_thread_id(
+        &self,
+        routine_id: &str,
+        discord_thread_id: &str,
+    ) -> Result<bool> {
+        let normalized = normalize_optional_text(Some(discord_thread_id.to_string()))
+            .ok_or_else(|| anyhow!("discord_thread_id must not be empty"))?;
+        let result = sqlx::query(
+            r#"
+            UPDATE routines
+            SET discord_thread_id = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status <> 'detached'
+            "#,
+        )
+        .bind(routine_id)
+        .bind(normalized)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("update routine {routine_id} discord_thread_id: {e}"))?;
 
         Ok(result.rows_affected() == 1)
     }
@@ -952,13 +1042,13 @@ impl RoutineStore {
     /// lease are left alone so a second server instance cannot interrupt work
     /// that another instance is actively executing.
     ///
-    /// Returns the number of expired-lease runs that were recovered.
-    pub async fn recover_stale_running_runs(&self) -> Result<u64> {
+    /// Returns the expired-lease runs that were recovered.
+    pub async fn recover_stale_running_runs(&self) -> Result<Vec<RecoveredRoutineRun>> {
         let mut tx = self.pool.begin().await?;
 
         // Close expired leases. The UPDATE re-checks status and lease expiry
         // under the row lock so a concurrently finished run is not clobbered.
-        let recovered: Vec<(String, String)> = sqlx::query_as(
+        let recovered: Vec<RecoveredRoutineRun> = sqlx::query_as(
             r#"
             WITH expired AS (
                 SELECT id
@@ -982,7 +1072,14 @@ impl RoutineStore {
                   AND rr.lease_expires_at < NOW()
                 RETURNING rr.id, rr.routine_id
             )
-            SELECT id, routine_id FROM closed
+            SELECT closed.id AS run_id,
+                   r.id AS routine_id,
+                   r.agent_id,
+                   r.script_ref,
+                   r.name,
+                   r.discord_thread_id
+            FROM closed
+            JOIN routines r ON r.id = closed.routine_id
             "#,
         )
         .fetch_all(&mut *tx)
@@ -991,13 +1088,15 @@ impl RoutineStore {
 
         if recovered.is_empty() {
             tx.commit().await?;
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
-        let count = recovered.len() as u64;
-        let recovered_routine_ids: Vec<&str> =
-            recovered.iter().map(|(_, rid)| rid.as_str()).collect();
-        let recovered_run_ids: Vec<&str> = recovered.iter().map(|(id, _)| id.as_str()).collect();
+        let recovered_routine_ids: Vec<&str> = recovered
+            .iter()
+            .map(|run| run.routine_id.as_str())
+            .collect();
+        let recovered_run_ids: Vec<&str> =
+            recovered.iter().map(|run| run.run_id.as_str()).collect();
 
         // Release only locks that still point at the interrupted run.
         sqlx::query(
@@ -1017,36 +1116,27 @@ impl RoutineStore {
         .map_err(|e| anyhow!("recover: clear in_flight_run_id: {e}"))?;
 
         tx.commit().await?;
-        Ok(count)
+        Ok(recovered)
     }
 
     async fn next_due_from_schedule(&self, schedule: &str) -> Result<DateTime<Utc>> {
-        let seconds = parse_schedule_interval(schedule)?.num_seconds();
-        sqlx::query_scalar(
-            r#"
-            SELECT NOW() + ($1::bigint * INTERVAL '1 second')
-            "#,
-        )
-        .bind(seconds)
-        .fetch_one(&*self.pool)
-        .await
-        .map_err(|e| anyhow!("compute routine next due from schedule: {e}"))
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&*self.pool)
+            .await
+            .map_err(|e| anyhow!("load database time for routine schedule: {e}"))?;
+        next_due_after(schedule, &self.default_timezone, now)
     }
 
     async fn next_due_from_schedule_tx(
         tx: &mut Transaction<'_, Postgres>,
         schedule: &str,
+        default_timezone: &str,
     ) -> Result<DateTime<Utc>> {
-        let seconds = parse_schedule_interval(schedule)?.num_seconds();
-        sqlx::query_scalar(
-            r#"
-            SELECT NOW() + ($1::bigint * INTERVAL '1 second')
-            "#,
-        )
-        .bind(seconds)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| anyhow!("compute routine next due from schedule in tx: {e}"))
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("load database time for routine schedule in tx: {e}"))?;
+        next_due_after(schedule, default_timezone, now)
     }
 
     async fn insert_running_run(
@@ -1100,6 +1190,8 @@ impl RoutineStore {
             name: candidate.name,
             execution_strategy: candidate.execution_strategy,
             checkpoint: candidate.checkpoint,
+            discord_thread_id: candidate.discord_thread_id,
+            timeout_secs: candidate.timeout_secs,
             lease_expires_at,
         })
     }
@@ -1129,7 +1221,7 @@ impl RoutineStore {
         let scheduled_next_due_at = if close.next_due_at.should_update() {
             close.next_due_at.value()
         } else if let Some(schedule) = schedule.as_deref() {
-            Some(Self::next_due_from_schedule_tx(&mut tx, schedule).await?)
+            Some(Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone).await?)
         } else {
             None
         };
@@ -1207,7 +1299,7 @@ fn validate_execution_strategy(strategy: &str) -> Result<()> {
 }
 
 pub fn validate_routine_schedule(schedule: &str) -> Result<()> {
-    parse_schedule_interval(schedule).map(|_| ())
+    parse_routine_schedule(schedule).map(|_| ())
 }
 
 fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
@@ -1218,6 +1310,75 @@ fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
             Ok(schedule)
         })
         .transpose()
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_timeout_secs(timeout_secs: Option<i32>) -> Result<()> {
+    if let Some(value) = timeout_secs
+        && value <= 0
+    {
+        return Err(anyhow!("routine timeout_secs must be greater than zero"));
+    }
+    Ok(())
+}
+
+enum ParsedRoutineSchedule {
+    Every(Duration),
+    Cron(Cron),
+}
+
+fn parse_routine_schedule(schedule: &str) -> Result<ParsedRoutineSchedule> {
+    let trimmed = schedule.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+        ));
+    }
+    if trimmed.starts_with("@every ") || trimmed.starts_with("every ") {
+        return parse_schedule_interval(trimmed).map(ParsedRoutineSchedule::Every);
+    }
+    if trimmed.starts_with('@') {
+        return Err(anyhow!(
+            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+        ));
+    }
+
+    let field_count = trimmed.split_whitespace().count();
+    if field_count != 5 {
+        return Err(anyhow!(
+            "unsupported routine cron schedule '{schedule}'; expected exactly 5 fields"
+        ));
+    }
+    let cron = CronParser::builder()
+        .seconds(Seconds::Disallowed)
+        .year(Year::Disallowed)
+        .build()
+        .parse(trimmed)
+        .map_err(|e| anyhow!("invalid routine cron schedule '{schedule}': {e}"))?;
+    Ok(ParsedRoutineSchedule::Cron(cron))
+}
+
+fn next_due_after(
+    schedule: &str,
+    default_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    match parse_routine_schedule(schedule)? {
+        ParsedRoutineSchedule::Every(duration) => Ok(now + duration),
+        ParsedRoutineSchedule::Cron(cron) => {
+            let timezone = Tz::from_str(default_timezone)
+                .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
+            let zoned_now = now.with_timezone(&timezone);
+            cron.find_next_occurrence(&zoned_now, false)
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
+        }
+    }
 }
 
 fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
@@ -1317,7 +1478,8 @@ struct CloseRun<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_schedule_interval, validate_routine_schedule};
+    use super::{next_due_after, parse_schedule_interval, validate_routine_schedule};
+    use chrono::{TimeZone, Timelike, Utc};
 
     // Integration tests that require a live PG connection live in
     // src/integration_tests.rs and are gated on the `integration` feature.
@@ -1344,6 +1506,32 @@ mod tests {
         assert!(validate_routine_schedule("").is_err());
         assert!(validate_routine_schedule("@every 0s").is_err());
         assert!(validate_routine_schedule("@daily").is_err());
-        assert!(validate_routine_schedule("*/5 * * * *").is_err());
+        assert!(validate_routine_schedule("* * * * * *").is_err());
+        assert!(validate_routine_schedule("60 9 * * *").is_err());
+    }
+
+    #[test]
+    fn accepts_standard_cron_schedules() {
+        assert!(validate_routine_schedule("*/5 * * * *").is_ok());
+        assert!(validate_routine_schedule("30 9 * * 1-5").is_ok());
+    }
+
+    #[test]
+    fn cron_next_due_uses_default_timezone() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 29, 0, 0, 0).unwrap();
+        let next_due = next_due_after("30 9 * * 1-5", "Asia/Seoul", now).unwrap();
+        let next_due_kst = next_due.with_timezone(&chrono_tz::Asia::Seoul);
+        assert_eq!(next_due_kst.hour(), 9);
+        assert_eq!(next_due_kst.minute(), 30);
+    }
+
+    #[test]
+    fn every_next_due_uses_utc_interval() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 29, 0, 0, 0).unwrap();
+        let next_due = next_due_after("@every 1h", "Asia/Seoul", now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 29, 1, 0, 0).unwrap()
+        );
     }
 }

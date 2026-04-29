@@ -3,11 +3,12 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use super::runtime::RoutineRunOutcome;
-use super::store::{ClaimedRoutineRun, RoutineRecord, RoutineStore};
+use super::store::{ClaimedRoutineRun, RecoveredRoutineRun, RoutineRecord, RoutineStore};
 
 #[derive(Clone)]
 pub struct RoutineDiscordLogger {
     pool: Arc<PgPool>,
+    health_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -20,8 +21,11 @@ pub struct RoutineDiscordLogStatus {
 }
 
 impl RoutineDiscordLogger {
-    pub fn new(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+    pub fn new_with_health_target(pool: Arc<PgPool>, health_target: Option<String>) -> Self {
+        Self {
+            pool,
+            health_target,
+        }
     }
 
     pub async fn log_routine_event(
@@ -31,6 +35,7 @@ impl RoutineDiscordLogger {
     ) -> RoutineDiscordLogStatus {
         self.log_to_routine_target(
             routine.agent_id.as_deref(),
+            routine.discord_thread_id.as_deref(),
             event.reason_code(),
             &format!("routine:{}:{}", routine.id, event.reason_code()),
             &routine_lifecycle_message(routine, event),
@@ -64,6 +69,7 @@ impl RoutineDiscordLogger {
         let status = self
             .log_to_routine_target(
                 claimed.agent_id.as_deref(),
+                claimed.discord_thread_id.as_deref(),
                 "routine_run_started",
                 &format!(
                     "routine:{}:run:{}:started",
@@ -108,6 +114,7 @@ impl RoutineDiscordLogger {
         let status = self
             .log_to_routine_target(
                 routine.agent_id.as_deref(),
+                routine.discord_thread_id.as_deref(),
                 &reason_code,
                 &format!(
                     "routine:{}:run:{}:{}",
@@ -121,13 +128,51 @@ impl RoutineDiscordLogger {
         status
     }
 
+    pub async fn log_recovery(
+        &self,
+        store: &RoutineStore,
+        recovered: &RecoveredRoutineRun,
+    ) -> RoutineDiscordLogStatus {
+        let message = recovery_message(recovered);
+        let target = recovered
+            .discord_thread_id
+            .as_deref()
+            .and_then(channel_target_from_id)
+            .or_else(|| self.health_target.clone());
+        let status = match target {
+            Some(target) => {
+                self.log_to_target(
+                    &target,
+                    "routine_recovery_resumed",
+                    &format!(
+                        "routine:{}:run:{}:recovery",
+                        recovered.routine_id, recovered.run_id
+                    ),
+                    &message,
+                )
+                .await
+            }
+            None => RoutineDiscordLogStatus::skipped(),
+        };
+        self.persist_run_log_status(store, &recovered.run_id, &status)
+            .await;
+        status
+    }
+
     async fn log_to_routine_target(
         &self,
         agent_id: Option<&str>,
+        discord_thread_id: Option<&str>,
         reason_code: &str,
         session_key: &str,
         content: &str,
     ) -> RoutineDiscordLogStatus {
+        if let Some(target) = discord_thread_id.and_then(channel_target_from_id) {
+            return self
+                .log_to_target(&target, reason_code, session_key, content)
+                .await;
+        }
+
         let Some(agent_id) = normalized_agent_id(agent_id) else {
             return RoutineDiscordLogStatus::skipped();
         };
@@ -139,10 +184,21 @@ impl RoutineDiscordLogger {
             }
         };
 
+        self.log_to_target(&target, reason_code, session_key, content)
+            .await
+    }
+
+    async fn log_to_target(
+        &self,
+        target: &str,
+        reason_code: &str,
+        session_key: &str,
+        content: &str,
+    ) -> RoutineDiscordLogStatus {
         match crate::services::message_outbox::enqueue_outbox_pg(
             &self.pool,
             crate::services::message_outbox::OutboxMessage {
-                target: &target,
+                target,
                 content,
                 bot: "notify",
                 source: "routine-runtime",
@@ -285,6 +341,14 @@ fn normalized_agent_id(agent_id: Option<&str>) -> Option<&str> {
     agent_id.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn channel_target_from_id(value: &str) -> Option<String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|channel_id| format!("channel:{channel_id}"))
+}
+
 fn routine_lifecycle_message(routine: &RoutineRecord, event: RoutineLifecycleEvent) -> String {
     format!(
         "루틴 {}: {} / id {} / script {} / status {}",
@@ -293,6 +357,15 @@ fn routine_lifecycle_message(routine: &RoutineRecord, event: RoutineLifecycleEve
         short_id(&routine.id),
         compact(&routine.script_ref, 80),
         routine.status
+    )
+}
+
+fn recovery_message(recovered: &RecoveredRoutineRun) -> String {
+    format!(
+        "[재개] 서버 재시작 - routine을 다시 스케줄합니다: {} / run {} / script {}",
+        compact(&recovered.name, 80),
+        short_id(&recovered.run_id),
+        compact(&recovered.script_ref, 80)
     )
 }
 
@@ -363,6 +436,8 @@ mod tests {
             last_run_at: None,
             last_result: None,
             checkpoint: None,
+            discord_thread_id: None,
+            timeout_secs: None,
             in_flight_run_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),

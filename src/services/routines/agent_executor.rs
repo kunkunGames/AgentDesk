@@ -3,23 +3,22 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::services::discord::health::{
-    HealthRegistry, reserve_headless_agent_turn, start_reserved_headless_agent_turn,
+    HealthRegistry, reserve_headless_agent_turn, resolve_bot_http,
+    start_reserved_headless_agent_turn,
 };
 
 use super::runtime::RoutineRunOutcome;
 use super::store::{ClaimedRoutineRun, NextDueAtUpdate, RoutineStore, RunningAgentRoutineRun};
 
-const AGENT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const FRESH_CONTEXT_GUARANTEED: bool = false;
 
 #[derive(Clone)]
 pub struct RoutineAgentExecutor {
     pool: Arc<PgPool>,
     health_registry: Option<Arc<HealthRegistry>>,
-    completion_timeout: Duration,
+    default_completion_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -30,11 +29,15 @@ struct AgentTurnCompletion {
 }
 
 impl RoutineAgentExecutor {
-    pub fn new(pool: Arc<PgPool>, health_registry: Option<Arc<HealthRegistry>>) -> Self {
+    pub fn new(
+        pool: Arc<PgPool>,
+        health_registry: Option<Arc<HealthRegistry>>,
+        default_completion_timeout_secs: u64,
+    ) -> Self {
         Self {
             pool,
             health_registry,
-            completion_timeout: AGENT_COMPLETION_TIMEOUT,
+            default_completion_timeout_secs: default_completion_timeout_secs.max(1),
         }
     }
 
@@ -136,10 +139,11 @@ impl RoutineAgentExecutor {
                 continue;
             }
 
-            if self.has_timed_out(&run).await? {
+            let timeout_secs = self.timeout_secs_for_run(&run);
+            if self.has_timed_out(&run, timeout_secs).await? {
                 let message = format!(
                     "routine agent turn timed out after {} seconds",
-                    self.completion_timeout.as_secs()
+                    timeout_secs
                 );
                 let result_json = Some(merge_pending_result(&run, "timeout", Some(&message), None));
                 let closed = store
@@ -202,7 +206,33 @@ impl RoutineAgentExecutor {
             ));
         };
         let channel_id = poise::serenity_prelude::ChannelId::new(channel_id_num);
-        let reservation = reserve_headless_agent_turn(channel_id);
+        let routine_channel = self
+            .resolve_or_create_routine_thread(
+                store,
+                registry,
+                claimed,
+                agent_id,
+                provider.as_str(),
+                channel_id,
+            )
+            .await;
+        let (turn_channel_id, discord_thread_id) = match routine_channel {
+            Ok(target) => (target.channel_id, target.discord_thread_id),
+            Err(error) => {
+                let warning = error.to_string();
+                let _ = store
+                    .record_discord_log_result(&claimed.run_id, "failed", Some(&warning))
+                    .await;
+                tracing::warn!(
+                    routine_id = claimed.routine_id,
+                    run_id = claimed.run_id,
+                    error = %warning,
+                    "routine thread setup failed; falling back to agent primary channel"
+                );
+                (channel_id, None)
+            }
+        };
+        let reservation = reserve_headless_agent_turn(turn_channel_id);
         let turn_id = reservation.turn_id().to_string();
 
         let result_json = json!({
@@ -210,7 +240,9 @@ impl RoutineAgentExecutor {
             "turn_id": turn_id.clone(),
             "agent_id": agent_id,
             "provider": provider.as_str(),
-            "channel_id": channel_id_num.to_string(),
+            "channel_id": turn_channel_id.get().to_string(),
+            "parent_channel_id": channel_id_num.to_string(),
+            "discord_thread_id": discord_thread_id,
             "routine_id": claimed.routine_id,
             "run_id": claimed.run_id,
             "script_ref": claimed.script_ref,
@@ -244,7 +276,7 @@ impl RoutineAgentExecutor {
             .unwrap_or_else(|| Some(primary_channel.clone()));
         let outcome = start_reserved_headless_agent_turn(
             registry,
-            channel_id,
+            turn_channel_id,
             provider.clone(),
             prompt.to_string(),
             Some("routine".to_string()),
@@ -282,8 +314,12 @@ impl RoutineAgentExecutor {
         .map_err(|error| anyhow!("lookup routine agent transcript {turn_id}: {error}"))
     }
 
-    async fn has_timed_out(&self, run: &RunningAgentRoutineRun) -> Result<bool> {
-        let timeout_secs = i64::try_from(self.completion_timeout.as_secs())
+    fn timeout_secs_for_run(&self, run: &RunningAgentRoutineRun) -> u64 {
+        timeout_secs_for_run(run, self.default_completion_timeout_secs)
+    }
+
+    async fn has_timed_out(&self, run: &RunningAgentRoutineRun, timeout_secs: u64) -> Result<bool> {
+        let timeout_secs = i64::try_from(timeout_secs)
             .map_err(|_| anyhow!("routine agent completion timeout exceeds i64 seconds"))?;
         sqlx::query_scalar(
             r#"
@@ -296,10 +332,190 @@ impl RoutineAgentExecutor {
         .await
         .map_err(|error| anyhow!("check routine agent timeout {}: {error}", run.run_id))
     }
+
+    async fn resolve_or_create_routine_thread(
+        &self,
+        store: &RoutineStore,
+        registry: &HealthRegistry,
+        claimed: &ClaimedRoutineRun,
+        agent_id: &str,
+        provider_name: &str,
+        parent_channel_id: poise::serenity_prelude::ChannelId,
+    ) -> Result<RoutineThreadTarget> {
+        if let Some(thread_id) = claimed
+            .discord_thread_id
+            .as_deref()
+            .and_then(parse_channel_id)
+        {
+            match validate_routine_thread(registry, provider_name, thread_id).await {
+                Ok(()) => {
+                    return Ok(RoutineThreadTarget {
+                        channel_id: thread_id,
+                        discord_thread_id: Some(thread_id.get().to_string()),
+                    });
+                }
+                Err(error) => {
+                    let warning = format!(
+                        "routine saved discord thread reuse failed; creating replacement: {error}"
+                    );
+                    let _ = store
+                        .record_discord_log_result(&claimed.run_id, "failed", Some(&warning))
+                        .await;
+                    tracing::warn!(
+                        routine_id = claimed.routine_id,
+                        run_id = claimed.run_id,
+                        error = %warning,
+                        "routine discord thread reuse failed"
+                    );
+                }
+            }
+        } else if claimed.discord_thread_id.as_deref().is_some() {
+            let warning = "routine saved discord_thread_id is invalid; creating replacement";
+            let _ = store
+                .record_discord_log_result(&claimed.run_id, "failed", Some(warning))
+                .await;
+        }
+
+        let title = routine_thread_title(&claimed.name, agent_id);
+        let thread_id = create_routine_thread(registry, provider_name, parent_channel_id, &title)
+            .await
+            .map_err(|error| anyhow!("create routine discord thread: {error}"))?;
+        let thread_id_string = thread_id.get().to_string();
+        if let Err(error) = store
+            .update_discord_thread_id(&claimed.routine_id, &thread_id_string)
+            .await
+        {
+            let warning = format!("persist routine discord_thread_id failed: {error}");
+            let _ = store
+                .record_discord_log_result(&claimed.run_id, "failed", Some(&warning))
+                .await;
+            tracing::warn!(
+                routine_id = claimed.routine_id,
+                run_id = claimed.run_id,
+                error = %warning,
+                "routine discord thread created but persistence failed"
+            );
+        }
+        Ok(RoutineThreadTarget {
+            channel_id: thread_id,
+            discord_thread_id: Some(thread_id_string),
+        })
+    }
 }
 
 struct StartedAgentTurn {
     result_json: Value,
+}
+
+struct RoutineThreadTarget {
+    channel_id: poise::serenity_prelude::ChannelId,
+    discord_thread_id: Option<String>,
+}
+
+fn parse_channel_id(value: &str) -> Option<poise::serenity_prelude::ChannelId> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(poise::serenity_prelude::ChannelId::new)
+}
+
+async fn validate_routine_thread(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    thread_id: poise::serenity_prelude::ChannelId,
+) -> Result<()> {
+    let http = resolve_provider_or_notify_http(registry, provider_name).await?;
+    let channel = thread_id
+        .to_channel(&*http)
+        .await
+        .map_err(|error| anyhow!("fetch saved routine thread {}: {error}", thread_id.get()))?;
+    match channel {
+        poise::serenity_prelude::Channel::Guild(channel)
+            if matches!(
+                channel.kind,
+                poise::serenity_prelude::ChannelType::PublicThread
+                    | poise::serenity_prelude::ChannelType::PrivateThread
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(anyhow!(
+            "saved routine discord_thread_id {} is not a thread",
+            thread_id.get()
+        )),
+    }
+}
+
+async fn create_routine_thread(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    parent_channel_id: poise::serenity_prelude::ChannelId,
+    title: &str,
+) -> Result<poise::serenity_prelude::ChannelId> {
+    let http = resolve_provider_or_notify_http(registry, provider_name).await?;
+    let thread = parent_channel_id
+        .create_thread(
+            &*http,
+            poise::serenity_prelude::builder::CreateThread::new(title)
+                .kind(poise::serenity_prelude::ChannelType::PublicThread)
+                .auto_archive_duration(poise::serenity_prelude::AutoArchiveDuration::OneDay),
+        )
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "discord create thread in {}: {error}",
+                parent_channel_id.get()
+            )
+        })?;
+    Ok(thread.id)
+}
+
+async fn resolve_provider_or_notify_http(
+    registry: &HealthRegistry,
+    provider_name: &str,
+) -> Result<Arc<poise::serenity_prelude::Http>> {
+    match resolve_bot_http(registry, provider_name).await {
+        Ok(http) => Ok(http),
+        Err((_, provider_error)) => resolve_bot_http(registry, "notify")
+            .await
+            .map_err(|(_, notify_error)| {
+                anyhow!(
+                    "provider bot unavailable: {provider_error}; notify bot unavailable: {notify_error}"
+                )
+            }),
+    }
+}
+
+fn routine_thread_title(routine_name: &str, agent_id: &str) -> String {
+    let base = format!(
+        "routine {} - {}",
+        compact_for_title(routine_name),
+        compact_for_title(agent_id)
+    );
+    base.chars().take(90).collect()
+}
+
+fn compact_for_title(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "unnamed".to_string()
+    } else {
+        value
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn timeout_secs_for_run(run: &RunningAgentRoutineRun, default_completion_timeout_secs: u64) -> u64 {
+    run.timeout_secs
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_completion_timeout_secs)
 }
 
 fn completed_result(
@@ -368,6 +584,19 @@ fn assistant_preview(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn running_run(timeout_secs: Option<i32>) -> RunningAgentRoutineRun {
+        RunningAgentRoutineRun {
+            run_id: "run-1".to_string(),
+            routine_id: "routine-1".to_string(),
+            script_ref: "agent-checkpoint-review.js".to_string(),
+            turn_id: "discord:123:456".to_string(),
+            result_json: None,
+            started_at: Utc::now(),
+            timeout_secs,
+        }
+    }
 
     #[test]
     fn pending_checkpoint_ignores_null() {
@@ -384,5 +613,25 @@ mod tests {
         let preview = assistant_preview(&long);
         assert_eq!(preview.chars().count(), 503);
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn timeout_secs_prefers_per_routine_value() {
+        assert_eq!(timeout_secs_for_run(&running_run(Some(120)), 1800), 120);
+        assert_eq!(timeout_secs_for_run(&running_run(None), 1800), 1800);
+        assert_eq!(timeout_secs_for_run(&running_run(Some(0)), 1800), 1800);
+        assert_eq!(timeout_secs_for_run(&running_run(Some(-5)), 1800), 1800);
+    }
+
+    #[test]
+    fn routine_thread_title_is_compact_and_bounded() {
+        let long_name = format!("  Daily\nRoutine\t{}  ", "x".repeat(120));
+        let title = routine_thread_title(&long_name, " maker ");
+
+        assert!(title.starts_with("routine Daily Routine "));
+        assert!(title.ends_with(" - maker") || title.len() == 90);
+        assert!(title.chars().count() <= 90);
+        assert!(!title.contains('\n'));
+        assert!(!title.contains('\t'));
     }
 }

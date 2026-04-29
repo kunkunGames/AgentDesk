@@ -1,3 +1,11 @@
+// Example attach body:
+// {
+//   "script_ref": "agent-checkpoint-review.js",
+//   "agent_id": "maker",
+//   "execution_strategy": "fresh",
+//   "schedule": "30 9 * * 1-5",
+//   "timeout_secs": 120
+// }
 agentdesk.routines.register({
   name: "agent-checkpoint-review",
   tick(ctx) {

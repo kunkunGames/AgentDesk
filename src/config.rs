@@ -1183,6 +1183,9 @@ pub struct RoutinesConfig {
     /// IANA timezone name used when no per-routine timezone is set.
     #[serde(default = "default_routines_timezone")]
     pub default_timezone: String,
+    /// Default maximum wait for agent-backed routine completion, in seconds.
+    #[serde(default = "default_routines_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
     /// Watch `dir` for script changes and reload without restart.
     #[serde(default = "default_true")]
     pub hot_reload: bool,
@@ -1197,6 +1200,7 @@ impl Default for RoutinesConfig {
             max_due_per_tick: default_routines_max_due_per_tick(),
             max_agent_polls_per_tick: default_routines_max_agent_polls_per_tick(),
             default_timezone: default_routines_timezone(),
+            agent_timeout_secs: default_routines_agent_timeout_secs(),
             hot_reload: true,
         }
     }
@@ -1225,7 +1229,11 @@ fn default_routines_max_agent_polls_per_tick() -> u32 {
 }
 
 fn default_routines_timezone() -> String {
-    "UTC".to_string()
+    "Asia/Seoul".to_string()
+}
+
+fn default_routines_agent_timeout_secs() -> u64 {
+    30 * 60
 }
 
 impl Default for DataConfig {
@@ -1654,7 +1662,8 @@ mod tests {
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
         assert_eq!(config.routines.max_agent_polls_per_tick, 10);
-        assert_eq!(config.routines.default_timezone, "UTC");
+        assert_eq!(config.routines.default_timezone, "Asia/Seoul");
+        assert_eq!(config.routines.agent_timeout_secs, 1800);
         assert!(config.routines.hot_reload);
         assert!(config.routines.is_default());
 
@@ -1683,7 +1692,8 @@ routines:
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
         assert_eq!(config.routines.max_agent_polls_per_tick, 10);
-        assert_eq!(config.routines.default_timezone, "UTC");
+        assert_eq!(config.routines.default_timezone, "Asia/Seoul");
+        assert_eq!(config.routines.agent_timeout_secs, 1800);
         assert!(config.routines.hot_reload);
         assert!(!config.routines.is_default());
     }
@@ -1715,6 +1725,7 @@ routines:
             max_due_per_tick: 25,
             max_agent_polls_per_tick: 50,
             default_timezone: "Asia/Seoul".to_string(),
+            agent_timeout_secs: 900,
             hot_reload: false,
         };
 

@@ -498,12 +498,21 @@ impl SupervisedWorkerRegistry {
                     return Ok(None);
                 };
                 let routines_config = self.config.routines.clone();
+                let routine_health_target = self
+                    .config
+                    .kanban
+                    .human_alert_channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("channel:{value}"));
                 let routine_health_registry = self.health_registry.clone();
                 self.register_tokio(spec, async move {
                     super::routine_runtime_loop(
                         routine_pg_pool,
                         routine_health_registry,
                         routines_config,
+                        routine_health_target,
                         tick_secs,
                     )
                     .await;
