@@ -1466,6 +1466,7 @@ async fn archive_duplicate_slot_threads(
     client: &reqwest::Client,
     token: &str,
     discord_api_base: &str,
+    pg_pool: Option<&PgPool>,
     expected_parent: u64,
     keep_thread_id: &str,
     candidate_thread_ids: &[String],
@@ -1521,6 +1522,22 @@ async fn archive_duplicate_slot_threads(
             .unwrap_or(false);
         if already_archived {
             continue;
+        }
+
+        match super::thread_reuse::should_defer_thread_archive_pg(pg_pool, thread_id).await {
+            Ok(true) => {
+                tracing::warn!(
+                    "[dispatch] Skipping duplicate slot thread archive for {thread_id}: active turn or fresh inflight still present"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(
+                    "[dispatch] Skipping duplicate slot thread archive for {thread_id}: active-check failed: {err}"
+                );
+                continue;
+            }
         }
 
         match client
@@ -2531,6 +2548,7 @@ async fn send_dispatch_to_discord_inner_with_context_pg(
                         &client,
                         token,
                         discord_api_base,
+                        Some(pool),
                         channel_id_num,
                         existing_tid,
                         &existing_thread_ids,
@@ -2648,6 +2666,7 @@ async fn send_dispatch_to_discord_inner_with_context_pg(
                                 &client,
                                 token,
                                 discord_api_base,
+                                Some(pool),
                                 channel_id_num,
                                 thread_id,
                                 &existing_thread_ids,

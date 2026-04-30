@@ -250,6 +250,13 @@ pub(super) async fn clear_thread_for_channel_pg(
     Ok(())
 }
 
+pub(super) async fn should_defer_thread_archive_pg(
+    pg_pool: Option<&PgPool>,
+    thread_id: &str,
+) -> Result<bool, String> {
+    crate::services::discord::should_defer_thread_archive_pg(pg_pool, thread_id).await
+}
+
 /// Clear ALL thread mappings (card done).
 pub(in crate::server::routes) fn clear_all_threads<T>(_conn: &T, _card_id: &str) {}
 

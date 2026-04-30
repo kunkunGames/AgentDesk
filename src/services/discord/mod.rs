@@ -462,6 +462,92 @@ pub(crate) fn has_fresh_inflight_for_channel(channel_id: u64) -> bool {
         true
     })
 }
+
+async fn has_active_session_for_thread_pg(
+    pg_pool: Option<&sqlx::PgPool>,
+    thread_id: &str,
+) -> Result<bool, String> {
+    let Some(pool) = pg_pool else {
+        return Ok(false);
+    };
+
+    let row = sqlx::query(
+        "SELECT 1
+         FROM sessions
+         WHERE thread_channel_id = $1
+           AND LOWER(COALESCE(status, '')) IN ('turn_active', 'working')
+           AND COALESCE(last_heartbeat, created_at) > NOW() - INTERVAL '10 minutes'
+         LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("load active session for thread {thread_id}: {error}"))?;
+
+    Ok(row.is_some())
+}
+
+pub(crate) async fn should_defer_thread_archive_pg(
+    pg_pool: Option<&sqlx::PgPool>,
+    thread_id: &str,
+) -> Result<bool, String> {
+    if let Ok(channel_id) = thread_id.parse::<u64>()
+        && has_fresh_inflight_for_channel(channel_id)
+    {
+        return Ok(true);
+    }
+
+    has_active_session_for_thread_pg(pg_pool, thread_id).await
+}
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+mod thread_archive_guard_tests {
+    use super::*;
+    use crate::services::provider::ProviderKind;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn thread_archive_guard_defers_for_fresh_inflight_without_db() {
+        let _guard = runtime_store::lock_test_env();
+        let root = TempDir::new().expect("temp root");
+        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+
+        let channel_id = 9_001_455;
+        let state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            123,
+            456,
+            789,
+            "active turn".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-codex-adk-cdx-t9001455".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        inflight::save_inflight_state(&state).expect("save inflight");
+
+        assert!(
+            should_defer_thread_archive_pg(None, &channel_id.to_string())
+                .await
+                .expect("archive guard")
+        );
+        assert!(
+            !should_defer_thread_archive_pg(None, "9001456")
+                .await
+                .expect("archive guard")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+    }
+}
+
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
