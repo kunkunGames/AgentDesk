@@ -211,7 +211,12 @@ impl RoutineDiscordLogger {
 
         let bot = match resolve_agent_provider_bot(&self.pool, agent_id).await {
             Ok(bot) => bot,
-            Err(error) => return RoutineDiscordLogStatus::failed(error),
+            Err(error) => {
+                tracing::warn!(
+                    "routine log provider bot resolution failed for {agent_id}: {error}; falling back to notify"
+                );
+                "notify".to_string()
+            }
         };
 
         self.log_to_target(&target, &bot, reason_code, session_key, content)
