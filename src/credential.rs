@@ -29,26 +29,27 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
+    use std::sync::OnceLock;
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
     // A helper to safely manage environment variables in tests.
     struct EnvVarGuard<'a> {
         key: String,
         previous_value: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'a, ()>,
+        _lock: MutexGuard<'a, ()>,
     }
 
     impl<'a> EnvVarGuard<'a> {
         fn set_path(key: &str, path: &Path) -> Self {
-            let guard = ENV_MUTEX.lock().unwrap();
+            let lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
             let previous_value = std::env::var_os(key);
             unsafe { std::env::set_var(key, path) };
             Self {
                 key: key.to_string(),
                 previous_value,
-                _guard: guard,
+                _lock: lock,
             }
         }
     }
