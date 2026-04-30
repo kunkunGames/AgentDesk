@@ -3,12 +3,15 @@ use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 
+use crate::services::discord::health::{HealthRegistry, resolve_bot_http};
+
 use super::runtime::RoutineRunOutcome;
 use super::store::{ClaimedRoutineRun, RecoveredRoutineRun, RoutineRecord, RoutineStore};
 
 #[derive(Clone)]
 pub struct RoutineDiscordLogger {
     pool: Arc<PgPool>,
+    health_registry: Option<Arc<HealthRegistry>>,
     health_target: Option<String>,
 }
 
@@ -22,9 +25,14 @@ pub struct RoutineDiscordLogStatus {
 }
 
 impl RoutineDiscordLogger {
-    pub fn new_with_health_target(pool: Arc<PgPool>, health_target: Option<String>) -> Self {
+    pub fn new_with_health_registry(
+        pool: Arc<PgPool>,
+        health_registry: Option<Arc<HealthRegistry>>,
+        health_target: Option<String>,
+    ) -> Self {
         Self {
             pool,
+            health_registry,
             health_target,
         }
     }
@@ -182,13 +190,19 @@ impl RoutineDiscordLogger {
     ) -> RoutineDiscordLogStatus {
         if let Some(target) = discord_thread_id.and_then(channel_target_from_id) {
             let bot = match normalized_agent_id(agent_id) {
-                Some(agent_id) => match resolve_agent_provider_bot(&self.pool, agent_id).await {
+                Some(agent_id) => match resolve_agent_log_bot(
+                    &self.pool,
+                    self.health_registry.as_deref(),
+                    agent_id,
+                )
+                .await
+                {
                     Ok(bot) => bot,
                     Err(error) => {
                         tracing::warn!(
-                            "routine thread log provider bot resolution failed for {agent_id}: {error}; falling back to notify"
+                            "routine thread log bot resolution failed for {agent_id}: {error}"
                         );
-                        "notify".to_string()
+                        return RoutineDiscordLogStatus::failed(error);
                     }
                 },
                 None => "notify".to_string(),
@@ -209,13 +223,13 @@ impl RoutineDiscordLogger {
             }
         };
 
-        let bot = match resolve_agent_provider_bot(&self.pool, agent_id).await {
+        let bot = match resolve_agent_log_bot(&self.pool, self.health_registry.as_deref(), agent_id)
+            .await
+        {
             Ok(bot) => bot,
             Err(error) => {
-                tracing::warn!(
-                    "routine log provider bot resolution failed for {agent_id}: {error}; falling back to notify"
-                );
-                "notify".to_string()
+                tracing::warn!("routine log bot resolution failed for {agent_id}: {error}");
+                return RoutineDiscordLogStatus::failed(error);
             }
         };
 
@@ -382,6 +396,64 @@ async fn resolve_agent_provider_bot(pool: &PgPool, agent_id: &str) -> Result<Str
         .resolved_primary_provider_kind()
         .map(|provider| provider.as_str().to_string())
         .ok_or_else(|| format!("agent {agent_id} has no primary provider for routine log"))
+}
+
+async fn resolve_agent_log_bot(
+    pool: &PgPool,
+    health_registry: Option<&HealthRegistry>,
+    agent_id: &str,
+) -> Result<String, String> {
+    let provider_bot = match resolve_agent_provider_bot(pool, agent_id).await {
+        Ok(bot) => Some(bot),
+        Err(error) => {
+            tracing::warn!(
+                "routine log provider bot lookup failed for {agent_id}: {error}; trying fallback bots"
+            );
+            None
+        }
+    };
+    let candidates = routine_log_bot_candidates(provider_bot.as_deref(), Some(agent_id));
+    resolve_available_log_bot(health_registry, &candidates).await
+}
+
+async fn resolve_available_log_bot(
+    health_registry: Option<&HealthRegistry>,
+    candidates: &[String],
+) -> Result<String, String> {
+    let Some(health_registry) = health_registry else {
+        return candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| "no routine discord log bot candidates".to_string());
+    };
+
+    let mut errors = Vec::new();
+    for bot in candidates {
+        match resolve_bot_http(health_registry, bot).await {
+            Ok(_) => return Ok(bot.clone()),
+            Err((status, error)) => errors.push(format!("{bot}: {status} {error}")),
+        }
+    }
+
+    Err(format!(
+        "no routine discord log bot available ({})",
+        errors.join("; ")
+    ))
+}
+
+fn routine_log_bot_candidates(provider_bot: Option<&str>, agent_id: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for bot in [provider_bot, agent_id, Some("notify")]
+        .into_iter()
+        .flatten()
+    {
+        let bot = bot.trim();
+        if bot.is_empty() || candidates.iter().any(|candidate| candidate == bot) {
+            continue;
+        }
+        candidates.push(bot.to_string());
+    }
+    candidates
 }
 
 fn normalized_agent_id(agent_id: Option<&str>) -> Option<&str> {
@@ -568,6 +640,19 @@ mod tests {
         assert_eq!(status.status, "skipped");
         assert_eq!(status.warning_code, None);
         assert_eq!(status.warning, None);
+    }
+
+    #[test]
+    fn routine_log_bot_candidates_dedupes_and_keeps_notify_fallback() {
+        assert_eq!(
+            routine_log_bot_candidates(Some("codex"), Some("maker")),
+            vec!["codex", "maker", "notify"]
+        );
+        assert_eq!(
+            routine_log_bot_candidates(Some(" maker "), Some("maker")),
+            vec!["maker", "notify"]
+        );
+        assert_eq!(routine_log_bot_candidates(None, Some("")), vec!["notify"]);
     }
 
     #[test]
