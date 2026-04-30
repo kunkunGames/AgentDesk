@@ -91,6 +91,35 @@ function observationOccurrences(obs) {
   return Math.min(50, Math.floor(value));
 }
 
+function utf8CharBytes(ch) {
+  const codePoint = ch.codePointAt(0);
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
+}
+
+function utf8ByteLength(value) {
+  let bytes = 0;
+  for (const ch of String(value || "")) {
+    bytes += utf8CharBytes(ch);
+  }
+  return bytes;
+}
+
+function truncateUtf8(value, maxBytes) {
+  if (maxBytes <= 0) return "";
+  let bytes = 0;
+  let out = "";
+  for (const ch of String(value || "")) {
+    const nextBytes = utf8CharBytes(ch);
+    if (bytes + nextBytes > maxBytes) break;
+    out += ch;
+    bytes += nextBytes;
+  }
+  return out;
+}
+
 // --- Daily cap reset ---
 
 function resetDailyCapIfNeeded(cp, nowStr) {
@@ -543,17 +572,15 @@ ${handoffAcceptance}
 구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.
 이 요청은 제안 전용입니다.`;
 
-  if (Buffer.byteLength(raw) <= PROMPT_CAP_BYTES) {
+  if (utf8ByteLength(raw) <= PROMPT_CAP_BYTES) {
     return raw;
   }
 
   // Trim examples to fit cap
   const header = raw.split("## 근거 예시")[0];
   const footer = "\n\n## 지시사항\n" + raw.split("## 지시사항\n")[1];
-  const budget = PROMPT_CAP_BYTES - Buffer.byteLength(header) - Buffer.byteLength(footer) - 20;
-  const trimmedEvidence = budget > 0 
-    ? Buffer.from(evidenceLines).slice(0, budget).toString('utf8').replace(/\uFFFD/g, '')
-    : "";
+  const budget = PROMPT_CAP_BYTES - utf8ByteLength(header) - utf8ByteLength(footer) - 20;
+  const trimmedEvidence = truncateUtf8(evidenceLines, budget);
   return header + "## 근거 예시\n" + trimmedEvidence + footer;
 }
 
@@ -616,11 +643,20 @@ agentdesk.routines.register({
       const activeCandidates = Object.values(cp.candidates).filter(
         (c) => c.state === "observing" || c.state === "recommended"
       ).length;
-      const summary = `observed=${observations.length}, candidates=${activeCandidates}, recommendations=${cp.stats.recommendations_today}`;
+      const summary = `관찰=${observations.length}, 후보=${activeCandidates}, 오늘 추천=${cp.stats.recommendations_today}`;
+      const outcomeSummary = `성공 요약: 새 자동화 추천 후보 없음 (${summary})`;
       return {
         action: "complete",
+        result: {
+          status: "ok",
+          summary,
+          outcome_summary: outcomeSummary,
+          observation_count: observations.length,
+          active_candidate_count: activeCandidates,
+          recommendations_today: cp.stats.recommendations_today,
+        },
         checkpoint: guardCheckpointSize(cp),
-        lastResult: summary,
+        lastResult: outcomeSummary,
       };
     }
 

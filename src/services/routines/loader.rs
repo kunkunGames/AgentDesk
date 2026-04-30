@@ -1040,7 +1040,27 @@ mod tests {
             .unwrap();
 
         match action {
-            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+            crate::services::routines::RoutineAction::Complete {
+                result_json,
+                checkpoint,
+                last_result,
+                ..
+            } => {
+                assert_eq!(
+                    last_result.as_deref(),
+                    Some("성공 요약: 새 자동화 추천 후보 없음 (관찰=6, 후보=0, 오늘 추천=0)")
+                );
+                let result = result_json.expect("complete action should include summary result");
+                assert_eq!(
+                    result.get("summary").and_then(Value::as_str),
+                    Some("관찰=6, 후보=0, 오늘 추천=0")
+                );
+                assert!(
+                    result
+                        .get("outcome_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("성공 요약:"))
+                );
                 let checkpoint = checkpoint.unwrap();
                 assert_eq!(
                     checkpoint
@@ -1226,6 +1246,44 @@ mod tests {
                 assert!(prompt.contains("## 게이트된 핸드오프 초안"));
                 assert!(prompt.contains("requires_human_approval"));
                 assert!(prompt.contains("구현, 파일 수정, 서비스 재시작"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_truncates_prompt_by_utf8_bytes_without_node_buffer() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let long_summary = "가나다라마바사아자차카타파하".repeat(320);
+        let observations = (0..5)
+            .map(|idx| {
+                serde_json::json!({
+                    "timestamp": "2026-04-30T06:59:00Z",
+                    "source": "routine_result",
+                    "category": "routine-candidate",
+                    "signature": "ops/long.js:complete",
+                    "summary": format!("{idx}: {long_summary}"),
+                    "occurrences": 1,
+                    "evidence_ref": format!("long:{idx}"),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.len() <= 12_288);
+                assert!(prompt.contains("## 지시사항"));
+                assert!(!prompt.contains('\u{FFFD}'));
             }
             other => panic!("unexpected action: {other:?}"),
         }
