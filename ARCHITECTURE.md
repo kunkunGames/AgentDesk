@@ -281,6 +281,7 @@ src/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
 │   │   ├── adk_session.rs
+│   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── discord_io.rs
 │   │   ├── formatting.rs
@@ -303,6 +304,7 @@ src/
 │   │   ├── org_writer.rs
 │   │   ├── placeholder_cleanup.rs
 │   │   ├── placeholder_controller.rs
+│   │   ├── placeholder_live_events.rs
 │   │   ├── placeholder_sweeper.rs
 │   │   ├── prompt_builder.rs
 │   │   ├── queue_io.rs

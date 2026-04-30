@@ -108,6 +108,7 @@
     extraction; still giant-file territory).
   - `src/services/discord/recovery_engine.rs` (4697 lines).
   - `src/services/discord/health.rs` (4533 lines).
+  - `src/services/discord/placeholder_controller.rs` (1237 lines).
   - `src/services/discord/router/message_handler.rs` (7158 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (3645 lines).
@@ -247,6 +248,7 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/platform/shell.rs` (1507) — split owned by #1281
   (GitClient extraction).
 - `src/services/platform/binary_resolver.rs` (1377).
+- `src/services/mcp_config.rs` (1072).
 - `src/services/discord/mod.rs` (5519),
   `src/services/discord_config_audit.rs` (1310), and
   `src/services/qwen_tmux_wrapper.rs` (1194).
