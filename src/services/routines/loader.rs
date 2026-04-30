@@ -1150,7 +1150,8 @@ mod tests {
             crate::services::routines::RoutineAction::Agent {
                 prompt, checkpoint, ..
             } => {
-                assert!(prompt.contains("Automatic retry or alert"));
+                assert!(prompt.contains("반복 실패 루틴에 대한 자동 재시도 또는 알림"));
+                assert!(prompt.contains("실패 요약:"));
                 let checkpoint = checkpoint.unwrap();
                 let candidate = checkpoint
                     .pointer("/candidates/ops~1retry.js:complete")
@@ -1159,7 +1160,13 @@ mod tests {
                     candidate
                         .get("suggested_automation")
                         .and_then(Value::as_str),
-                    Some("Automatic retry or alert when this routine fails repeatedly")
+                    Some("반복 실패 루틴에 대한 자동 재시도 또는 알림")
+                );
+                assert!(
+                    candidate
+                        .get("outcome_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("실패 요약:"))
                 );
                 assert_eq!(
                     candidate
@@ -1176,6 +1183,12 @@ mod tests {
                         .pointer("/gated_handoff/status")
                         .and_then(Value::as_str),
                     Some("requires_human_approval")
+                );
+                assert!(
+                    checkpoint
+                        .pointer("/recommendations/0/outcome_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("실패 요약:"))
                 );
             }
             other => panic!("unexpected action: {other:?}"),
@@ -1201,12 +1214,14 @@ mod tests {
 
         match action {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("에이전트가 도출한 내용은 반드시 한국어"));
+                assert!(prompt.contains("## 성공/실패 한 줄 요약"));
                 assert!(prompt.contains("## Before / After"));
-                assert!(prompt.contains("## Expected Implementation Files"));
-                assert!(prompt.contains("## Verification Method"));
-                assert!(prompt.contains("## Gated Handoff Draft"));
+                assert!(prompt.contains("## 예상 구현 파일"));
+                assert!(prompt.contains("## 검증 방법"));
+                assert!(prompt.contains("## 게이트된 핸드오프 초안"));
                 assert!(prompt.contains("requires_human_approval"));
-                assert!(prompt.contains("DO NOT implement"));
+                assert!(prompt.contains("구현, 파일 수정, 서비스 재시작"));
             }
             other => panic!("unexpected action: {other:?}"),
         }
@@ -1237,8 +1252,8 @@ mod tests {
             crate::services::routines::RoutineAction::Agent {
                 prompt, checkpoint, ..
             } => {
-                assert!(prompt.contains("Category: api-friction"));
-                assert!(prompt.contains("API friction monitor"));
+                assert!(prompt.contains("카테고리: api-friction"));
+                assert!(prompt.contains("API 마찰 모니터"));
                 assert!(prompt.contains("src/services/api_friction.rs"));
                 let candidate = checkpoint
                     .unwrap()
@@ -1278,8 +1293,8 @@ mod tests {
             .unwrap();
         match release_action {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
-                assert!(prompt.contains("Category: release-freshness"));
-                assert!(prompt.contains("Release freshness monitor"));
+                assert!(prompt.contains("카테고리: release-freshness"));
+                assert!(prompt.contains("릴리스 신선도 모니터"));
                 let inventory_path = ["docs", "generated", "worker-inventory.md"].join("/");
                 assert!(prompt.contains(&inventory_path));
             }
@@ -1305,8 +1320,8 @@ mod tests {
             .unwrap();
         match outbox_action {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
-                assert!(prompt.contains("Category: outbox-delivery"));
-                assert!(prompt.contains("Message outbox delivery monitor"));
+                assert!(prompt.contains("카테고리: outbox-delivery"));
+                assert!(prompt.contains("메시지 아웃박스 전달 모니터"));
                 assert!(prompt.contains("src/services/message_outbox.rs"));
             }
             other => panic!("unexpected action: {other:?}"),
@@ -1338,8 +1353,8 @@ mod tests {
             crate::services::routines::RoutineAction::Agent {
                 prompt, checkpoint, ..
             } => {
-                assert!(prompt.contains("Category: memento-hygiene"));
-                assert!(prompt.contains("Memento hygiene digest monitor"));
+                assert!(prompt.contains("카테고리: memento-hygiene"));
+                assert!(prompt.contains("Memento 위생 다이제스트 모니터"));
                 assert!(prompt.contains("src/services/memory"));
                 assert_eq!(
                     checkpoint
