@@ -494,6 +494,13 @@ ${evidenceLines || "(기록 없음)"}
 ## 성공/실패 한 줄 요약
 ${outcomeSummary}
 
+## 루트 기반 JS 자동화 패턴 탐지 가이드
+- 이 제안은 runtime이 제공한 bounded observation, checkpoint, automation inventory만 근거로 판단합니다.
+- 같은 증상이 아니라 같은 루트 원인 또는 같은 수동 작업이 반복되는지 pattern/category/count/first-last/example을 연결해 설명합니다.
+- 단순 빈도만 보지 말고 최근성, 실패 weight, 운영 ROI, 부작용, 이미 구현/억제된 자동화와의 중복 가능성을 함께 평가합니다.
+- 규칙으로 충분한 deterministic retry/check/threshold인지, 문맥 판단과 코드 변경 설계가 필요한 agent 주도 자동화인지 구분합니다.
+- 근거가 부족하거나 오탐 가능성이 높으면 자동화 보류로 결론을 내립니다.
+
 ## Before / After
 - Before: ${beforeAfter.before}
 - After: ${beforeAfter.after}
@@ -518,10 +525,11 @@ ${handoffAcceptance}
 
 ## 지시사항
 에이전트가 도출한 내용은 반드시 한국어로 작성합니다. 이 자동화를 구현할 가치가 있는지 평가하고 다음을 제공합니다:
-1. 자동화 여부(예 / 아니오 / 보류)와 이유
-2. 구현한다면 제안 구현 방식과 영향 파일/루틴
-3. 성공/실패에 대한 한 줄 요약
-4. 예상 부작용과 자동화 동작 검증 방법
+1. 자동화 여부(예 / 아니오 / 보류), 신뢰도, 그리고 이유
+2. 루트 원인 또는 반복 수동 작업 가설과 그 근거
+3. 구현한다면 제안 구현 방식, rule-vs-agent 선택 이유, 영향 파일/루틴
+4. 성공/실패에 대한 한 줄 요약
+5. 예상 부작용, 오탐/중복 억제 방법, 자동화 동작 검증 방법
 
 구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.
 이 요청은 제안 전용입니다.`;

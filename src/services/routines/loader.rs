@@ -1216,6 +1216,10 @@ mod tests {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.contains("에이전트가 도출한 내용은 반드시 한국어"));
                 assert!(prompt.contains("## 성공/실패 한 줄 요약"));
+                assert!(prompt.contains("## 루트 기반 JS 자동화 패턴 탐지 가이드"));
+                assert!(prompt.contains("루트 원인 또는 반복 수동 작업 가설"));
+                assert!(prompt.contains("rule-vs-agent 선택 이유"));
+                assert!(prompt.contains("오탐/중복 억제 방법"));
                 assert!(prompt.contains("## Before / After"));
                 assert!(prompt.contains("## 예상 구현 파일"));
                 assert!(prompt.contains("## 검증 방법"));
