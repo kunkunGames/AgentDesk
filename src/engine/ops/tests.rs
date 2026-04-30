@@ -12,7 +12,7 @@ fn test_db() -> Db {
     crate::db::test_db()
 }
 
-fn legacy_review_state_sync_for_tests(conn: &rusqlite::Connection, json_str: &str) -> String {
+fn legacy_review_state_sync_for_tests(conn: &sqlite_test::Connection, json_str: &str) -> String {
     let params: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(e) => return format!(r#"{{"error":"invalid JSON: {}"}}"#, e),
@@ -27,7 +27,7 @@ fn legacy_review_state_sync_for_tests(conn: &rusqlite::Connection, json_str: &st
     if state == "clear_verdict" {
         let result = conn.execute(
             "UPDATE card_review_state SET last_verdict = NULL, updated_at = datetime('now') WHERE card_id = ?1",
-            rusqlite::params![card_id],
+            sqlite_test::params![card_id],
         );
         return match result {
             Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),
@@ -52,7 +52,7 @@ fn legacy_review_state_sync_for_tests(conn: &rusqlite::Connection, json_str: &st
          pending_dispatch_id = CASE WHEN ?6 IS NOT NULL THEN ?6 WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id ELSE NULL END, \
          review_entered_at = COALESCE(?7, CASE WHEN ?2 = 'reviewing' THEN datetime('now') ELSE review_entered_at END), \
          updated_at = datetime('now')",
-        rusqlite::params![
+        sqlite_test::params![
             card_id,
             state,
             review_round,

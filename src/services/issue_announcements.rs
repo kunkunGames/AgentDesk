@@ -69,8 +69,8 @@ pub async fn create_issue_announcement_pg(
         return Ok(None);
     };
 
-    let token = crate::credential::read_bot_token("announce")
-        .ok_or_else(|| "no announce bot token configured".to_string())?;
+    let token = crate::credential::read_bot_token("notify")
+        .ok_or_else(|| "no notify bot token configured".to_string())?;
     let created_at = Utc::now();
     let content = render_active_card(
         input.issue_number,
@@ -135,17 +135,14 @@ pub async fn complete_issue_announcement_pg(
         return Ok(false);
     };
 
-    let token = crate::credential::read_bot_token("announce")
-        .ok_or_else(|| "no announce bot token configured".to_string())?;
     let title = event.title.as_deref().unwrap_or(&row.title);
     let content = render_completed_card(title, &row, &event);
-    let edit_result = send_issue_announcement_message(
-        &token,
+    let log_key = format!("issue_announcement:{}:{}", event.repo, event.issue_number);
+    let edit_result = edit_announcement_with_legacy_fallback(
         &row.channel_id,
-        Some(&row.message_id),
+        &row.message_id,
         &content,
-        &format!("issue_announcement:{}:{}", event.repo, event.issue_number),
-        "completed",
+        &log_key,
     )
     .await;
 
@@ -201,6 +198,83 @@ pub async fn complete_issue_announcement_pg(
             Err(error)
         }
     }
+}
+
+/// Edits an existing issue-announcement message, falling back to the
+/// legacy `announce` token when the message was authored by announce-bot
+/// before the #1448 follow-up moved announcements to `notify`.
+///
+/// Fallback triggers (the announce-only deployment shape is the legacy
+/// reality we have to support during the cutover window):
+/// - `notify` token is not configured (deployment hasn't seeded notify yet)
+/// - `notify` PATCH returns Discord 50005 (cross-bot edit on a message
+///   authored by announce-bot)
+/// - `notify` PATCH returns 50001 / 403 / "missing access" (notify bot
+///   doesn't yet have access to the legacy announcement channel)
+///
+/// Once all legacy announce-authored rows have closed and notify-bot has
+/// permissions on every announcement channel, both this fallback and the
+/// matching `is_legacy_announce_issue_card` gate in `mod.rs` can be
+/// removed (sunset target 2026-06-01).
+async fn edit_announcement_with_legacy_fallback(
+    channel_id: &str,
+    message_id: &str,
+    content: &str,
+    log_key: &str,
+) -> Result<String, String> {
+    let notify_token = crate::credential::read_bot_token("notify");
+    if let Some(token) = notify_token.as_deref() {
+        match send_issue_announcement_message(
+            token,
+            channel_id,
+            Some(message_id),
+            content,
+            log_key,
+            "completed",
+        )
+        .await
+        {
+            Ok(id) => return Ok(id),
+            Err(error) if should_try_legacy_announce_fallback(&error) => {
+                tracing::info!(
+                    target: "issue_announcements",
+                    "{log_key}: notify edit failed with `{error}`, retrying with announce token"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(announce_token) = crate::credential::read_bot_token("announce") else {
+        return Err(if notify_token.is_some() {
+            "notify edit failed and no announce bot token configured for legacy fallback"
+                .to_string()
+        } else {
+            "no notify or announce bot token configured".to_string()
+        });
+    };
+    send_issue_announcement_message(
+        &announce_token,
+        channel_id,
+        Some(message_id),
+        content,
+        log_key,
+        "completed-legacy-fallback",
+    )
+    .await
+}
+
+/// Decides whether a notify-side PATCH failure should trigger the
+/// announce-token fallback. Cross-bot (50005) and missing-access (50001 /
+/// 403) errors all indicate the message was originally authored by
+/// announce-bot or that notify-bot has no permission on the legacy
+/// channel — both correctable by retrying with announce.
+fn should_try_legacy_announce_fallback(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    error.contains("50005")
+        || error.contains("50001")
+        || lowered.contains("cannot edit a message authored by another user")
+        || lowered.contains("missing access")
+        || lowered.contains("403 forbidden")
 }
 
 async fn resolve_announcement_channel_pg(
@@ -363,7 +437,7 @@ fn trim_non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

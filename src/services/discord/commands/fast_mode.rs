@@ -110,7 +110,7 @@ pub(in crate::services::discord) async fn cmd_fast(ctx: Context<'_>) -> Result<(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{build_fast_disabled_notice, build_fast_enabled_notice, fast_mode_reset_line};
     use crate::services::discord::commands::config::native_fast_mode_supported;

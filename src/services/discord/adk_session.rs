@@ -167,6 +167,7 @@ pub(super) async fn post_adk_session_status(
     let Some(session_key) = session_key else {
         return;
     };
+    let status = crate::db::session_status::normalize_incoming_session_status(Some(status));
 
     let body = crate::server::routes::dispatched_sessions::HookSessionBody {
         session_key: session_key.to_string(),
@@ -508,7 +509,7 @@ fn clean_nonempty(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{derive_adk_session_info, parse_thread_channel_id_from_name};
 

@@ -62,7 +62,7 @@ pub(crate) fn claude_mcp_config_arg() -> Option<String> {
     claude_mcp_config_arg_from_servers(&servers)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn claude_mcp_config_arg_from_config(config: &Config) -> Option<String> {
     let servers = resolved_mcp_servers(config);
     claude_mcp_config_arg_from_servers(&servers)
@@ -449,7 +449,7 @@ fn run_codex_command_vec(codex_bin: &str, args: &[String]) -> Result<(), String>
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -106,7 +106,7 @@ fn prune_expired_analytics_cache_entries(cache: &mut HashMap<String, CachedJson>
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn reset_analytics_cache() {
     if let Ok(mut cache) = analytics_response_cache().lock() {
         cache.clear();
@@ -1467,7 +1467,7 @@ pub async fn skills_trend(
     build_analytics_response(&entry, "miss")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 
@@ -1745,7 +1745,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
-             VALUES ($1, $2, 'completed', TO_TIMESTAMP($3), TO_TIMESTAMP($4))",
+             VALUES ($1, $2, 'idle', TO_TIMESTAMP($3), TO_TIMESTAMP($4))",
         )
         .bind("qwen-session-1")
         .bind("qwen")
@@ -1774,7 +1774,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO sessions (session_key, provider, status, created_at, last_heartbeat)
-             VALUES ($1, $2, 'completed', TO_TIMESTAMP($3), TO_TIMESTAMP($4))",
+             VALUES ($1, $2, 'idle', TO_TIMESTAMP($3), TO_TIMESTAMP($4))",
         )
         .bind("opencode-session-1")
         .bind("opencode")

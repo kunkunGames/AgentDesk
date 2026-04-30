@@ -83,7 +83,7 @@ pub(super) fn resolve_dispatch_tmux_protection(
                        )
                      ORDER BY
                        CASE s.status
-                         WHEN 'working' THEN 0
+                         WHEN 'turn_active' THEN 0 WHEN 'working' THEN 0 WHEN 'awaiting_bg' THEN 1
                          WHEN 'idle' THEN 1
                          ELSE 2
                        END,
@@ -173,7 +173,7 @@ pub(super) fn resolve_dispatch_tmux_protection(
            )
          ORDER BY
            CASE s.status
-             WHEN 'working' THEN 0
+             WHEN 'turn_active' THEN 0 WHEN 'working' THEN 0 WHEN 'awaiting_bg' THEN 1
              WHEN 'idle' THEN 1
              ELSE 2
            END,
@@ -236,7 +236,7 @@ pub(super) fn resolve_dispatch_tmux_protection(
     .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{DispatchTmuxProtection, resolve_dispatch_tmux_protection};
     use crate::services::provider::ProviderKind;

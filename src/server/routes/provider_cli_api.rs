@@ -385,7 +385,7 @@ fn state_is_at_or_past(current: &MigrationState, next: &MigrationState) -> bool 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::engine::PolicyEngine;

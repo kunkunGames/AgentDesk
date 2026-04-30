@@ -1100,7 +1100,7 @@ pub(crate) fn handle_emit_launchd_plist(_args: &EmitLaunchdPlistArgs) -> Result<
     Err("emit-launchd-plist is only supported on macOS".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

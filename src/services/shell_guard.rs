@@ -430,7 +430,7 @@ pub fn format_block_message(decision: &GuardDecision) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

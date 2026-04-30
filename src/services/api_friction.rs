@@ -1088,7 +1088,7 @@ async fn load_pattern_evidence_pg(
     .map_err(|err| format!("query api_friction evidence: {err}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::fs;

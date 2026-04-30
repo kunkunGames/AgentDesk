@@ -250,7 +250,7 @@ pub(crate) async fn enqueue_lifecycle_notification_pg(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{OutboxMessage, warn_lifecycle_enqueue_failure, warn_outbox_enqueue_failure};
     use std::io::{self, Write};

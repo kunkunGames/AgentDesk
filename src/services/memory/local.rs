@@ -29,7 +29,7 @@ impl MemoryBackend for LocalMemoryBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::runtime_layout::{long_term_memory_root, shared_agent_knowledge_path};

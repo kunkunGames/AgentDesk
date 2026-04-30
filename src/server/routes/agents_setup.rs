@@ -1365,7 +1365,7 @@ fn audit_path(ctx: &SetupContext) -> PathBuf {
         .join(format!("agent-setup-{}-{now}.json", ctx.agent_id))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn maybe_forced_failure(step: &str) -> Result<(), SetupError> {
     match std::env::var("AGENTDESK_TEST_AGENT_SETUP_FAIL_AFTER") {
         Ok(value) if value == step => Err(setup_error(
@@ -1377,7 +1377,7 @@ fn maybe_forced_failure(step: &str) -> Result<(), SetupError> {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn maybe_forced_failure(_step: &str) -> Result<(), SetupError> {
     Ok(())
 }

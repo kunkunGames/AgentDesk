@@ -17,7 +17,7 @@ pub struct SqlGuardViolation {
 }
 
 impl SqlGuardViolation {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn target(self) -> SqlGuardTarget {
         self.target
     }
@@ -193,7 +193,7 @@ fn auto_queue_entries_mutation_re() -> &'static Regex {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{SqlGuardTarget, detect_core_table_write};
 

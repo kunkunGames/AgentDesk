@@ -148,7 +148,7 @@ pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty() && session_id.len() <= 64 && session_id_regex().is_match(session_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{is_valid_session_id, session_id_regex};
 

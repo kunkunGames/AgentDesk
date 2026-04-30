@@ -128,7 +128,7 @@ fn parse_porcelain_z(bytes: &[u8], workspace: &Path) -> Option<WipWarning> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::fs;

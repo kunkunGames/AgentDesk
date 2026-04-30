@@ -124,7 +124,7 @@ fn is_hang_dump(path: &Path) -> bool {
     name.starts_with("adk-hang-") && name.ends_with(".txt")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::fs::File;

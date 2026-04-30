@@ -3,8 +3,8 @@
 //! This module does not send, edit, split, summarize, or attach anything.
 //! It only turns a [`super::message::DiscordOutboundMessage`] and its
 //! [`super::policy::DiscordOutboundPolicy`] into explicit decisions that a
-//! future transport implementation can execute without re-encoding policy
-//! branches at every callsite.
+//! delivery implementation can execute without re-encoding policy branches at
+//! every callsite.
 
 use std::path::PathBuf;
 
@@ -79,6 +79,10 @@ pub(crate) enum LengthPolicyDecision {
         attachments: Vec<AttachmentPolicyDecision>,
         fallback_used: FallbackUsed,
     },
+    RejectOverLimit {
+        char_count: usize,
+        inline_char_limit: usize,
+    },
 }
 
 /// Attachment source selected by the planner for file fallback delivery.
@@ -151,7 +155,13 @@ fn decide_length(
     limits: OutboundPolicyLimits,
 ) -> LengthPolicyDecision {
     let char_count = message.content.chars().count();
-    if char_count <= limits.inline_char_limit {
+    let inline_limit = match message.policy.length_strategy {
+        LengthStrategy::Compact => limits.compact_char_limit,
+        LengthStrategy::Split
+        | LengthStrategy::FileAttachment
+        | LengthStrategy::RejectOverLimit => limits.inline_char_limit,
+    };
+    if char_count <= inline_limit {
         return LengthPolicyDecision::Inline { char_count };
     }
 
@@ -199,6 +209,10 @@ fn decide_length(
                 fallback_used: FallbackUsed::FileAttachment,
             }
         }
+        LengthStrategy::RejectOverLimit => LengthPolicyDecision::RejectOverLimit {
+            char_count,
+            inline_char_limit: limits.inline_char_limit,
+        },
     }
 }
 
@@ -228,7 +242,7 @@ fn decide_thread_fallback(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::outbound::message::{

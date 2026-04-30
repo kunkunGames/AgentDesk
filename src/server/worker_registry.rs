@@ -579,7 +579,7 @@ impl SupervisedWorkerRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage};
 

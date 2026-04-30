@@ -1,9 +1,9 @@
 use anyhow::anyhow;
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row as SqlxRow};
 
 #[derive(Debug, Default, Deserialize)]
@@ -42,7 +42,7 @@ pub(super) fn register_card_ops<'js>(
             if let Some(pool) = pg_get.as_ref() {
                 return card_get_raw_pg(pool, &card_id);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db) = db_get.as_ref() {
                 return card_get_raw_sqlite(db, &card_id);
             }
@@ -60,7 +60,7 @@ pub(super) fn register_card_ops<'js>(
             if let Some(pool) = pg_list.as_ref() {
                 return card_list_raw_pg(pool, &filter_json);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db) = db_list.as_ref() {
                 return card_list_raw_sqlite(db, &filter_json);
             }
@@ -80,7 +80,7 @@ pub(super) fn register_card_ops<'js>(
                 if let Some(pool) = pg_assign.as_ref() {
                     return card_assign_raw_pg(pool, &card_id, &agent_id);
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 if let Some(db) = db_assign.as_ref() {
                     return card_assign_raw_sqlite(db, &card_id, &agent_id);
                 }
@@ -101,7 +101,7 @@ pub(super) fn register_card_ops<'js>(
                 if let Some(pool) = pg_priority.as_ref() {
                     return card_set_priority_raw_pg(pool, &card_id, &priority);
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 if let Some(db) = db_priority.as_ref() {
                     return card_set_priority_raw_sqlite(db, &card_id, &priority);
                 }
@@ -171,7 +171,7 @@ fn card_select_sql_pg() -> &'static str {
      FROM kanban_cards kc"
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_select_sql_sqlite() -> &'static str {
     "SELECT \
         id, repo_id, title, status, priority, assigned_agent_id, \
@@ -184,7 +184,7 @@ fn card_select_sql_sqlite() -> &'static str {
      FROM kanban_cards"
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_get_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     json_result((|| {
         let conn = db
@@ -199,7 +199,7 @@ fn card_get_raw_sqlite(db: &crate::db::Db, card_id: &str) -> String {
     })())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_list_raw_sqlite(db: &crate::db::Db, filter_json: &str) -> String {
     json_result((|| {
         let filter = if filter_json.trim().is_empty() {
@@ -225,7 +225,7 @@ fn card_list_raw_sqlite(db: &crate::db::Db, filter_json: &str) -> String {
     })())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_assign_raw_sqlite(db: &crate::db::Db, card_id: &str, agent_id: &str) -> String {
     json_result((|| {
         if card_id.trim().is_empty() {
@@ -237,7 +237,7 @@ fn card_assign_raw_sqlite(db: &crate::db::Db, card_id: &str, agent_id: &str) -> 
         let changed = conn
             .execute(
                 "UPDATE kanban_cards SET assigned_agent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![agent_id, card_id],
+                sqlite_test::params![agent_id, card_id],
             )
             .map_err(|error| anyhow!("update sqlite card assignee {card_id}: {error}"))?;
         if changed == 0 {
@@ -251,7 +251,7 @@ fn card_assign_raw_sqlite(db: &crate::db::Db, card_id: &str, agent_id: &str) -> 
     })())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_set_priority_raw_sqlite(db: &crate::db::Db, card_id: &str, priority: &str) -> String {
     json_result((|| {
         if card_id.trim().is_empty() {
@@ -269,7 +269,7 @@ fn card_set_priority_raw_sqlite(db: &crate::db::Db, card_id: &str, priority: &st
         let changed = conn
             .execute(
                 "UPDATE kanban_cards SET priority = ?1, updated_at = datetime('now') WHERE id = ?2",
-                rusqlite::params![normalized, card_id],
+                sqlite_test::params![normalized, card_id],
             )
             .map_err(|error| anyhow!("update sqlite card priority {card_id}: {error}"))?;
         if changed == 0 {
@@ -283,8 +283,8 @@ fn card_set_priority_raw_sqlite(db: &crate::db::Db, card_id: &str, priority: &st
     })())
 }
 
-#[cfg(test)]
-fn card_row_to_json_sqlite(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn card_row_to_json_sqlite(row: &sqlite_test::Row<'_>) -> sqlite_test::Result<Value> {
     Ok(json!({
         "id": row.get::<_, String>(0)?,
         "repo_id": row.get::<_, Option<String>>(1)?,
@@ -321,7 +321,7 @@ fn card_row_to_json_sqlite(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn card_matches_filter(card: &Value, filter: &CardListFilter) -> bool {
     if let Some(repo_id) = filter.repo_id.as_deref()
         && card.get("repo_id").and_then(Value::as_str) != Some(repo_id)
@@ -670,7 +670,7 @@ fn json_result(result: anyhow::Result<Value>) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::io::{self, Write};

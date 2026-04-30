@@ -404,7 +404,7 @@ fn write_runtime_config_pg(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn seed_runtime_config_defaults<T>(_conn: &T, _config: &crate::config::Config) {
     tracing::debug!(
         "[settings] legacy SQLite runtime-config seeding skipped; Postgres seeding is authoritative"

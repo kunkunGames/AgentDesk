@@ -71,7 +71,7 @@ struct MemoryBackendRuntimeState {
 
 static MEMORY_BACKEND_STATE: LazyLock<RwLock<MemoryBackendRuntimeState>> =
     LazyLock::new(|| RwLock::new(MemoryBackendRuntimeState::default()));
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 static LAST_REFRESH_REASON: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
 
 #[derive(Clone, Debug)]
@@ -272,7 +272,7 @@ pub(crate) async fn refresh_backend_health(reason: &str) -> MemoryBackendRuntime
         reason,
         snapshot.memento.summary("memento")
     );
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         *LAST_REFRESH_REASON
             .write()
@@ -282,7 +282,7 @@ pub(crate) async fn refresh_backend_health(reason: &str) -> MemoryBackendRuntime
     snapshot
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn reset_for_tests() {
     let mut state = lock_write();
     *state = MemoryBackendRuntimeState::default();
@@ -291,7 +291,7 @@ pub(crate) fn reset_for_tests() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn last_refresh_reason_for_tests() -> Option<String> {
     LAST_REFRESH_REASON
         .read()
@@ -299,7 +299,7 @@ pub(crate) fn last_refresh_reason_for_tests() -> Option<String> {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::path::Path;

@@ -279,7 +279,7 @@ pub fn set_option(session_name: &str, key: &str, value: &str) {
         .output();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

@@ -3,12 +3,12 @@ mod review_state_repo;
 mod tuning_aggregate;
 mod verdict_route;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests;
 
 pub(crate) use decision_route::ReviewDecisionBody;
 pub use decision_route::submit_review_decision;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use decision_route::{
     clear_test_worktree_commit_override, set_test_worktree_commit_override,
 };

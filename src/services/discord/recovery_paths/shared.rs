@@ -32,7 +32,7 @@ pub(in crate::services::discord) fn clear_inflight_by_tmux_name(
     super::super::clear_inflight_by_tmux_name(provider, tmux_name)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

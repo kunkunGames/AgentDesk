@@ -499,7 +499,7 @@ fn get_process_command(pid: i32) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

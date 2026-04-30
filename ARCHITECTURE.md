@@ -30,7 +30,6 @@ src/
 │   ├── migrate/
 │   │   ├── apply.rs
 │   │   ├── plan.rs
-│   │   ├── postgres_cutover.rs
 │   │   ├── source.rs
 │   │   └── tests.rs
 │   ├── provider_cli/
@@ -62,6 +61,7 @@ src/
 │   ├── schema.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
+│   ├── session_status.rs
 │   ├── session_transcripts.rs
 │   ├── table_metadata.rs
 │   └── turns.rs
@@ -201,8 +201,29 @@ src/
 │   │   ├── mod.rs
 │   │   └── regression_alerts.rs
 │   ├── auto_queue/
+│   │   ├── activate_bridge.rs
+│   │   ├── activate_command.rs
+│   │   ├── activate_preflight.rs
+│   │   ├── activate_route.rs
 │   │   ├── cancel_run.rs
-│   │   └── runtime.rs
+│   │   ├── command.rs
+│   │   ├── control_routes.rs
+│   │   ├── dispatch_assignment_command.rs
+│   │   ├── dispatch_command.rs
+│   │   ├── dispatch_query.rs
+│   │   ├── fsm.rs
+│   │   ├── order_routes.rs
+│   │   ├── phase_gate.rs
+│   │   ├── planning.rs
+│   │   ├── query.rs
+│   │   ├── route.rs
+│   │   ├── route_dispatch.rs
+│   │   ├── route_generate.rs
+│   │   ├── route_types.rs
+│   │   ├── runtime.rs
+│   │   ├── slot_routes.rs
+│   │   ├── view.rs
+│   │   └── view_admin_routes.rs
 │   ├── discord/
 │   │   ├── commands/
 │   │   │   ├── command_policy.rs
@@ -222,6 +243,7 @@ src/
 │   │   │   └── text_commands.rs
 │   │   ├── outbound/
 │   │   │   ├── decision.rs
+│   │   │   ├── delivery.rs
 │   │   │   ├── legacy.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
@@ -255,6 +277,8 @@ src/
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── tests.rs
 │   │   │   └── tmux_runtime.rs
+│   │   ├── watchers/
+│   │   │   └── lifecycle.rs
 │   │   ├── adk_session.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── discord_io.rs
@@ -300,6 +324,13 @@ src/
 │   │   ├── tmux_overload_retry.rs
 │   │   ├── tmux_reaper.rs
 │   │   └── tmux_restart_handoff.rs
+│   ├── git/
+│   │   ├── branch_resolver.rs
+│   │   ├── commit_resolver.rs
+│   │   ├── mod.rs
+│   │   ├── remote.rs
+│   │   ├── repo_resolver.rs
+│   │   └── worktree_resolver.rs
 │   ├── maintenance/
 │   │   ├── jobs/
 │   │   │   ├── db_retention.rs
@@ -319,6 +350,7 @@ src/
 │   │   ├── events.rs
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
+│   │   ├── session_inventory.rs
 │   │   └── watcher_latency.rs
 │   ├── platform/
 │   │   ├── binary_resolver.rs
@@ -394,6 +426,7 @@ src/
 ├── config.rs
 ├── credential.rs
 ├── error.rs
+├── high_risk_recovery.rs
 ├── integration_tests.rs
 ├── kanban.rs
 ├── launch.rs
@@ -435,6 +468,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |
 | `src/credential.rs` | Reads runtime credential files such as Discord bot tokens from the AgentDesk root. |
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
+| `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
 | `src/integration_tests.rs` | End-to-end pipeline, dispatch, review, and recovery integration test harness. |
 | `src/kanban.rs` | High-level kanban orchestration and transition entrypoints. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |

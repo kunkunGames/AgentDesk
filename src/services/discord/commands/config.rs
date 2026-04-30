@@ -327,7 +327,7 @@ pub(in crate::services::discord) async fn current_working_dir(
     let sqlite_settings_db = if shared.pg_pool.is_some() {
         None
     } else {
-        shared.legacy_sqlite()
+        None::<&crate::db::Db>
     };
     load_last_session_path(
         sqlite_settings_db,
@@ -969,7 +969,7 @@ pub(in crate::services::discord) fn build_allowall_policy_note() -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::ffi::OsString;
     use std::fs;

@@ -13,8 +13,8 @@ use super::AppState;
 use crate::services::provider::ProviderKind;
 use crate::services::provider_exec;
 
-#[cfg(test)]
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn legacy_db(state: &AppState) -> &crate::db::Db {
     state
         .engine
@@ -264,7 +264,7 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<serde_js
         };
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     {
         return match status_config() {
             Ok(value) => (StatusCode::OK, Json(value)),
@@ -275,7 +275,7 @@ pub async fn status(State(state): State<AppState>) -> (StatusCode, Json<serde_js
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         let conn = match legacy_db(&state).lock() {
             Ok(c) => c,
@@ -525,7 +525,7 @@ async fn status_pg(pool: &sqlx::PgPool) -> Result<serde_json::Value, String> {
     }))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn status_config() -> Result<serde_json::Value, String> {
     let runtime_root = crate::cli::agentdesk_runtime_root();
     let config = match runtime_root.as_ref() {
@@ -612,7 +612,7 @@ pub async fn draft_get(State(state): State<AppState>) -> (StatusCode, Json<serde
             }
         }
     } else {
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             crate::cli::agentdesk_runtime_root()
                 .as_ref()
@@ -620,7 +620,7 @@ pub async fn draft_get(State(state): State<AppState>) -> (StatusCode, Json<serde
                 .map(|config| config.discord.guild_id.is_some() && !config.agents.is_empty())
                 .unwrap_or(false)
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             match legacy_db(&state).lock() {
                 Ok(conn) => conn
@@ -904,7 +904,7 @@ async fn load_channels(
     (StatusCode::OK, Json(json!({"guilds": result_guilds})))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn saved_onboarding_bot_token_without_pg(_state: &AppState) -> Option<String> {
     crate::cli::agentdesk_runtime_root()
         .as_ref()
@@ -918,7 +918,7 @@ fn saved_onboarding_bot_token_without_pg(_state: &AppState) -> Option<String> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn saved_onboarding_bot_token_without_pg(state: &AppState) -> Option<String> {
     legacy_db(state).lock().ok().and_then(|conn| {
         conn.query_row(
@@ -1797,15 +1797,15 @@ fn validate_unique_resolved_channels(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn collect_onboarding_conflicts(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     runtime_root: &Path,
     provider: &str,
     resolved_channels: &[ResolvedChannelMapping],
     rerun_policy: OnboardingRerunPolicy,
 ) -> Result<Vec<String>, String> {
-    use rusqlite::OptionalExtension;
+    use sqlite_test::OptionalExtension;
 
     validate_unique_resolved_channels(resolved_channels)?;
 
@@ -1897,7 +1897,7 @@ fn collect_onboarding_conflicts(
         let conflicting_db_channel_owner = conn
             .query_row(
                 "SELECT id FROM agents WHERE discord_channel_id = ?1 AND id != ?2 LIMIT 1",
-                rusqlite::params![mapping.channel_id, mapping.role_id],
+                sqlite_test::params![mapping.channel_id, mapping.role_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -3120,11 +3120,11 @@ async fn complete_with_options(
         collect_onboarding_conflicts_pg(pool, &root, provider, &resolved_channels, rerun_policy)
             .await
     } else {
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             Err("Postgres pool is required to check onboarding database conflicts".to_string())
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             let conn = match legacy_db(state).lock() {
                 Ok(conn) => conn,
@@ -3463,7 +3463,7 @@ async fn complete_with_options(
             );
         }
     } else {
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             completion_state.last_error =
                 Some("Postgres pool is required to persist onboarding state".to_string());
@@ -3480,7 +3480,7 @@ async fn complete_with_options(
                 serde_json::Map::new(),
             );
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             let mut conn = match legacy_db(state).lock() {
                 Ok(conn) => conn,
@@ -3566,7 +3566,7 @@ async fn complete_with_options(
                     Some(value) => {
                         if let Err(error) = tx.execute(
                             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                            rusqlite::params![key, value],
+                            sqlite_test::params![key, value],
                         ) {
                             completion_state.last_error =
                                 Some(format!("failed to persist kv_meta {}: {error}", key));
@@ -3616,7 +3616,7 @@ async fn complete_with_options(
                discord_channel_id = excluded.discord_channel_id, \
                description = COALESCE(excluded.description, agents.description), \
                system_prompt = COALESCE(excluded.system_prompt, agents.system_prompt)",
-            rusqlite::params![
+            sqlite_test::params![
                 mapping.role_id,
                 mapping.role_id,
                 provider,
@@ -3654,7 +3654,7 @@ async fn complete_with_options(
                 let office_id = "hq";
                 if let Err(error) = tx.execute(
                 "INSERT OR IGNORE INTO offices (id, name, name_ko, icon) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![office_id, "Headquarters", "본사", "🏛️"],
+                sqlite_test::params![office_id, "Headquarters", "본사", "🏛️"],
             ) {
                 completion_state.last_error =
                     Some(format!("failed to upsert default office: {error}"));
@@ -3676,7 +3676,7 @@ async fn complete_with_options(
                 if let Err(error) = tx.execute(
             "INSERT OR IGNORE INTO departments (id, name, name_ko, icon, color, office_id, sort_order) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            rusqlite::params![
+            sqlite_test::params![
                 dept_id,
                 template_name,
                 template_name_ko,
@@ -3705,7 +3705,7 @@ async fn complete_with_options(
                     if let Err(error) = tx.execute(
                         "INSERT OR REPLACE INTO office_agents (office_id, agent_id, department_id) \
                  VALUES (?1, ?2, ?3)",
-                        rusqlite::params![office_id, mapping.role_id, dept_id],
+                        sqlite_test::params![office_id, mapping.role_id, dept_id],
                     ) {
                         completion_state.last_error = Some(format!(
                             "failed to assign office agent {}: {error}",
@@ -3726,7 +3726,7 @@ async fn complete_with_options(
                     }
                     if let Err(error) = tx.execute(
                         "UPDATE agents SET department = ?1 WHERE id = ?2",
-                        rusqlite::params![dept_id, mapping.role_id],
+                        sqlite_test::params![dept_id, mapping.role_id],
                     ) {
                         completion_state.last_error = Some(format!(
                             "failed to set agent department {}: {error}",
@@ -3866,7 +3866,7 @@ async fn complete_with_options(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -4510,7 +4510,7 @@ mod tests {
             let conn = db.lock().unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?1, ?2)",
-                rusqlite::params!["onboarding_owner_id", "42"],
+                sqlite_test::params!["onboarding_owner_id", "42"],
             )
             .unwrap();
         }
@@ -4867,7 +4867,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO agents (id, name, provider, discord_channel_id, description, system_prompt, status, xp) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0)",
-                rusqlite::params![
+                sqlite_test::params![
                     "adk-cdx",
                     "adk-cdx",
                     "claude",

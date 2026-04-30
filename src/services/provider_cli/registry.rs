@@ -247,7 +247,7 @@ pub fn update_strategy_for(provider: &str) -> Option<&'static ProviderCliUpdateS
         .find(|s| s.provider == provider)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

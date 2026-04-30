@@ -88,7 +88,7 @@ pub struct CreatedDispatch {
 /// Test-only legacy convenience wrapper for executing intents with a SQLite
 /// handle. Production callers must use `execute_intents_with_backends` so PG is
 /// explicit and transition intents can route through the PG executor.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn execute_intents(
     db: &crate::db::Db,
     engine: Option<&crate::engine::PolicyEngine>,
@@ -384,7 +384,7 @@ fn execute_create_dispatch(
             .ok()
             .flatten()
         } else {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             {
                 db.and_then(|db| {
                     db.separate_conn().ok().and_then(|conn| {
@@ -398,7 +398,7 @@ fn execute_create_dispatch(
                     })
                 })
             }
-            #[cfg(not(test))]
+            #[cfg(not(feature = "legacy-sqlite-tests"))]
             {
                 let _ = db;
                 None
@@ -583,12 +583,12 @@ fn execute_delete_kv(
     .map_err(anyhow::Error::msg)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 
     fn test_db() -> crate::db::Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = sqlite_test::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -684,7 +684,7 @@ mod tests {
 
     // ── #158: card_review_state guard tests ─────────────────────
 
-    fn insert_test_card(conn: &rusqlite::Connection, card_id: &str) {
+    fn insert_test_card(conn: &sqlite_test::Connection, card_id: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO agents (id, name, discord_channel_id) VALUES ('agent-1', 'Test', '111')",
             [],
@@ -696,7 +696,7 @@ mod tests {
         ).unwrap();
     }
 
-    fn legacy_review_sync_for_tests(conn: &rusqlite::Connection, json_str: &str) -> String {
+    fn legacy_review_sync_for_tests(conn: &sqlite_test::Connection, json_str: &str) -> String {
         let params: serde_json::Value = serde_json::from_str(json_str).unwrap();
         let card_id = params["card_id"].as_str().unwrap_or("");
         let state = params["state"].as_str().unwrap_or("");
@@ -710,7 +710,7 @@ mod tests {
              last_verdict = COALESCE(?3, last_verdict), \
              pending_dispatch_id = CASE WHEN ?4 IS NOT NULL THEN ?4 WHEN ?2 = 'suggestion_pending' THEN pending_dispatch_id ELSE NULL END, \
              updated_at = datetime('now')",
-            rusqlite::params![card_id, state, last_verdict, pending_dispatch_id],
+            sqlite_test::params![card_id, state, last_verdict, pending_dispatch_id],
         );
         match result {
             Ok(n) => format!(r#"{{"ok":true,"rows_affected":{n}}}"#),

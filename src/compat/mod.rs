@@ -41,7 +41,7 @@ pub mod legacy_tmp_paths;
 pub use deprecated_alias::log_deprecated_alias;
 pub use legacy_tmp_paths::legacy_tmp_session_path;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     //! Tagged test suite for the compat module.
     //!
@@ -91,7 +91,7 @@ mod tests {
 
     /// Source-grep helper. Counts non-test callers of `symbol` across the
     /// `src/` tree, excluding `src/compat/` (the shim itself) and
-    /// `#[cfg(test)]` blocks.
+    /// `#[cfg(all(test, feature = "legacy-sqlite-tests"))]` blocks.
     ///
     /// The grep walks the crate source directory at compile time via
     /// `CARGO_MANIFEST_DIR`, so it runs in `cargo test` and CI without

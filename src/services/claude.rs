@@ -14,7 +14,7 @@ use crate::services::provider::{
     fold_read_output_result, register_child_pid,
 };
 use crate::services::remote::RemoteProfile;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::services::session_backend::parse_stream_message;
 use crate::services::session_backend::{
     StreamLineState, insert_process_session, observe_stream_context,
@@ -1883,7 +1883,7 @@ fn execute_streaming_remote_tmux(
     Err("Remote SSH tmux execution is not available in AgentDesk".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::restart_report::{

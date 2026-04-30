@@ -1,27 +1,74 @@
 # Allowlist for scripts/audit_maintainability.py (#1282).
 #
-# Each entry is a repo-relative POSIX path. Keep this list narrow:
-# additions must reference an issue or rationale in a comment on the
-# preceding line so future reviewers can decide whether to retire them.
+# Each entry is either a repo-relative POSIX path or a path:line finding.
+# Keep this list narrow: additions to hard-gated checks must reference an
+# open extraction or cleanup issue in a nearby comment so future reviewers
+# can decide whether to retire them.
 #
-# The audit is non-blocking, so allowlisting is mostly about keeping the
-# generated report short — not about silencing genuine regressions.
+# Hard-gated checks use this file as the current-HEAD baseline only. New
+# regressions should remove code, update change-surfaces.md when appropriate,
+# or link an open extraction issue before adding another exclusion.
 
-# Giant files: legacy modules pending split (see follow-up issues).
+# Giant files: change-surfaces.md is the source of truth. This list should
+# normally stay empty; add entries only for temporary parser gaps with an
+# open extraction issue.
 giant_files = [
-  # Discord recovery decision tree — split tracked by #1283 follow-up.
-  "src/services/discord/recovery_engine.rs",
-  # Tracing span helpers grew large; refactor candidate.
-  "src/integration_tests.rs",
 ]
 
 # Route SRP: temporary tolerated mixed-concerns route handlers.
 route_srp_violations = [
 ]
 
-# Direct Discord sends: only the outbound dispatcher is allowed; nothing
-# here yet.
+# Direct Discord sends: current baseline captured for #1436 outbound v3
+# extraction. Entries are path:line so new callsites in the same file still
+# fail the hard gate. Line numbers for tmux.rs / turn_bridge / mod.rs /
+# health.rs were refreshed in #1440 after the #1435 tmux watcher-lifecycle
+# extraction shifted callsites; #1450 refreshes the remaining drift detected
+# by CI with no logical regressions.
 direct_discord_sends = [
+  "src/services/discord/commands/model_picker.rs:60",
+  "src/services/discord/commands/skill.rs:286",
+  "src/services/discord/commands/skill.rs:352",
+  "src/services/discord/commands/text_commands.rs:975",
+  "src/services/discord/commands/text_commands.rs:1239",
+  "src/services/discord/discord_io.rs:364",
+  "src/services/discord/formatting.rs:2171",
+  "src/services/discord/formatting.rs:2226",
+  "src/services/discord/formatting.rs:2333",
+  "src/services/discord/formatting.rs:2390",
+  "src/services/discord/gateway.rs:186",
+  "src/services/discord/gateway.rs:210",
+  "src/services/discord/gateway.rs:237",
+  "src/services/discord/health.rs:2418",
+  "src/services/discord/health.rs:2464",
+  "src/services/discord/meeting_orchestrator.rs:654",
+  "src/services/discord/meeting_orchestrator.rs:678",
+  "src/services/discord/mod.rs:2103",
+  "src/services/discord/monitoring_status.rs:50",
+  "src/services/discord/monitoring_status.rs:74",
+  "src/services/discord/placeholder_controller.rs:202",
+  "src/services/discord/placeholder_controller.rs:270",
+  "src/services/discord/placeholder_controller.rs:348",
+  "src/services/discord/router/intake_gate.rs:370",
+  "src/services/discord/tmux.rs:1273",
+  "src/services/discord/tmux.rs:3380",
+  "src/services/discord/tmux.rs:3390",
+  "src/services/discord/tmux.rs:3421",
+  "src/services/discord/tmux.rs:3462",
+  "src/services/discord/tmux.rs:3516",
+  "src/services/discord/tmux.rs:3599",
+  "src/services/discord/tmux.rs:3677",
+  "src/services/discord/tmux.rs:3797",
+  "src/services/discord/tmux.rs:4071",
+  "src/services/discord/turn_bridge/mod.rs:1100",
+  "src/services/discord/turn_bridge/mod.rs:1483",
+  "src/services/discord/turn_bridge/mod.rs:2044",
+  "src/services/discord/turn_bridge/mod.rs:2047",
+  "src/services/discord/turn_bridge/mod.rs:2129",
+  "src/services/discord/turn_bridge/mod.rs:2168",
+  "src/services/discord/turn_bridge/mod.rs:2496",
+  "src/services/discord/turn_bridge/mod.rs:2714",
+  "src/services/discord/turn_bridge/mod.rs:2995",
 ]
 
 # Manual JSON row mapping: legacy mapping callsites pending typed migration.
@@ -36,8 +83,10 @@ limit_clamp_duplication = [
 git_subprocess_callsites = [
 ]
 
-# Legacy SQLite references: cli/migrate and compat are exempt by path rule
-# already; this list is for anything else that is unavoidable.
+# Legacy SQLite references: cli/migrate, compat, and db/legacy_sqlite are
+# exempt by path rule already. Baseline cleared in #1440 — keep this list
+# empty; new violations should be removed from production sources rather
+# than allowlisted.
 legacy_sqlite_refs = [
 ]
 

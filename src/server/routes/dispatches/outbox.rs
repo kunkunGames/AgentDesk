@@ -201,9 +201,9 @@ fn generic_outbox_delivery_result(
     DispatchNotifyDeliveryResult::success(dispatch_id, action, detail)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn dispatch_notify_delivery_suppressed_sqlite(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     dispatch_id: &str,
 ) -> bool {
     let status: Option<String> = conn
@@ -389,18 +389,18 @@ pub(crate) async fn process_outbox_batch<N: OutboxNotifier>(
     db: &crate::db::Db,
     notifier: &N,
 ) -> usize {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         return process_outbox_batch_with_pg(Some(db), None, notifier).await;
     }
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     {
         let _ = (db, notifier);
         0
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, notifier: &N) -> usize {
     let pending: Vec<DispatchOutboxRow> = {
         let conn = match db.lock() {
@@ -458,7 +458,7 @@ async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, noti
                                 delivery_status = ?2,
                                 delivery_result = ?3
                           WHERE id = ?1",
-                        rusqlite::params![id, delivery_result.status, delivery_result_json],
+                        sqlite_test::params![id, delivery_result.status, delivery_result_json],
                     )
                     .ok();
                 }
@@ -524,7 +524,7 @@ async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, noti
                                 delivery_status = ?2,
                                 delivery_result = ?3
                           WHERE id = ?1",
-                        rusqlite::params![id, delivery_result.status, delivery_result_json],
+                        sqlite_test::params![id, delivery_result.status, delivery_result_json],
                     )
                     .ok();
                     if action == "notify" {
@@ -560,7 +560,7 @@ async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, noti
                                     delivery_status = ?4,
                                     delivery_result = ?5
                               WHERE id = ?3",
-                            rusqlite::params![
+                            sqlite_test::params![
                                 err,
                                 new_count,
                                 id,
@@ -581,7 +581,7 @@ async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, noti
                                     retry_count = ?2,
                                     next_attempt_at = datetime('now', '+' || ?3 || ' seconds')
                               WHERE id = ?4",
-                            rusqlite::params![err, new_count, backoff_secs, id],
+                            sqlite_test::params![err, new_count, backoff_secs, id],
                         )
                         .ok();
                     }
@@ -598,7 +598,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
     pg_pool: Option<&PgPool>,
     notifier: &N,
 ) -> usize {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if pg_pool.is_none() {
         return match db {
             Some(db) => process_outbox_batch_sqlite(db, notifier).await,
@@ -606,7 +606,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
         };
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let _ = (db, notifier);
     let Some(pool) = pg_pool else {
         return 0;
@@ -776,7 +776,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
     count
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) async fn process_outbox_batch_with_real_notifier(
     db: Option<&crate::db::Db>,
     pg_pool: &PgPool,
@@ -1814,7 +1814,7 @@ fn truncate_dispatch_message(message: &str) -> String {
 //
 // Thin re-exports kept for the in-module tests at the bottom of this file
 // (still asserting Postgres `dispatch_outbox` insert semantics end-to-end).
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::services::dispatches_followup::{
     queue_dispatch_followup_pg, queue_dispatch_followup_sync,
 };
@@ -1956,7 +1956,7 @@ pub(crate) async fn dispatch_outbox_loop(pg_pool: Arc<PgPool>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::server::routes::dispatches::discord_delivery;

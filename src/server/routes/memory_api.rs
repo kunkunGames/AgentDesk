@@ -469,7 +469,7 @@ async fn memento_remember(body: &RememberBody) -> Result<(), String> {
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::db::test_db;

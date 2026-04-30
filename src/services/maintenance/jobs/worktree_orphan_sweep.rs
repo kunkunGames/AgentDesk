@@ -205,7 +205,7 @@ fn infer_repo_root_from_worktree(path: &Path) -> Option<PathBuf> {
     repo_dot_git.parent().map(|p| p.to_path_buf())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

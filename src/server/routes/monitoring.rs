@@ -111,7 +111,7 @@ fn schedule_render(state: &AppState, channel_id: u64) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

@@ -41,7 +41,7 @@ use crate::services::discord::outbound::{
 };
 
 /// Lock used to serialize env-var mutations across the harness. Mirrors the
-/// `routes_tests::env_lock` pattern so we never race with other `#[cfg(test)]`
+/// `routes_tests::env_lock` pattern so we never race with other `#[cfg(all(test, feature = "legacy-sqlite-tests"))]`
 /// code that touches `AGENTDESK_ROOT_DIR` or
 /// `AGENTDESK_TEST_AGENT_SETUP_FAIL_AFTER`.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {

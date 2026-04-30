@@ -1475,7 +1475,7 @@ fn should_run_http_only_onboarding(token: Option<&str>, launch_config_count: usi
     token.is_none() && launch_config_count == 0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::should_run_http_only_onboarding;
 

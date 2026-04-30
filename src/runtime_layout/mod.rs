@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use legacy_migration::remove_legacy_path;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use paths::{clear_test_home_dir_override, set_test_home_dir_override};
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use skill_sync::ensure_managed_skill_dir;
 
 pub(crate) use config_merge::preview_role_map_merge;
@@ -644,7 +644,7 @@ fn remove_link_or_path(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::io::{self, Write};

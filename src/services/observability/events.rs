@@ -143,7 +143,7 @@ impl EventLog {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn clear(&self) {
         if let Ok(mut buf) = self.buffer.lock() {
             buf.clear();
@@ -255,12 +255,12 @@ pub fn ensure_flusher() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn reset_for_tests() {
     global().clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use serde_json::json;

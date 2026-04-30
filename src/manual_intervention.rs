@@ -34,7 +34,7 @@ pub(crate) fn requires_manual_intervention(
     manual_intervention_fingerprint(review_status, blocked_reason).is_some()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

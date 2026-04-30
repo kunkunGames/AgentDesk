@@ -24,7 +24,10 @@ use super::stale_resume::{
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,
 };
 use super::tmux_runtime::should_resume_watcher_after_turn;
-use super::{advance_tmux_relay_confirmed_end, turn_bridge_replace_outcome_committed};
+use super::{
+    advance_tmux_relay_confirmed_end, monitor_handoff_tool_context,
+    should_delegate_bridge_relay_to_watcher, turn_bridge_replace_outcome_committed,
+};
 use crate::db::turns::TurnTokenUsage;
 use crate::services::agent_protocol::StreamMessage;
 use crate::services::discord::ChannelId;
@@ -48,7 +51,7 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -56,6 +59,102 @@ type TestGatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 struct CleanupFallbackQueueGateway {
     dispatch_count: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct CountingGateway {
+    send_count: Arc<AtomicUsize>,
+    edit_count: Arc<AtomicUsize>,
+    replace_count: Arc<AtomicUsize>,
+    remove_reaction_count: Arc<AtomicUsize>,
+}
+
+impl TurnGateway for CountingGateway {
+    fn send_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<MessageId, String>> {
+        self.send_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(MessageId::new(1487799916758827333)) })
+    }
+
+    fn edit_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        self.edit_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replace_message_with_outcome<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
+        self.replace_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        self.remove_reaction_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {})
+    }
+
+    fn schedule_retry_with_history<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _user_message_id: MessageId,
+        _user_text: &'a str,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn dispatch_queued_turn<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _intervention: &'a super::super::Intervention,
+        _request_owner_name: &'a str,
+        _has_more_queued_turns: bool,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn validate_live_routing<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn requester_mention(&self) -> Option<String> {
+        None
+    }
+
+    fn can_chain_locally(&self) -> bool {
+        true
+    }
+
+    fn bot_owner_provider(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Codex)
+    }
 }
 
 impl TurnGateway for CleanupFallbackQueueGateway {
@@ -144,6 +243,20 @@ impl TurnGateway for CleanupFallbackQueueGateway {
 
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
         Some(ProviderKind::Codex)
+    }
+}
+
+fn test_watcher_handle(tmux_session_name: &str, paused: bool) -> super::super::TmuxWatcherHandle {
+    super::super::TmuxWatcherHandle {
+        tmux_session_name: tmux_session_name.to_string(),
+        paused: Arc::new(AtomicBool::new(paused)),
+        resume_offset: Arc::new(std::sync::Mutex::new(None)),
+        cancel: Arc::new(AtomicBool::new(false)),
+        pause_epoch: Arc::new(AtomicU64::new(1)),
+        turn_delivered: Arc::new(AtomicBool::new(false)),
+        last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+            super::super::tmux_watcher_now_ms(),
+        )),
     }
 }
 
@@ -236,6 +349,19 @@ fn advance_tmux_relay_confirmed_end_updates_shared_floor_monotonically() {
         relay_coord.confirmed_end_offset.load(Ordering::Acquire),
         128
     );
+}
+
+#[test]
+fn monitor_handoff_tool_context_prefers_last_tool_summary_over_finalized_line() {
+    let (tool, command) =
+        monitor_handoff_tool_context(Some("Bash"), Some("cargo test"), Some("⚠ Bash: cargo test"));
+    assert_eq!(tool.as_deref(), Some("Bash"));
+    assert_eq!(command.as_deref(), Some("cargo test"));
+
+    let (fallback_tool, fallback_command) =
+        monitor_handoff_tool_context(None, Some("…"), Some("⚠ Bash: cargo test"));
+    assert_eq!(fallback_tool.as_deref(), Some("⚠ Bash: cargo test"));
+    assert_eq!(fallback_command, None);
 }
 
 #[test]
@@ -425,6 +551,316 @@ async fn replace_fallback_preserves_cleanup_inflight_and_defers_queued_dispatch(
     crate::services::discord::clear_inflight_state(&provider, channel_id.get());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_tmux_watcher_owner_suppresses_bridge_assistant_delivery() {
+    let shared = make_shared_data_for_tests();
+    let provider = ProviderKind::Codex;
+    let channel_id = ChannelId::new(1485506232256168033);
+    let channel_name = format!("adk-cdx-t{}", channel_id.get());
+    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    let user_msg_id = MessageId::new(1487795113240559799);
+    let current_msg_id = MessageId::new(1487799916758827199);
+
+    assert!(super::super::tmux::try_claim_watcher(
+        &shared.tmux_watchers,
+        channel_id,
+        test_watcher_handle(&tmux_name, true),
+    ));
+
+    let gateway = Arc::new(CountingGateway::default());
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let inflight_state = InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        Some(channel_name.clone()),
+        343742347365974026,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        "live tmux".to_string(),
+        None,
+        Some(tmux_name.clone()),
+        Some("/tmp/agentdesk-1222-output.jsonl".to_string()),
+        Some("/tmp/agentdesk-1222-input.fifo".to_string()),
+        0,
+    );
+
+    super::spawn_turn_bridge(
+        shared.clone(),
+        Arc::new(CancelToken::new()),
+        stream_rx,
+        super::TurnBridgeContext {
+            provider: provider.clone(),
+            gateway: gateway.clone(),
+            channel_id,
+            user_msg_id,
+            user_text_owned: "live tmux".to_string(),
+            request_owner_name: "tester".to_string(),
+            role_binding: None,
+            adk_session_key: None,
+            adk_session_name: Some(channel_name),
+            adk_session_info: None,
+            adk_cwd: None,
+            dispatch_id: None,
+            memory_recall_usage: TokenUsage::default(),
+            current_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(0),
+            new_session_id: None,
+            defer_watcher_resume: false,
+            completion_tx: Some(completion_tx),
+            inflight_state,
+        },
+    );
+
+    stream_tx
+        .send(StreamMessage::TmuxReady {
+            output_path: "/tmp/agentdesk-1222-output.jsonl".to_string(),
+            input_fifo_path: "/tmp/agentdesk-1222-input.fifo".to_string(),
+            tmux_session_name: tmux_name.clone(),
+            last_offset: 0,
+        })
+        .expect("send tmux ready");
+    stream_tx
+        .send(StreamMessage::Text {
+            content: "watcher should deliver this".to_string(),
+        })
+        .expect("send text");
+    stream_tx
+        .send(StreamMessage::Done {
+            result: String::new(),
+            session_id: None,
+        })
+        .expect("send done");
+    drop(stream_tx);
+
+    tokio::time::timeout(Duration::from_secs(5), completion_rx)
+        .await
+        .expect("turn bridge should finish")
+        .expect("completion sender should complete");
+
+    assert_eq!(gateway.send_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.edit_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.replace_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.remove_reaction_count.load(Ordering::Relaxed), 0);
+
+    let saved = super::super::inflight::load_inflight_state(&provider, channel_id.get())
+        .expect("watcher-owned relay keeps inflight for watcher completion");
+    assert!(saved.watcher_owns_live_relay);
+    assert_eq!(saved.current_msg_id, current_msg_id.get());
+
+    {
+        let watcher = shared
+            .tmux_watchers
+            .get(&channel_id)
+            .expect("existing watcher should remain owner");
+        assert!(!watcher.paused.load(Ordering::Relaxed));
+        assert_eq!(
+            watcher
+                .resume_offset
+                .lock()
+                .expect("resume offset lock")
+                .as_ref(),
+            Some(&0)
+        );
+    }
+
+    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
+    shared.tmux_watchers.remove(&channel_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_watcher_without_cached_context_falls_back_to_bridge_delivery() {
+    let shared = make_shared_data_for_tests();
+    let provider = ProviderKind::Codex;
+    let channel_id = ChannelId::new(1485506232256168035);
+    let channel_name = format!("adk-cdx-t{}", channel_id.get());
+    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    let user_msg_id = MessageId::new(1487795113240559801);
+    let current_msg_id = MessageId::new(1487799916758827201);
+
+    let gateway = Arc::new(CountingGateway::default());
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let inflight_state = InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        Some(channel_name.clone()),
+        343742347365974026,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        "fresh live tmux".to_string(),
+        None,
+        Some(tmux_name.clone()),
+        Some("/tmp/agentdesk-1222-fresh-output.jsonl".to_string()),
+        Some("/tmp/agentdesk-1222-fresh-input.fifo".to_string()),
+        0,
+    );
+
+    super::spawn_turn_bridge(
+        shared.clone(),
+        Arc::new(CancelToken::new()),
+        stream_rx,
+        super::TurnBridgeContext {
+            provider: provider.clone(),
+            gateway: gateway.clone(),
+            channel_id,
+            user_msg_id,
+            user_text_owned: "fresh live tmux".to_string(),
+            request_owner_name: "tester".to_string(),
+            role_binding: None,
+            adk_session_key: None,
+            adk_session_name: Some(channel_name),
+            adk_session_info: None,
+            adk_cwd: None,
+            dispatch_id: None,
+            memory_recall_usage: TokenUsage::default(),
+            current_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(0),
+            new_session_id: None,
+            defer_watcher_resume: false,
+            completion_tx: Some(completion_tx),
+            inflight_state,
+        },
+    );
+
+    stream_tx
+        .send(StreamMessage::TmuxReady {
+            output_path: "/tmp/agentdesk-1222-fresh-output.jsonl".to_string(),
+            input_fifo_path: "/tmp/agentdesk-1222-fresh-input.fifo".to_string(),
+            tmux_session_name: tmux_name,
+            last_offset: 0,
+        })
+        .expect("send tmux ready");
+    stream_tx
+        .send(StreamMessage::Text {
+            content: "bridge fallback should deliver this".to_string(),
+        })
+        .expect("send text");
+    stream_tx
+        .send(StreamMessage::Done {
+            result: String::new(),
+            session_id: None,
+        })
+        .expect("send done");
+    drop(stream_tx);
+
+    tokio::time::timeout(Duration::from_secs(5), completion_rx)
+        .await
+        .expect("turn bridge should finish")
+        .expect("completion sender should complete");
+
+    assert_eq!(gateway.send_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.edit_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.replace_count.load(Ordering::Relaxed), 1);
+    assert_eq!(gateway.remove_reaction_count.load(Ordering::Relaxed), 1);
+    assert!(
+        shared.tmux_watchers.get(&channel_id).is_none(),
+        "failed fresh watcher spawn must not leave a reusable watcher slot"
+    );
+
+    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_watcher_owned_turn_suppresses_bridge_assistant_delivery() {
+    let shared = make_shared_data_for_tests();
+    let provider = ProviderKind::Codex;
+    let channel_id = ChannelId::new(1485506232256168034);
+    let channel_name = format!("adk-cdx-t{}", channel_id.get());
+    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    let user_msg_id = MessageId::new(1487795113240559800);
+    let current_msg_id = MessageId::new(1487799916758827200);
+
+    assert!(super::super::tmux::try_claim_watcher(
+        &shared.tmux_watchers,
+        channel_id,
+        test_watcher_handle(&tmux_name, false),
+    ));
+
+    let gateway = Arc::new(CountingGateway::default());
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let mut inflight_state = InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        Some(channel_name.clone()),
+        343742347365974026,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        "resumed live tmux".to_string(),
+        None,
+        Some(tmux_name.clone()),
+        Some("/tmp/agentdesk-1222-resumed-output.jsonl".to_string()),
+        Some("/tmp/agentdesk-1222-resumed-input.fifo".to_string()),
+        0,
+    );
+    inflight_state.watcher_owns_live_relay = true;
+
+    super::spawn_turn_bridge(
+        shared.clone(),
+        Arc::new(CancelToken::new()),
+        stream_rx,
+        super::TurnBridgeContext {
+            provider: provider.clone(),
+            gateway: gateway.clone(),
+            channel_id,
+            user_msg_id,
+            user_text_owned: "resumed live tmux".to_string(),
+            request_owner_name: "tester".to_string(),
+            role_binding: None,
+            adk_session_key: None,
+            adk_session_name: Some(channel_name),
+            adk_session_info: None,
+            adk_cwd: None,
+            dispatch_id: None,
+            memory_recall_usage: TokenUsage::default(),
+            current_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(0),
+            new_session_id: None,
+            defer_watcher_resume: false,
+            completion_tx: Some(completion_tx),
+            inflight_state,
+        },
+    );
+
+    stream_tx
+        .send(StreamMessage::Text {
+            content: "watcher should still own resumed output".to_string(),
+        })
+        .expect("send text");
+    stream_tx
+        .send(StreamMessage::Done {
+            result: String::new(),
+            session_id: None,
+        })
+        .expect("send done");
+    drop(stream_tx);
+
+    tokio::time::timeout(Duration::from_secs(5), completion_rx)
+        .await
+        .expect("turn bridge should finish")
+        .expect("completion sender should complete");
+
+    assert_eq!(gateway.send_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.edit_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.replace_count.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.remove_reaction_count.load(Ordering::Relaxed), 0);
+
+    let saved = super::super::inflight::load_inflight_state(&provider, channel_id.get())
+        .expect("resumed watcher-owned relay keeps inflight for watcher completion");
+    assert!(saved.watcher_owns_live_relay);
+    assert_eq!(saved.current_msg_id, current_msg_id.get());
+
+    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
+    shared.tmux_watchers.remove(&channel_id);
+}
+
 #[tokio::test]
 async fn active_turn_output_offset_refreshes_session_heartbeat_before_done() {
     let db = crate::db::test_db();
@@ -445,7 +881,7 @@ async fn active_turn_output_offset_refreshes_session_heartbeat_before_done() {
         .execute(
             "INSERT INTO sessions
              (session_key, provider, status, thread_channel_id, last_heartbeat, created_at)
-             VALUES (?1, ?2, 'working', ?3, '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
+             VALUES (?1, ?2, 'turn_active', ?3, '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
             [
                 session_key.as_str(),
                 provider.as_str(),
@@ -564,7 +1000,7 @@ fn active_turn_activity_heartbeat_refreshes_once_per_interval_window() {
     conn.execute(
         "INSERT INTO sessions
          (session_key, provider, status, thread_channel_id, last_heartbeat, created_at)
-         VALUES (?1, ?2, 'working', ?3, '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
+         VALUES (?1, ?2, 'turn_active', ?3, '2026-04-09 01:02:03', '2026-04-09 01:02:03')",
         [
             session_key.as_str(),
             provider.as_str(),
@@ -1936,6 +2372,43 @@ fn work_outcome_parser_rejects_non_explicit_noop_mentions() {
         ),
         None
     );
+}
+
+#[test]
+fn bridge_relay_delegation_requires_fresh_watcher_task() {
+    assert!(!should_delegate_bridge_relay_to_watcher(
+        true, false, false, false, false, false, false
+    ));
+    assert!(should_delegate_bridge_relay_to_watcher(
+        true, true, false, false, false, false, false
+    ));
+}
+
+#[test]
+fn bridge_relay_delegation_stays_disabled_when_bridge_has_pending_response() {
+    assert!(!should_delegate_bridge_relay_to_watcher(
+        true, true, true, false, false, false, false
+    ));
+}
+
+#[test]
+fn bridge_relay_delegation_stays_disabled_for_terminal_error_paths() {
+    for (cancelled, prompt_too_long, transport_error, recovery_retry) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        assert!(!should_delegate_bridge_relay_to_watcher(
+            true,
+            true,
+            false,
+            cancelled,
+            prompt_too_long,
+            transport_error,
+            recovery_retry,
+        ));
+    }
 }
 
 // ========== resolve_done_response tests ==========

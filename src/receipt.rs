@@ -1838,7 +1838,7 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use chrono::TimeZone;

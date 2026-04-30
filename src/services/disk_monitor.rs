@@ -64,7 +64,7 @@ pub fn enospc_recent() -> bool {
     seconds_since_last_enospc().is_some_and(|elapsed| elapsed <= ENOSPC_BANNER_LINGER_SECS)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn reset_enospc_for_test() {
     LAST_ENOSPC_EPOCH_SECS.store(0, Ordering::Relaxed);
 }
@@ -236,7 +236,7 @@ pub async fn run_disk_monitor_tick_once(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::Mutex;

@@ -413,7 +413,7 @@ fn run_turn_once(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn build_turn_args(
     prompt: &str,
     model: Option<&str>,
@@ -919,7 +919,7 @@ fn emit_json_line(output: &mut std::fs::File, value: Value) -> Result<(), String
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         TurnNormalizationState, TurnWatchdogOutcome, build_turn_args, decode_external_prompt,

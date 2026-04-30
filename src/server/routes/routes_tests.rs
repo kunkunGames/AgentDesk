@@ -346,6 +346,15 @@ fn write_announce_token(runtime_root: &std::path::Path) {
         "announce-token\n",
     )
     .unwrap();
+    // #1448 follow-up: issue announcements moved to notify-bot. Tests
+    // that exercise the announcement creation path must also seed the
+    // notify token, or `create_issue_announcement_pg` short-circuits
+    // with `no notify bot token configured`.
+    fs::write(
+        crate::runtime_layout::credential_token_path(runtime_root, "notify"),
+        "notify-token\n",
+    )
+    .unwrap();
 }
 
 #[derive(Default)]
@@ -2309,7 +2318,7 @@ async fn agent_turn_pg_returns_recent_output_from_inflight_snapshot() {
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, active_dispatch_id, last_heartbeat, created_at)
-         VALUES ($1, 'agent-turn', 'codex', 'working', 'dispatch-turn', NOW(), '2026-04-06 10:00:00')",
+         VALUES ($1, 'agent-turn', 'codex', 'turn_active', 'dispatch-turn', NOW(), '2026-04-06 10:00:00')",
     )
     .bind(format!("mac-mini:{tmux_name}"))
     .execute(&pool)
@@ -2340,7 +2349,7 @@ async fn agent_turn_pg_returns_recent_output_from_inflight_snapshot() {
         .unwrap();
     assert_eq!(status, StatusCode::OK);
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["status"], "working");
+    assert_eq!(json["status"], "turn_active");
     assert_eq!(json["started_at"], "2026-04-06 10:11:12");
     assert_eq!(json["updated_at"], "2026-04-06 10:11:13");
     assert_eq!(json["recent_output_source"], "inflight");
@@ -2486,7 +2495,7 @@ async fn stop_agent_turn_preserves_matching_tmux_session() {
         conn.execute(
             "INSERT INTO sessions
              (session_key, agent_id, provider, status, last_heartbeat, created_at)
-             VALUES (?1, 'agent-stop', 'codex', 'working', datetime('now'), datetime('now'))",
+             VALUES (?1, 'agent-stop', 'codex', 'turn_active', datetime('now'), datetime('now'))",
             [session_key.clone()],
         )
         .unwrap();
@@ -2577,7 +2586,7 @@ async fn stop_agent_turn_pg_preserves_pending_queue_via_mailbox_fallback_cleanup
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'agent-stop-canonical', 'codex', 'working', NOW(), NOW())",
+         VALUES ($1, 'agent-stop-canonical', 'codex', 'turn_active', NOW(), NOW())",
     )
     .bind(session_key.as_str())
     .execute(&pool)
@@ -2674,7 +2683,7 @@ async fn stop_agent_turn_tmux_only_pg_fallback_clears_mailbox_without_detaching_
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'agent-stop-tmux-only', 'codex', 'working', NOW(), NOW())",
+         VALUES ($1, 'agent-stop-tmux-only', 'codex', 'turn_active', NOW(), NOW())",
     )
     .bind(session_key.as_str())
     .execute(&pool)
@@ -2924,7 +2933,7 @@ async fn cancel_turn_preserves_tmux_and_cancels_active_dispatch() {
         conn.execute(
             "INSERT INTO sessions
              (session_key, agent_id, provider, status, active_dispatch_id, last_heartbeat, created_at)
-             VALUES (?1, 'agent-queue-stop', 'codex', 'working', 'dispatch-turn-cancel', datetime('now'), datetime('now'))",
+             VALUES (?1, 'agent-queue-stop', 'codex', 'turn_active', 'dispatch-turn-cancel', datetime('now'), datetime('now'))",
             [session_key.clone()],
         )
         .unwrap();
@@ -3030,7 +3039,7 @@ async fn cancel_turn_preserves_pending_queue_via_mailbox_fallback_cleanup_pg() {
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'agent-cancel-canonical', 'claude', 'working', NOW(), NOW())",
+         VALUES ($1, 'agent-cancel-canonical', 'claude', 'turn_active', NOW(), NOW())",
     )
     .bind(session_key)
     .execute(&pool)
@@ -3142,7 +3151,7 @@ async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'project-agentdesk', 'claude', 'working', NOW() - INTERVAL '1 minute', NOW())",
+         VALUES ($1, 'project-agentdesk', 'claude', 'turn_active', NOW() - INTERVAL '1 minute', NOW())",
     )
     .bind(cc_session_key)
     .execute(&pool)
@@ -3151,7 +3160,7 @@ async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'project-agentdesk', 'codex', 'working', NOW(), NOW())",
+         VALUES ($1, 'project-agentdesk', 'codex', 'turn_active', NOW(), NOW())",
     )
     .bind(cdx_session_key)
     .execute(&pool)
@@ -3203,7 +3212,7 @@ async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
             .await
             .unwrap();
     assert_eq!(cc_status, "disconnected");
-    assert_eq!(cdx_status, "working");
+    assert_eq!(cdx_status, "turn_active");
 
     pool.close().await;
     pg_db.drop().await;
@@ -3340,7 +3349,7 @@ async fn agents_pg_include_current_thread_channel_id_from_working_session() {
     .unwrap();
     sqlx::query(
         "INSERT INTO sessions (session_key, agent_id, provider, status, thread_channel_id, last_heartbeat)
-         VALUES ($1, 'a1', 'codex', 'working', '1485506232256168011', NOW())",
+         VALUES ($1, 'a1', 'codex', 'turn_active', '1485506232256168011', NOW())",
     )
     .bind("mac-mini:AgentDesk-codex-adk-cdx-t1485506232256168011")
     .execute(&pool)
@@ -3500,7 +3509,7 @@ async fn claude_session_id_pg_get_clears_stale_fixed_working_session() {
         "INSERT INTO sessions (
             session_key, provider, status, active_dispatch_id, claude_session_id, last_heartbeat, created_at
          ) VALUES (
-            'test:stale-working', 'claude', 'working', 'dispatch-123', 'stale-sid',
+            'test:stale-working', 'claude', 'turn_active', 'dispatch-123', 'stale-sid',
             NOW() - INTERVAL '7 hours', NOW() - INTERVAL '7 hours'
          )",
     )
@@ -4602,7 +4611,7 @@ async fn hooks_disconnect_session_pg_only_without_sqlite_mirror() {
     .bind("session-pg-hook-disconnect")
     .bind("agent-pg-hook-session")
     .bind("claude")
-    .bind("working")
+    .bind("turn_active")
     .execute(&pg_pool)
     .await
     .unwrap();
@@ -5481,7 +5490,7 @@ async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns
             "INSERT INTO sessions (
                 session_key, agent_id, provider, status, active_dispatch_id, last_heartbeat, created_at
             ) VALUES (
-                ?1, 'agent-manual-backlog', 'codex', 'working', 'dispatch-manual-backlog',
+                ?1, 'agent-manual-backlog', 'codex', 'turn_active', 'dispatch-manual-backlog',
                 datetime('now', '-9 minutes'), datetime('now', '-9 minutes')
             )",
             sqlite_params![session_key],
@@ -8348,7 +8357,7 @@ async fn agent_pg_archive_rejects_when_active_turn_present() {
     // Seed an active turn for the managed-agent (status='working').
     sqlx::query(
         "INSERT INTO sessions (session_key, agent_id, provider, status, active_dispatch_id, last_heartbeat)
-         VALUES ('sess-active', 'managed-agent', 'codex', 'working', 'dispatch-1', NOW())",
+         VALUES ('sess-active', 'managed-agent', 'codex', 'turn_active', 'dispatch-1', NOW())",
     )
     .execute(&pool)
     .await
@@ -9046,7 +9055,7 @@ async fn sessions_tmux_output_pg_http_route_returns_shape_for_seeded_session() {
     sqlx::query(
         "INSERT INTO sessions
          (session_key, agent_id, provider, status, last_heartbeat, created_at)
-         VALUES ($1, 'agent-1067-http', 'codex', 'working', NOW(), NOW())",
+         VALUES ($1, 'agent-1067-http', 'codex', 'turn_active', NOW(), NOW())",
     )
     .bind(&session_key)
     .execute(&pool)
@@ -9087,7 +9096,7 @@ async fn sessions_tmux_output_pg_http_route_returns_shape_for_seeded_session() {
     assert_eq!(json["tmux_name"], tmux_name);
     assert_eq!(json["agent_id"], "agent-1067-http");
     assert_eq!(json["provider"], "codex");
-    assert_eq!(json["status"], "working");
+    assert_eq!(json["status"], "turn_active");
     assert_eq!(json["lines_requested"], 25);
     assert_eq!(json["lines_effective"], 25);
     // tmux session was never created, so capture returns empty and tmux_alive=false.
@@ -9700,6 +9709,103 @@ async fn api_docs_retry_redispatch_resume_reopen_semantics_are_distinguished() {
             "/{name} description must reference at least two of the sibling semantics (retry/redispatch/resume/reopen) to disambiguate; got {other_refs}: {desc}"
         );
     }
+}
+
+/// #1443: the `/api/docs/card-lifecycle-ops` decision-tree page must be
+/// reachable through the standard `/api/docs/{segment}` route and must
+/// surface the markers the incident response team relies on so callers
+/// cannot accidentally repeat the 2026-04-30 #1435 chained-call pattern.
+///
+/// The page is also surfaced in the `/api/docs` index `guides` array so
+/// agents discover it without reading source.
+#[tokio::test]
+async fn api_docs_card_lifecycle_ops_guide_is_reachable_and_complete() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    // Index lists the guide so callers discover the path.
+    let index_response = app
+        .clone()
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_bytes = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let index_json: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    let guides = index_json["guides"]
+        .as_array()
+        .expect("/docs index must list long-form guides under 'guides'");
+    let lifecycle_entry = guides
+        .iter()
+        .find(|guide| guide["name"] == "card-lifecycle-ops")
+        .expect("/docs index must surface the card-lifecycle-ops guide");
+    assert_eq!(
+        lifecycle_entry["path"], "/api/docs/card-lifecycle-ops",
+        "lifecycle guide path must be /api/docs/card-lifecycle-ops"
+    );
+
+    // Guide page itself is reachable through the standard /docs/{segment}
+    // route and contains the markers the incident postmortem requires.
+    let guide_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/card-lifecycle-ops")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guide_response.status(), StatusCode::OK);
+    let guide_bytes = axum::body::to_bytes(guide_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let guide_text = String::from_utf8(guide_bytes.to_vec()).unwrap();
+    let guide_json: serde_json::Value = serde_json::from_str(&guide_text).unwrap();
+
+    assert_eq!(guide_json["title"], "Card Lifecycle Ops Guide");
+    assert_eq!(guide_json["path"], "/api/docs/card-lifecycle-ops");
+
+    let last_refreshed = guide_json["last_refreshed"]
+        .as_str()
+        .expect("guide must declare a last_refreshed marker (#1432 freshness gate)");
+    assert!(
+        last_refreshed.starts_with("Last refreshed:"),
+        "last_refreshed marker must follow the 'Last refreshed: <date> against main @ <sha>' convention: {last_refreshed}"
+    );
+    assert!(
+        last_refreshed.contains("main @"),
+        "last_refreshed marker must pin the main commit sha per #1432: {last_refreshed}"
+    );
+
+    // The doc body must mention the structured markers so callers learn the
+    // contract: anti-pattern wording, the next_action_hint field name, and
+    // the 409 guard.
+    let lower = guide_text.to_lowercase();
+    assert!(
+        lower.contains("anti-pattern"),
+        "guide must contain an 'Anti-pattern' section naming today's incident"
+    );
+    assert!(
+        guide_text.contains("next_action_hint"),
+        "guide must reference the next_action_hint response field (#1442)"
+    );
+    assert!(
+        guide_text.contains("409"),
+        "guide must reference the 409 Conflict guard (#1444)"
+    );
+    assert!(
+        guide_text.contains("skipped_due_to_active_dispatch"),
+        "guide must reference skipped_due_to_active_dispatch (#1444)"
+    );
+    assert!(
+        guide_text.contains("/api/auto-queue/generate")
+            && guide_text.contains("/api/kanban-cards/{id}/redispatch")
+            && guide_text.contains("/api/kanban-cards/{id}/transition"),
+        "guide must enumerate the five lifecycle endpoints by exact path"
+    );
 }
 
 #[tokio::test]
@@ -13988,7 +14094,7 @@ async fn stats_pg_only_without_sqlite_mirror() {
     )
     .bind("session-pg-stats")
     .bind("agent-pg-stats")
-    .bind("working")
+    .bind("turn_active")
     .bind("dispatch-working-pg-stats")
     .bind(123_i32)
     .execute(&pg_pool)
@@ -14195,6 +14301,1116 @@ async fn force_transition_succeeds_with_correct_channel_pg() {
     pg_db.drop().await;
 }
 
+/// #1442 — `/redispatch` response must surface `new_dispatch_id`,
+/// `cancelled_dispatch_id`, and `next_action` so callers do not chain
+/// `/transition` or `/auto-queue/generate` and create duplicates.
+#[tokio::test]
+async fn redispatch_response_includes_dispatch_ids_and_next_action_pg_1442() {
+    let (_repo, _repo_guard) = setup_test_repo();
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-redispatch-1442").await;
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-redispatch-1442")
+    .bind("Redispatch 1442")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-redispatch-1442")
+    .bind("test-repo")
+    .bind(1442_i64)
+    .bind("dispatch-redispatch-1442-old")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '5 minutes'
+         )",
+    )
+    .bind("dispatch-redispatch-1442-old")
+    .bind("card-redispatch-1442")
+    .bind("agent-redispatch-1442")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] Issue #1442")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-redispatch-1442/redispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"reason":"test #1442"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "redispatch must succeed; got {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.get("card").is_some(),
+        "response must keep existing 'card' field for backward compat: {body_text}"
+    );
+    assert_eq!(
+        json["next_action"], "none_required",
+        "happy-path redispatch must report next_action=none_required: {body_text}"
+    );
+    assert_eq!(
+        json["cancelled_dispatch_id"], "dispatch-redispatch-1442-old",
+        "redispatch must echo the cancelled dispatch id: {body_text}"
+    );
+    let new_dispatch_id = json["new_dispatch_id"]
+        .as_str()
+        .expect("new_dispatch_id must be a string when create_dispatch succeeds");
+    assert!(
+        !new_dispatch_id.is_empty(),
+        "new_dispatch_id must not be empty when a dispatch was created"
+    );
+    assert_ne!(
+        new_dispatch_id, "dispatch-redispatch-1442-old",
+        "new_dispatch_id must be a brand-new UUID, not the cancelled one"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+/// #1442 — `/transition` response must include `cancelled_dispatch_ids`
+/// (array) and `next_action_hint` so callers can confirm the cleanup
+/// outcome without chaining additional calls.
+#[tokio::test]
+async fn transition_response_includes_cancelled_ids_and_next_action_hint_pg_1442() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-transition-1442").await;
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-transition-1442")
+    .bind("Transition 1442")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-transition-1442")
+    .bind("test-repo")
+    .bind(14422_i64)
+    .bind("dispatch-transition-1442")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '5 minutes'
+         )",
+    )
+    .bind("dispatch-transition-1442")
+    .bind("card-transition-1442")
+    .bind("agent-transition-1442")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] Issue #14422")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    // #1442 (codex P2): send x-channel-id so this test isn't 401-flaked when
+    // it runs in parallel with the `kanban_manager_channel_id` PMD-channel
+    // tests that mutate the global AGENTDESK_CONFIG.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-transition-1442/transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"ready","cancel_dispatches":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "transition must succeed; got {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["forced"], true);
+    let ids = json["cancelled_dispatch_ids"]
+        .as_array()
+        .expect("cancelled_dispatch_ids must be an array");
+    assert!(
+        ids.iter()
+            .any(|id| id.as_str() == Some("dispatch-transition-1442")),
+        "cancelled_dispatch_ids must list the previously-active dispatch id: {body_text}"
+    );
+    let hint = json["next_action_hint"]
+        .as_str()
+        .expect("next_action_hint must be a string");
+    assert!(
+        !hint.is_empty(),
+        "next_action_hint must not be empty: {body_text}"
+    );
+    // created_dispatch_id is allowed to be null when no new dispatch was kicked
+    // off by hooks; we just assert the field is present.
+    assert!(
+        json.get("created_dispatch_id").is_some(),
+        "response must include created_dispatch_id key (null is OK): {body_text}"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+/// #1442 — `/api/auto-queue/generate` response must include the structured
+/// `skipped_due_to_active_dispatch` array when a requested issue already has
+/// an active dispatch (the silent-skip case that drove the original bug).
+#[tokio::test]
+async fn auto_queue_generate_response_breaks_down_skipped_active_dispatch_pg_1442() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-aq-1442").await;
+
+    // Card #1 — eligible (status ready).
+    seed_auto_queue_card_pg(
+        &pool,
+        "card-aq-1442-ready",
+        1442001,
+        "ready",
+        "agent-aq-1442",
+    )
+    .await;
+    // Card #2 — ineligible because it has an active dispatch (status
+    // in_progress + latest_dispatch_id pointing at a dispatched row).
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-aq-1442-active")
+    .bind("Active dispatch 1442")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-aq-1442")
+    .bind("test-repo")
+    .bind(1442002_i64)
+    .bind("dispatch-aq-1442-active")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-aq-1442-active")
+    .bind("card-aq-1442-active")
+    .bind("agent-aq-1442")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] active 1442")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"repo":"test-repo","issue_numbers":[1442001,1442002]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "auto-queue generate must succeed; got {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let skipped_active = json["skipped_due_to_active_dispatch"]
+        .as_array()
+        .expect("skipped_due_to_active_dispatch must be an array");
+    assert!(
+        skipped_active
+            .iter()
+            .any(|entry| entry["issue_number"] == 1442002
+                && entry["existing_dispatch_id"] == "dispatch-aq-1442-active"),
+        "issue 1442002 must be reported under skipped_due_to_active_dispatch with its existing dispatch id: {body_text}"
+    );
+    assert!(
+        json["skipped_due_to_dependency"].is_array(),
+        "skipped_due_to_dependency key must be present as an array (even if empty): {body_text}"
+    );
+    assert!(
+        json["skipped_due_to_filter"].is_array(),
+        "skipped_due_to_filter key must be present as an array (even if empty): {body_text}"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+// ── #1444 idempotency guards ─────────────────────────────────────────
+//
+// Regression coverage for the "duplicate dispatch" incident pattern:
+// `/redispatch` is single-call complete, but callers used to chain
+// `/transition status:ready` and `/auto-queue/generate` after it, which
+// silently cancelled the just-created dispatch and made a second one. The
+// guards below reject such follow-up calls server-side so caller behaviour
+// can no longer regress past the protections added in #1442.
+
+#[tokio::test]
+async fn transition_to_ready_with_active_dispatch_returns_409_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-tx-1444").await;
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-tx-1444")
+    .bind("Transition guard 1444")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-tx-1444")
+    .bind("test-repo")
+    .bind(1444001_i64)
+    .bind("dispatch-tx-1444-active")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-tx-1444-active")
+    .bind("card-tx-1444")
+    .bind("agent-tx-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] active 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-tx-1444/transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "transition to ready with active dispatch must 409: {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["active_dispatch_id"], "dispatch-tx-1444-active",
+        "409 body must echo the blocking dispatch id: {body_text}"
+    );
+    let hint = json["next_action_hint"]
+        .as_str()
+        .expect("next_action_hint must be a string");
+    assert!(
+        hint.contains("force=true"),
+        "next_action_hint must point callers at force=true: {body_text}"
+    );
+    let error = json["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("force=true"),
+        "error must mention force=true: {body_text}"
+    );
+
+    // Verify the active dispatch was NOT cancelled by the rejected call.
+    let dispatch_status: String =
+        sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+            .bind("dispatch-tx-1444-active")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        dispatch_status, "dispatched",
+        "guarded transition must leave the live dispatch untouched"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn transition_to_ready_with_active_dispatch_force_true_proceeds_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-tx-force-1444").await;
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-tx-force-1444")
+    .bind("Force transition 1444")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-tx-force-1444")
+    .bind("test-repo")
+    .bind(1444002_i64)
+    .bind("dispatch-tx-force-1444-active")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-tx-force-1444-active")
+    .bind("card-tx-force-1444")
+    .bind("agent-tx-force-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] force 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-tx-force-1444/transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"ready","force":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "force=true must bypass the #1444 guard and succeed: {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["forced"], true);
+    let cancelled_ids = json["cancelled_dispatch_ids"]
+        .as_array()
+        .expect("cancelled_dispatch_ids must be an array");
+    assert!(
+        cancelled_ids
+            .iter()
+            .any(|id| id.as_str() == Some("dispatch-tx-force-1444-active")),
+        "cancelled_dispatch_ids must include the previously-active dispatch: {body_text}"
+    );
+
+    let dispatch_status: String =
+        sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+            .bind("dispatch-tx-force-1444-active")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        dispatch_status, "cancelled",
+        "force=true must cancel the previously-active dispatch"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+/// #1444 codex iter-1 P2 regression: when a card is already in `ready` and
+/// the caller retries the transition with `force=true` to clean up a still-
+/// active dispatch, the FSM short-circuits with NoOp and the cleanup path
+/// is bypassed. The route handler must explicitly cancel the active
+/// dispatches in that case so the documented force-recovery actually
+/// resolves the duplicate-dispatch incident.
+#[tokio::test]
+async fn transition_to_ready_force_true_cleans_up_active_dispatch_when_already_ready_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-tx-noop-1444").await;
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-tx-noop-1444")
+    .bind("Ready+active 1444 noop")
+    .bind("ready")
+    .bind("medium")
+    .bind("agent-tx-noop-1444")
+    .bind("test-repo")
+    .bind(1444003_i64)
+    .bind("dispatch-tx-noop-1444-active")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-tx-noop-1444-active")
+    .bind("card-tx-noop-1444")
+    .bind("agent-tx-noop-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] noop 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-tx-noop-1444/transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"ready","force":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "force ready→ready must succeed: {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let cancelled_ids = json["cancelled_dispatch_ids"]
+        .as_array()
+        .expect("cancelled_dispatch_ids must be an array");
+    assert!(
+        cancelled_ids
+            .iter()
+            .any(|id| id.as_str() == Some("dispatch-tx-noop-1444-active")),
+        "force=true on ready→ready must cancel the active dispatch even though FSM is NoOp: {body_text}"
+    );
+
+    let dispatch_status: String =
+        sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+            .bind("dispatch-tx-noop-1444-active")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        dispatch_status, "cancelled",
+        "active dispatch must be cancelled by the no-op force path"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn auto_queue_generate_skips_card_with_active_dispatch_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-aq-skip-1444").await;
+
+    // Card #1: in `ready` (an enqueueable state) BUT carries an active
+    // dispatch — exactly the #1444 race where redispatch already created a
+    // dispatch and a follow-up generate would otherwise queue a duplicate.
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-aq-skip-1444-ready-but-active")
+    .bind("Ready+active 1444")
+    .bind("ready")
+    .bind("medium")
+    .bind("agent-aq-skip-1444")
+    .bind("test-repo")
+    .bind(1444011_i64)
+    .bind("dispatch-aq-skip-1444-active")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-aq-skip-1444-active")
+    .bind("card-aq-skip-1444-ready-but-active")
+    .bind("agent-aq-skip-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] live 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Card #2: clean ready card — should make it into the run.
+    seed_auto_queue_card_pg(
+        &pool,
+        "card-aq-skip-1444-clean",
+        1444012,
+        "ready",
+        "agent-aq-skip-1444",
+    )
+    .await;
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"repo":"test-repo","issue_numbers":[1444011,1444012]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "generate must respond 200: {body_text}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let skipped_active = json["skipped_due_to_active_dispatch"]
+        .as_array()
+        .expect("skipped_due_to_active_dispatch must be an array");
+    assert!(
+        skipped_active
+            .iter()
+            .any(|entry| entry["issue_number"] == 1444011
+                && entry["existing_dispatch_id"] == "dispatch-aq-skip-1444-active"),
+        "issue 1444011 must be reported in skipped_due_to_active_dispatch: {body_text}"
+    );
+
+    // The clean card should still make it into the run.
+    let entries = json["entries"]
+        .as_array()
+        .expect("entries must be an array");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| { entry["card_id"].as_str() == Some("card-aq-skip-1444-clean") }),
+        "clean card must still appear in entries: {body_text}"
+    );
+    // The skipped card must NOT be in entries.
+    assert!(
+        entries.iter().all(|entry| {
+            entry["card_id"].as_str() != Some("card-aq-skip-1444-ready-but-active")
+        }),
+        "skipped card must not appear in entries: {body_text}"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+/// #1444: when /api/auto-queue/dispatch-next encounters an entry whose card
+/// already has an active dispatch, it must reuse the existing dispatch
+/// (no duplicate creation) and emit the DISPATCH-NEXT skip log marker. We
+/// verify the no-duplicate property — the card's latest_dispatch_id must
+/// not change, and dispatch row count for the card stays at 1.
+#[tokio::test]
+async fn dispatch_next_skips_card_with_active_dispatch_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-dn-1444").await;
+
+    // Seed a card already pointing at a live dispatch.
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-dn-1444")
+    .bind("Dispatch-next guard 1444")
+    .bind("ready")
+    .bind("medium")
+    .bind("agent-dn-1444")
+    .bind("test-repo")
+    .bind(1444020_i64)
+    .bind("dispatch-dn-1444-existing")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-dn-1444-existing")
+    .bind("card-dn-1444")
+    .bind("agent-dn-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] existing dn 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Build an active auto_queue run with one pending entry pointing at
+    // this card so dispatch-next has something to iterate over.
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (
+            id, repo, agent_id, status, max_concurrent_threads, thread_group_count
+         ) VALUES (
+            $1, $2, $3, 'active', 1, 1
+         )",
+    )
+    .bind("run-dn-1444")
+    .bind("test-repo")
+    .bind("agent-dn-1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase
+         ) VALUES (
+            $1, $2, $3, $4, 'pending', 0, 0
+         )",
+    )
+    .bind("entry-dn-1444")
+    .bind("run-dn-1444")
+    .bind("card-dn-1444")
+    .bind("agent-dn-1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/dispatch-next")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"repo":"test-repo"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        status.is_success(),
+        "dispatch-next should respond 2xx even when the entry is skipped: status={status} body={body_text}"
+    );
+
+    // No new dispatch must have been created — count stays at 1.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM task_dispatches WHERE kanban_card_id = $1",
+    )
+    .bind("card-dn-1444")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 1,
+        "dispatch-next must NOT create a duplicate dispatch when the card already has an active one: body={body_text}"
+    );
+    let latest: Option<String> =
+        sqlx::query_scalar("SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1")
+            .bind("card-dn-1444")
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten();
+    assert_eq!(
+        latest.as_deref(),
+        Some("dispatch-dn-1444-existing"),
+        "card must still point at the original dispatch"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+/// #1444 incident regression: replay today's bug — call /redispatch (which
+/// is single-call complete and creates one new dispatch), then chain the
+/// redundant /transition status:ready and /auto-queue/generate calls. The
+/// guards must reject the follow-ups so the second dispatch is NEVER
+/// created.
+#[tokio::test]
+async fn idempotency_guards_block_duplicate_dispatch_after_redispatch_pg_1444() {
+    crate::pipeline::ensure_loaded();
+    let (_repo, _repo_guard) = setup_test_repo();
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pool.clone());
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-incident-1444").await;
+
+    // Seed the failed-impl card the way redispatch needs it: in_progress
+    // with a previously-failed dispatch row. /redispatch will cancel that
+    // and create a brand-new dispatch_id.
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, assigned_agent_id, repo_id,
+            github_issue_number, latest_dispatch_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW()
+         )",
+    )
+    .bind("card-incident-1444")
+    .bind("Incident 1444")
+    .bind("in_progress")
+    .bind("medium")
+    .bind("agent-incident-1444")
+    .bind("test-repo")
+    .bind(1444100_i64)
+    .bind("dispatch-incident-1444-old")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '5 minutes'
+         )",
+    )
+    .bind("dispatch-incident-1444-old")
+    .bind("card-incident-1444")
+    .bind("agent-incident-1444")
+    .bind("implementation")
+    .bind("dispatched")
+    .bind("[Impl] incident-old 1444")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+
+    // Step 1 — /redispatch (the only call that should have happened).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-incident-1444/redispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"reason":"test #1444"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_dispatch_id = json["new_dispatch_id"]
+        .as_str()
+        .expect("redispatch must report a new_dispatch_id")
+        .to_string();
+    assert_ne!(
+        new_dispatch_id, "dispatch-incident-1444-old",
+        "redispatch must mint a fresh dispatch_id"
+    );
+
+    let after_redispatch_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM task_dispatches WHERE kanban_card_id = $1",
+    )
+    .bind("card-incident-1444")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_redispatch_count, 2,
+        "after /redispatch we expect 2 task_dispatches rows: the old (cancelled) and the new"
+    );
+
+    // Step 2 — the wrongly chained /transition status:ready. Must 409.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/card-incident-1444/transition")
+                .header("content-type", "application/json")
+                .header("x-channel-id", "pmd-chan-123")
+                .body(Body::from(r#"{"status":"ready"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "redundant transition→ready must 409 because the redispatched dispatch is still active"
+    );
+
+    // Step 3 — the wrongly chained /auto-queue/generate. Card must be
+    // reported under skipped_due_to_active_dispatch and NOT enter a run.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auto-queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"repo":"test-repo","issue_numbers":[1444100]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let skipped_active = json["skipped_due_to_active_dispatch"]
+        .as_array()
+        .expect("skipped_due_to_active_dispatch must be an array");
+    assert!(
+        skipped_active
+            .iter()
+            .any(|entry| entry["issue_number"] == 1444100),
+        "issue 1444100 must be reported as skipped_due_to_active_dispatch: {body_text}"
+    );
+    let entries = json["entries"]
+        .as_array()
+        .map(|e| e.as_slice())
+        .unwrap_or(&[]);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["card_id"].as_str().unwrap_or_default() != "card-incident-1444"),
+        "card-incident-1444 must NOT enter the generated run: {body_text}"
+    );
+
+    // Final invariant: only ONE active (pending|dispatched) dispatch row
+    // exists for the card after redispatch + the rejected follow-ups.
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT
+         FROM task_dispatches
+         WHERE kanban_card_id = $1
+           AND status IN ('pending', 'dispatched')",
+    )
+    .bind("card-incident-1444")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active_count, 1,
+        "exactly one active dispatch must exist after the rejected follow-ups; the guard prevents a duplicate"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
 #[tokio::test]
 async fn force_transition_rejects_mismatched_channel_when_pmd_channel_is_configured() {
     let _lock = env_lock();
@@ -14392,7 +15608,7 @@ async fn force_transition_to_done_tracks_pr_from_live_work_dispatch_and_cleans_i
         "INSERT INTO sessions (
             session_key, agent_id, provider, status, cwd, active_dispatch_id, last_heartbeat, created_at
         ) VALUES (
-            'session-ft-terminal', 'agent-ft-terminal', 'codex', 'working', $1, 'dispatch-ft-terminal',
+            'session-ft-terminal', 'agent-ft-terminal', 'codex', 'turn_active', $1, 'dispatch-ft-terminal',
             NOW() - INTERVAL '4 minutes', NOW() - INTERVAL '4 minutes'
         )",
     )
@@ -14691,7 +15907,7 @@ async fn postgres_force_transition_to_ready_cleans_up_live_state() {
     .bind("session-ft-clean-pg")
     .bind("agent-ft-clean-pg")
     .bind("codex")
-    .bind("working")
+    .bind("turn_active")
     .bind("dispatch-ft-clean-pg")
     .execute(&pg_pool)
     .await
@@ -14774,7 +15990,9 @@ async fn postgres_force_transition_to_ready_cleans_up_live_state() {
                 .uri("/kanban-cards/card-ft-clean-pg/transition")
                 .header("content-type", "application/json")
                 .header("x-channel-id", "pmd-chan-123")
-                .body(Body::from(r#"{"status":"ready"}"#))
+                // #1444: card has a live dispatch — force=true is now required
+                // for the ready transition to bypass the idempotency guard.
+                .body(Body::from(r#"{"status":"ready","force":true}"#))
                 .unwrap(),
         )
         .await
@@ -15911,7 +17129,7 @@ async fn reopen_reset_full_clears_review_thread_and_preflight_state() {
             "INSERT INTO sessions (
                 session_key, agent_id, provider, status, active_dispatch_id, last_heartbeat, created_at
             ) VALUES (
-                'session-reopen-reset', 'agent-reopen-reset', 'codex', 'working', 'dispatch-reopen-reset',
+                'session-reopen-reset', 'agent-reopen-reset', 'codex', 'turn_active', 'dispatch-reopen-reset',
                 datetime('now', '-9 minutes'), datetime('now', '-9 minutes')
             )",
             [],
@@ -19065,7 +20283,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-slot-thread-0', 'agent-slot', 'claude', 'working',
+                'host:AgentDesk-claude-slot-thread-0', 'agent-slot', 'claude', 'turn_active',
                 'slot 0 seed', 41, 'dispatch-slot-old-0', '222000000000000001', 'claude-slot-0',
                 datetime('now'), datetime('now')
             )",
@@ -19078,7 +20296,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-slot-thread-1', 'agent-slot', 'claude', 'working',
+                'host:AgentDesk-claude-slot-thread-1', 'agent-slot', 'claude', 'turn_active',
                 'slot 1 seed', 73, 'dispatch-slot-old-1', '222000000000000002', 'claude-slot-1',
                 datetime('now'), datetime('now')
             )",
@@ -19213,7 +20431,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         assert_eq!(second_slot, Some(1));
         conn.execute(
             "UPDATE sessions
-             SET status = 'working',
+             SET status = 'turn_active',
                  session_info = 'slot 0 in-progress context',
                  tokens = 99,
                  active_dispatch_id = 'dispatch-slot-in-progress',
@@ -19224,7 +20442,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         .unwrap();
         conn.execute(
             "UPDATE sessions
-             SET status = 'working',
+             SET status = 'turn_active',
                  session_info = 'slot 1 should stay hot',
                  tokens = 123,
                  active_dispatch_id = 'dispatch-slot-1-hot',
@@ -19352,7 +20570,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
     assert_eq!(
         untouched_slot_session,
         (
-            "working".to_string(),
+            "turn_active".to_string(),
             Some("dispatch-slot-1-hot".to_string()),
             123,
             Some("claude-slot-1-hot".to_string())
@@ -19503,7 +20721,7 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-same-group-thread', 'agent-same-group', 'claude', 'working',
+                'host:AgentDesk-claude-same-group-thread', 'agent-same-group', 'claude', 'turn_active',
                 'slot seed', 17, 'dispatch-same-group-seed', '222000000000000101', 'claude-same-group-seed',
                 datetime('now'), datetime('now')
             )",
@@ -19573,7 +20791,7 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
         );
         conn.execute(
             "UPDATE sessions
-             SET status = 'working',
+             SET status = 'turn_active',
                  session_info = 'group context retained',
                  tokens = 77,
                  active_dispatch_id = 'dispatch-same-group-hot',
@@ -23221,7 +24439,7 @@ async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots(
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-pause-slot', 'agent-pause-slot', 'claude', 'working',
+                'host:AgentDesk-claude-pause-slot', 'agent-pause-slot', 'claude', 'turn_active',
                 'pause slot seed', 19, 'dispatch-pause-slot', '222000000000004496', 'claude-pause-slot',
                 datetime('now'), datetime('now')
             )",
@@ -23233,7 +24451,7 @@ async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots(
                 session_key, agent_id, provider, status, session_info, tokens,
                 active_dispatch_id, claude_session_id, last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-pause-sidecar', 'agent-pause-slot', 'claude', 'working',
+                'host:AgentDesk-claude-pause-sidecar', 'agent-pause-slot', 'claude', 'turn_active',
                 'pause sidecar seed', 7, 'dispatch-pause-phase-gate', 'claude-pause-sidecar',
                 datetime('now'), datetime('now')
             )",
@@ -23331,7 +24549,7 @@ async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots(
     assert_eq!(
         session,
         (
-            "working".to_string(),
+            "turn_active".to_string(),
             Some("dispatch-pause-slot".to_string()),
             19,
             Some("claude-pause-slot".to_string()),
@@ -23459,7 +24677,7 @@ async fn auto_queue_pause_force_cancels_live_dispatches_and_releases_slots() {
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-pause-slot', 'agent-pause-slot', 'claude', 'working',
+                'host:AgentDesk-claude-pause-slot', 'agent-pause-slot', 'claude', 'turn_active',
                 'pause slot seed', 19, 'dispatch-pause-slot', '222000000000004496', 'claude-pause-slot',
                 datetime('now'), datetime('now')
             )",
@@ -23471,7 +24689,7 @@ async fn auto_queue_pause_force_cancels_live_dispatches_and_releases_slots() {
                 session_key, agent_id, provider, status, session_info, tokens,
                 active_dispatch_id, claude_session_id, last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-pause-sidecar', 'agent-pause-slot', 'claude', 'working',
+                'host:AgentDesk-claude-pause-sidecar', 'agent-pause-slot', 'claude', 'turn_active',
                 'pause sidecar seed', 7, 'dispatch-pause-phase-gate', 'claude-pause-sidecar',
                 datetime('now'), datetime('now')
             )",
@@ -23754,7 +24972,7 @@ async fn auto_queue_pause_pg_soft_does_not_cancel_live_dispatches_or_release_slo
     .bind("host:AgentDesk-claude-pause-slot-pg")
     .bind("agent-pause-slot-pg")
     .bind("claude")
-    .bind("working")
+    .bind("turn_active")
     .bind("pause slot seed pg")
     .bind(19_i64)
     .bind("dispatch-pause-slot-pg")
@@ -23855,7 +25073,7 @@ async fn auto_queue_pause_pg_soft_does_not_cancel_live_dispatches_or_release_slo
     assert_eq!(
         session,
         (
-            "working".to_string(),
+            "turn_active".to_string(),
             Some("dispatch-pause-slot-pg".to_string()),
             19,
             Some("claude-pause-slot-pg".to_string()),
@@ -24038,7 +25256,7 @@ async fn auto_queue_cancel_cancels_live_dispatches_skips_entries_and_releases_sl
                 active_dispatch_id, thread_channel_id, claude_session_id,
                 last_heartbeat, created_at
             ) VALUES (
-                'host:AgentDesk-claude-cancel-slot', 'agent-cancel-slot', 'claude', 'working',
+                'host:AgentDesk-claude-cancel-slot', 'agent-cancel-slot', 'claude', 'turn_active',
                 'cancel slot seed', 23, 'dispatch-cancel-slot', '222000000000004597', 'claude-cancel-slot',
                 datetime('now'), datetime('now')
             )",
@@ -24692,7 +25910,7 @@ async fn auto_queue_cancel_pg_cancels_live_dispatches_skips_entries_and_releases
     .bind("host:AgentDesk-claude-cancel-slot-pg")
     .bind("agent-cancel-slot-pg")
     .bind("claude")
-    .bind("working")
+    .bind("turn_active")
     .bind("cancel slot seed pg")
     .bind(23_i64)
     .bind("dispatch-cancel-slot-pg")
@@ -27880,7 +29098,7 @@ async fn v1_routes_pg_surface_dashboard_contract() {
     .bind("host:session-v1")
     .bind("agent-v1")
     .bind("claude")
-    .bind("working")
+    .bind("turn_active")
     .bind("dispatch-current")
     .bind("v1 session")
     .bind(321_i64)
@@ -28240,7 +29458,7 @@ async fn v1_stream_pg_emits_snapshot_and_replays_shared_bus_events() {
     .bind("host:session-v1-stream")
     .bind("agent-v1-stream")
     .bind("claude")
-    .bind("working")
+    .bind("turn_active")
     .bind("dispatch-v1-stream")
     .bind("v1 stream session")
     .bind(321_i64)

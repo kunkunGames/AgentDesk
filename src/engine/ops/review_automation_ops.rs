@@ -802,7 +802,7 @@ async fn reseed_pr_tracking_pg(pool: &PgPool, card_id: &str) -> Result<serde_jso
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

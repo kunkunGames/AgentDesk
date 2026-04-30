@@ -582,7 +582,7 @@ fn kv_key(job_name: &str, field: &str) -> String {
     format!("maintenance_job:{job_name}:{field}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn run_scheduler_loop_for_test(
     pg_pool: PgPool,
     registry: MaintenanceJobRegistry,
@@ -600,13 +600,13 @@ async fn run_scheduler_loop_for_test(
     .await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Default)]
 struct InMemoryMaintenanceJobStore {
     values: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl MaintenanceJobStore for InMemoryMaintenanceJobStore {
     fn read<'a>(&'a self, key: &'a str) -> StoreFuture<'a, Option<String>> {
         Box::pin(async move {
@@ -624,7 +624,7 @@ impl MaintenanceJobStore for InMemoryMaintenanceJobStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

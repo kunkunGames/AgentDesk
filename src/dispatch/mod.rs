@@ -2,9 +2,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row as SqlxRow};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::engine::PolicyEngine;
 
 mod dispatch_channel;
@@ -13,9 +13,9 @@ mod dispatch_create;
 mod dispatch_status;
 
 pub(crate) use dispatch_channel::dispatch_destination_provider_override;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use dispatch_channel::provider_from_channel_suffix;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use dispatch_context::resolve_card_worktree_sqlite_test;
 #[allow(unused_imports)]
 pub(crate) use dispatch_context::{
@@ -25,7 +25,7 @@ pub(crate) use dispatch_context::{
     dispatch_type_requires_fresh_worktree, dispatch_type_session_strategy_default,
     dispatch_type_uses_thread_routing, inject_review_dispatch_identifiers, resolve_card_worktree,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use dispatch_context::{
     ReviewTargetTrust, TargetRepoSource, build_review_context_sqlite_test,
     inject_review_merge_base_context,
@@ -39,7 +39,7 @@ pub use dispatch_create::{
     create_dispatch_core_with_id_and_options, create_dispatch_core_with_options,
     create_dispatch_pg_only, create_dispatch_with_options, create_dispatch_with_options_pg_only,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use dispatch_create::{
     create_dispatch_record_sqlite_test, create_dispatch_record_with_id_sqlite_test,
 };
@@ -51,7 +51,7 @@ pub use dispatch_status::{
     load_dispatch_row_pg_first, load_dispatch_row_with_backends, mark_dispatch_completed_pg_first,
     set_dispatch_status_pg_first, set_dispatch_status_with_backends,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[allow(unused_imports)]
 pub(crate) use dispatch_status::{
     ensure_dispatch_notify_outbox_on_conn, ensure_dispatch_status_reaction_outbox_on_conn,
@@ -99,12 +99,12 @@ pub(crate) fn is_user_cancel_reason(reason: Option<&str>) -> bool {
 /// The dispatch row remains the canonical source of truth. `auto_queue_entries`
 /// is a derived projection that must be cleared whenever the linked dispatch is
 /// cancelled so a stale `dispatched` entry cannot block or duplicate work.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     dispatch_id: &str,
     reason: Option<&str>,
-) -> rusqlite::Result<usize> {
+) -> sqlite_test::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT id FROM auto_queue_entries
          WHERE dispatch_id = ?1 AND status IN ('pending', 'dispatched')",
@@ -126,7 +126,9 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
             false,
         )
         .map_err(|e| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+            sqlite_test::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                e.to_string(),
+            )))
         })?
     } else {
         set_dispatch_status_without_queue_sync_on_conn(
@@ -139,7 +141,9 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
             false,
         )
         .map_err(|e| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+            sqlite_test::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                e.to_string(),
+            )))
         })?
     };
 
@@ -189,7 +193,7 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
                          updated_at = datetime('now')
                      WHERE id = ?2"
                 ),
-                rusqlite::params![target_status, entry_id],
+                sqlite_test::params![target_status, entry_id],
             )?;
             let _ = trigger_source;
         }
@@ -394,12 +398,12 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
 /// Used when PMD force-transitions a live card back to backlog/ready. In that
 /// case the current work should be abandoned rather than re-queued into the
 /// same active run.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn cancel_active_dispatches_for_card_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     reason: Option<&str>,
-) -> rusqlite::Result<usize> {
+) -> sqlite_test::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT id FROM task_dispatches
          WHERE kanban_card_id = ?1 AND status IN ('pending', 'dispatched')",
@@ -412,7 +416,7 @@ pub fn cancel_active_dispatches_for_card_on_conn(
 
     conn.execute(
         "UPDATE sessions \
-         SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END, \
+         SET status = CASE WHEN status IN ('turn_active', 'working') THEN 'idle' ELSE status END, \
              active_dispatch_id = NULL \
          WHERE active_dispatch_id IN (
              SELECT id FROM task_dispatches
@@ -436,7 +440,7 @@ pub fn cancel_active_dispatches_for_card_on_conn(
                 false,
             )
             .map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                sqlite_test::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
                     error.to_string(),
                 )))
             })?,
@@ -450,7 +454,7 @@ pub fn cancel_active_dispatches_for_card_on_conn(
                 false,
             )
             .map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                sqlite_test::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
                     error.to_string(),
                 )))
             })?,
@@ -698,9 +702,9 @@ pub(crate) fn summarize_dispatch_from_text(
 }
 
 /// Read a single dispatch row as JSON.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn query_dispatch_row(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     dispatch_id: &str,
 ) -> Result<serde_json::Value> {
     conn.query_row(
@@ -778,7 +782,7 @@ pub fn drain_unified_thread_kill_signals() -> Vec<String> {
     Vec::new()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::build_review_context_sqlite_test as build_review_context;
     use super::create_dispatch_record_sqlite_test as create_dispatch_record_test;
@@ -860,7 +864,7 @@ mod tests {
     }
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = sqlite_test::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         let db = crate::db::wrap_conn(conn);
@@ -942,7 +946,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "INSERT INTO kanban_cards (id, title, status, created_at, updated_at) VALUES (?1, 'Test Card', ?2, datetime('now'), datetime('now'))",
-            rusqlite::params![card_id, status],
+            sqlite_test::params![card_id, status],
         )
         .unwrap();
     }
@@ -951,7 +955,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET github_issue_number = ?1 WHERE id = ?2",
-            rusqlite::params![issue_number, card_id],
+            sqlite_test::params![issue_number, card_id],
         )
         .unwrap();
     }
@@ -960,7 +964,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET repo_id = ?1 WHERE id = ?2",
-            rusqlite::params![repo_id, card_id],
+            sqlite_test::params![repo_id, card_id],
         )
         .unwrap();
     }
@@ -969,7 +973,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET description = ?1 WHERE id = ?2",
-            rusqlite::params![description, card_id],
+            sqlite_test::params![description, card_id],
         )
         .unwrap();
     }
@@ -987,7 +991,7 @@ mod tests {
         dir
     }
 
-    fn count_notify_outbox(conn: &rusqlite::Connection, dispatch_id: &str) -> i64 {
+    fn count_notify_outbox(conn: &sqlite_test::Connection, dispatch_id: &str) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'notify'",
             [dispatch_id],
@@ -996,7 +1000,7 @@ mod tests {
         .unwrap()
     }
 
-    fn count_status_reaction_outbox(conn: &rusqlite::Connection, dispatch_id: &str) -> i64 {
+    fn count_status_reaction_outbox(conn: &sqlite_test::Connection, dispatch_id: &str) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM dispatch_outbox WHERE dispatch_id = ?1 AND action = 'status_reaction'",
             [dispatch_id],
@@ -1006,7 +1010,7 @@ mod tests {
     }
 
     fn load_dispatch_events(
-        conn: &rusqlite::Connection,
+        conn: &sqlite_test::Connection,
         dispatch_id: &str,
     ) -> Vec<(Option<String>, String, String)> {
         let mut stmt = conn
@@ -1410,7 +1414,7 @@ mod tests {
         conn.execute(
             "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
              VALUES (?1, ?2, 'agent-1', 'implementation', 'dispatched', 'User Cancel', datetime('now'), datetime('now'))",
-            rusqlite::params![dispatch_id, card_id],
+            sqlite_test::params![dispatch_id, card_id],
         )
         .unwrap();
         // Use a per-card run id so fixtures from sibling tests do not collide
@@ -1426,7 +1430,7 @@ mod tests {
             "INSERT INTO auto_queue_entries \
                  (id, run_id, kanban_card_id, agent_id, status, dispatch_id, dispatched_at) \
              VALUES (?1, ?2, ?3, 'agent-1', 'dispatched', ?4, datetime('now'))",
-            rusqlite::params![entry_id, run_id, card_id, dispatch_id],
+            sqlite_test::params![entry_id, run_id, card_id, dispatch_id],
         )
         .unwrap();
     }
@@ -3013,7 +3017,7 @@ mod tests {
                 'dispatch-review-target', 'card-review-target', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": repo_dir.clone(),
@@ -3076,7 +3080,7 @@ mod tests {
                 'dispatch-review-stale-worktree', 'card-review-stale-worktree', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_wt_path,
@@ -3132,7 +3136,7 @@ mod tests {
                 'dispatch-review-stale-repo', 'card-review-stale-repo', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_wt_path,
@@ -3190,7 +3194,7 @@ mod tests {
                 'dispatch-review-no-issue', 'card-review-no-issue', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_wt_path,
@@ -3265,7 +3269,7 @@ mod tests {
                 'dispatch-review-no-issue-tr', 'card-review-no-issue-tr', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({ "target_repo": external_repo_dir }).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_wt_path,
@@ -3344,7 +3348,7 @@ mod tests {
                 'dispatch-review-recycled', 'card-review-recycled-wt', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": recycled_wt_path,
@@ -3434,7 +3438,7 @@ mod tests {
                 'dispatch-review-external-tr', 'card-review-external-tr', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({ "target_repo": external_repo_dir }).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_wt_path,
@@ -3524,7 +3528,7 @@ mod tests {
                 'dispatch-review-descendant', 'card-review-descendant', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": wt_path,
@@ -3605,7 +3609,7 @@ mod tests {
                 'dispatch-review-merge-base', 'card-review-merge-base', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": wt_path,
@@ -3670,7 +3674,7 @@ mod tests {
                 'dispatch-review-match', 'card-review-match', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": repo_dir,
@@ -3722,7 +3726,7 @@ mod tests {
                 'dispatch-review-mismatch', 'card-review-mismatch', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": repo_dir,
@@ -3782,7 +3786,7 @@ mod tests {
                 'dispatch-review-worktree-fallback', 'card-review-worktree-fallback', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": wt_path,
@@ -3861,7 +3865,7 @@ mod tests {
                 'dispatch-review-dirty-completion', 'card-review-dirty-completion', 'agent-1', 'implementation', 'completed',
                 'Implemented without commit', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({}).to_string(),
             ],
@@ -3919,7 +3923,7 @@ mod tests {
                 'dispatch-review-external-reject', 'card-review-external-reject', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": external_dir,
@@ -4000,7 +4004,7 @@ mod tests {
                 'dispatch-review-external-accept', 'card-review-external-accept', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": external_dir,
@@ -4123,7 +4127,7 @@ mod tests {
                 'dispatch-review-762-external-fail', 'card-review-762-external-fail', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({ "target_repo": external_repo_dir }).to_string(),
                 serde_json::json!({
                     "completed_worktree_path":
@@ -4243,7 +4247,7 @@ mod tests {
                 'dispatch-review-762-a-core', 'card-review-762-a-core', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({ "target_repo": external_repo_dir }).to_string(),
                 serde_json::json!({
                     "completed_worktree_path":
@@ -4342,7 +4346,7 @@ mod tests {
                 'dispatch-review-762-a-caller', 'card-review-762-a-caller', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": external_dir,
@@ -4417,7 +4421,7 @@ mod tests {
                 'dispatch-review-762-c-none-none', 'card-review-762-c-none-none', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({ "target_repo": bogus_external }).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": format!("{bogus_external}/wt-gone"),
@@ -4470,7 +4474,7 @@ mod tests {
                 'dispatch-review-noop', 'card-review-noop', 'agent-1', 'implementation', 'completed',
                 'No changes needed', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "work_outcome": "noop",
@@ -4551,7 +4555,7 @@ mod tests {
                 'dispatch-review-quality', 'card-review-quality', 'agent-1', 'implementation', 'completed',
                 'Done', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": repo_dir,
@@ -4693,7 +4697,7 @@ mod tests {
                 'dispatch-summary-row', 'card-summary-row', 'agent-1', 'review-decision', 'completed',
                 'Review decision', ?1, datetime('now'), datetime('now')
              )",
-            rusqlite::params![json!({
+            sqlite_test::params![json!({
                 "decision": "accept",
                 "comment": "Ship it"
             })

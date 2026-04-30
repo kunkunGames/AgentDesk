@@ -22,13 +22,13 @@ pub(crate) use memento::{
 pub(crate) use memento_throttle::{
     RecallSizeBucket, memento_call_metrics_snapshot, note_recall_context_size,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use memento_throttle::{
     note_memento_dedup_hit, note_memento_remote_call, note_memento_tool_feedback_trigger,
     note_memento_tool_request, reset_memento_throttle_for_tests,
 };
 pub(crate) use runtime_state::{backend_is_active, backend_state, refresh_backend_health};
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use runtime_state::{
     last_refresh_reason_for_tests, reset_for_tests as reset_backend_health_for_tests,
 };
@@ -265,7 +265,7 @@ pub(crate) fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::settings::{

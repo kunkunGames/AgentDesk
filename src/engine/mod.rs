@@ -19,7 +19,7 @@ use rquickjs::{Context, Function, Persistent, Runtime};
 use sqlx::Row;
 
 use crate::config::Config;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
 
 use hooks::Hook;
@@ -81,7 +81,7 @@ enum EngineCommand {
     DrainStartupHooks {
         reply: mpsc::Sender<()>,
     },
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     BlockActor {
         entered: mpsc::Sender<()>,
         release: mpsc::Receiver<()>,
@@ -195,7 +195,7 @@ impl PolicyEngineActor {
                     engine.drain_startup_hooks_inline();
                     let _ = reply.send(());
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 EngineCommand::BlockActor {
                     entered,
                     release,
@@ -233,7 +233,7 @@ impl Drop for PolicyEngineActor {
 
 #[derive(Clone)]
 struct PolicyEngineRuntimeDeps {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     legacy_db: Option<Db>,
     pg_pool: Option<sqlx::PgPool>,
 }
@@ -288,7 +288,7 @@ impl PolicyEngine {
         Self::new_with_pg_and_label(config, pg_pool, "main")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn new_with_legacy_db(config: &Config, db: Db) -> Result<Self> {
         Self::new_with_test_backends_and_label(config, Some(db), None, "main")
     }
@@ -299,14 +299,14 @@ impl PolicyEngine {
         label: &'static str,
     ) -> Result<Self> {
         let runtime_deps = Arc::new(PolicyEngineRuntimeDeps {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             legacy_db: None,
             pg_pool: pg_pool.clone(),
         });
         Self::new_with_runtime_deps(config, runtime_deps, label)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     fn new_with_test_backends_and_label(
         config: &Config,
         legacy_db: Option<Db>,
@@ -330,7 +330,7 @@ impl PolicyEngine {
 
         // Register bridge ops (agentdesk.*)
         context.with(|ctx| {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             {
                 return ops::register_globals_with_supervisor_and_test_backends(
                     &ctx,
@@ -340,7 +340,7 @@ impl PolicyEngine {
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to register bridge ops: {e}"));
             }
-            #[cfg(not(test))]
+            #[cfg(not(feature = "legacy-sqlite-tests"))]
             ops::register_globals_with_supervisor_and_pg(
                 &ctx,
                 runtime_deps.pg_pool.clone(),
@@ -364,7 +364,7 @@ impl PolicyEngine {
 
             // Register bridge ops in the reload context too
             reload_ctx.with(|ctx| {
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 {
                     return ops::register_globals_with_supervisor_and_test_backends(
                         &ctx,
@@ -376,7 +376,7 @@ impl PolicyEngine {
                         anyhow::anyhow!("Failed to register bridge ops in reload ctx: {e}")
                     });
                 }
-                #[cfg(not(test))]
+                #[cfg(not(feature = "legacy-sqlite-tests"))]
                 ops::register_globals_with_supervisor_and_pg(
                     &ctx,
                     runtime_deps.pg_pool.clone(),
@@ -472,7 +472,7 @@ impl PolicyEngine {
         self.runtime_deps.pg_pool.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(crate) fn legacy_db(&self) -> Option<&Db> {
         self.runtime_deps.legacy_db.as_ref()
     }
@@ -560,12 +560,12 @@ impl PolicyEngine {
             return;
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             return;
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             let Some(legacy_db) = self.legacy_db() else {
                 return;
@@ -851,9 +851,9 @@ impl PolicyEngine {
 
             for (card_id, old_status, new_status) in &transitions {
                 crate::kanban::fire_transition_hooks_with_backends(
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                     self.legacy_db(),
-                    #[cfg(not(test))]
+                    #[cfg(not(feature = "legacy-sqlite-tests"))]
                     None,
                     self.pg_pool(),
                     self,
@@ -1229,9 +1229,9 @@ impl PolicyEngine {
             Self::empty_intent_result()
         } else {
             intent::execute_intents_with_backends(
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 self.legacy_db(),
-                #[cfg(not(test))]
+                #[cfg(not(feature = "legacy-sqlite-tests"))]
                 None,
                 self.pg_pool(),
                 Some(self),
@@ -1283,7 +1283,7 @@ impl PolicyEngine {
 
     /// Run a closure with a clone of the JS context (test-only helper used by
     /// hook-orchestration pre-validation tests, #1079).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(crate) fn with_js_context<R>(&self, f: impl FnOnce(&Context) -> R) -> Result<R> {
         let inner = self
             .inner
@@ -1293,7 +1293,7 @@ impl PolicyEngine {
     }
 
     /// Evaluate arbitrary JS in the engine context (useful for testing).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn eval_js<T: for<'js> rquickjs::FromJs<'js> + Send>(&self, code: &str) -> Result<T> {
         let inner = self
             .inner
@@ -1317,7 +1317,7 @@ impl PolicyEngine {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(crate) fn block_actor_for_test(
         &self,
         entered: mpsc::Sender<()>,
@@ -1394,12 +1394,12 @@ fn json_to_js<'js>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = sqlite_test::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)

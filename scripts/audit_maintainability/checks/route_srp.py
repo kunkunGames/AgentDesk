@@ -19,12 +19,14 @@ from ..common import Finding, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 ROUTE_DIR_PARTS = ("server", "routes")
+AUTO_QUEUE_ROUTE_FILE = "src/server/routes/auto_queue.rs"
 
 SQL_HINT = re.compile(
     r"sqlx::query|sqlx::query_as|\bquery!\(|\bquery_as!\(|"
     r"\"\s*(?:SELECT|INSERT|UPDATE|DELETE)\b",
     re.IGNORECASE,
 )
+MUTATION_SQL_HINT = re.compile(r"\b(?:INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
 JSON_HINT = re.compile(r"\bjson!\s*\(")
 DOMAIN_HINT = re.compile(r"crate::services::[A-Za-z0-9_]+")
 
@@ -40,9 +42,27 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     findings: list[Finding] = []
     for path in production_rust_files():
         rel = rel_posix(path)
-        if not _is_route_file(rel) or rel in allowlist:
+        if not _is_route_file(rel):
             continue
         text = strip_rust_comments(read_text(path))
+        if rel == AUTO_QUEUE_ROUTE_FILE:
+            mutations = len(MUTATION_SQL_HINT.findall(text))
+            if mutations > 0:
+                findings.append(
+                    Finding(
+                        rule="route_srp_violations",
+                        severity="error",
+                        file=rel,
+                        line=None,
+                        message=(
+                            "auto_queue route must stay HTTP-only; move direct "
+                            "INSERT/UPDATE/DELETE SQL into services::auto_queue"
+                        ),
+                        extra={"mutation_sql": str(mutations)},
+                    )
+                )
+        if rel in allowlist:
+            continue
         sql = len(SQL_HINT.findall(text))
         js = len(JSON_HINT.findall(text))
         dom = len(DOMAIN_HINT.findall(text))

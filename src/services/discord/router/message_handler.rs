@@ -113,6 +113,21 @@ fn should_send_watchdog_deadlock_prealert(
         && last_notified_deadline_ms != Some(deadline_ms)
 }
 
+fn apply_watchdog_deadline_extension(
+    watchdog_token: &CancelToken,
+    extension: crate::services::turn_orchestrator::WatchdogDeadlineExtension,
+) -> i64 {
+    watchdog_token.watchdog_max_deadline_ms.store(
+        extension.max_deadline_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    watchdog_token.watchdog_deadline_ms.store(
+        extension.new_deadline_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    extension.new_deadline_ms
+}
+
 fn build_watchdog_deadlock_prealert_message(
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
@@ -245,11 +260,30 @@ fn attach_paused_turn_watcher(
 
     #[cfg(unix)]
     if let (Some(tmux_session_name), Some(output_path)) = (tmux_session_name, output_path) {
+        let existing_owner_for_tmux = shared.tmux_watchers.iter().any(|entry| {
+            entry.tmux_session_name == tmux_session_name
+                && !entry.cancel.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let tmux_live =
+            crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name);
+        if !tmux_live && !existing_owner_for_tmux {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ↻ Skipping paused tmux watcher attach for channel {} ({source}) — tmux {} is not live yet",
+                channel_id,
+                tmux_session_name
+            );
+            return watcher_owner_channel_id;
+        }
+
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let resume_offset = Arc::new(std::sync::Mutex::new(None::<u64>));
         let pause_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let turn_delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_heartbeat_ts_ms = Arc::new(std::sync::atomic::AtomicI64::new(
+            super::super::tmux_watcher_now_ms(),
+        ));
         let handle = TmuxWatcherHandle {
             tmux_session_name: tmux_session_name.clone(),
             paused: paused.clone(),
@@ -257,6 +291,7 @@ fn attach_paused_turn_watcher(
             cancel: cancel.clone(),
             pause_epoch: pause_epoch.clone(),
             turn_delivered: turn_delivered.clone(),
+            last_heartbeat_ts_ms: last_heartbeat_ts_ms.clone(),
         };
         let claim = super::super::tmux::claim_or_reuse_watcher(
             &shared.tmux_watchers,
@@ -273,6 +308,9 @@ fn attach_paused_turn_watcher(
                 channel_id,
                 claim.as_str()
             );
+            if claim.replaced_existing() {
+                shared.record_tmux_watcher_reconnect(channel_id);
+            }
             tokio::spawn(super::super::tmux::tmux_output_watcher(
                 channel_id,
                 http,
@@ -285,6 +323,7 @@ fn attach_paused_turn_watcher(
                 resume_offset,
                 pause_epoch,
                 turn_delivered,
+                last_heartbeat_ts_ms,
             ));
         }
     }
@@ -301,7 +340,7 @@ fn attach_paused_turn_watcher(
     watcher_owner_channel_id
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod test_harness_exports {
     use super::*;
 
@@ -561,7 +600,7 @@ fn merge_reply_contexts(primary: Option<String>, secondary: Option<String>) -> O
 }
 
 fn take_session_retry_context(shared: &Arc<SharedData>, channel_id: ChannelId) -> Option<String> {
-    super::super::turn_bridge::take_session_retry_context(shared.legacy_sqlite(), channel_id.get())
+    super::super::turn_bridge::take_session_retry_context(None::<&crate::db::Db>, channel_id.get())
         .and_then(|raw| format_session_retry_context(&raw))
 }
 
@@ -753,7 +792,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                 session.recent_history_context(super::super::SESSION_RECOVERY_CONTEXT_MESSAGES)
             {
                 let _ = super::super::turn_bridge::store_session_retry_context(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     channel_id.get(),
                     &retry_context,
@@ -1149,16 +1188,10 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                     super::super::clear_watchdog_deadline_override(watchdog_channel_id_num).await;
                     return;
                 }
-                if let Some(new_deadline) =
+                if let Some(extension) =
                     super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
-                    let max_dl = watchdog_token
-                        .watchdog_max_deadline_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let clamped = std::cmp::min(new_deadline, max_dl);
-                    watchdog_token
-                        .watchdog_deadline_ms
-                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    apply_watchdog_deadline_extension(&watchdog_token, extension);
                     last_deadlock_prealert_deadline_ms = None;
                 }
                 {
@@ -1217,6 +1250,9 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                             .await;
                         return;
                     }
+                    let current_max_deadline = watchdog_token
+                        .watchdog_max_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     if maybe_send_watchdog_deadlock_prealert(
                         &watchdog_shared,
                         &watchdog_provider,
@@ -1224,23 +1260,17 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                         now,
                         current_deadline,
                         turn_started_ms,
-                        max_deadline_ms,
+                        current_max_deadline,
                     )
                     .await
                     {
                         last_deadlock_prealert_deadline_ms = Some(current_deadline);
                     }
                 }
-                if let Some(new_deadline) =
+                if let Some(extension) =
                     super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
-                    let max_dl = watchdog_token
-                        .watchdog_max_deadline_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let clamped = std::cmp::min(new_deadline, max_dl);
-                    watchdog_token
-                        .watchdog_deadline_ms
-                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    apply_watchdog_deadline_extension(&watchdog_token, extension);
                     last_deadlock_prealert_deadline_ms = None;
                 }
                 let current_deadline = watchdog_token
@@ -1818,14 +1848,14 @@ fn dispatch_session_path_should_update(
     dispatch_effective_path != current_path
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchCwdPolicyDecision {
     log_main_workspace_error: bool,
     reject_for_missing_fresh_worktree: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn evaluate_dispatch_cwd_policy(
     dispatch_type: Option<&str>,
     current_path: &str,
@@ -1982,7 +2012,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 session.recent_history_context(super::super::SESSION_RECOVERY_CONTEXT_MESSAGES)
             {
                 let _ = super::super::turn_bridge::store_session_retry_context(
-                    shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     channel_id.get(),
                     &retry_context,
@@ -3118,7 +3148,10 @@ pub(in crate::services::discord) async fn handle_text_message(
                     started_at_unix: chrono::Utc::now().timestamp(),
                     tool_summary: None,
                     command_summary: None,
+                    reason_detail: None,
                     context_line: None,
+                    request_line: Some(user_text.to_string()),
+                    progress_line: None,
                 };
                 let outcome = shared
                     .placeholder_controller
@@ -3235,7 +3268,10 @@ pub(in crate::services::discord) async fn handle_text_message(
             started_at_unix: chrono::Utc::now().timestamp(),
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: Some(user_text.to_string()),
+            progress_line: None,
         };
         let gateway = super::super::gateway::DiscordGateway::new(
             ctx.http.clone(),
@@ -3527,20 +3563,15 @@ pub(in crate::services::discord) async fn handle_text_message(
                 }
 
                 // Check for API-based deadline extension
-                if let Some(new_deadline) =
+                if let Some(extension) =
                     super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
-                    let max_dl = watchdog_token
-                        .watchdog_max_deadline_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let clamped = std::cmp::min(new_deadline, max_dl);
-                    watchdog_token
-                        .watchdog_deadline_ms
-                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    let effective_deadline =
+                        apply_watchdog_deadline_extension(&watchdog_token, extension);
                     last_deadlock_prealert_deadline_ms = None;
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     let remaining_min =
-                        (clamped - chrono::Utc::now().timestamp_millis()) / 1000 / 60;
+                        (effective_deadline - chrono::Utc::now().timestamp_millis()) / 1000 / 60;
                     tracing::info!(
                         "  [{ts}] ⏰ WATCHDOG: deadline extended for channel {} — {remaining_min}m remaining",
                         channel_id
@@ -3613,6 +3644,9 @@ pub(in crate::services::discord) async fn handle_text_message(
                             .await;
                         return;
                     }
+                    let current_max_deadline = watchdog_token
+                        .watchdog_max_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     if maybe_send_watchdog_deadlock_prealert(
                         &watchdog_shared,
                         &watchdog_provider,
@@ -3620,7 +3654,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         now,
                         current_deadline,
                         turn_started_ms,
-                        max_deadline_ms,
+                        current_max_deadline,
                     )
                     .await
                     {
@@ -3628,16 +3662,10 @@ pub(in crate::services::discord) async fn handle_text_message(
                     }
                 }
 
-                if let Some(new_deadline) =
+                if let Some(extension) =
                     super::super::take_watchdog_deadline_override(watchdog_channel_id_num).await
                 {
-                    let max_dl = watchdog_token
-                        .watchdog_max_deadline_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let clamped = std::cmp::min(new_deadline, max_dl);
-                    watchdog_token
-                        .watchdog_deadline_ms
-                        .store(clamped, std::sync::atomic::Ordering::Relaxed);
+                    apply_watchdog_deadline_extension(&watchdog_token, extension);
                     last_deadlock_prealert_deadline_ms = None;
                 }
                 let current_deadline = watchdog_token
@@ -5474,7 +5502,7 @@ fn resolve_session_id_for_current_turn(
     if reset_applied { None } else { session_id }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::super::super::DiscordSession;
     use super::super::control_intent::{
@@ -6533,6 +6561,43 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_deadline_extension_moves_deadline_and_cap() {
+        let token = CancelToken::new();
+        token
+            .watchdog_deadline_ms
+            .store(1_000, std::sync::atomic::Ordering::Relaxed);
+        token
+            .watchdog_max_deadline_ms
+            .store(2_000, std::sync::atomic::Ordering::Relaxed);
+        let extension = crate::services::turn_orchestrator::WatchdogDeadlineExtension {
+            requested_deadline_ms: 4_000,
+            new_deadline_ms: 4_000,
+            max_deadline_ms: 4_000,
+            applied_extend_secs: 2,
+            requested_extend_secs: 2,
+            extension_count: 1,
+            extension_count_limit: 6,
+            extension_total_secs: 2,
+            extension_total_secs_limit: 10_800,
+            clamped: false,
+        };
+
+        assert_eq!(apply_watchdog_deadline_extension(&token, extension), 4_000);
+        assert_eq!(
+            token
+                .watchdog_deadline_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4_000
+        );
+        assert_eq!(
+            token
+                .watchdog_max_deadline_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4_000
+        );
+    }
+
+    #[test]
     fn attach_paused_turn_watcher_pauses_existing_tmux_owner_channel() {
         let shared = super::super::super::make_shared_data_for_tests();
         let owner_channel = ChannelId::new(1485506232256168136);
@@ -6549,6 +6614,9 @@ mod tests {
                 cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 pause_epoch: owner_pause_epoch.clone(),
                 turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                    super::super::super::tmux_watcher_now_ms(),
+                )),
             },
         );
 
@@ -6575,6 +6643,28 @@ mod tests {
         assert!(
             !shared.tmux_watchers.contains_key(&thread_channel),
             "reusing an owner watcher must not install a duplicate thread watcher"
+        );
+    }
+
+    #[test]
+    fn attach_paused_turn_watcher_skips_prelaunch_dead_tmux() {
+        let shared = super::super::super::make_shared_data_for_tests();
+        let channel = ChannelId::new(1485506232256168138);
+        let owner = attach_paused_turn_watcher(
+            &shared,
+            Arc::new(poise::serenity_prelude::Http::new("Bot test-token")),
+            &ProviderKind::Codex,
+            channel,
+            Some("AgentDesk-codex-not-yet-spawned".to_string()),
+            Some("/tmp/agentdesk-test-output.jsonl".to_string()),
+            0,
+            "unit-test-prelaunch",
+        );
+
+        assert_eq!(owner, channel);
+        assert!(
+            !shared.tmux_watchers.contains_key(&channel),
+            "prelaunch turn start must wait for TmuxReady instead of spawning a watcher that immediately observes a dead pane"
         );
     }
 

@@ -2,7 +2,7 @@
 //!
 //! These tests verify pipeline correctness end-to-end before #106 data-driven transition.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::ffi::OsString;
     use std::fs;
@@ -905,7 +905,7 @@ mod tests {
         let conn = db.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions (session_key, agent_id, provider, status, cwd, last_heartbeat) \
-             VALUES (?1, 'agent-1', 'codex', 'working', ?2, datetime('now'))",
+             VALUES (?1, 'agent-1', 'codex', 'turn_active', ?2, datetime('now'))",
             sqlite_params![session_key, cwd],
         )
         .unwrap();

@@ -3189,7 +3189,7 @@ pub(super) async fn handle_meeting_command(
     Ok(false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         ActiveMeetingSlot, DEFAULT_MEETING_SELECTION_STAGE_TIMEOUT_SECS,

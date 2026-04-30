@@ -366,9 +366,25 @@ wait_for_http_service_health() {
 health_turn_snapshot() {
   local port="$1"
   local health_json
-  health_json=$(curl -sf --max-time 3 "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health" 2>/dev/null) || return 1
+  # Use /api/health/detail (auth-aware via _curl_health_auth_args) so that
+  # global_active / global_finalizing are present even when restart_pending
+  # is armed — public_health_json strips the counters from the redacted
+  # /api/health body (#1447 review iteration 4 P2). We also drop `-f` so the
+  # 503 body served while restart_pending is armed remains observable.
+  health_json=$(curl -s --max-time 3 -H "$(_health_origin_header)" \
+    "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null) || return 1
+  [ -n "$health_json" ] || return 1
 
   if _health_json_has_jq; then
+    # Require global_active and global_finalizing to be PRESENT (not just
+    # non-zero). If the body is missing them — for instance because we hit
+    # the auth shim or a redacted endpoint — fail closed instead of letting
+    # AGENTDESK_SKIP_TURN_DRAIN=0 callers incorrectly conclude "no turns".
+    if ! printf '%s\n' "$health_json" | jq -e '
+      (has("global_active")) and (has("global_finalizing"))
+    ' >/dev/null 2>&1; then
+      return 1
+    fi
     printf '%s\n' "$health_json" | jq -r '
       [
         (.global_active // 0),
@@ -379,11 +395,173 @@ health_turn_snapshot() {
     return
   fi
 
+  # jq-less fallback: require the field markers to be present in the body,
+  # otherwise return 1 so callers do not silently default to "0 active".
+  if ! printf '%s' "$health_json" | grep -q '"global_active":[0-9]'; then
+    return 1
+  fi
+  if ! printf '%s' "$health_json" | grep -q '"global_finalizing":[0-9]'; then
+    return 1
+  fi
   local active finalizing queue_depth
   active=$(printf '%s' "$health_json" | grep -o '"global_active":[0-9]*' | head -1 | cut -d: -f2)
   finalizing=$(printf '%s' "$health_json" | grep -o '"global_finalizing":[0-9]*' | head -1 | cut -d: -f2)
   queue_depth=$(printf '%s' "$health_json" | grep -o '"queue_depth":[0-9]*' | head -1 | cut -d: -f2)
   echo "${active:-0} ${finalizing:-0} ${queue_depth:-0}"
+}
+
+assert_restart_helpers_loaded() {
+  # Preflight contract for scripts that source _defaults.sh expecting the
+  # restart-drain helpers. Returns non-zero (so callers can `if !` and exit 1)
+  # instead of letting a missing function silently `command not found`. See
+  # #1447: silent fail of agentdesk-restart when these helpers were absent.
+  local missing=()
+  local fn
+  for fn in \
+    request_restart_drain_mode_or_fail \
+    wait_for_live_turns_to_drain_or_fail \
+    clear_restart_drain_mode; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      missing+=("$fn")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "✗ [gate] required restart helper(s) missing from _defaults.sh: ${missing[*]}" >&2
+    echo "  Refusing restart to avoid bypassing live-turn drain protection (#1447)." >&2
+    return 1
+  fi
+  return 0
+}
+
+clear_restart_drain_mode() {
+  local runtime_root="$1"
+  if [ -z "$runtime_root" ]; then
+    echo "✗ [gate] runtime root is required to clear restart drain mode" >&2
+    return 1
+  fi
+  rm -f "$runtime_root/restart_pending"
+}
+
+_health_origin_header() {
+  # auth_middleware (src/server/routes/auth.rs) treats requests with a
+  # same-origin Origin header as authenticated even when server.auth_token
+  # is configured. The restart skill runs on the same host as dcserver so
+  # this is always true; otherwise the helper would be locked out of
+  # /api/health/detail on auth-enabled deployments (#1447 review iter 4 P2).
+  printf 'Origin: http://%s' "${ADK_DEFAULT_LOOPBACK}"
+}
+
+_restart_pending_acknowledged() {
+  local port="$1"
+  local detail_json
+  # NOTE: do NOT pass `-f`. The runtime serves /api/health/detail as HTTP 503
+  # the moment `restart_pending` flips to true (build_health_snapshot returns
+  # `unhealthy` for restart-pending — see src/services/discord/health.rs), and
+  # `-f` would drop the body and report failure exactly when we need to read
+  # the body to confirm the gate is armed (#1447 review P1, iteration 2).
+  detail_json=$(curl -s --max-time 3 -H "$(_health_origin_header)" \
+    "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null) || return 1
+  [ -n "$detail_json" ] || return 1
+
+  # restart_pending is per-provider. Require EVERY provider that exposes
+  # the field to report true — otherwise a multi-provider runtime can
+  # accept new turns on an unsynced provider while we proceed to bootout
+  # (#1447 review P2).
+  if _health_json_has_jq; then
+    printf '%s\n' "$detail_json" | jq -e '
+      (.providers // [])
+      | map(select(.restart_pending != null))
+      | (length > 0) and all(.restart_pending == true)
+    ' >/dev/null 2>&1
+    return $?
+  fi
+
+  # jq-less fallback: every restart_pending occurrence must be true. If any
+  # is false we fail closed; if none are present we cannot confirm and fail.
+  if printf '%s' "$detail_json" | grep -q '"restart_pending":false'; then
+    return 1
+  fi
+  printf '%s' "$detail_json" | grep -q '"restart_pending":true'
+}
+
+request_restart_drain_mode_or_fail() {
+  local scope="$1"
+  local label="$2"
+  local port="$3"
+  local runtime_root="$4"
+  local source="${5:-agentdesk-restart}"
+  local ack_wait="${AGENTDESK_RESTART_DRAIN_ACK_WAIT:-20}"
+  local waited=0
+  local marker
+  local tmp_marker
+  local job_state
+
+  if [ -z "$runtime_root" ]; then
+    echo "✗ [gate] ${scope} runtime root is required for restart drain mode" >&2
+    return 1
+  fi
+
+  mkdir -p "$runtime_root" || {
+    echo "✗ [gate] failed to create ${scope} runtime root: $runtime_root" >&2
+    return 1
+  }
+
+  marker="$runtime_root/restart_pending"
+  tmp_marker="${marker}.$$"
+  {
+    printf 'source=%s\n' "$source"
+    printf 'scope=%s\n' "$scope"
+    printf 'label=%s\n' "$label"
+    date -u '+requested_at=%Y-%m-%dT%H:%M:%SZ'
+  } >"$tmp_marker" || {
+    echo "✗ [gate] failed to write restart drain marker: $tmp_marker" >&2
+    return 1
+  }
+  mv "$tmp_marker" "$marker" || {
+    rm -f "$tmp_marker"
+    echo "✗ [gate] failed to publish restart drain marker: $marker" >&2
+    return 1
+  }
+
+  while [ "$waited" -lt "$ack_wait" ]; do
+    if _restart_pending_acknowledged "$port"; then
+      echo "✓ [gate] ${scope} restart drain mode acknowledged by runtime"
+      return 0
+    fi
+    # #1447 review P2: idle runtime may consume the marker (restart_ctrl
+    # deletes restart_pending and calls exit(0) once all turns drain) before
+    # our 1s poll observes the in-memory flag. If the marker we just wrote
+    # has disappeared, the runtime acknowledged it the only way it can.
+    if [ ! -e "$marker" ]; then
+      echo "▸ [gate] ${scope} restart drain marker consumed by runtime — treating as acknowledged"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  job_state=$(_launchd_job_state "$label")
+  if [ "$job_state" = "not running" ]; then
+    # #1447 review iter 4 P2: leaving the marker on disk causes the next
+    # cold boot to enter drain mode, observe zero turns, delete the marker,
+    # and call exit(0) — flapping under KeepAlive. The service is not
+    # running, so there is nothing to drain; clear the marker and report
+    # success.
+    rm -f "$marker" 2>/dev/null || true
+    echo "▸ [gate] ${scope} launchd job is not running; cleared restart drain marker (no in-flight turns to drain)"
+    return 0
+  fi
+  # Late-arriving consumption: marker may have been consumed between the
+  # last poll and the post-loop launchd check. Same ack semantics as above.
+  if [ ! -e "$marker" ]; then
+    echo "▸ [gate] ${scope} restart drain marker consumed by runtime during timeout window — treating as acknowledged"
+    return 0
+  fi
+
+  echo "✗ [gate] ${scope} restart drain mode was not acknowledged within ${ack_wait}s" >&2
+  echo "  Refusing restart to avoid bypassing live-turn drain protection." >&2
+  clear_restart_drain_mode "$runtime_root" || true
+  return 1
 }
 
 wait_for_live_turns_to_drain_or_fail() {

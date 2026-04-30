@@ -123,7 +123,7 @@ fn infer_priority(labels: &[super::sync::GhLabel]) -> &'static str {
     "medium"
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::github::sync::GhLabel;

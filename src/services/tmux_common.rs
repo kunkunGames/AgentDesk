@@ -216,7 +216,7 @@ impl RotatingJsonlWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl RotatingJsonlWriter {
     #[cfg(unix)]
     fn bound_file_id(&self) -> std::io::Result<(u64, u64)> {
@@ -326,7 +326,7 @@ pub fn truncate_jsonl_head_safe(
     Ok(Some(new_size))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

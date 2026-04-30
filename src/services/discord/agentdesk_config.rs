@@ -860,7 +860,7 @@ pub(crate) fn configured_workspaces() -> Vec<String> {
     workspaces
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::fs;
 

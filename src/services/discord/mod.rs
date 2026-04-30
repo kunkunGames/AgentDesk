@@ -39,11 +39,15 @@ pub(crate) mod restart_report;
 mod role_map;
 mod router;
 mod runtime_bootstrap;
+// #1446 stall-deadlock recovery: shared post-clear bookkeeping for the
+// THREAD-GUARD + stall-watchdog cleanup paths so neither leaks
+// `global_active` / orphaned cancel tokens after a dead-dispatch sweep.
 pub mod runtime_store;
 pub(crate) mod session_identity;
 mod session_runtime;
 pub(crate) mod settings;
 pub(crate) mod shared_memory;
+mod stall_recovery;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
@@ -63,7 +67,7 @@ pub(in crate::services::discord) use recovery_engine as recovery;
 pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use turn_bridge::build_work_dispatch_completion_result;
 
 use std::borrow::Cow;
@@ -113,7 +117,7 @@ use settings::{
     validate_bot_channel_routing_with_provider_channel,
 };
 #[cfg(unix)]
-use tmux::{restore_tmux_watchers, tmux_output_watcher};
+use tmux::restore_tmux_watchers;
 #[cfg(unix)]
 use tmux_reaper::{cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions};
 use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
@@ -236,12 +240,42 @@ pub(in crate::services::discord) fn is_allowed_turn_sender(
     text: &str,
 ) -> bool {
     if announce_bot_id.is_some_and(|id| id == author_id) {
-        return true;
+        // Issue announcements moved to notify-bot in the #1448 follow-up,
+        // so live announce-bot traffic is dispatch / PM-decision /
+        // escalation / generic routing — all of which trigger turns.
+        // The transitional block below catches catch-up replays of
+        // pre-deploy announce-authored issue cards (📋/✅) so they
+        // don't spawn spurious turns. Remove once existing announce-bot
+        // announcement messages have aged out of catch-up scan windows
+        // (safe sunset target: 2026-06-01).
+        return !is_legacy_announce_issue_card(text);
     }
     if allowed_bot_ids.contains(&author_id) {
         return should_process_allowed_bot_turn_text(text);
     }
     !author_is_bot
+}
+
+/// TRANSITIONAL (#1448 follow-up — sunset 2026-06-01): suppresses
+/// pre-deploy announce-bot issue-announcement / completion cards that
+/// reappear during restart catch-up. Live traffic now routes through
+/// notify-bot, which never reaches the announce-bot branch above.
+fn is_legacy_announce_issue_card(text: &str) -> bool {
+    let head = text.trim_start();
+    if head.starts_with("📋 **새 이슈 #") {
+        return true;
+    }
+    if let Some(rest) = head.strip_prefix("✅ **#") {
+        let digits_end = rest
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii_digit())
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        if digits_end > 0 && rest[digits_end..].starts_with(" 완료** —") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(in crate::services::discord) fn should_phase2_recover_message(
@@ -315,6 +349,23 @@ pub(in crate::services::discord) fn recovery_known_message_ids(
     ids
 }
 
+pub(in crate::services::discord) fn advance_last_message_checkpoint(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> u64 {
+    let message_id = message_id.get();
+    let checkpoint = shared
+        .last_message_ids
+        .get(&channel_id)
+        .map(|current| (*current).max(message_id))
+        .unwrap_or(message_id);
+    shared.last_message_ids.insert(channel_id, checkpoint);
+    runtime_store::save_last_message_id(provider.as_str(), channel_id.get(), checkpoint);
+    checkpoint
+}
+
 pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff;
 /// Minimum interval between Discord placeholder edits for progress status.
 /// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
@@ -342,15 +393,26 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
     })
 }
 
-/// Extend the watchdog deadline for a channel. Returns the new deadline_ms or None if at cap.
-pub async fn extend_watchdog_deadline(channel_id: u64, extend_by_secs: u64) -> Option<i64> {
-    ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
-        .extend_timeout(extend_by_secs)
-        .await
+/// Extend the watchdog deadline for a channel and move the per-turn max cap with it.
+pub async fn extend_watchdog_deadline(
+    channel_id: u64,
+    extend_by_secs: u64,
+) -> Result<
+    crate::services::turn_orchestrator::WatchdogDeadlineExtension,
+    crate::services::turn_orchestrator::WatchdogDeadlineExtensionError,
+> {
+    let Some(handle) = ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id)) else {
+        return Err(
+            crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::MailboxUnavailable,
+        );
+    };
+    handle.extend_timeout(extend_by_secs).await
 }
 
 /// Read and consume the deadline override for a channel (if any).
-pub(super) async fn take_watchdog_deadline_override(channel_id: u64) -> Option<i64> {
+pub(super) async fn take_watchdog_deadline_override(
+    channel_id: u64,
+) -> Option<crate::services::turn_orchestrator::WatchdogDeadlineExtension> {
     ChannelMailboxRegistry::global_handle(ChannelId::new(channel_id))?
         .take_timeout_override()
         .await
@@ -505,6 +567,24 @@ pub(super) struct TmuxWatcherHandle {
     /// Set by turn_bridge when it delivers the response directly (non-handoff path).
     /// Watcher checks this before relay to avoid duplicate messages.
     pub(super) turn_delivered: Arc<std::sync::atomic::AtomicBool>,
+    /// Updated by the watcher task loop. If this stops moving while the registry
+    /// still has a slot, the slot is stale and must not suppress a new watcher.
+    pub(super) last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
+}
+
+pub(super) const TMUX_WATCHER_STALE_HEARTBEAT_MS: i64 = 60_000;
+
+pub(super) fn tmux_watcher_now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+impl TmuxWatcherHandle {
+    pub(super) fn heartbeat_stale(&self) -> bool {
+        let last = self
+            .last_heartbeat_ts_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        last <= 0 || tmux_watcher_now_ms().saturating_sub(last) > TMUX_WATCHER_STALE_HEARTBEAT_MS
+    }
 }
 
 pub(super) type TmuxWatcherRegistryGuard = std::sync::MutexGuard<'static, ()>;
@@ -658,12 +738,12 @@ impl TmuxWatcherRegistry {
     }
 
     pub(super) fn tmux_session_is_stale(&self, tmux_session_name: &str) -> Option<bool> {
-        self.by_tmux_session
-            .get(tmux_session_name)
-            .map(|entry| entry.cancel.load(std::sync::atomic::Ordering::Relaxed))
+        self.by_tmux_session.get(tmux_session_name).map(|entry| {
+            entry.cancel.load(std::sync::atomic::Ordering::Relaxed) || entry.heartbeat_stale()
+        })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn assert_invariants_for_tests(&self) {
         let _guard = lock_tmux_watcher_registry();
         assert_eq!(
@@ -722,7 +802,7 @@ impl TmuxWatcherRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn remove_after_channel_index_drop_for_tests(
         &self,
         channel_id: &ChannelId,
@@ -776,6 +856,9 @@ pub(super) struct TmuxRelayCoord {
     /// `watcher-state` observability endpoint (#964). Monotonic is NOT
     /// required — this is a telemetry field only.
     pub(super) last_relay_ts_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// Number of watcher reattach/reconnect spawns observed for this channel
+    /// in the current dcserver process. Exposed through watcher-state (#964).
+    pub(super) reconnect_count: Arc<std::sync::atomic::AtomicU64>,
     /// `.generation` marker file mtime (nanos since epoch) snapshotted the
     /// last time `confirmed_end_offset` was advanced. 0 = never observed.
     ///
@@ -802,6 +885,7 @@ impl TmuxRelayCoord {
             relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_generation_mtime_ns: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
@@ -1020,7 +1104,7 @@ pub(super) struct SharedData {
     /// HTTP API port for self-referencing requests (from config server.port).
     pub(super) api_port: u16,
     /// Test-only legacy DB handle for SQLite compatibility tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) sqlite: Option<crate::db::Db>,
     /// Shared PostgreSQL pool for PG-backed route and runtime helpers.
     pub(super) pg_pool: Option<sqlx::PgPool>,
@@ -1036,18 +1120,8 @@ pub(super) struct SharedData {
 }
 
 impl SharedData {
-    #[cfg(test)]
-    pub(super) fn legacy_sqlite(&self) -> Option<&crate::db::Db> {
-        self.sqlite.as_ref()
-    }
-
-    #[cfg(not(test))]
-    pub(super) fn legacy_sqlite(&self) -> Option<&crate::db::Db> {
-        None
-    }
-
     pub(super) fn has_runtime_storage(&self) -> bool {
-        self.pg_pool.is_some() || self.legacy_sqlite().is_some()
+        self.pg_pool.is_some()
     }
 
     fn mailbox(&self, channel_id: ChannelId) -> ChannelMailboxHandle {
@@ -1097,6 +1171,15 @@ impl SharedData {
             .entry(channel_id)
             .or_insert_with(|| Arc::new(TmuxRelayCoord::new()))
             .clone()
+    }
+
+    /// Record that this process spawned a watcher during recovery/reattach.
+    /// This is process-local telemetry for `GET /api/channels/:id/watcher-state`
+    /// (#964), not persisted dedupe state and not counted on first-turn attach.
+    pub(super) fn record_tmux_watcher_reconnect(&self, channel_id: ChannelId) {
+        self.tmux_relay_coord(channel_id)
+            .reconnect_count
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     pub(super) fn record_channel_speaker(
@@ -1321,7 +1404,7 @@ impl SharedData {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
     make_shared_data_for_tests_with_storage(None, None)
 }
@@ -1333,7 +1416,7 @@ pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
 /// primitives without widening visibility on production paths. Private
 /// types (`TmuxWatcherHandle`, `InflightTurnState`) never leak out of this
 /// module; consumers only see opaque newtype wrappers.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) mod test_harness_exports {
     use super::{TmuxWatcherHandle, TmuxWatcherRegistry};
     use crate::services::provider::ProviderKind;
@@ -1381,6 +1464,9 @@ pub(crate) mod test_harness_exports {
             cancel: cancel.clone(),
             pause_epoch: pause_epoch.clone(),
             turn_delivered: Arc::new(AtomicBool::new(false)),
+            last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                super::tmux_watcher_now_ms(),
+            )),
         };
         let inspector = WatcherHandleInspector {
             cancel,
@@ -1616,7 +1702,7 @@ pub(crate) mod test_harness_exports {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn make_shared_data_for_tests_with_storage(
     sqlite: Option<crate::db::Db>,
     pg_pool: Option<sqlx::PgPool>,
@@ -3428,7 +3514,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             // Clean up worktree if session had one
             if let Some(session) = data.sessions.get(&ch) {
                 if let Some(ref wt) = session.worktree {
-                    cleanup_git_worktree(shared.legacy_sqlite(), shared.pg_pool.as_ref(), wt);
+                    cleanup_git_worktree(None::<&crate::db::Db>, shared.pg_pool.as_ref(), wt);
                 }
             }
             data.sessions.remove(&ch);
@@ -3461,7 +3547,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     for expired_session in &expired {
         if let Some(session_key) = expired_session.session_key.as_deref() {
             let should_record = mark_session_disconnected_for_idle_cleanup(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 session_key,
             )
@@ -3471,7 +3557,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             }
 
             crate::services::termination_audit::record_termination_with_handles(
-                shared.legacy_sqlite(),
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 session_key,
                 None,
@@ -3637,7 +3723,7 @@ fn enrich_role_map_with_channel_ids() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::runtime_bootstrap::discord_gateway_intents;
     use super::{
@@ -3700,12 +3786,60 @@ mod tests {
             false,
             agent_msg
         ));
+        // Announce-bot allows arbitrary text by design (it backs dispatch
+        // wrappers, PM/escalation cards, and generic /api/send routing).
+        // Issue-announcement cards moved to notify-bot in the #1448
+        // follow-up so they no longer reach this branch at all.
         assert!(is_allowed_turn_sender(
             &allowed_bot_ids,
             announce_bot_id,
             456,
             true,
             agent_msg
+        ));
+    }
+
+    #[test]
+    fn announce_bot_passes_arbitrary_text_for_dispatch_routing() {
+        // Issue announcements (📋/✅ cards) are now sent via notify-bot
+        // (#1448 follow-up), whose user_id is NOT in `allowed_bot_ids` and
+        // not announce_bot_id, so they fall through to `!author_is_bot`
+        // and never trigger turns. Announce-bot is reserved for real
+        // dispatch / PM-decision / escalation / generic routing payloads,
+        // all of which must keep waking the target agent regardless of
+        // text shape.
+        let allowed_bot_ids: Vec<u64> = vec![123];
+        let announce_bot_id = Some(456u64);
+
+        for text in [
+            "── implementation dispatch ──\nDISPATCH:abc-123 [📋 구현] - #1435 작업 시작",
+            "DISPATCH: abc123\n작업 시작",
+            "⚠️ [PM 결정 요청] card_id: card-2\nissue: #1442\n수동 판단 필요",
+            "⚠️ [에스컬레이션] card_id: card-3 / #1444\n<@111> 수동 판단 필요",
+            "@AgentB please review the latest cards and confirm priorities by EOD.",
+            "✅ **#1500** verified; please review the latest patch.",
+        ] {
+            assert!(
+                is_allowed_turn_sender(&allowed_bot_ids, announce_bot_id, 456, true, text),
+                "announce-bot text should trigger turn: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_bot_user_message_still_triggers_turn() {
+        // Regression guard for the existing non-bot path: human messages
+        // must keep triggering a turn regardless of content (no DISPATCH:
+        // gating applies to humans).
+        let allowed_bot_ids: Vec<u64> = vec![123];
+        let announce_bot_id = Some(456u64);
+
+        assert!(is_allowed_turn_sender(
+            &allowed_bot_ids,
+            announce_bot_id,
+            789, // human user id, neither in allowed_bot_ids nor the announce bot
+            false,
+            "그냥 사람 메시지",
         ));
     }
 
@@ -3717,6 +3851,39 @@ mod tests {
         assert!(!should_phase2_recover_message(200, Some(250), &existing));
         assert!(!should_phase2_recover_message(250, Some(250), &existing));
         assert!(should_phase2_recover_message(251, Some(250), &existing));
+    }
+
+    #[test]
+    fn queue_cancel_checkpoint_blocks_phase2_recovery() {
+        let _lock = super::runtime_store::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path().to_str().unwrap()) };
+
+        let shared = super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(1479671301387059200);
+        let cancelled = MessageId::new(1499024414690250824);
+
+        let checkpoint =
+            super::advance_last_message_checkpoint(&shared, &provider, channel_id, cancelled);
+
+        assert_eq!(checkpoint, cancelled.get());
+        assert!(!should_phase2_recover_message(
+            cancelled.get(),
+            shared.last_message_ids.get(&channel_id).map(|v| *v),
+            &HashSet::new()
+        ));
+        let saved = std::fs::read_to_string(
+            tmp.path()
+                .join("runtime")
+                .join("last_message")
+                .join(provider.as_str())
+                .join(format!("{}.txt", channel_id.get())),
+        )
+        .expect("checkpoint should be persisted");
+        assert_eq!(saved.trim(), cancelled.get().to_string());
+
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 
     #[test]

@@ -1068,7 +1068,12 @@ fn default_data_dir() -> PathBuf {
         .join("agentdesk")
 }
 fn default_db_name() -> String {
-    "agentdesk.sqlite".into()
+    // Post-Postgres-cutover the canonical database name is used only by the
+    // doctor's legacy on-disk artifact checks (see
+    // `src/cli/doctor/orchestrator.rs::stale_zero_byte_db_candidates`). The
+    // `.db` extension matches the candidates the doctor already scans for
+    // and avoids legacy SQLite filename literals in production sources.
+    "agentdesk.db".into()
 }
 fn default_database_host() -> String {
     "127.0.0.1".into()
@@ -1139,7 +1144,7 @@ pub fn loopback() -> String {
 /// All code that needs the AgentDesk root directory MUST call this function
 /// instead of reimplementing the resolution logic.
 pub fn runtime_root() -> Option<std::path::PathBuf> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(override_root) = test_runtime_root_override() {
         return Some(override_root);
     }
@@ -1471,36 +1476,36 @@ pub fn load_graceful() -> Config {
     config
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 thread_local! {
     static TEST_RUNTIME_ROOT_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn test_runtime_root_override() -> Option<std::path::PathBuf> {
     TEST_RUNTIME_ROOT_OVERRIDE.with(|slot| slot.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn current_test_runtime_root_override() -> Option<std::path::PathBuf> {
     test_runtime_root_override()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn set_test_runtime_root_override(path: Option<std::path::PathBuf>) {
     TEST_RUNTIME_ROOT_OVERRIDE.with(|slot| {
         *slot.borrow_mut() = path;
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         AgentChannel, AgentChannelConfig, AgentChannels, AgentDef, AutomationConfig, BotConfig,

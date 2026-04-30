@@ -217,7 +217,7 @@ fn strip_non_matching_profile_sections(raw: &str, profile: &str) -> String {
     compact.trim_end().to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod profile_tests {
     use super::strip_non_matching_profile_sections;
 

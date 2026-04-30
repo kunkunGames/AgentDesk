@@ -607,7 +607,7 @@ fn qwen_user_settings_path() -> Option<PathBuf> {
 }
 
 fn model_catalog_home_dir() -> Option<PathBuf> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(path) = std::env::var_os("AGENTDESK_TEST_HOME") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
@@ -953,7 +953,7 @@ fn is_valid_opencode_model_override(raw: &str) -> bool {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::fs;
 

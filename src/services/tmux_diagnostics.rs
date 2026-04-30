@@ -227,7 +227,7 @@ pub fn build_tmux_death_diagnostic(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 

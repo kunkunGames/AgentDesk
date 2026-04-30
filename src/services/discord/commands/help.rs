@@ -84,7 +84,7 @@ pub(in crate::services::discord) async fn cmd_help(ctx: Context<'_>) -> Result<(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

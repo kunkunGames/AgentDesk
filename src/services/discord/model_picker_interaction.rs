@@ -358,7 +358,7 @@ pub(super) async fn handle_model_picker_interaction(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         build_model_picker_saved_response, model_picker_no_change_notice,

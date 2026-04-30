@@ -180,7 +180,7 @@ pub async fn sync_pipeline_stages_from_yaml_pg(
     Ok(yaml_names.len())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

@@ -7,7 +7,7 @@ use super::contract::{DoctorProfile, FixSafety, RunContext, SecurityExposure, Se
 use super::{health, mailbox};
 use crate::cli::dcserver;
 use crate::config;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::{open_write_connection, schema};
 use crate::services::provider::ProviderKind;
 use serde::Serialize;
@@ -487,7 +487,7 @@ fn qwen_home_dir() -> Option<PathBuf> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(path) = std::env::var_os("AGENTDESK_TEST_HOME") {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {
@@ -3204,7 +3204,7 @@ fn normalized_config_repo_ids(cfg: &config::Config) -> (BTreeSet<String>, Vec<St
     (valid, invalid.into_iter().collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn open_registered_github_repo_ids(db_path: &std::path::Path) -> Result<BTreeSet<String>, String> {
     let conn = open_write_connection(db_path).map_err(|e| format!("cannot open: {e}"))?;
     let mut stmt = conn
@@ -3513,7 +3513,7 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         Check, CheckGroup, CheckStatus, DoctorOptions, FixAction, HealthSnapshot,

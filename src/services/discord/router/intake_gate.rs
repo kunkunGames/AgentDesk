@@ -132,7 +132,7 @@ async fn enqueue_soft_intervention(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) async fn enqueue_soft_intervention_for_test(
     shared: &std::sync::Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -155,6 +155,118 @@ pub(super) async fn enqueue_soft_intervention_for_test(
 /// `➕` so users can tell merged from standalone at a glance (#1190 follow-up).
 pub(super) fn queue_pending_reaction_for(outcome: super::super::MailboxEnqueueOutcome) -> char {
     if outcome.merged { '➕' } else { '📬' }
+}
+
+/// #1446 Layer 2 — load the thread's persisted inflight state and report
+/// whether its `updated_at` is older than `INFLIGHT_STALENESS_THRESHOLD_SECS`.
+/// Returns `false` when no state file exists (nothing to clean) or when
+/// `updated_at` cannot be parsed (never infer staleness from missing data).
+///
+/// **Pure-classification helper only.** A stale `updated_at` is necessary
+/// but not sufficient to force-clean a live thread — `updated_at` only
+/// advances when `save_inflight_state` runs, so a healthy long Bash /
+/// large Read / slow LLM stream can legitimately go silent for minutes.
+/// `thread_guard_should_force_clean_stale_thread` adds the required
+/// secondary signal (watcher snapshot's `desynced == true`).
+pub(super) fn thread_guard_inflight_is_stale(
+    provider: &ProviderKind,
+    thread_id: serenity::ChannelId,
+    now_unix_secs: i64,
+) -> bool {
+    super::super::inflight::load_inflight_state(provider, thread_id.get())
+        .map(|state| {
+            super::super::inflight::inflight_state_is_stale(
+                &state,
+                now_unix_secs,
+                super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// #1446 Layer 2 — full force-clean predicate. Requires BOTH:
+///   1. `thread_guard_inflight_is_stale` (persisted `updated_at` is older
+///      than `INFLIGHT_STALENESS_THRESHOLD_SECS`), AND
+///   2. the watcher-state snapshot for the thread reports
+///      `desynced == true` (capture-lag, cross-owner mismatch, or live-
+///      tmux orphan with no relay heartbeat — the same conjunction the
+///      stall-watchdog uses).
+///
+/// Without the snapshot's desync corroboration we would force-clean a
+/// healthy long-running turn whose `updated_at` simply has not advanced
+/// because no chunk hit the bridge in the last 5 minutes. Returning
+/// `false` when the registry is unreachable is the conservative default —
+/// a missing registry happens during startup before the stall-watchdog
+/// would also be running, so deferring cleanup costs nothing.
+pub(super) async fn thread_guard_should_force_clean_stale_thread(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    thread_id: serenity::ChannelId,
+    now_unix_secs: i64,
+) -> bool {
+    if !thread_guard_inflight_is_stale(provider, thread_id, now_unix_secs) {
+        return false;
+    }
+    let Some(registry) = shared.health_registry.upgrade() else {
+        return false;
+    };
+    // Provider-scoped snapshot — multi-provider deployments may share a
+    // Discord channel, so the unscoped variant could return a different
+    // provider's state and we'd misread `desynced`.
+    let Some(snapshot) = registry
+        .snapshot_watcher_state_for_provider(provider, thread_id.get())
+        .await
+    else {
+        return false;
+    };
+    snapshot.desynced
+}
+
+/// #1446 Layer 2 — perform the THREAD-GUARD's stale-thread cleanup:
+///   1. drop the parent → thread mapping so subsequent intakes do not re-
+///      trigger the guard,
+///   2. delete the thread's inflight state file (releases the durable lock
+///      whose presence convinced `mailbox_has_active_turn` the dispatch is
+///      still live),
+///   3. **clear** the thread's mailbox (cancel token + active turn anchor +
+///      pending interventions). `cancel_active_turn` alone is insufficient
+///      here — for a dead-dispatch case there is no live turn task to
+///      observe the cancel signal and call `finish_turn`, so
+///      `has_active_turn()` would stay `true` forever and the next bot
+///      message would re-enter the THREAD-GUARD's queueing branch.
+///      `mailbox_clear_channel` synchronously drops `active_request_owner`
+///      / `active_user_message_id` and reports `has_active_turn() == false`
+///      immediately on completion (see `ChannelMailboxMsg::Clear` handler
+///      in `turn_orchestrator.rs`).
+///   4. complete the bookkeeping that the missing `finish_turn` would
+///      otherwise have done: cancel the orphaned token (kill any leftover
+///      child / tmux session) and decrement `global_active`. Mirrors the
+///      `placeholder_sweeper::finalize_abandoned_mailbox` cleanup
+///      pattern so health and deferred-restart counters do not leak.
+///
+/// We never touch the parent channel's own mailbox — only the thread's.
+/// This preserves the `watcher_owns_live_relay` invariant by leaving
+/// parent-side relay state untouched.
+pub(super) async fn thread_guard_force_clean_stale_thread(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    parent_channel_id: serenity::ChannelId,
+    thread_id: serenity::ChannelId,
+) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] 🔓 THREAD-GUARD: stale inflight detected for thread {}, cleaning up and proceeding",
+        thread_id
+    );
+    shared.dispatch_thread_parents.remove(&parent_channel_id);
+    super::super::inflight::delete_inflight_state_file(provider, thread_id.get());
+    let cleared = mailbox_clear_channel(shared, provider, thread_id).await;
+    super::super::stall_recovery::finalize_orphaned_clear(
+        shared,
+        thread_id,
+        cleared.removed_token,
+        "1446_thread_guard_stale_inflight",
+    );
 }
 
 fn should_merge_consecutive_messages(text: &str, is_allowed_bot: bool) -> bool {
@@ -333,6 +445,12 @@ async fn handle_reaction_remove(
             )
             .await;
             if removed.is_some() {
+                super::super::advance_last_message_checkpoint(
+                    &data.shared,
+                    &data.provider,
+                    channel_id,
+                    removed_reaction.message_id,
+                );
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] 📭 QUEUE-CANCEL: removed queued message {} in channel {} via reaction removal",
@@ -704,7 +822,7 @@ pub(in crate::services::discord) async fn handle_event(
             // message handling produces a bogus "No active session" error in DMs.
             if !text.is_empty() {
                 if try_handle_pending_dm_reply(
-                    data.shared.legacy_sqlite(),
+                    None::<&crate::db::Db>,
                     data.shared.pg_pool.as_ref(),
                     new_message,
                 )
@@ -854,39 +972,78 @@ pub(in crate::services::discord) async fn handle_event(
             // turn (the thread's cancel_token is keyed by thread_id, leaving
             // the parent channel "unlocked").
             if is_allowed_bot {
-                if let Some(thread_id_ref) = data.shared.dispatch_thread_parents.get(&channel_id) {
-                    let thread_id = *thread_id_ref.value();
+                // #1446 — copy the mapped thread_id and immediately drop the
+                // DashMap ref. `thread_guard_force_clean_stale_thread`
+                // re-acquires the same shard lock to call `.remove()`; if the
+                // ref were still held we would deadlock on the shard's
+                // RwLock. The narrow scope below releases the ref at the `}`.
+                let thread_id_opt = {
+                    data.shared
+                        .dispatch_thread_parents
+                        .get(&channel_id)
+                        .map(|entry| *entry.value())
+                };
+                if let Some(thread_id) = thread_id_opt {
                     // Thread still has an active turn?
                     let thread_active = mailbox_has_active_turn(&data.shared, thread_id).await;
                     if thread_active {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] 🔀 THREAD-GUARD: bot message to parent {} queued (dispatch thread {} active)",
-                            channel_id,
-                            thread_id
-                        );
-                        let outcome = enqueue_soft_intervention(
-                            data,
-                            channel_id,
-                            user_id,
-                            new_message.id,
-                            text,
-                            None,
-                            false,
-                            false,
+                        // #1446 stall-deadlock recovery: a phase-gate dispatch can
+                        // terminate without firing its inflight-cleanup hook,
+                        // leaving the thread's mailbox + inflight state file
+                        // pinned. The THREAD-GUARD then queues every parent-
+                        // channel bot message forever because
+                        // `mailbox_has_active_turn(thread)` keeps returning
+                        // true. We require BOTH a stale `updated_at` AND a
+                        // watcher-state desync signal before force-cleaning,
+                        // mirroring the stall-watchdog's conjunction so a
+                        // quiet-but-live long turn (e.g. mid-Bash) is never
+                        // mistaken for a dead dispatch.
+                        let stale_inflight = thread_guard_should_force_clean_stale_thread(
+                            &data.shared,
+                            &data.provider,
+                            thread_id,
+                            chrono::Utc::now().timestamp(),
                         )
                         .await;
-                        add_reaction(
-                            ctx,
-                            channel_id,
-                            new_message.id,
-                            queue_pending_reaction_for(outcome),
-                        )
-                        .await;
-                        data.shared
-                            .last_message_ids
-                            .insert(channel_id, new_message.id.get());
-                        return Ok(());
+                        if stale_inflight {
+                            thread_guard_force_clean_stale_thread(
+                                &data.shared,
+                                &data.provider,
+                                channel_id,
+                                thread_id,
+                            )
+                            .await;
+                            // Fall through to normal processing below.
+                        } else {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] 🔀 THREAD-GUARD: bot message to parent {} queued (dispatch thread {} active)",
+                                channel_id,
+                                thread_id
+                            );
+                            let outcome = enqueue_soft_intervention(
+                                data,
+                                channel_id,
+                                user_id,
+                                new_message.id,
+                                text,
+                                None,
+                                false,
+                                false,
+                            )
+                            .await;
+                            add_reaction(
+                                ctx,
+                                channel_id,
+                                new_message.id,
+                                queue_pending_reaction_for(outcome),
+                            )
+                            .await;
+                            data.shared
+                                .last_message_ids
+                                .insert(channel_id, new_message.id.get());
+                            return Ok(());
+                        }
                     } else {
                         // Thread turn finished — clean up stale mapping
                         data.shared.dispatch_thread_parents.remove(&channel_id);
@@ -1212,7 +1369,377 @@ pub(in crate::services::discord) async fn handle_event(
 
 use super::super::model_picker_interaction::handle_model_picker_interaction;
 
+/// #1446 Layer 2 — `thread_guard_inflight_is_stale` reads inflight files
+/// via the runtime root override, so we keep the always-on slice that
+/// only exercises the read+staleness classification (no `SharedData`
+/// construction). The `thread_guard_force_clean_stale_thread` integration
+/// test that drives mailbox cancel / dispatch_thread_parents removal is
+/// gated on `legacy-sqlite-tests` because it depends on `TestHealthHarness`.
 #[cfg(test)]
+mod thread_guard_stale_pure_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use poise::serenity_prelude::ChannelId;
+
+    /// Anchor `now` and produce a stale `updated_at` literal using the
+    /// production `now_string` encoding.
+    fn local_at_offset(now_unix: i64, offset_secs: i64) -> String {
+        chrono::Local
+            .timestamp_opt(now_unix + offset_secs, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    fn seed_inflight_with_updated_at(provider: &ProviderKind, channel_id: u64, updated_at: &str) {
+        let mut state = super::super::super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("test-thread-guard".to_string()),
+            42,
+            8_001,
+            8_002,
+            "test-input".to_string(),
+            Some("test-session".to_string()),
+            Some("test-tmux".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.updated_at = updated_at.to_string();
+        state.started_at = updated_at.to_string();
+        let root = super::super::super::inflight::inflight_runtime_root()
+            .expect("inflight runtime root must be available under test override");
+        let provider_dir = root.join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).expect("create provider dir");
+        let path = provider_dir.join(format!("{channel_id}.json"));
+        let json = serde_json::to_string_pretty(&state).expect("serialize seeded inflight");
+        std::fs::write(&path, json).expect("write seeded inflight");
+    }
+
+    /// Scoped env-var override for `AGENTDESK_ROOT_DIR`. Restores the
+    /// previous value (or removes the var) on drop. Used so the always-on
+    /// test does not leak state into adjacent test runs that may also rely
+    /// on the runtime root.
+    struct EnvRootGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+    impl EnvRootGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
+            Self { previous }
+        }
+    }
+    impl Drop for EnvRootGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    /// `thread_guard_inflight_is_stale` must:
+    ///   1. report `true` for a stale on-disk inflight,
+    ///   2. report `false` for a fresh on-disk inflight,
+    ///   3. report `false` when the inflight file does not exist (nothing
+    ///      to clean — never cleanup a thread we know nothing about).
+    #[tokio::test]
+    async fn thread_guard_inflight_is_stale_classifies_disk_state() {
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let _guard = EnvRootGuard::set(temp.path());
+
+        let provider = ProviderKind::Codex;
+        let now_unix = chrono::Utc::now().timestamp();
+
+        // Missing inflight → not stale.
+        assert!(
+            !super::thread_guard_inflight_is_stale(
+                &provider,
+                ChannelId::new(900_000_000_000_900),
+                now_unix
+            ),
+            "missing inflight must NOT be classified as stale"
+        );
+
+        // Stale inflight → stale.
+        let stale_channel = 900_000_000_000_901u64;
+        let stale_at = local_at_offset(
+            now_unix,
+            -(super::super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64) - 5,
+        );
+        seed_inflight_with_updated_at(&provider, stale_channel, &stale_at);
+        assert!(
+            super::thread_guard_inflight_is_stale(
+                &provider,
+                ChannelId::new(stale_channel),
+                now_unix
+            ),
+            "stale inflight (updated_at={stale_at}) must be classified as stale"
+        );
+
+        // Fresh inflight → not stale.
+        let fresh_channel = 900_000_000_000_902u64;
+        let fresh_at = local_at_offset(now_unix, -5);
+        seed_inflight_with_updated_at(&provider, fresh_channel, &fresh_at);
+        assert!(
+            !super::thread_guard_inflight_is_stale(
+                &provider,
+                ChannelId::new(fresh_channel),
+                now_unix
+            ),
+            "fresh inflight (updated_at={fresh_at}) must NOT be classified as stale"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+mod thread_guard_stale_tests {
+    //! #1446 Layer 2 — verify the stall-deadlock recovery path inside the
+    //! THREAD-GUARD. The full event-handler is not driven (it requires a
+    //! live Discord ctx); instead we exercise the two extracted helpers
+    //! `thread_guard_inflight_is_stale` + `thread_guard_force_clean_stale_thread`
+    //! through the same `SharedData` they would see in production.
+    use super::super::super::health::TestHealthHarness;
+    use super::*;
+    use chrono::TimeZone;
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
+    use std::sync::Arc;
+
+    /// Anchor `now` and produce a stale `updated_at` literal (older than
+    /// `INFLIGHT_STALENESS_THRESHOLD_SECS`) using the same encoding the
+    /// production `now_string` writer uses.
+    fn stale_local_updated_at(now_unix: i64) -> String {
+        let stale_unix = now_unix
+            - (super::super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64)
+            - 5;
+        chrono::Local
+            .timestamp_opt(stale_unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    fn fresh_local_updated_at() -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// Write an inflight state file directly to disk for `(provider, channel)`
+    /// with the supplied `updated_at`. Uses the inflight crate's
+    /// `inflight_runtime_root` so the test follows the same
+    /// `AGENTDESK_ROOT_DIR` / `set_test_runtime_root_override` plumbing as
+    /// the production paths.
+    fn seed_inflight_with_updated_at(
+        provider: &ProviderKind,
+        channel_id: u64,
+        tmux_session_name: &str,
+        updated_at: &str,
+    ) {
+        let mut state = super::super::super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("test-thread-guard".to_string()),
+            42,
+            8_001,
+            8_002,
+            "test-input".to_string(),
+            Some("test-session".to_string()),
+            Some(tmux_session_name.to_string()),
+            None,
+            None,
+            0,
+        );
+        state.updated_at = updated_at.to_string();
+        state.started_at = updated_at.to_string();
+        let root = super::super::super::inflight::inflight_runtime_root()
+            .expect("inflight runtime root must be available under test override");
+        let provider_dir = root.join(provider.as_str());
+        std::fs::create_dir_all(&provider_dir).expect("create provider dir");
+        let path = provider_dir.join(format!("{channel_id}.json"));
+        let json = serde_json::to_string_pretty(&state).expect("serialize seeded inflight");
+        std::fs::write(&path, json).expect("write seeded inflight");
+    }
+
+    /// #1446 Test 2 — when the thread's persisted inflight is stale, the
+    /// THREAD-GUARD must classify it as such, force-clean the dispatch
+    /// mapping + inflight file + mailbox active turn, and let the caller
+    /// fall through to normal processing (no enqueue).
+    #[tokio::test]
+    async fn thread_guard_clears_stale_inflight_and_proceeds() {
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let shared = harness.shared();
+        let provider = ProviderKind::Codex;
+
+        let parent_channel_id = ChannelId::new(900_000_000_000_001);
+        let thread_id = ChannelId::new(900_000_000_000_002);
+
+        // 1. Wire up the parent → thread mapping (production sets this when
+        //    a phase-gate dispatch opens).
+        shared
+            .dispatch_thread_parents
+            .insert(parent_channel_id, thread_id);
+
+        // 2. Pin the thread's mailbox as having an active turn (mirrors
+        //    the on-disk inflight state convincing `mailbox_has_active_turn`
+        //    that the dispatch is still live).
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        let started = shared
+            .mailbox(thread_id)
+            .try_start_turn(cancel_token.clone(), UserId::new(7), MessageId::new(8))
+            .await;
+        assert!(started, "test setup: mailbox must accept the active turn");
+        assert!(
+            shared.mailbox(thread_id).has_active_turn().await,
+            "test setup: thread mailbox must report active turn"
+        );
+
+        // 3. Drop a stale inflight file on disk for the thread.
+        let now_unix = chrono::Utc::now().timestamp();
+        let stale_at = stale_local_updated_at(now_unix);
+        seed_inflight_with_updated_at(&provider, thread_id.get(), "stale-tmux", &stale_at);
+
+        // 4. THREAD-GUARD's stale check fires.
+        let stale = super::thread_guard_inflight_is_stale(&provider, thread_id, now_unix);
+        assert!(
+            stale,
+            "stale inflight (updated_at={stale_at}) must be classified as stale"
+        );
+
+        // 5. Force-clean and verify the three side-effects.
+        super::thread_guard_force_clean_stale_thread(
+            &shared,
+            &provider,
+            parent_channel_id,
+            thread_id,
+        )
+        .await;
+
+        assert!(
+            !shared
+                .dispatch_thread_parents
+                .contains_key(&parent_channel_id),
+            "parent → thread mapping must be cleared by force-clean"
+        );
+        assert!(
+            super::super::super::inflight::load_inflight_state(&provider, thread_id.get())
+                .is_none(),
+            "stale inflight state file must be deleted by force-clean"
+        );
+        assert!(
+            !shared.mailbox(thread_id).has_active_turn().await,
+            "thread's mailbox active turn must be cancelled by force-clean (THREAD-GUARD will not re-queue subsequent bot messages)"
+        );
+    }
+
+    /// #1446 Test 4 (regression guard) — when the thread's persisted
+    /// inflight is FRESH, the THREAD-GUARD must NOT classify it as stale
+    /// and must NOT touch any state. False-positive cleanup of a healthy
+    /// long-running thread is much worse than slightly delayed recovery,
+    /// so this test pins the safe-default contract.
+    #[tokio::test]
+    async fn thread_guard_preserves_active_thread_unchanged() {
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let shared = harness.shared();
+        let provider = ProviderKind::Codex;
+
+        let parent_channel_id = ChannelId::new(900_000_000_000_011);
+        let thread_id = ChannelId::new(900_000_000_000_012);
+
+        shared
+            .dispatch_thread_parents
+            .insert(parent_channel_id, thread_id);
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        let started = shared
+            .mailbox(thread_id)
+            .try_start_turn(cancel_token.clone(), UserId::new(7), MessageId::new(8))
+            .await;
+        assert!(started, "test setup: mailbox must accept the active turn");
+
+        let fresh_at = fresh_local_updated_at();
+        seed_inflight_with_updated_at(&provider, thread_id.get(), "fresh-tmux", &fresh_at);
+
+        let now_unix = chrono::Utc::now().timestamp();
+        assert!(
+            !super::thread_guard_inflight_is_stale(&provider, thread_id, now_unix),
+            "fresh inflight (updated_at={fresh_at}) must NOT be classified as stale"
+        );
+
+        // No call to `thread_guard_force_clean_stale_thread` happens in
+        // production when the staleness check returns false. Verify all
+        // pre-existing state is intact.
+        assert!(
+            shared
+                .dispatch_thread_parents
+                .contains_key(&parent_channel_id),
+            "parent → thread mapping must survive a non-stale thread"
+        );
+        assert!(
+            super::super::super::inflight::load_inflight_state(&provider, thread_id.get())
+                .is_some(),
+            "fresh inflight state file must survive"
+        );
+        assert!(
+            shared.mailbox(thread_id).has_active_turn().await,
+            "fresh thread's mailbox active turn must be preserved"
+        );
+    }
+
+    /// Extra coverage for the missing-inflight branch — production lookup
+    /// on `(provider, thread_id)` returns `None` when no state file exists,
+    /// and the staleness helper must report `false` (nothing to clean).
+    #[tokio::test]
+    async fn thread_guard_treats_missing_inflight_as_not_stale() {
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let _harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let provider = ProviderKind::Codex;
+        let now_unix = chrono::Utc::now().timestamp();
+        assert!(
+            !super::thread_guard_inflight_is_stale(
+                &provider,
+                ChannelId::new(900_000_000_000_099),
+                now_unix
+            ),
+            "missing inflight state must NOT be classified as stale"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod direct_session_tests {
     use super::*;
 

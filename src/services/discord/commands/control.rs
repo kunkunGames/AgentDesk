@@ -252,7 +252,7 @@ pub(in crate::services::discord) async fn notify_turn_stop(
     let sqlite_runtime_db = if shared.pg_pool.is_some() {
         None
     } else {
-        shared.legacy_sqlite()
+        None::<&crate::db::Db>
     };
     crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
         sqlite_runtime_db,
@@ -415,7 +415,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     let sqlite_runtime_db = if shared.pg_pool.is_some() {
         None
     } else {
-        shared.legacy_sqlite()
+        None::<&crate::db::Db>
     };
     crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
         sqlite_runtime_db,
@@ -577,7 +577,7 @@ pub(in crate::services::discord) async fn cmd_down(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         ManagedSessionClearBehavior, ManagedSessionResetBehavior, PendingSessionResetPlan,

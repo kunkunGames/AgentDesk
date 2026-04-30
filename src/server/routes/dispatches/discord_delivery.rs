@@ -12,8 +12,8 @@ use crate::db::agents::{
     resolve_agent_primary_channel_pg,
 };
 use crate::dispatch::dispatch_destination_provider_override;
-#[cfg(test)]
-use rusqlite::OptionalExtension;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::{PgPool, Row as SqlxRow};
 use std::sync::OnceLock;
 
@@ -163,6 +163,36 @@ fn parse_dispatch_message_target(dispatch_context: Option<&str>) -> Option<Dispa
     })
 }
 
+/// #1445 fallback command-bot credential names checked when the loaded
+/// `discord.bots.*` config doesn't surface any provider-bound bots (e.g.
+/// pre-onboarding bootstraps). Tokens are only consumed when a credential
+/// file actually exists on disk.
+const COMMAND_BOT_PENDING_FALLBACK_NAMES: &[&str] = &["claude", "codex", "command", "command_2"];
+
+/// #1445: enumerate tokens of currently-launchable command bots — i.e.
+/// bots whose `discord.bots.<name>.provider` is set (these are the bots
+/// that add the `⏳` pending marker at turn start). `load_discord_bot_launch_configs`
+/// already filters by agent-channel mapping and deduplicates by token, so
+/// each returned entry represents a distinct command-bot identity. We
+/// supplement with on-disk credential files for the canonical fallback
+/// names so the cleanup still works when the YAML omits inline tokens.
+fn collect_command_bot_pending_tokens() -> Vec<String> {
+    let mut tokens: Vec<String> =
+        crate::services::discord::settings::load_discord_bot_launch_configs()
+            .into_iter()
+            .map(|launch| launch.token)
+            .collect();
+    for name in COMMAND_BOT_PENDING_FALLBACK_NAMES {
+        let Some(token) = crate::credential::read_bot_token(name) else {
+            continue;
+        };
+        if !tokens.iter().any(|existing| existing == &token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
 async fn update_dispatch_reaction_presence(
     client: &reqwest::Client,
     token: &str,
@@ -240,11 +270,41 @@ async fn apply_dispatch_status_reaction_state(
         }
         DispatchStatusReactionState::Failed => {
             // Clean announce-bot's own ⏳/✅ (404-tolerant) then add ❌.
+            // #1445: also DELETE the command-bot's `⏳` via each launchable
+            // command-bot token — repair paths that bypass the live
+            // command-bot cleanup (queue/API cancel, orphan recovery) leave
+            // the pending marker in place, so without this users see
+            // ⏳ + ❌ together and can't tell whether the dispatch is
+            // in-progress or failed. The cross-bot cleanup is best-effort:
+            // a 401/403 from a stale or revoked token must not block the
+            // authoritative ❌ PUT, so failures are logged and swallowed.
             // Command bot's ✅ added on response delivery (turn_bridge:1537)
             // is a separate @user reaction and will still render alongside
             // ❌ — inevitable cross-bot collision on failed turns that
             // returned text. ❌ remains the authoritative failure signal.
             update_dispatch_reaction_presence(client, token, base_url, target, '⏳', false).await?;
+            for owner_token in collect_command_bot_pending_tokens() {
+                if owner_token == token {
+                    // Already cleaned via the announce-bot @me DELETE above.
+                    continue;
+                }
+                if let Err(error) = update_dispatch_reaction_presence(
+                    client,
+                    &owner_token,
+                    base_url,
+                    target,
+                    '⏳',
+                    false,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        message_id = %target.message_id,
+                        %error,
+                        "[dispatch] #1445 best-effort command-bot ⏳ cleanup skipped (treating as harmless)"
+                    );
+                }
+            }
             update_dispatch_reaction_presence(client, token, base_url, target, '✅', false).await?;
             update_dispatch_reaction_presence(client, token, base_url, target, '❌', true).await
         }
@@ -728,48 +788,78 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
     minimal_message: &str,
     dispatch_id: Option<&str>,
 ) -> Result<DispatchMessagePostOutcome, DispatchMessagePostError> {
-    // #1006: route through the unified outbound API. The API owns length
-    // truncation + minimal-fallback retry. Dispatch notify callsites pass a
-    // semantic delivery id so outbox operators can distinguish normal sends,
-    // degraded fallback sends, and duplicate guard skips.
-    use crate::services::discord::outbound::{
-        DeliveryResult, DiscordOutboundMessage, DiscordOutboundPolicy, HttpOutboundClient,
-        OutboundDeduper, deliver_outbound,
-    };
+    // #1436: dispatch_outbox is the first production callsite using the v3
+    // outbound envelope directly. The compatibility re-export remains for
+    // older producers while this path exercises message/policy/decision/result.
+    use crate::services::discord::outbound::delivery::{deliver_outbound, first_raw_message_id};
+    use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+    use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+    use crate::services::discord::outbound::result::{DeliveryResult, FallbackUsed};
+    use crate::services::discord::outbound::{HttpOutboundClient, OutboundDeduper};
+    use poise::serenity_prelude::ChannelId;
 
     let outbound_client =
         HttpOutboundClient::new(client.clone(), token.to_string(), base_url.to_string());
     let dedup = OutboundDeduper::new();
-    let mut outbound_msg = DiscordOutboundMessage::new(channel_id, message);
     let correlation_id = dispatch_id.map(dispatch_delivery_correlation_id);
     let semantic_event_id = dispatch_id.map(dispatch_delivery_semantic_event_id);
-    if let (Some(correlation_id), Some(semantic_event_id)) =
-        (correlation_id.as_deref(), semantic_event_id.as_deref())
-    {
-        outbound_msg = outbound_msg.with_correlation(correlation_id, semantic_event_id);
-    }
-    let policy = DiscordOutboundPolicy::dispatch_outbox(minimal_message.to_string());
+    let mut policy = DiscordOutboundPolicy::dispatch_outbox();
+    let (delivery_correlation_id, delivery_semantic_event_id) =
+        match (correlation_id.as_ref(), semantic_event_id.as_ref()) {
+            (Some(correlation_id), Some(semantic_event_id)) => {
+                (correlation_id.clone(), semantic_event_id.clone())
+            }
+            _ => {
+                policy = policy.without_idempotency();
+                (
+                    "dispatch:adhoc".to_string(),
+                    "dispatch:adhoc:notify".to_string(),
+                )
+            }
+        };
+    let target_channel_id = channel_id
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| {
+            DispatchMessagePostError::new(
+                DispatchMessagePostErrorKind::Other,
+                format!("invalid dispatch outbound channel id {channel_id}: {error}"),
+            )
+        })?;
+    let outbound_msg = DiscordOutboundMessage::new(
+        delivery_correlation_id,
+        delivery_semantic_event_id,
+        message,
+        OutboundTarget::Channel(target_channel_id),
+        policy,
+    )
+    .with_summary(minimal_message.to_string());
 
-    match deliver_outbound(&outbound_client, &dedup, outbound_msg, policy).await {
-        DeliveryResult::Success { message_id } => Ok(DispatchMessagePostOutcome {
-            message_id: message_id.clone(),
-            delivery: DispatchNotifyDeliveryResult {
-                status: "success".to_string(),
-                dispatch_id: dispatch_id.unwrap_or("").to_string(),
-                action: "notify".to_string(),
-                correlation_id,
-                semantic_event_id,
-                target_channel_id: Some(channel_id.to_string()),
-                message_id: Some(message_id),
-                fallback_kind: None,
-                detail: None,
-            },
-        }),
-        DeliveryResult::Fallback { message_id, kind } => {
-            if matches!(
-                kind,
-                crate::services::discord::outbound::FallbackKind::MinimalFallback
-            ) {
+    match deliver_outbound(&outbound_client, &dedup, outbound_msg).await {
+        DeliveryResult::Sent { messages, .. } => {
+            let message_id = first_raw_message_id(&messages).unwrap_or_default();
+            Ok(DispatchMessagePostOutcome {
+                message_id: message_id.clone(),
+                delivery: DispatchNotifyDeliveryResult {
+                    status: "success".to_string(),
+                    dispatch_id: dispatch_id.unwrap_or("").to_string(),
+                    action: "notify".to_string(),
+                    correlation_id,
+                    semantic_event_id,
+                    target_channel_id: Some(channel_id.to_string()),
+                    message_id: Some(message_id),
+                    fallback_kind: None,
+                    detail: None,
+                },
+            })
+        }
+        DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => {
+            let message_id = first_raw_message_id(&messages).unwrap_or_default();
+            if matches!(fallback_used, FallbackUsed::MinimalFallback) {
                 tracing::warn!(
                     "[dispatch] Message too long for channel {channel_id}; retried with minimal fallback"
                 );
@@ -784,7 +874,11 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
                     semantic_event_id,
                     target_channel_id: Some(channel_id.to_string()),
                     message_id: Some(message_id),
-                    fallback_kind: Some(format!("{kind:?}")),
+                    fallback_kind: Some(match fallback_used {
+                        FallbackUsed::MinimalFallback => "MinimalFallback".to_string(),
+                        FallbackUsed::LengthCompacted => "Truncated".to_string(),
+                        other => format!("{other:?}"),
+                    }),
                     detail: Some("shared outbound API used degraded delivery".to_string()),
                 },
             })
@@ -803,19 +897,19 @@ pub(super) async fn post_dispatch_message_to_channel_with_delivery(
                 detail: Some("shared outbound API deduplicated delivery".to_string()),
             },
         }),
-        DeliveryResult::Skipped { .. } => Err(DispatchMessagePostError::new(
+        DeliveryResult::Skip { .. } => Err(DispatchMessagePostError::new(
             DispatchMessagePostErrorKind::Other,
             format!("unexpected skip for channel {channel_id}"),
         )),
-        DeliveryResult::PermanentFailure { detail } => {
-            let kind = if detail.to_ascii_lowercase().contains("base_type_max_length")
-                || detail.contains("length")
+        DeliveryResult::PermanentFailure { reason } => {
+            let kind = if reason.to_ascii_lowercase().contains("base_type_max_length")
+                || reason.contains("length")
             {
                 DispatchMessagePostErrorKind::MessageTooLong
             } else {
                 DispatchMessagePostErrorKind::Other
             };
-            Err(DispatchMessagePostError::new(kind, detail))
+            Err(DispatchMessagePostError::new(kind, reason))
         }
     }
 }
@@ -1739,7 +1833,7 @@ async fn resolve_agent_channel_with_provider_override_pg(
         .map_err(|error| format!("resolve postgres dispatch channel for {agent_id}: {error}"))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     _conn: &T,
     _agent_id: &str,
@@ -1750,9 +1844,9 @@ pub(super) fn resolve_dispatch_delivery_channel_on_conn<T>(
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_dispatch_delivery_channel_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     agent_id: &str,
     card_id: &str,
     dispatch_type: Option<&str>,
@@ -1786,9 +1880,9 @@ pub(super) fn resolve_dispatch_delivery_channel_on_conn(
         .map_err(|error| format!("resolve sqlite dispatch channel for {agent_id}: {error}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn latest_completed_review_provider_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> Result<Option<String>, String> {
     let context: Option<String> = conn
@@ -3123,7 +3217,7 @@ fn review_followup_deduper() -> &'static crate::services::discord::outbound::Out
     DEDUPER.get_or_init(crate::services::discord::outbound::OutboundDeduper::new)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use axum::{
@@ -3206,6 +3300,16 @@ mod tests {
         std::fs::write(
             crate::runtime_layout::credential_token_path(root, "announce"),
             "announce-token\n",
+        )
+        .unwrap();
+    }
+
+    fn write_command_bot_token(root: &std::path::Path, name: &str, value: &str) {
+        let credential_dir = crate::runtime_layout::credential_dir(root);
+        std::fs::create_dir_all(&credential_dir).unwrap();
+        std::fs::write(
+            crate::runtime_layout::credential_token_path(root, name),
+            format!("{value}\n"),
         )
         .unwrap();
     }
@@ -3626,6 +3730,46 @@ mod tests {
                 "PATCH /channels/thread-1",
                 "PUT /channels/thread-1/thread-members/42",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_outbox_direct_v3_envelope_posts_success_metadata() {
+        let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
+        let client = reqwest::Client::new();
+
+        let outcome = post_dispatch_message_to_channel_with_delivery(
+            &client,
+            "announce-token",
+            &base_url,
+            "123",
+            "direct v3 dispatch message",
+            "minimal fallback message",
+            Some("dispatch-v3-outbox"),
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+        assert_eq!(outcome.message_id, "message-123");
+        assert_eq!(outcome.delivery.status, "success");
+        assert_eq!(
+            outcome.delivery.correlation_id.as_deref(),
+            Some("dispatch:dispatch-v3-outbox")
+        );
+        assert_eq!(
+            outcome.delivery.semantic_event_id.as_deref(),
+            Some("dispatch:dispatch-v3-outbox:notify")
+        );
+        assert_eq!(outcome.delivery.target_channel_id.as_deref(), Some("123"));
+        assert_eq!(outcome.delivery.message_id.as_deref(), Some("message-123"));
+        assert_eq!(outcome.delivery.fallback_kind, None);
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.calls, vec!["POST /channels/123/messages"]);
+        assert_eq!(
+            state.posted_messages,
+            vec![("123".to_string(), "direct v3 dispatch message".to_string())]
         );
     }
 
@@ -4743,6 +4887,69 @@ mod tests {
 
         pool.close().await;
         pg_db.drop().await;
+    }
+
+    /// #1445: simulates the canonical bug — command-bot has added `⏳` at
+    /// turn start, then a repair path (queue/API cancel) drives the dispatch
+    /// to `failed` and announce-bot runs `apply_dispatch_status_reaction_state`.
+    /// Before the fix the announce-bot's `/@me` DELETE skipped command-bot's
+    /// `⏳`, leaving the message rendered as `⏳ + ❌` (in-progress vs failed
+    /// ambiguity). The fix issues a 404-tolerant `/@me` DELETE on each
+    /// provider's command-bot token so whichever provider owns `⏳` cleans up.
+    #[tokio::test]
+    async fn apply_dispatch_status_reaction_state_failed_clears_command_bot_pending() {
+        let _env_lock = env_lock();
+        let (base_url, state, server_handle) = spawn_mock_discord_server(false).await;
+        let _api_base = EnvVarGuard::set("AGENTDESK_DISCORD_API_BASE_URL", &base_url);
+        let temp = tempfile::tempdir().unwrap();
+        write_announce_token(temp.path());
+        write_command_bot_token(temp.path(), "claude", "claude-token");
+        write_command_bot_token(temp.path(), "codex", "codex-token");
+        let _root = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+
+        let target = DispatchMessageTarget {
+            channel_id: "123".to_string(),
+            message_id: "message-123".to_string(),
+        };
+        let token = crate::credential::read_bot_token("announce").unwrap();
+        apply_dispatch_status_reaction_state(
+            shared_discord_http_client(),
+            &token,
+            &base_url,
+            &target,
+            DispatchStatusReactionState::Failed,
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+        let state = state.lock().unwrap();
+        let reaction_calls: Vec<String> = state
+            .calls
+            .iter()
+            .filter(|call| call.contains("/channels/123/messages/message-123/reactions/"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            reaction_calls,
+            vec![
+                // announce-bot drops its own stale ⏳ (404-tolerant).
+                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
+                // #1445: each provider command-bot also drops its own ⏳
+                // (the 404 case for whichever bot didn't own it is fine).
+                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
+                "DELETE /channels/123/messages/message-123/reactions/%E2%8F%B3/@me",
+                "DELETE /channels/123/messages/message-123/reactions/%E2%9C%85/@me",
+                "PUT /channels/123/messages/message-123/reactions/%E2%9D%8C/@me",
+            ],
+            "#1445: failed dispatch must DELETE command-bot ⏳ via each provider token before announce-bot adds ❌ — final reaction state is ❌ only, never ⏳ + ❌"
+        );
+        assert!(
+            !reaction_calls
+                .iter()
+                .any(|call| call.starts_with("PUT") && call.contains("%E2%8F%B3")),
+            "#1445: must never re-add ⏳ on the failure path"
+        );
     }
 
     fn insert_review_followup_fixture(db: &crate::db::Db) {

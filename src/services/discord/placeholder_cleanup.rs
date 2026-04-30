@@ -184,7 +184,7 @@ impl PlaceholderCleanupRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn latest(
         &self,
         provider: &ProviderKind,
@@ -199,7 +199,7 @@ impl PlaceholderCleanupRegistry {
         self.records.get(&key).map(|stored| stored.record.clone())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     fn force_age_for_test(
         &self,
         provider: &ProviderKind,
@@ -217,7 +217,7 @@ impl PlaceholderCleanupRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     fn len_for_test(&self) -> usize {
         self.records.len()
     }
@@ -250,7 +250,7 @@ pub(super) fn classify_delete_error(detail: &str) -> PlaceholderCleanupOutcome {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

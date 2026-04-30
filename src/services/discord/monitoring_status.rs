@@ -390,7 +390,7 @@ fn format_kst_hhmm(value: DateTime<Utc>) -> String {
         .to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;

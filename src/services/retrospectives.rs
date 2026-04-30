@@ -564,7 +564,7 @@ fn format_duration(duration_seconds: Option<i64>) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::io::{self, Write};

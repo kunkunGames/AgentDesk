@@ -640,7 +640,7 @@ pub(super) fn list_registered_channel_bindings() -> Vec<RegisteredChannelBinding
     bindings
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

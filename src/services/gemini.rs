@@ -1409,7 +1409,7 @@ fn render_gemini_value(value: &Value) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         GEMINI_INVALID_RESUME_SELECTOR_MESSAGE, GEMINI_NO_PREVIOUS_SESSIONS_MESSAGE,

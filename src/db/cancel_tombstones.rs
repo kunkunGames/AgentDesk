@@ -97,7 +97,7 @@ fn is_id_drained(entries: &VecDeque<DrainedEntry>, id: &Uuid) -> bool {
     entries.iter().any(|entry| entry.id == *id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn clear_drained_ids_for_tests() {
     drained_ids().clear();
 }
@@ -258,7 +258,7 @@ pub async fn prune_expired_cancel_tombstones(pool: &PgPool) -> Result<u64, sqlx:
     Ok(result.rows_affected())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub async fn count_cancel_tombstones_for_tests(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let row = sqlx::query("SELECT COUNT(*)::BIGINT AS c FROM cancel_tombstones")
         .fetch_one(pool)
@@ -266,7 +266,7 @@ pub async fn count_cancel_tombstones_for_tests(pool: &PgPool) -> Result<i64, sql
     row.try_get("c")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

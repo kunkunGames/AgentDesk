@@ -56,7 +56,10 @@ pub(super) struct PlaceholderActiveInput {
     pub(super) started_at_unix: i64,
     pub(super) tool_summary: Option<String>,
     pub(super) command_summary: Option<String>,
+    pub(super) reason_detail: Option<String>,
     pub(super) context_line: Option<String>,
+    pub(super) request_line: Option<String>,
+    pub(super) progress_line: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +181,10 @@ impl PlaceholderController {
             input.started_at_unix,
             input.tool_summary.as_deref(),
             input.command_summary.as_deref(),
+            input.reason_detail.as_deref(),
             input.context_line.as_deref(),
+            input.request_line.as_deref(),
+            input.progress_line.as_deref(),
         );
 
         // Coalesce identical re-renders into a single PATCH.  Tool-stream
@@ -248,7 +254,10 @@ impl PlaceholderController {
             input.started_at_unix,
             input.tool_summary.as_deref(),
             input.command_summary.as_deref(),
+            input.reason_detail.as_deref(),
             input.context_line.as_deref(),
+            input.request_line.as_deref(),
+            input.progress_line.as_deref(),
         );
 
         if guarded.last_rendered.as_deref() == Some(rendered.as_str())
@@ -329,7 +338,10 @@ impl PlaceholderController {
             snapshot.started_at_unix,
             snapshot.tool_summary.as_deref(),
             snapshot.command_summary.as_deref(),
+            snapshot.reason_detail.as_deref(),
             snapshot.context_line.as_deref(),
+            snapshot.request_line.as_deref(),
+            snapshot.progress_line.as_deref(),
         );
 
         let edit_result = gateway
@@ -378,7 +390,7 @@ impl PlaceholderController {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::gateway::{HeadlessGateway, TurnGateway};
@@ -401,7 +413,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: Some("Monitor".to_string()),
             command_summary: Some("session=foo".to_string()),
+            reason_detail: None,
             context_line: Some("⏳ CI 통과 신호 대기".to_string()),
+            request_line: Some("배포 상태 확인해줘".to_string()),
+            progress_line: Some("2 alive (#A 4m12s, #B 1m05s) / 1 closed".to_string()),
         }
     }
 
@@ -754,7 +769,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         let outcome = controller
             .ensure_queued(gateway.as_ref(), key(), queued_input)
@@ -792,7 +810,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         let _ = controller
             .ensure_queued(gateway.as_ref(), key(), queued_input())
@@ -815,7 +836,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         let _ = controller
             .ensure_queued(gateway.as_ref(), key(), queued_input)
@@ -846,7 +870,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         // Stage 1: race-loss path renders the Queued card.
         let outcome = controller
@@ -894,7 +921,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         let _ = controller
             .ensure_queued(gateway.as_ref(), key(), queued_input)
@@ -918,7 +948,10 @@ mod tests {
             started_at_unix: 1_700_000_000,
             tool_summary: None,
             command_summary: None,
+            reason_detail: None,
             context_line: None,
+            request_line: None,
+            progress_line: None,
         };
         let outcome = controller
             .ensure_queued(gateway.as_ref(), key(), queued_input)

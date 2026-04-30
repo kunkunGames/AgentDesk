@@ -862,6 +862,12 @@ pub async fn delete_card(
 }
 
 /// POST /api/kanban-cards/:id/retry
+///
+/// This endpoint is single-call complete. Do NOT chain /transition or
+/// /auto-queue/generate after it — that creates duplicate dispatches
+/// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
+/// the response to confirm the new dispatch was created. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn retry_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -896,15 +902,32 @@ pub async fn retry_card(
     .ok()
     .flatten()
     .flatten();
-    if let Some(dispatch_id) = existing_dispatch_id.as_deref()
-        && let Err(error) =
-            crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(pool, dispatch_id, None)
-                .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{error}")})),
-        );
+    // #1442 (codex P2): only report `cancelled_dispatch_id` when the cancel
+    // call actually transitioned a `pending`/`dispatched` row to `cancelled`.
+    // The cancel helper returns `Ok(0)` for stale/already-terminal rows
+    // (e.g. failed/completed); the typical retry case must not falsely
+    // claim a cancellation that did not happen.
+    let mut cancelled_dispatch_id: Option<String> = None;
+    if let Some(prev_dispatch_id) = existing_dispatch_id.as_deref() {
+        match crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(
+            pool,
+            prev_dispatch_id,
+            None,
+        )
+        .await
+        {
+            Ok(changed) => {
+                if changed > 0 {
+                    cancelled_dispatch_id = Some(prev_dispatch_id.to_string());
+                }
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
+        }
     }
 
     use crate::engine::transition::TransitionIntent as TI2;
@@ -957,8 +980,10 @@ pub async fn retry_card(
     } else {
         agent_id_for_dispatch
     };
-    if !dispatch_agent_id.is_empty()
-        && let Err(error) = crate::dispatch::create_dispatch_pg_only(
+    let mut new_dispatch_id: Option<String> = None;
+    let mut next_action = "none_required".to_string();
+    if !dispatch_agent_id.is_empty() {
+        match crate::dispatch::create_dispatch_pg_only(
             pool,
             &state.engine,
             &id,
@@ -966,18 +991,50 @@ pub async fn retry_card(
             &retry_dispatch_type,
             &retry_title,
             &json!({"retry": true, "preserved_dispatch_type": retry_dispatch_type.clone()}),
-        )
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{error}")})),
-        );
+        ) {
+            Ok(dispatch) => {
+                // Codex P2: `create_dispatch_pg_only` can return an existing
+                // active dispatch tagged `__reused` instead of inserting a
+                // new row when a duplicate active dispatch already exists.
+                // Surface that explicitly so callers don't believe a fresh
+                // retry dispatch was issued.
+                let reused = dispatch
+                    .get("__reused")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if reused {
+                    next_action = "duplicate_active_dispatch_detected_inspect_card".to_string();
+                } else {
+                    new_dispatch_id = dispatch
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+                }
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
+        }
+    } else {
+        // No agent assigned — caller must assign an agent before a dispatch can be created.
+        next_action = "assign_agent_then_call_retry".to_string();
     }
 
     match load_card_json_pg(pool, &id).await {
         Ok(Some(card)) => {
             crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
-            (StatusCode::OK, Json(json!({"card": card})))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "card": card,
+                    "new_dispatch_id": new_dispatch_id,
+                    "cancelled_dispatch_id": cancelled_dispatch_id,
+                    "next_action": next_action,
+                })),
+            )
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -991,6 +1048,12 @@ pub async fn retry_card(
 }
 
 /// POST /api/kanban-cards/:id/redispatch
+///
+/// This endpoint is single-call complete. Do NOT chain /transition or
+/// /auto-queue/generate after it — that creates duplicate dispatches
+/// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
+/// the response to confirm the new dispatch was created. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn redispatch_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1026,15 +1089,32 @@ pub async fn redispatch_card(
     .ok()
     .flatten()
     .flatten();
-    if let Some(dispatch_id) = dispatch_id.as_deref()
-        && let Err(error) =
-            crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(pool, dispatch_id, None)
-                .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{error}")})),
-        );
+    // #1442 (codex P2): only report `cancelled_dispatch_id` when the cancel
+    // call actually transitioned a `pending`/`dispatched` row to `cancelled`.
+    // The cancel helper returns `Ok(0)` for stale/already-terminal rows, and
+    // claiming a cancellation that did not happen would defeat the
+    // single-call confirmation contract.
+    let mut cancelled_dispatch_id: Option<String> = None;
+    if let Some(prev_dispatch_id) = dispatch_id.as_deref() {
+        match crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(
+            pool,
+            prev_dispatch_id,
+            None,
+        )
+        .await
+        {
+            Ok(changed) => {
+                if changed > 0 {
+                    cancelled_dispatch_id = Some(prev_dispatch_id.to_string());
+                }
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
+        }
     }
 
     use crate::engine::transition::TransitionIntent;
@@ -1060,8 +1140,10 @@ pub async fn redispatch_card(
         }
     }
 
-    if !agent_id.is_empty()
-        && let Err(error) = crate::dispatch::create_dispatch_pg_only(
+    let mut new_dispatch_id: Option<String> = None;
+    let mut next_action = "none_required".to_string();
+    if !agent_id.is_empty() {
+        match crate::dispatch::create_dispatch_pg_only(
             pool,
             &state.engine,
             &id,
@@ -1069,18 +1151,51 @@ pub async fn redispatch_card(
             &dispatch_type,
             &dispatch_title,
             &json!({"redispatch": true, "preserved_dispatch_type": dispatch_type.clone()}),
-        )
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{error}")})),
-        );
+        ) {
+            Ok(dispatch) => {
+                // Codex P2: `create_dispatch_pg_only` can return an existing
+                // active dispatch tagged `__reused` instead of inserting a
+                // new row when a duplicate active dispatch already exists.
+                // Don't claim that as `new_dispatch_id` — that would falsely
+                // confirm a fresh dispatch was created and mask the
+                // duplicate-state problem the caller is trying to solve.
+                let reused = dispatch
+                    .get("__reused")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                if reused {
+                    next_action = "duplicate_active_dispatch_detected_inspect_card".to_string();
+                } else {
+                    new_dispatch_id = dispatch
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+                }
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("{error}")})),
+                );
+            }
+        }
+    } else {
+        // No agent assigned — caller must assign an agent before a dispatch can be created.
+        next_action = "assign_agent_then_call_redispatch".to_string();
     }
 
     match load_card_json_pg(pool, &id).await {
         Ok(Some(card)) => {
             crate::server::ws::emit_event(&state.broadcast_tx, "kanban_card_updated", card.clone());
-            (StatusCode::OK, Json(json!({"card": card})))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "card": card,
+                    "new_dispatch_id": new_dispatch_id,
+                    "cancelled_dispatch_id": cancelled_dispatch_id,
+                    "next_action": next_action,
+                })),
+            )
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1599,8 +1714,8 @@ pub async fn assign_issue(
 
 // ── Helpers ────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(super) fn card_row_to_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(super) fn card_row_to_json(row: &sqlite_test::Row) -> sqlite_test::Result<serde_json::Value> {
     let repo_id = row.get::<_, Option<String>>(1)?;
     let assigned_agent_id = row.get::<_, Option<String>>(5)?;
     let metadata_raw = row.get::<_, Option<String>>(10).unwrap_or(None);
@@ -2105,7 +2220,7 @@ pub async fn pm_decision(
                 "SELECT COUNT(*)::BIGINT
                  FROM task_dispatches td
                  JOIN sessions s ON s.active_dispatch_id = td.id
-                    AND s.status IN ('working', 'idle')
+                    AND s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working', 'idle')
                  WHERE td.kanban_card_id = $1
                    AND td.status IN ('pending', 'dispatched')",
             )
@@ -2362,8 +2477,8 @@ pub struct RereviewBody {
     pub reason: Option<String>,
 }
 
-#[cfg(test)]
-fn find_active_review_dispatch_id(conn: &rusqlite::Connection, card_id: &str) -> Option<String> {
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+fn find_active_review_dispatch_id(conn: &sqlite_test::Connection, card_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT id FROM task_dispatches
          WHERE kanban_card_id = ?1
@@ -2401,7 +2516,7 @@ fn trimmed_header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a st
         .filter(|value| !value.is_empty())
 }
 
-pub(super) fn require_explicit_bearer_token(
+pub(crate) fn require_explicit_bearer_token(
     headers: &HeaderMap,
     operation: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -2439,9 +2554,9 @@ pub(super) fn require_explicit_bearer_token(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_agent_id_from_channel_id_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     channel_id: &str,
 ) -> Option<String> {
     conn.query_row(
@@ -2477,9 +2592,9 @@ async fn resolve_agent_id_from_channel_id_with_pg(
     .and_then(|row| row.try_get::<String, _>("id").ok())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_requesting_agent_id_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     headers: &HeaderMap,
 ) -> Option<String> {
     if let Some(agent_id) = trimmed_header_value(headers, "x-agent-id") {
@@ -2497,7 +2612,7 @@ pub(super) fn resolve_requesting_agent_id_on_conn(
         .and_then(|channel_id| resolve_agent_id_from_channel_id_on_conn(conn, channel_id))
 }
 
-pub(super) async fn resolve_requesting_agent_id_with_pg(
+pub(crate) async fn resolve_requesting_agent_id_with_pg(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
 ) -> Option<String> {
@@ -3422,15 +3537,28 @@ pub async fn batch_transition(
 pub struct ForceTransitionBody {
     pub status: String,
     pub cancel_dispatches: Option<bool>,
+    /// #1444: explicit opt-in to cancel a card's active dispatch when the
+    /// target_status is `ready`. Without `force=true` (and without legacy
+    /// `cancel_dispatches=true`), `/transition` returns 409 Conflict if the
+    /// card already has a pending/dispatched dispatch — preventing the
+    /// duplicate dispatch incident from #1442.
+    pub force: Option<bool>,
 }
 
 fn force_transition_needs_cleanup(target_status: &str, cancel_dispatches: Option<bool>) -> bool {
     matches!(target_status, "backlog" | "ready") && cancel_dispatches.unwrap_or(true)
 }
 
-#[cfg(test)]
+/// #1444: returns true if the caller has explicitly opted into cancelling an
+/// existing active dispatch on a `target=ready` transition. Either the new
+/// `force` flag or the legacy `cancel_dispatches=true` field qualifies.
+fn force_transition_force_intent_present(body: &ForceTransitionBody) -> bool {
+    body.force.unwrap_or(false) || body.cancel_dispatches.unwrap_or(false)
+}
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn count_live_auto_queue_entries_for_card_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<usize> {
     let count: i64 = conn
@@ -3449,9 +3577,9 @@ fn count_live_auto_queue_entries_for_card_on_conn(
     Ok(count.max(0) as usize)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_force_transition_terminalized_links_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     conn.execute(
@@ -3476,9 +3604,9 @@ fn clear_force_transition_terminalized_links_on_conn(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn cleanup_force_transition_revert_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     target_status: &str,
 ) -> anyhow::Result<(usize, usize)> {
@@ -3498,11 +3626,11 @@ fn cleanup_force_transition_revert_on_conn(
     Ok((cancelled_dispatches, skipped_auto_queue_entries))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn skip_live_auto_queue_entries_for_card_legacy(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
-) -> rusqlite::Result<usize> {
+) -> sqlite_test::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT id FROM auto_queue_entries
          WHERE kanban_card_id = ?1
@@ -3532,13 +3660,13 @@ fn skip_live_auto_queue_entries_for_card_legacy(
     Ok(changed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn move_auto_queue_entry_to_dispatched_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     entry_id: &str,
     trigger_source: &str,
     options: &crate::db::auto_queue::EntryStatusUpdateOptions,
-) -> rusqlite::Result<()> {
+) -> sqlite_test::Result<()> {
     conn.execute(
         "UPDATE auto_queue_entries
          SET status = 'dispatched',
@@ -3548,7 +3676,7 @@ fn move_auto_queue_entry_to_dispatched_on_conn(
              completed_at = NULL,
              updated_at = datetime('now')
          WHERE id = ?1 AND status IN ('pending', 'dispatched', 'done')",
-        rusqlite::params![entry_id, options.dispatch_id, options.slot_index],
+        sqlite_test::params![entry_id, options.dispatch_id, options.slot_index],
     )?;
     let _ = trigger_source;
     Ok(())
@@ -3596,9 +3724,9 @@ async fn reactivate_done_auto_queue_entries_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_card_metadata_map_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
     let metadata_raw: Option<String> = conn.query_row(
@@ -3638,9 +3766,9 @@ async fn load_card_metadata_map_pg(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn save_card_metadata_map_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     metadata: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
@@ -3652,7 +3780,7 @@ fn save_card_metadata_map_on_conn(
     } else {
         conn.execute(
             "UPDATE kanban_cards SET metadata = ?1 WHERE id = ?2",
-            rusqlite::params![serde_json::to_string(metadata)?, card_id],
+            sqlite_test::params![serde_json::to_string(metadata)?, card_id],
         )?;
     }
     Ok(())
@@ -3690,9 +3818,9 @@ async fn save_card_metadata_map_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn mark_api_reopen_skip_preflight_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3715,9 +3843,9 @@ async fn mark_api_reopen_skip_preflight_on_pg(
     save_card_metadata_map_pg(pool, card_id, &metadata).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_api_reopen_skip_preflight_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3734,9 +3862,9 @@ async fn clear_api_reopen_skip_preflight_on_pg(
     save_card_metadata_map_pg(pool, card_id, &metadata).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn consume_api_reopen_preflight_skip_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3793,9 +3921,9 @@ async fn consume_api_reopen_preflight_skip_on_pg(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn clear_reopen_preflight_cache_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
 ) -> anyhow::Result<()> {
     let mut metadata = load_card_metadata_map_on_conn(conn, card_id)?;
@@ -3830,6 +3958,50 @@ async fn clear_reopen_preflight_cache_on_pg(
     save_card_metadata_map_pg(pool, card_id, &metadata).await
 }
 
+/// Snapshot active dispatches (status IN ('pending','dispatched')) for a card.
+///
+/// Used by /transition (#1442) to report which dispatch IDs were cancelled by
+/// the cleanup paths in the response payload.
+async fn active_dispatch_ids_for_card_pg(
+    pool: &sqlx::PgPool,
+    card_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT id
+         FROM task_dispatches
+         WHERE kanban_card_id = $1
+           AND status IN ('pending', 'dispatched')",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| anyhow::anyhow!("load active dispatches for {card_id}: {error}"))?;
+    Ok(rows)
+}
+
+/// Filter the input dispatch IDs down to the ones currently in `cancelled`
+/// status. Used after a /transition cleanup to confirm which previously-active
+/// dispatches were actually terminated by the cleanup path (#1442).
+async fn cancelled_dispatch_ids_among_pg(
+    pool: &sqlx::PgPool,
+    dispatch_ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    if dispatch_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT id
+         FROM task_dispatches
+         WHERE id = ANY($1)
+           AND status = 'cancelled'",
+    )
+    .bind(dispatch_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| anyhow::anyhow!("filter cancelled dispatches: {error}"))?;
+    Ok(rows)
+}
+
 async fn clear_all_threads_pg(pool: &sqlx::PgPool, card_id: &str) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE kanban_cards
@@ -3849,6 +4021,13 @@ async fn clear_all_threads_pg(pool: &sqlx::PgPool, card_id: &str) -> anyhow::Res
 ///
 /// Administrative endpoint. Bypasses dispatch validation.
 /// Requires an explicit Bearer token (no same-origin bypass).
+///
+/// This endpoint is single-call complete. Do NOT chain /redispatch,
+/// /retry, or /auto-queue/generate after it — that creates duplicate
+/// dispatches (see #1442 incident). Inspect `cancelled_dispatch_ids`,
+/// `created_dispatch_id`, and `next_action_hint` in the response to
+/// determine whether any follow-up is genuinely required. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn force_transition(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3859,7 +4038,15 @@ pub async fn force_transition(
         return response;
     }
 
-    let needs_cleanup = force_transition_needs_cleanup(&body.status, body.cancel_dispatches);
+    // #1444 codex iter-2 P2: `force=true` is documented as opting into the
+    // "cancel + transition" recovery, so it must drive the cleanup decision
+    // alongside the legacy `cancel_dispatches` flag. Otherwise a caller
+    // sending `{"status":"ready","force":true,"cancel_dispatches":false}`
+    // would bypass the 409 guard but skip the cleanup, leaving the active
+    // dispatch in place — the exact regression the guard exists to prevent.
+    let force_intent_present = force_transition_force_intent_present(&body);
+    let cleanup_opt_in = force_intent_present || body.cancel_dispatches.unwrap_or(true);
+    let needs_cleanup = force_transition_needs_cleanup(&body.status, Some(cleanup_opt_in));
     let target_status = body.status;
     let mut cleanup_counts = (0, 0);
     let pool = match state.pg_pool_ref() {
@@ -3874,6 +4061,44 @@ pub async fn force_transition(
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await
         .unwrap_or_else(|| "api".to_string());
+    // Snapshot active dispatch IDs before transition so we can report which
+    // were cancelled by the cleanup paths (#1442). The cleanup helpers report
+    // counts but not IDs; we reconcile by querying the post-transition status
+    // of each pre-existing active dispatch and surfacing the ones now in
+    // `cancelled` state.
+    let pre_active_dispatch_ids: Vec<String> = active_dispatch_ids_for_card_pg(pool, &id)
+        .await
+        .unwrap_or_default();
+
+    // #1444 idempotency guard: when the caller asks to transition a card to
+    // `ready` while it already has a pending/dispatched dispatch, refuse with
+    // 409 unless `force=true` (or legacy `cancel_dispatches=true`) is
+    // explicitly set. This stops the #1442 incident pattern where a caller
+    // chains `/redispatch` + `/transition` + `/auto-queue/generate` and
+    // accidentally creates duplicate dispatches.
+    if target_status == "ready" && !force_intent_present && !pre_active_dispatch_ids.is_empty() {
+        let active_id = pre_active_dispatch_ids.first().cloned().unwrap_or_default();
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "card has active dispatch {active_id}; pass force=true to cancel and re-transition"
+                ),
+                "active_dispatch_id": active_id,
+                "active_dispatch_ids": pre_active_dispatch_ids,
+                "next_action_hint": "card already has a live dispatch — inspect /api/dispatches/{id}; pass force=true (or legacy cancel_dispatches=true) on /transition to cancel + re-transition",
+            })),
+        );
+    }
+    let pre_latest_dispatch_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
     let terminal_cleanup =
         match sqlx::query("SELECT repo_id, assigned_agent_id FROM kanban_cards WHERE id = $1")
             .bind(&id)
@@ -3892,8 +4117,10 @@ pub async fn force_transition(
                 .await
                 {
                     Ok(effective) => {
-                        effective.is_terminal(&target_status)
-                            && body.cancel_dispatches.unwrap_or(true)
+                        // #1444 codex iter-2 P2: same `force || cancel_dispatches`
+                        // unification as the ready/backlog cleanup decision so
+                        // `force=true` drives terminal cleanup too.
+                        effective.is_terminal(&target_status) && cleanup_opt_in
                     }
                     Err(error) => {
                         return (
@@ -3962,8 +4189,106 @@ pub async fn force_transition(
 
     match transition_result {
         Ok(result) => {
-            let (cancelled_dispatches, skipped_auto_queue_entries) = cleanup_counts;
+            let (mut cancelled_dispatches, mut skipped_auto_queue_entries) = cleanup_counts;
             crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
+
+            // #1444 codex iter-2 P1: when target_status equals current status
+            // (transition is a NoOp at the FSM level) AND the caller forced
+            // the call to clear an active dispatch, the cleanup helpers
+            // never ran because the FSM short-circuited. Run the SAME
+            // `ForceTransitionRevertCleanup` cleanup the normal ready
+            // transition path applies — cancel dispatches AND skip live
+            // auto-queue entries AND clear `latest_dispatch_id`/review
+            // fields on the card AND clear stale session bindings — so
+            // the documented force-recovery actually leaves the card in a
+            // clean state. (Iter-1 used the generic per-dispatch cancel
+            // which RESET queue entries to pending, leaving them eligible
+            // for redispatch and the dispatch pointer stale on the card.)
+            if !result.changed
+                && force_intent_present
+                && target_status == "ready"
+                && !pre_active_dispatch_ids.is_empty()
+            {
+                match crate::kanban::force_transition_revert_cleanup_pg_only(
+                    pool,
+                    &id,
+                    &target_status,
+                )
+                .await
+                {
+                    Ok(noop_counts) => {
+                        cancelled_dispatches += noop_counts.cancelled_dispatches;
+                        skipped_auto_queue_entries += noop_counts.skipped_auto_queue_entries;
+                    }
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "error": format!(
+                                    "force-transition no-op cleanup failed for card {id}: {error}"
+                                ),
+                            })),
+                        );
+                    }
+                }
+            }
+
+            // Reconcile the pre-transition active dispatch snapshot against
+            // current state to surface concrete cancelled IDs (#1442).
+            let cancelled_dispatch_ids =
+                if cancelled_dispatches > 0 && !pre_active_dispatch_ids.is_empty() {
+                    cancelled_dispatch_ids_among_pg(pool, &pre_active_dispatch_ids)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+            // Detect a brand-new dispatch that may have been kicked off by
+            // hooks fired during the transition (e.g. on_enter).
+            let post_latest_dispatch_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT latest_dispatch_id FROM kanban_cards WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+            let created_dispatch_id = match (
+                pre_latest_dispatch_id.as_deref(),
+                post_latest_dispatch_id.as_deref(),
+            ) {
+                (Some(prev), Some(curr)) if prev != curr => Some(curr.to_string()),
+                (None, Some(curr)) => Some(curr.to_string()),
+                _ => None,
+            };
+
+            // Only suggest /auto-queue/generate when the target state is
+            // actually enqueueable by that endpoint AND no live dispatch
+            // remains for the card (codex P2). Suggesting generate while a
+            // pending/dispatched dispatch is still in flight queues a card
+            // that's already running — the original #1442 failure mode.
+            // Cleanup only runs for `backlog`/`ready` (or with
+            // cancel_dispatches=true on terminal targets), so callers can
+            // also reach `requested`/`ready` while a live dispatch persists.
+            let post_active_dispatch_count = active_dispatch_ids_for_card_pg(pool, &id)
+                .await
+                .map(|ids| ids.len())
+                .unwrap_or(0);
+            let next_action_hint = if created_dispatch_id.is_some() {
+                "none_required".to_string()
+            } else if matches!(result.to.as_str(), "ready" | "requested")
+                && post_active_dispatch_count == 0
+            {
+                // Caller may want to dispatch the now-ready card via the
+                // queue. The transition itself is complete; this hint surfaces
+                // the natural follow-up so callers do not silently chain
+                // /redispatch (which would create duplicates — #1442).
+                "call /api/auto-queue/generate to dispatch newly-ready card".to_string()
+            } else {
+                "none_required".to_string()
+            };
 
             let card = load_card_json_pg(pool, &id)
                 .await
@@ -3986,6 +4311,9 @@ pub async fn force_transition(
                             "from": result.from,
                             "to": result.to,
                             "cancelled_dispatches": cancelled_dispatches,
+                            "cancelled_dispatch_ids": cancelled_dispatch_ids,
+                            "created_dispatch_id": created_dispatch_id,
+                            "next_action_hint": next_action_hint,
                             "skipped_auto_queue_entries": skipped_auto_queue_entries
                         })),
                     )
@@ -4006,7 +4334,7 @@ pub async fn force_transition(
 // ── #1065 param standardization tests ────────────────────────────────
 // UpdateCardBody canonical field is `assignee_agent_id` (snake_case).
 // Legacy `assigned_agent_id` still accepted via serde alias during migration.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod param_standardization_tests {
     use super::UpdateCardBody;
 

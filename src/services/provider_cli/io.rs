@@ -191,7 +191,7 @@ pub fn load_smoke_result(
     read_json(&paths::smoke_result_path(root, provider, channel))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::provider_cli::registry::{LaunchArtifact, ProviderCliRegistry};

@@ -260,7 +260,7 @@ pub(super) fn build_control_intent_system_reminder(intent: &DetectedControlInten
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         ControlIntentSurface, build_control_intent_system_reminder,

@@ -109,7 +109,7 @@ pub(crate) fn classify_mailbox_snapshot(snapshot: &Value) -> Option<MailboxFindi
     if agent_turn_status == "idle"
         && queue_depth == 0
         && session_record_present
-        && session_status == "working"
+        && matches!(session_status, "turn_active" | "working")
         && !tmux_present
         && !active_dispatch_present
     {
@@ -174,7 +174,7 @@ pub(crate) fn classify_mailbox_snapshot(snapshot: &Value) -> Option<MailboxFindi
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

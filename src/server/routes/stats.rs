@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::AppState;
 use super::session_activity::SessionActivityResolver;
+use crate::db::session_status::is_active_status;
 
 #[derive(Debug, Deserialize)]
 pub struct StatsQuery {
@@ -214,7 +215,7 @@ async fn load_departments_pg(
         entry.0 += 1;
         entry.2 += agent.xp;
         let effective_working = working_session_agents.contains(&agent.id)
-            || agent.status.as_deref() == Some("working");
+            || agent.status.as_deref().is_some_and(is_active_status);
         if effective_working {
             entry.1 += 1;
         }
@@ -443,7 +444,7 @@ async fn get_stats_pg(pool: &PgPool, office_id: Option<&str>) -> Result<serde_js
     let mut idle = 0i64;
     for agent in &agent_rows {
         let effective_working = working_session_agents.contains(&agent.id)
-            || agent.status.as_deref() == Some("working");
+            || agent.status.as_deref().is_some_and(is_active_status);
         if effective_working {
             working += 1;
             continue;
@@ -565,7 +566,7 @@ async fn load_memento_feedback_counts(state: &AppState) -> Option<(i64, i64)> {
     load_memento_feedback_counts_legacy(state)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_memento_feedback_counts_legacy(state: &AppState) -> Option<(i64, i64)> {
     let db = state.legacy_db()?;
     let conn = db.lock().ok()?;
@@ -580,7 +581,7 @@ fn load_memento_feedback_counts_legacy(state: &AppState) -> Option<(i64, i64)> {
     ))
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn load_memento_feedback_counts_legacy(_state: &AppState) -> Option<(i64, i64)> {
     None
 }

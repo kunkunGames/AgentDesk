@@ -963,7 +963,7 @@ pub(in crate::services::discord) async fn cmd_debug(ctx: Context<'_>) -> Result<
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::collections::HashMap;

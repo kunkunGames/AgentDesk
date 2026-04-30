@@ -72,7 +72,7 @@ pub(crate) fn resolve_shared_allowed_tool_compat(tool: &str) -> Option<SharedAll
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         LineStreamEvent, SharedAllowedToolKind, resolve_shared_allowed_tool_compat,

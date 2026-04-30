@@ -3,6 +3,10 @@
 > Code paths that are intentionally legacy on `main`. Each entry has a cleanup
 > owner issue. Touch these paths only inside the scope of the listed issue or
 > for a single narrow bugfix; do not extend them with new logic.
+>
+> Last refreshed: 2026-04-30 (against `main` @ `58c26894784f12235ae33ee3b0963a248e0b23f5`).
+> Baseline note: legacy SQLite adapter crates are absent from the default
+> `cargo tree`.
 
 ## Schema Reminder
 
@@ -11,37 +15,11 @@ Every entry uses the common §8 schema: `feature`, `canonical_modules`,
 `active_callsite_coverage`, `invariants`, `allowed_changes`, `tests`,
 `related_issues`.
 
-## `libsql_rusqlite` Cargo Dependency
-
-- feature: `db_layer / sqlite_dependency`
-- canonical_modules: `src/db/postgres.rs` (PG pool), `src/db/mod.rs` (PG-only
-  helpers)
-- legacy_modules:
-  - `Cargo.toml::libsql_rusqlite = { package = "libsql-rusqlite", version =
-    "0.33", features = ["bundled"] }`
-  - `src/db/schema.rs` SQLite migration code (giant-file, 3195 lines)
-  - `src/db/mod.rs` SQLite init/`DbPool` types
-  - All `use libsql_rusqlite::*` imports in production code (1000+ hits per
-    issue baseline)
-- do_not_edit_without_migration_plan: do not add any new
-  `use libsql_rusqlite::*` import. Removing existing ones is welcome inside
-  #1239 scope.
-- active_callsite_coverage: blocked behind #1237 (remove runtime
-  `AppState.db`) and #1238 (PG-only fallback removal). #1239 deletes the
-  Cargo dependency last.
-- invariants: PG cutover policy from
-  [`docs/postgres-cutover.md`](../postgres-cutover.md) and
-  [`docs/generated/pg-audit-checklist.md`](../generated/pg-audit-checklist.md).
-- allowed_changes: `bugfix` only inside the SQLite paths; PG-only `new_feature`
-  must use `pg_pool_ref()`.
-- tests: `cargo test --bin agentdesk high_risk_recovery::` (post-#1239 DoD).
-- related_issues: parent epic #843, ordered chain #1237 → #1238 → #1239.
-
 ## Legacy Outbound (`outbound/legacy.rs`)
 
 - feature: `discord_outbound / legacy_helpers`
-- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision}.rs`
-  (v3 domain types and pure planner)
+- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery}.rs`
+  (v3 domain types, pure planner, and delivery implementation)
 - legacy_modules: `src/services/discord/outbound/legacy.rs` —
   `deliver_outbound`, `OutboundDeduper`, all `Discord*` types and policy
   enums. Also `src/services/discord/formatting.rs::send_long_message_raw`
@@ -98,9 +76,8 @@ Every entry uses the common §8 schema: `feature`, `canonical_modules`,
   review-verdict routes, and the auto_queue route family.
 - do_not_edit_without_migration_plan: do not add a new SQLite arm. Existing
   arms are removed in #1238 in batches.
-- active_callsite_coverage: baseline grep is owned by #1239 ("작업 시작 전
-  `rg -c 'legacy_db|rusqlite|libsql_rusqlite' src | sort -nr | head -20`"
-  per the issue's "정적분석 보강" section).
+- active_callsite_coverage: baseline grep was owned by #1239 static analysis;
+  #1438 removes the default SQLite dependency surface.
 - invariants: a route handler must produce the same response shape on the PG
   path as it did on the SQLite path during the migration window.
 - allowed_changes: `bugfix` only; `extraction` is the cleanup itself.
@@ -136,20 +113,6 @@ Every entry uses the common §8 schema: `feature`, `canonical_modules`,
   cancel/recovery suites.
 - related_issues: #896 (origin), #1283 (cancel-induced death immediate
   re-attach), #1138 (lifecycle restructure).
-
-## `cli/migrate/postgres_cutover.rs` Retention
-
-- feature: `cli_runtime / pg_cutover_archive`
-- canonical_modules: PG-only runtime; one-shot cutover code.
-- legacy_modules: `src/cli/migrate/postgres_cutover.rs` (7669 lines, largest
-  CLI module; retained for restoration / reference).
-- do_not_edit_without_migration_plan: no new logic. The 추가 DoD on #1239
-  states this file must be feature-gated or moved to a separate module
-  before final SQLite-dependency removal.
-- active_callsite_coverage: n/a.
-- invariants: not on the production runtime path. CLI invocation only.
-- allowed_changes: `bugfix` only inside #1239 scope.
-- related_issues: #843, #1239.
 
 ## Update Cadence
 

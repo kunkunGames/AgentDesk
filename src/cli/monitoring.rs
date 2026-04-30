@@ -122,7 +122,7 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

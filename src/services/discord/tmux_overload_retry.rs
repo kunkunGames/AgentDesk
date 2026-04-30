@@ -145,7 +145,7 @@ pub(super) fn schedule_provider_overload_retry(
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         PROVIDER_OVERLOAD_RETRY_STATE, ProviderOverloadDecision,

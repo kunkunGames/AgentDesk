@@ -229,7 +229,7 @@ async fn build_app_state(with_health_registry: bool) -> Result<AppState, String>
     };
 
     Ok(AppState {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         legacy_db_override: None,
         pg_pool,
         engine,
@@ -1473,7 +1473,7 @@ pub(crate) async fn cmd_dispatch_redispatch(card_id: &str) -> Result<(), String>
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{extract_issue_numbers, parse_worktree_list, review_decision_mode};
 

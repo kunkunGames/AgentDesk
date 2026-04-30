@@ -33,6 +33,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "engine/": "QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops.",
     "error.rs": "Shared HTTP and policy error type with typed codes and JSON response helpers.",
     "github/": "GitHub sync, issue triage, and Definition-of-Done mirroring.",
+    "high_risk_recovery.rs": "PG-only high-risk recovery tests for boot reconciliation and review refire paths.",
     "integration_tests/": "Scenario-specific integration test modules that supplement `src/integration_tests.rs`.",
     "integration_tests.rs": "End-to-end pipeline, dispatch, review, and recovery integration test harness.",
     "kanban.rs": "High-level kanban orchestration and transition entrypoints.",

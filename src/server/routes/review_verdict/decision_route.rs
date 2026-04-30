@@ -1,15 +1,15 @@
 use axum::{Json, extract::State, http::StatusCode};
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 
 use super::super::AppState;
 use super::review_state_repo::update_card_review_state;
 use super::tuning_aggregate::{record_decision_tuning, spawn_aggregate_if_needed_with_pg};
 
 /// PG-only wrapper for kanban transitions after #1384.
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 async fn transition_status_pg_first(
     state: &AppState,
     card_id: &str,
@@ -31,7 +31,7 @@ async fn transition_status_pg_first(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 async fn transition_status_pg_first(
     state: &AppState,
     card_id: &str,
@@ -65,7 +65,7 @@ async fn transition_status_pg_first(
     if changed {
         conn.execute(
             "UPDATE kanban_cards SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![new_status, card_id],
+            sqlite_test::params![new_status, card_id],
         )?;
         crate::kanban::fire_transition_hooks_with_backends(
             Some(db),
@@ -87,33 +87,33 @@ fn spawn_review_tuning_aggregate_pg_first(state: &AppState) {
     spawn_aggregate_if_needed_with_pg(state.pg_pool_ref().cloned());
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_state_db(state: &AppState) -> Option<&crate::db::Db> {
     state.legacy_db()
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn review_state_db(_state: &AppState) -> Option<&crate::db::Db> {
     None
 }
 
 // ── Review Decision (agent's response to counter-model review) ──────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn test_worktree_commit_override_slot() -> &'static std::sync::Mutex<Option<Option<String>>> {
     static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Option<String>>>> =
         std::sync::OnceLock::new();
     OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn set_test_worktree_commit_override(commit: Option<String>) {
     if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
         *slot = Some(commit);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn clear_test_worktree_commit_override() {
     if let Ok(mut slot) = test_worktree_commit_override_slot().lock() {
         *slot = None;
@@ -126,7 +126,7 @@ async fn current_issue_worktree_commit(
     issue_num: i64,
     context: Option<&serde_json::Value>,
 ) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     {
         if let Ok(slot) = test_worktree_commit_override_slot().lock() {
             if let Some(override_commit) = slot.clone() {
@@ -205,7 +205,7 @@ async fn active_accept_followups_pg_first(
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db() {
         if let Ok(conn) = db.separate_conn() {
             if let Ok((review, rework, review_decision)) = conn.query_row(
@@ -251,7 +251,7 @@ async fn current_card_status_pg_first(state: &AppState, card_id: &str) -> Option
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db() {
         return db.separate_conn().ok().and_then(|conn| {
             conn.query_row(
@@ -316,7 +316,7 @@ async fn load_review_decision_card_context_pg_first(
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db()
         && let Ok(conn) = db.separate_conn()
         && let Ok(Some((status, repo_id, agent_id, title))) = conn
@@ -382,7 +382,7 @@ async fn card_exists_pg_first(state: &AppState, card_id: &str) -> bool {
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db() {
         return db
             .separate_conn()
@@ -454,7 +454,7 @@ async fn pending_review_decision_dispatch_id_pg_first(
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db() {
         let conn = db.separate_conn().ok()?;
         if let Ok(Some(dispatch_id)) = conn
@@ -825,7 +825,7 @@ async fn cancel_dispatch_pg_first(
         .await;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if let Some(db) = state.legacy_db() {
         let conn = db
             .separate_conn()
@@ -843,7 +843,7 @@ async fn cancel_dispatch_pg_first(
 
 async fn dismiss_review_cleanup_pg_first(state: &AppState, card_id: &str) -> Result<(), String> {
     let Some(pool) = state.pg_pool_ref() else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         if let Some(db) = state.legacy_db() {
             let conn = db
                 .separate_conn()
@@ -857,7 +857,7 @@ async fn dismiss_review_cleanup_pg_first(state: &AppState, card_id: &str) -> Res
                 )
                 .and_then(|mut stmt| {
                     let rows = stmt.query_map([card_id], |row| row.get::<_, String>(0))?;
-                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                    rows.collect::<sqlite_test::Result<Vec<_>>>()
                 })
                 .map_err(|error| {
                     format!("load sqlite dismiss cleanup dispatches for {card_id}: {error}")
@@ -1281,7 +1281,7 @@ pub async fn submit_review_decision(
                                 crate::dispatch::DispatchCreateOptions::default(),
                             )
                         } else {
-                            #[cfg(test)]
+                            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                             {
                                 state.legacy_db().map_or_else(
                                     || {
@@ -1302,7 +1302,7 @@ pub async fn submit_review_decision(
                                     },
                                 )
                             }
-                            #[cfg(not(test))]
+                            #[cfg(not(feature = "legacy-sqlite-tests"))]
                             {
                                 Err(anyhow::anyhow!(
                                     "postgres pool unavailable for rework dispatch"
@@ -1395,9 +1395,9 @@ pub async fn submit_review_decision(
             }
 
             if let Some(ref rd_id) = pending_rd_id {
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 let status_db = state.legacy_db();
-                #[cfg(not(test))]
+                #[cfg(not(feature = "legacy-sqlite-tests"))]
                 let status_db = None;
                 match crate::dispatch::set_dispatch_status_with_backends(
                     status_db,
@@ -1719,9 +1719,9 @@ pub async fn submit_review_decision(
             }
 
             if let Some(ref rd_id) = pending_rd_id {
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 let status_db = state.legacy_db();
-                #[cfg(not(test))]
+                #[cfg(not(feature = "legacy-sqlite-tests"))]
                 let status_db = None;
                 match crate::dispatch::set_dispatch_status_with_backends(
                     status_db,

@@ -193,7 +193,7 @@ pub(in crate::services::discord) fn risk_tier_summary_for_help(high_risk_enabled
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

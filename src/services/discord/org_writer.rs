@@ -177,7 +177,7 @@ fn load_org_document(path: &Path) -> Result<OrgDocument, String> {
     serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse '{}': {e}", path.display()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::fs;
 

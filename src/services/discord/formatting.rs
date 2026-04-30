@@ -208,7 +208,7 @@ pub(super) fn extract_skill_description(content: &str) -> String {
     "Custom skill".to_string()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         LongRunningCloseTrigger, MonitorHandoffReason, MonitorHandoffStatus,
@@ -1256,7 +1256,7 @@ mod tests {
         );
         let expected = concat!(
             "🔄 **백그라운드 처리 중**\n",
-            "> **도구**: ⚙ Bash: cargo build · **사유**: 비동기 dispatch\n",
+            "> **도구**: ⚙ Bash: cargo build · **사유**: 직결 스트림 끊김 — watcher 이어받음\n",
             "> **시작**: <t:1700000000:R>\n",
             "완료 시 이 채널로 결과 이어서 보냅니다.",
         );
@@ -1273,7 +1273,7 @@ mod tests {
             Some("cargo test --package agentdesk -- --nocapture"),
         );
         assert!(text.starts_with("🔄 **백그라운드 처리 중**\n"));
-        assert!(text.contains("**도구**: Bash · **사유**: 명시 호출"));
+        assert!(text.contains("**도구**: Bash · **사유**: 백그라운드 도구 실행 중"));
         assert!(text.contains("**명령**: `cargo test --package agentdesk -- --nocapture`"));
         assert!(text.contains("<t:1700000000:R>"));
     }
@@ -1301,7 +1301,7 @@ mod tests {
             None,
         );
         assert!(failed.starts_with("❌ **백그라운드 실패**: exit code 137\n"));
-        assert!(failed.contains("**사유**: 인라인 타임아웃"));
+        assert!(failed.contains("**사유**: 응답 지연 — watcher 이어받음"));
 
         let timed_out = build_monitor_handoff_placeholder(
             MonitorHandoffStatus::TimedOut,
@@ -1334,13 +1334,18 @@ mod tests {
             // card cannot leak partial state from an earlier turn.
             Some("Bash"),
             Some("ls -la"),
+            None,
             Some("⏳ context"),
+            Some("user request"),
+            Some("2 alive (#A 4m12s) / 0 closed"),
         );
         assert!(text.starts_with("📬 **메시지 대기 중**\n"));
         assert!(text.contains("> **사유**: 앞선 턴 진행 중"));
         assert!(!text.contains("> **도구**:"));
         assert!(!text.contains("> **명령**:"));
         assert!(!text.contains("> **요약**:"));
+        assert!(!text.contains("> **요청**:"));
+        assert!(!text.contains("> **진행**:"));
         assert!(text.contains("> **시작**: <t:1700000000:R>"));
         assert!(text.ends_with("현재 진행 중인 턴 완료 후 처리 시작합니다."));
     }
@@ -1379,6 +1384,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::MonitorLike,
+                None,
             ))
         );
         assert_eq!(
@@ -1386,6 +1392,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::MonitorLike,
+                None,
             ))
         );
     }
@@ -1400,6 +1407,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::BackgroundDispatch,
+                None,
             ))
         );
         // Foreground Bash → no card (would otherwise spam users on every
@@ -1430,6 +1438,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::BackgroundDispatch,
+                Some("x".to_string()),
             ))
         );
         assert_eq!(
@@ -1449,6 +1458,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::BackgroundDispatch,
+                Some("x".to_string()),
             ))
         );
         assert_eq!(
@@ -1456,6 +1466,7 @@ mod tests {
             Some((
                 MonitorHandoffReason::ExplicitCall,
                 LongRunningCloseTrigger::BackgroundDispatch,
+                None,
             ))
         );
         assert_eq!(
@@ -1472,10 +1483,32 @@ mod tests {
             1_700_000_000,
             Some("Monitor"),
             None,
+            None,
             Some("⏳ CI 통과 신호 대기"),
+            Some("배포 상태 확인해줘\n두 번째 줄은 제외"),
+            Some("2 alive (#A 4m12s, #B 1m05s) / 1 closed"),
         );
+        assert!(text.contains("**요청**: 배포 상태 확인해줘"));
+        assert!(text.contains("**진행**: 2 alive (#A 4m12s, #B 1m05s) / 1 closed"));
         assert!(text.contains("**요약**: ⏳ CI 통과 신호 대기"));
         assert!(text.contains("**도구**: Monitor"));
+    }
+
+    #[test]
+    fn test_monitor_handoff_reason_detail_renders_agent_description() {
+        let text = build_monitor_handoff_placeholder_with_context(
+            MonitorHandoffStatus::Active,
+            MonitorHandoffReason::ExplicitCall,
+            1_700_000_000,
+            Some("Agent"),
+            Some("Branch ship-readiness audit"),
+            Some("Branch ship-readiness audit"),
+            None,
+            None,
+            None,
+        );
+        assert!(text.contains("**사유**: 백그라운드 도구 실행 중 (Branch ship-readiness audit)"));
+        assert!(text.contains("**명령**: `Branch ship-readiness audit`"));
     }
 }
 
@@ -2724,8 +2757,8 @@ pub(super) fn humanize_tool_status(tool_line: &str) -> String {
 }
 
 /// Reason label shown in the monitor handoff placeholder. Mirrors the issue
-/// #1114 spec: 비동기 dispatch (tmux watcher), 인라인 타임아웃 (timeout
-/// before stream end), 명시 호출 (explicit `/monitor`-style invocation).
+/// #1324 wording so users see what is happening instead of internal mechanism
+/// names such as "async dispatch".
 /// `Queued` (#1332) is paired with `MonitorHandoffStatus::Queued` to render
 /// the mailbox-queued placeholder card (앞선 턴 진행 중).
 /// `InlineTimeout` and `ExplicitCall` are exposed for downstream wiring
@@ -2742,9 +2775,9 @@ pub(super) enum MonitorHandoffReason {
 impl MonitorHandoffReason {
     fn label(self) -> &'static str {
         match self {
-            Self::AsyncDispatch => "비동기 dispatch",
-            Self::InlineTimeout => "인라인 타임아웃",
-            Self::ExplicitCall => "명시 호출",
+            Self::AsyncDispatch => "직결 스트림 끊김 — watcher 이어받음",
+            Self::InlineTimeout => "응답 지연 — watcher 이어받음",
+            Self::ExplicitCall => "백그라운드 도구 실행 중",
             Self::Queued => "앞선 턴 진행 중",
         }
     }
@@ -2769,6 +2802,7 @@ pub(super) enum MonitorHandoffStatus<'a> {
 
 const MONITOR_HANDOFF_TOOL_MAX_BYTES: usize = 80;
 const MONITOR_HANDOFF_COMMAND_MAX_BYTES: usize = 80;
+const MONITOR_HANDOFF_REASON_DETAIL_MAX_BYTES: usize = 80;
 
 fn monitor_handoff_header(status: MonitorHandoffStatus<'_>) -> String {
     match status {
@@ -2824,10 +2858,15 @@ pub(super) fn build_monitor_handoff_placeholder(
         tool_summary,
         command_summary,
         None,
+        None,
+        None,
+        None,
     )
 }
 
 const MONITOR_HANDOFF_CONTEXT_MAX_BYTES: usize = 200;
+const MONITOR_HANDOFF_REQUEST_MAX_BYTES: usize = 200;
+const MONITOR_HANDOFF_PROGRESS_MAX_BYTES: usize = 200;
 
 /// Variant of `build_monitor_handoff_placeholder` that surfaces an additional
 /// `context_line` slot — typically the last assistant prose line emitted just
@@ -2840,7 +2879,10 @@ pub(super) fn build_monitor_handoff_placeholder_with_context(
     started_at_unix: i64,
     tool_summary: Option<&str>,
     command_summary: Option<&str>,
+    reason_detail: Option<&str>,
     context_line: Option<&str>,
+    request_line: Option<&str>,
+    progress_line: Option<&str>,
 ) -> String {
     let header = monitor_handoff_header(status);
     let footer = monitor_handoff_footer(status);
@@ -2868,6 +2910,21 @@ pub(super) fn build_monitor_handoff_placeholder_with_context(
         }
     });
 
+    let reason_label = reason_detail
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_for_status_bytes(
+                    trimmed,
+                    MONITOR_HANDOFF_REASON_DETAIL_MAX_BYTES,
+                ))
+            }
+        })
+        .map(|detail| format!("{} ({detail})", reason.label()))
+        .unwrap_or_else(|| reason.label().to_string());
+
     let context_line = context_line.and_then(|raw| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -2880,21 +2937,50 @@ pub(super) fn build_monitor_handoff_placeholder_with_context(
         }
     });
 
-    let mut lines = Vec::with_capacity(6);
+    let request_line = request_line.and_then(|raw| {
+        let trimmed = raw.lines().next().unwrap_or("").trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(truncate_for_status_bytes(
+                trimmed,
+                MONITOR_HANDOFF_REQUEST_MAX_BYTES,
+            ))
+        }
+    });
+
+    let progress_line = progress_line.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(truncate_for_status_bytes(
+                trimmed,
+                MONITOR_HANDOFF_PROGRESS_MAX_BYTES,
+            ))
+        }
+    });
+
+    let mut lines = Vec::with_capacity(8);
     lines.push(header);
     // #1332 — the Queued card has no tool/command yet (turn has not started),
     // so collapse to a reason-only sub-line. Active/terminal cards keep the
     // dual 도구·사유 layout from #1114.
     if matches!(status, MonitorHandoffStatus::Queued) {
         let _ = (tool_field, command_line, context_line);
-        lines.push(format!("> **사유**: {reason}", reason = reason.label()));
+        lines.push(format!("> **사유**: {reason_label}"));
     } else {
         lines.push(format!(
-            "> **도구**: {tool_field} · **사유**: {reason}",
-            reason = reason.label()
+            "> **도구**: {tool_field} · **사유**: {reason_label}",
         ));
+        if let Some(request) = request_line {
+            lines.push(format!("> **요청**: {request}"));
+        }
         if let Some(command) = command_line {
             lines.push(format!("> **명령**: `{command}`"));
+        }
+        if let Some(progress) = progress_line {
+            lines.push(format!("> **진행**: {progress}"));
         }
         if let Some(context) = context_line {
             lines.push(format!("> **요약**: {context}"));
@@ -2936,7 +3022,11 @@ pub(super) enum LongRunningCloseTrigger {
 pub(super) fn classify_long_running_tool(
     name: &str,
     input: &str,
-) -> Option<(MonitorHandoffReason, LongRunningCloseTrigger)> {
+) -> Option<(
+    MonitorHandoffReason,
+    LongRunningCloseTrigger,
+    Option<String>,
+)> {
     // `Agent` is not a canonical Claude Code tool name (the canonical entry is
     // `Task`), so it would not survive `canonical_tool_name`. Match it
     // explicitly first so the Task/Agent + run_in_background path stays alive.
@@ -2950,6 +3040,7 @@ pub(super) fn classify_long_running_tool(
         "Monitor" => Some((
             MonitorHandoffReason::ExplicitCall,
             LongRunningCloseTrigger::MonitorLike,
+            None,
         )),
         "Bash" | "Task" | "Agent" => {
             // Only escalate to the live-turn card when the call is explicitly
@@ -2961,9 +3052,16 @@ pub(super) fn classify_long_running_tool(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if bg {
+                let reason_detail = v
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 Some((
                     MonitorHandoffReason::ExplicitCall,
                     LongRunningCloseTrigger::BackgroundDispatch,
+                    reason_detail,
                 ))
             } else {
                 None

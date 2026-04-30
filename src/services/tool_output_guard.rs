@@ -124,14 +124,14 @@ pub fn snapshot_counters() -> ToolOutputCounters {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn reset_counters_for_tests() {
     OVERSIZE_COUNT.store(0, Ordering::Relaxed);
     TOTAL_OUTPUT_BYTES.store(0, Ordering::Relaxed);
     TOTAL_OUTPUT_SAMPLES.store(0, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

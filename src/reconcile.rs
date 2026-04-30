@@ -81,13 +81,13 @@ pub(crate) async fn reconcile_boot_runtime(
     let mut stats = if let Some(pool) = pg_pool {
         reconcile_boot_db_pg(pool).await?
     } else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             reconcile_boot_db_sqlite(
                 db.ok_or_else(|| anyhow!("SQLite db required for test boot reconcile"))?,
             )?
         }
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             return Err(anyhow!("Postgres pool required for boot reconcile"));
         }
@@ -114,7 +114,7 @@ pub(crate) async fn reconcile_boot_runtime(
     Ok(stats)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn reconcile_boot_db_sqlite(db: &Db) -> Result<BootReconcileStats> {
     let conn = db
         .separate_conn()
@@ -533,7 +533,7 @@ pub(crate) async fn reconcile_zombie_resources() -> ZombieReconcileStats {
     stats
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

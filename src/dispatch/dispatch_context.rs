@@ -1,12 +1,12 @@
 use anyhow::Result;
-#[cfg(test)]
-use rusqlite::OptionalExtension;
 use serde_json::json;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::OptionalExtension;
 use sqlx::PgPool;
 
 use crate::db::Db;
 use crate::db::agents::AgentChannelBindings;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::agents::load_agent_channel_bindings;
 use crate::db::agents::load_agent_channel_bindings_pg;
 use crate::services::provider::ProviderKind;
@@ -21,7 +21,7 @@ struct DispatchExecutionTarget {
     target_repo: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Debug, Clone, Default)]
 struct CardDispatchInfo {
     issue_number: Option<i64>,
@@ -298,9 +298,9 @@ pub(super) fn dispatch_context_worktree_target(
     Ok(Some((path.to_string(), branch)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_parent_dispatch_context_sqlite_test(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     card_id: &str,
     context: &serde_json::Value,
 ) -> Result<(Option<String>, i64)> {
@@ -351,7 +351,7 @@ fn is_card_scoped_worktree_path(path: &str, branch: Option<&str>) -> bool {
     !is_repo_root || is_non_main_branch
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_card_dispatch_info(db: &Db, card_id: &str) -> Option<CardDispatchInfo> {
     db.separate_conn().ok().and_then(|conn| {
         conn.query_row(
@@ -368,12 +368,12 @@ fn load_card_dispatch_info(db: &Db, card_id: &str) -> Option<CardDispatchInfo> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_card_issue_repo(db: &Db, card_id: &str) -> Option<(Option<i64>, Option<String>)> {
     load_card_dispatch_info(db, card_id).map(|info| (info.issue_number, info.repo_id))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn load_card_pr_number(db: &Db, card_id: &str) -> Option<i64> {
     db.separate_conn().ok().and_then(|conn| {
         conn.query_row(
@@ -388,7 +388,7 @@ fn load_card_pr_number(db: &Db, card_id: &str) -> Option<i64> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn inject_review_dispatch_identifiers_sqlite_test(
     db: &Db,
     card_id: &str,
@@ -426,7 +426,7 @@ pub(crate) fn inject_review_dispatch_identifiers_sqlite_test(
         _ => {}
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn resolve_card_target_repo_ref_sqlite_test(
     db: &Db,
     card_id: &str,
@@ -451,7 +451,7 @@ pub(super) fn resolve_card_target_repo_ref_sqlite_test(
     info.repo_id
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_card_repo_dir_with_context(
     db: &Db,
     card_id: &str,
@@ -463,7 +463,7 @@ fn resolve_card_repo_dir_with_context(
         .map_err(|e| anyhow::anyhow!("Cannot {purpose} for card {}: {}", card_id, e))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_card_repo_dir(db: &Db, card_id: &str, purpose: &str) -> Result<Option<String>> {
     resolve_card_repo_dir_with_context(db, card_id, None, purpose)
 }
@@ -478,7 +478,7 @@ fn resolve_card_repo_dir(db: &Db, card_id: &str, purpose: &str) -> Result<Option
 /// design ensures the fallback chain always reaches `resolve_card_worktree()` or
 /// `resolve_card_issue_commit_target()` when the dispatch-history commit can't
 /// be confirmed as belonging to this issue.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn commit_belongs_to_card_issue(
     db: &Db,
     card_id: &str,
@@ -532,7 +532,7 @@ pub(crate) fn commit_belongs_to_card_issue(
     subject.contains(&pattern)
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 pub(crate) fn commit_belongs_to_card_issue(
     _db: &Db,
     card_id: &str,
@@ -581,7 +581,7 @@ fn worktree_head_matches_commit(dir: &str, commit_sha: &str) -> bool {
     head == commit_sha
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_review_target_branch(
     db: &Db,
     card_id: &str,
@@ -601,7 +601,7 @@ fn resolve_review_target_branch(
     .or_else(|| crate::services::platform::shell::git_branch_name(dir))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn refresh_review_target_worktree(
     db: &Db,
     card_id: &str,
@@ -776,7 +776,7 @@ fn refresh_review_target_worktree(
     Ok(None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn latest_completed_work_dispatch_target(
     db: &Db,
     kanban_card_id: &str,
@@ -963,9 +963,9 @@ fn result_has_work_completion_evidence(result: &serde_json::Value) -> bool {
         || json_string_field(result, "work_outcome").is_some()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn validate_dispatch_completion_evidence_on_conn(
-    conn: &rusqlite::Connection,
+    conn: &sqlite_test::Connection,
     db: &Db,
     pg_pool: Option<&sqlx::PgPool>,
     dispatch_id: &str,
@@ -1190,7 +1190,7 @@ pub(super) fn inject_review_merge_base_context(
 /// canonical worktree. If the card points at a repo without a configured
 /// local mapping, this fails instead of silently falling back to the default
 /// repo.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) fn resolve_card_worktree_sqlite_test(
     db: &Db,
     card_id: &str,
@@ -1213,7 +1213,7 @@ pub(crate) fn resolve_card_worktree_sqlite_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_card_issue_commit_target(
     db: &Db,
     card_id: &str,
@@ -1252,7 +1252,7 @@ fn resolve_card_issue_commit_target(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn resolve_repo_head_fallback_target(
     db: &Db,
     kanban_card_id: &str,
@@ -1349,7 +1349,7 @@ pub(crate) enum ReviewTargetTrust {
 /// callers (anyone reaching `POST /api/dispatches`) MUST pass `Untrusted`;
 /// internal callers that already have first-party review-target values may
 /// opt into `Trusted`.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn build_review_context_sqlite_test(
     db: &Db,
     kanban_card_id: &str,
@@ -2539,7 +2539,7 @@ pub(super) async fn build_review_context(
     Ok(serde_json::to_string(&serde_json::Value::Object(obj))?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::db::Db;
@@ -2763,7 +2763,7 @@ mod tests {
              ) VALUES (
                 ?1, 'Test Card', ?2, ?3, datetime('now'), datetime('now')
              )",
-            rusqlite::params![card_id, status, issue_number],
+            sqlite_test::params![card_id, status, issue_number],
         )
         .unwrap();
     }
@@ -2789,7 +2789,7 @@ mod tests {
         let conn = db.separate_conn().unwrap();
         conn.execute(
             "UPDATE kanban_cards SET repo_id = ?1 WHERE id = ?2",
-            rusqlite::params![repo_id, card_id],
+            sqlite_test::params![repo_id, card_id],
         )
         .unwrap();
     }
@@ -2975,7 +2975,7 @@ mod tests {
                 'card-review-identifiers', ?1, ?2, 'wt/692-review', 901, ?3, 'review',
                 datetime('now'), datetime('now')
              )",
-            rusqlite::params![repo_dir, repo_dir, reviewed_commit],
+            sqlite_test::params![repo_dir, repo_dir, reviewed_commit],
         )
         .unwrap();
         drop(conn);
@@ -3036,7 +3036,7 @@ mod tests {
                 'dispatch-800-stale', 'card-stale-completed-wt', 'agent-1', 'implementation', 'completed',
                 'Stale wt completion', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({
                     "worktree_path": stale_path_str,
                     "worktree_branch": stale_branch,
@@ -3094,7 +3094,7 @@ mod tests {
                 'dispatch-800-stale-commit', 'card-stale-completed-with-commit', 'agent-1', 'implementation', 'completed',
                 'Stale wt completion (with commit)', ?1, ?2, datetime('now'), datetime('now')
              )",
-            rusqlite::params![
+            sqlite_test::params![
                 serde_json::json!({}).to_string(),
                 serde_json::json!({
                     "completed_worktree_path": stale_path_str,
@@ -3847,7 +3847,7 @@ mod tests {
              ) VALUES (
                 ?1, ?2, ?3, 'wt/sqlite-db-value', 7001, ?4, 'review', datetime('now'), datetime('now')
              )",
-            rusqlite::params![card_id, repo_dir, repo_dir, reviewed_commit],
+            sqlite_test::params![card_id, repo_dir, repo_dir, reviewed_commit],
         )
         .unwrap();
         drop(conn);

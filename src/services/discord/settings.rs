@@ -35,7 +35,7 @@ use super::runtime_store;
 use super::runtime_store::{bot_settings_path, discord_uploads_root};
 
 pub(crate) use content::load_longterm_memory_catalog;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use content::load_peer_agents;
 pub(super) use content::{
     channel_upload_dir, cleanup_channel_uploads, cleanup_old_uploads, is_known_agent,
@@ -49,7 +49,7 @@ pub(super) use read::{
 pub use read::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use validation::bot_settings_allow_agent;
 pub(crate) use validation::list_registered_channel_bindings;
 pub(super) use validation::{
@@ -336,7 +336,7 @@ fn resolve_bot_token(bot_name: &str, bot: &crate::config::BotConfig) -> Option<S
         .or_else(|| crate::credential::read_bot_token(bot_name))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;

@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::Result;
-#[cfg(test)]
-use rusqlite::{Connection, OptionalExtension};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::{Connection, OptionalExtension};
 use sqlx::{PgPool, Row as SqlxRow};
 
 use crate::config::{AgentChannel, AgentDef};
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
 use crate::services::provider::ProviderKind;
 
@@ -129,11 +129,11 @@ fn normalized_channel(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn load_agent_channel_bindings(
     conn: &Connection,
     agent_id: &str,
-) -> rusqlite::Result<Option<AgentChannelBindings>> {
+) -> sqlite_test::Result<Option<AgentChannelBindings>> {
     conn.query_row(
         "SELECT provider, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx
          FROM agents WHERE id = ?1",
@@ -151,29 +151,29 @@ pub fn load_agent_channel_bindings(
     .optional()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn resolve_agent_primary_channel_on_conn(
     conn: &Connection,
     agent_id: &str,
-) -> rusqlite::Result<Option<String>> {
+) -> sqlite_test::Result<Option<String>> {
     Ok(load_agent_channel_bindings(conn, agent_id)?.and_then(|b| b.primary_channel()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn resolve_agent_channel_for_provider_on_conn(
     conn: &Connection,
     agent_id: &str,
     provider: Option<&str>,
-) -> rusqlite::Result<Option<String>> {
+) -> sqlite_test::Result<Option<String>> {
     Ok(load_agent_channel_bindings(conn, agent_id)?.and_then(|b| b.channel_for_provider(provider)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn resolve_agent_dispatch_channel_on_conn(
     conn: &Connection,
     agent_id: &str,
     dispatch_type: Option<&str>,
-) -> rusqlite::Result<Option<String>> {
+) -> sqlite_test::Result<Option<String>> {
     Ok(
         load_agent_channel_bindings(conn, agent_id)?.and_then(|bindings| {
             if matches!(dispatch_type, Some("review" | "e2e-test" | "consultation")) {
@@ -284,7 +284,7 @@ pub async fn resolve_agent_dispatch_channel_pg(
 
 /// Upsert agents from config into the agents table.
 /// Only updates fields that come from config; leaves status/xp/skills untouched.
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn sync_agents_from_config(db: &Db, agents: &[AgentDef]) -> Result<usize> {
     let conn = db
         .lock()
@@ -315,7 +315,7 @@ pub fn sync_agents_from_config(db: &Db, agents: &[AgentDef]) -> Result<usize> {
     Ok(agents.len())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn legacy_agent_alias(agent_id: &str) -> Option<String> {
     if agent_id.starts_with(LEGACY_AGENT_PREFIX) {
         return None;
@@ -323,7 +323,7 @@ fn legacy_agent_alias(agent_id: &str) -> Option<String> {
     Some(format!("{LEGACY_AGENT_PREFIX}{agent_id}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn sqlite_agent_exists(conn: &Connection, agent_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
@@ -332,7 +332,7 @@ fn sqlite_agent_exists(conn: &Connection, agent_id: &str) -> Result<bool> {
     )?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Result<()> {
     let discord_channel_cc = agent
         .channels
@@ -375,7 +375,7 @@ fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Resul
             discord_channel_cc = excluded.discord_channel_cc,
             discord_channel_cdx = excluded.discord_channel_cdx,
             updated_at = CURRENT_TIMESTAMP",
-        rusqlite::params![
+        sqlite_test::params![
             agent.id,
             agent.name,
             agent.name_ko,
@@ -392,7 +392,7 @@ fn upsert_agent_from_config_sqlite(conn: &Connection, agent: &AgentDef) -> Resul
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn migrate_legacy_agent_aliases_sqlite(
     conn: &Connection,
     agents: &[AgentDef],
@@ -429,7 +429,7 @@ fn migrate_legacy_agent_aliases_sqlite(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn copy_runtime_fields_from_legacy_sqlite(
     conn: &Connection,
     legacy_id: &str,
@@ -450,13 +450,13 @@ fn copy_runtime_fields_from_legacy_sqlite(
              system_prompt = COALESCE((SELECT system_prompt FROM agents WHERE id = ?1), system_prompt),
              pipeline_config = COALESCE((SELECT pipeline_config FROM agents WHERE id = ?1), pipeline_config)
          WHERE id = ?2",
-        rusqlite::params![legacy_id, canonical_id],
+        sqlite_test::params![legacy_id, canonical_id],
     )?;
 
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn move_legacy_agent_references_sqlite(
     conn: &Connection,
     legacy_id: &str,
@@ -481,7 +481,7 @@ fn move_legacy_agent_references_sqlite(
         "UPDATE session_transcripts SET agent_id = ?1 WHERE agent_id = ?2",
         "UPDATE memento_feedback_turn_stats SET agent_id = ?1 WHERE agent_id = ?2",
     ] {
-        conn.execute(sql, rusqlite::params![canonical_id, legacy_id])?;
+        conn.execute(sql, sqlite_test::params![canonical_id, legacy_id])?;
     }
 
     conn.execute(
@@ -489,7 +489,7 @@ fn move_legacy_agent_references_sqlite(
          SELECT office_id, ?1, department_id, joined_at
            FROM office_agents
           WHERE agent_id = ?2",
-        rusqlite::params![canonical_id, legacy_id],
+        sqlite_test::params![canonical_id, legacy_id],
     )?;
     conn.execute("DELETE FROM office_agents WHERE agent_id = ?1", [legacy_id])?;
 
@@ -500,7 +500,7 @@ fn move_legacy_agent_references_sqlite(
          SELECT ?1, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at
            FROM auto_queue_slots
           WHERE agent_id = ?2",
-        rusqlite::params![canonical_id, legacy_id],
+        sqlite_test::params![canonical_id, legacy_id],
     )?;
     conn.execute(
         "DELETE FROM auto_queue_slots WHERE agent_id = ?1",
@@ -510,13 +510,13 @@ fn move_legacy_agent_references_sqlite(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::config::AgentChannels;
 
     fn test_db() -> Db {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = sqlite_test::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         crate::db::schema::migrate(&conn).unwrap();
         crate::db::wrap_conn(conn)
@@ -683,7 +683,7 @@ mod tests {
             "INSERT INTO agents (
                 id, name, provider, status, xp, sprite_number, description, system_prompt, pipeline_config
              ) VALUES (?1, ?2, 'codex', 'working', 42, 7, 'legacy-desc', 'legacy-prompt', '{\"k\":1}')",
-            rusqlite::params!["openclaw-maker", "Legacy Maker"],
+            sqlite_test::params!["openclaw-maker", "Legacy Maker"],
         )
         .unwrap();
         conn.execute(
@@ -703,7 +703,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions (session_key, agent_id, status) VALUES ('sess-1', 'openclaw-maker', 'working')",
+            "INSERT INTO sessions (session_key, agent_id, status) VALUES ('sess-1', 'openclaw-maker', 'turn_active')",
             [],
         )
         .unwrap();
@@ -868,7 +868,7 @@ mod tests {
             "INSERT INTO agents (
                 id, name, provider, status, xp
              ) VALUES (?1, ?2, 'codex', 'working', 42)",
-            rusqlite::params!["openclaw-maker", "Configured Legacy Maker"],
+            sqlite_test::params!["openclaw-maker", "Configured Legacy Maker"],
         )
         .unwrap();
         conn.execute(

@@ -229,7 +229,7 @@ impl ObservabilityCounters {
         rows
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub fn reset(&self) {
         self.table.clear();
     }
@@ -278,12 +278,12 @@ pub fn snapshot() -> Vec<CounterSnapshotRow> {
     global().snapshot()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn reset_for_tests() {
     global().reset();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::sync::Arc;

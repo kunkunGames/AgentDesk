@@ -5,6 +5,8 @@
 > auto-generated inventory in
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
+>
+> Last refreshed: 2026-04-30 (against #1435 tmux watcher lifecycle extraction).
 
 ## Read This First
 
@@ -24,8 +26,8 @@
 
 ### `discord_outbound`
 
-- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision}.rs`
-  (#1006 v3 domain types and pure planner).
+- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery}.rs`
+  (#1006 v3 domain types, pure planner, and delivery implementation).
 - legacy_modules: `src/services/discord/outbound/legacy.rs` (`deliver_outbound`,
   `OutboundDeduper`, `DiscordOutbound*` types).
 - do_not_edit_without_migration_plan:
@@ -51,18 +53,18 @@
 ### `policy_engine`
 
 - canonical_modules: `src/engine/mod.rs` (driver) plus `src/engine/ops/*.rs`
-  (per-domain op handlers). `src/pipeline.rs` (2144 lines, giant-file)
+  (per-domain op handlers). `src/pipeline.rs` (2125 lines, giant-file)
   composes the policy pipeline.
 - legacy_modules: none — there is no parallel engine. The whole surface is
   pre-migration giant-file territory.
 - do_not_edit_without_migration_plan:
-  - `src/engine/mod.rs` (2363 lines, giant-file).
-  - `src/engine/ops/review_automation_ops.rs` (2722 lines, giant-file).
-  - `src/engine/transition.rs` (1757 lines, giant-file).
-  - `src/engine/ops/kanban_ops.rs` (1484 lines, giant-file).
-  - `src/engine/ops/db_ops.rs` (1200 lines, giant-file).
-  - `src/engine/intent.rs` (1018 lines, giant-file).
-  - `src/pipeline.rs` (2144 lines, giant-file).
+  - `src/engine/mod.rs` (2590 lines, giant-file).
+  - `src/engine/ops/review_automation_ops.rs` (2140 lines, giant-file).
+  - `src/engine/transition.rs` (1309 lines, giant-file).
+  - `src/engine/ops/kanban_ops.rs` (1116 lines, giant-file).
+  - `src/engine/ops/db_ops.rs` (1195 lines, giant-file).
+  - `src/engine/intent.rs` (873 lines, retained migration-sensitive surface).
+  - `src/pipeline.rs` (2125 lines, giant-file).
 - active_callsite_coverage: n/a (no canonical replacement yet).
 - invariants: typed-facade contract from
   [`docs/policy-typed-facade.md`](../policy-typed-facade.md); engine never
@@ -79,10 +81,10 @@
 - canonical_modules: `src/dispatch/{mod,dispatch_context,dispatch_create,dispatch_status}.rs`.
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file, awaiting split issue):
-  - `src/dispatch/mod.rs` (4899 lines).
-  - `src/dispatch/dispatch_context.rs` (3802 lines).
-  - `src/dispatch/dispatch_create.rs` (2517 lines).
-  - `src/dispatch/dispatch_status.rs` (1877 lines).
+  - `src/dispatch/mod.rs` (4875 lines).
+  - `src/dispatch/dispatch_context.rs` (3913 lines).
+  - `src/dispatch/dispatch_create.rs` (2737 lines).
+  - `src/dispatch/dispatch_status.rs` (1828 lines).
 - active_callsite_coverage: n/a.
 - invariants: dispatch creation is the only writer for `dispatched_sessions`;
   status transitions go through `dispatch_status`.
@@ -92,24 +94,30 @@
 
 ### `tmux_watcher`
 
-- canonical_modules: `src/services/discord/tmux.rs` (single owner per #1222
-  single-relay-owner contract), `src/services/discord/inflight.rs` (state file
-  contract).
+- canonical_modules: `src/services/discord/watchers/lifecycle.rs` (watcher
+  stop/reattach/claim/restore lifecycle, including the #1222 single-owner
+  claim path and #1283 cancel-induced reattach contract),
+  `src/services/discord/tmux.rs` (watcher loop and remaining tmux relay
+  parsing), `src/services/discord/inflight.rs` (state file contract).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/tmux.rs` (11537 lines — largest in the repo).
-  - `src/services/discord/recovery_engine.rs` (4669 lines).
-  - `src/services/discord/health.rs` (4093 lines).
-  - `src/services/discord/router/message_handler.rs` (6094 lines).
-  - `src/services/discord/meeting_orchestrator.rs` (3777 lines).
-  - `src/services/discord/turn_bridge/mod.rs` (2878 lines).
-  - `src/services/discord/turn_bridge/completion_guard.rs` (2092 lines).
-  - `src/services/discord/formatting.rs` (2736 lines).
+  - `src/services/discord/watchers/lifecycle.rs` (2145 lines — canonical
+    lifecycle extraction surface from #1435; split further before adding new
+    lifecycle behavior).
+  - `src/services/discord/tmux.rs` (9910 lines after #1435 lifecycle
+    extraction; still giant-file territory).
+  - `src/services/discord/recovery_engine.rs` (4697 lines).
+  - `src/services/discord/health.rs` (4533 lines).
+  - `src/services/discord/router/message_handler.rs` (7158 lines).
+  - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
+  - `src/services/discord/turn_bridge/mod.rs` (3645 lines).
+  - `src/services/discord/turn_bridge/completion_guard.rs` (2096 lines).
+  - `src/services/discord/formatting.rs` (3105 lines).
   - `src/services/discord/settings.rs` (2394 lines).
-  - `src/services/discord/prompt_builder.rs` (1963 lines).
-  - `src/services/discord/runtime_bootstrap.rs` (1962 lines).
-  - `src/services/discord/session_runtime.rs` (1880 lines).
-  - `src/services/discord/commands/config.rs` (1809 lines).
+  - `src/services/discord/prompt_builder.rs` (2027 lines).
+  - `src/services/discord/runtime_bootstrap.rs` (2647 lines).
+  - `src/services/discord/session_runtime.rs` (1887 lines).
+  - `src/services/discord/commands/config.rs` (1810 lines).
   - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
     discord_config_audit.rs, router/intake_gate.rs, model_catalog.rs,
     qwen_tmux_wrapper.rs, agentdesk_config.rs, inflight.rs}` (all 1000+ lines).
@@ -118,7 +126,7 @@
   per #1112; `/api/inflight/rebind` is the only path that synthesises an
   inflight state file (`src/services/discord/inflight.rs:107`,
   `:415`, `:952`). Cancel-induced death must trigger immediate re-attach
-  (#1283 contract, see `src/services/discord/tmux.rs`).
+  (#1283 contract, see `src/services/discord/watchers/lifecycle.rs`).
 - allowed_changes: `bugfix` only on `tmux.rs` and the giant Discord modules.
   `extraction` requires a follow-up issue.
 - tests: `src/integration_tests/tests/*` cancel/recovery suites.
@@ -127,19 +135,26 @@
 ### `dashboard_routes`
 
 - canonical_modules: `src/server/routes/*.rs` (per-domain route module).
+  `src/server/routes/auto_queue.rs` (151 lines) is now an HTTP-only facade;
+  its query/command/view/FSM behavior lives under
+  `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
+  smaller route-delegation slices.
+  `src/services/auto_queue/activate_command.rs` (1012 lines, post-#1444
+  idempotency-guard expansion) is the canonical activate/dispatch-next
+  command surface; it is intentionally above the giant-file threshold and
+  tracked here. Further growth requires a split issue.
 - legacy_modules: none, but several routes still call `legacy_db()` against
   the SQLite compat handle (see `known-legacy.md`).
 - do_not_edit_without_migration_plan (giant-file routes):
-  - `src/server/routes/auto_queue.rs` (10249 lines).
-  - `src/server/routes/dispatches/discord_delivery.rs` (6101 lines).
-  - `src/server/routes/kanban.rs` (4797 lines).
-  - `src/server/routes/dispatched_sessions.rs` (4498 lines).
-  - `src/server/routes/onboarding.rs` (4482 lines).
-  - `src/server/routes/docs.rs` (3629 lines).
-  - `src/server/routes/dispatches/outbox.rs` (2882 lines).
-  - `src/server/routes/escalation.rs` (2205 lines).
-  - `src/server/routes/meetings.rs` (2024 lines).
-  - `src/server/routes/review_verdict/decision_route.rs` (2003 lines).
+  - `src/server/routes/dispatches/discord_delivery.rs` (5402 lines).
+  - `src/server/routes/kanban.rs` (4037 lines).
+  - `src/server/routes/dispatched_sessions.rs` (3998 lines).
+  - `src/server/routes/onboarding.rs` (5271 lines).
+  - `src/server/routes/docs.rs` (3755 lines).
+  - `src/server/routes/dispatches/outbox.rs` (2908 lines).
+  - `src/server/routes/escalation.rs` (2110 lines).
+  - `src/server/routes/meetings.rs` (2158 lines).
+  - `src/server/routes/review_verdict/decision_route.rs` (1865 lines).
   - `src/server/routes/{agents,agents_crud,agents_setup,analytics,v1,
     settings,resume,pipeline,dispatches/thread_reuse}.rs` (all 1000+ lines).
 - active_callsite_coverage: legacy_db helper coverage tracked separately —
@@ -150,8 +165,10 @@
   - Dashboard routes never write to canonical config files; they read DB
     state and emit events.
 - allowed_changes: `bugfix` only on giant routes; `new_feature` only when
-  added to a sub-1000-line module or after splitting. New routes must register
-  in the route inventory generator.
+  added to a sub-1000-line module or after splitting. Auto-queue domain logic
+  changes must go under `src/services/auto_queue/*`; the route facade should
+  remain extraction/delegation only. New routes must register in the route
+  inventory generator.
 - tests: `src/server/routes/routes_tests.rs`, plus per-route module tests.
 - related_issues: split issues TBD (file under follow-up).
 
@@ -160,29 +177,50 @@
 - canonical_modules: `src/cli/*.rs`.
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/cli/migrate/postgres_cutover.rs` (7669 lines, retention candidate
-    after #1239).
-  - `src/cli/doctor/orchestrator.rs` (4362 lines).
-  - `src/cli/migrate/apply.rs` (3144 lines).
+  - `src/cli/migrate.rs` (348 lines, retired postgres-cutover facade).
+  - `src/cli/doctor/orchestrator.rs` (4324 lines).
+  - `src/cli/migrate/apply.rs` (3142 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
-  - `src/cli/{init.rs (1597), client.rs (1496), direct.rs (1536),
-    dcserver.rs (1541)}`.
+  - `src/cli/{init.rs (1600), client.rs (1583), direct.rs (1535),
+    dcserver.rs (1496)}`.
+  - `src/cli/provider_cli/mod.rs` (1701 lines).
 - active_callsite_coverage: n/a.
 - invariants: LaunchAgent plist and runtime layout are generated only — see
   the matrix in `docs/source-of-truth.md`.
 - allowed_changes: `bugfix` only; PG-cutover retention plan is owned by
   #1239.
 
+### `runtime_core`
+
+- canonical_modules: `src/config.rs`, `src/runtime_layout/mod.rs`,
+  `src/server/mod.rs`, `src/kanban.rs`, `src/receipt.rs`, and
+  `src/github/sync.rs`.
+- legacy_modules: none — these are shared runtime coordination surfaces.
+- do_not_edit_without_migration_plan (giant-file):
+  - `src/config.rs` (2236 lines).
+  - `src/runtime_layout/mod.rs` (1425 lines).
+  - `src/server/mod.rs` (3234 lines).
+  - `src/kanban.rs` (3875 lines).
+  - `src/receipt.rs` (2133 lines).
+  - `src/github/sync.rs` (1059 lines).
+- active_callsite_coverage: n/a.
+- invariants: config precedence, runtime path generation, kanban state, receipt
+  persistence, and GitHub sync must keep their existing owner-specific
+  contracts; split work needs a dedicated extraction issue before new feature
+  logic lands here.
+- allowed_changes: `bugfix` only; new feature logic must land in smaller
+  owner-specific modules or a scoped extraction branch.
+
 ### `db_layer`
 
 - canonical_modules: `src/db/{mod,postgres,schema}.rs` and per-domain modules.
 - legacy_modules: SQLite path through `libsql_rusqlite` (see `known-legacy.md`).
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/db/auto_queue.rs` (5940 lines).
-  - `src/db/schema.rs` (3195 lines).
-  - `src/db/postgres.rs` (1421 lines).
-  - `src/db/session_transcripts.rs` (1245 lines).
-  - `src/db/agents.rs` (1039 lines).
+  - `src/db/auto_queue.rs` (4533 lines).
+  - `src/db/schema.rs` (3194 lines).
+  - `src/db/postgres.rs` (1435 lines).
+  - `src/db/session_transcripts.rs` (877 lines, retained PG-cleanup surface).
+  - `src/db/agents.rs` (1125 lines).
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
 - invariants: production reads/writes go through `pg_pool_ref()`; `legacy_db()`
@@ -196,13 +234,23 @@
 The remaining giant-file modules under `src/services/` not covered above:
 
 - `src/services/api_friction.rs` (1808).
-- `src/services/auto_queue.rs` (1050) and `auto_queue/cancel_run.rs` (1782).
-- `src/services/claude.rs` (2477), `gemini.rs` (2546), `qwen.rs` (2446),
-  `codex.rs` (1679), `provider.rs` (2100) — provider adapters.
+- `src/services/auto_queue.rs` (1047) and
+  `src/services/auto_queue/activate_command.rs` (1012); auto-queue route
+  behavior is split across `src/services/auto_queue/*` slices, with
+  `activate_command.rs` now giant-file territory.
+- `src/services/claude.rs` (2477), `src/services/gemini.rs` (2565),
+  `src/services/qwen.rs` (2466), `src/services/codex.rs` (1665),
+  `src/services/opencode.rs` (2133), `src/services/provider.rs` (2177) —
+  provider adapters.
 - `src/services/memory/memento.rs` (2479).
 - `src/services/observability/mod.rs` (3647).
+- `src/services/routines/store.rs` (1537).
 - `src/services/platform/shell.rs` (1507) — split owned by #1281
   (GitClient extraction).
+- `src/services/platform/binary_resolver.rs` (1377).
+- `src/services/discord/mod.rs` (5519),
+  `src/services/discord_config_audit.rs` (1310), and
+  `src/services/qwen_tmux_wrapper.rs` (1194).
 - `src/services/turn_orchestrator.rs` (2070).
 - `src/services/session_backend.rs` (1053).
 

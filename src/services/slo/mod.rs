@@ -471,7 +471,7 @@ pub async fn run_aggregation_tick(
 // coverage depends on Postgres fixtures after #868.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

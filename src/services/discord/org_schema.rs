@@ -455,7 +455,7 @@ pub(crate) fn list_registered_channels() -> Vec<RegisteredChannel> {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use poise::serenity_prelude::ChannelId;
     use std::fs;

@@ -7,19 +7,18 @@
 //!   prefixed with `Discord*`, `OutboundDeduper`, `deliver_outbound`, etc.).
 //!   Every public symbol is re-exported here so existing callers continue to
 //!   compile against `crate::services::discord::outbound::*` unchanged.
-//! - New domain types in [`message`], [`policy`], [`result`], plus the pure
-//!   policy planner in [`decision`]. These are the cleaner v3 shapes that
-//!   future slices (1.1 = service impl, 1.2 = outbox migration) will rewire
-//!   callers onto. They live alongside the legacy types until the migration
+//! - New domain types in [`message`], [`policy`], [`result`], the pure policy
+//!   planner in [`decision`], and the v3 delivery implementation in
+//!   [`delivery`]. They live alongside the legacy types until the migration
 //!   completes and are reachable through their submodule paths only — they
 //!   intentionally do NOT shadow the legacy `Discord*` re-exports here.
 //!
-//! Slice 1.0 is a domain API only: the new types and pure policy planner
-//! compile and have unit-test coverage, but no production callsite references
-//! them yet. The deliver implementation that consumes these types and the
-//! outbox migration are deferred to slice 1.1 / 1.2.
+//! The default re-exports remain the legacy compatibility surface while
+//! production callsites move to `outbound::delivery::deliver_outbound` with
+//! v3 envelopes one producer at a time.
 
 pub(crate) mod decision;
+pub(crate) mod delivery;
 mod legacy;
 pub(crate) mod message;
 pub(crate) mod policy;

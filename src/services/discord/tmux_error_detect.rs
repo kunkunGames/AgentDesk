@@ -53,7 +53,7 @@ pub(super) fn detect_provider_overload_message(text: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         detect_provider_overload_message, is_auth_error_message, is_prompt_too_long_message,

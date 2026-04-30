@@ -1,13 +1,13 @@
 use anyhow::{Result, anyhow};
-#[cfg(test)]
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use sqlite_test::{Connection, params};
 use sqlx::PgPool;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use sqlx::Row as SqlxRow;
 
 use crate::db::Db;
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::session_agent_resolution::resolve_agent_id_for_session;
 use crate::db::session_agent_resolution::resolve_agent_id_for_session_pg;
 
@@ -74,7 +74,7 @@ pub struct SessionTranscriptRecord {
     pub created_at: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionTranscriptSearchHit {
     pub id: i64,
@@ -105,7 +105,7 @@ struct PreparedSessionTranscript {
     duration_ms: Option<i64>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn persist_turn(db: &Db, entry: PersistSessionTranscript<'_>) -> Result<bool> {
     let mut conn = db
         .lock()
@@ -119,13 +119,13 @@ pub async fn persist_turn_db(
     entry: PersistSessionTranscript<'_>,
 ) -> Result<bool> {
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             let db =
                 db.ok_or_else(|| anyhow!("sqlite db is required when postgres pool is absent"))?;
             return persist_turn(db, entry);
         }
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             let _ = db;
             return Err(anyhow!(
@@ -143,7 +143,7 @@ pub async fn persist_turn_db(
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub fn persist_turn_on_conn(
     conn: &mut Connection,
     entry: PersistSessionTranscript<'_>,
@@ -266,7 +266,7 @@ fn prepare_persist_entry_base(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn prepare_persist_entry(
     conn: &Connection,
     entry: &PersistSessionTranscript<'_>,
@@ -306,7 +306,7 @@ async fn prepare_persist_entry_pg(
     )
     .await;
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     if prepared.agent_id.is_none() {
         if let Some(db) = db {
             let conn = db
@@ -332,7 +332,7 @@ pub fn dispatch_has_assistant_response_db(
     dispatch_id: &str,
 ) -> Result<bool> {
     let Some(pool) = pg_pool else {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         {
             let Some(db) = db else {
                 return Ok(false);
@@ -351,7 +351,7 @@ pub fn dispatch_has_assistant_response_db(
                 )
                 .map_err(|e| anyhow!("session transcript lookup failed: {e}"));
         }
-        #[cfg(not(test))]
+        #[cfg(not(feature = "legacy-sqlite-tests"))]
         {
             let _ = db;
             return Ok(false);
@@ -390,7 +390,7 @@ where
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub async fn search_transcripts_pg(
     pool: &PgPool,
     raw_query: &str,
@@ -495,7 +495,7 @@ pub async fn search_transcripts_pg(
     Ok((search_query, hits))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn normalize_search_query(raw_query: &str) -> Option<String> {
     let normalized = raw_query.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -569,7 +569,7 @@ fn normalized_opt(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

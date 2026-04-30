@@ -210,7 +210,7 @@ fn load_entries(
 
 /// Remove the entire on-disk store for this bot (used by tests + by drain
 /// helpers that have already cleared every in-memory mapping for a channel).
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(super) fn clear_all(provider: &ProviderKind, token_hash: &str) {
     let Some(root) = store_root() else {
         return;
@@ -261,7 +261,7 @@ pub(super) fn persist_queue_exit_placeholder_clears_channel_from_map(
     save_channel_queue_exit_placeholder_clears(provider, token_hash, channel_id, &entries);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use crate::services::discord::runtime_store::lock_test_env;

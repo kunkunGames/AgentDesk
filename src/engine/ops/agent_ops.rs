@@ -10,18 +10,18 @@ use sqlx::{PgPool, Row as SqlxRow};
 
 pub(super) fn register_agent_ops<'js>(
     ctx: &Ctx<'js>,
-    #[cfg(test)] db: Option<Db>,
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))] db: Option<Db>,
     pg_pool: Option<PgPool>,
 ) -> JsResult<()> {
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let db: Option<Db> = None;
 
-    #[cfg(not(test))]
+    #[cfg(not(feature = "legacy-sqlite-tests"))]
     let _ = &db;
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let agents_obj = Object::new(ctx.clone())?;
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     let db_get = db.clone();
     let pg_get = pg_pool.clone();
     agents_obj.set(
@@ -30,7 +30,7 @@ pub(super) fn register_agent_ops<'js>(
             if let Some(pool) = pg_get.as_ref() {
                 return agent_get_raw_pg(pool, &agent_id);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db_get) = db_get.as_ref() {
                 return agent_get_raw_sqlite_test(db_get, &agent_id);
             }
@@ -39,7 +39,7 @@ pub(super) fn register_agent_ops<'js>(
     )?;
 
     // __resolvePrimaryChannel(agentId) -> channelId | ""
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     let db_primary = db.clone();
     let pg_primary = pg_pool.clone();
     agents_obj.set(
@@ -48,7 +48,7 @@ pub(super) fn register_agent_ops<'js>(
             if let Some(pool) = pg_primary.as_ref() {
                 return resolve_agent_primary_channel_pg_raw(pool, &agent_id);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db_primary) = db_primary.as_ref() {
                 return match db_primary.separate_conn() {
                     Ok(conn) => match crate::db::agents::resolve_agent_primary_channel_on_conn(
@@ -65,7 +65,7 @@ pub(super) fn register_agent_ops<'js>(
     )?;
 
     // __resolveCounterModelChannel(agentId) -> channelId | ""
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     let db_counter = db.clone();
     let pg_counter = pg_pool.clone();
     agents_obj.set(
@@ -74,7 +74,7 @@ pub(super) fn register_agent_ops<'js>(
             if let Some(pool) = pg_counter.as_ref() {
                 return resolve_agent_counter_channel_pg_raw(pool, &agent_id);
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
             if let Some(db_counter) = db_counter.as_ref() {
                 return match db_counter.separate_conn() {
                     Ok(conn) => crate::db::agents::load_agent_channel_bindings(&conn, &agent_id)
@@ -90,7 +90,7 @@ pub(super) fn register_agent_ops<'js>(
     )?;
 
     // __resolveDispatchChannel(agentId, dispatchType) -> channelId | ""
-    #[cfg(test)]
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     let db_dispatch = db;
     let pg_dispatch = pg_pool;
     agents_obj.set(
@@ -109,7 +109,7 @@ pub(super) fn register_agent_ops<'js>(
                         },
                     );
                 }
-                #[cfg(test)]
+                #[cfg(all(test, feature = "legacy-sqlite-tests"))]
                 if let Some(db_dispatch) = db_dispatch.as_ref() {
                     return match db_dispatch.separate_conn() {
                         Ok(conn) => {
@@ -169,9 +169,9 @@ pub(super) fn register_agent_ops<'js>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn agent_get_raw_sqlite_test(db: &Db, agent_id: &str) -> String {
-    use rusqlite::OptionalExtension;
+    use sqlite_test::OptionalExtension;
 
     let result = (|| -> anyhow::Result<serde_json::Value> {
         let conn = db.read_conn()?;

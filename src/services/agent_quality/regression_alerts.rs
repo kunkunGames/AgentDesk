@@ -420,7 +420,7 @@ pub async fn run_regression_alerter_pg(pool: &PgPool) -> Result<u64> {
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

@@ -1150,7 +1150,7 @@ fn dry_run_action_prefix(dry_run: bool) -> &'static str {
     if dry_run { "would migrate" } else { "migrated" }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

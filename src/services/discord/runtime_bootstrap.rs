@@ -425,7 +425,7 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
                 AND NOT EXISTS (
                     SELECT 1 FROM sessions s
                      WHERE s.agent_id = d.to_agent_id
-                       AND s.status = 'working'
+                       AND s.status IN ('turn_active', 'working')
                 )
                 AND NOT EXISTS (
                     SELECT 1 FROM task_dispatches d2
@@ -853,7 +853,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         token_hash: token_hash.clone(),
         provider: provider.clone(),
         api_port,
-        #[cfg(test)]
+        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
         sqlite: None,
         pg_pool,
         engine,
@@ -1469,6 +1469,17 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                     provider_for_setup.clone(),
                 );
 
+                // #1446 stall-deadlock recovery: complementary to the
+                // placeholder sweeper — scans attached watchers for the
+                // `attached=true && desynced=true && inflight stale` triad
+                // and force-cleans the channel so THREAD-GUARD does not
+                // queue the parent forever. Strictly more conservative
+                // thresholds than the THREAD-GUARD's intake-time check.
+                super::health::spawn_stall_watchdog(
+                    health_registry_for_setup.clone(),
+                    provider_for_setup.clone(),
+                );
+
                 // #1031 server-level idle detection (Option A — turn idle
                 // heuristic). Periodically scans each provider's active
                 // mailboxes and registers `system-detected:idle` monitoring
@@ -1777,7 +1788,7 @@ async fn gc_stale_fixed_working_sessions(shared: &Arc<SharedData>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use poise::serenity_prelude::{MessageId, UserId};

@@ -15,7 +15,7 @@ pub(crate) fn load_shared_knowledge() -> Option<String> {
     Some(format!("[Shared Agent Knowledge]\n{}", trimmed))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
 

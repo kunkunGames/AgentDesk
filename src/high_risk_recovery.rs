@@ -1,0 +1,368 @@
+use std::path::PathBuf;
+
+use serde_json::json;
+
+use crate::config::Config;
+use crate::engine::PolicyEngine;
+
+struct PgRecoveryTestDatabase {
+    _lifecycle: crate::db::postgres::PostgresTestLifecycleGuard,
+    admin_url: String,
+    database_name: String,
+    database_url: String,
+}
+
+impl PgRecoveryTestDatabase {
+    async fn create() -> Self {
+        let lifecycle = crate::db::postgres::lock_test_lifecycle();
+        let admin_url = pg_test_admin_database_url();
+        let database_name = format!("agentdesk_pg_recovery_{}", uuid::Uuid::new_v4().simple());
+        let database_url = format!("{}/{}", pg_test_base_database_url(), database_name);
+        crate::db::postgres::create_test_database(
+            &admin_url,
+            &database_name,
+            "pg-only high_risk_recovery",
+        )
+        .await
+        .expect("create postgres recovery test db");
+
+        Self {
+            _lifecycle: lifecycle,
+            admin_url,
+            database_name,
+            database_url,
+        }
+    }
+
+    async fn migrate(&self) -> sqlx::PgPool {
+        crate::db::postgres::connect_test_pool_and_migrate(
+            &self.database_url,
+            "pg-only high_risk_recovery",
+        )
+        .await
+        .expect("connect + migrate postgres recovery test db")
+    }
+
+    async fn drop(self) {
+        crate::db::postgres::drop_test_database(
+            &self.admin_url,
+            &self.database_name,
+            "pg-only high_risk_recovery",
+        )
+        .await
+        .expect("drop postgres recovery test db");
+    }
+}
+
+fn pg_test_base_database_url() -> String {
+    if let Ok(base) = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE") {
+        let trimmed = base.trim();
+        if !trimmed.is_empty() {
+            return trimmed.trim_end_matches('/').to_string();
+        }
+    }
+
+    let user = std::env::var("PGUSER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "postgres".to_string());
+    let password = std::env::var("PGPASSWORD")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let host = std::env::var("PGHOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+    let port = std::env::var("PGPORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "5432".to_string());
+
+    match password {
+        Some(password) => format!("postgresql://{user}:{password}@{host}:{port}"),
+        None => format!("postgresql://{user}@{host}:{port}"),
+    }
+}
+
+fn pg_test_admin_database_url() -> String {
+    let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "postgres".to_string());
+    format!("{}/{}", pg_test_base_database_url(), admin_db)
+}
+
+fn test_engine_with_pg(pg_pool: sqlx::PgPool) -> PolicyEngine {
+    crate::pipeline::ensure_loaded();
+    let mut config = Config::default();
+    config.policies.dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policies");
+    config.policies.hot_reload = false;
+    PolicyEngine::new_with_pg(&config, Some(pg_pool)).expect("create pg-backed policy engine")
+}
+
+async fn seed_agent_pg(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt)
+         VALUES ('agent-1', 'Test Agent', '111', '222')
+         ON CONFLICT (id) DO UPDATE SET
+             name = EXCLUDED.name,
+             discord_channel_id = EXCLUDED.discord_channel_id,
+             discord_channel_alt = EXCLUDED.discord_channel_alt",
+    )
+    .execute(pool)
+    .await
+    .expect("seed postgres agent");
+}
+
+async fn seed_card_pg(pool: &sqlx::PgPool, card_id: &str, status: &str) {
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id,
+            title,
+            status,
+            assigned_agent_id,
+            created_at,
+            updated_at
+         ) VALUES (
+            $1,
+            'Test Card',
+            $2,
+            'agent-1',
+            NOW(),
+            NOW()
+         )
+         ON CONFLICT (id) DO UPDATE SET
+             status = EXCLUDED.status,
+             assigned_agent_id = EXCLUDED.assigned_agent_id,
+             updated_at = EXCLUDED.updated_at",
+    )
+    .bind(card_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("seed postgres card");
+}
+
+#[tokio::test]
+async fn boot_reconcile_pg_resets_stale_runtime_rows() {
+    let pg_db = PgRecoveryTestDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let engine = test_engine_with_pg(pool.clone());
+
+    seed_agent_pg(&pool).await;
+    seed_card_pg(&pool, "card-pg-runtime", "in_progress").await;
+    seed_card_pg(&pool, "card-pg-runtime-valid", "in_progress").await;
+
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id,
+            kanban_card_id,
+            to_agent_id,
+            dispatch_type,
+            status,
+            title,
+            created_at,
+            updated_at
+         ) VALUES (
+            'dispatch-valid',
+            'card-pg-runtime-valid',
+            'agent-1',
+            'implementation',
+            'pending',
+            'Valid pending dispatch',
+            NOW(),
+            NOW()
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed active dispatch");
+    sqlx::query(
+        "INSERT INTO dispatch_outbox (dispatch_id, action, status)
+         VALUES ('dispatch-processing', 'notify', 'processing')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed stale outbox row");
+    sqlx::query(
+        "INSERT INTO kv_meta (key, value)
+         VALUES ('dispatch_reserving:dispatch-valid', 'agent-1')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed stale reservation");
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, agent_id, status)
+         VALUES ('run-pg-runtime', 'agent-1', 'active')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed auto queue run");
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id,
+            run_id,
+            kanban_card_id,
+            agent_id,
+            status,
+            dispatch_id,
+            dispatched_at
+         ) VALUES (
+            'entry-broken',
+            'run-pg-runtime',
+            'card-pg-runtime',
+            'agent-1',
+            'dispatched',
+            NULL,
+            NOW()
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed broken auto queue entry");
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id,
+            run_id,
+            kanban_card_id,
+            agent_id,
+            status,
+            dispatch_id,
+            dispatched_at
+         ) VALUES (
+            'entry-valid',
+            'run-pg-runtime',
+            'card-pg-runtime-valid',
+            'agent-1',
+            'dispatched',
+            'dispatch-valid',
+            NOW()
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed valid auto queue entry");
+
+    let stats = crate::reconcile::reconcile_boot_runtime(None, &engine, Some(&pool))
+        .await
+        .expect("pg boot reconcile succeeds");
+
+    assert_eq!(stats.stale_processing_outbox_reset, 1);
+    assert_eq!(stats.stale_dispatch_reservations_cleared, 1);
+    assert_eq!(stats.missing_notify_outbox_backfilled, 1);
+    assert_eq!(stats.broken_auto_queue_entries_reset, 1);
+
+    let outbox_status: String = sqlx::query_scalar(
+        "SELECT status FROM dispatch_outbox
+         WHERE dispatch_id = 'dispatch-processing' AND action = 'notify'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load outbox status");
+    assert_eq!(outbox_status, "pending");
+
+    let reservation_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM kv_meta WHERE key = 'dispatch_reserving:dispatch-valid'
+        )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load reservation status");
+    assert!(!reservation_exists);
+
+    let broken_status: String =
+        sqlx::query_scalar("SELECT status FROM auto_queue_entries WHERE id = 'entry-broken'")
+            .fetch_one(&pool)
+            .await
+            .expect("load broken entry status");
+    let valid_status: String =
+        sqlx::query_scalar("SELECT status FROM auto_queue_entries WHERE id = 'entry-valid'")
+            .fetch_one(&pool)
+            .await
+            .expect("load valid entry status");
+    assert_eq!(broken_status, "pending");
+    assert_eq!(valid_status, "dispatched");
+
+    drop(engine);
+    crate::db::postgres::close_test_pool(pool, "pg-only high_risk_recovery")
+        .await
+        .expect("close pg-only high_risk_recovery pool");
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn boot_reconcile_pg_refires_missing_review_dispatch() {
+    let pg_db = PgRecoveryTestDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let engine = test_engine_with_pg(pool.clone());
+
+    seed_agent_pg(&pool).await;
+    seed_card_pg(&pool, "card-pg-review", "review").await;
+
+    let reviewed_commit = crate::services::platform::git_head_commit(env!("CARGO_MANIFEST_DIR"))
+        .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id,
+            kanban_card_id,
+            to_agent_id,
+            dispatch_type,
+            status,
+            title,
+            context,
+            created_at,
+            updated_at,
+            completed_at
+         ) VALUES (
+            'dispatch-pg-work',
+            'card-pg-review',
+            'agent-1',
+            'implementation',
+            'completed',
+            'Completed implementation',
+            $1::jsonb,
+            NOW() - INTERVAL '2 minutes',
+            NOW() - INTERVAL '1 minute',
+            NOW() - INTERVAL '1 minute'
+         )",
+    )
+    .bind(json!({
+        "reviewed_commit": reviewed_commit,
+        "branch": "test-review-target"
+    }))
+    .execute(&pool)
+    .await
+    .expect("seed completed implementation dispatch");
+
+    let stats = crate::reconcile::reconcile_boot_runtime(None, &engine, Some(&pool))
+        .await
+        .expect("pg boot reconcile succeeds");
+
+    assert_eq!(
+        stats.missing_review_dispatches_refired, 1,
+        "boot reconcile must re-fire OnReviewEnter through PG"
+    );
+    let active_review_dispatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM task_dispatches
+         WHERE kanban_card_id = 'card-pg-review'
+           AND dispatch_type IN ('review', 'review-decision')
+           AND status IN ('pending', 'dispatched')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count active review dispatches");
+    assert_eq!(active_review_dispatches, 1);
+
+    drop(engine);
+    crate::db::postgres::close_test_pool(pool, "pg-only high_risk_recovery")
+        .await
+        .expect("close pg-only high_risk_recovery pool");
+    pg_db.drop().await;
+}

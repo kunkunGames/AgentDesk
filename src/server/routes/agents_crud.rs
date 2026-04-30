@@ -8,11 +8,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::postgres::PgRow;
 use sqlx::{Postgres, QueryBuilder, Row};
 use std::path::{Path as FsPath, PathBuf};
 use tokio::process::Command;
 
 use super::{AppState, agents_setup};
+use crate::services::observability::session_inventory::derive_visual_status;
 
 // ── Query / Body structs ─────────────────────────────────────────
 
@@ -157,6 +159,29 @@ fn merged_channel_values(
 
 fn parse_pipeline_config_json(raw: Option<String>) -> Option<serde_json::Value> {
     raw.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+}
+
+fn visual_status_fields(row: &PgRow, agent_status: Option<&str>) -> (String, String, String) {
+    let session_status = row
+        .try_get::<Option<String>, _>("current_session_status")
+        .ok()
+        .flatten();
+    let last_tool_at = row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("current_last_tool_at")
+        .ok()
+        .flatten();
+    let active_children = row
+        .try_get::<Option<i32>, _>("current_active_children")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let status = session_status.as_deref().or(agent_status);
+    let visual = derive_visual_status(status, last_tool_at, active_children, chrono::Utc::now());
+    (
+        visual.display(),
+        visual.emoji().to_string(),
+        visual.code().to_string(),
+    )
 }
 
 fn clean_optional_text(value: Option<String>) -> Option<String> {
@@ -391,9 +416,27 @@ async fn list_agents_pg(
                (SELECT s.thread_channel_id
                   FROM sessions s
                  WHERE s.agent_id = a.id
-                   AND s.status = 'working'
+                   AND s.status IN ('turn_active', 'awaiting_bg', 'working')
                  ORDER BY s.last_heartbeat DESC NULLS LAST, s.id DESC
                  LIMIT 1) AS current_thread_channel_id,
+               (SELECT s.status
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_session_status,
+               (SELECT s.last_tool_at
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_last_tool_at,
+               (SELECT COALESCE(s.active_children, 0)
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_active_children,
                a.pipeline_config::text AS pipeline_config
           FROM agents a
           INNER JOIN office_agents oa ON oa.agent_id = a.id
@@ -419,9 +462,27 @@ async fn list_agents_pg(
                (SELECT s.thread_channel_id
                   FROM sessions s
                  WHERE s.agent_id = a.id
-                   AND s.status = 'working'
+                   AND s.status IN ('turn_active', 'awaiting_bg', 'working')
                  ORDER BY s.last_heartbeat DESC NULLS LAST, s.id DESC
                  LIMIT 1) AS current_thread_channel_id,
+               (SELECT s.status
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_session_status,
+               (SELECT s.last_tool_at
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_last_tool_at,
+               (SELECT COALESCE(s.active_children, 0)
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_active_children,
                a.pipeline_config::text AS pipeline_config
           FROM agents a
           LEFT JOIN departments d ON d.id = a.department
@@ -443,6 +504,9 @@ async fn list_agents_pg(
         .into_iter()
         .map(|row| {
             let provider = row.try_get::<Option<String>, _>("provider").ok().flatten();
+            let status = row.try_get::<Option<String>, _>("status").ok().flatten();
+            let (visual_status, visual_status_emoji, visual_status_code) =
+                visual_status_fields(&row, status.as_deref());
             let discord_channel_alt = row
                 .try_get::<Option<String>, _>("discord_channel_alt")
                 .ok()
@@ -465,7 +529,10 @@ async fn list_agents_pg(
                 "discord_channel_cc": row.try_get::<Option<String>, _>("discord_channel_cc").ok().flatten(),
                 "discord_channel_cdx": discord_channel_cdx.clone(),
                 "discord_channel_id_codex": discord_channel_cdx,
-                "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
+                "status": status,
+                "visual_status": visual_status,
+                "visual_status_emoji": visual_status_emoji,
+                "visual_status_code": visual_status_code,
                 "xp": row.try_get::<Option<i64>, _>("xp").ok().flatten().unwrap_or(0),
                 "stats_xp": row.try_get::<Option<i64>, _>("xp").ok().flatten().unwrap_or(0),
                 "stats_tasks_done": row.try_get::<Option<i64>, _>("tasks_done").ok().flatten().unwrap_or(0),
@@ -511,9 +578,27 @@ async fn load_agent_pg(pool: &sqlx::PgPool, id: &str) -> Result<Option<serde_jso
                (SELECT s.thread_channel_id
                   FROM sessions s
                  WHERE s.agent_id = a.id
-                   AND s.status = 'working'
+                   AND s.status IN ('turn_active', 'awaiting_bg', 'working')
                  ORDER BY s.last_heartbeat DESC NULLS LAST, s.id DESC
                  LIMIT 1) AS current_thread_channel_id,
+               (SELECT s.status
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_session_status,
+               (SELECT s.last_tool_at
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_last_tool_at,
+               (SELECT COALESCE(s.active_children, 0)
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                 ORDER BY CASE WHEN s.status IN ('turn_active', 'awaiting_bg', 'working') THEN 0 ELSE 1 END,
+                          s.last_heartbeat DESC NULLS LAST, s.created_at DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_active_children,
                a.pipeline_config::text AS pipeline_config
           FROM agents a
           LEFT JOIN departments d ON d.id = a.department
@@ -530,6 +615,9 @@ async fn load_agent_pg(pool: &sqlx::PgPool, id: &str) -> Result<Option<serde_jso
     };
 
     let provider = row.try_get::<Option<String>, _>("provider").ok().flatten();
+    let status = row.try_get::<Option<String>, _>("status").ok().flatten();
+    let (visual_status, visual_status_emoji, visual_status_code) =
+        visual_status_fields(&row, status.as_deref());
     let discord_channel_alt = row
         .try_get::<Option<String>, _>("discord_channel_alt")
         .ok()
@@ -567,7 +655,10 @@ async fn load_agent_pg(pool: &sqlx::PgPool, id: &str) -> Result<Option<serde_jso
             "discord_channel_cc": row.try_get::<Option<String>, _>("discord_channel_cc").ok().flatten(),
             "discord_channel_cdx": discord_channel_cdx.clone(),
             "discord_channel_id_codex": discord_channel_cdx,
-            "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
+            "status": status,
+            "visual_status": visual_status,
+            "visual_status_emoji": visual_status_emoji,
+            "visual_status_code": visual_status_code,
             "xp": row.try_get::<Option<i64>, _>("xp").ok().flatten().unwrap_or(0),
             "stats_xp": row.try_get::<Option<i64>, _>("xp").ok().flatten().unwrap_or(0),
             "stats_tasks_done": row.try_get::<Option<i64>, _>("tasks_done").ok().flatten().unwrap_or(0),
@@ -1233,7 +1324,7 @@ async fn pg_agent_has_active_turn(pool: &sqlx::PgPool, id: &str) -> Result<bool,
         "SELECT COUNT(*)
            FROM sessions
           WHERE agent_id = $1
-            AND (status = 'working' OR active_dispatch_id IS NOT NULL)",
+            AND (status IN ('turn_active', 'awaiting_bg', 'working') OR active_dispatch_id IS NOT NULL)",
     )
     .bind(id)
     .fetch_one(pool)
@@ -1698,7 +1789,7 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Json<serde_j
         "SELECT id, session_key, agent_id, provider, status, active_dispatch_id,
                 model, tokens, cwd, to_char(last_heartbeat, 'YYYY-MM-DD HH24:MI:SS') AS last_heartbeat
          FROM sessions
-         WHERE status IN ('connected', 'working', 'idle')
+         WHERE status IN ('connected', 'turn_active', 'awaiting_bg', 'awaiting_user', 'idle', 'working')
          ORDER BY id",
     )
     .fetch_all(pool)

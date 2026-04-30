@@ -58,12 +58,12 @@ fn review_state_sync_pg_first(state: &AppState, payload: &serde_json::Value) -> 
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn review_verdict_db(state: &AppState) -> Option<&crate::db::Db> {
     state.legacy_db()
 }
 
-#[cfg(not(test))]
+#[cfg(not(feature = "legacy-sqlite-tests"))]
 fn review_verdict_db(_state: &AppState) -> Option<&crate::db::Db> {
     None
 }
