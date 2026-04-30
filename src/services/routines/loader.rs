@@ -991,6 +991,25 @@ mod tests {
         })
     }
 
+    fn categorized_observation(
+        signature: &str,
+        category: &str,
+        source: &str,
+        occurrences: u8,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "source": source,
+            "category": category,
+            "signature": signature,
+            "summary": format!("{category} repeated evidence"),
+            "weight": 2,
+            "occurrences": occurrences,
+            "evidence_ref": format!("{source}:{signature}:{timestamp}"),
+        })
+    }
+
     #[test]
     fn automation_recommender_inventory_wildcard_suppresses_matching_observations() {
         let loader = automation_recommender_loader();
@@ -1074,6 +1093,186 @@ mod tests {
                         .get("recommended_execution")
                         .and_then(Value::as_str),
                     Some("agent")
+                );
+                assert!(candidate.get("before_after").is_some());
+                assert!(candidate.get("expected_files").is_some());
+                assert!(candidate.get("expected_side_effects").is_some());
+                assert!(candidate.get("verification_method").is_some());
+                assert_eq!(
+                    candidate
+                        .pointer("/gated_handoff/status")
+                        .and_then(Value::as_str),
+                    Some("requires_human_approval")
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_prompt_includes_quality_sections_and_gated_handoff() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..5)
+            .map(|_| routine_observation("ops/retry.js:complete", 2, "2026-04-30T06:59:00Z"))
+            .collect::<Vec<_>>();
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("## Before / After"));
+                assert!(prompt.contains("## Expected Implementation Files"));
+                assert!(prompt.contains("## Verification Method"));
+                assert!(prompt.contains("## Gated Handoff Draft"));
+                assert!(prompt.contains("requires_human_approval"));
+                assert!(prompt.contains("DO NOT implement"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_expands_api_friction_category() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = vec![categorized_observation(
+            "api-friction:/api/docs/kanban",
+            "api-friction",
+            "api_friction",
+            5,
+            "2026-04-30T06:59:00Z",
+        )];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("Category: api-friction"));
+                assert!(prompt.contains("API friction monitor"));
+                assert!(prompt.contains("src/services/api_friction.rs"));
+                let candidate = checkpoint
+                    .unwrap()
+                    .pointer("/candidates/api-friction:~1api~1docs~1kanban/category")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string();
+                assert_eq!(candidate, "api-friction");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_expands_release_and_outbox_categories() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let release_action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(
+                    None,
+                    vec![categorized_observation(
+                        "release-freshness:worker-inventory",
+                        "release-freshness",
+                        "precomputed_digest",
+                        5,
+                        "2026-04-30T06:59:00Z",
+                    )],
+                    vec![],
+                    now,
+                ),
+            )
+            .unwrap();
+        match release_action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("Category: release-freshness"));
+                assert!(prompt.contains("Release freshness monitor"));
+                assert!(prompt.contains("docs/generated/worker-inventory.md"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let outbox_action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(
+                    None,
+                    vec![categorized_observation(
+                        "outbox-delivery:notify:routine_run_failed",
+                        "outbox-delivery",
+                        "message_outbox",
+                        5,
+                        "2026-04-30T06:59:00Z",
+                    )],
+                    vec![],
+                    now,
+                ),
+            )
+            .unwrap();
+        match outbox_action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("Category: outbox-delivery"));
+                assert!(prompt.contains("Message outbox delivery monitor"));
+                assert!(prompt.contains("src/services/message_outbox.rs"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_accepts_memento_digest_occurrence_counts() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = vec![categorized_observation(
+            "memento-hygiene:api-friction-memory",
+            "memento-hygiene",
+            "memento_digest",
+            5,
+            "2026-04-30T06:59:00Z",
+        )];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("Category: memento-hygiene"));
+                assert!(prompt.contains("Memento hygiene digest monitor"));
+                assert!(prompt.contains("src/services/memory"));
+                assert_eq!(
+                    checkpoint
+                        .unwrap()
+                        .pointer("/candidates/memento-hygiene:api-friction-memory/evidence_count")
+                        .and_then(Value::as_i64),
+                    Some(5)
                 );
             }
             other => panic!("unexpected action: {other:?}"),
