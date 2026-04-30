@@ -52,17 +52,20 @@ use super::{
 mod watcher_lifecycle;
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(crate) use self::watcher_lifecycle::WatcherClaimOutcome;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(in crate::services::discord) use self::watcher_lifecycle::try_claim_watcher;
 use self::watcher_lifecycle::*;
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) use self::watcher_lifecycle::{
-    WATCHER_POST_TERMINAL_IDLE_WINDOW, WatcherClaimOutcome, WatcherStopDecision, WatcherStopInput,
-    watcher_stop_decision_after_terminal_success,
-};
 pub(in crate::services::discord) use self::watcher_lifecycle::{
     claim_or_reuse_watcher, clear_recovery_handled_channels,
     fail_dispatch_for_ready_for_input_stall, refresh_session_heartbeat_from_tmux_output,
     restore_tmux_watchers, session_belongs_to_current_runtime, store_recovery_handled_channels,
+};
+use super::watcher_lifecycle_decision::*;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(crate) use super::watcher_lifecycle_decision::{
+    WATCHER_POST_TERMINAL_IDLE_WINDOW, WatcherStopDecision, WatcherStopInput,
+    watcher_stop_decision_after_terminal_success,
 };
 const READY_FOR_INPUT_IDLE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const WATCHER_ACTIVITY_HEARTBEAT_INTERVAL: std::time::Duration =

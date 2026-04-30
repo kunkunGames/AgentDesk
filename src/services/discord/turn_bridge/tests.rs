@@ -23,7 +23,6 @@ use super::stale_resume::{
     contains_stale_resume_error_text, output_file_has_stale_resume_error_after_offset,
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,
 };
-use super::tmux_runtime::should_resume_watcher_after_turn;
 use super::{
     advance_tmux_relay_confirmed_end, monitor_handoff_tool_context,
     should_delegate_bridge_relay_to_watcher, turn_bridge_replace_outcome_committed,
@@ -42,6 +41,7 @@ use crate::services::discord::placeholder_cleanup::{
     PlaceholderCleanupFailureClass, PlaceholderCleanupOperation, PlaceholderCleanupOutcome,
 };
 use crate::services::discord::settings::{MemoryBackendKind, ResolvedMemorySettings};
+use crate::services::discord::watcher_lifecycle_decision::should_resume_watcher_after_turn;
 use crate::services::memory::{SessionEndReason, TokenUsage};
 use crate::services::provider::{CancelToken, ProviderKind};
 use crate::ui::ai_screen::{HistoryItem, HistoryType};

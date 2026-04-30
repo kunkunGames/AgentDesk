@@ -661,14 +661,6 @@ pub(super) fn is_dcserver_restart_command(input: &str) -> bool {
         && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
 }
 
-pub(super) fn should_resume_watcher_after_turn(
-    defer_watcher_resume: bool,
-    has_local_queued_turns: bool,
-    can_chain_locally: bool,
-) -> bool {
-    !defer_watcher_resume && !(has_local_queued_turns && can_chain_locally)
-}
-
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{TmuxCleanupPolicy, handoff_interrupted_message, stale_inflight_message};

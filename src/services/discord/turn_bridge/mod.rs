@@ -71,9 +71,10 @@ use stale_resume::{
     output_file_has_stale_resume_error_after_offset, stream_error_has_stale_resume_error,
     stream_error_requires_terminal_session_reset,
 };
-use tmux_runtime::{is_dcserver_restart_command, should_resume_watcher_after_turn};
+use tmux_runtime::is_dcserver_restart_command;
 
 use super::formatting::ReplaceLongMessageOutcome;
+use super::watcher_lifecycle_decision::should_resume_watcher_after_turn;
 use crate::db::session_status::{AWAITING_BG, AWAITING_USER, IDLE};
 
 fn sync_inflight_restart_mode_from_cancel(

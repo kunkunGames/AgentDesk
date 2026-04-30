@@ -63,6 +63,9 @@ mod tmux_reaper;
 #[cfg(unix)]
 mod tmux_restart_handoff;
 mod turn_bridge;
+#[cfg(unix)]
+#[path = "watchers/lifecycle_decision.rs"]
+mod watcher_lifecycle_decision;
 
 pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
