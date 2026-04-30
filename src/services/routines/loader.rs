@@ -66,7 +66,10 @@ pub struct RoutineTickContext {
     pub now: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observations: Option<Vec<Value>>,
-    #[serde(rename = "automationInventory", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "automationInventory",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub automation_inventory: Option<Vec<Value>>,
     pub limits: ObservationLimits,
 }
@@ -860,11 +863,13 @@ mod tests {
     fn bundled_sample_routines_load_and_validate() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("routines");
         let loader = RoutineScriptLoader::new().unwrap();
-        assert_eq!(loader.load_dir(&root).unwrap(), 2);
+        assert_eq!(loader.load_dir(&root).unwrap(), 4);
         assert_eq!(
             loader.script_refs().unwrap(),
             vec![
                 "agent-checkpoint-review.js".to_string(),
+                "monitoring/automation-candidate-recommender.js".to_string(),
+                "monitoring/working-watchdog.js".to_string(),
                 "script-summary.js".to_string(),
             ]
         );
@@ -895,6 +900,30 @@ mod tests {
                 .execute_tick(
                     "script-summary.js",
                     context_for("script-summary.js", "script-only-summary")
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Complete { .. }
+        ));
+        assert!(matches!(
+            loader
+                .execute_tick(
+                    "monitoring/automation-candidate-recommender.js",
+                    context_for(
+                        "monitoring/automation-candidate-recommender.js",
+                        "automation-candidate-recommender"
+                    )
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Complete { .. }
+        ));
+        assert!(matches!(
+            loader
+                .execute_tick(
+                    "monitoring/working-watchdog.js",
+                    context_for(
+                        "monitoring/working-watchdog.js",
+                        "monitoring-working-watchdog"
+                    )
                 )
                 .unwrap(),
             crate::services::routines::RoutineAction::Complete { .. }

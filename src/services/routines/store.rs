@@ -544,7 +544,11 @@ impl RoutineStore {
                 row.try_get("started_at").unwrap_or_else(|_| Utc::now());
 
             let action_str = action.as_deref().unwrap_or("run");
-            let weight: u8 = if status == "failed" || status == "error" { 2 } else { 1 };
+            let weight: u8 = if status == "failed" || status == "error" {
+                2
+            } else {
+                1
+            };
             let summary = if let Some(ref err) = error {
                 let short_err = if err.len() > 120 { &err[..120] } else { err };
                 format!("{name} {action_str} {status}: {short_err}")
