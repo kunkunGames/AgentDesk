@@ -10,11 +10,11 @@ const MAX_EXAMPLES_PER_CANDIDATE = 3;
 const PROMPT_CAP_BYTES = 12288;
 const CHECKPOINT_CAP_BYTES = 65536;
 const CHECKPOINT_VERSION = 1;
+const CANDIDATE_TTL_DAYS = 30;
 
 // --- Scoring weights ---
 const WEIGHT_BASE = 10;
 const WEIGHT_RECENCY_BONUS = 10;   // occurred in last 30 min
-const WEIGHT_ERROR_MULTIPLIER = 2; // weight=2 obs counts double
 const WEIGHT_FIRST_SEEN = 5;       // new candidate bonus
 
 // --- Checkpoint helpers ---
@@ -81,18 +81,33 @@ function resetDailyCapIfNeeded(cp, nowStr) {
 
 // --- Suppression / inventory filter ---
 
+function hasDurableAcceptance(entry) {
+  return Boolean(entry && (entry.automation_ref || entry.source_ref));
+}
+
 function buildSuppressedSet(cp, inventory) {
-  const suppressed = new Set();
+  const exact = new Set();
+  const prefixes = [];
+
+  function addPattern(patternId) {
+    if (!patternId) return;
+    if (patternId.endsWith(":*")) {
+      prefixes.push(patternId.slice(0, -1));
+    } else {
+      exact.add(patternId);
+    }
+  }
 
   // From checkpoint suppressions
   for (const [patternId, entry] of Object.entries(cp.suppressions || {})) {
     const state = entry.state;
     if (
+      (state === "accepted" && hasDurableAcceptance(entry)) ||
       state === "implemented" ||
       state === "suppressed" ||
       state === "rejected"
     ) {
-      suppressed.add(patternId);
+      addPattern(patternId);
     }
   }
 
@@ -100,12 +115,12 @@ function buildSuppressedSet(cp, inventory) {
   for (const item of inventory || []) {
     if (
       item.pattern_id &&
-      (item.status === "implemented" ||
-        item.status === "accepted" ||
+      ((item.status === "accepted" && hasDurableAcceptance(item)) ||
+        item.status === "implemented" ||
         item.status === "suppressed" ||
         item.status === "rejected")
     ) {
-      suppressed.add(item.pattern_id);
+      addPattern(item.pattern_id);
     }
   }
 
@@ -113,16 +128,20 @@ function buildSuppressedSet(cp, inventory) {
   for (const [patternId, candidate] of Object.entries(cp.candidates || {})) {
     const s = candidate.state;
     if (
-      s === "accepted" ||
+      (s === "accepted" && hasDurableAcceptance(candidate)) ||
       s === "implemented" ||
       s === "suppressed" ||
       s === "rejected"
     ) {
-      suppressed.add(patternId);
+      addPattern(patternId);
     }
   }
 
-  return suppressed;
+  return {
+    has(patternId) {
+      return exact.has(patternId) || prefixes.some((prefix) => patternId.startsWith(prefix));
+    },
+  };
 }
 
 // --- Expired suppression cleanup ---
@@ -134,6 +153,19 @@ function pruneExpiredSuppressions(cp, nowStr) {
       if (cp.candidates[patternId]) {
         cp.candidates[patternId].state = "observing";
       }
+    }
+  }
+}
+
+function expireStaleCandidates(cp, nowStr) {
+  const cutoff = new Date(new Date(nowStr).getTime() - CANDIDATE_TTL_DAYS * 24 * 3600 * 1000).toISOString();
+  for (const candidate of Object.values(cp.candidates || {})) {
+    if (
+      candidate.last_seen_at &&
+      candidate.last_seen_at < cutoff &&
+      (candidate.state === "observing" || candidate.state === "recommended")
+    ) {
+      candidate.state = "expired";
     }
   }
 }
@@ -164,13 +196,17 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
         last_recommendation_hash: null,
         cooldown_until: null,
         automation_ref: null,
+        has_error_evidence: false,
       };
       cp.candidates[patternId] = candidate;
     }
 
     // Skip if already resolved
+    if (candidate.state === "accepted" && !hasDurableAcceptance(candidate)) {
+      candidate.state = "recommended";
+    }
     if (
-      candidate.state === "accepted" ||
+      (candidate.state === "accepted" && hasDurableAcceptance(candidate)) ||
       candidate.state === "implemented" ||
       candidate.state === "suppressed" ||
       candidate.state === "rejected"
@@ -183,10 +219,10 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
 
     // Score delta
     const weight = typeof obs.weight === "number" ? obs.weight : 1;
-    const effectiveWeight = weight * WEIGHT_ERROR_MULTIPLIER > WEIGHT_BASE
-      ? weight  // obs.weight=2 → already captures failure signal
-      : weight;
-    let delta = WEIGHT_BASE * effectiveWeight;
+    let delta = WEIGHT_BASE * weight;
+    if (weight === 2) {
+      candidate.has_error_evidence = true;
+    }
 
     // Recency bonus
     if (obs.timestamp && obs.timestamp >= thirtyMinAgo) {
@@ -201,6 +237,7 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
         summary: obs.summary,
         timestamp: obs.timestamp,
         evidence_ref: obs.evidence_ref,
+        weight,
       });
     }
   }
@@ -221,6 +258,9 @@ function findEscalationCandidate(cp, nowStr) {
       continue;
     }
     if (candidate.score <= bestScore) {
+      continue;
+    }
+    if (candidate.evidence_count < 5) {
       continue;
     }
     if (candidate.cooldown_until && candidate.cooldown_until > nowStr) {
@@ -244,10 +284,13 @@ function findEscalationCandidate(cp, nowStr) {
 
 function markRecommended(cp, escalation, nowStr) {
   const { patternId, candidate, hash } = escalation;
+  const assessment = candidateAssessment(patternId, candidate);
   candidate.state = "recommended";
   candidate.last_recommended_at = nowStr;
   candidate.last_recommendation_hash = hash;
   candidate.cooldown_until = addHours(nowStr, COOLDOWN_HOURS);
+  candidate.suggested_automation = assessment.suggestedAutomation;
+  candidate.recommended_execution = assessment.recommendedExecution;
   cp.stats.recommendations_today++;
   cp.stats.agent_escalations++;
   cp.recommendations.push({
@@ -265,17 +308,24 @@ function markRecommended(cp, escalation, nowStr) {
 
 // --- Agent prompt builder ---
 
+function candidateAssessment(patternId, candidate) {
+  const isErrorPattern = Boolean(candidate.has_error_evidence) ||
+    (candidate.examples || []).some((example) => example.weight === 2);
+  return {
+    suggestedAutomation: isErrorPattern
+      ? "Automatic retry or alert when this routine fails repeatedly"
+      : "Scheduled routine to handle this pattern automatically",
+    recommendedExecution: candidate.score >= 90 ? "agent" : "rule",
+  };
+}
+
 function buildPrompt(escalation) {
   const { patternId, candidate } = escalation;
   const evidenceLines = (candidate.examples || [])
     .map((ex, i) => `${i + 1}. [${ex.timestamp || "?"}] ${ex.summary || ""}`)
     .join("\n");
 
-  const isErrorPattern = patternId.includes(":error") || patternId.includes(":failed");
-  const suggestedAutomation = isErrorPattern
-    ? "Automatic retry or alert when this routine fails repeatedly"
-    : "Scheduled routine to handle this pattern automatically";
-  const recommendedExecution = candidate.score >= 90 ? "agent" : "rule";
+  const { suggestedAutomation, recommendedExecution } = candidateAssessment(patternId, candidate);
   const sideEffects = "Adds a new routine; verify cooldown/dedup logic; monitor noise in Discord";
 
   const raw = `# Automation Candidate Recommendation
@@ -320,16 +370,15 @@ function guardCheckpointSize(cp) {
   const json = JSON.stringify(cp);
   if (json.length <= CHECKPOINT_CAP_BYTES) return cp;
 
-  // Prune oldest candidates with lowest score first
+  // Prune least-recently-observed candidates first.
   const entries = Object.entries(cp.candidates).sort(
-    ([, a], [, b]) => a.score - b.score
+    ([, a], [, b]) => String(a.last_seen_at || "").localeCompare(String(b.last_seen_at || ""))
   );
   let pruned = 0;
   for (const [patternId] of entries) {
     if (JSON.stringify(cp).length <= CHECKPOINT_CAP_BYTES) break;
     if (
-      cp.candidates[patternId].state === "observing" &&
-      cp.candidates[patternId].score < SCORE_THRESHOLD
+      cp.candidates[patternId].state === "observing"
     ) {
       delete cp.candidates[patternId];
       pruned++;
@@ -359,6 +408,7 @@ agentdesk.routines.register({
 
     resetDailyCapIfNeeded(cp, nowStr);
     pruneExpiredSuppressions(cp, nowStr);
+    expireStaleCandidates(cp, nowStr);
 
     const suppressedSet = buildSuppressedSet(cp, inventory);
     scoreObservations(cp, observations, suppressedSet, nowStr);

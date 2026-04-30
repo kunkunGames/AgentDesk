@@ -135,7 +135,12 @@ impl RoutineDiscordLogger {
         recovered: &RecoveredRoutineRun,
     ) -> RoutineDiscordLogStatus {
         let message = recovery_message(recovered);
-        let status = if recovered.discord_thread_id.is_some() {
+        let status = if recovered
+            .discord_thread_id
+            .as_deref()
+            .and_then(channel_target_from_id)
+            .is_some()
+        {
             self.log_to_routine_target(
                 recovered.agent_id.as_deref(),
                 recovered.discord_thread_id.as_deref(),
@@ -179,7 +184,12 @@ impl RoutineDiscordLogger {
             let bot = match normalized_agent_id(agent_id) {
                 Some(agent_id) => match resolve_agent_provider_bot(&self.pool, agent_id).await {
                     Ok(bot) => bot,
-                    Err(error) => return RoutineDiscordLogStatus::failed(error),
+                    Err(error) => {
+                        tracing::warn!(
+                            "routine thread log provider bot resolution failed for {agent_id}: {error}; falling back to notify"
+                        );
+                        "notify".to_string()
+                    }
                 },
                 None => "notify".to_string(),
             };

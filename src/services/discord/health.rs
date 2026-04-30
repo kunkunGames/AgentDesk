@@ -2134,12 +2134,12 @@ async fn resolve_agent_target_channel_id_pg(
     })
 }
 
-async fn is_authorized_routine_thread_target(
+async fn routine_thread_parent_hint(
     pg_pool: Option<&PgPool>,
     thread_channel_id: ChannelId,
-) -> bool {
+) -> Option<ChannelId> {
     let Some(pg_pool) = pg_pool else {
-        return false;
+        return None;
     };
 
     let agent_id = match sqlx::query_scalar::<_, String>(
@@ -2158,43 +2158,39 @@ async fn is_authorized_routine_thread_target(
     .await
     {
         Ok(Some(agent_id)) => agent_id,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(error) => {
             tracing::warn!(
                 "routine thread auth lookup failed for {}: {}",
                 thread_channel_id.get(),
                 error
             );
-            return false;
+            return None;
         }
     };
 
     let bindings = match crate::db::agents::load_agent_channel_bindings_pg(pg_pool, &agent_id).await
     {
         Ok(Some(bindings)) => bindings,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(error) => {
             tracing::warn!(
                 "routine thread auth failed to load agent bindings for {agent_id}: {error}"
             );
-            return false;
+            return None;
         }
     };
 
     let Some(primary_channel) = bindings.primary_channel() else {
-        return false;
+        return None;
     };
     let Some(parent_channel_id) = parse_channel_target_value(&primary_channel) else {
         tracing::warn!(
             "routine thread auth found invalid primary channel for {agent_id}: {primary_channel}"
         );
-        return false;
+        return None;
     };
-    let parent_channel_name = (!primary_channel.chars().all(|ch| ch.is_ascii_digit()))
-        .then_some(primary_channel.as_str());
-
-    super::settings::resolve_role_binding(ChannelId::new(parent_channel_id), parent_channel_name)
-        .is_some()
+    Some(ChannelId::new(parent_channel_id))
 }
 
 fn resolve_channel_target(target: &str) -> Result<u64, SendTargetResolutionError> {
@@ -2327,12 +2323,23 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
     // If the target is a thread, resolve its parent channel and check that instead.
     // Pass channel name so byChannelName-style configs can match.
     if super::settings::resolve_role_binding(channel_id, None).is_none() {
-        let mut authorized = is_authorized_routine_thread_target(pg_pool, channel_id).await;
+        let routine_parent_hint = routine_thread_parent_hint(pg_pool, channel_id).await;
+        let mut authorized = false;
         // Try resolving as a thread: fetch channel info and check parent_id
-        if !authorized && let Ok(http) = resolve_bot_http(registry, bot).await {
+        if let Ok(http) = resolve_bot_http(registry, bot).await {
             if let Ok(channel) = channel_id.to_channel(&*http).await {
                 if let Some(guild_channel) = channel.guild() {
                     if let Some(parent_id) = guild_channel.parent_id {
+                        if let Some(expected_parent) = routine_parent_hint {
+                            if expected_parent != parent_id {
+                                tracing::warn!(
+                                    target_channel_id = channel_id.get(),
+                                    actual_parent_id = parent_id.get(),
+                                    expected_parent_id = expected_parent.get(),
+                                    "routine thread parent hint did not match Discord parent"
+                                );
+                            }
+                        }
                         // Resolve parent channel name for byChannelName configs
                         let parent_name = if let Ok(parent_ch) = parent_id.to_channel(&*http).await
                         {

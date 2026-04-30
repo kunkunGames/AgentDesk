@@ -13,6 +13,16 @@ use uuid::Uuid;
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
 const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
 
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
 /// Durable PG-backed store for routines and routine_runs.
 ///
 /// All mutating operations are transaction-scoped. Callers never hold a
@@ -503,6 +513,7 @@ impl RoutineStore {
     /// Results are truncated to `max_items` and `max_payload_bytes` before return.
     pub async fn fetch_recent_run_observations(
         &self,
+        current_script_ref: Option<&str>,
         max_items: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<serde_json::Value>> {
@@ -521,10 +532,12 @@ impl RoutineStore {
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.status IN ('succeeded', 'failed', 'skipped', 'error')
               AND rr.started_at > NOW() - INTERVAL '24 hours'
+              AND ($1::text IS NULL OR r.script_ref <> $1)
             ORDER BY rr.started_at DESC
-            LIMIT $1
+            LIMIT $2
             "#,
         )
+        .bind(current_script_ref)
         .bind(limit)
         .fetch_all(&*self.pool)
         .await
@@ -550,7 +563,7 @@ impl RoutineStore {
                 1
             };
             let summary = if let Some(ref err) = error {
-                let short_err = if err.len() > 120 { &err[..120] } else { err };
+                let short_err = truncate_chars(err, 120);
                 format!("{name} {action_str} {status}: {short_err}")
             } else {
                 format!("{name} {action_str} {status}")
@@ -575,6 +588,54 @@ impl RoutineStore {
         }
 
         Ok(observations)
+    }
+
+    pub async fn fetch_active_routine_automation_inventory(
+        &self,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let limit = (max_items as i64).min(100);
+        let rows = sqlx::query(
+            r#"
+            SELECT script_ref, name, updated_at
+            FROM routines
+            WHERE status <> 'detached'
+            ORDER BY updated_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch active routine automation inventory: {e}"))?;
+
+        let mut inventory = Vec::with_capacity(rows.len());
+        let mut total_bytes: usize = 0;
+
+        for row in &rows {
+            let script_ref: String = row.try_get("script_ref").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let updated_at: DateTime<Utc> =
+                row.try_get("updated_at").unwrap_or_else(|_| Utc::now());
+
+            let item = serde_json::json!({
+                "pattern_id": format!("{script_ref}:*"),
+                "status": "implemented",
+                "reason": "registered routine",
+                "source_ref": format!("routine:{name}"),
+                "updated_at": updated_at.to_rfc3339(),
+            });
+
+            let bytes = item.to_string().len();
+            if total_bytes + bytes > max_payload_bytes {
+                break;
+            }
+            total_bytes += bytes;
+            inventory.push(item);
+        }
+
+        Ok(inventory)
     }
 
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
@@ -1670,7 +1731,8 @@ struct CloseRun<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_due_after, next_due_after_anchor, parse_schedule_interval, validate_routine_schedule,
+        next_due_after, next_due_after_anchor, parse_schedule_interval, truncate_chars,
+        validate_routine_schedule,
     };
     use chrono::{TimeZone, Timelike, Utc};
 
@@ -1759,5 +1821,13 @@ mod tests {
             next_due,
             Utc.with_ymd_and_hms(2026, 4, 30, 3, 33, 8).unwrap()
         );
+    }
+
+    #[test]
+    fn truncate_chars_does_not_split_multibyte_text() {
+        let text = "가".repeat(121);
+        let truncated = truncate_chars(&text, 120);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.trim_end_matches("...").chars().count(), 120);
     }
 }

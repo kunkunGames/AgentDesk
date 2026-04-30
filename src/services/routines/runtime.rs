@@ -7,6 +7,7 @@ use super::action::RoutineAction;
 use super::agent_executor::RoutineAgentExecutor;
 use super::discord_log::RoutineDiscordLogger;
 use super::loader::{
+    MAX_AUTOMATION_INVENTORY_ITEMS, MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
     MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATIONS_PER_TICK, ObservationLimits,
     RoutineScriptLoader, RoutineTickAgent, RoutineTickContext, RoutineTickRoutine, RoutineTickRun,
 };
@@ -72,13 +73,29 @@ pub async fn execute_claimed_script_run(
     let fresh_context_guaranteed = false;
     let agent = load_tick_agent_context(store, claimed.agent_id.as_deref()).await?;
     let observations = store
-        .fetch_recent_run_observations(MAX_OBSERVATIONS_PER_TICK, MAX_OBSERVATION_PAYLOAD_BYTES)
+        .fetch_recent_run_observations(
+            Some(&claimed.script_ref),
+            MAX_OBSERVATIONS_PER_TICK,
+            MAX_OBSERVATION_PAYLOAD_BYTES,
+        )
         .await
         .unwrap_or_default();
     let observations = if observations.is_empty() {
         None
     } else {
         Some(observations)
+    };
+    let automation_inventory = store
+        .fetch_active_routine_automation_inventory(
+            MAX_AUTOMATION_INVENTORY_ITEMS,
+            MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+    let automation_inventory = if automation_inventory.is_empty() {
+        None
+    } else {
+        Some(automation_inventory)
     };
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
@@ -97,7 +114,7 @@ pub async fn execute_claimed_script_run(
         checkpoint: claimed.checkpoint.clone(),
         now: chrono::Utc::now(),
         observations,
-        automation_inventory: None,
+        automation_inventory,
         limits: ObservationLimits::default(),
     };
 
@@ -161,15 +178,15 @@ async fn load_tick_agent_context(
                (SELECT s.thread_channel_id
                   FROM sessions s
                  WHERE s.agent_id = a.id
-                   AND s.status = 'working'
+                   AND s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working')
                  ORDER BY s.last_heartbeat DESC NULLS LAST, s.id DESC
                  LIMIT 1) AS current_thread_channel_id,
                EXISTS (
                    SELECT 1
-                     FROM sessions s
-                    WHERE s.agent_id = a.id
-                      AND s.status = 'working'
-               ) AS has_working_session
+                    FROM sessions s
+                   WHERE s.agent_id = a.id
+                      AND s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working')
+               ) AS has_busy_session
           FROM agents a
          WHERE a.id = $1
         "#,
@@ -194,12 +211,10 @@ async fn load_tick_agent_context(
         .try_get::<Option<String>, _>("current_thread_channel_id")
         .ok()
         .flatten();
-    let has_working_session = row
-        .try_get::<bool, _>("has_working_session")
-        .unwrap_or(false);
+    let has_busy_session = row.try_get::<bool, _>("has_busy_session").unwrap_or(false);
     let has_active_task = current_task_id.is_some();
     let has_busy_signal =
-        has_working_session || current_thread_channel_id.is_some() || has_active_task;
+        has_busy_session || current_thread_channel_id.is_some() || has_active_task;
     let is_idle = status == "idle" && !has_busy_signal;
 
     Ok(Some(RoutineTickAgent {

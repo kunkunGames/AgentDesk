@@ -216,8 +216,12 @@ impl RoutineAgentExecutor {
                 channel_id,
             )
             .await;
-        let (turn_channel_id, discord_thread_id) = match routine_channel {
-            Ok(target) => (target.channel_id, target.discord_thread_id),
+        let (turn_channel_id, discord_thread_id, delivery_bot) = match routine_channel {
+            Ok(target) => (
+                target.channel_id,
+                target.discord_thread_id,
+                target.delivery_bot,
+            ),
             Err(error) => {
                 let warning = error.to_string();
                 let _ = store
@@ -229,7 +233,7 @@ impl RoutineAgentExecutor {
                     error = %warning,
                     "routine thread setup failed; falling back to agent primary channel"
                 );
-                (channel_id, None)
+                (channel_id, None, "notify".to_string())
             }
         };
         let reservation = reserve_headless_agent_turn(turn_channel_id);
@@ -263,7 +267,7 @@ impl RoutineAgentExecutor {
 
         let metadata = Some(json!({
             "agent_id": agent_id,
-            "delivery_bot": provider.as_str(),
+            "delivery_bot": delivery_bot,
             "routine_id": claimed.routine_id,
             "routine_run_id": claimed.run_id,
             "script_ref": claimed.script_ref,
@@ -364,10 +368,11 @@ impl RoutineAgentExecutor {
             .and_then(parse_channel_id)
         {
             match validate_routine_thread(registry, provider_name, agent_id, thread_id).await {
-                Ok(()) => {
+                Ok(delivery_bot) => {
                     return Ok(RoutineThreadTarget {
                         channel_id: thread_id,
                         discord_thread_id: Some(thread_id.get().to_string()),
+                        delivery_bot,
                     });
                 }
                 Err(error) => {
@@ -393,7 +398,7 @@ impl RoutineAgentExecutor {
         }
 
         let title = routine_thread_title(&claimed.name, agent_id);
-        let thread_id =
+        let (thread_id, delivery_bot) =
             create_routine_thread(registry, provider_name, agent_id, parent_channel_id, &title)
                 .await
                 .map_err(|error| anyhow!("create routine discord thread: {error}"))?;
@@ -416,6 +421,7 @@ impl RoutineAgentExecutor {
         Ok(RoutineThreadTarget {
             channel_id: thread_id,
             discord_thread_id: Some(thread_id_string),
+            delivery_bot,
         })
     }
 }
@@ -427,6 +433,12 @@ struct StartedAgentTurn {
 struct RoutineThreadTarget {
     channel_id: poise::serenity_prelude::ChannelId,
     discord_thread_id: Option<String>,
+    delivery_bot: String,
+}
+
+struct RoutineThreadHttp {
+    http: Arc<poise::serenity_prelude::Http>,
+    bot: String,
 }
 
 fn parse_channel_id(value: &str) -> Option<poise::serenity_prelude::ChannelId> {
@@ -442,10 +454,10 @@ async fn validate_routine_thread(
     provider_name: &str,
     agent_id: &str,
     thread_id: poise::serenity_prelude::ChannelId,
-) -> Result<()> {
-    let http = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
+) -> Result<String> {
+    let resolved = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
     let channel = thread_id
-        .to_channel(&*http)
+        .to_channel(&*resolved.http)
         .await
         .map_err(|error| anyhow!("fetch saved routine thread {}: {error}", thread_id.get()))?;
     match channel {
@@ -456,7 +468,7 @@ async fn validate_routine_thread(
                     | poise::serenity_prelude::ChannelType::PrivateThread
             ) =>
         {
-            Ok(())
+            Ok(resolved.bot)
         }
         _ => Err(anyhow!(
             "saved routine discord_thread_id {} is not a thread",
@@ -471,11 +483,11 @@ async fn create_routine_thread(
     agent_id: &str,
     parent_channel_id: poise::serenity_prelude::ChannelId,
     title: &str,
-) -> Result<poise::serenity_prelude::ChannelId> {
-    let http = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
+) -> Result<(poise::serenity_prelude::ChannelId, String)> {
+    let resolved = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
     let thread = parent_channel_id
         .create_thread(
-            &*http,
+            &*resolved.http,
             poise::serenity_prelude::builder::CreateThread::new(title)
                 .kind(poise::serenity_prelude::ChannelType::PublicThread)
                 .auto_archive_duration(poise::serenity_prelude::AutoArchiveDuration::OneDay),
@@ -487,14 +499,14 @@ async fn create_routine_thread(
                 parent_channel_id.get()
             )
         })?;
-    Ok(thread.id)
+    Ok((thread.id, resolved.bot))
 }
 
 async fn resolve_routine_thread_http(
     registry: &HealthRegistry,
     provider_name: &str,
     agent_id: &str,
-) -> Result<Arc<poise::serenity_prelude::Http>> {
+) -> Result<RoutineThreadHttp> {
     let mut errors = Vec::new();
     let mut tried = Vec::new();
     for bot in [provider_name, agent_id, "notify"] {
@@ -503,7 +515,12 @@ async fn resolve_routine_thread_http(
         }
         tried.push(bot);
         match resolve_bot_http(registry, bot).await {
-            Ok(http) => return Ok(http),
+            Ok(http) => {
+                return Ok(RoutineThreadHttp {
+                    http,
+                    bot: bot.to_string(),
+                });
+            }
             Err((_, error)) => errors.push(format!("{bot}: {error}")),
         }
     }
