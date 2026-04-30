@@ -39,7 +39,7 @@ pub async fn run_due_tick(
         if let Some(logger) = discord_logger {
             logger.log_run_started(store, &run).await;
         }
-        match execute_claimed_script_run(store, loader, agent_executor, run).await {
+        match execute_claimed_script_run(store, loader, agent_executor, discord_logger, run).await {
             Ok(Some(outcome)) => {
                 if let Some(logger) = discord_logger {
                     logger.log_run_outcome(store, &outcome).await;
@@ -69,6 +69,7 @@ pub async fn execute_claimed_script_run(
     store: &RoutineStore,
     loader: &RoutineScriptLoader,
     agent_executor: Option<&RoutineAgentExecutor>,
+    discord_logger: Option<&RoutineDiscordLogger>,
     claimed: ClaimedRoutineRun,
 ) -> Result<Option<RoutineRunOutcome>> {
     let fresh_context_guaranteed = false;
@@ -91,6 +92,7 @@ pub async fn execute_claimed_script_run(
             Vec::new()
         }
     };
+    let observation_count = observations.len();
     let observations = if observations.is_empty() {
         None
     } else {
@@ -128,11 +130,23 @@ pub async fn execute_claimed_script_run(
             );
         }
     }
+    let automation_inventory_count = automation_inventory.len();
     let automation_inventory = if automation_inventory.is_empty() {
         None
     } else {
         Some(automation_inventory)
     };
+    if let Some(logger) = discord_logger {
+        logger
+            .log_run_js_inputs(
+                store,
+                &claimed,
+                observation_count,
+                automation_inventory_count,
+                claimed.checkpoint.is_some(),
+            )
+            .await;
+    }
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
             id: claimed.routine_id.clone(),
@@ -181,6 +195,18 @@ pub async fn execute_claimed_script_run(
             }));
         }
     };
+    if let Some(logger) = discord_logger {
+        logger
+            .log_run_js_action(
+                store,
+                &claimed,
+                action.action_name(),
+                action_summary(&action).as_deref(),
+                action_prompt(&action),
+                action_has_checkpoint(&action),
+            )
+            .await;
+    }
 
     close_action(
         store,
@@ -190,6 +216,68 @@ pub async fn execute_claimed_script_run(
         fresh_context_guaranteed,
     )
     .await
+}
+
+fn action_summary(action: &RoutineAction) -> Option<String> {
+    match action {
+        RoutineAction::Complete {
+            result_json,
+            last_result,
+            ..
+        } => last_result
+            .clone()
+            .or_else(|| result_json_summary(result_json.as_ref())),
+        RoutineAction::Skip {
+            reason,
+            result_json,
+            last_result,
+            ..
+        } => last_result
+            .clone()
+            .or_else(|| reason.clone())
+            .or_else(|| result_json_summary(result_json.as_ref())),
+        RoutineAction::Pause {
+            reason,
+            result_json,
+            last_result,
+            ..
+        } => last_result
+            .clone()
+            .or_else(|| reason.clone())
+            .or_else(|| result_json_summary(result_json.as_ref())),
+        RoutineAction::Agent { prompt, .. } => Some(format!(
+            "agent prompt generated ({} chars)",
+            prompt.chars().count()
+        )),
+    }
+}
+
+fn action_prompt(action: &RoutineAction) -> Option<&str> {
+    match action {
+        RoutineAction::Agent { prompt, .. } => Some(prompt.as_str()),
+        _ => None,
+    }
+}
+
+fn action_has_checkpoint(action: &RoutineAction) -> bool {
+    match action {
+        RoutineAction::Complete { checkpoint, .. }
+        | RoutineAction::Skip { checkpoint, .. }
+        | RoutineAction::Pause { checkpoint, .. }
+        | RoutineAction::Agent { checkpoint, .. } => checkpoint.is_some(),
+    }
+}
+
+fn result_json_summary(result_json: Option<&Value>) -> Option<String> {
+    let value = result_json?;
+    for key in ["outcome_summary", "summary", "status"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn merge_loaded_script_automation_inventory(
