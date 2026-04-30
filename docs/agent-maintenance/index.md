@@ -31,6 +31,10 @@
 - [`opencode-usability-spec.md`](opencode-usability-spec.md) — implementation
   contract for raising OpenCode's Discord-facing usability toward Claude/Codex
   parity, including prompt/output safety, SSE text handling, and MCP sync.
+- [`post-stabilization-backlog.md`](post-stabilization-backlog.md) — Phase 3
+  maintainability checklist deferred until relay recovery and CookingHeart
+  two-node readiness are stable. Use this page to decide when P2 cleanup may be
+  promoted into a runtime lane.
 
 ## Generated Companions (read-only)
 

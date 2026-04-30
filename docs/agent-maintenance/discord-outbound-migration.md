@@ -4,7 +4,7 @@
 > review followups, short manual/DM notifications, gateway placeholder sends,
 > and dispatch completion summaries directly.
 >
-> Last refreshed: 2026-04-30 (against `adk-1457` before merge).
+> Last refreshed: 2026-04-30 (against #1457 v3 outbound migration refresh).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
