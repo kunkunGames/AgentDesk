@@ -240,12 +240,42 @@ pub(in crate::services::discord) fn is_allowed_turn_sender(
     text: &str,
 ) -> bool {
     if announce_bot_id.is_some_and(|id| id == author_id) {
-        return true;
+        // Issue announcements moved to notify-bot in the #1448 follow-up,
+        // so live announce-bot traffic is dispatch / PM-decision /
+        // escalation / generic routing — all of which trigger turns.
+        // The transitional block below catches catch-up replays of
+        // pre-deploy announce-authored issue cards (📋/✅) so they
+        // don't spawn spurious turns. Remove once existing announce-bot
+        // announcement messages have aged out of catch-up scan windows
+        // (safe sunset target: 2026-06-01).
+        return !is_legacy_announce_issue_card(text);
     }
     if allowed_bot_ids.contains(&author_id) {
         return should_process_allowed_bot_turn_text(text);
     }
     !author_is_bot
+}
+
+/// TRANSITIONAL (#1448 follow-up — sunset 2026-06-01): suppresses
+/// pre-deploy announce-bot issue-announcement / completion cards that
+/// reappear during restart catch-up. Live traffic now routes through
+/// notify-bot, which never reaches the announce-bot branch above.
+fn is_legacy_announce_issue_card(text: &str) -> bool {
+    let head = text.trim_start();
+    if head.starts_with("📋 **새 이슈 #") {
+        return true;
+    }
+    if let Some(rest) = head.strip_prefix("✅ **#") {
+        let digits_end = rest
+            .char_indices()
+            .find(|(_, ch)| !ch.is_ascii_digit())
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        if digits_end > 0 && rest[digits_end..].starts_with(" 완료** —") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(in crate::services::discord) fn should_phase2_recover_message(

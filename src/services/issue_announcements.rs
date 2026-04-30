@@ -135,17 +135,14 @@ pub async fn complete_issue_announcement_pg(
         return Ok(false);
     };
 
-    let token = crate::credential::read_bot_token("notify")
-        .ok_or_else(|| "no notify bot token configured".to_string())?;
     let title = event.title.as_deref().unwrap_or(&row.title);
     let content = render_completed_card(title, &row, &event);
-    let edit_result = send_issue_announcement_message(
-        &token,
+    let log_key = format!("issue_announcement:{}:{}", event.repo, event.issue_number);
+    let edit_result = edit_announcement_with_legacy_fallback(
         &row.channel_id,
-        Some(&row.message_id),
+        &row.message_id,
         &content,
-        &format!("issue_announcement:{}:{}", event.repo, event.issue_number),
-        "completed",
+        &log_key,
     )
     .await;
 
@@ -201,6 +198,63 @@ pub async fn complete_issue_announcement_pg(
             Err(error)
         }
     }
+}
+
+/// Edits an existing issue-announcement message, falling back to the
+/// legacy `announce` token when the message was authored by announce-bot
+/// before the #1448 follow-up moved announcements to `notify`. Discord
+/// rejects cross-bot edits with a 50005 error string ("Cannot edit a
+/// message authored by another user"), so we detect that signature and
+/// retry with the announce token. Once existing announce-authored rows
+/// have all closed, the fallback can be removed (sunset target
+/// 2026-06-01, same as the legacy turn-sender block in `mod.rs`).
+async fn edit_announcement_with_legacy_fallback(
+    channel_id: &str,
+    message_id: &str,
+    content: &str,
+    log_key: &str,
+) -> Result<String, String> {
+    let notify_token = crate::credential::read_bot_token("notify")
+        .ok_or_else(|| "no notify bot token configured".to_string())?;
+    match send_issue_announcement_message(
+        &notify_token,
+        channel_id,
+        Some(message_id),
+        content,
+        log_key,
+        "completed",
+    )
+    .await
+    {
+        Ok(id) => Ok(id),
+        Err(error) if is_cross_bot_edit_error(&error) => {
+            let Some(announce_token) = crate::credential::read_bot_token("announce") else {
+                return Err(format!(
+                    "{error} (and no announce bot token configured for legacy fallback)"
+                ));
+            };
+            send_issue_announcement_message(
+                &announce_token,
+                channel_id,
+                Some(message_id),
+                content,
+                log_key,
+                "completed-legacy-fallback",
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_cross_bot_edit_error(error: &str) -> bool {
+    // Discord error code 50005 = "Cannot edit a message authored by
+    // another user". Match on the numeric code or the canonical phrase
+    // so both `reqwest`/serenity wrappers surface as legacy fallbacks.
+    error.contains("50005")
+        || error
+            .to_ascii_lowercase()
+            .contains("cannot edit a message authored by another user")
 }
 
 async fn resolve_announcement_channel_pg(
