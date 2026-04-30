@@ -236,7 +236,7 @@ function findRecentInflightForSession(sessionKey, tmuxName) {
   try {
     inflights = agentdesk.inflight.list() || [];
   } catch(e) {
-    return null;
+    throw new Error("inflight lookup failed: " + e);
   }
   var best = null;
   var bestUpdatedAt = 0;
